@@ -1,0 +1,167 @@
+"""Installer and wizard invariants.
+
+The wizard is the first thing a new operator runs, often as root, on a machine
+they care about. Two classes of mistake matter here: leaking a secret into
+somewhere it can be read later, and changing the host before the operator has
+agreed to anything. Both are pinned below.
+"""
+from __future__ import annotations
+
+import re
+import stat
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+WIZARD = (REPO / "scripts" / "wizard.sh").read_text(encoding="utf-8")
+DISTRO = (REPO / "deploy" / "lib" / "distro.sh").read_text(encoding="utf-8")
+INSTALL = (REPO / "deploy" / "install.sh").read_text(encoding="utf-8")
+PREFLIGHT = (REPO / "deploy" / "preflight.sh").read_text(encoding="utf-8")
+
+
+# --- secrets ----------------------------------------------------------------
+def test_secrets_are_read_with_echo_off():
+    """A token typed in cleartext ends up in a screen recording, a screenshot,
+    and the scrollback of whoever is pairing with you."""
+    assert "ask_secret()" in WIZARD
+    body = WIZARD.split("ask_secret()")[1].split("\n}")[0]
+    assert "read -r -s" in body            # -s is the echo-off flag
+
+
+def test_secrets_are_never_passed_as_arguments():
+    """`ps` shows every process's argv to every user on the host. A bot token
+    on a command line is a token given away."""
+    for var in ("TELEGRAM_BOT_TOKEN", "ANTHROPIC_API_KEY"):
+        # It may only appear where it is read, written to stdin, or saved to the
+        # 0600 answers file — never interpolated into an ssh/bash command.
+        for line in WIZARD.splitlines():
+            if var not in line or line.strip().startswith("#"):
+                continue
+            assert not re.search(rf"(ssh|bash|sh) .*\$\{{?{var}", line), \
+                f"{var} reaches a command line: {line.strip()}"
+
+
+def test_secrets_travel_on_stdin():
+    assert "build_secrets |" in WIZARD or "build_secrets >" in WIZARD
+    assert "cat > /tmp/sentinel-secrets" in WIZARD
+
+
+def test_saved_answers_file_is_locked_down():
+    """It contains the bot token. Anything looser than 0600 hands it to every
+    other account on the machine."""
+    assert "umask 077" in WIZARD
+    assert 'chmod 0600 "$SAVE_FILE"' in WIZARD
+    assert "conține secrete" in WIZARD      # and it says so in the file itself
+
+
+def test_secrets_are_removed_from_the_target_after_install():
+    assert "rm -f /tmp/sentinel-secrets" in WIZARD
+
+
+def test_packaging_excludes_the_secrets_directory():
+    tar_line = next(l for l in WIZARD.splitlines() if "tar --exclude" in l)
+    assert "secrets/*" in tar_line or "--exclude='secrets/*'" in WIZARD
+    assert "--exclude='.git'" in WIZARD
+
+
+# --- nothing changes before consent -----------------------------------------
+def test_confirmation_precedes_every_mutation():
+    """Everything above the confirmation must be questions and read-only checks;
+    an installer that has already edited nginx by the time it asks is lying."""
+    confirm_at = WIZARD.index("Din acest punct înainte se modifică serverul")
+    for mutating in ("tar --exclude", "scp -q", "run_install"):
+        assert WIZARD.index(mutating) > confirm_at, \
+            f"{mutating!r} happens before the operator confirms"
+
+
+def test_dry_run_exits_before_any_change():
+    dry_at = WIZARD.index('"$DRY_RUN" == "yes"')
+    install_at = WIZARD.index("Instalare")
+    assert dry_at < install_at
+
+
+def test_second_ssh_session_is_advised():
+    # A locked-out operator with no second session has to use the provider's
+    # console, which people discover they cannot reach at exactly the wrong time.
+    assert "a doua sesiune SSH" in WIZARD
+
+
+# --- distribution support ---------------------------------------------------
+def test_both_families_are_handled_everywhere_they_branch():
+    """A half-supported distribution is worse than a refused one: it leaves a
+    machine that looks protected and is not."""
+    for fn in ("pkg_install", "pkg_names_core", "pg_bootstrap", "pg_confdir",
+               "python_pkg_names", "suricata_defaults_file",
+               "security_module_allow_nginx_proxy"):
+        body = _func(DISTRO, fn)
+        assert "rhel)" in body, f"{fn} has no rhel branch"
+        assert "debian)" in body, f"{fn} has no debian branch"
+
+
+def test_unsupported_distribution_is_refused_by_name():
+    assert "distro_supported" in INSTALL
+    assert "unsupported distribution" in INSTALL
+    assert "unsupported distribution" in INSTALL or "nesuportată" in WIZARD
+
+
+def test_installer_has_no_hardcoded_package_manager_left():
+    """Every dnf/apt call must go through the abstraction, or Debian support is
+    fiction that fails halfway through an install."""
+    offenders = [l.strip() for l in INSTALL.splitlines()
+                 if re.search(r"^\s*(dnf|apt-get|yum|rpm -q) ", l)
+                 and not l.strip().startswith("#")]
+    assert not offenders, f"direct package-manager calls remain: {offenders[:3]}"
+
+
+def test_no_hardcoded_postgres_paths_left():
+    offenders = [l.strip() for l in INSTALL.splitlines()
+                 if "/var/lib/pgsql" in l and not l.strip().startswith("#")]
+    assert not offenders, f"RHEL-only postgres paths remain: {offenders[:3]}"
+
+
+def test_systemd_is_required_not_assumed():
+    """journald is the primary detection source; without it SSH brute-force is
+    invisible, so the check belongs up front rather than as a later surprise."""
+    assert "systemd is required" in PREFLIGHT
+    assert "systemd" in WIZARD
+
+
+def test_python_floor_matches_what_the_distros_ship():
+    """3.10 covers Ubuntu 22.04 through AlmaLinux 9 with no third-party repo.
+    Requiring 3.12 would have forced deadsnakes onto two supported targets."""
+    assert "PYTHON_MIN_MINOR=10" in DISTRO
+    pyproject = (REPO / "pyproject.toml").read_text(encoding="utf-8")
+    assert 'requires-python = ">=3.10"' in pyproject
+
+
+# --- executable bits --------------------------------------------------------
+def test_wizard_declares_a_shebang():
+    assert WIZARD.startswith("#!/usr/bin/env bash")
+
+
+def test_shell_files_use_unix_line_endings():
+    """A CRLF shell script fails on Linux with a confusing 'bad interpreter'."""
+    for name in ("scripts/wizard.sh", "deploy/lib/distro.sh",
+                 "deploy/install.sh", "deploy/preflight.sh"):
+        assert b"\r\n" not in (REPO / name).read_bytes(), f"{name} has CRLF"
+
+
+def _func(source: str, name: str) -> str:
+    m = re.search(rf"^{re.escape(name)}\(\)\s*\{{.*?^\}}", source, re.S | re.M)
+    assert m, f"function {name} not found"
+    return m.group(0)
+
+
+def test_entrypoint_scripts_are_executable_in_git():
+    """`./scripts/wizard.sh` is the documented first command. Committed at 0644
+    it fails on a fresh clone with 'Permission denied' — the mode has to live in
+    git, not in whatever the author's filesystem happened to have."""
+    import subprocess
+    out = subprocess.run(["git", "ls-files", "-s", "--", "*.sh"],
+                         cwd=REPO, capture_output=True, text=True).stdout
+    if not out.strip():
+        return  # not a git checkout (e.g. a source tarball)
+    for line in out.strip().splitlines():
+        mode, _, _, path = line.split(maxsplit=3)
+        has_shebang = (REPO / path).read_bytes().startswith(b"#!")
+        if has_shebang:
+            assert mode == "100755", f"{path} has a shebang but is committed {mode}"

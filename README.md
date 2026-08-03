@@ -112,41 +112,45 @@ tests/                         unit / integration / security
 
 ## Quick start
 
-1. **Prepare secrets locally** (never committed, never in argv):
+One command, wherever you are:
 
-   ```bash
-   ./scripts/secrets-init.sh
-   ```
+```bash
+git clone https://github.com/dragosnimu/sentinel.git
+cd sentinel
+./scripts/wizard.sh
+```
 
-2. **Dry run** — preflight only, changes nothing on the server:
+The wizard works out what it is looking at. Run it on your laptop and it asks
+for a target and installs over SSH; run it on the server itself and it skips
+the SSH half. It asks what it needs, checks what it can, shows you a summary,
+and changes nothing until you say yes.
 
-   ```bash
-   ./scripts/deploy.sh --host 203.0.113.10 --user deploy \
-       --key ~/.ssh/sentinel_deploy --domain sentinel.exemplu.ro \
-       --web-port 8443 --dry-run
-   ```
+```
+./scripts/wizard.sh                  interactive
+./scripts/wizard.sh --dry-run        ask and check, change nothing
+./scripts/wizard.sh --save my.conf   interactive, remember the answers
+./scripts/wizard.sh --config my.conf unattended — a second server, or a rebuild
+```
 
-3. **Deploy** (open a second SSH session first — see the warning the script prints):
+**Supported hosts.** RHEL-family (AlmaLinux, Rocky, RHEL, CentOS Stream,
+Fedora) and Debian-family (Debian, Ubuntu). Anything else is refused by name
+rather than half-installed: a machine that looks protected and is not is worse
+than one that clearly failed. systemd is required — journald is the primary
+detection source, so without it SSH brute-force is invisible.
 
-   ```bash
-   ./scripts/deploy.sh --host 203.0.113.10 --user deploy \
-       --key ~/.ssh/sentinel_deploy --domain sentinel.exemplu.ro --web-port 8443
-   ```
+Python 3.10 or newer, which every supported target already ships: Ubuntu 22.04
+has 3.10, Debian 12 has 3.11, AlmaLinux 9 has 3.11/3.12 in AppStream, Ubuntu
+24.04 has 3.12. No third-party repository is needed for any of them.
 
-   If nginx already owns 80/443 — the dry run tells you — the simpler option is a
-   vhost on it, which also makes the certificate work without any manual step:
+**What it asks for.** The target and its SSH details; the domain the dashboard
+will answer on; whether nginx should host it as one vhost among your existing
+sites or on a port of its own; your own public address, which goes into the
+never-block list; a Telegram bot token and chat id, if you want the emergency
+channel; and an Anthropic API key, if you want AI triage. Everything except the
+domain and your address is optional.
 
-   ```bash
-   ./scripts/deploy.sh --host 203.0.113.10 --user deploy \
-       --key ~/.ssh/sentinel_deploy --domain sentinel.exemplu.ro --nginx-mode shared
-   ```
-
-   From PowerShell, use `scripts\deploy.ps1` with the same flags (`-NginxMode shared`).
-
-Full instructions, including the Telegram bot setup and the TOTP enrolment:
-**[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** (Romanian).
-
----
+Secrets are typed with the terminal echo off and travel on stdin — never as
+command-line arguments, because `ps` shows those to every account on the host.
 
 ## Safety properties worth knowing before you run it
 

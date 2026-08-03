@@ -41,6 +41,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # shellcheck source=lib/common.sh
 source "${SCRIPT_DIR}/lib/common.sh"
+source "${SCRIPT_DIR}/lib/distro.sh"
+
+# Everything below branches on this. Detecting once, early, means a failure
+# here is a clear refusal rather than a confusing package error 200 lines in.
+distro_detect || die "cannot read /etc/os-release — unsupported system"
+distro_supported || die "unsupported distribution: ${DISTRO_PRETTY}. Sentinel installs on RHEL-family (AlmaLinux, Rocky, RHEL, Fedora) and Debian-family (Debian, Ubuntu) hosts."
 
 DOMAIN=""
 ADMIN_IP=""
@@ -269,36 +275,46 @@ step_packages() {
     # Recorded BEFORE the install, because it decides whether nginx.conf is ours
     # to edit later. If nginx was already serving the operator's sites, its
     # config belongs to them.
-    if rpm -q nginx >/dev/null 2>&1 || systemctl is-active --quiet nginx 2>/dev/null; then
+    if pkg_installed nginx || systemctl is-active --quiet nginx 2>/dev/null; then
         NGINX_WAS_PREEXISTING=1
         printf 'NGINX_WAS_PREEXISTING=1
 ' >> "${STATE_MARKERS}/preflight.env"
         info "nginx is already installed here — its configuration will not be modified"
     fi
 
-    info "installing base packages (this takes a few minutes on a fresh host)"
-    dnf install -y epel-release >/dev/null 2>&1 || warn "EPEL not available"
+    info "installing base packages on ${DISTRO_PRETTY} (a few minutes on a fresh host)"
+    pkg_refresh
+    pkg_enable_extra_repos || warn "extra repositories unavailable; Suricata may be missing"
 
-    local pkgs=(
-        python3.12 python3.12-devel gcc
-        # systemd-python is a C extension built at pip time; it needs the
-        # libsystemd headers and pkg-config to find them. Without these, the
-        # wheel build fails with "Package 'libsystemd' ... not found" and the
-        # whole venv step dies. It is what the journald collector reads through.
-        systemd-devel pkgconf-pkg-config
-        nginx
-        nftables
-        tar zstd jq git curl
-        certbot
-        policycoreutils-python-utils
-    )
-    dnf install -y "${pkgs[@]}" || die "package installation failed"
-
-    if ! rpm -q postgresql-server >/dev/null 2>&1; then
-        dnf module enable -y postgresql:16 >/dev/null 2>&1 || \
-            warn "postgresql:16 module unavailable; using the default stream"
-        dnf install -y postgresql-server postgresql-contrib || die "PostgreSQL install failed"
+    # An interpreter first: everything else is easier once we know which one.
+    # The names differ per family, so try each candidate set until one resolves.
+    if ! python_find >/dev/null; then
+        local group installed=0
+        while read -r group; do
+            # shellcheck disable=SC2086
+            if pkg_install $group >/dev/null 2>&1; then installed=1; break; fi
+        done < <(python_pkg_names)
+        (( installed )) || die "could not install a Python >= 3.${PYTHON_MIN_MINOR}"
     fi
+    PYTHON_BIN="$(python_find)" || die "no Python >= 3.${PYTHON_MIN_MINOR} after install"
+    printf 'PYTHON_BIN=%q\n' "$PYTHON_BIN" >> "${STATE_MARKERS}/preflight.env"
+    info "using ${PYTHON_BIN} ($("$PYTHON_BIN" -V 2>&1))"
+
+    # Shared roles, per-family names. `systemd-devel` / `libsystemd-dev` matter
+    # most: systemd-python is a C extension built at pip time, and without the
+    # headers the venv step dies with "Package 'libsystemd' ... not found".
+    local pkgs=()
+    while read -r p; do pkgs+=("$p"); done < <(pkg_names_core)
+    pkg_install "${pkgs[@]}" || die "package installation failed"
+
+    # Optional extras: a missing one degrades a feature, it does not stop setup.
+    pkg_install git certbot >/dev/null 2>&1 || \
+        warn "git/certbot unavailable; TLS issuance may need doing by hand"
+    if [[ "$DISTRO_FAMILY" == "rhel" ]]; then
+        pkg_install policycoreutils-python-utils >/dev/null 2>&1 || true
+    fi
+
+    pg_bootstrap || die "PostgreSQL install failed"
     ok "base packages installed"
 }
 
@@ -338,16 +354,17 @@ corrupted download or a compromised mirror — do not work around it."
 
 # --- 22 -------------------------------------------------------------------
 step_postgres() {
-    if [[ ! -f /var/lib/pgsql/data/PG_VERSION ]]; then
-        postgresql-setup --initdb || die "postgresql-setup --initdb failed"
-        ok "PostgreSQL cluster initialised"
-    fi
+    # RHEL keeps configuration inside the data directory; Debian splits it
+    # into /etc/postgresql/<version>/main and initialises the cluster in its
+    # postinst, so there is nothing to initdb there.
+    local pgconf; pgconf="$(pg_confdir)"
+    [[ -d "$pgconf" ]] || die "PostgreSQL config directory not found at ${pgconf}"
 
     install -D -m 0644 -o postgres -g postgres \
         "${SCRIPT_DIR}/postgres/sentinel-tuning.conf" \
-        /var/lib/pgsql/data/conf.d/sentinel-tuning.conf
-    grep -q "include_dir 'conf.d'" /var/lib/pgsql/data/postgresql.conf || \
-        echo "include_dir = 'conf.d'" >> /var/lib/pgsql/data/postgresql.conf
+        "${pgconf}/conf.d/sentinel-tuning.conf"
+    grep -q "include_dir 'conf.d'" "${pgconf}/postgresql.conf" || \
+        echo "include_dir = 'conf.d'" >> "${pgconf}/postgresql.conf"
 
     # Loopback only, scram-sha-256. The database is never reachable off-host.
     #
@@ -357,7 +374,7 @@ step_postgres() {
     # would never be reached and every connection as `sentinel` would fail with
     # "Ident authentication failed" — which is exactly what happened. The guard
     # matches our actual rule so a re-run is idempotent regardless of position.
-    local hba=/var/lib/pgsql/data/pg_hba.conf
+    local hba="${pgconf}/pg_hba.conf"
     if ! grep -qE '^[[:space:]]*host[[:space:]]+sentinel[[:space:]]+sentinel[[:space:]]+127' "$hba"; then
         local hba_tmp; hba_tmp="$(mktemp)"
         awk -v snip="${SCRIPT_DIR}/postgres/pg_hba.snippet" '
@@ -403,7 +420,7 @@ step_postgres() {
 
 # --- 23 -------------------------------------------------------------------
 step_venv() {
-    local py=python3.12
+    local py="${PYTHON_BIN:-$(python_find || echo python3)}"
     have "$py" || py=python3
 
     if [[ ! -x "${SENTINEL_PREFIX}/venv/bin/python" ]]; then
@@ -764,7 +781,7 @@ competing for :80."
 
     # SELinux blocks nginx from proxying to 127.0.0.1:8787 by default, and the
     # symptom is a 502 with nothing useful in the nginx log.
-    setsebool -P httpd_can_network_connect 1 2>/dev/null || true
+    security_module_allow_nginx_proxy
 
     nginx -t || die "nginx configuration is invalid; not reloading"
     systemctl enable --now nginx
@@ -828,7 +845,7 @@ configuration first — Sentinel will not add a vhost to a broken nginx."
         > /etc/nginx/conf.d/sentinel-shared.conf
     chmod 0644 /etc/nginx/conf.d/sentinel-shared.conf
 
-    setsebool -P httpd_can_network_connect 1 2>/dev/null || true
+    security_module_allow_nginx_proxy
 
     # -- And healthy AFTER. This is the important one. ----------------------
     #
@@ -1160,7 +1177,7 @@ step_suricata() {
         info "Suricata skipped (RAM gate). Sentinel runs log-only."
         return 0
     fi
-    dnf install -y suricata || { warn "suricata install failed; continuing log-only"; return 0; }
+    pkg_install "$(suricata_pkg)" || { warn "suricata install failed; continuing log-only"; return 0; }
 
     # We do NOT replace the distro suricata.yaml — it is complete and passes -T.
     # Everything site-specific is layered on top via OPTIONS, a BPF file, a
@@ -1185,7 +1202,7 @@ step_suricata() {
     # (EXTERNAL_NET -> HOME_NET) never match. The distro default is RFC1918 only.
     [[ -n "${pubip}" ]] && options+=" --set vars.address-groups.HOME_NET=[${pubip}]"
 
-    printf 'OPTIONS="%s"\n' "${options}" > /etc/sysconfig/suricata
+    printf 'OPTIONS="%s"\n' "${options}" > "$(suricata_defaults_file)"
 
     # A NIDS on a small VPS must have a ceiling, or a rule explosion OOM-kills
     # whatever it was meant to protect.
@@ -1232,7 +1249,7 @@ step_auxiliary() {
     # setfacl are present.
     if [[ -d /var/log/nginx ]]; then
         if ! have setfacl; then
-            dnf install -y acl >/dev/null 2>&1 || warn "acl (setfacl) unavailable; ingest may not read nginx logs"
+            pkg_install acl >/dev/null 2>&1 || warn "acl (setfacl) unavailable; ingest may not read nginx logs"
         fi
         if have setfacl; then
             setfacl -m u:"${SENTINEL_USER}":rx /var/log/nginx 2>/dev/null || true

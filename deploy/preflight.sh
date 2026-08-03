@@ -52,21 +52,31 @@ SURICATA_OK=0
 section "Sistem"
 
 # ---------------------------------------------------------------------------
-if [[ -r /etc/os-release ]]; then
-    # shellcheck disable=SC1091
-    . /etc/os-release
-    case "${ID}${ID_LIKE:-}" in
-        *almalinux*|*rhel*|*centos*|*rocky*|*fedora*)
-            ok "OS: ${PRETTY_NAME}" ;;
-        *)
-            fail "OS is ${PRETTY_NAME}. Sentinel targets AlmaLinux/RHEL 9. \
-The installer uses dnf, systemd unit paths and SELinux conventions from that family." ;;
-    esac
-    if [[ "${VERSION_ID%%.*}" != "9" ]]; then
-        warn "major version ${VERSION_ID} — tested on 9.x. Package names may differ."
+# The same detection the installer uses, so preflight cannot pass on a host the
+# installer would then refuse.
+_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/distro.sh"
+if [[ -r "$_lib" ]]; then
+    # shellcheck disable=SC1090
+    . "$_lib"
+    if distro_detect && distro_supported; then
+        ok "OS: ${DISTRO_PRETTY} (${DISTRO_FAMILY}-family)"
+    else
+        fail "OS is ${DISTRO_PRETTY:-unknown}. Sentinel installs on RHEL-family (AlmaLinux, Rocky, RHEL, CentOS Stream, Fedora) and Debian-family (Debian, Ubuntu) hosts."
+    fi
+
+    # systemd is not negotiable: the journald collector is how SSH brute-force
+    # is seen at all, and every service ships as a unit.
+    if ! command -v systemctl >/dev/null 2>&1 || [[ ! -d /run/systemd/system ]]; then
+        fail "systemd is required (journald is the primary log source)"
+    fi
+
+    if _py="$(python_find 2>/dev/null)"; then
+        ok "Python: ${_py} ($("$_py" -V 2>&1))"
+    else
+        warn "no Python >= 3.${PYTHON_MIN_MINOR} yet — the installer will add one"
     fi
 else
-    fail "cannot read /etc/os-release"
+    fail "cannot read lib/distro.sh next to this script"
 fi
 
 if [[ "$(id -u)" -ne 0 ]]; then
