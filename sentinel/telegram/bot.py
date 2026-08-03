@@ -93,6 +93,12 @@ def _guard(handler):
 
 # --- formatting ------------------------------------------------------------
 def format_incident(inc: inc_repo.IncidentRow, *, header: str = "INCIDENT") -> str:
+    # An IDS rule is named after what it detects, so the CVE is usually sitting
+    # in the title: "ET EXPLOIT Apache log4j RCE CVE-2021-44228". Linking it is
+    # the difference between an alert you can act on from a phone and one that
+    # needs a laptop and a search engine.
+    from sentinel.intel.links import cve_html, cves_in
+
     emoji = _SEV_EMOJI.get(inc.severity, "⚪")
     lines = [
         f"{emoji} <b>{header} #{inc.id}</b> · <b>{_esc(inc.severity.upper())}</b>",
@@ -102,6 +108,12 @@ def format_incident(inc: inc_repo.IncidentRow, *, header: str = "INCIDENT") -> s
         lines.append(_esc(inc.summary))
     if inc.actor_key:
         lines.append(f"Sursă: <code>{_esc(inc.actor_key)}</code>")
+    # One references line rather than links woven into the title. The title is
+    # read first and fastest; turning words inside it blue costs more than the
+    # tap it saves, and the same CVE would then appear twice on one card.
+    refs = cves_in(f"{inc.title} {inc.summary or ''}")[:3]
+    if refs:
+        lines.append("Referințe: " + " · ".join(cve_html(c) for c in refs))
     lines.append(f"Detecții: {inc.detection_count} · stare: {_esc(inc.status)}")
     auto = _auto_action_text(inc.auto_action)
     if auto:

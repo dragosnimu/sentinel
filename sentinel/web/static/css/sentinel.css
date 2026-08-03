@@ -499,6 +499,19 @@ table.services td { vertical-align: top; }
   border: 1px solid color-mix(in srgb, var(--off) 50%, transparent);
 }
 .tag-exposed { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+
+/* Secondary vulnerability references (Red Hat, CISA KEV) sitting next to a CVE.
+   Quiet by default: the identifier itself is the link you want most of the
+   time, and three equally-loud links in a table cell is three things to read
+   instead of one. */
+.reflinks { margin-left: .45rem; font-size: .78rem; white-space: nowrap; }
+.reflinks a {
+  color: var(--fg-muted);
+  border-bottom: 1px dotted color-mix(in srgb, var(--fg-muted) 55%, transparent);
+  text-decoration: none;
+}
+.reflinks a + a { margin-left: .4rem; }
+.reflinks a:hover, .reflinks a:focus-visible { color: var(--accent); border-bottom-color: var(--accent); }
 .uptime { font-weight: 660; }
 .uptime-ok { color: var(--ok); } .uptime-warn { color: var(--warn); } .uptime-bad { color: var(--bad); }
 .spark { display: block; }

@@ -1,0 +1,46 @@
+{#
+  Vulnerability references, rendered the same way everywhere.
+
+  `rel="noreferrer"` is not boilerplate here. Without it, following a link tells
+  NVD, Red Hat and CISA which page of this dashboard the request came from —
+  which is to say, that this host has that CVE open. A security dashboard should
+  not leak its own findings by being read.
+
+  `noopener` and `target="_blank"` keep the dashboard session out of reach of
+  the opened tab, and keep the operator's place in a filtered list.
+#}
+
+{# One CVE with all its sources. `rpm` puts Red Hat first — on AlmaLinux the
+   real question is backport status, which NVD gets wrong for backported
+   packages. `kev` adds the catalogue link only when it is actually listed. #}
+{% macro cve_cell(cve, rpm=false, kev=false) -%}
+  {%- set links = cve_links(cve, rpm=rpm, kev=kev) -%}
+  {%- if links -%}
+    <a href="{{ links[0][1] }}" target="_blank" rel="noopener noreferrer"
+       title="{{ links[0][0] }} — {{ cve }}">{{ cve }}</a>
+    {%- if links|length > 1 %}
+      <span class="reflinks">
+      {%- for label, url in links[1:] %}
+        <a href="{{ url }}" target="_blank" rel="noopener noreferrer">{{ label }}</a>
+      {%- endfor %}
+      </span>
+    {%- endif -%}
+  {%- else -%}
+    {{ cve or '—' }}
+  {%- endif -%}
+{%- endmacro %}
+
+{# Free text that may mention CVEs — an IDS signature name, an advisory title.
+   The text is printed by Jinja (escaped), and only the identifiers become
+   links, so markup inside a signature name can never become live HTML. #}
+{% macro cve_refs(text, rpm=false) -%}
+  {%- set found = cves_in(text) -%}
+  {%- if found %}
+    <span class="reflinks">
+    {%- for cve in found %}
+      <a href="{{ cve_links(cve, rpm=rpm)[0][1] }}" target="_blank"
+         rel="noopener noreferrer">{{ cve }}</a>
+    {%- endfor %}
+    </span>
+  {%- endif -%}
+{%- endmacro %}

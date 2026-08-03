@@ -47,13 +47,22 @@ def format_plan(row: patches.PlanRow) -> str:
     risk = plan.get("risk", {})
     vulns = plan.get("vulnerabilities", [])
 
-    cves = ", ".join(str(v.get("cve")) for v in vulns[:4] if v.get("cve")) or "—"
+    # Linked, not printed. This message is where the decision to patch a
+    # production box gets made, and "look it up yourself" is a poor way to ask
+    # for that decision. Red Hat first: these are RPM findings, so the question
+    # is backport status, which NVD answers wrongly for backported packages.
+    from sentinel.intel.links import cve_html
+
+    cves = " · ".join(cve_html(v.get("cve"), rpm=True)
+                      for v in vulns[:4] if v.get("cve")) or "—"
     lines = [
         f"{RISK_EMOJI.get(row.risk_level, '⚪')} <b>Plan de patch #{row.id}</b> · "
         f"risc <b>{_esc(row.risk_level or '?')}</b>",
         f"<b>Țintă:</b> {_esc(target.get('asset_name', '?'))} "
         f"({_esc(target.get('stack', '?'))})",
-        f"<b>Vulnerabilități:</b> {_esc(cves)}",
+        # Not _esc'd: cve_html escapes its own input and returns markup. Passing
+        # it through the escaper again would print the anchor tags as text.
+        f"<b>Vulnerabilități:</b> {cves}",
         "",
         f"⏱️ Downtime estimat: <b>{row.estimated_downtime_s or 0}s</b>",
         f"💥 Impact: {_esc(risk.get('blast_radius', '?'))}",

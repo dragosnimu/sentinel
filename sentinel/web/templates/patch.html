@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_vuln.html" as vuln %}
 {% set active = 'patches' %}
 {% block title %}Plan #{{ p.id }} · Sentinel{% endblock %}
 
@@ -56,7 +57,7 @@
       <tbody>
         {% for v in p.plan.get('vulnerabilities', []) %}
         <tr>
-          <td class="mono">{{ v.get('cve', '—') }}</td>
+          <td class="mono nowrap">{{ vuln.cve_cell(v.get('cve'), rpm=true) }}</td>
           <td>{{ v.get('package', '') }}</td>
           <td class="muted small">{{ v.get('severity', '') }}</td>
         </tr>

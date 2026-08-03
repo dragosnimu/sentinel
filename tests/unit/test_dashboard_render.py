@@ -19,10 +19,13 @@ NOW = datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc)
 
 
 def _env() -> "jinja2.Environment":
-    return jinja2.Environment(
-        loader=jinja2.FileSystemLoader(str(TEMPLATES)),
-        autoescape=True,   # the real app autoescapes; attacker text lands here
-    )
+    # The app's own factory, not a hand-rolled environment. Templates call
+    # globals directly, so an environment configured differently here would
+    # either pass on markup that fails in production or fail on markup that
+    # works — and the divergence shows up as a render-time UndefinedError.
+    from sentinel.web.jinja import build_env
+
+    return build_env()
 
 
 def _context(**over):
@@ -144,13 +147,18 @@ def test_findings_page_renders():
     html = _env().get_template("findings.html").render(
         user=_context()["user"], active="findings",
         counts={"total": 2, "critical": 1, "high": 1, "kev": 1},
-        rows=[{"id": 1, "cve": "CVE-2026-1", "advisory_id": None, "title": "x",
+        rows=[{"id": 1, "cve": "CVE-2026-9538", "advisory_id": None, "title": "x",
                "severity": "critical", "cvss": 9.8, "epss": 0.7, "kev": True,
                "priority": 100, "package": "kernel", "installed_version": "1",
                "fixed_version": "2", "scanner": "dnf", "location": None,
                "status": "open", "last_seen": NOW, "asset_name": None,
                "sev_dot": "bad"}])
-    assert "CVE-2026-1" in html and "kernel" in html
+    assert "CVE-2026-9538" in html and "kernel" in html
+    # A dnf finding: Red Hat first (backport status is the real question here),
+    # NVD alongside, and the KEV catalogue because this row is flagged kev.
+    assert "access.redhat.com/security/cve/CVE-2026-9538" in html
+    assert "nvd.nist.gov" in html and "cisa.gov" in html
+    assert "noreferrer" in html
 
 
 def test_absurd_delta_is_worded_not_numeric():

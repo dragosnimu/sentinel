@@ -123,9 +123,10 @@ def test_bulk_close_can_spare_recent_incidents():
 
 # --- template ---------------------------------------------------------------
 def test_incident_pages_render_with_actions():
-    jinja2 = pytest.importorskip("jinja2")
-    tpl = Path(__file__).resolve().parents[2] / "sentinel" / "web" / "templates"
-    env = jinja2.Environment(loader=jinja2.FileSystemLoader(str(tpl)), autoescape=True)
+    pytest.importorskip("jinja2")
+    from sentinel.web.jinja import build_env
+
+    env = build_env()
     user = type("U", (), {"username": "operator", "role": "owner"})()
     row = type("R", (), {
         "id": 7, "severity": "high", "title": "Brute-force SSH", "summary": "x",
@@ -151,9 +152,10 @@ def test_incident_pages_render_with_actions():
 
 
 def test_viewer_sees_no_action_buttons():
-    jinja2 = pytest.importorskip("jinja2")
-    tpl = Path(__file__).resolve().parents[2] / "sentinel" / "web" / "templates"
-    env = jinja2.Environment(loader=jinja2.FileSystemLoader(str(tpl)), autoescape=True)
+    pytest.importorskip("jinja2")
+    from sentinel.web.jinja import build_env
+
+    env = build_env()
     user = type("U", (), {"username": "obs", "role": "viewer"})()
     html = env.get_template("incidents.html").render(
         user=user, active="incidents", rows=[], counts={"total": 0},

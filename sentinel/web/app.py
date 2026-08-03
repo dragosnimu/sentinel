@@ -300,7 +300,12 @@ def create_app(
 
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     templates.env.autoescape = True
-    templates.env.globals["version"] = __version__
+    # From the shared factory, so a template that renders here renders in the
+    # tests too. `_vuln.html` calls these globals directly; an environment
+    # without them raises UndefinedError at render time, not at import.
+    from sentinel.web.jinja import template_globals
+
+    templates.env.globals.update(template_globals())
     app.state.templates = templates
 
     from sentinel.web.routers import (

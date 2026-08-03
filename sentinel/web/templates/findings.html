@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_vuln.html" as vuln %}
 {% set active = 'findings' %}
 {% block title %}Vulnerabilități · Sentinel{% endblock %}
 
@@ -33,8 +34,10 @@
         <td class="num mono"><strong>{{ r.priority }}</strong></td>
         <td><span class="dot dot-{{ r.sev_dot }}"></span> {{ r.severity }}{% if r.kev %} <span class="tag" title="Exploatat activ (CISA KEV)">🔥</span>{% endif %}</td>
         <td class="mono nowrap">
-          {% if r.cve %}<a href="https://nvd.nist.gov/vuln/detail/{{ r.cve }}" rel="noopener noreferrer">{{ r.cve }}</a>{% else %}—{% endif %}
+          {{ vuln.cve_cell(r.cve, rpm=(r.scanner == 'dnf'), kev=r.kev) }}
         </td>
+        {# No cve_refs here: the CVE column already carries the links, and a
+           second copy on the same row is noise, not redundancy. #}
         <td>{{ r.title }}</td>
         <td class="mono">{{ r.package or '—' }}</td>
         <td class="mono nowrap">{{ r.fixed_version or '—' }}</td>

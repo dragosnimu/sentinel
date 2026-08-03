@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_vuln.html" as vuln %}
 {% set active = 'incidents' %}
 {% block title %}Incident #{{ inc.id }} · Sentinel{% endblock %}
 
@@ -7,6 +8,9 @@
 <h1><span class="dot dot-{{ inc.sev_dot }}"></span> {{ inc.title }}</h1>
 <p class="page-sub">
   Incident #{{ inc.id }} · stare: <strong>{{ status_ro.get(inc.status, inc.status) }}</strong>
+  {#- An IDS rule is named after what it detects, so the CVE is usually in the
+      title itself. Pulling it out saves retyping it into a search box. -#}
+  {{ vuln.cve_refs(inc.title) }}{{ vuln.cve_refs(inc.summary) if inc.summary }}
 </p>
 
 {% if request.query_params.get('msg') %}

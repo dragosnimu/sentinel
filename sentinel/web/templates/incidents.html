@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_vuln.html" as vuln %}
 {% set active = 'incidents' %}
 {% block title %}Incidente · Sentinel{% endblock %}
 
@@ -55,7 +56,7 @@
       <tr class="{{ 'row-bad' if r.severity in ('high','critical') and r.status in ('open','acknowledged') }}">
         <td class="mono">{{ r.id }}</td>
         <td class="nowrap"><span class="dot dot-{{ r.sev_dot }}"></span>{{ r.severity }}</td>
-        <td><a href="/incidents/{{ r.id }}">{{ r.title }}</a></td>
+        <td><a href="/incidents/{{ r.id }}">{{ r.title }}</a>{{ vuln.cve_refs(r.title) }}</td>
         <td class="mono small">{{ r.actor_key or '—' }}</td>
         <td class="num">{{ r.detection_count }}</td>
         <td class="nowrap small">
