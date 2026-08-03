@@ -1,0 +1,72 @@
+[Unit]
+# Consumes the ai_jobs queue: triage, correlation, prediction, reports, and
+# patch-plan generation.
+#
+# This is the only Sentinel unit permitted to reach the internet, and the only
+# one that spawns the headless claude CLI. It is deliberately off the hot path:
+# an incident exists, is visible and has been acted on before this process ever
+# sees it. If it dies, or the API is unreachable, detection and blocking are
+# unaffected — messages are simply tagged "(analiză AI indisponibilă)".
+Description=Sentinel AI analysis worker
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+PartOf=sentinel.target
+
+[Service]
+Type=exec
+User=sentinel
+Group=sentinel
+WorkingDirectory=/opt/sentinel/claude-workspace
+ExecStart=/opt/sentinel/bin/sentinel ai
+Restart=always
+RestartSec=10
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/opt/sentinel/lib
+# HOME and cwd both point at the workspace so the sentinel-soc skill is
+# discovered as a project skill AND as a personal one — belt and braces, because
+# a skill that silently fails to load produces plausible output with none of the
+# safety rules applied.
+Environment=HOME=/opt/sentinel/claude-workspace
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=false
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @obsolete
+
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+ReadWritePaths=/var/lib/sentinel /opt/sentinel/claude-workspace
+ReadOnlyPaths=/etc/sentinel
+
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# No IPAddressDeny: this process legitimately needs api.anthropic.com. The
+# containment for it is the CLI's --permission-mode plan and the read-only tool
+# allowlist, not the network.
+
+# The claude CLI is a Node process and is not frugal. This ceiling is set so a
+# runaway analysis cannot pressure the rest of the host into an OOM kill.
+MemoryMax=768M
+TasksMax=128
+OOMPolicy=stop
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-ai
+
+[Install]
+WantedBy=multi-user.target

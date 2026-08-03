@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% set active = 'events' %}
+{% block title %}Evenimente · Sentinel{% endblock %}
+{% block head_extra %}<meta http-equiv="refresh" content="15"><meta name="referrer" content="no-referrer">{% endblock %}
+
+{% block content %}
+<h1>Evenimente</h1>
+
+{% if summary.total == 0 %}
+<div class="notice notice-info">
+  <strong>Niciun eveniment în fereastra selectată.</strong>
+  <p>
+    Ingestia rulează continuu (<code>sentinel-ingest</code>) și citește sshd (prin
+    journald) și logurile de acces nginx. Dacă e gol, ori serviciul de ingestie nu
+    rulează, ori pur şi simplu nu s-a întâmplat nimic în ultimele {{ filter.window }} min.
+  </p>
+</div>
+{% endif %}
+
+{# No inline JS (onchange submit): the strict CSP has no `unsafe-inline`, so a
+   plain submit button drives the filter instead. #}
+<form method="get" action="/events" class="filterbar">
+  <label>Sursă
+    <select name="source">
+      <option value="">toate</option>
+      {% for s in sources %}
+      <option value="{{ s }}" {% if filter.source == s %}selected{% endif %}>{{ s }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>Fereastră
+    <select name="window">
+      {% for w in [15, 60, 360, 1440] %}
+      <option value="{{ w }}" {% if filter.window == w %}selected{% endif %}>{{ w }} min</option>
+      {% endfor %}
+    </select>
+  </label>
+  {% if filter.ip %}<input type="hidden" name="ip" value="{{ filter.ip }}">{% endif %}
+  <button type="submit" class="btn btn-quiet">Filtrează</button>
+  {% if filter.ip %}<a href="/events?window={{ filter.window }}" class="pill pill-off">ip: {{ filter.ip }} ×</a>{% endif %}
+  <span class="muted small">{{ summary.total }} evenimente · reîmprospătare 15s</span>
+</form>
+
+<div class="grid">
+  <section class="card">
+    <h2>Pe sursă</h2>
+    <dl class="kv">
+      {% for s in summary.by_source %}
+      <dt><a href="/events?source={{ s.source }}&amp;window={{ filter.window }}">{{ s.source }}</a></dt>
+      <dd class="mono">{{ s.n }}</dd>
+      {% else %}<dd class="muted">—</dd>{% endfor %}
+    </dl>
+  </section>
+  <section class="card">
+    <h2>Top surse (IP)</h2>
+    <dl class="kv">
+      {% for t in summary.top_ips %}
+      <dt><a href="/events?ip={{ t.ip }}&amp;window={{ filter.window }}" class="mono">{{ t.ip }}</a></dt>
+      <dd>
+        {{ t.n }}
+        {% if t.auth_fails %}<span class="pill pill-bad">{{ t.auth_fails }} auth_fail</span>{% endif %}
+      </dd>
+      {% else %}<dd class="muted">—</dd>{% endfor %}
+    </dl>
+  </section>
+</div>
+
+<div class="table-scroll">
+  <table class="events">
+    <thead>
+      <tr><th>Când (UTC)</th><th>Sursă</th><th>Acțiune</th><th>Sursă IP</th><th>Detaliu</th><th class="num">Stare</th></tr>
+    </thead>
+    <tbody>
+    {% for r in rows %}
+      <tr class="{{ 'row-bad' if r.action_class == 'bad' }}">
+        <td class="mono nowrap">{{ r.ts.strftime('%m-%d %H:%M:%S') }}</td>
+        <td class="muted">{{ r.source }}</td>
+        <td><span class="pill pill-{{ r.action_class or 'off' }}">{{ r.action }}</span></td>
+        <td class="mono">
+          {% if r.src_ip %}<a href="/events?ip={{ r.src_ip }}&amp;window={{ filter.window }}">{{ r.src_ip }}</a>{% else %}—{% endif %}
+          {% if r.geo_country %}<span class="tag">{{ r.geo_country }}</span>{% endif %}
+          {% if r.geo_as_org %}<div class="muted small truncate" title="AS{{ r.geo_asn }} {{ r.geo_as_org }}">AS{{ r.geo_asn }}</div>{% endif %}
+        </td>
+        <td class="detail">
+          {# All values below are attacker-controlled and auto-escaped by Jinja. #}
+          {% if r.source == 'nginx' %}
+            <span class="mono">{{ r.http_method }} <span class="path">{{ r.http_path }}</span></span>
+            {% if r.http_host %}<span class="muted small">@{{ r.http_host }}</span>{% endif %}
+            {% if r.http_ua %}<div class="muted small truncate" title="{{ r.http_ua }}">{{ r.http_ua }}</div>{% endif %}
+          {% elif r.source == 'sshd' %}
+            user <span class="mono">{{ r.username or '—' }}</span>
+          {% else %}
+            {{ r.process or '' }} {{ r.http_path or '' }}
+          {% endif %}
+        </td>
+        <td class="num mono">
+          {% if r.http_status %}<span class="uptime-{{ 'bad' if r.http_status >= 400 else 'ok' }}">{{ r.http_status }}</span>{% else %}—{% endif %}
+        </td>
+      </tr>
+    {% else %}
+      <tr><td colspan="6" class="muted">Niciun eveniment.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{% endblock %}

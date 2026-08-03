@@ -1,0 +1,74 @@
+[Unit]
+# Rule engine, baselines, actor state, incident builder, auto-block decision.
+#
+# Kept in its own process so that a memory spike in the scanner or a crash in
+# the AI worker cannot stop detection. If this unit enters a restart loop, the
+# watchdog flushes the blocklist — a detector that cannot run must not leave
+# stale drops in the kernel.
+Description=Sentinel detection engine
+After=network.target postgresql.service sentinel-executor.service
+Requires=postgresql.service
+Wants=sentinel-executor.service
+PartOf=sentinel.target
+
+[Service]
+Type=exec
+User=sentinel
+Group=sentinel
+WorkingDirectory=/opt/sentinel
+ExecStart=/opt/sentinel/bin/sentinel detect
+Restart=always
+RestartSec=5
+# More than 5 restarts in 5 minutes and systemd gives up. The watchdog notices
+# the unit is failed and flushes; better a stopped detector than a flapping one
+# making blocking decisions from half-initialised state.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/opt/sentinel/lib
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectProc=invisible
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug @obsolete
+
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+ReadWritePaths=/var/lib/sentinel /run/sentinel
+ReadOnlyPaths=/etc/sentinel
+
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Local database and the executor socket. Reputation lookups use the local
+# in-memory intel store, refreshed by the maintenance job — this process has no
+# reason to reach the network.
+IPAddressAllow=localhost
+IPAddressDeny=any
+
+MemoryMax=512M
+TasksMax=128
+OOMPolicy=stop
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-detect
+
+[Install]
+WantedBy=multi-user.target

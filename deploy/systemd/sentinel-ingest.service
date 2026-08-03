@@ -1,0 +1,67 @@
+[Unit]
+# All collectors: journald, nginx/apache access logs, auditd, Suricata eve.json,
+# and Docker events.
+#
+# Needs to READ logs owned by other services, which is why it has
+# CAP_DAC_READ_SEARCH and group membership in adm and systemd-journal. It writes
+# nothing outside its own state directory.
+Description=Sentinel event ingestion
+After=network.target postgresql.service
+Requires=postgresql.service
+PartOf=sentinel.target
+
+[Service]
+Type=exec
+User=sentinel
+Group=sentinel
+SupplementaryGroups=systemd-journal adm
+WorkingDirectory=/opt/sentinel
+ExecStart=/opt/sentinel/bin/sentinel ingest
+Restart=always
+RestartSec=5
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/opt/sentinel/lib
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug @obsolete
+
+# Read arbitrary log files without owning them. This is the minimum that lets a
+# collector tail /var/log/audit/audit.log; the alternative is running as root.
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+
+ReadWritePaths=/var/lib/sentinel
+ReadOnlyPaths=/etc/sentinel /var/log /run/log
+
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Loopback covers PostgreSQL. Collectors read files and journald, not the network.
+IPAddressAllow=localhost
+IPAddressDeny=any
+
+MemoryMax=512M
+TasksMax=128
+OOMPolicy=stop
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-ingest
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,90 @@
+# auditd rules Sentinel's host-integrity detection depends on.
+#
+# Installed to /etc/audit/rules.d/sentinel.rules and loaded with augenrules.
+# The `sentinel-ingest` collector tails /var/log/audit/audit.log and turns these
+# into events; without them, the host.* rules in the detection catalog have
+# nothing to fire on.
+#
+# Deliberately narrow. auditd can be made to log almost everything, and a rule
+# set that generates 50k events a day gets disabled by whoever is on call. Every
+# watch here corresponds to a specific detection rule.
+#
+# Keys map to detection rules:
+#   sentinel_identity  -> auth.new_user
+#   sentinel_ssh       -> auth.new_ssh_key
+#   sentinel_cron      -> host.cron_change
+#   sentinel_systemd   -> host.systemd_unit_added
+#   sentinel_webroot   -> host.webroot_write
+#   sentinel_exec      -> host.suspicious_exec
+#   sentinel_priv      -> auth.sudo_failures
+
+# --- Accounts and credentials ----------------------------------------------
+# Adding a user or a key is a classic persistence step, and it is rare enough
+# on a server like this that every occurrence is worth an alert.
+-w /etc/passwd  -p wa -k sentinel_identity
+-w /etc/shadow  -p wa -k sentinel_identity
+-w /etc/group   -p wa -k sentinel_identity
+-w /etc/gshadow -p wa -k sentinel_identity
+-w /etc/sudoers   -p wa -k sentinel_priv
+-w /etc/sudoers.d -p wa -k sentinel_priv
+
+# --- SSH --------------------------------------------------------------------
+# A write to authorized_keys is persistence. A change to sshd_config could be
+# anyone widening the way in.
+-w /etc/ssh/sshd_config -p wa -k sentinel_ssh
+-w /root/.ssh           -p wa -k sentinel_ssh
+-w /home                -p wa -k sentinel_ssh
+
+# --- Scheduled execution ----------------------------------------------------
+-w /etc/crontab    -p wa -k sentinel_cron
+-w /etc/cron.d     -p wa -k sentinel_cron
+-w /etc/cron.daily -p wa -k sentinel_cron
+-w /var/spool/cron -p wa -k sentinel_cron
+-w /etc/systemd/system -p wa -k sentinel_systemd
+-w /usr/lib/systemd/system -p wa -k sentinel_systemd
+
+# --- Webroots ---------------------------------------------------------------
+# A file appearing in a webroot outside a deploy window is the classic webshell
+# signature. Exclusions for CMS caches and logs are applied downstream, in
+# detection.yaml, rather than here — auditd has no useful glob support and
+# tuning at the kernel level would mean reloading rules to change a threshold.
+-w /var/www -p wa -k sentinel_webroot
+-w /srv     -p wa -k sentinel_webroot
+
+# --- Suspicious execution ---------------------------------------------------
+# Network tools executed by a non-root user. This is what a reverse shell or a
+# staged download looks like from the kernel's point of view.
+#
+# The auid>=1000 filter excludes system daemons; auid!=unset excludes processes
+# with no login session, which would otherwise include every service on the box.
+-a always,exit -F arch=b64 -S execve -F path=/usr/bin/nc     -F auid>=1000 -F auid!=unset -k sentinel_exec
+-a always,exit -F arch=b64 -S execve -F path=/usr/bin/ncat   -F auid>=1000 -F auid!=unset -k sentinel_exec
+-a always,exit -F arch=b64 -S execve -F path=/usr/bin/socat  -F auid>=1000 -F auid!=unset -k sentinel_exec
+-a always,exit -F arch=b64 -S execve -F path=/usr/bin/wget   -F auid>=1000 -F auid!=unset -k sentinel_exec
+-a always,exit -F arch=b64 -S execve -F path=/usr/bin/curl   -F auid>=1000 -F auid!=unset -k sentinel_exec
+
+# --- SUID changes -----------------------------------------------------------
+# A new SUID binary is a privilege-escalation foothold.
+-a always,exit -F arch=b64 -S chmod,fchmod,fchmodat -F auid>=1000 -F auid!=unset -F key=sentinel_exec
+
+# --- Module loading ---------------------------------------------------------
+# Kernel module insertion on a VPS that loads no custom modules is not routine.
+-a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k sentinel_exec
+
+# --- What is NOT watched, and why ------------------------------------------
+#
+# /var/lib/docker: container churn writes there constantly. Watching it would
+#   produce thousands of events an hour saying "Docker is running".
+#
+# /opt/sentinel and /var/lib/sentinel: Sentinel would alert on its own writes,
+#   which is both noise and a feedback loop.
+#
+# Every open()/read(): this is where audit rule sets go to die. The volume is
+#   enormous, the signal is negligible, and the result is that someone disables
+#   auditd entirely — leaving you with no host integrity monitoring at all.
+#
+# If another product on this host writes continuously to its own directory, add
+# a matching `never,exit` line for it rather than letting it drown the log.
+-a never,exit -F dir=/var/lib/docker
+-a never,exit -F dir=/opt/sentinel
+-a never,exit -F dir=/var/lib/sentinel

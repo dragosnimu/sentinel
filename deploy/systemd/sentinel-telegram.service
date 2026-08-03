@@ -1,0 +1,64 @@
+[Unit]
+# The bot. Long polling, not a webhook: no inbound port, no public endpoint to
+# spoof or flood, and it keeps working even when nginx or TLS is broken — which
+# matters, because Telegram is the emergency channel and the moment you need it
+# most is the moment the dashboard is unreachable.
+Description=Sentinel Telegram bot
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+PartOf=sentinel.target
+
+[Service]
+Type=exec
+User=sentinel
+Group=sentinel
+WorkingDirectory=/opt/sentinel
+ExecStart=/opt/sentinel/bin/sentinel telegram
+Restart=always
+RestartSec=10
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/opt/sentinel/lib
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectProc=invisible
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug @obsolete
+
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+ReadWritePaths=/var/lib/sentinel /run/sentinel
+ReadOnlyPaths=/etc/sentinel
+
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Needs api.telegram.org, so no blanket IPAddressDeny. Command authorisation is
+# enforced by the chat_id allowlist checked on every update type, roles, and
+# two-step confirmation on destructive actions — not by the network.
+
+MemoryMax=256M
+TasksMax=64
+OOMPolicy=stop
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-telegram
+
+[Install]
+WantedBy=multi-user.target

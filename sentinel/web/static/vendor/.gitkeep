@@ -1,0 +1,5 @@
+Vendored front-end libraries land here, downloaded and checksum-verified by
+scripts/vendor-assets.sh. Nothing here is committed.
+
+P1 needs none of them: the login page and the status dashboard are plain HTML
+and CSS with no JavaScript at all. Charts arrive in P2.

@@ -1,0 +1,169 @@
+{
+  "schema_version": 1,
+  "target": {
+    "asset_id": 3,
+    "asset_name": "nginx",
+    "stack": "rpm",
+    "systemd_unit": "nginx.service",
+    "protected": false,
+    "databases": []
+  },
+  "vulnerabilities": [
+    {
+      "finding_id": 402,
+      "cve": "CVE-2026-9999",
+      "cvss": 7.5,
+      "epss": 0.31,
+      "kev": false,
+      "package": "nginx",
+      "current": "1.20.1-14.el9",
+      "fixed_in": "1.20.1-16.el9_5"
+    }
+  ],
+  "risk": {
+    "level": "low",
+    "blast_radius": "single-service",
+    "estimated_downtime_s": 2,
+    "requires_reboot": false,
+    "reversible": true,
+    "confidence": 0.94,
+    "assumptions_ro": ["Configurația nginx nu depinde de module eliminate în versiunea nouă."]
+  },
+  "maintenance_window": { "required": false, "suggested": null },
+
+  "preflight": [
+    {
+      "id": "pf1",
+      "desc_ro": "Versiunea instalată corespunde finding-ului",
+      "check": { "kind": "pkg_version", "name": "nginx", "equals": "1.20.1-14.el9" },
+      "blocking": true
+    },
+    {
+      "id": "pf2",
+      "desc_ro": "Serviciul este sănătos înainte de patch",
+      "check": { "kind": "systemd", "unit": "nginx.service", "expect_state": "active" },
+      "blocking": true
+    },
+    {
+      "id": "pf3",
+      "desc_ro": "Spațiu liber suficient pentru backup",
+      "check": { "kind": "disk_free", "path": "/var/backups/sentinel", "min_bytes": 209715200 },
+      "blocking": true
+    },
+    {
+      "id": "pf4",
+      "desc_ro": "Niciun incident deschis pe acest asset",
+      "check": { "kind": "no_open_incident", "asset_id": 3 },
+      "blocking": true
+    }
+  ],
+
+  "backup": [
+    {
+      "id": "bk1",
+      "desc_ro": "Salvează starea RPM pentru downgrade",
+      "kind": "rpm_state",
+      "source": "nginx",
+      "estimated_size_mb": 1,
+      "restore_argv": ["dnf", "-y", "downgrade", "nginx-1.20.1-14.el9"]
+    },
+    {
+      "id": "bk2",
+      "desc_ro": "Arhivează configurația nginx",
+      "kind": "path",
+      "source": "/etc/nginx",
+      "estimated_size_mb": 2,
+      "restore_argv": ["tar", "--zstd", "-xf", "{artifact}", "-C", "/"]
+    }
+  ],
+
+  "apply": [
+    {
+      "id": "ap1",
+      "desc_ro": "Actualizează pachetul nginx",
+      "argv": ["dnf", "-y", "update", "nginx"],
+      "run_as": "root",
+      "timeout_s": 300,
+      "idempotent": true,
+      "expect_exit": [0],
+      "on_failure": "rollback"
+    },
+    {
+      "id": "ap2",
+      "desc_ro": "Verifică sintaxa configurației după actualizare",
+      "argv": ["nginx", "-t"],
+      "run_as": "root",
+      "timeout_s": 30,
+      "idempotent": true,
+      "expect_exit": [0],
+      "on_failure": "rollback"
+    },
+    {
+      "id": "ap3",
+      "desc_ro": "Reîncarcă nginx fără downtime",
+      "argv": ["systemctl", "reload", "nginx"],
+      "run_as": "root",
+      "timeout_s": 30,
+      "idempotent": true,
+      "expect_exit": [0],
+      "on_failure": "rollback"
+    }
+  ],
+
+  "health_check": [
+    {
+      "id": "hc1",
+      "desc_ro": "nginx este activ",
+      "check": { "kind": "systemd", "unit": "nginx.service", "expect_state": "active" },
+      "blocking": true
+    },
+    {
+      "id": "hc2",
+      "desc_ro": "Aplicația răspunde",
+      "check": {
+        "kind": "http",
+        "url": "https://127.0.0.1/healthz",
+        "expect_status": 200,
+        "timeout_s": 10,
+        "retries": 5,
+        "retry_delay_s": 3
+      },
+      "blocking": true
+    }
+  ],
+
+  "rollback": [
+    {
+      "id": "rb1",
+      "desc_ro": "Revino la versiunea anterioară a pachetului",
+      "argv": ["dnf", "-y", "downgrade", "nginx-1.20.1-14.el9"],
+      "run_as": "root",
+      "timeout_s": 300,
+      "idempotent": true,
+      "expect_exit": [0],
+      "on_failure": "abort"
+    },
+    {
+      "id": "rb2",
+      "desc_ro": "Repornește nginx",
+      "argv": ["systemctl", "restart", "nginx"],
+      "run_as": "root",
+      "timeout_s": 60,
+      "idempotent": true,
+      "expect_exit": [0],
+      "on_failure": "abort"
+    }
+  ],
+
+  "post_verification": [
+    {
+      "id": "pv1",
+      "desc_ro": "Versiunea instalată este cea corectată",
+      "check": { "kind": "pkg_version", "name": "nginx", "at_least": "1.20.1-16.el9_5" },
+      "blocking": true
+    }
+  ],
+
+  "restore_instructions_ro": "Dacă totul eșuează: dnf -y downgrade nginx-1.20.1-14.el9 && tar --zstd -xf /var/backups/sentinel/<id>/etc-nginx.tar.zst -C / && systemctl restart nginx",
+  "notes_ro": "Reload, nu restart — conexiunile existente nu sunt întrerupte. Downtime real așteptat: sub 1 secundă."
+}

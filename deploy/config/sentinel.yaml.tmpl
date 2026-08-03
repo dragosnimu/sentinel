@@ -1,0 +1,305 @@
+# Sentinel main configuration.
+#
+# Rendered by install.sh. An existing file is NEVER overwritten — the installer
+# writes sentinel.yaml.new alongside it and prints a diff.
+#
+# Secrets do not belong here. They live in secrets.env (0640 root:sentinel).
+# Safety boundaries — the never-block networks, the patch binary allowlist, the
+# protected paths — are in code (sentinel/constants.py, executor/policy.py) and
+# are deliberately not configurable.
+
+timezone: Europe/Bucharest
+hostname: "@@HOSTNAME@@"
+log_level: INFO
+
+database:
+  host: 127.0.0.1
+  port: 5432
+  name: sentinel
+  user: sentinel
+  pool_min: 2
+  pool_max: 10
+  statement_timeout_ms: 30000
+
+retention:
+  # 30 days of raw events at this volume is roughly 1-8 GB. The rollups keep
+  # the useful aggregate far longer at a fraction of the size.
+  raw_events_days: 30
+  rollup_1m_days: 90
+  rollup_1h_days: 400
+  health_samples_days: 30
+  # Below this, the maintenance job drops the oldest partitions early and
+  # alerts, rather than letting the filesystem fill and take PostgreSQL — and
+  # everything else on the host — down with it.
+  disk_guard_free_pct: 15
+
+ingest:
+  # journald: sshd/sshd-session (autentificare) + sudo/su (escaladare privilegii).
+  journald: true
+  nginx: true
+  apache: false
+  # auditd: doar tipurile de înregistrări relevante pentru securitate
+  # (autentificări, USER_CMD, modificări de conturi, AVC, crash-uri). Restul e
+  # filtrat în colector — auditd poate produce zeci de mii de linii pe zi.
+  auditd: true
+  suricata: @@SURICATA_ENABLED@@
+  # NEIMPLEMENTATE încă: nu există colector pentru ele. Lăsate false ca să nu
+  # pretindă o acoperire pe care Sentinel nu o are.
+  docker: false
+  fim: false
+
+  nginx_log_paths:
+    - /var/log/nginx/*access*.log
+
+  auditd_log_path: /var/log/audit/audit.log
+
+  # Sources that produce high volume with no security value on this host.
+  # Dropped before they reach the database. Add one here if you find a chatty
+  # source filling partitions without ever producing a detection.
+  exclude_sources: []
+
+  batch_size: 500
+  flush_interval_ms: 1000
+
+detection:
+  enabled: true
+  rules_dir: /etc/sentinel/rules.d
+  # Anomaly rules record but do not alert until a baseline has this much
+  # history. Shortening it is how you get several hundred false positives in
+  # week one.
+  baseline_warmup_days: 14
+  suppress_sources: []
+
+response:
+  auto_block:
+    # ── SHIPS DISABLED. READ BEFORE CHANGING. ───────────────────────────────
+    # The first 72 hours are observe-only: you get a Telegram message saying
+    # what WOULD have been blocked, with a button to do it. Use that time to
+    # find the false positives — uptime monitors, Let's Encrypt validation,
+    # search crawlers, CDN edges, your own mobile address, NAT'd office ranges.
+    #
+    # Turn it on only after a quiet 72 hours:
+    #   sed -i 's/enabled: false/enabled: true/' /etc/sentinel/sentinel.yaml
+    #   systemctl restart sentinel-detect
+    enabled: false
+
+    observe_mode_notify: true
+
+    # Deterministic severity at or above which an armed auto-block may fire.
+    # Below it you still get the alert (with a manual block button), but nothing
+    # is placed automatically. High keeps enumeration noise from arming.
+    min_severity: high
+
+    # Hard caps. A runaway detector must not be able to black-hole the internet
+    # one /32 at a time. Exceeding either alerts and refuses further blocks.
+    max_per_minute: 60
+    max_elements: 20000
+
+    # One bad actor behind a NAT would otherwise take out a whole building.
+    allow_cidr_blocks: false
+
+    default_ttl_s: 86400
+
+    # Internet-background-noise research scanners (Shodan, Censys, Rapid7) are
+    # not attacking you specifically and blocking them achieves nothing.
+    skip_known_scanners: true
+
+  executor_socket: /run/sentinel/executor.sock
+  executor_timeout_s: 30
+
+  # Operator additions to the hard-coded never-block list.
+  #
+  # This is where deployment-specific addresses go: your uptime monitor, your
+  # CI runner, your office range, and any high-volume source you must not cut
+  # off. The hard-coded list in executor/policy.py covers only the universal
+  # cases (loopback, RFC1918, your SSH peer) — everything site-specific belongs
+  # here, where you can see it and change it.
+  #
+  # Entries are loaded into the nftables allowlist at install and refreshed
+  # hourly, AND they are what the root executor refuses to block. Your admin
+  # address is seeded here at install so the executor will never firewall you off
+  # — the nftables allowlist alone is not enough, because that only wins the
+  # accept/drop race; the executor still needs to know not to add the rule.
+  # Format: CIDR strings, e.g. "203.0.113.0/24".
+  extra_allowlist: [@@EXTRA_ALLOWLIST@@]
+
+telegram:
+  enabled: true
+  # An empty allowlist would accept commands from anyone who finds the bot.
+  # Sentinel refuses to start with telegram.enabled and no chat ids.
+  allowed_chat_ids:
+    - @@TELEGRAM_CHAT_ID@@
+  owner_chat_id: @@TELEGRAM_CHAT_ID@@
+  operator_chat_ids: []
+  viewer_chat_ids: []
+
+  # Critical alerts always pass, whatever this says.
+  quiet_hours: null
+  min_severity: medium
+  digest_threshold: 10
+  rate_limit_per_minute: 30
+  callback_ttl_s: 600
+
+  # Defence in depth if a phone is lost or stolen: a static PIN, set in
+  # secrets.env as TELEGRAM_APPLY_PIN, required for patch apply and for
+  # allowlist changes.
+  require_pin_for_apply: false
+
+web:
+  # The app itself: loopback only. nginx terminates TLS and applies the rate
+  # limits and security headers; binding publicly would bypass all three.
+  bind: 127.0.0.1
+  port: 8787
+
+  # How the dashboard is exposed. Set by --nginx-mode at install time.
+  #
+  #   dedicated  Sentinel's own nginx listener on public_port (8443). Touches
+  #              nothing that already exists. The URL carries the port, there is
+  #              no HTTP->HTTPS redirect, and certbot's HTTP-01 challenge is
+  #              unavailable because Sentinel does not own :80.
+  #
+  #   shared     Sentinel is one vhost among several on the nginx already serving
+  #              80 and 443, selected by server_name. Clean URL, working
+  #              redirect, and certificates work normally because Sentinel serves
+  #              its own ACME challenge. Requires nginx to be what owns those
+  #              ports, and writes into a config directory shared with your sites.
+  #
+  # Changing this is not a config-file edit: re-run the installer with the other
+  # --nginx-mode, so the vhost files are replaced and nginx -t is re-validated.
+  nginx_mode: @@NGINX_MODE@@
+
+  # The port that appears in the dashboard URL.
+  #
+  # In dedicated mode nginx binds this, and it must be open in the provider's
+  # firewall too — nftables on this host is a deny-lister and does not block it,
+  # but a cloud security group will.
+  #
+  # In shared mode nothing new is bound (the existing nginx already listens on
+  # 443) and this is only used to build links.
+  public_port: @@PUBLIC_PORT@@
+
+  domain: "@@DOMAIN@@"
+  session_ttl_s: 43200
+  require_totp: true
+  max_failed_logins: 5
+  lockout_minutes: 15
+
+  # Empty means any source reaching nginx may attempt a login. Filling this in
+  # with your own ranges is the cheapest hardening available for a public
+  # security dashboard, and costs nothing — Telegram stays the "from anywhere"
+  # channel and does not depend on the dashboard at all.
+  ip_allowlist: []
+
+ai:
+  enabled: true
+  model_fast: claude-haiku-4-5-20251001
+  model_main: claude-sonnet-5
+  # Patch plans get the strongest model. It is the highest-consequence output
+  # in the system and the least frequent, so the cost is irrelevant.
+  model_patch: claude-opus-5
+  max_tokens: 4096
+  timeout_s: 120
+
+  # Hard stop, not a warning. Start conservative and raise it once you have
+  # seen a week of real spend. An event storm without a cap is expensive.
+  daily_budget_usd: 5.0
+  monthly_budget_usd: 100.0
+
+  # Below this severity the deterministic verdict stands and no model is called.
+  triage_min_severity: high
+  correlate_interval_minutes: 15
+  daily_report_at: "08:00"
+  ask_rate_limit_per_hour: 10
+
+  cli_binary: claude
+  cli_workspace: /opt/sentinel/claude-workspace
+  cli_max_turns: 25
+
+scan:
+  enabled: true
+  window: "03:00-05:00"
+  os_packages: true
+  containers: true
+  filesystem: true
+  source_sca: true
+  secrets: true
+
+  # semgrep is slow and noisy. Enabling it across every repository buries the
+  # findings that matter. Opt in per repository, by path.
+  sast_repos: []
+
+  # Active scanning of your own live application. Requires the asset to have
+  # confirmed_by_operator: true in inventory.yaml — discovery alone does not
+  # authorise attacking something.
+  web_dast: false
+  nuclei_rate_limit: 20
+  nuclei_severities: [medium, high, critical]
+
+  lynis_weekly: true
+  discovery_paths: [/var/www, /opt, /srv, /home]
+  # One at a time. Two concurrent scanners is how a memory spike becomes an
+  # OOM kill of whatever else is running on the host.
+  max_concurrent: 1
+
+patch:
+  # Generation is automatic. Application never is: it needs two explicit
+  # Telegram confirmations, and the approval token is bound to the plan hash.
+  auto_generate_for_kev: true
+
+  # Paths no automated patch may touch, on top of the hard-coded floor
+  # (/opt/sentinel, /etc/sentinel, /root/.ssh, /etc/ssh, /etc/shadow, /boot...).
+  #
+  # Put anything here you would rather patch by hand: another product's install
+  # directory, a database you cannot afford to have restarted, a mount managed
+  # by someone else. The validator rejects any plan that references them.
+  extra_protected_paths: []
+
+  backup_dir: /var/backups/sentinel
+  retention_count: 10
+  retention_days: 30
+  require_free_space_multiplier: 3
+  dry_run_default: true
+  health_check_grace_s: 30
+  # An untested backup is not a backup. This schedules the reminder.
+  restore_drill_days: 90
+
+health:
+  interval_s: 30
+  http_timeout_s: 10
+  down_after_failures: 3
+  degraded_latency_multiplier: 3.0
+  disk_warn_pct: 85
+  # On a small VPS, memory pressure is the most likely cause of an unexplained
+  # outage: the OOM killer picks the largest process, which is usually the
+  # application you were trying to protect rather than Sentinel.
+  mem_warn_mb: 1024
+  mem_critical_mb: 500
+
+intel:
+  enabled: true
+  refresh_hours: 6
+  feeds_dir: /etc/sentinel/feeds.d
+  geoip_db: /var/lib/sentinel/geoip/dbip-asn-lite.mmdb
+  epss: true
+  kev: true
+
+suricata:
+  enabled: @@SURICATA_ENABLED@@
+  eve_path: /var/log/suricata/eve.json
+  interface: @@IFACE@@
+
+  # Traffic Suricata should not inspect at all, in BPF syntax.
+  #
+  # Empty is a valid and common answer. It matters when this host carries a
+  # high-volume flow with no security value — bulk telemetry, a syslog feed,
+  # backup replication. Inspecting one of those can fill the disk within hours
+  # and produces nothing worth reading.
+  #
+  # Preflight samples the interface and tells you whether you need this. If it
+  # reported a dominant flow, exclude it here, e.g.:
+  #   bpf_filter: "not (host 203.0.113.10 and udp port 514)"
+  bpf_filter: "@@BPF_FILTER@@"
+
+  # Suricata's own memory ceiling. On a small VPS this is the difference
+  # between a NIDS and an OOM kill.
+  memcap_mb: 128

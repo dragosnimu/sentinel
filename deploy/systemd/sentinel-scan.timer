@@ -1,0 +1,15 @@
+[Unit]
+Description=Nightly Sentinel vulnerability scan
+
+[Timer]
+# Inside the configured maintenance window. The randomised delay keeps the scan
+# from starting at exactly the same instant as certbot renewals, log rotation
+# and every other 03:00 cron on the box.
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=1800
+AccuracySec=60
+Persistent=true
+Unit=sentinel-scan.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,115 @@
+# Sentinel asset inventory.
+#
+# Discovery proposes; you confirm. Nothing here is overwritten by a discovery
+# run — new findings land in the `discovered:` section below with a drift flag,
+# and you promote them by hand.
+#
+# Two fields carry real weight:
+#
+#   protected: true
+#     No automated patch plan may ever be generated for this asset. Set on
+#     anything you are not willing to have an automated procedure touch.
+#
+#   confirmed_by_operator: true
+#     Required before Sentinel will actively scan (DAST) an asset. Discovery
+#     finding a service is not authorisation to attack it — that is your
+#     decision, and it should be, because scanning something you do not own is
+#     a legal problem rather than a technical one.
+
+assets:
+
+  # ── Sentinel itself ────────────────────────────────────────────────────────
+  # Sentinel does not patch Sentinel. Upgrades go through deploy/upgrade.sh.
+  - name: sentinel.web
+    kind: web
+    bind_addr: 127.0.0.1
+    port: 8787
+    is_internet_exposed: true      # reachable through nginx
+    criticality: 3
+    protected: true
+    confirmed_by_operator: false
+    systemd_unit: sentinel-web.service
+    tags: [sentinel, infrastructure]
+
+  # ── Host services ──────────────────────────────────────────────────────────
+  - name: sshd
+    kind: service
+    port: 22
+    is_internet_exposed: true
+    criticality: 5
+    protected: true                # sshd_config is on the forbidden-paths list
+    confirmed_by_operator: false
+    systemd_unit: sshd.service
+    tags: [host]
+    notes: "Criticitate 5: pierderea SSH înseamnă pierderea accesului la server."
+
+  - name: postgresql
+    kind: database
+    bind_addr: 127.0.0.1
+    port: 5432
+    is_internet_exposed: false
+    criticality: 4
+    protected: false
+    confirmed_by_operator: true
+    systemd_unit: postgresql.service
+    tags: [host, sentinel]
+
+  # ── Your applications ──────────────────────────────────────────────────────
+  # Fill these in. The linkage below is what lets the patch planner write a
+  # correct backup step: without `databases`, a plan will back up files and
+  # silently miss the schema and data a plugin update also changed.
+  #
+  # - name: blog.example.com
+  #   kind: web
+  #   port: 443
+  #   is_internet_exposed: true
+  #   criticality: 3
+  #   protected: false
+  #   confirmed_by_operator: true          # authorises DAST against it
+  #   stack: php-wordpress
+  #   systemd_unit: php-fpm.service
+  #   vhost_file: /etc/nginx/conf.d/blog.conf
+  #   webroot: /var/www/blog
+  #   repo_path: /var/www/blog
+  #   repo_branch: main
+  #   databases:
+  #     - engine: mariadb
+  #       name: blog
+  #       host: 127.0.0.1
+  #       port: 3306
+  #   tags: [app, wordpress]
+  #   notes: "wp-content/uploads este 12 GB — exclus din backup-urile de patch."
+
+  # ── Alte produse care rulează pe acest server ──────────────────────────────
+  # Dacă serverul găzduiește software pe care nu vrei ca Sentinel să-l atingă
+  # automat — un stack livrat de altcineva, o bază de date critică, orice ai
+  # prefera să actualizezi manual — declară-l aici cu `protected: true`.
+  # Disponibilitatea îi este în continuare monitorizată, deci afli dacă pică;
+  # doar că nu se va genera niciodată un plan de patch automat pentru el.
+  #
+  # Adaugă și directoarele lui în `patch.extra_protected_paths` din
+  # sentinel.yaml: `protected` blochează planurile pentru asset, iar lista de
+  # căi blochează orice plan care i-ar atinge fișierele din alt motiv.
+  #
+  # - name: <produsul-lor>
+  #   kind: container
+  #   port: 8443
+  #   is_internet_exposed: true
+  #   criticality: 4
+  #   protected: true
+  #   confirmed_by_operator: false     # fără DAST pe software care nu e al tău
+  #   tags: [third-party]
+  #   notes: "Nu se atinge automat. Actualizările se fac manual de furnizor."
+
+# Never-block additions beyond the hard-coded list in executor/policy.py.
+# Your uptime monitor and CI runner belong here: they generate exactly the
+# traffic pattern that trips auth and enumeration rules.
+allowlist:
+  # - cidr: 203.0.113.0/24
+  #   reason: "birou"
+  # - cidr: 198.51.100.10/32
+  #   reason: "monitor uptime extern"
+
+# Written by discovery. Reviewed by you, then moved up into `assets:`.
+# Not read by the runtime — anything left here is unmonitored.
+discovered: []

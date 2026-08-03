@@ -1,0 +1,90 @@
+# ---- Secrets: never, ever commit these ----
+secrets/*
+!secrets/.gitkeep
+*.env.local
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!deploy/**/*.key.example
+telegram.conf
+credentiale*.txt
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib60/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ---- Virtual environments ----
+.venv/
+venv/
+ENV/
+env/
+
+# ---- Testing / coverage ----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.hypothesis/
+
+# ---- Runtime / local data ----
+*.log
+*.db
+*.sqlite3
+data/
+dumps/
+*.pcap
+*.mmdb
+geoip/
+.install-state/
+
+# ---- Deploy artifacts ----
+deploy/wheels/*.whl
+*.tar.gz
+*.tar.zst
+deploy-package-*/
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Claude Code local overrides ----
+.claude/settings.local.json
+
+# ---- Vendored front-end libraries ----
+# Downloaded with checksum verification by scripts/vendor-assets.sh.
+# A minified blob in git is unreviewable; a pinned checksum plus a download is
+# auditable. Never commit these.
+sentinel/web/static/vendor/*
+!sentinel/web/static/vendor/.gitkeep
+
+# Prezentarea generată local (binar, conține un instantaneu de producție)
+docs/Sentinel-prezentare.pdf

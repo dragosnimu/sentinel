@@ -1,0 +1,146 @@
+# Sentinel asset inventory — completat prin descoperire pe srv01, 2026-07-31.
+#
+# Discovery propune; tu confirmi. Nimic de aici nu e suprascris de o rulare de
+# discovery — modificările tale rămân.
+#
+# Două câmpuri contează cel mai mult:
+#   protected: true              — niciun plan de patch automat nu va viza asset-ul.
+#   confirmed_by_operator: true  — necesar înainte ca Sentinel să scaneze activ (DAST).
+#
+# Sondare (dedusă din 'kind' + câmpuri):
+#   web       -> cerere HTTP "/" pe loopback (orice răspuns <500 = activ)
+#   database  -> connect TCP
+#   service   -> systemctl is-active (dacă are systemd_unit), altfel TCP pe port
+#
+# Notă: bazele din containere care nu-și publică portul pe host (procure360_db,
+# snipeit-db) nu pot fi sondate direct de user-ul 'sentinel' fără acces docker —
+# disponibilitatea aplicației care le folosește acoperă implicit starea lor.
+
+assets:
+
+  # ── Sentinel & infrastructură gazdă (protejate — fără patch automat) ────────
+  - name: sentinel.web
+    kind: web
+    bind_addr: 127.0.0.1
+    port: 8787
+    is_internet_exposed: true
+    criticality: 3
+    protected: true
+    systemd_unit: sentinel-web.service
+    tags: [sentinel, infrastructura]
+
+  - name: sshd
+    kind: service
+    bind_addr: 127.0.0.1
+    port: 22
+    is_internet_exposed: true
+    criticality: 5
+    protected: true
+    systemd_unit: sshd.service
+    tags: [infrastructura, acces]
+    notes: sshd_config este pe lista de căi interzise pentru patch-uri.
+
+  - name: nginx
+    kind: service
+    is_internet_exposed: true
+    criticality: 5
+    protected: true
+    systemd_unit: nginx.service
+    tags: [infrastructura, reverse-proxy]
+    notes: Fronteaza toate site-urile. Config partajat cu vhost-ul Sentinel.
+
+  - name: docker
+    kind: service
+    criticality: 4
+    protected: true
+    systemd_unit: docker.service
+    tags: [infrastructura, containere]
+
+  - name: postgresql
+    kind: database
+    bind_addr: 127.0.0.1
+    port: 5432
+    is_internet_exposed: false
+    criticality: 4
+    protected: true
+    tags: [infrastructura, baza-de-date]
+    notes: Baza Sentinel (și a altor consumatori de pe host).
+
+  # ── Aplicații web ───────────────────────────────────────────────────────────
+  - name: procure360
+    kind: web
+    bind_addr: 127.0.0.1
+    port: 3000
+    is_internet_exposed: true          # procure360.exemplu.ro prin nginx
+    criticality: 4
+    tags: [aplicatie, productie]
+    notes: Vhost nginx procure360.exemplu.ro -> 127.0.0.1:3000.
+
+  - name: snipeit
+    kind: web
+    bind_addr: 127.0.0.1
+    port: 8000
+    is_internet_exposed: true          # 0.0.0.0:8000 public
+    criticality: 4
+    tags: [aplicatie, inventar-active]
+    notes: Container snipe/snipe-it. Expus direct pe portul 8000.
+
+  - name: n8n
+    kind: web
+    bind_addr: 127.0.0.1
+    port: 5678
+    is_internet_exposed: false         # doar loopback + traefik
+    criticality: 4
+    tags: [aplicatie, automatizare]
+
+  - name: bet-calculator
+    kind: web
+    bind_addr: 127.0.0.1
+    port: 3001
+    is_internet_exposed: true          # 0.0.0.0:3001 public
+    criticality: 3
+    tags: [aplicatie]
+
+  - name: qdrant
+    kind: web
+    bind_addr: 127.0.0.1
+    port: 6333
+    is_internet_exposed: true          # 0.0.0.0:6333 public
+    criticality: 3
+    tags: [aplicatie, baza-vectoriala]
+    notes: API HTTP pe 6333. Expus public — verifică dacă trebuie.
+
+  - name: webmin
+    kind: service
+    port: 10000
+    is_internet_exposed: true          # 0.0.0.0:10000 public, HTTPS
+    criticality: 4
+    systemd_unit: webmin.service
+    tags: [aplicatie, administrare]
+    notes: Panou de administrare, expus public pe 10000. Sondat prin systemd — Webmin restrictioneaza HTTP prin IP, o proba de pe loopback ar da fals-negativ.
+
+  # ── Servicii de rețea / infra apps ──────────────────────────────────────────
+  - name: n8n-traefik
+    kind: service
+    bind_addr: 127.0.0.1
+    port: 88
+    is_internet_exposed: true          # 0.0.0.0:88 și :444 public
+    criticality: 3
+    tags: [infrastructura, reverse-proxy]
+    notes: Traefik al stivei n8n. Publică 88 și 444.
+
+  - name: mariadb-host
+    kind: database
+    bind_addr: 127.0.0.1
+    port: 3306
+    is_internet_exposed: false
+    criticality: 3
+    tags: [baza-de-date]
+    notes: MariaDB pe host (probabil backend Zabbix). Legat pe loopback.
+
+  - name: zabbix-agent
+    kind: service
+    is_internet_exposed: true          # 0.0.0.0:10050
+    criticality: 2
+    systemd_unit: zabbix-agent.service
+    tags: [monitorizare]

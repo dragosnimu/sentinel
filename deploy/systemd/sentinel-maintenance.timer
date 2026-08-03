@@ -1,0 +1,16 @@
+[Unit]
+Description=Run Sentinel maintenance hourly
+
+[Timer]
+OnBootSec=180
+OnCalendar=hourly
+RandomizedDelaySec=300
+AccuracySec=60
+# Persistent here, unlike the health timer: if the host was down over a
+# retention boundary, the partition and rollup work genuinely does need to
+# catch up, or inserts start landing in the DEFAULT partition.
+Persistent=true
+Unit=sentinel-maintenance.service
+
+[Install]
+WantedBy=timers.target

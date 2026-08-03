@@ -1,0 +1,71 @@
+[Unit]
+# The only Sentinel component that runs as root.
+#
+# It is small (~400 lines), stdlib-only, and imports nothing from the sentinel
+# package — so a compromise of the main codebase cannot reach into it. It
+# validates every request against a hard-coded policy and writes the audit row
+# itself, so a compromised caller can neither forge nor omit an entry.
+#
+# If this file ever grows a "just one more capability", stop and reconsider.
+Description=Sentinel privileged action executor
+Documentation=file:/opt/sentinel/libexec/README.md
+After=network.target postgresql.service
+PartOf=sentinel.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=root
+Group=root
+ExecStart=/opt/sentinel/venv/bin/python /opt/sentinel/libexec/sentinel_executor.py
+Restart=always
+RestartSec=2
+
+RuntimeDirectory=sentinel
+RuntimeDirectoryMode=0750
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# Root, but not unlimited root. Only the capabilities nftables management and
+# backup/restore genuinely need.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID CAP_KILL
+AmbientCapabilities=CAP_NET_ADMIN
+
+NoNewPrivileges=false
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=false
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=false
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictSUIDSGID=false
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictNamespaces=~CLONE_NEWUSER
+
+# Every path it may write. Adding one here is a security decision, not a
+# convenience: this is the list of things root-level Sentinel can modify.
+ReadWritePaths=/var/backups/sentinel /var/lib/sentinel /run/sentinel /etc/sentinel
+
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+
+# The executor talks to nftables and to the local database. It has no reason to
+# reach the internet, and preventing it removes an entire exfiltration path from
+# the only root component.
+IPAddressAllow=localhost
+IPAddressDeny=any
+
+MemoryMax=192M
+TasksMax=64
+OOMPolicy=stop
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-executor
+
+[Install]
+WantedBy=multi-user.target

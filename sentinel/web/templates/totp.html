@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Cod de verificare · Sentinel{% endblock %}
+{% block body_class %}auth{% endblock %}
+{% block main_class %}auth-shell{% endblock %}
+{% block chrome %}{% endblock %}
+
+{% block content %}
+<div class="auth-card">
+  <div class="auth-head">
+    <span class="brand-mark brand-mark-lg" aria-hidden="true"></span>
+    <h1>Al doilea factor</h1>
+    {% if username %}<p class="muted">{{ username }}</p>{% endif %}
+  </div>
+
+  {% if error %}
+  <p class="alert alert-error" role="alert">{{ error }}</p>
+  {% endif %}
+
+  <form method="post" action="/totp" autocomplete="off">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+    <label for="code">Codul din aplicația de autentificare</label>
+    {#
+      inputmode=numeric brings up the number pad on a phone; one-time-code lets
+      iOS and Android offer the code from the notification. autocomplete="off" on
+      the form but "one-time-code" here — a password manager must not save this.
+    #}
+    <input id="code" name="code" type="text"
+           inputmode="numeric" pattern="[0-9]*"
+           autocomplete="one-time-code"
+           maxlength="6" minlength="6"
+           class="code-input" required autofocus
+           aria-describedby="code-hint">
+
+    <p id="code-hint" class="muted small">
+      6 cifre. Codul e valabil 30 de secunde și nu poate fi refolosit.
+    </p>
+
+    <button type="submit" class="btn btn-primary btn-block">Verifică</button>
+  </form>
+
+  <form method="post" action="/logout" class="auth-alt">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit" class="btn btn-quiet btn-block">Anulează</button>
+  </form>
+</div>
+{% endblock %}

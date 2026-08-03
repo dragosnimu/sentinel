@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% set active = 'blocklist' %}
+{% block title %}Blocklist · Sentinel{% endblock %}
+
+{% block content %}
+<h1>Blocklist</h1>
+
+{% if msg %}<div class="notice notice-info"><p>{{ msg }}</p></div>{% endif %}
+
+<div class="statline">
+  <span class="pill pill-bad">{{ blocks | length }} active (DB)</span>
+  <span class="pill pill-off">nftables: {{ live_count if live_count >= 0 else '?' }} elemente</span>
+  <span class="muted small">
+    Blocarea se face din Telegram (<code>/block</code>) sau automat. Aici doar
+    vezi și deblochezi — un dashboard compromis nu trebuie să poată bloca pe nimeni.
+  </span>
+</div>
+
+<div class="table-scroll">
+  <table>
+    <thead>
+      <tr><th>IP</th><th>Motiv</th><th>De către</th><th>Expiră</th>{% if can_unblock %}<th></th>{% endif %}</tr>
+    </thead>
+    <tbody>
+    {% for b in blocks %}
+      <tr>
+        <td class="mono">{{ b.ip }}</td>
+        <td class="muted truncate" title="{{ b.reason }}">{{ b.reason }}</td>
+        <td class="muted">{{ b.created_by }}</td>
+        <td class="mono nowrap">{{ b.expires_at.strftime('%m-%d %H:%M') if b.expires_at else 'permanent' }}</td>
+        {% if can_unblock %}
+        <td>
+          <form method="post" action="/blocklist/unblock" class="inline">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="ip" value="{{ b.ip }}">
+            <button type="submit" class="btn btn-quiet">Deblochează</button>
+          </form>
+        </td>
+        {% endif %}
+      </tr>
+    {% else %}
+      <tr><td colspan="{{ 5 if can_unblock else 4 }}" class="muted">Niciun IP blocat.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<h2>Istoric recent</h2>
+<div class="table-scroll">
+  <table>
+    <thead><tr><th>IP</th><th>Blocat</th><th>De către</th><th>Stare</th></tr></thead>
+    <tbody>
+    {% for b in history %}
+      <tr class="{{ '' if b.active else 'muted' }}">
+        <td class="mono">{{ b.ip }}</td>
+        <td class="mono nowrap">{{ b.blocked_at.strftime('%m-%d %H:%M') }}</td>
+        <td class="muted">{{ b.created_by }}</td>
+        <td>{{ 'activ' if b.active else 'deblocat' }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<p class="muted small">
+  Blocurile nu se persistă peste reboot (ieșire de urgență), iar TTL-ul expiră în
+  kernel. <code>/etc/sentinel/PANIC</code> golește tot în ≤60s.
+</p>
+{% endblock %}

@@ -1,0 +1,181 @@
+{% extends "base.html" %}
+{% set active = 'patches' %}
+{% block title %}Plan #{{ p.id }} · Sentinel{% endblock %}
+
+{% block content %}
+<p class="muted small"><a href="/patches">← Planuri</a></p>
+<h1>Plan de patch #{{ p.id }}</h1>
+<p class="page-sub">
+  <span class="pill pill-{{ p.pill }}">{{ p.status_ro }}</span>
+  · țintă <strong>{{ p.plan.get('target', {}).get('asset_name', '?') }}</strong>
+  · hash <code class="small">{{ p.plan_hash[:16] }}…</code>
+</p>
+
+{% if request.query_params.get('msg') %}
+<div class="notice notice-info"><strong>{{ request.query_params.get('msg') }}</strong></div>
+{% endif %}
+
+{% if p.status == 'rejected_invalid' %}
+<div class="notice notice-critical">
+  <strong>Planul a fost respins de validator.</strong>
+  <p>A fost păstrat ca dovadă — un plan invalid spune ceva despre model și despre
+     prompt, iar ștergerea lui ar ascunde un tipar care merită văzut. Nu poate fi
+     aprobat sau executat.</p>
+</div>
+{% if p.validation_errors %}
+<div class="card" style="margin-bottom:1.2rem">
+  <h2>Erori de validare</h2>
+  <ul class="list">
+    {% for e in p.validation_errors %}
+    <li><code>{{ e.path }}</code> — {{ e.message }}</li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+{% endif %}
+
+<div class="grid-2">
+  <div class="card">
+    <h2>Risc și impact</h2>
+    <dl class="kv">
+      <dt>Nivel de risc</dt><dd>{{ p.risk_level or '—' }}</dd>
+      <dt>Impact</dt><dd>{{ p.plan.get('risk', {}).get('blast_radius', '—') }}</dd>
+      <dt>Downtime estimat</dt><dd>{{ p.estimated_downtime_s or 0 }}s</dd>
+      <dt>Reversibil</dt>
+      <dd>{% if p.reversible %}da{% else %}<strong>NU</strong>{% endif %}</dd>
+      <dt>Necesită reboot</dt>
+      <dd>{% if p.requires_reboot %}<strong>DA</strong>{% else %}nu{% endif %}</dd>
+      <dt>Generat de</dt><dd>{{ p.plan.get('generated_by', 'ai') }}</dd>
+      {% if p.approved_by %}<dt>Aprobat de</dt><dd>{{ p.approved_by }}</dd>{% endif %}
+    </dl>
+  </div>
+
+  <div class="card">
+    <h2>Vulnerabilități acoperite</h2>
+    <table>
+      <tbody>
+        {% for v in p.plan.get('vulnerabilities', []) %}
+        <tr>
+          <td class="mono">{{ v.get('cve', '—') }}</td>
+          <td>{{ v.get('package', '') }}</td>
+          <td class="muted small">{{ v.get('severity', '') }}</td>
+        </tr>
+        {% else %}<tr><td class="muted">—</td></tr>{% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% macro steps_table(title, items, is_check) %}
+<div class="card" style="margin-top:1.1rem">
+  <h2>{{ title }} ({{ items | length }})</h2>
+  {% if not items %}<p class="muted">— niciunul —</p>{% else %}
+  <table>
+    <tbody>
+      {% for s in items %}
+      <tr>
+        <td class="mono small nowrap">{{ s.get('id', '?') }}</td>
+        <td>
+          {{ s.get('desc_ro', '') }}
+          <div class="mono small muted" style="margin-top:.2rem">
+            {%- if is_check -%}
+              kind={{ s.get('check', {}).get('kind', '?') }}
+              {%- if not s.get('blocking') %} · neblocantă{% endif -%}
+            {%- elif s.get('argv') -%}
+              {{ s.get('argv') | join(' ') }}
+            {%- elif s.get('kind') -%}
+              {{ s.get('kind') }}: {{ s.get('source', '') }}
+            {%- endif -%}
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endif %}
+</div>
+{% endmacro %}
+
+<h2>Ce face planul</h2>
+{{ steps_table('Preflight — verificări înainte', p.plan.get('preflight', []), true) }}
+{{ steps_table('Backup — punctul de restaurare', p.plan.get('backup', []), false) }}
+{{ steps_table('Aplicare', p.plan.get('apply', []), false) }}
+{{ steps_table('Verificare de sănătate', p.plan.get('health_check', []), true) }}
+{{ steps_table('Revenire (rollback)', p.plan.get('rollback', []), false) }}
+{{ steps_table('Verificare finală', p.plan.get('post_verification', []), true) }}
+
+<div class="card" style="margin-top:1.1rem">
+  <h2>Cum revii manual</h2>
+  <p>{{ p.plan.get('restore_instructions_ro', '—') }}</p>
+</div>
+
+{% if can_act and p.status in ('validated', 'approved') %}
+<h2>Acțiuni</h2>
+<div class="card">
+  <p class="muted small" style="margin-top:0">
+    Aplicarea se aprobă <strong>doar pe Telegram</strong>, în doi pași — aprobarea
+    e legată de chat și de hash-ul planului, iar a doua suprafață ar însemna încă
+    un loc unde se poate greși. Trimite <code>/patch {{ p.id }}</code> botului.
+  </p>
+  <div class="filterbar" style="margin-bottom:0">
+    <form method="post" action="/patches/{{ p.id }}/dry-run" class="inline">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit" class="btn btn-primary">🧪 Dry-run (nu schimbă nimic)</button>
+    </form>
+    <form method="post" action="/patches/{{ p.id }}/reject" class="inline">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit" class="btn">❌ Respinge planul</button>
+    </form>
+  </div>
+</div>
+{% endif %}
+
+{% if executions %}
+<h2>Execuții</h2>
+<div class="table-scroll">
+  <table>
+    <thead><tr><th>#</th><th>Mod</th><th>Stare</th><th>Durată</th><th>Când</th><th>Eroare</th></tr></thead>
+    <tbody>
+      {% for e in executions %}
+      <tr class="{{ 'row-bad' if e.status in ('failed', 'rollback_failed') }}">
+        <td class="mono">{{ e.id }}</td>
+        <td>{{ 'dry-run' if e.mode == 'dry_run' else 'aplicare' }}</td>
+        <td>{{ e.status }}</td>
+        <td class="num">{{ ((e.duration_ms or 0) / 1000) | round(1) }}s</td>
+        <td class="mono nowrap small">{{ e.started_at.strftime('%d.%m %H:%M') }}</td>
+        <td class="muted small">{{ (e.error or '')[:80] }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{% if steps %}
+<h2>Pașii ultimei execuții</h2>
+<div class="table-scroll">
+  <table>
+    <thead><tr><th class="num">#</th><th>Fază</th><th>Pas</th><th>Comandă</th>
+               <th>Stare</th><th class="num">Cod</th><th class="num">ms</th></tr></thead>
+    <tbody>
+      {% for s in steps %}
+      <tr class="{{ 'row-bad' if s.status == 'failed' }}">
+        <td class="num mono">{{ s.seq }}</td>
+        <td class="small">{{ s.phase }}</td>
+        <td class="mono small">{{ s.step_id }}</td>
+        <td class="mono small"><span class="truncate" title="{{ s.argv | join(' ') }}">{{ s.argv | join(' ') }}</span></td>
+        <td>{{ s.status }}</td>
+        <td class="num">{{ s.exit_code if s.exit_code is not none else '—' }}</td>
+        <td class="num">{{ s.duration_ms or 0 }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endif %}
+
+<h2>Planul complet (JSON)</h2>
+<div class="card">
+  <pre class="mono small" style="overflow-x:auto; margin:0">{{ plan_json }}</pre>
+</div>
+{% endblock %}

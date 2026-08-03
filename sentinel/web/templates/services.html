@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+{% set active = 'services' %}
+{% block title %}Servicii · Sentinel{% endblock %}
+
+{# Live enough for an availability view without a client-side framework: the page
+   re-renders every 30s, matching the prober's cadence. A partial-update layer can
+   replace this later. No inline script — the strict CSP stays intact. #}
+{% block head_extra %}<meta http-equiv="refresh" content="30">{% endblock %}
+
+{% block content %}
+<h1>Servicii</h1>
+
+{% if not probing %}
+<div class="notice notice-info">
+  <strong>Nicio probă încă.</strong>
+  <p>
+    Sondarea disponibilității rulează la fiecare 30 de secunde
+    (<code>sentinel-health.timer</code>). Dacă toate serviciile apar
+    „necunoscut”, ori serviciul de health nu rulează, ori inventarul
+    (<code>/etc/sentinel/inventory.yaml</code>) e gol.
+  </p>
+</div>
+{% endif %}
+
+<div class="statline">
+  <span class="pill pill-ok">{{ counts.up }} active</span>
+  {% if counts.degraded %}<span class="pill pill-warn">{{ counts.degraded }} degradate</span>{% endif %}
+  {% if counts.down %}<span class="pill pill-bad">{{ counts.down }} picate</span>{% endif %}
+  {% if counts.unknown %}<span class="pill pill-off">{{ counts.unknown }} necunoscute</span>{% endif %}
+  <span class="muted small">actualizat automat la 30s</span>
+</div>
+
+<div class="table-scroll">
+  <table class="services">
+    <thead>
+      <tr>
+        <th>Serviciu</th>
+        <th>Tip</th>
+        <th>Stare</th>
+        <th class="num">Latență</th>
+        <th class="num">Uptime 24h</th>
+        <th>Ultimele 24h</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for r in rows %}
+      <tr class="{{ 'row-bad' if r.status == 'down' }}">
+        <td>
+          <span class="svc-name">{{ r.asset.name }}</span>
+          {% if r.asset.is_internet_exposed %}<span class="tag tag-exposed" title="Expus la internet">public</span>{% endif %}
+          {% if r.asset.protected %}<span class="tag" title="Protejat — niciun patch automat">protejat</span>{% endif %}
+          {% if r.error and r.status != 'up' %}<div class="muted small truncate" title="{{ r.error }}">{{ r.error }}</div>{% endif %}
+        </td>
+        <td class="muted">{{ r.asset.kind }}{% if r.asset.port %} :{{ r.asset.port }}{% endif %}</td>
+        <td>
+          <span class="dot dot-{{ r.dot }}"></span> {{ r.status_ro }}
+          {% if r.open_since %}<div class="muted small">din {{ r.open_since.strftime('%H:%M') }} UTC</div>{% endif %}
+        </td>
+        <td class="num mono">{{ r.latency_ms ~ ' ms' if r.latency_ms is not none else '—' }}</td>
+        <td class="num mono">
+          {% if r.uptime_24h is not none %}
+            {% set us = 'bad' if r.uptime_24h < 95 else ('warn' if r.uptime_24h < 99.5 else 'ok') %}
+            <span class="uptime uptime-{{ us }}">{{ '%.2f'|format(r.uptime_24h) }}%</span>
+          {% else %}—{% endif %}
+        </td>
+        <td>
+          {% if r.sparkline %}
+          <svg class="spark" viewBox="0 0 220 28" width="220" height="28" preserveAspectRatio="none" aria-label="Uptime 24h">
+            <line x1="0" y1="0.5" x2="220" y2="0.5" class="spark-100"></line>
+            <polyline points="{{ r.sparkline }}" class="spark-line spark-{{ r.dot }}"></polyline>
+          </svg>
+          {% if r.sparkline_gaps %}<span class="muted small">· lipsuri</span>{% endif %}
+          {% else %}<span class="muted small">fără date</span>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    {% if not rows %}
+      <tr><td colspan="6" class="muted">Inventarul e gol. Editează <code>/etc/sentinel/inventory.yaml</code>.</td></tr>
+    {% endif %}
+    </tbody>
+  </table>
+</div>
+
+{% if capacity %}
+<h2>Capacitatea gazdei</h2>
+<div class="grid">
+  <section class="card">
+    <h2>Memorie</h2>
+    <dl class="kv">
+      <dt>RAM disponibil</dt>
+      <dd>
+        {% set mem_state = 'bad' if capacity.mem_available_mb < 500 else ('warn' if capacity.mem_available_mb < 1024 else 'ok') %}
+        <span class="dot dot-{{ mem_state }}"></span>
+        {{ capacity.mem_available_mb }} MB
+        {% if capacity.mem_total_mb %}<span class="muted">din {{ capacity.mem_total_mb }}</span>{% endif %}
+      </dd>
+      <dt>Swap folosit</dt><dd>{{ capacity.swap_used_mb }} MB</dd>
+    </dl>
+  </section>
+  <section class="card">
+    <h2>Procesor</h2>
+    <dl class="kv">
+      <dt>CPU</dt><dd>{{ capacity.cpu_pct if capacity.cpu_pct is not none else '—' }}%</dd>
+      <dt>Încărcare (1 min)</dt><dd>{{ capacity.load1 if capacity.load1 is not none else '—' }}</dd>
+      <dt>Conexiuni TCP</dt><dd>{{ capacity.conn_count if capacity.conn_count is not none else '—' }}</dd>
+    </dl>
+  </section>
+  <section class="card">
+    <h2>Disc</h2>
+    <dl class="kv">
+      {% for mount, d in capacity.disks.items() %}
+      <dt class="mono">{{ mount }}</dt>
+      <dd>
+        <span class="dot dot-{{ 'bad' if d.used_pct > 85 else ('warn' if d.used_pct > 75 else 'ok') }}"></span>
+        {{ d.used_pct }}% <span class="muted">({{ d.free_gb }} GB liberi)</span>
+      </dd>
+      {% endfor %}
+    </dl>
+  </section>
+</div>
+{% endif %}
+
+{% endblock %}

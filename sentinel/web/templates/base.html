@@ -1,0 +1,88 @@
+{#
+  Base layout — sidebar shell.
+
+  No <script> tags anywhere, and no external origins. That is what lets the CSP
+  be `script-src 'self'` with no `unsafe-inline`: an XSS in this dashboard has
+  nowhere to load a payload from and nowhere to send data to. Every visual here
+  is CSS and inline SVG, which is also why there is no chart library.
+
+  The sidebar collapses into a horizontal strip under 900px rather than hiding
+  behind a hamburger — a menu you must open costs a tap during an incident, and
+  seven links fit across a phone.
+#}
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  {# A security dashboard has no business in anyone's search index or referrer. #}
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <meta name="referrer" content="no-referrer">
+  <title>{% block title %}Sentinel{% endblock %}</title>
+  <link rel="stylesheet" href="/static/css/sentinel.css">
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  {% block head_extra %}{% endblock %}
+</head>
+<body class="{% block body_class %}{% endblock %}">
+
+{% if user is defined and user %}
+<div class="app">
+
+  <aside class="sidebar">
+    <a class="brand" href="/">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span>SENTINEL</span>
+    </a>
+
+    <nav class="sidenav" aria-label="Navigare principală">
+      {% set items = [
+        ('/',          'dashboard',  'Panou',            'grid'),
+        ('/incidents', 'incidents',  'Incidente',        'alert'),
+        ('/findings',  'findings',   'Vulnerabilități',  'shield'),
+        ('/patches',   'patches',    'Patch-uri',        'wrench'),
+        ('/blocklist', 'blocklist',  'Blocklist',        'ban'),
+        ('/services',  'services',   'Servicii',         'server'),
+        ('/events',    'events',     'Evenimente',       'list'),
+      ] %}
+      {% for href, key, label, icon in items %}
+      <a href="{{ href }}" class="{% if active == key %}active{% endif %}">
+        <span class="ico ico-{{ icon }}" aria-hidden="true"></span>
+        <span>{{ label }}</span>
+      </a>
+      {% endfor %}
+    </nav>
+
+    <div class="sidebar-foot">
+      <a href="/account" class="userbox {% if active == 'account' %}active{% endif %}">
+        <span class="avatar" aria-hidden="true">{{ user.username[:2] | upper }}</span>
+        <span class="userbox-text">
+          <span class="userbox-name">{{ user.username }}</span>
+          <span class="role role-{{ user.role }}">{{ user.role }}</span>
+        </span>
+      </a>
+      <form method="post" action="/logout" class="inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button type="submit" class="btn btn-quiet btn-sm btn-block">Ieșire</button>
+      </form>
+    </div>
+  </aside>
+
+  <main class="{% block main_class %}content{% endblock %}">
+    {% block content %}{% endblock %}
+    <footer class="footer">
+      <span>Sentinel {{ version }}</span><span>·</span><span>ora serverului: UTC</span>
+    </footer>
+  </main>
+
+</div>
+
+{% else %}
+{# Unauthenticated pages (login, TOTP) get no chrome at all. #}
+<main class="{% block auth_main_class %}auth-shell{% endblock %}">
+  {% block auth_content %}{{ self.content() }}{% endblock %}
+</main>
+<footer class="footer footer-plain"><span>Sentinel {{ version }}</span></footer>
+{% endif %}
+
+</body>
+</html>

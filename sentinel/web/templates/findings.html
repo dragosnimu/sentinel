@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% set active = 'findings' %}
+{% block title %}Vulnerabilități · Sentinel{% endblock %}
+
+{% block content %}
+<h1>Vulnerabilități</h1>
+
+<div class="statline">
+  {% if counts.critical %}<span class="pill pill-bad">{{ counts.critical }} critice</span>{% endif %}
+  {% if counts.high %}<span class="pill pill-bad">{{ counts.high }} mari</span>{% endif %}
+  {% if counts.medium %}<span class="pill pill-warn">{{ counts.medium }} medii</span>{% endif %}
+  {% if counts.low %}<span class="pill pill-off">{{ counts.low }} mici</span>{% endif %}
+  {% if counts.kev %}<span class="pill pill-bad" title="CISA Known Exploited — exploatat activ">🔥 {{ counts.kev }} KEV</span>{% endif %}
+  <span class="muted small">{{ counts.total }} deschise · scanare nocturnă</span>
+</div>
+
+{% if not rows %}
+<div class="notice notice-info">
+  <strong>Nicio vulnerabilitate deschisă.</strong>
+  <p>Scanerul de pachete OS (<code>dnf updateinfo</code>) rulează în fereastra de
+     mentenanță (03:00–05:00). Rezultatele apar aici, prioritizate.</p>
+</div>
+{% endif %}
+
+<div class="table-scroll">
+  <table>
+    <thead>
+      <tr><th class="num">Prio</th><th>Sev.</th><th>CVE</th><th>Titlu</th><th>Pachet</th><th>Fix</th><th>Scaner</th></tr>
+    </thead>
+    <tbody>
+    {% for r in rows %}
+      <tr class="{{ 'row-bad' if r.severity in ('high','critical') or r.kev }}">
+        <td class="num mono"><strong>{{ r.priority }}</strong></td>
+        <td><span class="dot dot-{{ r.sev_dot }}"></span> {{ r.severity }}{% if r.kev %} <span class="tag" title="Exploatat activ (CISA KEV)">🔥</span>{% endif %}</td>
+        <td class="mono nowrap">
+          {% if r.cve %}<a href="https://nvd.nist.gov/vuln/detail/{{ r.cve }}" rel="noopener noreferrer">{{ r.cve }}</a>{% else %}—{% endif %}
+        </td>
+        <td>{{ r.title }}</td>
+        <td class="mono">{{ r.package or '—' }}</td>
+        <td class="mono nowrap">{{ r.fixed_version or '—' }}</td>
+        <td class="muted small">{{ r.scanner }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

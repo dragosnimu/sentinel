@@ -1,0 +1,50 @@
+# Catch-all for requests that reach Sentinel's port without naming its vhost.
+#
+# THE PROBLEM THIS SOLVES
+#
+# nginx picks the *first* server block listening on an address as the default
+# when no `default_server` is declared for it. Sentinel's vhost is the only one
+# on its dedicated port, so it becomes that default — and then it answers for any
+# Host header, including a bare-IP request. Someone port-scanning the address
+# finds the login page, which tells them exactly what is running there and where
+# to point a credential attack.
+#
+# With this block, only `https://<domain>:<port>` reaches the dashboard.
+# Everything else on that port gets nothing.
+#
+# Scoped to Sentinel's own port only. It deliberately does NOT touch 80 or 443 —
+# those belong to whatever this host is actually for, and claiming
+# `default_server` on them would hijack someone else's default vhost, or make
+# nginx refuse to start if one already exists.
+
+server {
+    # `listen ... http2`, not `http2 on;`: the standalone directive is nginx
+    # 1.25.1+, and AlmaLinux 9 ships 1.20.1, which rejects it.
+    listen @@PUBLIC_PORT@@ ssl http2 default_server;
+    listen [::]:@@PUBLIC_PORT@@ ssl http2 default_server;
+
+    # `_` never matches a real Host header, so this block is only ever selected
+    # by virtue of being the default for this port.
+    server_name _;
+
+    # A TLS handshake must complete before nginx can read the Host header, so
+    # this block needs a certificate even though it serves nothing. The
+    # self-signed placeholder is the right one here: a client reaching this block
+    # is not one we want to succeed, and presenting the real certificate would
+    # confirm which domain lives on this address.
+    ssl_certificate     /etc/pki/tls/certs/sentinel-selfsigned.crt;
+    ssl_certificate_key /etc/pki/tls/private/sentinel-selfsigned.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    # No security headers here on purpose: nothing is served, so there is nothing
+    # to protect, and emitting HSTS from a block reached by bare IP would pin a
+    # policy against an address rather than a name.
+
+    access_log /var/log/nginx/sentinel-probe.log;
+
+    # 444: close the connection with no response at all.
+    #
+    # Not 404 and not 403 — those confirm a server is listening and willing to
+    # talk. 444 costs the scanner a connection and tells them nothing.
+    return 444;
+}

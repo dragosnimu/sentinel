@@ -1,0 +1,43 @@
+# Sentinel runtime dependencies — version-pinned.
+#
+# This file is the human-editable source. The server installer uses
+# requirements-lock.txt (hash-pinned, generated with pip-compile
+# --generate-hashes) so that a compromised mirror cannot substitute a package.
+#
+# Regenerate the lock with:
+#   pip-compile --generate-hashes --output-file=requirements-lock.txt requirements.txt
+
+# --- Database ---
+asyncpg==0.30.0
+
+# --- Config / validation ---
+pydantic==2.9.2
+PyYAML==6.0.2
+
+# --- Web ---
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+jinja2==3.1.4
+python-multipart==0.0.17
+itsdangerous==2.2.0
+
+# --- Auth ---
+argon2-cffi==23.1.0
+pyotp==2.9.0
+qrcode==8.0
+
+# --- HTTP client (Anthropic API, health probes, intel feeds) ---
+httpx==0.27.2
+
+# --- Telegram ---
+python-telegram-bot==21.9
+
+# --- System introspection ---
+psutil==6.1.0
+systemd-python==235; sys_platform == "linux"
+
+# --- Enrichment ---
+maxminddb==2.6.2
+
+# --- TLS inspection ---
+cryptography==44.0.0

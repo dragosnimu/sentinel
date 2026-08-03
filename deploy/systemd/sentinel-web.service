@@ -1,0 +1,75 @@
+[Unit]
+# The dashboard. Publicly reachable through nginx, which makes it the most
+# exposed Sentinel component and therefore the most tightly confined.
+#
+# It is read-only against the database plus an SSE hub. It NEVER talks to the
+# executor: destructive actions go into action_requests and require a Telegram
+# confirmation. A compromised dashboard leaks security data; it cannot block,
+# unblock, patch or restart anything.
+Description=Sentinel web dashboard
+After=network.target postgresql.service
+Requires=postgresql.service
+PartOf=sentinel.target
+
+[Service]
+Type=exec
+User=sentinel
+Group=sentinel
+WorkingDirectory=/opt/sentinel
+ExecStart=/opt/sentinel/bin/sentinel web
+Restart=always
+RestartSec=5
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/opt/sentinel/lib
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug @obsolete
+
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Nothing to write except its own state.
+ReadWritePaths=/var/lib/sentinel
+ReadOnlyPaths=/etc/sentinel
+
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# It binds 127.0.0.1:8787 and queries the local database. Nothing else.
+# An SSRF or an RCE in the dashboard therefore has no network to pivot into —
+# it cannot reach the internet, other services on the host, or anything else.
+IPAddressAllow=localhost
+IPAddressDeny=any
+
+# The executor socket is deliberately NOT in ReadWritePaths. Even if the code
+# tried, the filesystem says no.
+
+MemoryMax=384M
+TasksMax=128
+OOMPolicy=stop
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-web
+
+[Install]
+WantedBy=multi-user.target

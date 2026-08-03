@@ -1,0 +1,24 @@
+
+# --- Sentinel ---------------------------------------------------------------
+# INSERTED by install.sh before the distribution defaults. Loopback only,
+# scram-sha-256 only.
+#
+# The database holds the full security history: every incident, every blocked
+# address, every vulnerability finding, and the complete patch audit trail. It
+# is never reachable off this host, and `trust` never appears here — not even
+# for local, which would let any local user read all of it.
+#
+# pg_hba is first-match-wins. AlmaLinux ships a broad
+# `host all all 127.0.0.1/32 ident` line; these rules MUST sit above it, or a
+# connection as the sentinel role matches ident first and fails with "Ident
+# authentication failed". install.sh inserts them ahead of the first active
+# rule for exactly that reason — do not move them below the defaults.
+
+local   sentinel        sentinel                                scram-sha-256
+host    sentinel        sentinel        127.0.0.1/32            scram-sha-256
+host    sentinel        sentinel        ::1/128                 scram-sha-256
+
+# Everything else for this database is refused explicitly rather than falling
+# through to whatever the distribution default happens to be.
+host    sentinel        all             0.0.0.0/0               reject
+host    sentinel        all             ::/0                    reject

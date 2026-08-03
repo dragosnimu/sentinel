@@ -1,0 +1,47 @@
+[Unit]
+# The anti-lockout deadman.
+#
+# This is the single most important unit in the deployment. It runs as root,
+# every 60 seconds, and depends on NOTHING else Sentinel provides — not the
+# database, not the executor, not the web service. That independence is the
+# whole point: it must work precisely when everything else has failed.
+#
+# It flushes the entire blocklist when any of these hold:
+#   * /etc/sentinel/PANIC exists                (the operator's manual escape)
+#   * the web health endpoint has been down >5m (Sentinel is broken)
+#   * sentinel-detect is in a restart loop      (the detector cannot be trusted)
+#   * the blocklist exceeds the hard cap        (something has run away)
+#
+# A detector that cannot run must not leave stale blocks in the kernel.
+Description=Sentinel anti-lockout watchdog
+Documentation=file:/opt/sentinel/lib/sentinel/respond/watchdog.py
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/opt/sentinel/venv/bin/python /opt/sentinel/lib/sentinel/respond/watchdog.py
+Environment=PYTHONPATH=/opt/sentinel/lib
+Environment=PYTHONUNBUFFERED=1
+
+# Deliberately generous: if the watchdog itself starts failing, that is worth
+# knowing, but it must never be the thing that prevents a flush.
+TimeoutStartSec=45
+
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=false
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/sentinel /etc/sentinel
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+IPAddressAllow=localhost
+IPAddressDeny=any
+
+MemoryMax=64M
+TasksMax=16
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-watchdog

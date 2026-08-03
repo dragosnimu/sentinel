@@ -1,0 +1,41 @@
+[Unit]
+Description=Sentinel availability and capacity probe
+After=postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=oneshot
+User=sentinel
+Group=sentinel
+WorkingDirectory=/opt/sentinel
+ExecStart=/opt/sentinel/bin/sentinel health
+TimeoutStartSec=60
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/sentinel/lib
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+
+ReadWritePaths=/var/lib/sentinel
+ReadOnlyPaths=/etc/sentinel
+
+# Probes reach the monitored assets, which may include public hostnames of
+# services on this host, so no blanket network deny here.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+MemoryMax=192M
+TasksMax=32
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-health

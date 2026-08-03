@@ -1,0 +1,193 @@
+# Sentinel dashboard as a vhost on the EXISTING nginx.
+#
+# This is `--nginx-mode shared`. Sentinel becomes one virtual host among the
+# ones already on this server, on the ports nginx is already listening on.
+#
+# WHAT MAKES THIS SAFE
+#
+# Every server block below is scoped by `server_name`. nginx routes a request to
+# a vhost by matching the Host header, so a request for any other site on this
+# host never reaches these blocks and their configuration is never consulted.
+# Nothing here is global: the rate-limit zones are namespaced, the headers are
+# inside our locations, and there is no `default_server`.
+#
+# WHAT TO WATCH
+#
+# 1. NO `default_server` ANYWHERE BELOW. Claiming it would hijack which vhost
+#    answers a bare-IP request or an unknown Host — a behaviour change to the
+#    operator's setup, not to ours. If no vhost on this host declares it, nginx
+#    picks the first one it loaded, and install.sh tests afterwards whether that
+#    turned out to be us.
+#
+# 2. This file shares /etc/nginx/conf.d/ with the operator's own vhosts. A syntax
+#    error here makes `nginx -t` fail for the WHOLE server. A reload would simply
+#    be refused, so their sites keep running — but the next restart, for any
+#    unrelated reason, would fail to start nginx at all. install.sh therefore runs
+#    `nginx -t` before and after, and removes this file immediately if it broke.
+#
+# 3. Compared with dedicated mode, the trade is: clean URL, working redirect and
+#    straightforward certificates, in exchange for writing into a config
+#    directory that is not exclusively ours.
+
+# Namespaced so they cannot collide with zones the operator already defined.
+limit_req_zone $binary_remote_addr zone=sentinel_login:10m rate=5r/m;
+limit_req_zone $binary_remote_addr zone=sentinel_api:10m   rate=60r/m;
+limit_req_zone $binary_remote_addr zone=sentinel_all:10m   rate=300r/m;
+limit_conn_zone $binary_remote_addr zone=sentinel_conn:10m;
+
+upstream sentinel_app {
+    server 127.0.0.1:@@PORT@@ fail_timeout=5s;
+    keepalive 8;
+}
+
+# ---------------------------------------------------------------------------
+# :80 — ACME challenge and redirect, for this server_name only
+# ---------------------------------------------------------------------------
+# This block is why certificates are easy in shared mode: Sentinel serves its own
+# ACME challenge, so `certbot certonly --webroot` works with no change to any
+# other service's configuration.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name @@DOMAIN@@;
+
+    # Must stay reachable over plain HTTP and must never be redirected. A
+    # silently failed renewal is the classic cause of "the dashboard broke
+    # exactly 90 days after we deployed it".
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/lib/letsencrypt;
+        default_type "text/plain";
+        allow all;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# ---------------------------------------------------------------------------
+# :443 — the dashboard
+# ---------------------------------------------------------------------------
+server {
+    # `listen ... http2` rather than the separate `http2 on;` directive: the
+    # latter is nginx 1.25.1+, and RHEL/AlmaLinux 9 ships nginx 1.20.1, which
+    # rejects it with `unknown directive "http2"`. The listen parameter works on
+    # 1.20 through current (deprecated-but-functional on the newest).
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name @@DOMAIN@@;
+
+    # Points at the self-signed placeholder until a certificate is issued, so
+    # `nginx -t` passes the moment this file lands — which matters more here than
+    # in dedicated mode, because a failing `nginx -t` affects the whole server.
+    ssl_certificate     /etc/pki/tls/certs/sentinel-selfsigned.crt;
+    ssl_certificate_key /etc/pki/tls/private/sentinel-selfsigned.key;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    # Upstream timeouts at server scope so every location inherits them and the
+    # /stream location can override read_timeout without a duplicate-directive
+    # error (they used to live in sentinel-proxy-params.conf, which /stream also
+    # includes).
+    proxy_connect_timeout 5s;
+    proxy_send_timeout    30s;
+    proxy_read_timeout    60s;
+
+    # Deliberately NOT `shared:SentinelTLS` in a way that could clash: the zone
+    # name is namespaced, and the size is modest because this vhost sees far less
+    # traffic than the operator's sites.
+    ssl_session_cache shared:SentinelTLS:10m;
+
+    include /etc/nginx/conf.d/sentinel-security-headers.conf;
+
+    # ---------------------------------------------------------------------
+    # OPTIONAL BUT RECOMMENDED: restrict the dashboard to your own addresses.
+    #
+    # This is scoped to Sentinel's vhost, so it does not affect any other site
+    # on this server. The cheapest hardening available for a public security
+    # dashboard, and it costs nothing — Telegram stays the "from anywhere"
+    # channel and does not depend on this vhost being up.
+    #
+    #   allow 203.0.113.0/24;      # office
+    #   allow 198.51.100.42/32;    # home
+    #   deny  all;
+    # ---------------------------------------------------------------------
+
+    client_max_body_size 2m;
+    client_body_timeout 15s;
+    client_header_timeout 15s;
+    send_timeout 30s;
+
+    limit_conn sentinel_conn 20;
+    limit_req  zone=sentinel_all burst=100 nodelay;
+
+    server_tokens off;
+
+    # Separate log files, so Sentinel's traffic does not land in the operator's
+    # access log and Sentinel's own ingestion does not read theirs by accident.
+    access_log /var/log/nginx/sentinel-access.log;
+    error_log  /var/log/nginx/sentinel-error.log warn;
+
+    location = /login {
+        limit_req zone=sentinel_login burst=3 nodelay;
+        limit_req_status 429;
+        include /etc/nginx/conf.d/sentinel-proxy-params.conf;
+        proxy_pass http://sentinel_app;
+    }
+
+    location = /totp {
+        limit_req zone=sentinel_login burst=3 nodelay;
+        include /etc/nginx/conf.d/sentinel-proxy-params.conf;
+        proxy_pass http://sentinel_app;
+    }
+
+    location /api/ {
+        limit_req zone=sentinel_api burst=30 nodelay;
+        include /etc/nginx/conf.d/sentinel-proxy-params.conf;
+        proxy_pass http://sentinel_app;
+    }
+
+    location = /stream {
+        include /etc/nginx/conf.d/sentinel-proxy-params.conf;
+        proxy_pass http://sentinel_app;
+        # SSE holds the connection open; buffering would batch events and defeat
+        # the point of a live incident feed. proxy_http_version and the empty
+        # Connection header already come from the include above — repeating them
+        # here is a duplicate-directive error, so /stream only ADDS what differs.
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;
+        chunked_transfer_encoding off;
+    }
+
+    location /static/ {
+        alias /opt/sentinel/lib/sentinel/web/static/;
+        expires 7d;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+    }
+
+    location = /healthz {
+        include /etc/nginx/conf.d/sentinel-proxy-params.conf;
+        proxy_pass http://sentinel_app;
+        access_log off;
+    }
+
+    location / {
+        include /etc/nginx/conf.d/sentinel-proxy-params.conf;
+        proxy_pass http://sentinel_app;
+    }
+
+    # Anything probing for a CMS is not looking for this dashboard. 444 closes
+    # without a response: it costs the scanner a connection and tells them
+    # nothing. Scoped to this vhost, so it does not affect a real CMS the
+    # operator may be hosting elsewhere on this server.
+    location ~* ^/(wp-admin|wp-login|phpmyadmin|administrator|\.env|\.git) {
+        access_log /var/log/nginx/sentinel-probe.log;
+        return 444;
+    }
+}

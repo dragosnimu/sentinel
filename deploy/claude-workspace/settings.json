@@ -1,0 +1,139 @@
+{
+  "$comment": [
+    "Runtime settings for the headless Claude Code sessions Sentinel spawns on",
+    "the server. Installed to /opt/sentinel/claude-workspace/.claude/settings.json.",
+    "",
+    "This is defence in depth, not the primary control. The primary control is",
+    "that cli_bridge.py invokes `claude -p --permission-mode plan` with an",
+    "explicit --allowedTools list, which is structurally read-only. These rules",
+    "make the intent explicit and catch a mistake in the invocation.",
+    "",
+    "Deny wins over allow. Everything not matched is denied by --permission-mode",
+    "plan regardless of what appears here."
+  ],
+
+  "permissions": {
+    "defaultMode": "plan",
+
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "Skill",
+
+      "Bash(systemctl status:*)",
+      "Bash(systemctl cat:*)",
+      "Bash(systemctl show:*)",
+      "Bash(systemctl list-units:*)",
+      "Bash(journalctl -n:*)",
+
+      "Bash(rpm -q:*)",
+      "Bash(rpm -qa:*)",
+      "Bash(dnf list installed:*)",
+      "Bash(dnf --showduplicates list:*)",
+      "Bash(dnf updateinfo:*)",
+      "Bash(dnf info:*)",
+
+      "Bash(nginx -T)",
+      "Bash(nginx -t)",
+      "Bash(httpd -S)",
+      "Bash(apachectl -S)",
+
+      "Bash(docker ps:*)",
+      "Bash(docker inspect:*)",
+      "Bash(docker images:*)",
+
+      "Bash(git -C:*)",
+      "Bash(git log:*)",
+      "Bash(git status:*)",
+      "Bash(git rev-parse:*)",
+
+      "Bash(ls:*)",
+      "Bash(stat:*)",
+      "Bash(df:*)",
+      "Bash(du:*)",
+      "Bash(free:*)",
+      "Bash(ss -tlnp)",
+      "Bash(ss -tan)",
+      "Bash(sha256sum:*)",
+      "Bash(wc:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+
+      "Bash(/opt/sentinel/venv/bin/python /opt/sentinel/claude-workspace/.claude/skills/sentinel-soc/scripts/*)",
+      "Bash(/opt/sentinel/bin/sentinel-query:*)",
+      "Bash(/opt/sentinel/bin/sentinel-health:*)"
+    ],
+
+    "deny": [
+      "Write",
+      "Edit",
+      "NotebookEdit",
+      "WebFetch",
+      "WebSearch",
+
+      "Read(/etc/sentinel/secrets.env)",
+      "Read(/etc/shadow)",
+      "Read(/root/.ssh/**)",
+      "Read(/home/*/.ssh/**)",
+      "Read(**/.env)",
+      "Read(**/credentiale*)",
+      "Read(**/*.pem)",
+      "Read(**/*.key)",
+      "Read(**/id_rsa*)",
+      "Read(**/id_ed25519*)",
+
+      "Bash(sudo:*)",
+      "Bash(su:*)",
+      "Bash(nft:*)",
+      "Bash(iptables:*)",
+      "Bash(firewall-cmd:*)",
+      "Bash(systemctl start:*)",
+      "Bash(systemctl stop:*)",
+      "Bash(systemctl restart:*)",
+      "Bash(systemctl reload:*)",
+      "Bash(systemctl enable:*)",
+      "Bash(systemctl disable:*)",
+      "Bash(dnf install:*)",
+      "Bash(dnf update:*)",
+      "Bash(dnf remove:*)",
+      "Bash(dnf downgrade:*)",
+      "Bash(rm:*)",
+      "Bash(mv:*)",
+      "Bash(cp:*)",
+      "Bash(chmod:*)",
+      "Bash(chown:*)",
+      "Bash(dd:*)",
+      "Bash(mkfs:*)",
+      "Bash(curl:*)",
+      "Bash(wget:*)",
+      "Bash(nc:*)",
+      "Bash(ncat:*)",
+      "Bash(socat:*)",
+      "Bash(ssh:*)",
+      "Bash(scp:*)",
+      "Bash(sh:*)",
+      "Bash(bash:*)",
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(perl:*)",
+      "Bash(docker exec:*)",
+      "Bash(docker run:*)",
+      "Bash(docker stop:*)",
+      "Bash(docker rm:*)",
+      "Bash(psql:*)",
+      "Bash(mysql:*)",
+      "Bash(crontab:*)",
+      "Bash(useradd:*)",
+      "Bash(usermod:*)",
+      "Bash(passwd:*)"
+    ]
+  },
+
+  "env": {
+    "SENTINEL_CLAUDE_RUNTIME": "1"
+  },
+
+  "includeCoAuthoredBy": false,
+  "cleanupPeriodDays": 7
+}

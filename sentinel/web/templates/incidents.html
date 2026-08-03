@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+{% set active = 'incidents' %}
+{% block title %}Incidente · Sentinel{% endblock %}
+
+{% block content %}
+<h1>Incidente</h1>
+<p class="page-sub">Cele mai recente primele · incidentele deschise rămân deasupra</p>
+
+{% if msg %}<div class="notice notice-info"><strong>{{ msg }}</strong></div>{% endif %}
+
+<div class="statline">
+  {% if counts.critical %}<span class="pill pill-bad">{{ counts.critical }} critice</span>{% endif %}
+  {% if counts.high %}<span class="pill pill-bad">{{ counts.high }} mari</span>{% endif %}
+  {% if counts.medium %}<span class="pill pill-warn">{{ counts.medium }} medii</span>{% endif %}
+  {% if counts.low %}<span class="pill pill-off">{{ counts.low }} mici</span>{% endif %}
+  <span class="muted small">{{ counts.total }} deschise</span>
+</div>
+
+<div class="filterbar">
+  <span class="small muted">Stare:</span>
+  <span class="filterlinks" style="margin:0">
+    <a href="/incidents?sort={{ sort }}" class="{% if not filter_status %}active{% endif %}">toate</a> ·
+    <a href="/incidents?status=open&sort={{ sort }}" class="{% if filter_status == 'open' %}active{% endif %}">deschise</a> ·
+    <a href="/incidents?status=resolved&sort={{ sort }}" class="{% if filter_status == 'resolved' %}active{% endif %}">rezolvate</a> ·
+    <a href="/incidents?status=false_positive&sort={{ sort }}" class="{% if filter_status == 'false_positive' %}active{% endif %}">fals-pozitive</a>
+  </span>
+
+  <span class="small muted" style="margin-left:1.5rem">Sortare:</span>
+  <span class="filterlinks" style="margin:0">
+    {% set labels = {'recent': 'recente', 'severitate': 'severitate', 'detectii': 'nr. detecții', 'vechi': 'vechi'} %}
+    {% for key in ['recent', 'severitate', 'detectii', 'vechi'] %}
+      <a href="/incidents?sort={{ key }}{% if filter_status %}&status={{ filter_status }}{% endif %}"
+         class="{% if sort == key %}active{% endif %}">{{ labels[key] }}</a>{% if not loop.last %} · {% endif %}
+    {% endfor %}
+  </span>
+</div>
+
+{% if not rows %}
+<div class="notice notice-info">
+  <strong>Niciun incident.</strong>
+  <p>Motorul de detecție rulează. Un brute-force SSH sau o enumerare web va
+     apărea aici în &lt;60 s, cu push pe Telegram.</p>
+</div>
+{% endif %}
+
+<div class="table-scroll">
+  <table>
+    <thead>
+      <tr><th>#</th><th>Sev.</th><th>Titlu</th><th>Sursă</th>
+          <th class="num">Detecții</th><th>Stare</th><th>Ultima</th>
+          {% if can_act %}<th>Acțiuni</th>{% endif %}</tr>
+    </thead>
+    <tbody>
+    {% for r in rows %}
+      <tr class="{{ 'row-bad' if r.severity in ('high','critical') and r.status in ('open','acknowledged') }}">
+        <td class="mono">{{ r.id }}</td>
+        <td class="nowrap"><span class="dot dot-{{ r.sev_dot }}"></span>{{ r.severity }}</td>
+        <td><a href="/incidents/{{ r.id }}">{{ r.title }}</a></td>
+        <td class="mono small">{{ r.actor_key or '—' }}</td>
+        <td class="num">{{ r.detection_count }}</td>
+        <td class="nowrap small">
+          {{ status_ro.get(r.status, r.status) }}
+          {%- if r.notified_at %} <span class="tag" title="Trimis pe Telegram">📨</span>{% endif -%}
+        </td>
+        <td class="mono nowrap small">{{ r.last_detection_at.strftime('%d.%m %H:%M') }}</td>
+        {% if can_act %}
+        <td class="nowrap">
+          {% if r.status in ('open', 'acknowledged') %}
+          <form method="post" action="/incidents/{{ r.id }}/status" class="inline">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="status" value="resolved">
+            <button type="submit" class="btn btn-sm">Rezolvă</button>
+          </form>
+          {% else %}<span class="muted small">—</span>{% endif %}
+        </td>
+        {% endif %}
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{% if can_act and open_rules %}
+<h2>Închidere în masă</h2>
+<div class="card">
+  <p class="muted small" style="margin-top:0">
+    O regulă zgomotoasă produce sute de incidente, iar închiderea unul câte unul
+    e felul în care o listă ajunge să nu mai fie citită. Se închide o singură
+    regulă odată — un „închide tot” ar ascunde și incidentul care conta.
+  </p>
+  <form method="post" action="/incidents/bulk-close">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="filterbar" style="margin-bottom:0">
+      <label>Regulă
+        <select name="rule" required>
+          <option value="">— alege —</option>
+          {% for r in open_rules %}
+          <option value="{{ r.regula }}">{{ r.regula }} ({{ r.n }} deschise)</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Marchează ca
+        <select name="status">
+          <option value="resolved">rezolvat</option>
+          <option value="false_positive">fals-pozitiv</option>
+          <option value="suppressed">suprimat</option>
+        </select>
+      </label>
+      <label>Mai vechi de
+        <select name="older_than_hours">
+          <option value="0">oricând</option>
+          <option value="1">1 oră</option>
+          <option value="24" selected>24 ore</option>
+          <option value="168">7 zile</option>
+        </select>
+      </label>
+      <button type="submit" class="btn btn-primary">Închide</button>
+    </div>
+  </form>
+</div>
+{% endif %}
+{% endblock %}

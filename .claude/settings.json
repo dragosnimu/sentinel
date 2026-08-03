@@ -1,0 +1,42 @@
+{
+  "$comment": [
+    "Developer-machine settings for working ON this repository.",
+    "",
+    "This is NOT what the server runs. The headless runtime on the server uses",
+    "deploy/claude-workspace/settings.json, which is far more restrictive",
+    "(read-only, plan mode, no network, no writes). Keeping them separate means",
+    "local development is not crippled by production lockdown, and production",
+    "lockdown is not loosened by a convenience added during development.",
+    "",
+    "The deny list below is short and deliberate: things that would be a mistake",
+    "here regardless of who is asking."
+  ],
+
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest:*)",
+      "Bash(pytest:*)",
+      "Bash(ruff check:*)",
+      "Bash(ruff format:*)",
+      "Bash(mypy:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(shellcheck:*)"
+    ],
+
+    "deny": [
+      "Read(./secrets/**)",
+      "Read(**/.env.local)",
+      "Read(**/*.pem)",
+      "Read(**/*.key)",
+      "Read(**/id_rsa*)",
+      "Read(**/id_ed25519*)",
+      "Write(./secrets/**)",
+
+      "Bash(ssh:*)",
+      "Bash(scp:*)",
+      "Bash(git push:*)"
+    ]
+  }
+}

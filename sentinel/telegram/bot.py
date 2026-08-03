@@ -1,0 +1,564 @@
+"""The Telegram bot: reporting, incident push, and manual response.
+
+Reporting was P4; P5 added response. The bot can now block, unblock and flush —
+each behind an explicit confirmation and role check (owner/operator act, viewer
+is read-only). Patch approval and its own confirmation flow arrive in P9. Every
+update is checked against the chat-id allowlist before anything runs; an
+unauthorised chat gets silence and one log line, never a reply that would confirm
+the bot exists.
+
+Incident pushes for a network actor carry a one-tap block button. Tapping it is
+routed through the same on_callback path as /block, so the role check and the
+executor's never-block guard both still apply — a viewer's tap and an admin
+address are both refused.
+
+Push is a plain asyncio task, not the PTB job-queue, so the base
+python-telegram-bot install (no [job-queue] extra) is enough. It polls for
+incidents the operator has not been told about yet and sends them.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import html
+import ipaddress
+from typing import Any
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+
+from sentinel import __version__
+from sentinel.config import Config, Secrets
+from sentinel.db.engine import Database
+from sentinel.db.repo import assets as assets_repo
+from sentinel.db.repo import blocklist as blocklist_repo
+from sentinel.db.repo import capacity as capacity_repo
+from sentinel.db.repo import health as health_repo
+from sentinel.db.repo import incidents as inc_repo
+from sentinel.errors import ExecutorRejected, ExecutorUnavailable
+from sentinel.logging_setup import get_logger
+from sentinel.respond import actions
+
+log = get_logger(__name__)
+
+_SEV_EMOJI = {"info": "⚪", "low": "🔵", "medium": "🟡", "high": "🟠", "critical": "🔴"}
+_STATUS_EMOJI = {"up": "🟢", "degraded": "🟡", "down": "🔴", "unknown": "⚪"}
+
+
+def _esc(text: Any) -> str:
+    return html.escape(str(text)) if text is not None else ""
+
+
+def _authorized(cfg: Config, update: Update) -> bool:
+    chat = update.effective_chat
+    return chat is not None and chat.id in set(cfg.telegram.allowed_chat_ids)
+
+
+def _can_act(cfg: Config, chat_id: int) -> bool:
+    """Owner or operator may block/unblock. A viewer is read-only.
+
+    If no roles are configured (only allowed_chat_ids), every allowed chat can
+    act — a single-admin deployment should not have to also list itself as owner.
+    """
+    tg = cfg.telegram
+    if tg.owner_chat_id is None and not tg.operator_chat_ids:
+        return chat_id in set(tg.allowed_chat_ids)
+    return chat_id == tg.owner_chat_id or chat_id in set(tg.operator_chat_ids)
+
+
+async def _deny_viewer(update: Update) -> None:
+    await update.effective_message.reply_text(
+        "Această comandă modifică starea (blocare/deblocare) și necesită rol de "
+        "operator sau owner. Contul tău are acces doar de vizualizare."
+    )
+
+
+def _guard(handler):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        cfg: Config = context.bot_data["cfg"]
+        if not _authorized(cfg, update):
+            chat = update.effective_chat
+            log.warning("unauthorized telegram command",
+                        extra={"chat_id": chat.id if chat else None})
+            return
+        try:
+            await handler(update, context)
+        except Exception as exc:  # noqa: BLE001 - a broken command must not kill the bot
+            log.error("telegram handler failed", extra={"detail": str(exc)})
+            if update.message:
+                await update.message.reply_text("A apărut o eroare la procesarea comenzii.")
+    return wrapper
+
+
+# --- formatting ------------------------------------------------------------
+def format_incident(inc: inc_repo.IncidentRow, *, header: str = "INCIDENT") -> str:
+    emoji = _SEV_EMOJI.get(inc.severity, "⚪")
+    lines = [
+        f"{emoji} <b>{header} #{inc.id}</b> · <b>{_esc(inc.severity.upper())}</b>",
+        f"<b>{_esc(inc.title)}</b>",
+    ]
+    if inc.summary:
+        lines.append(_esc(inc.summary))
+    if inc.actor_key:
+        lines.append(f"Sursă: <code>{_esc(inc.actor_key)}</code>")
+    lines.append(f"Detecții: {inc.detection_count} · stare: {_esc(inc.status)}")
+    auto = _auto_action_text(inc.auto_action)
+    if auto:
+        lines.append(auto)
+    lines.append(f"Detalii: <code>/incident {inc.id}</code>")
+    return "\n".join(lines)
+
+
+_SKIP_REASON_RO = {
+    "rate_cap": "plafon de rată atins",
+    "max_elements": "blocklist plin",
+    "allowlisted": "sursă în allowlist",
+    "known_scanner": "scanner cunoscut",
+    "cidr_not_allowed": "bloc CIDR nepermis",
+    "refused_client": "refuzat la validare",
+    "executor_error": "executor indisponibil",
+}
+
+
+def _auto_action_text(auto_action: str | None) -> str | None:
+    """Render the decider's verdict for the alert body."""
+    if not auto_action or auto_action == "observed":
+        return None
+    if auto_action == "blocked":
+        return "🛡️ <b>Blocat automat</b>"
+    if auto_action.startswith("skipped:"):
+        reason = _SKIP_REASON_RO.get(auto_action[8:], auto_action[8:])
+        return f"⏭️ Auto-block sărit: {_esc(reason)}"
+    return None
+
+
+def _incident_ip(inc: inc_repo.IncidentRow) -> str | None:
+    """The attacker IP if the incident has one. actor_key defaults to src_ip,
+    so for the network rules it is the address — but only trust it if it really
+    parses as one, never as a label to shove into a block command."""
+    if not inc.actor_key:
+        return None
+    try:
+        ipaddress.ip_address(inc.actor_key)
+    except ValueError:
+        return None
+    return inc.actor_key
+
+
+def _incident_block_kb(inc: inc_repo.IncidentRow, cfg: Config) -> InlineKeyboardMarkup | None:
+    """The one-tap action on the alert. If the decider already blocked the actor
+    (armed mode), offer UNBLOCK; otherwise offer BLOCK. Either way on_callback
+    re-checks the role and the executor re-checks never-block, so a viewer's tap
+    is refused and the admin address is never firewalled even if pressed."""
+    ip = _incident_ip(inc)
+    if ip is None:
+        return None
+    if inc.auto_action == "blocked":
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"↩️ Deblochează {ip}", callback_data=f"unblk:{ip}"),
+            InlineKeyboardButton("✔️ OK, lasă blocat", callback_data="cancel"),
+        ]])
+    ttl = cfg.response.auto_block.default_ttl_s
+    hours = ttl // 3600
+    label = f"🚫 Blochează {ip}" + (f" ({hours}h)" if ttl else " (permanent)")
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(label, callback_data=f"blk:{ip}:{ttl}"),
+        InlineKeyboardButton("❌ Ignoră", callback_data="cancel"),
+    ]])
+
+
+# --- commands --------------------------------------------------------------
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db: Database = context.bot_data["db"]
+    counts = await inc_repo.open_counts(db)
+    live = await health_repo.live_status(db)
+    assets = await assets_repo.list_all(db)
+    up = sum(1 for a in assets if (s := live.get(a.id)) and s.status == "up")
+    down = sum(1 for a in assets if (s := live.get(a.id)) and s.status == "down")
+
+    sev_line = " ".join(
+        f"{_SEV_EMOJI[s]}{counts[s]}" for s in ("critical", "high", "medium", "low") if counts.get(s)
+    ) or "niciun incident deschis"
+    text = (
+        f"🛡️ <b>Sentinel {_esc(__version__)}</b>\n"
+        f"Incidente deschise: <b>{counts['total']}</b>  {sev_line}\n"
+        f"Servicii: 🟢 {up} active · 🔴 {down} picate · {len(assets)} total\n"
+        f"Comenzi: /incidents /incident /services /health"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def cmd_incidents(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db: Database = context.bot_data["db"]
+    rows = await inc_repo.list_incidents(db, status="open", limit=10)
+    if not rows:
+        await update.message.reply_text("Niciun incident deschis. 🎉")
+        return
+    blocks = [format_incident(r) for r in rows]
+    await update.message.reply_text("\n\n".join(blocks), parse_mode=ParseMode.HTML)
+
+
+async def cmd_patches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/patches` — list plans awaiting a decision, `/patch <id>` to see one."""
+    from sentinel.db.repo import patches as patch_repo
+    from sentinel.telegram import patch_flow
+
+    db: Database = context.bot_data["db"]
+    cfg: Config = context.bot_data["cfg"]
+
+    if context.args and context.args[0].isdigit():
+        row = await patch_repo.get_plan(db, int(context.args[0]))
+        if row is None:
+            await update.message.reply_text("Plan inexistent.")
+            return
+        if row.status != "validated":
+            await update.message.reply_text(
+                patch_flow.format_plan(row) + f"\n\nStare: <b>{row.status}</b> — "
+                "nu poate fi aprobat.", parse_mode=ParseMode.HTML)
+            return
+        if not _can_act(cfg, update.effective_chat.id):
+            await update.message.reply_text(patch_flow.format_plan(row),
+                                            parse_mode=ParseMode.HTML)
+            return
+        await patch_flow.send_plan_for_approval(
+            context.bot, db, update.effective_chat.id, row)
+        return
+
+    rows = await patch_repo.list_plans(db, limit=10)
+    pending = [r for r in rows if r.status == "validated"]
+    if not pending:
+        await update.message.reply_text(
+            "Niciun plan de patch în așteptare." if not rows else
+            "Niciun plan validat în așteptare.\nUltimele: "
+            + ", ".join(f"#{r.id} ({r.status})" for r in rows[:5]))
+        return
+    lines = ["🩹 <b>Planuri în așteptare</b>"]
+    for r in pending:
+        target = r.plan.get("target", {}).get("asset_name", "?")
+        lines.append(f"• #{r.id} — {_esc(target)} · risc {_esc(r.risk_level or '?')} "
+                     f"· <code>/patch {r.id}</code>")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def on_patch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Route every patch button. Role is checked here, once, before any branch —
+    a viewer must not be able to dry-run either, since that still runs commands."""
+    cfg: Config = context.bot_data["cfg"]
+    query = update.callback_query
+    await query.answer()
+    if not _authorized(cfg, update) or not _can_act(cfg, update.effective_chat.id):
+        await query.edit_message_text("Neautorizat.")
+        return
+
+    from sentinel.telegram import patch_flow
+    data = query.data or ""
+    prefix, _, rest = data.partition(":")
+    try:
+        if prefix == "pap1":
+            await patch_flow.on_stage1(update, context, rest)
+        elif prefix == "pap2":
+            await patch_flow.on_stage2(update, context, rest)
+        elif prefix == "pdry":
+            await patch_flow.on_dry_run(update, context, int(rest))
+        elif prefix == "prej":
+            await patch_flow.on_reject(update, context, int(rest))
+    except Exception as exc:  # noqa: BLE001 - never leave the operator staring at a spinner
+        log.error("patch callback failed", extra={"data": prefix, "detail": str(exc)})
+        await query.edit_message_text(f"Eroare: {_esc(exc)}")
+
+
+async def _close_incident(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                          status: str, label: str) -> None:
+    """Shared body for /resolve and /fp.
+
+    The status is a parameter rather than shared state: `bot_data` is global
+    across every chat, so stashing it there would let two operators acting at
+    the same moment swap each other's verdict.
+    """
+    cfg: Config = context.bot_data["cfg"]
+    if not _can_act(cfg, update.effective_chat.id):
+        await update.message.reply_text("Doar owner/operator pot închide incidente.")
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "Folosire: <code>/resolve &lt;id&gt; [notă]</code>\n"
+            "sau <code>/fp &lt;id&gt;</code> pentru fals-pozitiv.",
+            parse_mode=ParseMode.HTML)
+        return
+
+    db: Database = context.bot_data["db"]
+    incident_id = int(context.args[0])
+    note = " ".join(context.args[1:])[:300] or None
+
+    inc = await inc_repo.get_incident(db, incident_id)
+    if inc is None:
+        await update.message.reply_text("Incident inexistent.")
+        return
+    await inc_repo.set_status(db, incident_id, status, note=note,
+                              by=f"telegram:{update.effective_chat.id}")
+    await update.message.reply_text(
+        f"✅ Incident #{incident_id} marcat <b>{label}</b>.\n<i>{_esc(inc.title)}</i>",
+        parse_mode=ParseMode.HTML)
+
+
+async def cmd_resolve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/resolve <id> [notă]` — close an incident from the phone that alerted you.
+
+    The alert arrives here, so the dismissal belongs here too: making someone
+    open a laptop to clear a known-benign incident is how a queue stops being read.
+    """
+    await _close_incident(update, context, "resolved", "rezolvat")
+
+
+async def cmd_false_positive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/fp <id>` — closes it too, but records that the RULE was wrong. That
+    number is the one worth watching when deciding which threshold to relax."""
+    await _close_incident(update, context, "false_positive", "fals-pozitiv")
+
+
+async def cmd_incident(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db: Database = context.bot_data["db"]
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Folosire: <code>/incident &lt;id&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+    inc = await inc_repo.get_incident(db, int(context.args[0]))
+    if inc is None:
+        await update.message.reply_text("Incident inexistent.")
+        return
+    dets = await inc_repo.incident_detections(db, inc.id, limit=5)
+    text = format_incident(inc)
+    if dets:
+        det_lines = "\n".join(
+            f"• {_esc(d['ts'].strftime('%H:%M:%S'))} {_esc(d['rule_id'])} [{_esc(d['severity'])}]"
+            for d in dets
+        )
+        text += f"\n\n<b>Detecții recente</b>\n{det_lines}"
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def cmd_services(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db: Database = context.bot_data["db"]
+    assets = await assets_repo.list_all(db)
+    live = await health_repo.live_status(db)
+    lines = ["🖥️ <b>Servicii</b>"]
+    for a in assets:
+        s = live.get(a.id)
+        status = s.status if s else "unknown"
+        lat = f" {s.latency_ms}ms" if s and s.latency_ms is not None else ""
+        lines.append(f"{_STATUS_EMOJI.get(status, '⚪')} {_esc(a.name)}{lat}")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db: Database = context.bot_data["db"]
+    cap = await capacity_repo.latest(db)
+    if cap is None:
+        await update.message.reply_text("Nicio măsurătoare de capacitate încă.")
+        return
+    disks = " · ".join(f"{_esc(m)} {d['used_pct']}%" for m, d in cap.disks.items())
+    text = (
+        f"📊 <b>Capacitate</b>\n"
+        f"CPU: {cap.cpu_pct}% · încărcare: {cap.load1}\n"
+        f"RAM disponibil: {cap.mem_available_mb} MB / {cap.mem_total_mb}\n"
+        f"Disc: {disks}\n"
+        f"Conexiuni TCP: {cap.conn_count}"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+# --- response commands (P5) -----------------------------------------------
+from sentinel.telegram.bot_ttl import parse_ttl as _parse_ttl  # noqa: E402
+
+
+async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: Config = context.bot_data["cfg"]
+    if not _can_act(cfg, update.effective_chat.id):
+        await _deny_viewer(update)
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Folosire: <code>/block &lt;ip&gt; [durată: 1h|30m|3600|perm]</code>",
+            parse_mode=ParseMode.HTML)
+        return
+    ip = context.args[0]
+    ttl = _parse_ttl(context.args[1] if len(context.args) > 1 else None)
+    ttl_label = "permanent" if ttl is None else (f"{ttl // 3600}h" if ttl >= 3600 else f"{ttl}s")
+
+    # Confirm before acting. A block is reversible, but a fat-fingered address is
+    # still an outage for whoever is behind it, so it gets a second tap.
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"✅ Blochează {ip} ({ttl_label})", callback_data=f"blk:{ip}:{ttl if ttl is not None else 0}"),
+        InlineKeyboardButton("❌ Anulează", callback_data="cancel"),
+    ]])
+    await update.message.reply_text(
+        f"Confirmi blocarea <code>{_esc(ip)}</code> pentru {ttl_label}?",
+        parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: Config = context.bot_data["cfg"]
+    query = update.callback_query
+    await query.answer()
+    if not _authorized(cfg, update) or not _can_act(cfg, update.effective_chat.id):
+        await query.edit_message_text("Neautorizat.")
+        return
+    data = query.data or ""
+    if data == "cancel":
+        await query.edit_message_text("Anulat.")
+        return
+    if data.startswith("unblk:"):
+        ip = data.split(":", 1)[1]
+        db = context.bot_data["db"]
+        try:
+            await actions.unblock(db, ip, by=f"telegram:{update.effective_chat.id}")
+            await query.edit_message_text(
+                f"↩️ Deblocat <code>{_esc(ip)}</code>.", parse_mode=ParseMode.HTML)
+        except Exception as exc:  # noqa: BLE001
+            await query.edit_message_text(f"Nu am putut debloca: {_esc(exc)}")
+        return
+    if data.startswith("blk:"):
+        _, ip, ttl_s = data.split(":", 2)
+        ttl = int(ttl_s) or None
+        db: Database = context.bot_data["db"]
+        by = f"telegram:{update.effective_chat.id}"
+        try:
+            await actions.block(db, ip, ttl=ttl, reason="blocare manuală Telegram", by=by)
+            await query.edit_message_text(f"🛡️ Blocat <code>{_esc(ip)}</code>.", parse_mode=ParseMode.HTML)
+        except actions.BlockRefused as exc:
+            await query.edit_message_text(f"Refuzat: {_esc(exc)}")
+        except ExecutorRejected as exc:
+            await query.edit_message_text(f"Executorul a refuzat: {_esc(exc)}")
+        except ExecutorUnavailable as exc:
+            await query.edit_message_text(f"Executorul e indisponibil: {_esc(exc)}")
+
+
+async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: Config = context.bot_data["cfg"]
+    if not _can_act(cfg, update.effective_chat.id):
+        await _deny_viewer(update)
+        return
+    if not context.args:
+        await update.message.reply_text("Folosire: <code>/unblock &lt;ip&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+    ip = context.args[0]
+    db: Database = context.bot_data["db"]
+    try:
+        await actions.unblock(db, ip, by=f"telegram:{update.effective_chat.id}")
+        await update.message.reply_text(f"Deblocat <code>{_esc(ip)}</code>.", parse_mode=ParseMode.HTML)
+    except (ExecutorRejected, ExecutorUnavailable) as exc:
+        await update.message.reply_text(f"Eroare: {_esc(exc)}")
+
+
+async def cmd_blocklist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    db: Database = context.bot_data["db"]
+    blocks = await blocklist_repo.list_active(db, limit=30)
+    live = await actions.live_count()
+    if not blocks:
+        await update.message.reply_text(f"Blocklist gol. (nftables: {live if live >= 0 else '?'} elemente)")
+        return
+    lines = [f"🚫 <b>Blocklist</b> — {len(blocks)} active (nftables: {live if live >= 0 else '?'})"]
+    for b in blocks:
+        exp = b.expires_at.strftime("%m-%d %H:%M") if b.expires_at else "permanent"
+        lines.append(f"<code>{_esc(b.ip)}</code> · {exp} · {_esc(b.created_by)}")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_panic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: Config = context.bot_data["cfg"]
+    if not _can_act(cfg, update.effective_chat.id):
+        await _deny_viewer(update)
+        return
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🚨 Golește TOT blocklistul", callback_data="flush"),
+        InlineKeyboardButton("❌ Anulează", callback_data="cancel"),
+    ]])
+    await update.message.reply_text(
+        "Confirmi golirea întregului blocklist? (deblochează toate IP-urile)", reply_markup=kb)
+
+
+async def on_flush_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: Config = context.bot_data["cfg"]
+    query = update.callback_query
+    await query.answer()
+    if not _can_act(cfg, update.effective_chat.id):
+        await query.edit_message_text("Neautorizat.")
+        return
+    db: Database = context.bot_data["db"]
+    try:
+        await actions.flush(db, by=f"telegram:{update.effective_chat.id}", reason="panic Telegram")
+        await query.edit_message_text("🚨 Blocklist golit.")
+    except (ExecutorRejected, ExecutorUnavailable) as exc:
+        await query.edit_message_text(f"Eroare: {_esc(exc)}")
+
+
+# --- push loop -------------------------------------------------------------
+async def _push_loop(app: Application, cfg: Config, db: Database) -> None:
+    interval = 15
+    while True:
+        try:
+            incidents = await inc_repo.unnotified(db, min_severity=cfg.telegram.min_severity)
+            for inc in incidents:
+                text = "🚨 " + format_incident(inc, header="INCIDENT NOU")
+                kb = _incident_block_kb(inc, cfg)
+                for chat_id in cfg.telegram.allowed_chat_ids:
+                    try:
+                        await app.bot.send_message(
+                            chat_id, text, parse_mode=ParseMode.HTML, reply_markup=kb)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("push send failed", extra={"chat_id": chat_id, "detail": str(exc)})
+                await inc_repo.mark_notified(db, inc.id)
+                if incidents:
+                    log.info("incident pushed", extra={"incident_id": inc.id, "severity": inc.severity})
+        except Exception as exc:  # noqa: BLE001
+            log.error("push loop error", extra={"detail": str(exc)})
+        await asyncio.sleep(interval)
+
+
+def build_application(cfg: Config, secrets: Secrets) -> Application:
+    token = secrets.require("TELEGRAM_BOT_TOKEN")
+    app = Application.builder().token(token).build()
+
+    async def post_init(application: Application) -> None:
+        db = Database(cfg)
+        await db.connect()
+        application.bot_data["db"] = db
+        application.bot_data["cfg"] = cfg
+        application.bot_data["push_task"] = asyncio.create_task(_push_loop(application, cfg, db))
+        log.info("telegram bot ready", extra={"chats": len(cfg.telegram.allowed_chat_ids)})
+
+    async def post_shutdown(application: Application) -> None:
+        task = application.bot_data.get("push_task")
+        if task:
+            task.cancel()
+        db = application.bot_data.get("db")
+        if db:
+            await db.close()
+
+    app.post_init = post_init
+    app.post_shutdown = post_shutdown
+
+    app.add_handler(CommandHandler("start", _guard(cmd_status)))
+    app.add_handler(CommandHandler("status", _guard(cmd_status)))
+    app.add_handler(CommandHandler("incidents", _guard(cmd_incidents)))
+    app.add_handler(CommandHandler("incident", _guard(cmd_incident)))
+    app.add_handler(CommandHandler("resolve", _guard(cmd_resolve)))
+    app.add_handler(CommandHandler("fp", _guard(cmd_false_positive)))
+    app.add_handler(CommandHandler("patches", _guard(cmd_patches)))
+    app.add_handler(CommandHandler("patch", _guard(cmd_patches)))
+    app.add_handler(CommandHandler("services", _guard(cmd_services)))
+    app.add_handler(CommandHandler("health", _guard(cmd_health)))
+    # Response (P5): still read-mostly, but these can change firewall state.
+    app.add_handler(CommandHandler("block", _guard(cmd_block)))
+    app.add_handler(CommandHandler("unblock", _guard(cmd_unblock)))
+    app.add_handler(CommandHandler("blocklist", _guard(cmd_blocklist)))
+    app.add_handler(CommandHandler("panic", _guard(cmd_panic)))
+    # Inline confirm buttons. The callbacks re-check authorisation themselves,
+    # so they are registered without the message-oriented _guard wrapper.
+    # Patch buttons first: they carry opaque tokens and must not fall through to
+    # the generic handler, which would treat the token as an address.
+    app.add_handler(CallbackQueryHandler(on_patch_callback,
+                                         pattern=r"^(pap1:|pap2:|pdry:|prej:)"))
+    app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(blk:|unblk:|cancel$)"))
+    app.add_handler(CallbackQueryHandler(on_flush_callback, pattern=r"^flush$"))
+    return app

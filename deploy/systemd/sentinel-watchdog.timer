@@ -1,0 +1,16 @@
+[Unit]
+Description=Run the Sentinel anti-lockout watchdog every 60 seconds
+# No Requires= on anything. This timer must fire even when every other
+# Sentinel unit is dead — that is the situation it exists for.
+
+[Timer]
+OnBootSec=90
+OnUnitActiveSec=60
+AccuracySec=5
+# Persistent=false on purpose: after downtime the concern is the *current*
+# state, not catching up on missed runs.
+Persistent=false
+Unit=sentinel-watchdog.service
+
+[Install]
+WantedBy=timers.target

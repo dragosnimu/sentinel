@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Eroare {{ status }} · Sentinel{% endblock %}
+{% block body_class %}auth{% endblock %}
+{% block main_class %}auth-shell{% endblock %}
+{% block chrome %}{% endblock %}
+
+{% block content %}
+<div class="auth-card">
+  <div class="auth-head">
+    <span class="brand-mark brand-mark-lg" aria-hidden="true"></span>
+    <h1>{{ status }}</h1>
+  </div>
+
+  {#
+    `detail` is set by our own HTTPException raises — a role refusal, a bad
+    request. It never carries an exception message: unhandled errors are caught
+    separately and answer with a fixed string, because a stack trace or a query
+    fragment in a 500 body on a public dashboard is free reconnaissance.
+  #}
+  <p class="muted">
+    {% if status == 403 %}
+      Nu ai acces la această resursă.
+    {% elif status == 404 %}
+      Pagina nu există.
+    {% elif status == 429 %}
+      Prea multe cereri. Încearcă mai târziu.
+    {% else %}
+      {{ detail or 'A apărut o eroare.' }}
+    {% endif %}
+  </p>
+
+  {% if status == 403 and detail %}
+  <p class="alert alert-error small">{{ detail }}</p>
+  {% endif %}
+
+  <a href="/" class="btn btn-quiet btn-block">Înapoi la panou</a>
+</div>
+{% endblock %}

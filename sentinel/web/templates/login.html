@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block title %}Autentificare · Sentinel{% endblock %}
+{% block body_class %}auth{% endblock %}
+{% block main_class %}auth-shell{% endblock %}
+
+{# No topbar on the login page: nothing to navigate to, and nothing to leak. #}
+{% block chrome %}{% endblock %}
+
+{% block content %}
+<div class="auth-card">
+  <div class="auth-head">
+    <span class="brand-mark brand-mark-lg" aria-hidden="true"></span>
+    <h1>Sentinel</h1>
+    {% if domain %}<p class="muted mono">{{ domain }}</p>{% endif %}
+  </div>
+
+  {% if error %}
+  {# role=alert so a screen reader announces it without the user hunting for it #}
+  <p class="alert alert-error" role="alert">{{ error }}</p>
+  {% endif %}
+
+  <form method="post" action="/login" autocomplete="on">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+    <label for="username">Utilizator</label>
+    <input id="username" name="username" type="text"
+           value="{{ username or '' }}"
+           autocomplete="username"
+           autocapitalize="none" spellcheck="false"
+           required maxlength="64" autofocus>
+
+    <label for="password">Parolă</label>
+    <input id="password" name="password" type="password"
+           autocomplete="current-password"
+           required maxlength="1024">
+
+    <button type="submit" class="btn btn-primary btn-block">Continuă</button>
+  </form>
+
+  <p class="auth-note">
+    Autentificarea cere un al doilea factor. Dacă ai pierdut accesul la aplicația
+    de autentificare, deblocarea se face pe server:
+    <code>sentinel web --enroll-totp --username &lt;user&gt;</code>
+  </p>
+</div>
+{% endblock %}

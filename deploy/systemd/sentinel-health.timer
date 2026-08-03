@@ -1,0 +1,14 @@
+[Unit]
+Description=Probe service availability and host capacity every 30 seconds
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=30
+AccuracySec=5
+# A gap in samples is an outage record, not something to backfill: catching up
+# on missed probes would invent uptime data that was never measured.
+Persistent=false
+Unit=sentinel-health.service
+
+[Install]
+WantedBy=timers.target

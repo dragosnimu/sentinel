@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% set active = 'account' %}
+{% block title %}Cont · Sentinel{% endblock %}
+
+{% block content %}
+<h1>Cont</h1>
+
+<div class="grid">
+  <section class="card">
+    <h2>Identitate</h2>
+    <dl class="kv">
+      <dt>Utilizator</dt><dd class="mono">{{ user.username }}</dd>
+      <dt>Rol</dt><dd><span class="role role-{{ user.role }}">{{ user.role }}</span></dd>
+      <dt>Al doilea factor</dt>
+      <dd>
+        <span class="dot dot-{{ 'ok' if user.totp_confirmed else 'bad' }}"></span>
+        {{ 'configurat' if user.totp_confirmed else 'NECONFIGURAT' }}
+      </dd>
+    </dl>
+    <p class="muted small">
+      Rolurile și parolele se schimbă pe server, nu din interfață. Un dashboard
+      care își poate escalada propriile privilegii transformă o compromitere de
+      interfață într-o preluare de control:
+      <code>sentinel web --set-password --username {{ user.username }}</code>
+    </p>
+  </section>
+
+  <section class="card">
+    <h2>Sesiuni active</h2>
+    {% if sessions %}
+    <ul class="list">
+      {% for s in sessions %}
+      <li>
+        <span class="mono">{{ s.ip or '—' }}</span>
+        {% if s.id == current_session_id %}<span class="badge">aceasta</span>{% endif %}
+        <br>
+        <span class="muted small">
+          creată {{ s.created_at.strftime('%Y-%m-%d %H:%M') }} ·
+          activă {{ s.last_seen_at.strftime('%H:%M') }} ·
+          expiră {{ s.expires_at.strftime('%Y-%m-%d %H:%M') }}
+        </span>
+        {% if s.user_agent %}
+        <br><span class="muted small truncate">{{ s.user_agent }}</span>
+        {% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+    <p class="muted small">
+      Dacă vezi o sesiune pe care nu o recunoști, revocă tot de pe server:
+      <code>sentinel web --revoke-sessions --username {{ user.username }}</code>
+      — apoi schimbă parola.
+    </p>
+    {% else %}
+    <p class="muted">Nicio sesiune activă în afară de aceasta.</p>
+    {% endif %}
+  </section>
+</div>
+
+<h2>Jurnal de audit — acțiuni din interfață</h2>
+<p class="muted small">
+  Jurnalul complet este înlănțuit prin hash și include operațiile privilegiate
+  scrise de executor. Aici sunt doar cele venite din interfața web, ultimele 7 zile.
+</p>
+
+{% if audit %}
+<div class="table-scroll">
+  <table>
+    <thead>
+      <tr><th>Când (UTC)</th><th>Actor</th><th>Operație</th><th>Țintă</th><th>Rezultat</th></tr>
+    </thead>
+    <tbody>
+    {% for a in audit %}
+      <tr class="{{ 'row-bad' if a.result != 'ok' }}">
+        <td class="mono nowrap">{{ a.at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+        <td class="mono">{{ a.actor }}</td>
+        <td>{{ a.operation }}</td>
+        <td class="mono muted">{{ a.target or '—' }}</td>
+        <td>{{ a.result }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<p class="muted">Nicio înregistrare.</p>
+{% endif %}
+
+{% endblock %}

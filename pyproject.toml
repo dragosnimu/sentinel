@@ -1,0 +1,135 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sentinel"
+dynamic = ["version"]
+description = "Sentinel — autonomous cybersecurity agent for a single Linux server"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+authors = [{ name = "Sentinel" }]
+
+# Runtime dependencies. Pinned exactly in requirements.txt; hash-pinned in
+# requirements-lock.txt, which is what the server installer actually uses.
+dependencies = [
+    "asyncpg>=0.29,<0.31",
+    "pydantic>=2.7,<3",
+    "pyyaml>=6.0,<7",
+    "fastapi>=0.111,<0.116",
+    "uvicorn[standard]>=0.30,<0.35",
+    "jinja2>=3.1,<4",
+    "python-multipart>=0.0.9,<0.1",
+    "itsdangerous>=2.2,<3",
+    "argon2-cffi>=23.1,<24",
+    "pyotp>=2.9,<3",
+    "qrcode>=7.4,<9",
+    "httpx>=0.27,<0.29",
+    "python-telegram-bot>=21.3,<22",
+    "psutil>=5.9,<7",
+    "maxminddb>=2.6,<3",
+    "cryptography>=42,<45",
+    "systemd-python>=235; sys_platform == 'linux'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2,<9",
+    "pytest-asyncio>=0.23,<0.25",
+    "pytest-cov>=5,<6",
+    "ruff>=0.5,<0.9",
+    "mypy>=1.10,<2",
+    "types-PyYAML",
+]
+scan = [
+    # Installed into an isolated venv on the server, not into the main one.
+    "pip-audit>=2.7,<3",
+]
+
+[project.scripts]
+sentinel = "sentinel.__main__:main"
+
+[tool.setuptools.dynamic]
+version = { file = "VERSION" }
+
+[tool.setuptools.packages.find]
+include = ["sentinel*"]
+exclude = ["tests*", "deploy*", "scripts*", "docs*", "executor*"]
+
+[tool.setuptools.package-data]
+sentinel = [
+    "web/templates/**/*.html",
+    "web/static/**/*",
+    "detect/rules.d/*.yml",
+    "ai/prompts/*.md",
+    "intel/feeds.d/*.yml",
+    "db/migrations/*.sql",
+]
+
+# ---------------------------------------------------------------------------
+# Linting
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["deploy", "scripts"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",    # pycodestyle
+    "F",         # pyflakes
+    "I",         # isort
+    "B",         # bugbear
+    "UP",        # pyupgrade
+    "S",         # flake8-bandit — security. This is a security tool; keep it on.
+    "ASYNC",     # flake8-async
+    "T20",       # no print() in library code
+    "RUF",
+]
+ignore = [
+    "S101",   # assert is fine in tests
+    "E501",   # line length handled by the formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "T20"]
+# The executor deliberately runs subprocesses; it has its own hostile-input
+# test suite and a hard-coded allowlist. Bandit's blanket subprocess warnings
+# are noise there, but S602 (shell=True) stays banned everywhere.
+"executor/*.py" = ["S603", "S607"]
+"sentinel/util/shellsafe.py" = ["S603"]
+
+[tool.ruff.lint.flake8-bandit]
+check-typed-exception = true
+
+# ---------------------------------------------------------------------------
+# Type checking
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+strict_equality = true
+exclude = ["^tests/", "^deploy/", "^scripts/"]
+
+[[tool.mypy.overrides]]
+module = ["telegram.*", "systemd.*", "maxminddb.*", "qrcode.*", "pyotp.*"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q --strict-markers"
+markers = [
+    "integration: requires a live PostgreSQL instance",
+    "security: hostile-input and injection tests (must never be skipped in CI)",
+    "slow: takes more than a few seconds",
+]

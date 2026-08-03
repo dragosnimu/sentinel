@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% set active = 'incidents' %}
+{% block title %}Incident #{{ inc.id }} · Sentinel{% endblock %}
+
+{% block content %}
+<p class="muted small"><a href="/incidents">← Incidente</a></p>
+<h1><span class="dot dot-{{ inc.sev_dot }}"></span> {{ inc.title }}</h1>
+<p class="page-sub">
+  Incident #{{ inc.id }} · stare: <strong>{{ status_ro.get(inc.status, inc.status) }}</strong>
+</p>
+
+{% if request.query_params.get('msg') %}
+<div class="notice notice-info"><strong>{{ request.query_params.get('msg') }}</strong></div>
+{% endif %}
+
+{% if can_act %}
+{#
+  Closing is not deletion: the evidence and the timeline stay. If the same actor
+  trips the same rule again a NEW incident is raised rather than this one
+  reopening quietly — something you closed coming back is worth seeing.
+#}
+<div class="card" style="margin-bottom:1.2rem">
+  <h2>Închide incidentul</h2>
+  <form method="post" action="/incidents/{{ inc.id }}/status">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label for="note" style="margin-top:0">Notă (opțional — de ce închizi)</label>
+    <input type="text" id="note" name="note" maxlength="300"
+           placeholder="ex: scanare de rutină, sursă cunoscută, remediat">
+    <div class="filterbar" style="margin:1rem 0 0">
+      {% if inc.status == 'open' %}
+      <button type="submit" name="status" value="acknowledged" class="btn">Confirmă (lucrez la el)</button>
+      {% endif %}
+      <button type="submit" name="status" value="resolved" class="btn btn-primary">Rezolvat</button>
+      <button type="submit" name="status" value="false_positive" class="btn">Fals-pozitiv</button>
+      <button type="submit" name="status" value="suppressed" class="btn">Suprimă</button>
+      {% if inc.status not in ('open', 'acknowledged') %}
+      <button type="submit" name="status" value="open" class="btn btn-quiet">Redeschide</button>
+      {% endif %}
+    </div>
+  </form>
+</div>
+{% endif %}
+
+<div class="grid">
+  <section class="card">
+    <h2>Rezumat</h2>
+    <dl class="kv">
+      <dt>Severitate</dt><dd>{{ inc.severity }}{% if inc.ai_severity %} <span class="muted">(AI: {{ inc.ai_severity }})</span>{% endif %}</dd>
+      <dt>Stare</dt><dd>{{ status_ro.get(inc.status, inc.status) }}</dd>
+      <dt>Sursă</dt><dd class="mono">{{ inc.actor_key or '—' }}</dd>
+      <dt>Detecții</dt><dd>{{ inc.detection_count }}</dd>
+      <dt>Prima</dt><dd class="mono">{{ inc.first_detection_at.strftime('%Y-%m-%d %H:%M:%S') }} UTC</dd>
+      <dt>Ultima</dt><dd class="mono">{{ inc.last_detection_at.strftime('%Y-%m-%d %H:%M:%S') }} UTC</dd>
+      <dt>Telegram</dt><dd>{{ 'trimis ' + inc.notified_at.strftime('%H:%M') if inc.notified_at else 'nu' }}</dd>
+    </dl>
+    {% if inc.summary %}<p>{{ inc.summary }}</p>{% endif %}
+  </section>
+
+  {% if verdict %}
+  <section class="card">
+    <h2>Analiză AI</h2>
+    <dl class="kv">
+      <dt>Severitate AI</dt><dd>{{ verdict.severity or '—' }}</dd>
+      <dt>Fals-pozitiv?</dt><dd>{{ 'DA' if verdict.is_false_positive else 'nu' }}</dd>
+      <dt>Acțiune sugerată</dt><dd>{{ verdict.recommended_action or '—' }}</dd>
+      <dt>Încredere</dt><dd>{{ '%.0f%%' % (verdict.confidence * 100) if verdict.confidence is not none else '—' }}</dd>
+      {% if verdict.prompt_injection_detected %}<dt>⚠️</dt><dd class="mono">tentativă de prompt-injection detectată în dovezi</dd>{% endif %}
+    </dl>
+    {% if verdict.summary_ro %}<p>{{ verdict.summary_ro }}</p>{% endif %}
+    <p class="muted small">Verdict deterministic: <strong>{{ inc.severity }}</strong>. AI-ul comentează, nu suprascrie.</p>
+  </section>
+  {% endif %}
+
+  <section class="card">
+    <h2>Detecții</h2>
+    {% if detections %}
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Când</th><th>Regulă</th><th>Sev.</th><th>Evidență</th></tr></thead>
+        <tbody>
+        {% for d in detections %}
+          <tr>
+            <td class="mono nowrap">{{ d.ts.strftime('%m-%d %H:%M:%S') }}</td>
+            <td class="mono">{{ d.rule_id }}</td>
+            <td>{{ d.severity }}</td>
+            <td class="muted small">
+              {% if d.evidence.fails %}{{ d.evidence.fails }} eșecuri{% endif %}
+              {% if d.evidence.usernames %}· useri: {{ d.evidence.usernames | join(', ') }}{% endif %}
+              {% if d.evidence.notfound %}{{ d.evidence.notfound }} × 404 pe {{ d.evidence.distinct_paths }} căi{% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<p class="muted">Nicio detecție înregistrată.</p>{% endif %}
+  </section>
+</div>
+
+<p class="muted small">
+  Blocarea se face din Telegram (buton pe alertă) sau din pagina Blocklist.
+  Deciziile de răspuns rămân la tine; auto-block este oprit.
+</p>
+{% endblock %}

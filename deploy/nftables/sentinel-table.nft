@@ -1,0 +1,134 @@
+#!/usr/sbin/nft -f
+#
+# Sentinel's blocking table.
+#
+# Read this before changing anything — several properties here are load-bearing
+# safety features, not stylistic choices.
+#
+#   1. `policy accept` on every base chain.
+#      Sentinel is a DENY-LISTER, not a firewall. It drops what it has been told
+#      to drop and accepts everything else. This means Sentinel cannot lock you
+#      out by failing, crashing, or being misconfigured — only by explicitly
+#      blocking your address. That single decision removes most of the lockout
+#      risk in the entire design.
+#
+#   2. Priority -5.
+#      Evaluates before a default `filter` table but does not replace it. If
+#      firewalld is ever enabled, both tables coexist: nftables evaluates every
+#      table's hooks, so Sentinel does not have to own the firewall to work.
+#
+#   3. Allowlist rules come before blocklist rules.
+#      An address in the allowlist is accepted and never reaches a drop, even if
+#      a bug put it in the blocklist too.
+#
+#   4. `flags timeout` on the blocklist sets.
+#      The KERNEL expires elements. No cron sweeper, no drift if Sentinel is
+#      down, and a block placed by a daemon that then dies still expires on
+#      schedule.
+#
+#   5. Nothing here is persisted to /etc/sysconfig/nftables.conf.
+#      A reboot clears every block. On start, blocklist.py re-applies the
+#      non-expired ones from the database. Rebooting is therefore always a way
+#      out of a self-inflicted block — deliberately.
+#
+#   6. The forward chain matters.
+#      Traffic to a Docker-published port traverses `forward`, not `input`.
+#      Blocking only `input` would leave every containerised service on the host
+#      reachable by an attacker Sentinel believes it has blocked — a silent and
+#      complete failure of the thing it was asked to do.
+
+table inet sentinel {
+
+    # -- Allowlist ---------------------------------------------------------
+    # Populated by install.sh BEFORE the chains below exist, with: the
+    # operator's SSH peer address, RFC1918, loopback, this host's own public
+    # addresses, the resolved addresses of api.telegram.org and
+    # api.anthropic.com (blocking those would silently remove Sentinel's own
+    # alerting and analysis — a failure with no symptom), and everything in
+    # `response.extra_allowlist` from the config.
+    #
+    # The authoritative never-block list is hard-coded in executor/policy.py.
+    # These sets are the enforcement; that file is the decision.
+    set allowlist_v4 {
+        type ipv4_addr
+        flags interval
+        auto-merge
+        comment "never dropped, whatever the blocklist says"
+    }
+
+    set allowlist_v6 {
+        type ipv6_addr
+        flags interval
+        auto-merge
+    }
+
+    # -- Blocklist ---------------------------------------------------------
+    # `size` is a hard ceiling, matching MAX_BLOCKLIST_ELEMENTS in constants.py.
+    # A runaway detector hits the cap and stops rather than black-holing the
+    # internet one /32 at a time.
+    set blocklist_v4 {
+        type ipv4_addr
+        flags timeout, interval
+        size 65536
+        comment "TTL managed by the kernel; re-applied from the DB after reboot"
+    }
+
+    set blocklist_v6 {
+        type ipv6_addr
+        flags timeout, interval
+        size 65536
+    }
+
+    # -- Watchlist ---------------------------------------------------------
+    # Counted, never dropped. `/watch <ip>` puts an address here to measure what
+    # it is actually doing before deciding to block it.
+    set watchlist_v4 {
+        type ipv4_addr
+        flags timeout
+        size 8192
+    }
+
+    set watchlist_v6 {
+        type ipv6_addr
+        flags timeout
+        size 8192
+    }
+
+    chain input {
+        type filter hook input priority -5; policy accept;
+
+        # Established traffic first: an existing SSH session is not re-evaluated
+        # against a rule added after it was opened. Blocking an address does not
+        # kill the operator's own connection mid-command.
+        ct state established,related accept
+        iif lo accept
+
+        ip  saddr @allowlist_v4 accept
+        ip6 saddr @allowlist_v6 accept
+
+        ip  saddr @watchlist_v4 counter
+        ip6 saddr @watchlist_v6 counter
+
+        # The counters are read back into blocklist.hit_count, which is the
+        # honest answer to "was blocking this worth it" — a block with zero hits
+        # stopped nothing.
+        ip  saddr @blocklist_v4 counter drop
+        ip6 saddr @blocklist_v6 counter drop
+    }
+
+    chain forward {
+        type filter hook forward priority -5; policy accept;
+
+        ct state established,related accept
+
+        ip  saddr @allowlist_v4 accept
+        ip6 saddr @allowlist_v6 accept
+
+        # Both directions: saddr catches traffic to the containers, daddr stops
+        # a compromised container reaching a blocked address outbound.
+        ip  saddr @blocklist_v4 counter drop
+        ip  daddr @blocklist_v4 counter drop
+        ip6 saddr @blocklist_v6 counter drop
+        ip6 daddr @blocklist_v6 counter drop
+    }
+}

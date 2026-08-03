@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% set active = 'patches' %}
+{% block title %}Patch-uri · Sentinel{% endblock %}
+
+{% block content %}
+<h1>Planuri de patch</h1>
+<p class="page-sub">
+  Generarea e automată; aplicarea nu este niciodată. Aprobarea se face pe Telegram,
+  în doi pași.
+</p>
+
+{% if msg %}<div class="notice notice-info"><strong>{{ msg }}</strong></div>{% endif %}
+
+{% if not rows %}
+<div class="notice notice-info">
+  <strong>Niciun plan de patch.</strong>
+  <p>Planurile se generează pentru vulnerabilități exploatate activ (KEV) care au
+     o versiune de reparare cunoscută. Momentan nu există niciuna deschisă — ceea
+     ce e o veste bună.</p>
+</div>
+{% endif %}
+
+<div class="table-scroll">
+  <table>
+    <thead>
+      <tr><th>#</th><th>Țintă</th><th>Risc</th><th>Downtime</th>
+          <th>Reversibil</th><th>Stare</th><th>Creat</th></tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr class="{{ 'row-bad' if r.status in ('failed', 'rejected_invalid') }}">
+        <td class="mono"><a href="/patches/{{ r.id }}">{{ r.id }}</a></td>
+        <td class="strong">{{ r.asset }}</td>
+        <td>{{ r.risk_level or '—' }}</td>
+        <td class="num">{{ r.estimated_downtime_s or 0 }}s</td>
+        <td>
+          {%- if r.reversible %}da{% else %}<span class="pill pill-bad">NU</span>{% endif -%}
+          {%- if r.requires_reboot %} <span class="tag tag-exposed">reboot</span>{% endif -%}
+        </td>
+        <td><span class="pill pill-{{ r.pill }}">{{ r.status_ro }}</span></td>
+        <td class="mono nowrap small">{{ r.created_at.strftime('%d.%m %H:%M') }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<h2>Puncte de restaurare</h2>
+{% if not restore_points %}
+<p class="muted">Niciun punct de restaurare. Se creează automat înainte de fiecare patch.</p>
+{% else %}
+<div class="table-scroll">
+  <table>
+    <thead>
+      <tr><th>Punct</th><th>Asset</th><th class="num">Mărime</th>
+          <th>Verificat</th><th>Creat</th></tr>
+    </thead>
+    <tbody>
+      {% for rp in restore_points %}
+      <tr class="{{ 'row-bad' if rp.verify_error }}">
+        <td class="mono small">{{ rp.path.split('/')[-1] }}</td>
+        <td>{{ rp.asset_name or 'host' }}</td>
+        <td class="num">{{ (rp.size_bytes / 1048576) | round(1) }} MB</td>
+        <td>
+          {%- if rp.verify_error %}<span class="pill pill-bad">corupt</span>
+          {%- elif rp.verified_at %}<span class="pill pill-ok">da</span>
+          {%- else %}<span class="pill pill-warn">neverificat</span>{% endif -%}
+        </td>
+        <td class="mono nowrap small">{{ rp.created_at.strftime('%d.%m %H:%M') }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+<p class="muted small" style="margin:.7rem 0 0">
+  Fiecare punct conține <code>restore.sh</code> — funcționează fără Sentinel,
+  fără Python și fără baza de date, și refuză să restaureze o arhivă coruptă.
+</p>
+{% endif %}
+{% endblock %}

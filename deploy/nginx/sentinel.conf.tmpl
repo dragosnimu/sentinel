@@ -1,0 +1,154 @@
+# Sentinel dashboard vhost.
+#
+# LISTENS ON A DEDICATED PORT, NOT 443.
+#
+# This host already serves something on 80 and 443. A monitoring agent that
+# displaces the service it monitors has inverted its purpose, so Sentinel takes
+# a port of its own. Three consequences, all of them deliberate:
+#
+#   1. The dashboard URL carries the port: https://<domain>:<port>
+#   2. There is no HTTP→HTTPS redirect, because Sentinel does not own :80.
+#      A plain-HTTP request to the domain reaches whatever *does* own :80.
+#   3. Certificates cannot come from certbot's HTTP-01 challenge on :80.
+#      install.sh uses a webroot served by the existing :80 service, or a
+#      DNS-01 challenge, or falls back to self-signed. See docs/DEPLOYMENT.md.
+#
+# The port must also be open in the provider's firewall. nftables on this host is
+# a deny-lister with `policy accept`, so it does not block it — but a cloud
+# security group will.
+
+# Rate-limit zones. Keyed on the real client address; if this ever sits behind a
+# CDN, switch to $http_x_forwarded_for AND restrict set_real_ip_from, or an
+# attacker sets the header themselves and the limit becomes decorative.
+limit_req_zone $binary_remote_addr zone=sentinel_login:10m rate=5r/m;
+limit_req_zone $binary_remote_addr zone=sentinel_api:10m   rate=60r/m;
+limit_req_zone $binary_remote_addr zone=sentinel_all:10m   rate=300r/m;
+limit_conn_zone $binary_remote_addr zone=sentinel_conn:10m;
+
+upstream sentinel_app {
+    server 127.0.0.1:@@PORT@@ fail_timeout=5s;
+    keepalive 8;
+}
+
+server {
+    # `listen ... http2`, not `http2 on;`: the standalone directive is nginx
+    # 1.25.1+, and AlmaLinux 9 ships 1.20.1, which rejects it.
+    listen @@PUBLIC_PORT@@ ssl http2;
+    listen [::]:@@PUBLIC_PORT@@ ssl http2;
+    server_name @@DOMAIN@@;
+
+    # certbot rewrites these two lines when it issues a real certificate. Until
+    # then they point at the self-signed placeholder install.sh generates, so
+    # `nginx -t` passes on a fresh host instead of failing before certbot runs.
+    ssl_certificate     /etc/pki/tls/certs/sentinel-selfsigned.crt;
+    ssl_certificate_key /etc/pki/tls/private/sentinel-selfsigned.key;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_session_cache shared:SentinelTLS:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+    ssl_stapling on;
+
+    # Upstream timeouts at server scope so every location inherits them and the
+    # /stream location can override read_timeout without a duplicate-directive
+    # error (they used to live in sentinel-proxy-params.conf, which /stream also
+    # includes).
+    proxy_connect_timeout 5s;
+    proxy_send_timeout    30s;
+    proxy_read_timeout    60s;
+    ssl_stapling_verify on;
+
+    include /etc/nginx/conf.d/sentinel-security-headers.conf;
+
+    # ---------------------------------------------------------------------
+    # OPTIONAL BUT RECOMMENDED: restrict the dashboard to your own addresses.
+    #
+    # The single cheapest hardening available for a public security dashboard,
+    # and it costs nothing operationally — Telegram remains the "from anywhere"
+    # channel and does not depend on this vhost being up.
+    #
+    # Uncomment, fill in, then `nginx -t && systemctl reload nginx`:
+    #
+    #   allow 203.0.113.0/24;      # office
+    #   allow 198.51.100.42/32;    # home
+    #   deny  all;
+    # ---------------------------------------------------------------------
+
+    client_max_body_size 2m;
+    client_body_timeout 15s;
+    client_header_timeout 15s;
+    send_timeout 30s;
+
+    limit_conn sentinel_conn 20;
+    limit_req  zone=sentinel_all burst=100 nodelay;
+
+    # Do not advertise what to look for exploits against.
+    server_tokens off;
+
+    access_log /var/log/nginx/sentinel-access.log;
+    error_log  /var/log/nginx/sentinel-error.log warn;
+
+    # -- Login: the brute-force surface -----------------------------------
+    location = /login {
+        limit_req zone=sentinel_login burst=3 nodelay;
+        limit_req_status 429;
+        include /etc/nginx/conf.d/sentinel-proxy-params.conf;
+        proxy_pass http://sentinel_app;
+    }
+
+    location = /totp {
+        limit_req zone=sentinel_login burst=3 nodelay;
+        include /etc/nginx/conf.d/sentinel-proxy-params.conf;
+        proxy_pass http://sentinel_app;
+    }
+
+    location /api/ {
+        limit_req zone=sentinel_api burst=30 nodelay;
+        include /etc/nginx/conf.d/sentinel-proxy-params.conf;
+        proxy_pass http://sentinel_app;
+    }
+
+    # -- Live event stream -------------------------------------------------
+    location = /stream {
+        include /etc/nginx/conf.d/sentinel-proxy-params.conf;
+        proxy_pass http://sentinel_app;
+        # SSE holds the connection open; buffering would batch events and defeat
+        # the point of a live incident feed. proxy_http_version and the empty
+        # Connection header already come from the include above — repeating them
+        # here is a duplicate-directive error, so /stream only ADDS what differs.
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;
+        chunked_transfer_encoding off;
+    }
+
+    # -- Static assets, all vendored locally -------------------------------
+    location /static/ {
+        alias /opt/sentinel/lib/sentinel/web/static/;
+        expires 7d;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+    }
+
+    # -- Health, for the watchdog and for monitoring ------------------------
+    location = /healthz {
+        include /etc/nginx/conf.d/sentinel-proxy-params.conf;
+        proxy_pass http://sentinel_app;
+        access_log off;
+    }
+
+    location / {
+        include /etc/nginx/conf.d/sentinel-proxy-params.conf;
+        proxy_pass http://sentinel_app;
+    }
+
+    # Anything probing for a CMS is not looking for this dashboard. Answer 444
+    # (close without a response) rather than 404: it costs the scanner a
+    # connection and tells them nothing.
+    location ~* ^/(wp-admin|wp-login|phpmyadmin|administrator|\.env|\.git) {
+        access_log /var/log/nginx/sentinel-probe.log;
+        return 444;
+    }
+}

@@ -1,0 +1,123 @@
+# Notification routing.
+#
+# The failure mode this file exists to prevent is alert fatigue. A channel that
+# fires forty times a day gets muted, and a muted channel protects nothing. The
+# defaults are tuned so that a Telegram notification means "look at this now".
+#
+# Everything is visible in the dashboard regardless of what is routed here.
+
+routing:
+  critical:
+    telegram: true
+    # Critical always passes quiet hours, mutes and digesting. If it is not
+    # worth waking someone for, it is not critical — reclassify the rule.
+    bypass_quiet_hours: true
+    bypass_mute: true
+    digest: false
+  high:
+    telegram: true
+    bypass_quiet_hours: false
+    bypass_mute: false
+    digest: false
+  medium:
+    telegram: true
+    bypass_quiet_hours: false
+    bypass_mute: false
+    # Medium is where storms happen. Batch them.
+    digest: true
+  low:
+    telegram: false
+    digest: true
+  info:
+    telegram: false
+    digest: false
+
+quiet_hours:
+  enabled: false
+  # Local time. Critical still passes; everything else queues and is delivered
+  # in the morning digest.
+  start: "23:00"
+  end: "07:00"
+  timezone: Europe/Bucharest
+
+digest:
+  # More than this many notifications inside the window collapses into a single
+  # summary message with counts and a dashboard link.
+  threshold: 10
+  window_minutes: 5
+  send_at: ["08:00", "20:00"]
+
+dedup:
+  # The same incident fingerprint does not re-notify within this window, no
+  # matter how many detections it accumulates. A brute-force attempt is one
+  # message, not four hundred.
+  window_minutes: 30
+  # An escalation is news even inside the dedup window.
+  renotify_on_severity_increase: true
+
+events:
+  # Which things generate a message at all.
+  incident_opened: true
+  incident_escalated: true
+  incident_resolved: false        # visible in the dashboard; not worth a ping
+
+  auto_block: true
+  # Every auto-block message carries an "↩️ Deblochează" button. A bad block is
+  # one tap from reversal — that property is what makes auto-blocking
+  # acceptable at all, so this should stay on.
+  manual_block: false
+  block_expired: false
+
+  # While auto_block is disabled (the first 72 hours), this is what tells you
+  # what WOULD have been blocked. It is the whole point of observe mode.
+  observe_mode_would_block: true
+
+  vulnerability_new_critical: true
+  vulnerability_new_kev: true
+  vulnerability_new_high: false   # the daily report covers these
+  scan_completed: false
+  scan_failed: true
+
+  patch_plan_generated: true
+  patch_applied: true
+  # Always. A rollback means something went wrong on a production server, and
+  # it bypasses mute and quiet hours regardless of the settings above.
+  patch_rolled_back: true
+
+  service_down: true
+  service_recovered: true
+  capacity_warning: true
+
+  # Sentinel's own health. If ingestion has stopped or the AI budget is
+  # exhausted, silence would otherwise look identical to "nothing is happening".
+  sentinel_unhealthy: true
+  ai_budget_exceeded: true
+  # A broken audit hash chain means someone tampered with the log, or the
+  # database was restored underneath it. Either way it is not routine.
+  audit_chain_broken: true
+
+  # The watchdog flushed the blocklist. Always worth knowing, because it means
+  # blocking is currently off.
+  watchdog_triggered: true
+
+report:
+  daily:
+    enabled: true
+    at: "08:00"
+    # Skip the daily report on days when nothing happened, rather than sending
+    # "0 incidents" and training you to ignore the 08:00 message.
+    skip_if_empty: true
+  weekly:
+    enabled: true
+    day: monday
+    at: "08:00"
+    skip_if_empty: false
+  monthly:
+    enabled: false
+
+limits:
+  # Ceiling on outbound messages. If Sentinel ever tries to exceed this, the
+  # excess is digested rather than dropped, and the fact is logged — a storm
+  # must not silently lose an alert.
+  max_per_hour: 60
+  max_per_day: 300

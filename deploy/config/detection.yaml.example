@@ -1,0 +1,230 @@
+# Detection thresholds.
+#
+# These are the shipped defaults. They are conservative on purpose: a rule that
+# fires too often gets muted, and a muted rule protects nothing. Tune down only
+# after you have watched real traffic for a few days.
+#
+# Every rule here has a documented false-positive profile in
+# .claude/skills/sentinel-soc/references/detection-catalog.md. Read the row
+# before changing a number — most "noisy rule" problems are actually a missing
+# allowlist entry for a monitor or a crawler.
+#
+# `auto_block: true` only takes effect when response.auto_block.enabled is also
+# true in sentinel.yaml, which ships false.
+
+auth:
+  ssh_bruteforce:
+    enabled: true
+    # A broken backup agent with a stale key produces exactly this pattern.
+    # The distinguishing signal is the username: an attacker cycles them, a
+    # broken client repeats one.
+    failures: 10
+    window_s: 120
+    severity: high
+    auto_block: true
+    block_ttl_s: 86400
+
+  ssh_spray:
+    enabled: true
+    # Few attempts each across many usernames. Almost never a false positive,
+    # and more serious than brute force — it implies the attacker has a user
+    # list from somewhere.
+    distinct_users: 8
+    max_attempts_per_user: 3
+    window_s: 300
+    severity: high
+    auto_block: true
+    block_ttl_s: 86400
+
+  ssh_success_after_failures:
+    enabled: true
+    prior_failures: 5
+    window_s: 600
+    severity: critical
+    # Never auto-blocks: if the login succeeded, blocking the address after the
+    # fact accomplishes nothing and might be locking out the operator who
+    # mistyped a passphrase. This one wakes a human instead.
+    auto_block: false
+
+  web_login_bruteforce:
+    enabled: true
+    failures: 15
+    window_s: 120
+    severity: high
+    auto_block: true
+    block_ttl_s: 21600
+    login_paths: [/login, /wp-login.php, /admin, /user/login, /signin]
+
+  sudo_failures:
+    enabled: true
+    failures: 3
+    window_s: 300
+    severity: medium
+    auto_block: false
+
+  new_user_or_key:
+    enabled: true
+    severity: critical
+    auto_block: false
+
+scan:
+  horizontal:
+    enabled: true
+    distinct_ports: 15
+    window_s: 60
+    severity: medium
+    auto_block: true
+    block_ttl_s: 3600
+    # Shodan, Censys and Rapid7 hit every address on the internet. Blocking
+    # them achieves nothing and fills the blocklist.
+    skip_known_scanners: true
+
+  tls_no_request:
+    enabled: true
+    count: 5
+    window_s: 60
+    severity: low
+    # Health checkers do exactly this. Allowlist yours rather than raising it.
+    auto_block: false
+
+web:
+  sqli:
+    enabled: true
+    severity: high
+    auto_block: true
+    block_ttl_s: 21600
+    # A search box where users type an apostrophe is the classic false
+    # positive. Add such endpoints here.
+    exclude_paths: []
+
+  xss:
+    enabled: true
+    severity: medium
+    auto_block: true
+    block_ttl_s: 21600
+    exclude_paths: []
+
+  lfi_traversal:
+    enabled: true
+    severity: high
+    auto_block: true
+    block_ttl_s: 21600
+
+  rce:
+    enabled: true
+    # Command injection, ${jndi:, template-injection markers. Effectively never
+    # a false positive — treat every hit as real.
+    severity: critical
+    auto_block: true
+    block_ttl_s: 86400
+
+  sensitive_path:
+    enabled: true
+    severity: medium
+    auto_block: true
+    block_ttl_s: 21600
+    paths: [/.env, /.git/config, /backup.sql, /phpinfo.php, /actuator, /server-status, /.DS_Store]
+
+  enumeration:
+    enabled: true
+    # A crawler following broken links also produces 404s. The difference is
+    # whether the paths appear in your own HTML or in a wordlist.
+    errors_4xx: 60
+    window_s: 60
+    severity: medium
+    auto_block: true
+    block_ttl_s: 7200
+
+  admin_probe:
+    enabled: true
+    severity: low
+    # Constant internet background noise. Individually meaningless; it matters
+    # only as part of a sequence, which the kill-chain state machine tracks.
+    auto_block: false
+
+dos:
+  request_rate:
+    enabled: true
+    # Floor plus a baseline multiple, so a quiet asset is not held to the same
+    # absolute number as a busy one.
+    floor_per_min: 300
+    baseline_mad_multiple: 6
+    severity: medium
+    auto_block: true
+    block_ttl_s: 7200
+
+  conn_flood:
+    enabled: true
+    concurrent: 200
+    severity: medium
+    auto_block: true
+    block_ttl_s: 7200
+
+host:
+  new_listener:
+    enabled: true
+    severity: high
+  webroot_write:
+    enabled: true
+    severity: critical
+    # CMS caches and log files inside a webroot are legitimate writes. Tune per
+    # asset rather than disabling the rule.
+    exclude_globs: ["*/cache/*", "*/tmp/*", "*.log"]
+  new_suid:
+    enabled: true
+    severity: critical
+  cron_change:
+    enabled: true
+    severity: high
+  pkt_capture:
+    enabled: true
+    severity: medium
+    # Legitimate capture jobs on this host. A monitoring cron that runs tcpdump
+    # every few minutes will otherwise alert hundreds of times a day, and the
+    # rule gets disabled — which is worse than tuning it.
+    # Match on the command line, e.g. "*my-metrics-sampler*".
+    exclude_cmdline: []
+
+anomaly:
+  # All anomaly rules are suppressed while the baseline is in its 14-day
+  # warm-up, and none of them auto-block: a statistical outlier alone is weak
+  # evidence, and blocking on it would take out the first legitimate traffic
+  # spike you ever get.
+  traffic_volume:
+    enabled: true
+    z_threshold: 4.0
+    severity: low
+  error_rate:
+    enabled: true
+    z_threshold: 4.0
+    severity: low
+  bytes_out:
+    enabled: true
+    z_threshold: 4.0
+    # Possible exfiltration. Worth a look even though it is often a backup job.
+    severity: medium
+
+availability:
+  service_down:
+    enabled: true
+    consecutive_failures: 3
+    severity: high
+  capacity_disk:
+    enabled: true
+    warn_pct: 85
+    severity: high
+  capacity_memory:
+    enabled: true
+    # Critical rather than high: on a small host, memory pressure ends with the
+    # OOM killer choosing the largest process — usually the application you are
+    # protecting, not Sentinel. The failure shows up as "the site is down", with
+    # nothing obviously pointing at memory.
+    critical_mb: 500
+    severity: critical
+
+tls:
+  expiring:
+    enabled: true
+    warn_days: 14
+    critical_days: 7
+    severity: medium

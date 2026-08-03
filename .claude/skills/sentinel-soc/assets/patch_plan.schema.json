@@ -1,0 +1,229 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sentinel.local/schemas/patch_plan.schema.json",
+  "title": "Sentinel patch plan",
+  "description": "A safe, reviewable, reversible patching procedure. Structural validity is necessary but not sufficient: patch/validator.py applies additional safety rules (binary allowlist, forbidden targets, backup/rollback coupling) that this schema cannot express.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "target",
+    "vulnerabilities",
+    "risk",
+    "preflight",
+    "backup",
+    "apply",
+    "health_check",
+    "post_verification",
+    "restore_instructions_ro"
+  ],
+  "properties": {
+    "plan_id": { "type": "string", "format": "uuid" },
+    "schema_version": { "type": "integer", "const": 1 },
+    "created_at": { "type": "string", "format": "date-time" },
+
+    "generated_by": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "model": { "type": "string" },
+        "prompt_version": { "type": "string" },
+        "duration_ms": { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asset_id", "asset_name", "stack", "protected"],
+      "properties": {
+        "asset_id": { "type": "integer" },
+        "asset_name": { "type": "string", "minLength": 1 },
+        "stack": { "type": "string", "minLength": 1 },
+        "systemd_unit": { "type": ["string", "null"] },
+        "container": { "type": ["string", "null"] },
+        "webroot": { "type": ["string", "null"] },
+        "repo": { "type": ["string", "null"] },
+        "databases": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["engine", "name"],
+            "properties": {
+              "engine": { "enum": ["mysql", "mariadb", "postgres", "sqlite", "mongo"] },
+              "name": { "type": "string" },
+              "host": { "type": "string" },
+              "port": { "type": "integer" }
+            }
+          },
+          "default": []
+        },
+        "protected": {
+          "type": "boolean",
+          "description": "If true, no automated plan may exist. The generator must return an error object instead."
+        }
+      }
+    },
+
+    "vulnerabilities": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["finding_id", "package"],
+        "properties": {
+          "finding_id": { "type": "integer" },
+          "cve": { "type": ["string", "null"], "pattern": "^(CVE-[0-9]{4}-[0-9]{4,})?$" },
+          "cvss": { "type": ["number", "null"], "minimum": 0, "maximum": 10 },
+          "epss": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+          "kev": { "type": "boolean", "default": false },
+          "package": { "type": "string" },
+          "current": { "type": ["string", "null"] },
+          "fixed_in": { "type": ["string", "null"] }
+        }
+      }
+    },
+
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level", "blast_radius", "estimated_downtime_s", "requires_reboot", "reversible", "confidence"],
+      "properties": {
+        "level": { "enum": ["low", "medium", "high", "critical"] },
+        "blast_radius": { "enum": ["single-service", "multi-service", "host-wide"] },
+        "estimated_downtime_s": { "type": "integer", "minimum": 0 },
+        "requires_reboot": {
+          "type": "boolean",
+          "description": "Mandatory true for kernel, glibc, systemd, openssl, dbus. Triggers a separate reboot approval."
+        },
+        "reversible": {
+          "type": "boolean",
+          "description": "If true, a non-empty rollback section is required. If false, the plan is flagged high_risk."
+        },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "assumptions_ro": { "type": "array", "items": { "type": "string" }, "default": [] }
+      }
+    },
+
+    "maintenance_window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required"],
+      "properties": {
+        "required": { "type": "boolean" },
+        "suggested": { "type": ["string", "null"] }
+      }
+    },
+
+    "preflight": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/check" },
+      "description": "At least one item must have blocking:true. Enforced by the validator."
+    },
+    "backup": { "type": "array", "items": { "$ref": "#/$defs/backupItem" } },
+    "apply": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/step" } },
+    "health_check": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/check" } },
+    "rollback": { "type": "array", "items": { "$ref": "#/$defs/step" }, "default": [] },
+    "post_verification": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/check" } },
+
+    "restore_instructions_ro": { "type": "string", "minLength": 20 },
+    "notes_ro": { "type": ["string", "null"] }
+  },
+
+  "$defs": {
+    "argv": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" },
+      "description": "Executed directly, never through a shell. The validator rejects shell metacharacters and any argv[0] outside the binary allowlist."
+    },
+
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "desc_ro", "argv", "timeout_s", "on_failure"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9_]{2,16}$" },
+        "desc_ro": { "type": "string", "minLength": 5 },
+        "argv": { "$ref": "#/$defs/argv" },
+        "cwd": { "type": ["string", "null"] },
+        "run_as": { "type": "string", "default": "root" },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Scrubbed by the runner. Never put secrets here."
+        },
+        "timeout_s": { "type": "integer", "minimum": 1, "maximum": 3600 },
+        "idempotent": { "type": "boolean", "default": false },
+        "expect_exit": { "type": "array", "items": { "type": "integer" }, "default": [0] },
+        "on_failure": { "enum": ["rollback", "abort", "continue"] }
+      }
+    },
+
+    "backupItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "desc_ro", "kind", "source", "restore_argv"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9_]{2,16}$" },
+        "desc_ro": { "type": "string", "minLength": 5 },
+        "kind": { "enum": ["path", "mysql", "postgres", "docker_volume", "rpm_state", "git_ref"] },
+        "source": { "type": "string", "minLength": 1 },
+        "estimated_size_mb": { "type": "integer", "minimum": 0 },
+        "exclude": { "type": "array", "items": { "type": "string" }, "default": [] },
+        "restore_argv": {
+          "$ref": "#/$defs/argv",
+          "description": "May contain the literal {artifact}, substituted by the runner with the real artifact path."
+        }
+      }
+    },
+
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "desc_ro", "check", "blocking"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9_]{2,16}$" },
+        "desc_ro": { "type": "string", "minLength": 5 },
+        "blocking": { "type": "boolean" },
+        "check": {
+          "type": "object",
+          "required": ["kind"],
+          "properties": { "kind": { "enum": [
+            "http", "tcp", "systemd", "docker", "pkg_version",
+            "file_exists", "file_absent", "file_sha256",
+            "disk_free", "no_open_incident", "command"
+          ] } },
+          "allOf": [
+            { "if": { "properties": { "kind": { "const": "http" } } },
+              "then": { "required": ["url", "expect_status"] } },
+            { "if": { "properties": { "kind": { "const": "tcp" } } },
+              "then": { "required": ["host", "port"] } },
+            { "if": { "properties": { "kind": { "const": "systemd" } } },
+              "then": { "required": ["unit", "expect_state"] } },
+            { "if": { "properties": { "kind": { "const": "docker" } } },
+              "then": { "required": ["container", "expect_status"] } },
+            { "if": { "properties": { "kind": { "const": "pkg_version" } } },
+              "then": { "required": ["name"],
+                        "anyOf": [ { "required": ["equals"] }, { "required": ["at_least"] } ] } },
+            { "if": { "properties": { "kind": { "const": "file_exists" } } },
+              "then": { "required": ["path"] } },
+            { "if": { "properties": { "kind": { "const": "file_absent" } } },
+              "then": { "required": ["path"] } },
+            { "if": { "properties": { "kind": { "const": "file_sha256" } } },
+              "then": { "required": ["path", "sha256"] } },
+            { "if": { "properties": { "kind": { "const": "disk_free" } } },
+              "then": { "required": ["path", "min_bytes"] } },
+            { "if": { "properties": { "kind": { "const": "no_open_incident" } } },
+              "then": { "required": ["asset_id"] } },
+            { "if": { "properties": { "kind": { "const": "command" } } },
+              "then": { "required": ["argv"] } }
+          ]
+        }
+      }
+    }
+  }
+}
