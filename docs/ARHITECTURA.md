@@ -26,7 +26,7 @@ mai jos decurg din asta.
 ## 2. Imaginea de ansamblu
 
 ```
-                 ┌──────────────── HOST AlmaLinux 9.7 ────────────────┐
+                 ┌──────────── HOST Linux (systemd) ──────────────────┐
  internet ─▶ nginx :8443       ─▶ 127.0.0.1:8787  sentinel-web
                   │ TLS, HSTS, limit_req              │ doar citește
                   ▼                                   ▼
@@ -178,6 +178,34 @@ Suricata îl inspectează, discul se umple în câteva ore. Preflight eșantione
 interfața 10 secunde, identifică fluxurile dominante și îți spune dacă ai
 nevoie de un filtru — în loc ca proiectul să hardcodeze adresa cuiva.
 
+### 3.12 Un installer care întreabă, nu un pachet care presupune
+
+Livrarea nu se face ca `.rpm` sau `.deb`. Un pachet e excelent la copiat fișiere
+și prost la tot ce face de fapt instalarea asta: să afle cine deține portul 443,
+să te întrebe de pe ce adresă administrezi înainte să existe vreo regulă de
+blocare, să testeze dacă provocarea ACME poate fi servită înainte să consume din
+rate-limit-ul Let's Encrypt, și să facă rollback dacă un serviciu al tău s-a
+oprit. Un `%post` de RPM care ar încerca astea ar fi un installer prost deghizat
+într-un pachet.
+
+Deci: [`scripts/wizard.sh`](../scripts/wizard.sh) întreabă,
+[`deploy/preflight.sh`](../deploy/preflight.sh) verifică,
+[`deploy/install.sh`](../deploy/install.sh) face — și doar după confirmare.
+
+**Diferențele între distribuții stau într-un singur fișier**,
+[`deploy/lib/distro.sh`](../deploy/lib/distro.sh): manager de pachete, numele
+pachetelor pentru aceleași roluri, inițializarea PostgreSQL (RHEL cere `initdb`;
+Debian creează clusterul în postinst, iar un `initdb` manual acolo ar produce un
+al doilea cluster nefolosit pe alt port), calea configurațiilor, fișierul de
+opțiuni al Suricatei, SELinux față de AppArmor. Restul installer-ului nu știe pe
+ce distribuție rulează — și un test respinge orice `dnf` sau `apt-get` direct
+strecurat înapoi în el, fiindcă suportul pentru a doua familie ar deveni
+altminteri ficțiune care eșuează la jumătatea instalării.
+
+O distribuție din afara celor două familii e **refuzată pe nume**. O gazdă pe
+care instalarea a eșuat vizibil e recuperabilă; una care pare protejată și nu e,
+nu.
+
 ---
 
 ## 4. Predicția — ce este de fapt
@@ -289,15 +317,15 @@ verifică că nu s-a executat nimic.
 |---|---|---|
 | **P0** ✅ | Schelet, skill, agenți, schema DB, tooling deployment, docs | `pytest` verde; migrațiile se aplică; skill-ul e descoperit local |
 | **P1** ✅ | Fundația pe server: Postgres, venv, dashboard cu login TOTP, nginx + certbot, watchdog anti-lockout, rollback | Login HTTPS cu TOTP din internet; nimic din ce rula nu s-a oprit; `--rollback` curăță complet |
-| **P2** | Inventar + disponibilitate: discovery, health prober, capacity, pagina Servicii | Dashboard-ul arată fiecare serviciu real, up/down live + uptime 24h |
-| **P3** | Ingestie: colectori, normalizare, enrichment geo/ASN, partiționare, pagina Evenimente | Evenimente în timp real; creșterea discului măsurată 48h și în buget |
-| **P4** | Detecție + Telegram read-only | Brute-force SSH simulat → incident în UI **și** push Telegram în <60s. **Fără blocare** |
-| **P5** | Răspuns: executor, nftables, blocklist, watchdog, comenzi de blocare | Blocare verificată de pe a doua rețea; TTL; `/panic`; watchdog. **Auto-block încă oprit** |
-| **P6** | Autonomie + Suricata + baseline | Auto-block pe praguri conservatoare; 72h de calibrare |
-| **P7** | Scanare vulnerabilități | Scanare completă în fereastra nocturnă, fără impact pe latența celorlalte servicii |
-| **P8** | Stratul AI | Verdict AI în <2 min pe un incident HIGH; degradare curată; raport zilnic RO |
-| **P9** | Patching | Canary: generare → dry-run → aplicare → rupere deliberată → rollback automat verificat |
-| **P10** | Analytics + hardening final + docs | `TESTARE.md` complet; `systemd-analyze security` ≤3.0 pe toate unitățile |
+| **P2** ✅ | Inventar + disponibilitate: discovery, health prober, capacity, pagina Servicii | Dashboard-ul arată fiecare serviciu real, up/down live + uptime 24h |
+| **P3** ✅ | Ingestie: colectori, normalizare, enrichment geo/ASN, partiționare, pagina Evenimente | Evenimente în timp real; creșterea discului măsurată 48h și în buget |
+| **P4** ✅ | Detecție + Telegram read-only | Brute-force SSH simulat → incident în UI **și** push Telegram în <60s. **Fără blocare** |
+| **P5** ✅ | Răspuns: executor, nftables, blocklist, watchdog, comenzi de blocare | Blocare verificată de pe a doua rețea; TTL; `/panic`; watchdog. **Auto-block încă oprit** |
+| **P6** ✅ | Autonomie + Suricata + baseline | Auto-block pe praguri conservatoare; 72h de calibrare |
+| **P7** ✅ | Scanare vulnerabilități | Scanare completă în fereastra nocturnă, fără impact pe latența celorlalte servicii |
+| **P8** ✅ | Stratul AI | Verdict AI în <2 min pe un incident HIGH; degradare curată; raport zilnic RO |
+| **P9** ✅ | Patching | Canary: generare → dry-run → aplicare → rupere deliberată → rollback automat verificat |
+| **P10** ⏳ | Analytics + hardening final + docs | `TESTARE.md` complet; `systemd-analyze security` ≤3.0 pe toate unitățile |
 
 Fiecare fază se termină cu tot ce rula înainte încă rulând. Fără excepții:
 preflight înregistrează serviciile, porturile și containerele active, iar

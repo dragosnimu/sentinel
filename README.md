@@ -13,7 +13,8 @@ Standalone: it depends on nothing but the host it runs on, and it does not take
 ports 80 or 443 — the dashboard serves on its own port (8443 by default), so a
 host that is already a web server stays one.
 
-Target environment: **AlmaLinux 9**, native systemd, Python 3.12.
+Target environment: any **systemd** Linux of the RHEL or Debian family, Python
+3.10 or newer. Verified in production on AlmaLinux 9.
 
 Interface language is Romanian; code and docs-for-code are English.
 
@@ -88,9 +89,11 @@ Apache or Caddy) owns those ports, and writes into `/etc/nginx/conf.d/`, a
 directory shared with your sites — so the installer runs `nginx -t` before and
 after, and **removes its own files if the test fails**.
 
-Both are supported and tested. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) §2.1
-for the comparison and [docs/SECURITATE.md](docs/SECURITATE.md) §4 for what
-`shared` changes about the exposure.
+Both are supported and tested. The wizard offers `shared` only when it finds
+nginx actually owning 80/443 — a vhost does not help when Apache is the one
+listening there. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) §1 for the
+comparison and [docs/SECURITATE.md](docs/SECURITATE.md) §4 for what `shared`
+changes about the exposure.
 
 ---
 
@@ -103,7 +106,9 @@ sentinel/                      The Python package (runs as user `sentinel`)
 executor/                      The only root component. Tiny, stdlib-only, no imports from sentinel/
 deploy/                        Server-side installer, systemd units, nginx, nftables, Suricata, configs
                                (preflight records what the host already runs; install rolls back if it stops)
-scripts/                       Operator-side tooling, run from Windows (bash + PowerShell)
+deploy/lib/distro.sh           Every RHEL-vs-Debian difference, in one file and nowhere else
+scripts/wizard.sh              The guided installer — start here
+scripts/                       Operator-side tooling (bash + PowerShell, runs from Windows too)
 docs/                          Romanian documentation — start with docs/DEPLOYMENT.md
 tests/                         unit / integration / security
 ```
@@ -130,7 +135,13 @@ and changes nothing until you say yes.
 ./scripts/wizard.sh --dry-run        ask and check, change nothing
 ./scripts/wizard.sh --save my.conf   interactive, remember the answers
 ./scripts/wizard.sh --config my.conf unattended — a second server, or a rebuild
+./scripts/wizard.sh --yes            skip the final confirmation
 ```
+
+Run `--dry-run` first: two minutes, and it shows you exactly what the install
+will find. Full walkthrough — every question, what it does *not* do for you, and
+the DNS/certificate/firewall decisions that have to be made before you start —
+in [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) §3.1.
 
 **Supported hosts.** RHEL-family (AlmaLinux, Rocky, RHEL, CentOS Stream,
 Fedora) and Debian-family (Debian, Ubuntu). Anything else is refused by name
@@ -189,7 +200,7 @@ Security tests (`-m security`) must never be skipped.
 ## Status
 
 Delivered in phases, each verified on a live server before the next began.
-**487 automated tests**, 31 of which assert that something dangerous is
+**514 automated tests**, 31 of which assert that something dangerous is
 *refused* rather than that something works.
 
 | Phase | What it added | State |
@@ -215,7 +226,9 @@ takes two explicit confirmations.
 Known gaps, stated rather than hidden: container logs are not collected (only
 the host's), there is no dedicated file-integrity monitor beyond what auditd
 covers, and the `http`/`tcp`/`docker` patch-plan check kinds are declared but
-not yet implemented in the runner.
+not yet implemented in the runner. The Debian/Ubuntu install path is written and
+covered by tests, but **has not yet been run end-to-end on a real Debian host** —
+the RHEL path is the one verified in production.
 
 ## License
 

@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.19.1 — Documentația urmează installer-ul
+
+Wizard-ul exista, dar documentația încă trimitea oamenii direct la
+`deploy.sh` cu opt argumente. Acum [DEPLOYMENT.md](DEPLOYMENT.md) **începe** cu
+el: §3.1 e calea recomandată, §3.2 rămâne calea manuală, pentru CI și pentru
+cazul în care vrei fiecare parametru explicit.
+
+**Ce s-a corectat, nu doar adăugat:**
+
+- **Două comenzi din documentație nu funcționau dacă le copiai.** O rescriere
+  anterioară lăsase `\n` literal în mijlocul lor, în loc de continuarea de
+  linie — `deploy.sh ... --dry-run` din §3.2 și `diff` din §6.4. Un exemplu care
+  nu rulează e mai rău decât niciun exemplu: îl încerci, eșuează, și nu știi
+  dacă de vină e comanda sau serverul.
+- **Tabelul de cerințe cerea încă AlmaLinux 9.x** și porturile 80/443 libere —
+  ambele neadevărate de câteva versiuni. Acum: familia RHEL sau Debian, systemd
+  obligatoriu, Python ≥3.10, portul panoului liber.
+- **Secțiunea 2 avea două §2.1 și două §2.2**, iar lista numerotată „ce îți
+  trebuie pregătit" era ruptă în două de subsecțiuni intercalate: punctul 1
+  (DNS), apoi certificatul și portul, apoi punctele 2 și 3 (Telegram, cheia AI).
+  Renumerotată 2.1–2.5, cu lista întreagă la un loc.
+- **Stadiul livrării spunea „faza curentă: P0".** Acum P0–P9 livrate, P10 în
+  curs, cu lipsurile enumerate.
+
+**Adăugat:** [ARHITECTURA.md §3.12](ARHITECTURA.md) — de ce installer și nu
+pachet `.rpm`/`.deb`. Pe scurt: un pachet e bun la copiat fișiere și prost la
+tot ce face de fapt instalarea asta — să afle cine deține 443, să te întrebe de
+pe ce adresă administrezi *înainte* să existe vreo regulă de blocare, să testeze
+provocarea ACME înainte să consume din rate-limit-ul Let's Encrypt, să facă
+rollback dacă un serviciu al tău s-a oprit.
+
+Și în [DEPANARE.md](DEPANARE.md): reluarea cu `wizard.sh --config`, plus
+eșecurile frecvente pe pași scrise pentru ambele familii de distribuții
+(`initdb` nu se rulează pe Debian — clusterul e creat de postinst; headerele
+Python se numesc `python3-dev`, nu `python3.N-devel`).
+
+---
+
 ## 0.18.0 — P9.3: Generarea planurilor + interfața de patch-uri
 
 **Transport: Messages API, nu `claude -p` headless.** Planul original prevedea

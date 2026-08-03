@@ -1,10 +1,14 @@
 # Ghid de instalare — Sentinel
 
-Instalarea agentului de cybersecurity Sentinel pe VPS-ul AlmaLinux 9.7 de la
-`203.0.113.10`.
+Instalarea agentului de cybersecurity Sentinel pe un server Linux. Exemplele
+folosesc gazda `203.0.113.10` cu domeniul `sentinel.exemplu.ro`.
 
 Sentinel este de sine stătător: nu depinde de niciun SIEM, de niciun agent
 extern și de niciun serviciu în afara gazdei pe care rulează.
+
+**Ai nevoie de o singură comandă.** [§3.1](#31-calea-recomandată--wizard-ul) e
+tot ce trebuie citit ca să instalezi; restul documentului explică deciziile pe
+care wizard-ul ți le pune și ce faci când ceva nu merge.
 
 > **Regula zero: ce rula deja pe server nu se strică.** Sentinel este un
 > musafir. Preflight înregistrează fiecare serviciu activ, fiecare port în
@@ -26,7 +30,10 @@ extern și de niciun serviciu în afara gazdei pe care rulează.
 | `sentinel-watchdog` | Deadman anti-lockout, la fiecare 60s, independent de restul |
 | timere | Scanare nocturnă, probe de disponibilitate, mentenanță orară |
 
-Porturi noi ocupate: **80**, **443** (nginx), **8787** și **5432** (doar
+Porturi noi ocupate: **8443** (nginx, public — configurabil), **8787** și
+**5432**, ambele legate pe `127.0.0.1`. Porturile 80 și 443 rămân ale
+serviciilor tale; detaliile mai jos.
+
 ### Două moduri de expunere — alege înainte de deploy
 
 | | `dedicated` *(implicit)* | `shared` |
@@ -45,10 +52,12 @@ contează, iar certificatul nu mai are nevoie de nicio intervenție.
 
 ```bash
 # shared — nginx deține deja 80/443
-./scripts/deploy.sh --host 203.0.113.10 --user deploy     --key ~/.ssh/sentinel_deploy --domain sentinel.exemplu.ro --nginx-mode shared
+./scripts/deploy.sh --host 203.0.113.10 --user deploy \
+    --key ~/.ssh/sentinel_deploy --domain sentinel.exemplu.ro --nginx-mode shared
 
 # dedicated — altceva (Apache, Caddy, un container) deține 80/443
-./scripts/deploy.sh --host 203.0.113.10 --user deploy     --key ~/.ssh/sentinel_deploy --domain sentinel.exemplu.ro --web-port 8443
+./scripts/deploy.sh --host 203.0.113.10 --user deploy \
+    --key ~/.ssh/sentinel_deploy --domain sentinel.exemplu.ro --web-port 8443
 ```
 
 #### Ce protejează modul shared
@@ -98,7 +107,7 @@ scopul. Trei consecințe:
 2. **Nu există redirect de la HTTP.** O cerere pe `http://sentinel.exemplu.ro`
    ajunge la serviciul care deține `:80`, nu la Sentinel.
 3. **Certificatul nu poate veni din provocarea HTTP-01 a lui certbot**, care are
-   nevoie de `:80`. Vezi §2.1.
+   nevoie de `:80`. Vezi §2.3.
 
 Preflight verifică întâi că portul cerut e liber și raportează ce deține 80/443
 — fără să atingă nimic.
@@ -111,18 +120,32 @@ Preflight verifică întâi că portul cerut e liber și raportează ce deține 
 
 | Cerință | Valoare | Ce se întâmplă dacă nu |
 |---|---|---|
-| OS | AlmaLinux / RHEL 9.x | Preflight oprește instalarea |
+| OS | familia **RHEL** (AlmaLinux, Rocky, RHEL, CentOS Stream, Fedora) sau familia **Debian** (Debian, Ubuntu) | Preflight refuză pe nume — vezi mai jos |
+| systemd | obligatoriu | Preflight oprește instalarea |
+| Python | ≥ 3.10 | Instalarea îl aduce din depozitele distribuției |
 | RAM disponibil | ≥ 2,5 GB | Sub 2,5 GB → Suricata e sărită (mod log-only, în continuare util). **Sub 1,5 GB → abort**: OOM killer-ul alege cel mai mare proces, de obicei aplicația ta |
 | Disc liber | ≥ 10 GB pe `/`, ≥ 8 GB pe `/var` | Preflight oprește |
-| Porturi 80, 443 | libere | Preflight oprește |
+| Portul public al panoului | liber (implicit 8443) | Preflight oprește |
 | `firewalld` | inactiv | Preflight oprește (poți forța cu `--allow-firewalld`) |
 | Servicii existente | funcționale | Preflight le înregistrează; instalarea face rollback automat dacă vreunul se oprește |
 | sudo | funcțional | Ți se cere parola o dată |
 
+**O distribuție nesuportată e refuzată, nu instalată pe jumătate.** O mașină
+care *pare* protejată și nu e, e mai rea decât una la care instalarea a eșuat
+vizibil. Tot ce diferă între cele două familii — managerul de pachete,
+inițializarea PostgreSQL, calea configurațiilor, fișierul de opțiuni al
+Suricatei, SELinux față de AppArmor — stă într-un singur loc,
+[`deploy/lib/distro.sh`](../deploy/lib/distro.sh), iar un test verifică mecanic
+că nu a rămas niciun `dnf` sau `apt-get` direct în installer.
+
+**Python 3.10 e pragul** fiindcă îl are deja fiecare țintă suportată, fără
+depozit terț: Ubuntu 22.04 are 3.10, Debian 12 are 3.11, AlmaLinux 9 are
+3.11/3.12 în AppStream, Ubuntu 24.04 are 3.12.
+
 Verifică rapid, înainte de orice:
 
 ```bash
-ssh deploy@203.0.113.10 'free -h; df -h /; systemctl is-active firewalld'
+ssh deploy@203.0.113.10 'cat /etc/os-release | head -2; free -h; df -h /; systemctl is-active firewalld'
 ```
 
 ### 2.2 Ce îți trebuie pregătit
@@ -150,7 +173,28 @@ ssh deploy@203.0.113.10 'free -h; df -h /; systemctl is-active firewalld'
    pe un site care mai servește și altceva ar moșteni configurația și
    antetele acelui site.
 
-### 2.1 Certificatul — partea care necesită o decizie
+2. **Un bot Telegram nou.** Scrie-i lui [@BotFather](https://t.me/BotFather):
+   ```
+   /newbot
+   ```
+   Alege un nume și un username. Primești un token de forma
+   `1234567890:AAG...`. **Creează un bot nou, dedicat** — nu refolosi unul care
+   duce deja alte notificări; amestecarea alertelor de rutină cu cele de
+   securitate este exact modul în care alertele de securitate ajung să nu mai
+   fie citite.
+
+   Apoi ia-ți chat id-ul numeric de la [@userinfobot](https://t.me/userinfobot).
+   Nu username-ul — id-ul numeric.
+
+3. **O cheie API Anthropic** (`sk-ant-...`), din consola Anthropic.
+   **Pune o limită de cheltuială pe cheie acolo.** Plafonul din `sentinel.yaml`
+   e prima linie de apărare, nu singura.
+
+   Fără cheie, Sentinel rulează determinist: detecția, blocarea, alertarea și
+   scanarea funcționează în continuare; mesajele sunt marcate
+   „(analiză AI indisponibilă)".
+
+### 2.3 Certificatul — partea care necesită o decizie
 
 `certbot --nginx` **nu funcționează aici.** Provocarea HTTP-01 are nevoie de
 portul 80, iar Sentinel nu îl deține. TLS-ALPN-01 are nevoie de 443, la fel
@@ -201,8 +245,11 @@ installer o evită.
 **Varianta B — DNS-01, fără să atingi nimic.** Nu are nevoie de niciun port:
 
 ```bash
-sudo dnf install python3-certbot-dns-cloudflare   # sau plugin-ul registrarului tău
-sudo certbot certonly --dns-cloudflare -d sentinel.exemplu.ro     --agree-tos -m tu@exemplu.ro --non-interactive
+sudo dnf install python3-certbot-dns-cloudflare      # RHEL, Alma, Rocky, Fedora
+sudo apt-get install python3-certbot-dns-cloudflare  # Debian, Ubuntu
+# sau plugin-ul registrarului tău
+sudo certbot certonly --dns-cloudflare -d sentinel.exemplu.ro \
+    --agree-tos -m tu@exemplu.ro --non-interactive
 ```
 
 Apoi instalează cu `--cert-mode none` — Sentinel găsește certificatul și îl
@@ -213,10 +260,11 @@ cu certificat self-signed. Dashboard-ul funcționează, browserul avertizează, 
 poți relua doar pasul de certificat mai târziu:
 
 ```bash
-sudo /opt/sentinel/deploy/install.sh --domain sentinel.exemplu.ro     --web-port 8443 --cert-mode webroot --from-step 33
+sudo /opt/sentinel/deploy/install.sh --domain sentinel.exemplu.ro \
+    --web-port 8443 --cert-mode webroot --from-step 33
 ```
 
-### 2.2 Portul trebuie deschis în firewall-ul providerului
+### 2.4 Portul trebuie deschis în firewall-ul providerului
 
 nftables pe această gazdă e deny-lister cu `policy accept`, deci **nu** blochează
 portul 8443. Dar un security group de cloud sau un firewall de la provider o
@@ -230,28 +278,7 @@ curl -sk -o /dev/null -w '%{http_code}
 ' https://sentinel.exemplu.ro:8443/healthz
 ```
 
-2. **Un bot Telegram nou.** Scrie-i lui [@BotFather](https://t.me/BotFather):
-   ```
-   /newbot
-   ```
-   Alege un nume și un username. Primești un token de forma
-   `1234567890:AAG...`. **Creează un bot nou, dedicat** — nu refolosi unul care
-   duce deja alte notificări; amestecarea alertelor de rutină cu cele de
-   securitate este exact modul în care alertele de securitate ajung să nu mai
-   fie citite.
-
-   Apoi ia-ți chat id-ul numeric de la [@userinfobot](https://t.me/userinfobot).
-   Nu username-ul — id-ul numeric.
-
-3. **O cheie API Anthropic** (`sk-ant-...`), din consola Anthropic.
-   **Pune o limită de cheltuială pe cheie acolo.** Plafonul din `sentinel.yaml`
-   e prima linie de apărare, nu singura.
-
-   Fără cheie, Sentinel rulează determinist: detecția, blocarea, alertarea și
-   scanarea funcționează în continuare; mesajele sunt marcate
-   „(analiză AI indisponibilă)".
-
-### 2.3 Pregătire anti-lockout — nu sări peste
+### 2.5 Pregătire anti-lockout — nu sări peste
 
 Înainte de instalare:
 
@@ -273,7 +300,91 @@ blocându-te explicit. Asta elimină majoritatea riscului de lockout din start.
 
 ## 3. Instalare
 
-### Pasul 1 — Pregătește secretele local
+Două căi, același rezultat. **Wizard-ul (§3.1) e cel recomandat** — pune
+întrebările, verifică ce poate verifica singur și cheamă exact aceleași
+scripturi. Calea manuală (§3.2) rămâne documentată pentru automatizare și
+pentru cazurile în care vrei să vezi fiecare parametru pe linia de comandă.
+
+### 3.1 Calea recomandată — wizard-ul
+
+```bash
+git clone https://github.com/dragosnimu/sentinel.git
+cd sentinel
+./scripts/wizard.sh
+```
+
+Wizard-ul își dă seama singur unde rulează. Pe laptopul tău întreabă o țintă și
+instalează prin SSH; pe server sare peste jumătatea de SSH și instalează local.
+Nu ai de ales modul — e dedus din context și ți se arată.
+
+**Cele trei reguli pe care le respectă**, și de ce fiecare contează:
+
+1. **Nimic nu se ghicește tăcut.** Unde există un default rezonabil, e afișat
+   între paranteze și îl poți accepta cu Enter; unde nu există, întreabă. Un
+   installer care alege singur portul, utilizatorul sau modul nginx te lasă cu
+   o instalare pe care nu o poți explica peste trei luni.
+2. **Secretele nu ajung în tabela de procese.** Tokenul de bot și cheia API se
+   citesc cu ecoul terminalului stins și călătoresc pe stdin — niciodată ca
+   argument, fiindcă `ps` arată argumentele oricărui proces către orice cont de
+   pe gazdă.
+3. **Nimic nu se modifică înainte de rezumat.** Tot ce se întâmplă până la
+   confirmare sunt întrebări și verificări read-only. Un installer care a
+   editat deja nginx în momentul în care te întreabă dacă e în regulă te minte.
+
+**Ce te întreabă**, în ordine:
+
+| Secțiune | Ce | Obligatoriu |
+|---|---|---|
+| 1. Unde instalăm | aici sau alt server; adresă, utilizator sudo, port și cheie SSH | da (în modul SSH) |
+| 2. Verific serverul | *nu întreabă nimic* — detectează distribuția, RAM, disc, cine deține 80/443, dacă portul cerut e liber | — |
+| 3. Interfața web | domeniul panoului; mod nginx `shared` sau `dedicated`; portul public | domeniul |
+| 4. Siguranță | adresa ta publică, cea de pe care administrezi — intră în lista never-block | da |
+| 5. Telegram | token bot + chat id | opțional |
+| 6. Analiză AI | cheie API Anthropic | opțional |
+| 7. Opțiuni | Suricata da/nu | are default |
+
+Modul nginx nu ți se oferă la întâmplare: dacă verificarea de la pasul 2 a găsit
+nginx pe 80/443, `shared` e prima opțiune; dacă acolo e altceva — Apache, Caddy,
+un container — opțiunea nici nu apare, fiindcă un vhost nginx nu ajută când
+nginx nu deține portul.
+
+**Adresa ta publică** e propusă automat din conexiunea curentă, dar confirm-o:
+e singurul lucru care garantează că nu te poți bloca singur afară. Verificarea
+o poți face oricând cu `curl -s https://ifconfig.me`.
+
+**Modurile de rulare:**
+
+```bash
+./scripts/wizard.sh                    # interactiv
+./scripts/wizard.sh --dry-run          # întreabă și verifică, nu modifică nimic
+./scripts/wizard.sh --save prod.conf   # interactiv, ține minte răspunsurile
+./scripts/wizard.sh --config prod.conf # neasistat — al doilea server, sau o refacere
+./scripts/wizard.sh --yes              # sare peste confirmarea finală
+./scripts/wizard.sh --help
+```
+
+**Rulează întâi `--dry-run`.** Costă două minute și îți arată exact ce va găsi
+instalarea: distribuția detectată, memoria, discul, ce deține 80/443, dacă
+portul panoului e liber. Nu atinge nimic.
+
+Fișierul salvat cu `--save` **conține tokenul de bot și cheia API**, deci se
+scrie cu `umask 077` și `chmod 0600`, și o spune în prima lui linie. Tratează-l
+ca pe un secret: nu îl pune în repo, nu îl trimite pe chat.
+
+**Ce nu face wizard-ul:** nu creează înregistrarea DNS, nu deschide portul în
+firewall-ul providerului și nu obține certificatul dacă nici modul `auto` nu
+poate. Astea rămân în §2 — le verifică și îți spune, dar nu le poate face în
+locul tău.
+
+La final îți afișează URL-ul panoului, comanda de creare a contului admin și
+ieșirile de urgență.
+
+### 3.2 Calea manuală — `deploy.sh`
+
+Aceiași pași, executați de tine. Utilă pentru CI, pentru un runbook propriu, sau
+când vrei să vezi fiecare parametru explicit.
+
+#### Pasul 1 — Pregătește secretele local
 
 Din Git Bash sau WSL, în directorul proiectului:
 
@@ -289,11 +400,12 @@ niciodată ca argument de linie de comandă, unde `ps` pe server le-ar arăta.
 Parola bazei de date se generează automat; nu trebuie să o inventezi sau să o
 vezi vreodată.
 
-### Pasul 2 — Verificare fără modificări
+#### Pasul 2 — Verificare fără modificări
 
 ```bash
 ./scripts/deploy.sh --host 203.0.113.10 --user deploy \
-    --key ~/.ssh/sentinel_deploy --domain sentinel.exemplu.ro \n    --web-port 8443 --dry-run
+    --key ~/.ssh/sentinel_deploy --domain sentinel.exemplu.ro \
+    --web-port 8443 --dry-run
 ```
 
 Rulează **doar** preflight-ul. Nu modifică absolut nimic pe server.
@@ -309,7 +421,7 @@ informative. Cele mai frecvente:
 | `services … no longer running` | Instalarea a oprit ceva. Rollback automat. Compară cu `baseline-services.txt` înainte să reîncerci |
 | `CRLF line endings found` | Repo clonat pe Windows fără `.gitattributes` aplicat. Re-clonează |
 
-### Pasul 3 — Instalarea propriu-zisă
+#### Pasul 3 — Instalarea propriu-zisă
 
 ```bash
 ./scripts/deploy.sh --host 203.0.113.10 --user deploy \
@@ -350,7 +462,7 @@ Instalarea se termină cu:
    funcționează: config încărcat, secrete citite, rețea, token valid, chat id
    corect. Un log verde de instalare dovedește mult mai puțin.
 
-### Pasul 4 — Verificare
+### 3.3 Verificare
 
 ```bash
 ./scripts/smoke-test.sh --host 203.0.113.10 --user deploy \
@@ -361,7 +473,7 @@ Verifică serviciile, baza de date, tabela nftables, dashboard-ul, headerele de
 securitate, permisiunile pe `secrets.env`, resursele — și, la final, că nimic
 din ce rula înainte nu s-a oprit.
 
-### Pasul 5 — Cont admin și 2FA
+### 3.4 Cont admin și 2FA
 
 Dacă instalarea nu a creat contul, creează-l:
 
@@ -523,6 +635,15 @@ marker în `/var/lib/sentinel/.install-state/`.
 ssh ... 'sudo /opt/sentinel/deploy/install.sh --force-step 29'
 ```
 
+Dacă ai instalat cu wizard-ul, îl poți relua pur și simplu: pașii deja făcuți
+sunt sărite. Ca să nu răspunzi din nou la toate întrebările, salvează-le de la
+început cu `--save`:
+
+```bash
+./scripts/wizard.sh --save prod.conf     # prima dată
+./scripts/wizard.sh --config prod.conf   # reluare, fără întrebări
+```
+
 ### 6.2 M-am blocat singur
 
 **Ordine, de la cel mai rapid:**
@@ -566,7 +687,9 @@ Dacă smoke-test-ul sau instalarea semnalează asta:
 ```bash
 ssh deploy@203.0.113.10
 systemctl --failed
-diff <(systemctl list-units --type=service --state=running --no-legend --plain \n        | awk '{print $1}' | sort) \n     /var/lib/sentinel/.install-state/baseline-services.txt
+diff <(systemctl list-units --type=service --state=running --no-legend --plain \
+        | awk '{print $1}' | sort) \
+     /var/lib/sentinel/.install-state/baseline-services.txt
 free -h                    # cauza cea mai probabilă
 ```
 
@@ -581,7 +704,8 @@ nu se rezolvă, fă rollback — Sentinel nu merită o întrerupere a producție
 
 ```bash
 git pull
-./scripts/deploy.sh --host ... --user ... --key ... --domain ...
+./scripts/wizard.sh --config prod.conf        # dacă ai salvat răspunsurile
+./scripts/deploy.sh --host ... --user ... --key ... --domain ...   # sau explicit
 ```
 
 Instalarea e idempotentă; pașii deja făcuți sunt sărite, codul se
@@ -616,6 +740,8 @@ git diff --name-only HEAD@{1} -- sentinel/db/migrations/
 | Snapshot pre-deploy | `/var/backups/sentinel/predeploy-latest` |
 | Loguri | `journalctl -u 'sentinel-*'` |
 | Fișier PANIC | `/etc/sentinel/PANIC` |
+| Wizard de instalare | `./scripts/wizard.sh` (în repo) |
+| Abstractizarea de distribuție | `deploy/lib/distro.sh` (în repo) |
 
 ```bash
 systemctl status 'sentinel-*'              # starea tuturor unităților
@@ -629,15 +755,37 @@ systemd-analyze security 'sentinel-*'      # scor de hardening (țintă ≤3.0)
 
 ## 9. Stadiul livrării
 
-Livrare pe faze. Faza curentă: **P0 — schelet, skill, agenți, tooling de
-deployment, documentație.**
+Livrare pe faze, fiecare verificată pe un server real înainte de următoarea.
+**P0–P9 sunt livrate.** 514 teste automate, dintre care 31 verifică faptul că
+ceva periculos este *refuzat*, nu că ceva funcționează.
 
-Ce funcționează acum: preflight, instalare, PostgreSQL + schema completă,
-tabela nftables, unitățile systemd, nginx + Let's Encrypt, workspace-ul Claude
-cu skill-ul și agenții, validatorul de planuri de patch, rollback.
+| Fază | Ce a adus |
+|---|---|
+| P0 | Schelet, schema planurilor de patch + validator, skill, tooling de deployment |
+| P1 | Dashboard HTTPS, Argon2id + TOTP, sesiuni, watchdog anti-lockout |
+| P2 | Inventar de assets, probe de disponibilitate, istoric |
+| P3 | Ingestie: journald (sshd, sudo/su), nginx, auditd, îmbogățire geo/ASN |
+| P4 | Reguli de detecție, incidente, alertare Telegram |
+| P5 | Răspuns: blocklist nftables, blocare dintr-un tap, `/panic`, audit cu lanț de hash |
+| P6 | Decizia de auto-block (observă/armat), baseline sezonier, Suricata IDS |
+| P7 | Scanare de vulnerabilități: `dnf updateinfo`, oglindă CISA KEV, prioritizare |
+| P8 | Triaj AI cu plafon dur de tokeni și izolare anti prompt-injection |
+| P9 | Patching: generare de planuri, aprobare în doi pași, backup verificat, rollback automat |
+| P10 | Analytics extins, hardening final, documentație completă — **în curs** |
 
-Ce urmează, în ordine: **P1** fundația pe server cu login TOTP · **P2** inventar
-și disponibilitate · **P3** ingestie · **P4** detecție + Telegram · **P5**
-răspuns și blocare · apoi P6–P10 (autonomie, scanare, AI, patching, analytics).
+**Auto-block-ul se livrează dezactivat.** Mecanismul e complet și testat, dar
+primele zile sunt menite să fie doar de observare: afli ce *ar fi* fost blocat,
+cu buton, ca fals-pozitivele să iasă la suprafață înainte să fie tăiat ceva la
+3 dimineața. Planurile de patch se generează automat; aplicarea unuia cere
+mereu două confirmări explicite.
 
-Detalii în [ARHITECTURA.md](ARHITECTURA.md).
+Lipsuri, declarate în loc să fie ascunse: logurile din containere nu sunt
+colectate (doar cele ale gazdei), nu există monitor dedicat de integritate a
+fișierelor dincolo de ce acoperă auditd, iar tipurile de verificare
+`http`/`tcp`/`docker` din planurile de patch sunt declarate dar încă
+neimplementate în runner. Calea de instalare Debian/Ubuntu este scrisă și
+acoperită de teste, dar **nu a fost încă rulată complet pe o gazdă Debian
+reală** — pe RHEL este verificată în producție.
+
+Detalii în [ARHITECTURA.md](ARHITECTURA.md) și în
+[CHANGELOG.md](CHANGELOG.md).

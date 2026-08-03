@@ -349,6 +349,25 @@ td.r, th.r { text-align: right; font-variant-numeric: tabular-nums; }
 .refuse p { font-size: .84rem; color: var(--ink-mid); }
 .refuse .x { color: var(--bad); font-family: var(--mono); font-size: .8rem; }
 
+/* Terminal: aceeași fereastră ca .frame, dar conținut monospațiat. Prompt-ul
+   e un ::before, ca să nu poată fi selectat odată cu comanda. */
+.term {
+  border: 1px solid var(--edge); border-radius: var(--r);
+  background: var(--panel-2); overflow: hidden;
+}
+.term-bar {
+  display: flex; align-items: center; gap: .45rem;
+  padding: .55rem .8rem; background: var(--panel);
+  border-bottom: 1px solid var(--edge);
+  font: 600 .74rem/1 var(--mono); color: var(--ink-dim); letter-spacing: .04em;
+}
+.term-body { padding: 1rem 1.1rem; font: 400 .84rem/1.75 var(--mono); }
+.term-body .c { display: block; color: var(--ink); }
+.term-body .c::before { content: "$ "; color: var(--amber); }
+.term-body .o { display: block; color: var(--ink-mid); }
+.term-body .o.ok { color: var(--ok); }
+.term-body .cm { display: block; color: var(--ink-dim); }
+
 .foot { padding: 3rem 0 4rem; color: var(--ink-dim); font-size: .86rem; }
 
 @media (max-width: 720px) {
@@ -972,6 +991,89 @@ html, body { background: var(--ground); }
   </div>
 </section>
 
+<!-- ═══════════════════════════════════ INSTALARE ═══════════════════════ -->
+<section class="pagebreak">
+  <div class="wrap stack-lg">
+    <div class="head">
+      <span class="eyebrow">Instalare</span>
+      <h2>O comandă, și nimic nu se schimbă până nu spui da.</h2>
+      <p class="lede">
+        Wizard-ul își dă seama singur unde rulează: pe laptopul tău întreabă o
+        țintă și instalează prin SSH, pe server sare peste jumătatea de SSH.
+      </p>
+    </div>
+
+    <div class="term">
+      <div class="term-bar">bash</div>
+      <div class="term-body">
+        <span class="c">git clone https://github.com/dragosnimu/sentinel.git</span>
+        <span class="c">cd sentinel &amp;&amp; ./scripts/wizard.sh --dry-run</span>
+        <span class="o">&nbsp;</span>
+        <span class="o ok">✓ AlmaLinux 9.8 (familia rhel)</span>
+        <span class="o ok">✓ python3.12 — 5208 MB memorie — 94 GB liberi</span>
+        <span class="o ok">✓ nginx deține 80/443 → modul „shared" e disponibil</span>
+        <span class="o">! portul 8443 e ocupat de altcineva</span>
+        <span class="o">&nbsp;</span>
+        <span class="cm">--dry-run: nu s-a modificat nimic.</span>
+      </div>
+    </div>
+
+    <div class="flow">
+      <div>
+        <span class="s">01 · ÎNTREABĂ</span>
+        <h3>Nimic nu se ghicește tăcut</h3>
+        <p>Ținta, domeniul, modul nginx, adresa ta de administrare, Telegram,
+           cheia AI. Unde există un default rezonabil, îl vezi înainte să-l
+           accepți.</p>
+      </div>
+      <div>
+        <span class="s">02 · VERIFICĂ</span>
+        <h3>Doar citește</h3>
+        <p>Distribuție, memorie, disc, cine deține 80/443, dacă portul cerut e
+           liber, dacă domeniul rezolvă aici. Nimic nu se atinge.</p>
+      </div>
+      <div>
+        <span class="s">03 · REZUMĂ</span>
+        <h3>Ultimul punct de ieșire</h3>
+        <p>Tot ce urmează să se schimbe, pe ecran, înainte de confirmare. Un
+           installer care a editat deja nginx când te întreabă, te minte.</p>
+      </div>
+      <div>
+        <span class="s">04 · INSTALEAZĂ</span>
+        <h3>Numerotat și reluabil</h3>
+        <p>Fiecare pas are marker pe disc. Dacă un serviciu al tău s-a oprit,
+           instalarea face rollback singură.</p>
+      </div>
+    </div>
+
+    <div class="refuse">
+      <div>
+        <b>Secretele nu ajung în tabela de procese</b>
+        <p>Tokenul de bot și cheia API se citesc cu ecoul stins și călătoresc pe
+           stdin. Ca argument de linie de comandă, <span class="mono">ps</span>
+           le-ar arăta oricărui cont de pe gazdă.</p>
+      </div>
+      <div>
+        <b>Două familii de distribuții, un singur fișier</b>
+        <p>RHEL (AlmaLinux, Rocky, CentOS Stream, Fedora) și Debian (Debian,
+           Ubuntu). Tot ce diferă stă în
+           <span class="mono">deploy/lib/distro.sh</span>.</p>
+      </div>
+      <div>
+        <b>Ce nu e suportat, e refuzat pe nume</b>
+        <p><span class="x">unsupported distribution</span>
+           O gazdă la care instalarea a eșuat vizibil e recuperabilă. Una care
+           pare protejată și nu e, nu.</p>
+      </div>
+    </div>
+
+    <p class="caption">
+      Răspunsurile se pot salva și relua neasistat — al doilea server, sau o
+      refacere, nu mai cer nicio întrebare.
+    </p>
+  </div>
+</section>
+
 <!-- ═══════════════════════════════════ STARE ═══════════════════════════ -->
 <section class="pagebreak">
   <div class="wrap stack-lg">
@@ -981,7 +1083,7 @@ html, body { background: var(--ground); }
     </div>
 
     <div class="proof">
-      <div><span class="v num">487</span><span class="k">teste automate</span></div>
+      <div><span class="v num">514</span><span class="k">teste automate</span></div>
       <div><span class="v num">31</span><span class="k">invariante de siguranță</span></div>
       <div><span class="v num">7</span><span class="k">servicii systemd</span></div>
       <div><span class="v num">13</span><span class="k">migrații de schemă</span></div>
@@ -1008,8 +1110,8 @@ html, body { background: var(--ground); }
 
 <div class="wrap foot">
   <p>
-    Sentinel 0.18.0 · AlmaLinux 9 · cifrele din această pagină sunt extrase dintr-o
-    instalare reală în producție, la momentul generării.
+    Sentinel 0.19.1 · RHEL sau Debian, cu systemd · cifrele din această pagină sunt
+    extrase dintr-o instalare reală în producție, la momentul generării.
   </p>
 </div>
 

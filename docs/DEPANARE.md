@@ -124,7 +124,14 @@ Instalatorul e numerotat pe pași, idempotent și reluabil. Markerii sunt în
 ls /var/lib/sentinel/.install-state/    # ce a reușit
 ```
 
-Repari cauza, apoi:
+Dacă ai instalat cu wizard-ul, cea mai simplă reluare e chiar el — pașii deja
+făcuți sunt sărite, iar cu `--config` nu mai răspunzi la întrebări:
+
+```bash
+./scripts/wizard.sh --config prod.conf
+```
+
+Altfel repari cauza, apoi:
 
 ```bash
 ./scripts/deploy.sh --host ... --user ... --key ... --from-step 22
@@ -132,10 +139,11 @@ Repari cauza, apoi:
 
 | Pas | Eșec frecvent | Rezolvare |
 |---|---|---|
-| 20 packages | Repo indisponibil | `sudo dnf clean all && sudo dnf makecache` |
+| 10 preflight | `unsupported distribution` | Doar familiile RHEL și Debian sunt suportate. Verifică `ID` și `ID_LIKE` din `/etc/os-release` |
+| 20 packages | Repo indisponibil | RHEL: `sudo dnf clean all && sudo dnf makecache` · Debian: `sudo apt-get update` |
 | 21 external_tools | `checksum mismatch` | **Nu ocoli asta.** Ori download corupt, ori mirror compromis. Reîncearcă; dacă persistă, investighează |
-| 22 postgres | `initdb` eșuează | `/var/lib/pgsql/data` există deja și nu e gol |
-| 23 venv | `pip install` eșuează | Lipsesc `gcc`/`python3.12-devel`, sau nu e rețea |
+| 22 postgres | `initdb` eșuează | RHEL: `/var/lib/pgsql/data` există deja și nu e gol. Pe Debian clusterul e creat de postinst-ul pachetului, deci nu se rulează `initdb` deloc — vezi `pg_lsclusters` |
+| 23 venv | `pip install` eșuează | Lipsesc `gcc` și headerele Python (`python3.N-devel` pe RHEL, `python3-dev` pe Debian), sau nu e rețea |
 | 28 migrate | Nu se conectează | Parola rolului nu corespunde. Reia pasul 22 cu `--force-step 22` |
 | 33 nginx | certbot eșuează | DNS nu rezolvă aici, sau portul 80 nu e accesibil din internet |
 
