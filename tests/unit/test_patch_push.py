@@ -205,6 +205,67 @@ def test_message_escapes_html():
     assert "<b>x</b>" not in text.replace("<b>Dry-run", "")
 
 
+# --- the dry-run must not destroy the way to apply --------------------------
+def test_dry_run_never_edits_the_plan_message():
+    """`edit_message_text` replaces the inline keyboard as well as the text, so
+    editing the plan message to report a dry-run DELETED the approve button.
+    The one action meant to build confidence before applying became the thing
+    that made applying impossible."""
+    pytest.importorskip("telegram")
+    import inspect
+
+    from sentinel.telegram import patch_flow
+    src = inspect.getsource(patch_flow.on_dry_run)
+    assert "query.edit_message_text" not in src, \
+        "on_dry_run edits the plan message — the approve button dies with it"
+    assert "reply_text" in src          # the result goes underneath it instead
+
+
+def test_dry_run_reports_progress_without_touching_the_plan():
+    pytest.importorskip("telegram")
+    import inspect
+
+    from sentinel.telegram import patch_flow
+    src = inspect.getsource(patch_flow.on_dry_run)
+    # Progress and result land on the same NEW message, edited in place.
+    assert "progress = await query.message.reply_text" in src
+    assert src.count("progress.edit_text") >= 2      # refused, and finished
+
+
+def test_reject_still_edits_because_the_plan_is_dead():
+    """The counter-case, so the rule above is not applied blindly: rejecting a
+    plan SHOULD replace the message — leaving live-looking approve buttons on a
+    rejected plan is worse than losing them."""
+    pytest.importorskip("telegram")
+    import inspect
+
+    from sentinel.telegram import patch_flow
+    assert "edit_message_text" in inspect.getsource(patch_flow.on_reject)
+
+
+def test_an_unexpected_error_does_not_wipe_the_plan_message():
+    pytest.importorskip("telegram")
+    import inspect
+
+    from sentinel.telegram import bot
+    src = inspect.getsource(bot.on_patch_callback)
+    handler = src.split("except Exception", 1)[1]
+    assert "reply_text" in handler and "edit_message_text" not in handler
+
+
+def test_an_unauthorised_tap_is_an_alert_not_an_edit():
+    """One viewer tapping a button must not delete the plan for everyone else
+    in the chat."""
+    pytest.importorskip("telegram")
+    import inspect
+
+    from sentinel.telegram import bot
+    src = inspect.getsource(bot.on_patch_callback)
+    guard = src.split("_can_act", 1)[1].split("from sentinel.telegram", 1)[0]
+    assert "show_alert=True" in guard
+    assert "edit_message_text" not in guard
+
+
 # --- isolation --------------------------------------------------------------
 def test_each_push_source_is_isolated():
     """One failing query must not stop the others. A broken plan push used to be

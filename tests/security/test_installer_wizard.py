@@ -182,11 +182,58 @@ def test_deploy_probes_multiplexing_instead_of_assuming_it():
 
 def test_deploy_replaces_the_remote_deploy_tree_rather_than_nesting():
     """`cp -r src dest` nests when dest exists, so the second deploy left the
-    FIRST deploy's rollback.sh in place."""
+    FIRST deploy's rollback.sh in place — the one script whose staleness bites."""
     deploy = (REPO / "scripts" / "deploy.sh").read_text(encoding="utf-8")
-    line = next(l for l in deploy.splitlines() if "/opt/sentinel/deploy" in l and "cp -r" in l)
-    assert "rm -rf /opt/sentinel/deploy" in line
-    assert "|| true" not in line            # a silent failure here ages rollback.sh
+    block = deploy.split("# Keep the extracted tree", 1)[1].split("ssh_run \"rm -rf", 1)[0]
+    # Comments in this block quote the very command shapes under test, so
+    # matching against them would check the prose instead of the code.
+    code = "\n".join(l for l in block.splitlines() if not l.strip().startswith("#"))
+    assert "rm -rf /opt/sentinel/deploy" in code
+    assert code.index("rm -rf /opt/sentinel/deploy") < code.index("cp -r")
+    assert "|| true" not in code            # a silent failure here ages rollback.sh
+
+
+def test_every_privileged_command_gets_its_own_sudo():
+    """`sudo a && b` elevates only `a`; the rest of the chain runs as the login
+    user. Written as a chain, the tree removal succeeded as root and the copy
+    that replaced it did not — leaving the host with no rollback.sh at all."""
+    deploy = (REPO / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    for line in deploy.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("ssh_sudo ") or stripped.startswith("#"):
+            continue
+        # The argument is one command: no shell chaining inside the quotes,
+        # unless it is explicitly re-wrapped in sh -c.
+        arg = stripped.split("ssh_sudo ", 1)[1]
+        if "sh -c" in arg:
+            continue
+        # `$( ... )` is evaluated by the LOCAL shell before the string is sent,
+        # so chaining in there is not chaining under the remote sudo.
+        arg = _strip_substitutions(arg)
+        assert " && " not in arg, f"chained command under one sudo: {stripped}"
+        assert "; " not in arg, f"chained command under one sudo: {stripped}"
+
+
+def _strip_substitutions(text: str) -> str:
+    """Remove `$( ... )` spans, counting nesting.
+
+    A non-greedy regex is not enough: `$( ((PURGE)) && echo x )` closes three
+    times, and stopping at the first `)` leaves the `&&` behind and fails the
+    caller for a chain that never reaches the remote host."""
+    out, i = [], 0
+    while i < len(text):
+        if text.startswith("$(", i):
+            depth, i = 1, i + 2
+            while i < len(text) and depth:
+                if text[i] == "(":
+                    depth += 1
+                elif text[i] == ")":
+                    depth -= 1
+                i += 1
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
 
 
 def _func(source: str, name: str) -> str:

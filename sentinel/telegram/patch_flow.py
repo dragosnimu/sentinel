@@ -186,25 +186,35 @@ async def on_stage2(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
 async def on_dry_run(update: Update, context: ContextTypes.DEFAULT_TYPE,
                      plan_id: int) -> None:
-    """A dry run changes nothing, so it needs no token and no second screen."""
+    """A dry run changes nothing, so it needs no token and no second screen.
+
+    The result is a REPLY, never an edit of the plan message. Editing was the
+    obvious thing to write and it was wrong: `edit_message_text` replaces the
+    inline keyboard too, so running a dry-run deleted the approve button —
+    turning the one action meant to build confidence before applying into the
+    thing that made applying impossible. The plan message stays untouched with
+    its buttons; the result appears underneath it, which is also the order the
+    decision was actually made in.
+    """
     query = update.callback_query
     db: Database = context.bot_data["db"]
     cfg = context.bot_data["cfg"]
 
-    await query.edit_message_text("🧪 Rulez dry-run…")
+    progress = await query.message.reply_text("🧪 Rulez dry-run…")
     from sentinel.patch import runner
     try:
         result = await runner.run_plan(db, cfg, plan_id, mode="dry_run",
                                        triggered_by=f"telegram:{update.effective_chat.id}")
     except runner.PatchRefused as exc:
-        await query.edit_message_text(f"⛔ {_esc(exc)}")
+        await progress.edit_text(f"⛔ {_esc(exc)}")
         return
 
     lines = [f"🧪 <b>Dry-run {result.status}</b> (execuție #{result.execution_id})", ""]
     for s in result.steps[:12]:
         lines.append(f"{'✓' if s.ok else '✗'} <code>{_esc(s.phase)}/{_esc(s.step_id)}</code>")
     lines.append("\n<i>Nimic nu a fost modificat.</i>")
-    await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    lines.append("Butoanele de aprobare sunt pe mesajul planului, mai sus.")
+    await progress.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def on_reject(update: Update, context: ContextTypes.DEFAULT_TYPE,

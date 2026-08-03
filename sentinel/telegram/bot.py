@@ -246,10 +246,13 @@ async def on_patch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     a viewer must not be able to dry-run either, since that still runs commands."""
     cfg: Config = context.bot_data["cfg"]
     query = update.callback_query
-    await query.answer()
+
     if not _authorized(cfg, update) or not _can_act(cfg, update.effective_chat.id):
-        await query.edit_message_text("Neautorizat.")
+        # An alert, not an edit. Editing would delete the plan and its buttons
+        # for everyone in the chat because one viewer tapped something.
+        await query.answer("Neautorizat.", show_alert=True)
         return
+    await query.answer()
 
     from sentinel.telegram import patch_flow
     data = query.data or ""
@@ -265,7 +268,9 @@ async def on_patch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await patch_flow.on_reject(update, context, int(rest))
     except Exception as exc:  # noqa: BLE001 - never leave the operator staring at a spinner
         log.error("patch callback failed", extra={"data": prefix, "detail": str(exc)})
-        await query.edit_message_text(f"Eroare: {_esc(exc)}")
+        # Reply, never edit. An unexpected exception is the worst moment to
+        # destroy the message holding the plan and the only approval buttons.
+        await query.message.reply_text(f"Eroare: {_esc(exc)}")
 
 
 async def _close_incident(update: Update, context: ContextTypes.DEFAULT_TYPE,
