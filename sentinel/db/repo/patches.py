@@ -143,13 +143,18 @@ async def finish_execution(db: Database, execution_id: int, *, status: str,
                            error: str | None = None,
                            rollback_reason: str | None = None,
                            post_ok: bool | None = None) -> None:
+    # Every parameter is cast explicitly. $5 in particular: its only other use is
+    # `rollback_reason = $5`, and Postgres resolves an UPDATE SET assignment
+    # AFTER parameter type inference — so the bare `$5 IS NULL` left it with no
+    # type at all and the statement failed to prepare. Without the cast this
+    # errors on every call, whatever the values are.
     await db.execute(
         """
-        UPDATE patch_executions SET status = $2, finished_at = now(),
+        UPDATE patch_executions SET status = $2::text, finished_at = now(),
             duration_ms = (extract(epoch from (now() - started_at)) * 1000)::int,
-            result = $3::jsonb, error = $4, rollback_reason = $5,
-            rollback_at = CASE WHEN $5 IS NULL THEN rollback_at ELSE now() END,
-            post_verification_passed = $6
+            result = $3::jsonb, error = $4::text, rollback_reason = $5::text,
+            rollback_at = CASE WHEN $5::text IS NULL THEN rollback_at ELSE now() END,
+            post_verification_passed = $6::boolean
         WHERE id = $1
         """,
         execution_id, status, json.dumps(result or {}), error, rollback_reason, post_ok)

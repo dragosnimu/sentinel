@@ -97,7 +97,10 @@ async def _dispatch(db: Database, kind: str, c: dict[str, Any]) -> CheckOutcome:
         n = int(await db.fetchval(
             "SELECT count(*) FROM incidents WHERE status IN ('open','acknowledged') "
             "AND severity IN ('high','critical') "
-            "AND (asset_id = $1 OR $1 IS NULL)", c.get("asset_id")) or 0)
+            # Cast for the same reason as in repo/patches.py: a parameter whose
+            # only other appearance is a bare IS NULL cannot always be inferred.
+            "AND (asset_id = $1::bigint OR $1::bigint IS NULL)",
+            c.get("asset_id")) or 0)
         return CheckOutcome(n == 0, f"{n} incidente grave deschise", kind)
 
     if kind == "file_sha256":
