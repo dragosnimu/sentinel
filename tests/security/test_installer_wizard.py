@@ -145,6 +145,50 @@ def test_shell_files_use_unix_line_endings():
         assert b"\r\n" not in (REPO / name).read_bytes(), f"{name} has CRLF"
 
 
+# --- the upgrade path actually upgrades ------------------------------------
+COMMON = (REPO / "deploy" / "lib" / "common.sh").read_text(encoding="utf-8")
+
+
+def test_the_upgrade_steps_are_not_marker_gated():
+    """`git pull` + re-run is the documented upgrade. With every step behind a
+    completion marker, that re-run skipped the package copy AND the migrations,
+    printed success, and changed nothing on the host."""
+    assert "ALWAYS_STEPS=" in COMMON
+    for step in ("package", "migrate"):
+        assert step in COMMON.split("ALWAYS_STEPS=", 1)[1].split("\n", 1)[0], \
+            f"step {step} would be skipped on an upgrade"
+    assert "! step_is_always" in COMMON
+
+
+def test_documented_upgrade_command_matches_the_installer():
+    deployment = (REPO / "docs" / "DEPLOYMENT.md").read_text(encoding="utf-8")
+    upgrade = deployment.split("## 7. Upgrade", 1)[1].split("\n## ", 1)[0]
+    # The doc promises both of these happen; the test above is what makes it true.
+    assert "migrațiile noi se aplică" in upgrade
+    assert "git pull" in upgrade
+
+
+def test_deploy_probes_multiplexing_instead_of_assuming_it():
+    """Multiplexing is an optimisation. Assuming it works turns a cosmetic
+    Windows limitation into 'cannot reach the host', which sends the operator
+    to debug a network that is fine."""
+    deploy = (REPO / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    assert 'MUX="no"' in deploy
+    # Probed with a real session: `-O check` answers a different question.
+    probe = deploy.split('MUX="no"', 1)[1].split("ssh_run()", 1)[0]
+    assert '"${USER}@${HOST}" true' in probe
+    assert "-O exit" in probe               # the failed master is torn down
+
+
+def test_deploy_replaces_the_remote_deploy_tree_rather_than_nesting():
+    """`cp -r src dest` nests when dest exists, so the second deploy left the
+    FIRST deploy's rollback.sh in place."""
+    deploy = (REPO / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    line = next(l for l in deploy.splitlines() if "/opt/sentinel/deploy" in l and "cp -r" in l)
+    assert "rm -rf /opt/sentinel/deploy" in line
+    assert "|| true" not in line            # a silent failure here ages rollback.sh
+
+
 def _func(source: str, name: str) -> str:
     m = re.search(rf"^{re.escape(name)}\(\)\s*\{{.*?^\}}", source, re.S | re.M)
     assert m, f"function {name} not found"

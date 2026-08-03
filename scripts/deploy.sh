@@ -96,16 +96,59 @@ fi
 
 # One authentication, many commands. Also keeps the operator from being
 # prompted for a passphrase at each step.
+#
+# It is an optimisation, not a requirement, so it is PROBED rather than assumed.
+# Multiplexing needs a unix socket, and it does not work under Git Bash on
+# Windows (the mux handshake dies with "read from master failed") or where the
+# socket directory is mounted noexec. Assuming it works turns a cosmetic
+# limitation into "cannot reach the host", which is both wrong and the hardest
+# possible message to debug — it points at the network, and the network is fine.
 CTRL_PATH="${TMPDIR:-/tmp}/sentinel-deploy-%r@%h:%p"
 CTRL_OPTS=(-o "ControlMaster=auto" -o "ControlPath=${CTRL_PATH}" -o "ControlPersist=10m")
-SSH_OPTS+=("${CTRL_OPTS[@]}")
-SCP_OPTS+=("${CTRL_OPTS[@]}")
+MUX="no"
+
+# A socket left behind by an interrupted run is not reusable, and ssh does not
+# say so plainly: it prints "ControlSocket already exists, disabling
+# multiplexing" on EVERY later connection and carries on unmultiplexed. The
+# probe below then sees a command that worked and concludes multiplexing is
+# fine. Clear the concrete path first so the probe measures this run.
+rm -f "${TMPDIR:-/tmp}/sentinel-deploy-${USER}@${HOST}:${SSH_PORT}" 2>/dev/null || true
+
+# The probe runs a real command through the master and reads what ssh SAYS about
+# it, not just the exit code. Two ways this goes wrong otherwise:
+#
+#   * `ssh -O check` reports the master alive on Git Bash, and then every
+#     session over it dies with "read from master failed" — "is it alive" is a
+#     different question from "can I use it";
+#   * when multiplexing is refused, ssh warns and silently falls back to a
+#     direct connection, so the command SUCCEEDS. Exit code alone says yes.
+if ssh -M -N -f -o ConnectTimeout=15 "${SSH_OPTS[@]}" "${CTRL_OPTS[@]}" \
+       "${USER}@${HOST}" 2>/dev/null &&
+   PROBE_OUT="$(ssh "${SSH_OPTS[@]}" "${CTRL_OPTS[@]}" "${USER}@${HOST}" true 2>&1)" &&
+   [[ "$PROBE_OUT" != *"disabling multiplexing"* ]] &&
+   [[ "$PROBE_OUT" != *"read from master failed"* ]]
+then
+    MUX="yes"
+    SSH_OPTS+=("${CTRL_OPTS[@]}")
+    SCP_OPTS+=("${CTRL_OPTS[@]}")
+else
+    # Tear the master down AND unlink the socket. `-O exit` fails against a
+    # master that is already half-dead, which is exactly the case that got us
+    # here, and the leftover file poisons every subsequent run.
+    ssh -O exit "${SSH_OPTS[@]}" "${CTRL_OPTS[@]}" "${USER}@${HOST}" >/dev/null 2>&1 || true
+    rm -f "${TMPDIR:-/tmp}/sentinel-deploy-${USER}@${HOST}:${SSH_PORT}" 2>/dev/null || true
+    warn "SSH multiplexing unavailable here (normal on Windows/Git Bash)."
+    warn "Continuing without it — you may be asked for the key more than once."
+fi
 
 ssh_run()  { ssh "${SSH_OPTS[@]}" "${USER}@${HOST}" "$@"; }
+# NOTE: this elevates ONE command. `ssh_sudo "a && b"` runs only `a` as root.
+# Call it once per command, or wrap the chain in `sh -c` yourself.
 ssh_sudo() { ssh -t "${SSH_OPTS[@]}" "${USER}@${HOST}" "sudo -p 'sudo password: ' $*"; }
 
 cleanup() {
-    ssh -O exit "${SSH_OPTS[@]}" "${USER}@${HOST}" 2>/dev/null || true
+    [[ "$MUX" == "yes" ]] &&
+        ssh -O exit "${SSH_OPTS[@]}" "${USER}@${HOST}" 2>/dev/null || true
     [[ -n "${TARBALL:-}" && -f "${TARBALL:-}" ]] && rm -f "$TARBALL"
 }
 trap cleanup EXIT
@@ -294,7 +337,19 @@ ok "installation finished"
 
 # Keep the extracted tree: rollback.sh lives in it, and the operator will want
 # it if something needs resuming.
-ssh_sudo "mkdir -p /opt/sentinel && cp -r '${REMOTE_DIR}/deploy' /opt/sentinel/deploy" || true
+#
+# Replaced wholesale, not copied over. `cp -r src dest` nests when dest exists,
+# so the second deploy to a host produced /opt/sentinel/deploy/deploy and left
+# the FIRST deploy's rollback.sh in place — the one script whose being stale
+# matters most. Removed first, then copied.
+# One sudo per command, deliberately. `sudo cmd1 && cmd2` elevates cmd1 ONLY —
+# the rest of the chain runs as the login user. Written as a chain, this removed
+# the old tree as root and then failed to write the new one, leaving the host
+# with no rollback.sh at all.
+ssh_sudo "install -d -m 0755 /opt/sentinel" \
+    && ssh_sudo "rm -rf /opt/sentinel/deploy" \
+    && ssh_sudo "cp -r '${REMOTE_DIR}/deploy' /opt/sentinel/deploy" \
+    || warn "could not refresh /opt/sentinel/deploy — rollback.sh there may be from an older release"
 ssh_run "rm -rf '${REMOTE_DIR}'"
 
 # ---------------------------------------------------------------------------

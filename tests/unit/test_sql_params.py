@@ -69,7 +69,11 @@ def test_the_statement_that_broke_is_fully_cast():
     """Regression: pin the exact statement, so a future edit that drops the
     casts fails here rather than on the operator's screen."""
     src = (REPO / "sentinel" / "db" / "repo" / "patches.py").read_text(encoding="utf-8")
-    stmt = src.split("UPDATE patch_executions SET", 1)[1].split('"""', 1)[0]
+    # Anchored on the function, not on the first `UPDATE patch_executions` in
+    # the file — other statements touch that table, and matching one of those
+    # instead would make this test pass while checking nothing.
+    fn = src.split("async def finish_execution", 1)[1].split("\nasync def ", 1)[0]
+    stmt = fn.split("UPDATE patch_executions SET", 1)[1].split('"""', 1)[0]
     for param in ("$2", "$3", "$4", "$5", "$6"):
         assert f"{param}::" in stmt, f"{param} is uncast in finish_execution"
     assert "$5::text IS NULL" in stmt

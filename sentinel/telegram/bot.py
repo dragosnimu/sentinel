@@ -493,25 +493,112 @@ async def on_flush_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 # --- push loop -------------------------------------------------------------
+_EXEC_EMOJI = {"succeeded": "✅", "aborted": "⛔", "failed": "❌",
+               "rolled_back": "↩️", "rollback_failed": "🔥"}
+
+
+def _format_execution(row: dict) -> str:
+    """The outcome of a run the operator started somewhere else.
+
+    A dry-run that succeeded is good news and gets one line. Anything that rolled
+    back or failed carries its reason: that is the whole reason to send this.
+    """
+    mode = "Dry-run" if row["mode"] == "dry_run" else "Aplicare"
+    emoji = _EXEC_EMOJI.get(row["status"], "•")
+    lines = [
+        f"{emoji} <b>{mode} {_esc(row['status'])}</b> · plan #{row['plan_id']} "
+        f"(execuție #{row['id']})",
+        f"Pornit de: <code>{_esc(row['triggered_by'])}</code>",
+    ]
+    if row.get("duration_ms"):
+        lines.append(f"Durată: {row['duration_ms']} ms")
+    if row.get("rollback_reason"):
+        lines.append(f"\n↩️ <b>Revenire:</b> {_esc(str(row['rollback_reason'])[:300])}")
+    elif row.get("error"):
+        lines.append(f"\n<b>Eroare:</b> {_esc(str(row['error'])[:300])}")
+    if row["mode"] == "dry_run":
+        lines.append("\n<i>Nimic nu a fost modificat.</i>")
+    return "\n".join(lines)
+
+
+async def _broadcast(app: Application, cfg: Config, text: str,
+                     kb: InlineKeyboardMarkup | None = None) -> int:
+    """Send to every allowed chat. Returns how many actually went out."""
+    sent = 0
+    for chat_id in cfg.telegram.allowed_chat_ids:
+        try:
+            await app.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML,
+                                       reply_markup=kb)
+            sent += 1
+        except Exception as exc:  # noqa: BLE001
+            log.warning("push send failed", extra={"chat_id": chat_id, "detail": str(exc)})
+    return sent
+
+
+async def _push_incidents(app: Application, cfg: Config, db: Database) -> None:
+    for inc in await inc_repo.unnotified(db, min_severity=cfg.telegram.min_severity):
+        text = "🚨 " + format_incident(inc, header="INCIDENT NOU")
+        await _broadcast(app, cfg, text, _incident_block_kb(inc, cfg))
+        await inc_repo.mark_notified(db, inc.id)
+        log.info("incident pushed", extra={"incident_id": inc.id, "severity": inc.severity})
+
+
+async def _push_plans(app: Application, cfg: Config, db: Database) -> None:
+    """Offer newly generated plans, with their approval buttons.
+
+    Unlike an incident, this is NOT marked notified when every send failed. An
+    incident that missed its push is still visible in the dashboard and still
+    counted; a plan that missed its push is a decision waiting on someone who was
+    never asked. It is retried until it either lands or ages out of the TTL.
+    """
+    from sentinel.db.repo import patches as patch_repo
+    from sentinel.telegram import patch_flow
+
+    for row in await patch_repo.unnotified_plans(db):
+        sent = 0
+        for chat_id in cfg.telegram.allowed_chat_ids:
+            # Not _broadcast: each chat needs its OWN approval token, because a
+            # token is bound to the chat it was issued for.
+            if not _can_act(cfg, chat_id):
+                continue
+            try:
+                await patch_flow.send_plan_for_approval(app.bot, db, chat_id, row)
+                sent += 1
+            except Exception as exc:  # noqa: BLE001
+                log.warning("plan push failed",
+                            extra={"chat_id": chat_id, "plan": row.id, "detail": str(exc)})
+        if sent:
+            await patch_repo.mark_plan_notified(db, row.id)
+            log.warning("patch plan pushed", extra={"plan": row.id, "chats": sent})
+        else:
+            log.error("patch plan reached nobody — will retry",
+                      extra={"plan": row.id})
+
+
+async def _push_executions(app: Application, cfg: Config, db: Database) -> None:
+    from sentinel.db.repo import patches as patch_repo
+
+    for row in await patch_repo.unnotified_executions(db):
+        await _broadcast(app, cfg, _format_execution(row))
+        # Marked whatever happened: an outcome report is information, not a
+        # pending decision, and retrying it forever would be noise.
+        await patch_repo.mark_execution_notified(db, row["id"])
+        log.info("execution outcome pushed",
+                 extra={"execution_id": row["id"], "status": row["status"]})
+
+
 async def _push_loop(app: Application, cfg: Config, db: Database) -> None:
     interval = 15
+    # Each source is isolated: a failure in one must not stop the others. An
+    # exception in the plan query used to be enough to stop incident alerts.
+    sources = (("incidents", _push_incidents), ("plans", _push_plans),
+               ("executions", _push_executions))
     while True:
-        try:
-            incidents = await inc_repo.unnotified(db, min_severity=cfg.telegram.min_severity)
-            for inc in incidents:
-                text = "🚨 " + format_incident(inc, header="INCIDENT NOU")
-                kb = _incident_block_kb(inc, cfg)
-                for chat_id in cfg.telegram.allowed_chat_ids:
-                    try:
-                        await app.bot.send_message(
-                            chat_id, text, parse_mode=ParseMode.HTML, reply_markup=kb)
-                    except Exception as exc:  # noqa: BLE001
-                        log.warning("push send failed", extra={"chat_id": chat_id, "detail": str(exc)})
-                await inc_repo.mark_notified(db, inc.id)
-                if incidents:
-                    log.info("incident pushed", extra={"incident_id": inc.id, "severity": inc.severity})
-        except Exception as exc:  # noqa: BLE001
-            log.error("push loop error", extra={"detail": str(exc)})
+        for name, fn in sources:
+            try:
+                await fn(app, cfg, db)
+            except Exception as exc:  # noqa: BLE001
+                log.error("push loop error", extra={"source": name, "detail": str(exc)})
         await asyncio.sleep(interval)
 
 

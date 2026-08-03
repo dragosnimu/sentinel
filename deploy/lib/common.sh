@@ -63,6 +63,24 @@ mark_done() {
 
 clear_step() { rm -f "${STATE_MARKERS}/$1"; }
 
+# Steps that must run on EVERY invocation, marker or not.
+#
+# A marker means "this was done once", which is the right question for creating
+# a user or initialising a database cluster, and the wrong question for
+# installing the code. The documented upgrade path is `git pull` and re-run —
+# and with everything marker-gated that re-run skipped the package copy AND the
+# migrations, reported success, and changed nothing. An upgrade that silently
+# does nothing is worse than one that fails.
+#
+# Everything listed here is idempotent by construction: the package copy wipes
+# and rewrites, migrations are forward-only and skip what is applied, unit files
+# are overwritten, and the service start is a restart behind a health gate.
+ALWAYS_STEPS="package claude_workspace migrate systemd start_services"
+
+step_is_always() {
+    case " ${ALWAYS_STEPS} " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+
 # step NN name -- runs the body unless already marked or below --from-step.
 run_step() {
     local num="$1" name="$2"; shift 2
@@ -77,7 +95,7 @@ run_step() {
     if [[ "${FORCE_STEP:-}" == "$num" ]]; then
         clear_step "$key"
     fi
-    if step_done "$key"; then
+    if step_done "$key" && ! step_is_always "$name"; then
         printf '%s[=]%s step %-28s (already done)\n' "$_C_GREEN" "$_C_RESET" "$key"
         return 0
     fi

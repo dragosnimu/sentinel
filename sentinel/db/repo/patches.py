@@ -89,6 +89,60 @@ async def list_plans(db: Database, *, limit: int = 50) -> list[PlanRow]:
     return [_plan(r) for r in rows]
 
 
+# --- push queue -------------------------------------------------------------
+#
+# The bot claims rows from these two queries and stamps them. Everything else
+# about patching is pull-based (the operator asks); these are the only places
+# the system speaks first, so both are deliberately narrow.
+async def unnotified_plans(db: Database, *, limit: int = 3) -> list[PlanRow]:
+    """Validated plans the operator has never been shown.
+
+    `limit` is small on purpose. A scan that turns up eight exploited CVEs at
+    3 a.m. should not produce eight approval prompts stacked on a phone — the
+    rest are still listed by `/patches`, and the next pass will offer them.
+    """
+    rows = await db.fetch(
+        f"""
+        SELECT {_PLAN_COLS} FROM patch_plans
+        WHERE notified_at IS NULL AND status = 'validated'
+          AND created_at > now() - make_interval(hours => $1)
+        ORDER BY created_at
+        LIMIT $2
+        """,
+        PLAN_TTL_HOURS, limit)
+    return [_plan(r) for r in rows]
+
+
+async def mark_plan_notified(db: Database, plan_db_id: int) -> None:
+    await db.execute("UPDATE patch_plans SET notified_at = now() WHERE id = $1", plan_db_id)
+
+
+async def unnotified_executions(db: Database, *, limit: int = 5) -> list[dict[str, Any]]:
+    """Finished executions whose outcome has not been reported.
+
+    Telegram-triggered runs are excluded: `on_dry_run` already edits its own
+    message with the result, and announcing it a second time would train the
+    operator to ignore the announcements.
+    """
+    rows = await db.fetch(
+        """
+        SELECT e.id, e.plan_id, e.mode, e.status, e.duration_ms, e.error,
+               e.triggered_by, e.rollback_reason
+        FROM patch_executions e
+        WHERE e.notified_at IS NULL AND e.finished_at IS NOT NULL
+          AND e.triggered_by NOT LIKE 'telegram:%'
+        ORDER BY e.finished_at
+        LIMIT $1
+        """,
+        limit)
+    return [dict(r) for r in rows]
+
+
+async def mark_execution_notified(db: Database, execution_id: int) -> None:
+    await db.execute("UPDATE patch_executions SET notified_at = now() WHERE id = $1",
+                     execution_id)
+
+
 async def approve_plan(db: Database, plan_db_id: int, *, by: str, expected_hash: str) -> bool:
     """Approve — but only if the plan is byte-identical to what was shown.
 
