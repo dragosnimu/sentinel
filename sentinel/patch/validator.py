@@ -436,6 +436,42 @@ def _check_nondeterministic(argv: list[str], path: str, r: ValidationResult) -> 
 # ---------------------------------------------------------------------------
 # Backups and checks
 # ---------------------------------------------------------------------------
+# `source` means a different thing per kind, and getting it wrong is not caught
+# by anything downstream until the executor runs — at which point the operator
+# has already approved twice and is watching a patch abort.
+#
+# The specific failure this exists for: a plan asked to back up `rpm_state` with
+# source `/var/lib/rpm`. That reads correctly — it IS the RPM database — but the
+# executor's `rpm_state` records the installed `name-version-release.arch` of one
+# package, which is what makes the `dnf downgrade` in restore_argv meaningful.
+# `rpm -q /var/lib/rpm` exits 1, so the backup fails and the patch aborts.
+#
+# The prompt already stated the contract. Stating it was not enough: the model is
+# the drafting tool and the validator is the authority, so the authority has to
+# know the rule too.
+_PKG_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
+
+_PATH_KINDS = ("path", "git_ref")
+_NAME_KINDS = ("rpm_state", "mysql", "postgres", "docker_volume")
+
+
+def _check_source_shape(kind: str, source: str, path: str, r: ValidationResult) -> None:
+    if kind in _NAME_KINDS:
+        if source.startswith("/"):
+            r.error(
+                path, "bad_format",
+                f"{kind} takes a NAME, not a filesystem path — got {source!r}. "
+                f"For rpm_state that is the package (e.g. \"curl\"); the executor "
+                f"records its exact version so restore_argv can pin it.",
+            )
+        elif not _PKG_NAME_RE.match(source):
+            r.error(path, "bad_format",
+                    f"{kind} source {source!r} is not a valid name")
+    elif kind in _PATH_KINDS and not source.startswith("/"):
+        r.error(path, "bad_format",
+                f"{kind} takes an absolute path — got {source!r}")
+
+
 def _validate_backups(backups: Any, r: ValidationResult) -> list[dict[str, Any]]:
     if backups is None:
         return []
@@ -458,6 +494,7 @@ def _validate_backups(backups: Any, r: ValidationResult) -> list[dict[str, Any]]
             r.error(f"{base}.source", "missing_field", "source is required")
         else:
             _check_protected_paths(source, f"{base}.source", r)
+            _check_source_shape(str(item.get("kind", "")), source, f"{base}.source", r)
 
         restore = item.get("restore_argv")
         if restore is None:

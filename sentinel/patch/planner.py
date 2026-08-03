@@ -32,11 +32,30 @@ from sentinel.config import Config
 from sentinel.db.engine import Database
 from sentinel.db.repo import patches as repo
 from sentinel.logging_setup import get_logger
-from sentinel.patch.validator import plan_hash, validate_plan
+from sentinel.patch.validator import CHECK_REQUIRED_FIELDS, plan_hash, validate_plan
 
 log = get_logger(__name__)
 
 MAX_ATTEMPTS = 2
+
+
+def _check_fields_doc() -> str:
+    """Render the per-kind required fields FROM the validator's own table.
+
+    The prompt used to list the check kinds and nothing else, so the model had
+    to invent the fields — and invented them wrong: `disk_free` with no
+    `min_bytes`, `no_open_incident` with no `asset_id`. Both attempts were
+    rejected for the same class of omission, which is real money spent on a
+    guaranteed refusal.
+
+    Generated rather than written out, because a hand-copied list drifts the
+    first time a check kind gains a field, and the drift is invisible until a
+    plan is rejected in production.
+    """
+    lines = [f"   · {kind}: {', '.join(fields)}"
+             for kind, fields in sorted(CHECK_REQUIRED_FIELDS.items())]
+    lines.append("   · pkg_version cere ÎN PLUS `equals` sau `at_least`")
+    return "\n".join(lines)
 
 PLANNER_SYSTEM = """\
 Ești inginerul de patch-uri al agentului Sentinel, pe un server AlmaLinux 9.
@@ -56,8 +75,9 @@ REGULI ABSOLUTE — un plan care le încalcă este respins de validator, nu disc
    /var/backups/sentinel, /root/.ssh, /etc/ssh, /etc/passwd, /etc/shadow,
    /etc/sudoers, /boot.
 4. `preflight`, `health_check` și `post_verification` sunt verificări STRUCTURATE
-   (obiecte cu `kind`), nu comenzi. Tipuri: systemd, command, file_exists,
-   file_absent, file_sha256, pkg_version, disk_free, no_open_incident, http, tcp, docker.
+   (obiecte cu `kind`), nu comenzi. Fiecare tip are câmpuri OBLIGATORII — dacă
+   lipsește vreunul, planul e respins:
+%%CHECK_FIELDS%%
 5. Dacă există `backup`, trebuie să existe și o verificare `disk_free` în preflight.
 6. Cel puțin o verificare din preflight trebuie să aibă `blocking: true`.
 7. Un pas de `rollback` nu poate avea `on_failure: "rollback"` (ar fi recursiv);
@@ -83,7 +103,8 @@ STRUCTURA EXACTĂ a câmpurilor obligatorii:
     · `rpm_state` → NUMELE PACHETULUI, nu o cale (ex. "curl"). Se salvează
       versiunea instalată, ca rollback-ul să o poată fixa.
     · `git_ref`   → calea depozitului git
-  Un `rpm_state` cu o cale în loc de nume de pachet produce un backup gol.
+  Un `rpm_state` cu o cale (ex. "/var/lib/rpm") este RESPINS de validator:
+  `rpm -q` primește un nume de pachet, nu o cale, iar backup-ul ar eșua.
 - `restore_instructions_ro`: text
 Folosește exact valorile din contextul primit pentru asset_id, asset_name și
 finding_id — nu le inventa.
@@ -94,6 +115,10 @@ nu o secvență inteligentă. Nu inventa pași. Nu presupune fișiere pe care nu
 le-am arătat.
 
 Răspunde DOAR prin apelul tool-ului `emit_patch_plan`."""
+
+# Substituted, not f-stringed: the prompt is full of literal `{...}` describing
+# the JSON shape, and an f-string would try to interpolate every one of them.
+PLANNER_SYSTEM = PLANNER_SYSTEM.replace("%%CHECK_FIELDS%%", _check_fields_doc())
 
 
 def _tool_schema() -> dict[str, Any]:

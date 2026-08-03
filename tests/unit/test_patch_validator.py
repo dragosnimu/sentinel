@@ -217,6 +217,67 @@ def test_check_kind_required_fields(broken_plan):
 
 
 # ---------------------------------------------------------------------------
+# `source` means something different per kind
+# ---------------------------------------------------------------------------
+def test_rpm_state_source_must_be_a_package_not_a_path(broken_plan):
+    """The one that reached production. `/var/lib/rpm` reads correctly — it IS
+    the RPM database — but the executor's rpm_state records one package's exact
+    version, which is what makes `dnf downgrade` in restore_argv possible.
+    `rpm -q /var/lib/rpm` exits 1, and the patch aborts at backup, after the
+    operator has already confirmed twice."""
+    assert "bad_format" in codes(broken_plan("backup.0.source", "/var/lib/rpm"))
+    assert "bad_format" in codes(broken_plan("backup.0.source", "/usr/bin/curl"))
+
+
+def test_rpm_state_accepts_a_real_package_name(good_plan):
+    plan = dict(good_plan)
+    for name in ("curl", "nginx", "python3.12", "kernel-core", "gcc-c++"):
+        plan["backup"] = [{**good_plan["backup"][0], "source": name}]
+        assert "bad_format" not in codes(plan), name
+
+
+def test_path_kinds_must_be_absolute(broken_plan):
+    """The mirror image: a `path` backup whose source is a bare name would tar
+    up whatever the executor's working directory happens to contain."""
+    assert "bad_format" in codes(broken_plan("backup.1.source", "nginx"))
+    assert "bad_format" in codes(broken_plan("backup.1.source", "etc/nginx"))
+
+
+# ---------------------------------------------------------------------------
+# The prompt has to agree with the validator, or every plan costs two calls
+# ---------------------------------------------------------------------------
+def test_prompt_lists_the_required_field_of_every_check_kind():
+    """The prompt used to name the check kinds and stop there, so the model
+    invented the fields — `disk_free` with no `min_bytes`, `no_open_incident`
+    with no `asset_id`. Both attempts rejected for the same omission: real money
+    for a guaranteed refusal."""
+    from sentinel.patch.planner import PLANNER_SYSTEM
+    from sentinel.patch.validator import CHECK_REQUIRED_FIELDS
+
+    for kind, fields in CHECK_REQUIRED_FIELDS.items():
+        assert f"· {kind}:" in PLANNER_SYSTEM, f"{kind} is not described to the model"
+        for field in fields:
+            line = next(l for l in PLANNER_SYSTEM.splitlines() if l.strip().startswith(f"· {kind}:"))
+            assert field in line, f"{kind} requires {field}, and the prompt omits it"
+
+
+def test_the_prompt_placeholder_was_actually_substituted():
+    """A silent `.replace` miss would leave `%%CHECK_FIELDS%%` in the system
+    prompt — syntactically fine, and the model told nothing."""
+    from sentinel.patch.planner import PLANNER_SYSTEM
+    assert "%%" not in PLANNER_SYSTEM
+
+
+def test_the_rejection_says_what_to_write_instead(broken_plan):
+    """A validation error is fed back to the model for one retry, so it has to
+    be actionable — 'bad format' alone earns a second identical mistake."""
+    from sentinel.patch.validator import validate_plan
+    plan = broken_plan("backup.0.source", "/var/lib/rpm")
+    msg = next(e.message for e in validate_plan(plan).errors if "rpm_state" in e.message)
+    assert "NAME" in msg and "curl" in msg
+
+
+# ---------------------------------------------------------------------------
 # Plan hash — the binding between an approval and a specific plan
 # ---------------------------------------------------------------------------
 def test_hash_is_stable_across_volatile_fields(good_plan):
