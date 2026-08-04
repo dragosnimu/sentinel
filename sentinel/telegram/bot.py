@@ -196,7 +196,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"🛡️ <b>Sentinel {_esc(__version__)}</b>\n"
         f"Incidente deschise: <b>{counts['total']}</b>  {sev_line}\n"
         f"Servicii: 🟢 {up} active · 🔴 {down} picate · {len(assets)} total\n"
-        f"Comenzi: /incidents /incident /services /health"
+        f"Toate comenzile: /ajutor"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -465,37 +465,6 @@ async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"Deblocat <code>{_esc(ip)}</code>.", parse_mode=ParseMode.HTML)
     except (ExecutorRejected, ExecutorUnavailable) as exc:
         await update.message.reply_text(f"Eroare: {_esc(exc)}")
-
-
-async def cmd_blocklist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    db: Database = context.bot_data["db"]
-    blocks = await blocklist_repo.list_active(db, limit=30)
-    live = await actions.live_count()
-    if not blocks:
-        await update.message.reply_text(f"Blocklist gol. (nftables: {live if live >= 0 else '?'} elemente)")
-        return
-    lines = [f"🚫 <b>Blocklist</b> — {len(blocks)} active (nftables: {live if live >= 0 else '?'})"]
-    for b in blocks:
-        exp = b.expires_at.strftime("%m-%d %H:%M") if b.expires_at else "permanent"
-        lines.append(f"<code>{_esc(b.ip)}</code> · {exp} · {_esc(b.created_by)}")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-
-_MUTE_HELP = (
-    "🔕 <b>Ore de liniște</b>\n\n"
-    "<code>/mute 22:00-06:00</code> — în fiecare noapte, între aceste ore\n"
-    "<code>/mute 2h</code> — pauză unică (maxim 24h)\n"
-    "<code>/mute off</code> — oprește tot\n"
-    "<code>/mute</code> — starea curentă\n\n"
-    "<i>Alertele critice, PANIC, watchdog-ul și eșecurile de patch trec "
-    "întotdeauna. Restul sunt reținute, nu pierdute — sosesc când se termină "
-    "intervalul.</i>"
-)
-
-
-def _fmt_local(moment, tz_name: str | None) -> str:
-    from sentinel.telegram.quiet import zone
-    return moment.astimezone(zone(tz_name)).strftime("%H:%M pe %d.%m")
 
 
 async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -856,24 +825,49 @@ def build_application(cfg: Config, secrets: Secrets) -> Application:
     app.post_init = post_init
     app.post_shutdown = post_shutdown
 
-    app.add_handler(CommandHandler("start", _guard(cmd_status)))
-    app.add_handler(CommandHandler("status", _guard(cmd_status)))
-    app.add_handler(CommandHandler("incidents", _guard(cmd_incidents)))
-    app.add_handler(CommandHandler("incident", _guard(cmd_incident)))
-    app.add_handler(CommandHandler("resolve", _guard(cmd_resolve)))
-    app.add_handler(CommandHandler("fp", _guard(cmd_false_positive)))
-    app.add_handler(CommandHandler("patches", _guard(cmd_patches)))
-    app.add_handler(CommandHandler("patch", _guard(cmd_patches)))
-    app.add_handler(CommandHandler("services", _guard(cmd_services)))
-    app.add_handler(CommandHandler("health", _guard(cmd_health)))
-    # Response (P5): still read-mostly, but these can change firewall state.
-    app.add_handler(CommandHandler("block", _guard(cmd_block)))
-    app.add_handler(CommandHandler("unblock", _guard(cmd_unblock)))
-    app.add_handler(CommandHandler("blocklist", _guard(cmd_blocklist)))
-    app.add_handler(CommandHandler("panic", _guard(cmd_panic)))
-    app.add_handler(CommandHandler("mute", _guard(cmd_mute)))
-    app.add_handler(CommandHandler("unmute", _guard(cmd_unmute)))
-    app.add_handler(CommandHandler("liniste", _guard(cmd_mute)))
+    from sentinel.telegram import views
+
+    # Every command, and the Romanian name for each one. The interface language
+    # is Romanian, so `/incidente` has to work; the English names stay because
+    # they are what the documentation and the phone's autocomplete already
+    # learned, and dropping them would break both.
+    #
+    # (name, handler) — registered for each alias in the tuple.
+    read_only = [
+        (("start", "help", "ajutor"),                  views.cmd_help),
+        (("dashboard", "panou"),                       views.cmd_dashboard),
+        (("status",),                                  cmd_status),
+        (("incidents", "incidente"),                   cmd_incidents),
+        (("incident",),                                cmd_incident),
+        # No diacritics: Telegram accepts [a-z0-9_] in a command name and
+        # REJECTS the whole handler set otherwise, which crash-loops the bot —
+        # i.e. one bad alias takes down the emergency channel.
+        (("vulns", "vulnerabilitati"),                 views.cmd_vulns),
+        (("vuln",),                                    views.cmd_vuln),
+        (("events", "evenimente"),                     views.cmd_events),
+        (("services", "servicii"),                     cmd_services),
+        (("health", "sanatate"),                       cmd_health),
+        (("blocklist", "blocate"),                     views.cmd_blocklist_full),
+        (("patches", "patch", "patchuri"),             cmd_patches),
+    ]
+    for names, handler in read_only:
+        for name in names:
+            app.add_handler(CommandHandler(name, _guard(handler)))
+
+    # State-changing. Each re-checks the role itself; `_guard` only enforces the
+    # chat allowlist, which is not the same thing.
+    acting = [
+        (("resolve", "rezolva"),   cmd_resolve),
+        (("fp", "falspozitiv"),    cmd_false_positive),
+        (("block", "blocheaza"),   cmd_block),
+        (("unblock", "deblocheaza"), cmd_unblock),
+        (("panic",),               cmd_panic),
+        (("mute", "liniste"),      cmd_mute),
+        (("unmute",),              cmd_unmute),
+    ]
+    for names, handler in acting:
+        for name in names:
+            app.add_handler(CommandHandler(name, _guard(handler)))
     # Inline confirm buttons. The callbacks re-check authorisation themselves,
     # so they are registered without the message-oriented _guard wrapper.
     # Patch buttons first: they carry opaque tokens and must not fall through to

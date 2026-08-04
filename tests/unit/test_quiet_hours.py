@@ -284,8 +284,10 @@ def test_mute_is_registered_with_an_unmute_escape_hatch():
 
     from sentinel.telegram import bot
     src = inspect.getsource(bot.build_application)
-    assert 'CommandHandler("mute"' in src
-    assert 'CommandHandler("unmute"' in src
+    # Registered from the alias table rather than one call per command, so the
+    # assertion is on the table.
+    assert '("mute", "liniste")' in src
+    assert '("unmute",)' in src
 
 
 def test_unmute_clears_both_mechanisms():
