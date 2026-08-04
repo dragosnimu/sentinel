@@ -67,8 +67,61 @@ autentificare.
 | `/blocklist [n]` | Blocurile active cu TTL rămas, motiv, contor de hit-uri, buton `Deblochează` pe fiecare |
 | `/allow <ip> [motiv]` | Adaugă în allowlist. Necesită confirmare |
 | `/watch <ip>` | Monitorizează fără să blocheze |
-| `/mute <minute>` | Suprimă notificările non-critice. Cele critice trec întotdeauna |
+| `/mute` | Ore de liniște — vezi §3.1 |
+| `/unmute` | Repornește alertele, oprind ambele mecanisme |
 | `/panic` | **Golește tot blocklist-ul, imediat.** Dublă confirmare. Disponibilă chiar și pe mute |
+
+### 3.1 Ore de liniște
+
+Un canal care te trezește la 3 dimineața pentru o scanare de porturi e un canal
+pe care îl vei opri definitiv într-o săptămână — iar un canal oprit definitiv e
+mai rău decât niciunul: arată ca acoperire și nu e. De asta există `/mute`.
+
+```
+/mute 22:00-06:00     în fiecare noapte, între aceste ore
+/mute 2h              pauză unică (maxim 24h)
+/mute off             oprește tot
+/mute                 starea curentă
+```
+
+**Se setează per chat**, nu global. Cel care scrie comanda e cel pe care îl
+trezește telefonul, iar o setare comună ar lăsa un operator să tacă telefonul
+altuia.
+
+**Orele sunt locale.** Serverul rulează pe UTC, dar cine scrie „22:00" se referă
+la 22:00 unde stă el. Fusul se citește după nume din `/etc/timezone` sau din
+`/etc/localtime` — nu ca decalaj fix — ca noaptea în care se schimbă ora să nu
+mute sfârșitul intervalului cu o oră.
+
+**Nu există mute nelimitat.** `/mute 7d` e limitat la 24 de ore. Un mute pe care
+trebuie să-ți amintești să-l anulezi e unul pe care nu-l vei anula.
+
+#### Ce trece oricum
+
+Tăcerea trebuie să fie sigură. Astea ignoră orice interval, orice pauză și orice
+configurație:
+
+| | De ce |
+|---|---|
+| Alertele **critice** | Dacă nu merită trezirea, nu erau critice |
+| **PANIC** și **watchdog** | Îți spun că propria plasă de siguranță s-a declanșat |
+| **Patch eșuat** sau **revenit** | Ceva pe gazdă s-a schimbat și apoi s-a schimbat înapoi. Nu se amână până dimineață |
+| **Lockout** | S-ar putea să fii blocat afară chiar acum |
+
+Lista trăiește în cod (`sentinel/telegram/quiet.py`), nu în configurație:
+*care alerte pot fi tăcute* e o proprietate de siguranță, iar un fișier de
+configurație e locul greșit în care să lași pe cineva s-o tacă și pe ultima.
+
+#### Ce se întâmplă cu restul
+
+Sunt **reținute, nu pierdute.** Rândurile rămân cu `notified_at` gol și pleacă
+la primul ciclu după ce se termină intervalul. Dacă s-au adunat mai multe decât
+`digest_threshold`, sosesc ca un singur rezumat — să te trezești la șaizeci de
+notificări e, practic, la fel cu a nu te trezi la niciuna.
+
+Dacă interogarea preferințelor eșuează, botul **alertează oricum**. E singura
+direcție sigură: o eroare de bază de date nu are voie să tacă un canal de
+securitate.
 
 ### Vulnerabilități și patching
 

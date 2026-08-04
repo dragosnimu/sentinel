@@ -126,7 +126,13 @@ class TelegramConfig:
     owner_chat_id: int | None = None
     operator_chat_ids: list[int] = field(default_factory=list)
     viewer_chat_ids: list[int] = field(default_factory=list)
-    quiet_hours: str | None = None          # "23:00-07:00"; critical always passes
+    # Deployment-wide default window, "22:00-06:00". A chat that sets its own
+    # with /mute overrides this. Critical alerts, PANIC, the watchdog and patch
+    # failures ignore it entirely — see telegram/quiet.py.
+    quiet_hours: str | None = None
+    # IANA zone the window is read in. None = the host's own zone, which is
+    # what an operator typing "22:00" almost always means.
+    timezone: str | None = None
     min_severity: str = "medium"
     digest_threshold: int = 10              # more than N alerts in 5 min → digest
     rate_limit_per_minute: int = 30

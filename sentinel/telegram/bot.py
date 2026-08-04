@@ -481,6 +481,102 @@ async def cmd_blocklist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+_MUTE_HELP = (
+    "🔕 <b>Ore de liniște</b>\n\n"
+    "<code>/mute 22:00-06:00</code> — în fiecare noapte, între aceste ore\n"
+    "<code>/mute 2h</code> — pauză unică (maxim 24h)\n"
+    "<code>/mute off</code> — oprește tot\n"
+    "<code>/mute</code> — starea curentă\n\n"
+    "<i>Alertele critice, PANIC, watchdog-ul și eșecurile de patch trec "
+    "întotdeauna. Restul sunt reținute, nu pierdute — sosesc când se termină "
+    "intervalul.</i>"
+)
+
+
+def _fmt_local(moment, tz_name: str | None) -> str:
+    from sentinel.telegram.quiet import zone
+    return moment.astimezone(zone(tz_name)).strftime("%H:%M pe %d.%m")
+
+
+async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/mute` — set, inspect or clear the quiet window for THIS chat.
+
+    Per chat, not global: the operator typing it is the one being woken up, and
+    a shared setting would let one person silence another's phone.
+    """
+    from datetime import datetime, timezone as _tz
+
+    from sentinel.db.repo import chats as chats_repo
+    from sentinel.telegram import quiet
+
+    cfg: Config = context.bot_data["cfg"]
+    db: Database = context.bot_data["db"]
+    chat_id = update.effective_chat.id
+
+    if not _can_act(cfg, chat_id):
+        await _deny_viewer(update)
+        return
+
+    arg = " ".join(context.args or []).strip()
+    prefs = await chats_repo.get_prefs(db, chat_id)
+    tz_name = prefs.timezone or getattr(cfg.telegram, "timezone", None)
+
+    # --- status ---
+    if not arg:
+        window = quiet.parse_window(prefs.quiet_hours or cfg.telegram.quiet_hours or "")
+        state = quiet.evaluate(now=datetime.now(_tz.utc), window=window,
+                               muted_until=prefs.muted_until, tz_name=tz_name)
+        lines = [_MUTE_HELP, ""]
+        lines.append(f"Interval: <b>{window or 'niciunul'}</b>")
+        if prefs.muted_until and prefs.muted_until > datetime.now(_tz.utc):
+            lines.append(f"Pauză activă până la <b>{_fmt_local(prefs.muted_until, tz_name)}</b>")
+        lines.append(
+            f"Acum: <b>{'🔕 liniște' if state.muted else '🔔 activ'}</b>"
+            + (f" — {_esc(state.reason)}, până la {_fmt_local(state.until, tz_name)}"
+               if state.muted and state.until else ""))
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        return
+
+    # --- off ---
+    if arg.lower() in ("off", "stop", "0", "nu", "gata"):
+        await chats_repo.clear_all_mutes(db, chat_id)
+        log.warning("quiet hours cleared", extra={"chat_id": chat_id})
+        await update.message.reply_text("🔔 Alertele sunt active. Niciun interval de liniște.")
+        return
+
+    # --- recurring window ---
+    if (window := quiet.parse_window(arg)) is not None:
+        await chats_repo.set_quiet_hours(db, chat_id, str(window), tz=tz_name)
+        log.warning("quiet hours set", extra={"chat_id": chat_id, "window": str(window)})
+        crosses = " (peste miezul nopții)" if window.crosses_midnight else ""
+        await update.message.reply_text(
+            f"🔕 Liniște în fiecare zi între <b>{window}</b>{crosses}.\n"
+            f"Fus orar: <code>{_esc(str(quiet.zone(tz_name)))}</code>\n\n"
+            "<i>Criticele, PANIC și eșecurile de patch trec oricum. "
+            "Restul sosesc la sfârșitul intervalului.</i>",
+            parse_mode=ParseMode.HTML)
+        return
+
+    # --- ad-hoc ---
+    if (delta := quiet.parse_duration(arg)) is not None:
+        until = datetime.now(_tz.utc) + delta
+        await chats_repo.set_muted_until(db, chat_id, until)
+        log.warning("ad-hoc mute set", extra={"chat_id": chat_id, "minutes": delta.total_seconds() / 60})
+        capped = " (limitat la 24h)" if delta >= quiet.MAX_ADHOC else ""
+        await update.message.reply_text(
+            f"🔕 Pauză până la <b>{_fmt_local(until, tz_name)}</b>{capped}.",
+            parse_mode=ParseMode.HTML)
+        return
+
+    await update.message.reply_text(
+        "Nu am înțeles.\n\n" + _MUTE_HELP, parse_mode=ParseMode.HTML)
+
+
+async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.args = ["off"]
+    await cmd_mute(update, context)
+
+
 async def cmd_panic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Config = context.bot_data["cfg"]
     if not _can_act(cfg, update.effective_chat.id):
@@ -538,11 +634,50 @@ def _format_execution(row: dict) -> str:
     return "\n".join(lines)
 
 
+async def _quiet_chats(cfg: Config, db: Database) -> set[int]:
+    """Chats that are inside a quiet window right now.
+
+    Read once per cycle. A per-message lookup would query this table thousands
+    of times a day to answer a question that changes twice.
+    """
+    from datetime import datetime, timezone as _tz
+
+    from sentinel.db.repo import chats as chats_repo
+    from sentinel.telegram import quiet
+
+    now = datetime.now(_tz.utc)
+    prefs = await chats_repo.all_prefs(db)
+    default = cfg.telegram.quiet_hours
+    out: set[int] = set()
+    for chat_id in cfg.telegram.allowed_chat_ids:
+        p = prefs.get(chat_id)
+        window = quiet.parse_window((p.quiet_hours if p else None) or default or "")
+        state = quiet.evaluate(now=now, window=window,
+                               muted_until=p.muted_until if p else None,
+                               tz_name=(p.timezone if p else None)
+                               or getattr(cfg.telegram, "timezone", None))
+        if state.muted:
+            out.add(chat_id)
+    return out
+
+
 async def _broadcast(app: Application, cfg: Config, text: str,
-                     kb: InlineKeyboardMarkup | None = None) -> int:
-    """Send to every allowed chat. Returns how many actually went out."""
+                     kb: InlineKeyboardMarkup | None = None, *,
+                     quiet_chats: set[int] | None = None,
+                     severity: str | None = None, kind: str | None = None) -> int:
+    """Send to every allowed chat. Returns how many actually went out.
+
+    A chat inside its quiet window is skipped — unless the message is one that
+    is never muted, in which case the window is ignored entirely. See
+    `telegram/quiet.py` for what qualifies and why.
+    """
+    from sentinel.telegram.quiet import passes_anyway
+
+    urgent = passes_anyway(severity, kind)
     sent = 0
     for chat_id in cfg.telegram.allowed_chat_ids:
+        if quiet_chats and chat_id in quiet_chats and not urgent:
+            continue
         try:
             await app.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML,
                                        reply_markup=kb)
@@ -552,21 +687,81 @@ async def _broadcast(app: Application, cfg: Config, text: str,
     return sent
 
 
-async def _push_incidents(app: Application, cfg: Config, db: Database) -> None:
-    for inc in await inc_repo.unnotified(db, min_severity=cfg.telegram.min_severity):
+# More than this many incidents waiting when the window lifts, and they arrive
+# as one summary instead of one message each. Waking up to sixty notifications
+# is functionally the same as waking up to none.
+DIGEST_FLOOR = 6
+
+
+async def _push_incidents(app: Application, cfg: Config, db: Database,
+                          quiet_chats: set[int]) -> None:
+    pending = await inc_repo.unnotified(db, min_severity=cfg.telegram.min_severity)
+    if not pending:
+        return
+
+    # Everyone quiet and nothing urgent in the batch: leave the rows unsent.
+    # They are HELD, not dropped — `notified_at` stays NULL, so the next cycle
+    # after the window lifts picks them all up.
+    all_quiet = quiet_chats >= set(cfg.telegram.allowed_chat_ids)
+    from sentinel.telegram.quiet import passes_anyway
+
+    if all_quiet and not any(passes_anyway(i.severity) for i in pending):
+        log.info("incidents held for quiet hours", extra={"n": len(pending)})
+        return
+
+    threshold = max(getattr(cfg.telegram, "digest_threshold", 10), DIGEST_FLOOR)
+    if len(pending) > threshold:
+        await _push_incident_digest(app, cfg, db, pending, quiet_chats)
+        return
+
+    for inc in pending:
         text = "🚨 " + format_incident(inc, header="INCIDENT NOU")
-        await _broadcast(app, cfg, text, _incident_block_kb(inc, cfg))
+        await _broadcast(app, cfg, text, _incident_block_kb(inc, cfg),
+                         quiet_chats=quiet_chats, severity=inc.severity)
         await inc_repo.mark_notified(db, inc.id)
         log.info("incident pushed", extra={"incident_id": inc.id, "severity": inc.severity})
 
 
-async def _push_plans(app: Application, cfg: Config, db: Database) -> None:
+async def _push_incident_digest(app: Application, cfg: Config, db: Database,
+                                pending: list, quiet_chats: set[int]) -> None:
+    """One message for a backlog, which is what a night of quiet hours produces."""
+    by_sev: dict[str, int] = {}
+    for inc in pending:
+        by_sev[inc.severity] = by_sev.get(inc.severity, 0) + 1
+    summary = " · ".join(f"{n} {sev}" for sev, n in sorted(by_sev.items()))
+    lines = [f"📋 <b>{len(pending)} incidente noi</b> — {summary}", ""]
+    for inc in pending[:10]:
+        lines.append(f"{_SEV_EMOJI.get(inc.severity, '⚪')} #{inc.id} "
+                     f"{_esc(inc.title)} · <code>{_esc(inc.actor_key or '—')}</code>")
+    if len(pending) > 10:
+        lines.append(f"<i>…și încă {len(pending) - 10}.</i>")
+    lines.append("\nDeschide unul: <code>/incident &lt;id&gt;</code>")
+
+    await _broadcast(app, cfg, "\n".join(lines), quiet_chats=quiet_chats,
+                     severity=max((i.severity for i in pending), key=_sev_rank, default=None))
+    for inc in pending:
+        await inc_repo.mark_notified(db, inc.id)
+    log.warning("incident digest pushed", extra={"n": len(pending)})
+
+
+def _sev_rank(sev: str) -> int:
+    return ["info", "low", "medium", "high", "critical"].index(sev) if sev in (
+        "info", "low", "medium", "high", "critical") else 0
+
+
+async def _push_plans(app: Application, cfg: Config, db: Database,
+                     quiet_chats: set[int]) -> None:
     """Offer newly generated plans, with their approval buttons.
 
     Unlike an incident, this is NOT marked notified when every send failed. An
     incident that missed its push is still visible in the dashboard and still
     counted; a plan that missed its push is a decision waiting on someone who was
     never asked. It is retried until it either lands or ages out of the TTL.
+
+    Quiet hours hold plans rather than dropping them, and that falls out of the
+    same rule: nothing is marked notified until it reaches somebody. A patch
+    proposal is the least urgent thing here — it changes a production machine
+    and needs two confirmations — so it can wait for morning.
     """
     from sentinel.db.repo import patches as patch_repo
     from sentinel.telegram import patch_flow
@@ -576,7 +771,7 @@ async def _push_plans(app: Application, cfg: Config, db: Database) -> None:
         for chat_id in cfg.telegram.allowed_chat_ids:
             # Not _broadcast: each chat needs its OWN approval token, because a
             # token is bound to the chat it was issued for.
-            if not _can_act(cfg, chat_id):
+            if not _can_act(cfg, chat_id) or chat_id in quiet_chats:
                 continue
             try:
                 await patch_flow.send_plan_for_approval(app.bot, db, chat_id, row)
@@ -592,11 +787,18 @@ async def _push_plans(app: Application, cfg: Config, db: Database) -> None:
                       extra={"plan": row.id})
 
 
-async def _push_executions(app: Application, cfg: Config, db: Database) -> None:
+async def _push_executions(app: Application, cfg: Config, db: Database,
+                          quiet_chats: set[int]) -> None:
     from sentinel.db.repo import patches as patch_repo
 
     for row in await patch_repo.unnotified_executions(db):
-        await _broadcast(app, cfg, _format_execution(row))
+        # A patch that failed or rolled back is never held: something on the
+        # host changed and then changed back, and that does not keep till
+        # morning. A clean dry-run does.
+        kind = ("patch_rolled_back" if row["status"] in ("rolled_back", "rollback_failed")
+                else "patch_failed" if row["status"] == "failed" else None)
+        await _broadcast(app, cfg, _format_execution(row),
+                         quiet_chats=quiet_chats, kind=kind)
         # Marked whatever happened: an outcome report is information, not a
         # pending decision, and retrying it forever would be noise.
         await patch_repo.mark_execution_notified(db, row["id"])
@@ -611,9 +813,21 @@ async def _push_loop(app: Application, cfg: Config, db: Database) -> None:
     sources = (("incidents", _push_incidents), ("plans", _push_plans),
                ("executions", _push_executions))
     while True:
+        # Resolved once per cycle and handed to each source, so all three agree
+        # on whether it is quiet — and so a slow cycle cannot straddle the end
+        # of the window and send half the batch under the old answer.
+        try:
+            quiet_chats = await _quiet_chats(cfg, db)
+        except Exception as exc:  # noqa: BLE001
+            # Failing OPEN is the only safe direction: a broken preferences
+            # query must not silence a security channel.
+            log.error("quiet-hours lookup failed; alerting anyway",
+                      extra={"detail": str(exc)})
+            quiet_chats = set()
+
         for name, fn in sources:
             try:
-                await fn(app, cfg, db)
+                await fn(app, cfg, db, quiet_chats)
             except Exception as exc:  # noqa: BLE001
                 log.error("push loop error", extra={"source": name, "detail": str(exc)})
         await asyncio.sleep(interval)
@@ -657,6 +871,9 @@ def build_application(cfg: Config, secrets: Secrets) -> Application:
     app.add_handler(CommandHandler("unblock", _guard(cmd_unblock)))
     app.add_handler(CommandHandler("blocklist", _guard(cmd_blocklist)))
     app.add_handler(CommandHandler("panic", _guard(cmd_panic)))
+    app.add_handler(CommandHandler("mute", _guard(cmd_mute)))
+    app.add_handler(CommandHandler("unmute", _guard(cmd_unmute)))
+    app.add_handler(CommandHandler("liniste", _guard(cmd_mute)))
     # Inline confirm buttons. The callbacks re-check authorisation themselves,
     # so they are registered without the message-oriented _guard wrapper.
     # Patch buttons first: they carry opaque tokens and must not fall through to

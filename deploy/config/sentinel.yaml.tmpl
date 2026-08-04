@@ -133,8 +133,17 @@ telegram:
   operator_chat_ids: []
   viewer_chat_ids: []
 
-  # Critical alerts always pass, whatever this says.
+  # Deployment-wide quiet window, in local time, e.g. "22:00-06:00". Each chat
+  # can set its own from the phone with /mute, which overrides this.
+  #
+  # Left null on purpose. Muting is a real reduction in coverage, so it is a
+  # decision the operator makes knowingly rather than one an installer makes for
+  # them. Critical alerts, PANIC, the watchdog and patch failures ignore any
+  # window; everything else is held and delivered when the window ends.
   quiet_hours: null
+  # IANA zone the window is read in. null = the host's own zone, which is what
+  # someone typing "22:00" means.
+  timezone: null
   min_severity: medium
   digest_threshold: 10
   rate_limit_per_minute: 30

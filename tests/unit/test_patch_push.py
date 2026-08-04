@@ -276,7 +276,12 @@ def test_each_push_source_is_isolated():
     from sentinel.telegram import bot
     src = inspect.getsource(bot._push_loop)
     assert "for name, fn in sources" in src
-    assert src.count("try:") == 1 and "await fn(" in src
+    # The call to each source sits inside the per-source try, so one failing
+    # source cannot take the others down. (Counting `try:` blocks would be
+    # wrong — the quiet-hours lookup has its own, for its own reason.)
+    body = src.split("for name, fn in sources", 1)[1]
+    assert body.index("try:") < body.index("await fn(")
+    assert "except Exception" in body
 
 
 def test_a_plan_that_reached_nobody_is_retried():

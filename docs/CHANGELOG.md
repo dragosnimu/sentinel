@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.20.0 — Ore de liniște
+
+Un canal care te trezește la 3 dimineața pentru o scanare de porturi e un canal
+pe care îl oprești definitiv într-o săptămână — iar un canal oprit definitiv e
+mai rău decât niciunul: arată ca acoperire și nu e. `/mute` există ca să
+păstreze canalul folosibil, nu ca să-l facă mai tăcut.
+
+```
+/mute 22:00-06:00     în fiecare noapte
+/mute 2h              pauză unică (maxim 24h)
+/mute off             oprește tot
+```
+
+Două mecanisme separate deliberat: un interval recurent (cazul normal) și o
+pauză până la un moment (fereastră de mentenanță, test zgomotos). **Nu există
+mute nelimitat** — `/mute 7d` e limitat la 24h, fiindcă un mute pe care trebuie
+să-ți amintești să-l anulezi e unul pe care nu-l vei anula.
+
+`telegram_chats.muted_until` exista din 0006 și nu era citită niciodată;
+`telegram.quiet_hours` exista în config și nu era citită niciodată. Al treilea
+config mort găsit în proiectul ăsta — de data asta implementat, nu șters.
+
+### Ce nu se poate tăcea
+
+Tăcerea trebuie să fie sigură. Alertele critice, PANIC, watchdog-ul, eșecurile
+de patch și lockout-ul ignoră orice interval. Lista trăiește în cod, nu în
+configurație: *care alerte pot fi tăcute* e o proprietate de siguranță, iar un
+fișier de configurație e locul greșit în care să lași pe cineva s-o tacă și pe
+ultima.
+
+Restul sunt **reținute, nu pierdute** — `notified_at` rămâne gol și pleacă după
+ce se termină intervalul, ca rezumat dacă s-au adunat prea multe. Iar dacă
+interogarea preferințelor eșuează, botul alertează oricum: o eroare de bază de
+date nu are voie să tacă un canal de securitate.
+
+### Ora e locală, și rămâne locală peste schimbarea orei
+
+Cine scrie „22:00" se referă la 22:00 unde stă el; serverul rulează pe UTC. O
+eroare de trei ore aici ar tăcea exact serile pe care operatorul voia să le
+acopere.
+
+Fusul se rezolvă **după nume**, din `/etc/timezone` sau din simlink-ul
+`/etc/localtime` — nu prin `datetime.now().astimezone()`, care dă un decalaj
+FIX („+03:00", nu „Europe/Bucharest"). Un decalaj fix nu are reguli de oră de
+vară, deci în noaptea în care se schimbă ora sfârșitul unei ferestre 22:00-06:00
+s-ar calcula cu o oră greșit. O dată pe an, pe întuneric, exact când nimeni nu
+se uită.
+
+`tzdata` a intrat în dependențele de dezvoltare: Linux are tzdb de sistem,
+Windows nu, iar fără el testele de fus cădeau pe fusul gazdei și nu mai testau
+ce pretindeau.
+
+### Setat pe server
+
+`22:00-06:00`, fus `Europe/Bucharest`, verificat oră cu oră peste toată noaptea:
+activ la 21:00, liniște de la 22:00 până la 05:59, activ din nou la 06:00.
+
+---
+
 ## 0.19.1 — Documentația urmează installer-ul
 
 Wizard-ul exista, dar documentația încă trimitea oamenii direct la
