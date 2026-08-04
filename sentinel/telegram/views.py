@@ -322,6 +322,7 @@ HELP = """🛡️ <b>Sentinel — comenzi</b>
 
 <b>Privire de ansamblu</b>
 /dashboard — verdict, cifre, observații, top atacatori
+/selfcheck — chiar funcționează Sentinel? fiecare componentă
 /status — o linie: incidente și servicii
 /health — starea Sentinel însuși
 
@@ -385,3 +386,67 @@ async def cmd_blocklist_full(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append(f"   {esc(b.reason or '—')} · {esc(b.created_by)}")
 
     await _reply(update, clamp(lines, tail="\n<code>/unblock &lt;ip&gt;</code>"))
+
+
+# ---------------------------------------------------------------------------
+# /selfcheck
+# ---------------------------------------------------------------------------
+async def cmd_selfcheck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Every self-check, as of the last run — and how long ago that was.
+
+    Reads the recorded state rather than re-running: the checks touch systemd,
+    nftables and the executor, and letting a chat message trigger all of that on
+    demand is a way to turn a curious operator into load. The timer runs every
+    five minutes, so the answer is never stale enough to matter.
+    """
+    db: Database = context.bot_data["db"]
+
+    run = await db.fetchrow(
+        "SELECT started_at, worst_status, checks_run, checks_bad, duration_ms "
+        "FROM selfcheck_runs ORDER BY started_at DESC LIMIT 1")
+    if run is None:
+        await _reply(update, "Autoverificarea nu a rulat încă.\n"
+                             "<code>systemctl start sentinel-selfcheck</code>")
+        return
+
+    rows = await db.fetch(
+        "SELECT key, status, title, detail, since FROM selfcheck_state "
+        "ORDER BY CASE status WHEN 'down' THEN 0 WHEN 'degraded' THEN 1 "
+        "WHEN 'unknown' THEN 2 ELSE 3 END, key")
+
+    emoji = {"down": "🔴", "degraded": "🟡", "ok": "🟢", "unknown": "⚪"}
+    age_min = int((_now() - run["started_at"]).total_seconds() // 60)
+    bad = [r for r in rows if r["status"] in ("down", "degraded")]
+
+    head = ("🟢 <b>Totul funcționează</b>" if not bad else
+            "🔴 <b>Sentinel nu funcționează complet</b>"
+            if any(r["status"] == "down" for r in bad) else
+            "🟡 <b>Sentinel funcționează degradat</b>")
+    lines = [
+        head,
+        f"<i>{run['checks_run']} verificări · ultima rulare acum {age_min} min "
+        f"· {run['duration_ms']} ms</i>",
+    ]
+
+    if bad:
+        lines.append("")
+        for r in bad:
+            since_min = int((_now() - r["since"]).total_seconds() // 60)
+            age = f"{since_min // 60}h {since_min % 60}m" if since_min >= 60 else f"{since_min}m"
+            lines.append(f"{emoji[r['status']]} <b>{esc(r['title'])}</b> · de {age}")
+            if r["detail"]:
+                lines.append(f"   {esc(r['detail'])}")
+
+    ok_rows = [r for r in rows if r["status"] == "ok"]
+    if ok_rows:
+        lines += ["", f"<b>În regulă ({len(ok_rows)})</b>"]
+        lines.append(" · ".join(esc(r["title"]) for r in ok_rows[:14]))
+        if len(ok_rows) > 14:
+            lines.append(f"<i>…și încă {len(ok_rows) - 14}.</i>")
+
+    await _reply(update, clamp(lines))
+
+
+def _now():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc)

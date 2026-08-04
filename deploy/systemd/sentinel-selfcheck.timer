@@ -1,0 +1,25 @@
+[Unit]
+Description=Sentinel self-check, every 5 minutes
+Documentation=file:/opt/sentinel/lib/sentinel/selfcheck/checks.py
+
+[Timer]
+# Five minutes is the answer to "how long may Sentinel be partly broken before
+# I am told". Shorter buys little: the fastest fault here — a collector going
+# quiet — is only detectable after its own patience window anyway, and polling
+# harder would just run the same queries more often.
+#
+# It also starts shortly after boot, on purpose. The two real outages this
+# exists for were both post-reboot states: an nftables table that no longer
+# existed, and a reader that came up and then stopped. Waiting five minutes to
+# discover a machine came back wrong is four minutes too many.
+OnBootSec=90
+OnUnitActiveSec=5min
+AccuracySec=30
+
+# Not Persistent: a missed run while the host was off is not worth replaying,
+# because the next run in 90 seconds observes the present, which is the only
+# thing this unit cares about.
+Unit=sentinel-selfcheck.service
+
+[Install]
+WantedBy=timers.target

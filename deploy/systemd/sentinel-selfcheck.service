@@ -1,0 +1,78 @@
+[Unit]
+# Does Sentinel actually work right now?
+#
+# Not "is the process running" — that question answered `yes` throughout every
+# outage this deployment has had. It said yes while the journald reader sat
+# frozen for 21 hours and SSH authentication went unwatched. It said yes for a
+# full day while the nftables table did not exist and every block, manual or
+# automatic, would have failed silently.
+#
+# So this unit checks that each function is PRODUCING ITS EFFECT: that a
+# collector wrote a row, that the kernel holds the table, that the executor
+# replies, that the alert channel has delivered something. It reports to
+# Telegram on change, and it never restarts anything — a self-check that repairs
+# what it finds is a self-check whose findings stop being read.
+#
+# Distinct from sentinel-watchdog.service, deliberately. That one is the root
+# anti-lockout deadman: tiny, dependency-free, and it must stay that way. This
+# one is the opposite — it depends on everything, because everything is what it
+# is looking at.
+Description=Sentinel self-check
+Documentation=file:/opt/sentinel/lib/sentinel/selfcheck/checks.py
+After=network-online.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+User=sentinel
+Group=sentinel
+WorkingDirectory=/opt/sentinel
+ExecStart=/opt/sentinel/bin/sentinel selfcheck
+
+# Short by design. Every check is a local query, a socket round-trip or a
+# systemctl call; if this has not finished in a minute, something it is trying
+# to reach is hanging, and a hung self-check is itself a fault worth surfacing
+# rather than waiting out.
+TimeoutStartSec=60
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/sentinel/lib
+
+# systemctl is-active needs to reach the system bus; nft needs to read the
+# ruleset. Both are read-only uses and neither needs privilege beyond seeing.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @mount @debug @swap
+
+# Reading the nftables ruleset requires NET_ADMIN even for `list`. Bounded to
+# exactly that: this unit must never be able to CHANGE the ruleset, only look
+# at it — changing it is the executor's job and nobody else's.
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+
+ReadWritePaths=/var/lib/sentinel
+ReadOnlyPaths=/etc/sentinel
+
+# Loopback for the database and the executor socket; the internet only for the
+# direct-send fallback, which fires when the bot itself is down.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+
+MemoryMax=192M
+TasksMax=64
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-selfcheck
+
+# Exit 1 (degraded) and 2 (down) are findings, not failures of this unit. Left
+# as SuccessExitStatus so `systemctl status` does not report the self-check as
+# broken every time it correctly reports something else as broken.
+SuccessExitStatus=0 1 2

@@ -775,12 +775,38 @@ async def _push_executions(app: Application, cfg: Config, db: Database,
                  extra={"execution_id": row["id"], "status": row["status"]})
 
 
+async def _push_notifications(app: Application, cfg: Config, db: Database,
+                              quiet_chats: set[int]) -> None:
+    """Drain the generic notification queue.
+
+    Currently fed by the self-check. Kept generic because the table always was:
+    anything that needs to tell the operator something, without holding the bot
+    token itself, writes a row here.
+    """
+    rows = await db.fetch(
+        "SELECT id, severity, title, body FROM notifications "
+        "WHERE state = 'queued' AND channel = 'telegram' "
+        "ORDER BY enqueued_at LIMIT 5")
+    for row in rows:
+        # `selfcheck` is never held: the message says part of the security agent
+        # has stopped working, and that does not keep until morning.
+        sent = await _broadcast(app, cfg, row["body"], quiet_chats=quiet_chats,
+                                severity=row["severity"], kind="selfcheck")
+        await db.execute(
+            "UPDATE notifications SET state = $2::text, sent_at = now(), "
+            "attempts = attempts + 1 WHERE id = $1",
+            row["id"], "sent" if sent else "failed")
+        log.warning("notification pushed",
+                    extra={"id": row["id"], "severity": row["severity"], "chats": sent})
+
+
 async def _push_loop(app: Application, cfg: Config, db: Database) -> None:
     interval = 15
     # Each source is isolated: a failure in one must not stop the others. An
     # exception in the plan query used to be enough to stop incident alerts.
     sources = (("incidents", _push_incidents), ("plans", _push_plans),
-               ("executions", _push_executions))
+               ("executions", _push_executions),
+               ("notifications", _push_notifications))
     while True:
         # Resolved once per cycle and handed to each source, so all three agree
         # on whether it is quiet — and so a slow cycle cannot straddle the end
@@ -847,6 +873,7 @@ def build_application(cfg: Config, secrets: Secrets) -> Application:
         (("events", "evenimente"),                     views.cmd_events),
         (("services", "servicii"),                     cmd_services),
         (("health", "sanatate"),                       cmd_health),
+        (("selfcheck", "autoverificare"),              views.cmd_selfcheck),
         (("blocklist", "blocate"),                     views.cmd_blocklist_full),
         (("patches", "patch", "patchuri"),             cmd_patches),
     ]

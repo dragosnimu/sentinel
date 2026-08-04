@@ -715,7 +715,16 @@ EOF
 step_start_services() {
     # One at a time, each behind a health gate. Starting six units at once and
     # then discovering three are broken is a much worse debugging session.
-    local -a order=(sentinel-executor sentinel-web)
+    # EVERY unit, not just two. A deploy that installs new code and restarts
+    # only the executor and the web app leaves ingest, detect, ai and telegram
+    # running the OLD code until somebody notices — which is a partial upgrade
+    # that reports success, and the hardest kind of state to reason about
+    # afterwards ("is this bug fixed on the server or not?").
+    #
+    # Ordered: the executor first because others talk to it, telegram last
+    # because its restart is the most visible.
+    local -a order=(sentinel-executor sentinel-web sentinel-ingest
+                    sentinel-detect sentinel-ai sentinel-telegram)
 
     for unit in "${order[@]}"; do
         [[ -f "/etc/systemd/system/${unit}.service" ]] || { info "${unit}: not in this build"; continue; }
@@ -737,7 +746,7 @@ step_start_services() {
         fi
     done
 
-    for unit in sentinel-health.timer sentinel-maintenance.timer sentinel-watchdog.timer; do
+    for unit in sentinel-health.timer sentinel-maintenance.timer \n                sentinel-watchdog.timer sentinel-selfcheck.timer; do
         [[ -f "/etc/systemd/system/${unit}" ]] && systemctl enable --now "$unit" >/dev/null 2>&1 \
             && ok "${unit} enabled"
     done

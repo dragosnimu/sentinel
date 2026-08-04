@@ -59,6 +59,10 @@ NEVER_MUTED_KINDS = frozenset({
     "patch_failed",      # a patch stopped partway
     "patch_rolled_back",  # the host changed and then changed back
     "lockout",           # you may be locked out right now
+    # Part of the security agent has stopped working. Holding this until 06:00
+    # would mean the hours you chose to stop watching your phone are exactly the
+    # hours nobody is watching the server either.
+    "selfcheck",
 })
 
 _WINDOW_RE = re.compile(r"^\s*([0-2]?\d):([0-5]\d)\s*-\s*([0-2]?\d):([0-5]\d)\s*$")

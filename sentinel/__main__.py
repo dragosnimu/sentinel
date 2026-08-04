@@ -5,6 +5,7 @@ place that sets up logging, loads config, and reports a clean startup failure
 instead of a traceback in `journalctl`.
 
     sentinel ingest | detect | ai | telegram | web | scan | health | maintenance
+    sentinel selfcheck [--print]
     sentinel migrate [--dry-run]
     sentinel config-check
     sentinel version
@@ -20,7 +21,8 @@ from sentinel import __version__
 from sentinel.errors import ConfigError, SentinelError
 from sentinel.logging_setup import setup_logging
 
-SERVICES = ("ingest", "detect", "ai", "telegram", "web", "scan", "health", "maintenance")
+SERVICES = ("ingest", "detect", "ai", "telegram", "web", "scan", "health",
+            "maintenance", "selfcheck")
 
 
 def _run_service(name: str, args: argparse.Namespace) -> int:
