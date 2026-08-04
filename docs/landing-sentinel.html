@@ -1,0 +1,824 @@
+<!doctype html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Sentinel — agent autonom de securitate pentru serverul tău | CRYPTOITDATA</title>
+<meta name="description" content="Atacurile pe servere expuse sunt automate și continue. Sentinel este un agent care rulează pe serverul tău: vede, decide, blochează și propune patch-uri — și cere confirmarea ta înainte să schimbe ceva.">
+
+<meta property="og:title" content="Sentinel — apărare continuă pentru servere expuse la internet">
+<meta property="og:description" content="43 de zile ca să repari. 5 zile până la exploatare în masă. Sentinel închide diferența.">
+<meta property="og:type" content="website">
+<meta property="og:locale" content="ro_RO">
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;700;900&display=swap" rel="stylesheet">
+
+<style>
+/* ===========================================================================
+   Sentinel — landing page pentru cryptoitdata.eu
+
+   Paleta, fonturile, razele și ritmul secțiunilor sunt preluate din site-ul
+   existent (Space Grotesk 900 cu tracking negativ, Inter pentru corp, teal
+   #26C6B5 pe fundal #050811, carduri 24px, secțiuni la 96px).
+
+   Singura culoare adăugată este roșul de alertă, folosit EXCLUSIV pentru
+   semantica de amenințare — niciodată ca accent de brand. Un roșu care ar
+   concura cu teal-ul ar transforma fiecare secțiune într-o urgență, iar o
+   pagină în care totul e urgent nu are nimic urgent.
+   =========================================================================== */
+
+:root {
+  --abyss:   #050811;   /* fundalul de hero și CTA de pe site */
+  --night:   #0A0F1E;   /* secțiunile întunecate secundare */
+  --ink:     #0F172A;
+  --muted:   #475569;
+  --surface: #F8FAFC;
+  --line:    #CBD5E1;
+  --white:   #FFFFFF;
+
+  --teal:    #26C6B5;   /* accentul de brand */
+  --blue:    #1E88E5;   /* secundarul de brand */
+  --alert:   #F0524D;   /* DOAR amenințare. Nu e culoare de brand. */
+  --amber:   #F0A92E;
+
+  --display: "Space Grotesk", "Segoe UI", system-ui, sans-serif;
+  --body:    Inter, "Segoe UI", system-ui, -apple-system, sans-serif;
+  --mono:    ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+
+  --r:       24px;
+  --pad:     96px;
+  --wrap:    1140px;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--white);
+  color: var(--ink);
+  font: 400 17px/1.65 var(--body);
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+
+h1, h2, h3, h4 {
+  font-family: var(--display);
+  margin: 0;
+  text-wrap: balance;
+}
+h1 { font-size: clamp(2.4rem, 5.6vw, 3.6rem); font-weight: 900; letter-spacing: -0.04em; line-height: 1.05; }
+h2 { font-size: clamp(1.75rem, 3.6vw, 2.35rem); font-weight: 900; letter-spacing: -0.025em; line-height: 1.12; }
+h3 { font-size: 1.35rem; font-weight: 700; letter-spacing: -0.02em; line-height: 1.25; }
+p  { margin: 0; }
+a  { color: inherit; }
+
+.wrap { max-width: var(--wrap); margin: 0 auto; padding: 0 24px; }
+.narrow { max-width: 72ch; }
+section { padding: var(--pad) 0; }
+
+.eyebrow {
+  display: inline-block;
+  font: 600 0.78rem/1 var(--body);
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--teal);
+  margin-bottom: 1.1rem;
+}
+.lede { font-size: 1.18rem; color: var(--muted); }
+.dark .lede { color: #94A3B8; }
+.mono { font-family: var(--mono); font-size: 0.92em; }
+.num  { font-variant-numeric: tabular-nums; }
+
+.dark { background: var(--abyss); color: var(--white); }
+.night { background: var(--night); color: var(--white); }
+.soft { background: var(--surface); }
+
+/* --------------------------------------------------------------- butoane */
+.btn {
+  display: inline-flex; align-items: center; gap: .6rem;
+  padding: 16px 32px; border-radius: 999px;
+  font: 600 1rem/1 var(--body);
+  text-decoration: none; border: 1px solid transparent;
+  transition: transform .18s ease, box-shadow .18s ease, background .18s ease;
+}
+.btn-primary { background: var(--teal); color: #04211E; }
+.btn-primary:hover { transform: translateY(-2px); box-shadow: 0 12px 32px rgb(38 198 181 / .32); }
+.btn-ghost { background: rgb(255 255 255 / .06); color: var(--white); border-color: rgb(255 255 255 / .18); }
+.btn-ghost:hover { background: rgb(255 255 255 / .12); transform: translateY(-2px); }
+.btn-dark { background: var(--ink); color: var(--white); }
+.btn-dark:hover { transform: translateY(-2px); box-shadow: 0 12px 32px rgb(15 23 42 / .22); }
+.btn:focus-visible { outline: 3px solid var(--teal); outline-offset: 3px; }
+
+/* ---------------------------------------------------------------- header */
+.topbar {
+  position: sticky; top: 0; z-index: 50;
+  background: rgb(5 8 17 / .82);
+  backdrop-filter: blur(14px);
+  border-bottom: 1px solid rgb(255 255 255 / .07);
+}
+.topbar .wrap { display: flex; align-items: center; justify-content: space-between; padding-block: 14px; }
+.brand { display: flex; align-items: center; gap: .6rem; font: 900 1.05rem/1 var(--display); color: #fff; text-decoration: none; letter-spacing: -.02em; }
+.brand i { width: 26px; height: 26px; border-radius: 8px; background: linear-gradient(140deg, var(--teal), var(--blue)); display: block; }
+.brand small { font: 500 .72rem/1 var(--body); color: #64748B; letter-spacing: .12em; text-transform: uppercase; }
+
+/* ------------------------------------------------------------------ hero */
+.hero { position: relative; overflow: hidden; padding: 120px 0 100px; }
+.hero::before {
+  content: ""; position: absolute; inset: -30% -10% auto -10%; height: 70%;
+  background: radial-gradient(ellipse at 30% 40%, rgb(38 198 181 / .16), transparent 62%),
+              radial-gradient(ellipse at 78% 20%, rgb(30 136 229 / .14), transparent 58%);
+  pointer-events: none;
+}
+.hero-grid { display: grid; gap: 56px; position: relative; }
+@media (min-width: 1000px) { .hero-grid { grid-template-columns: 1.05fr .95fr; align-items: center; } }
+
+.hero h1 .hl { color: var(--teal); }
+.hero-actions { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 2.2rem; }
+.hero-note { margin-top: 1.6rem; font-size: .92rem; color: #64748B; }
+
+/* --- fluxul de atacuri: teza paginii, nu ornament ------------------------
+   Un server expus nu e „posibil să fie atacat". E atacat chiar acum, continuu,
+   de programe. Vizitatorul vede asta întâmplându-se înainte să citească un
+   singur argument. Liniile în teal sunt răspunsul, intercalate în timp real. */
+.feed {
+  background: #04060F;
+  border: 1px solid rgb(255 255 255 / .09);
+  border-radius: var(--r);
+  overflow: hidden;
+  box-shadow: 0 24px 70px rgb(0 0 0 / .55);
+}
+.feed-bar {
+  display: flex; align-items: center; gap: .7rem;
+  padding: 13px 18px;
+  background: rgb(255 255 255 / .035);
+  border-bottom: 1px solid rgb(255 255 255 / .07);
+  font: 500 .78rem/1 var(--mono); color: #64748B;
+}
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--alert); flex: none; animation: pulse 1.9s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.82); } }
+
+.feed-body { height: 330px; padding: 14px 18px; overflow: hidden; font: 400 .82rem/1.85 var(--mono); position: relative; }
+.feed-body::after {
+  content: ""; position: absolute; inset: auto 0 0 0; height: 74px;
+  background: linear-gradient(transparent, #04060F);
+  pointer-events: none;
+}
+/* `min-width: 0` aici ȘI pe `.m` de mai jos.
+   Un flex item are implicit `min-width: auto` — refuză să scadă sub lățimea
+   propriului conținut — deci `text-overflow: ellipsis` nu se aplică niciodată
+   și linia împinge pagina în lateral. Pe 375px asta făcea documentul 1265px
+   lat și scrolla orizontal întreaga pagină. */
+.line { display: flex; gap: .65rem; white-space: nowrap; min-width: 0; animation: slidein .34s ease both; }
+@keyframes slidein { from { opacity: 0; transform: translateY(9px); } to { opacity: 1; transform: none; } }
+.line .t { color: #475569; flex: none; }
+.line .s { flex: none; }
+.line.atk .s { color: var(--alert); }
+.line.def .s { color: var(--teal); }
+.line .m { color: #94A3B8; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 1 1 auto; }
+.line.def .m { color: #CBD5E1; }
+
+.feed-foot {
+  display: flex; flex-wrap: wrap; gap: 8px 26px;
+  padding: 15px 18px; border-top: 1px solid rgb(255 255 255 / .07);
+  font: 500 .8rem/1 var(--body); color: #64748B;
+}
+.feed-foot b { color: var(--white); font-variant-numeric: tabular-nums; font-weight: 700; }
+
+/* ----------------------------------------------------- asimetria 43 vs 5 */
+.gap-grid { display: grid; gap: 40px; margin-top: 3rem; }
+@media (min-width: 900px) { .gap-grid { grid-template-columns: 1fr 1fr; gap: 56px; } }
+
+.bar-block { }
+.bar-label { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; margin-bottom: .7rem; }
+.bar-label strong { font: 900 2.4rem/1 var(--display); letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
+.bar-label span { font-size: .95rem; color: var(--muted); }
+.dark .bar-label span { color: #94A3B8; }
+.bar { height: 15px; border-radius: 999px; background: rgb(255 255 255 / .08); overflow: hidden; }
+.bar i { display: block; height: 100%; width: 0; border-radius: 999px; transition: width 1.5s cubic-bezier(.2,.8,.25,1); }
+.bar-slow i { background: linear-gradient(90deg, #64748B, #94A3B8); }
+.bar-fast i { background: linear-gradient(90deg, var(--alert), #FF8A65); }
+.bar-note { margin-top: .8rem; font-size: .95rem; color: #94A3B8; }
+
+.verdict {
+  margin-top: 2.6rem; padding: 26px 30px;
+  border-left: 3px solid var(--alert);
+  background: rgb(240 82 77 / .07);
+  border-radius: 0 14px 14px 0;
+  font-size: 1.06rem;
+}
+
+/* ------------------------------------------------------------- statistici */
+.stats { display: grid; gap: 1px; background: rgb(255 255 255 / .09); border: 1px solid rgb(255 255 255 / .09); border-radius: var(--r); overflow: hidden; margin-top: 3rem; }
+@media (min-width: 720px) { .stats { grid-template-columns: repeat(4, 1fr); } }
+.stat { background: var(--abyss); padding: 28px 26px; }
+.stat b { display: block; font: 900 2.1rem/1 var(--display); letter-spacing: -.035em; font-variant-numeric: tabular-nums; }
+.stat span { display: block; margin-top: .55rem; font-size: .9rem; color: #94A3B8; line-height: 1.5; }
+.stat.teal b { color: var(--teal); }
+.stat.alert b { color: var(--alert); }
+
+.source-link {
+  display: inline-flex; align-items: center; gap: .5rem; margin-top: 2rem;
+  color: var(--teal); text-decoration: none; font-weight: 600; font-size: .96rem;
+  border-bottom: 1px solid rgb(38 198 181 / .35); padding-bottom: 2px;
+}
+.source-link:hover { border-bottom-color: var(--teal); }
+
+/* ------------------------------------------------------------------ bucla */
+.loop { display: grid; gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; margin-top: 3rem; }
+@media (min-width: 760px) { .loop { grid-template-columns: repeat(5, 1fr); } }
+.step { background: var(--white); padding: 30px 26px; transition: background .2s ease; }
+.step:hover { background: var(--surface); }
+.step .n { font: 700 .78rem/1 var(--mono); color: var(--teal); letter-spacing: .1em; display: block; margin-bottom: .9rem; }
+.step h3 { font-size: 1.08rem; margin-bottom: .5rem; }
+.step p { font-size: .93rem; color: var(--muted); line-height: 1.6; }
+
+/* ------------------------------------------------------------- refuzurile */
+.refusals { display: grid; gap: 20px; margin-top: 3rem; }
+@media (min-width: 780px) { .refusals { grid-template-columns: repeat(2, 1fr); } }
+.refusal {
+  background: var(--white); border: 1px solid var(--line);
+  border-radius: var(--r); padding: 30px 32px;
+  transition: transform .2s ease, box-shadow .2s ease, border-color .2s ease;
+}
+.refusal:hover { transform: translateY(-3px); box-shadow: 0 16px 40px rgb(15 23 42 / .09); border-color: var(--teal); }
+.refusal .x { display: inline-block; font: 700 .74rem/1 var(--mono); letter-spacing: .1em; color: var(--alert); background: rgb(240 82 77 / .1); padding: 6px 11px; border-radius: 7px; margin-bottom: 1rem; }
+.refusal h3 { margin-bottom: .55rem; }
+.refusal p { color: var(--muted); font-size: .97rem; }
+
+/* --------------------------------------------------------------- telefon */
+.phone-grid { display: grid; gap: 48px; align-items: center; margin-top: 3rem; }
+@media (min-width: 960px) { .phone-grid { grid-template-columns: .85fr 1.15fr; } }
+.phone {
+  background: #E7EBF0; border-radius: 26px; padding: 20px 16px;
+  box-shadow: 0 26px 64px rgb(0 0 0 / .4);
+  max-width: 400px; width: 100%;
+}
+.msg { background: #fff; border-radius: 14px; padding: 15px 17px; margin-bottom: 11px; font-size: .9rem; line-height: 1.55; color: #0F1419; }
+.msg .h { font-weight: 700; margin-bottom: .45rem; display: block; }
+.msg .meta { color: #707A85; font-size: .8rem; }
+.msg code { font-family: var(--mono); font-size: .84em; background: #F1F5F9; padding: 1px 5px; border-radius: 4px; }
+.tg-btns { display: flex; gap: 8px; margin-top: 11px; }
+.tg-btn { flex: 1; text-align: center; background: #F1F5F9; color: #1E88E5; border-radius: 9px; padding: 10px; font-size: .84rem; font-weight: 600; }
+
+.checklist { list-style: none; padding: 0; margin: 0; display: grid; gap: 16px; }
+.checklist li { display: flex; gap: .9rem; align-items: flex-start; font-size: 1rem; line-height: 1.6; }
+.checklist .tick { color: var(--teal); font-weight: 700; flex: none; margin-top: .1rem; }
+.checklist b { display: block; }
+.checklist span { color: #94A3B8; font-size: .94rem; }
+
+/* -------------------------------------------------------------- încredere */
+.proof { display: grid; gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; margin-top: 3rem; }
+@media (min-width: 640px) { .proof { grid-template-columns: repeat(4, 1fr); } }
+.proof div { background: var(--white); padding: 26px 24px; }
+.proof b { display: block; font: 900 1.9rem/1 var(--display); letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
+.proof span { display: block; margin-top: .5rem; font-size: .88rem; color: var(--muted); line-height: 1.5; }
+
+/* -------------------------------------------------------------------- CTA */
+.cta { text-align: center; }
+.cta h2 { max-width: 20ch; margin: 0 auto 1.2rem; }
+.cta .lede { max-width: 60ch; margin: 0 auto; }
+.cta-actions { display: flex; flex-wrap: wrap; gap: 14px; justify-content: center; margin-top: 2.4rem; }
+
+/* ----------------------------------------------------------------- footer */
+.foot { padding: 40px 0; border-top: 1px solid rgb(255 255 255 / .08); color: #64748B; font-size: .9rem; }
+.foot .wrap { display: flex; flex-wrap: wrap; gap: 16px; justify-content: space-between; align-items: center; }
+.foot a { color: #94A3B8; text-decoration: none; }
+.foot a:hover { color: var(--teal); }
+
+/* ------------------------------------------------------ apariția la scroll
+
+   Ascunderea e condiționată de clasa `.js-reveal`, pusă pe <html> de script.
+   Fără ea, totul e vizibil.
+
+   Prima variantă avea `.reveal { opacity: 0 }` necondiționat, adică întreaga
+   pagină depindea de un IntersectionObserver ca să existe: JS blocat, o eroare
+   la încărcare sau un browser care nu declanșează observatorul = vizitatorul
+   primește o pagină goală. Conținutul nu are voie să depindă de decor. */
+.js-reveal .reveal { opacity: 0; transform: translateY(26px); transition: opacity .7s cubic-bezier(.2,.7,.3,1), transform .7s cubic-bezier(.2,.7,.3,1); }
+.js-reveal .reveal.in { opacity: 1; transform: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+  .reveal { opacity: 1; transform: none; }
+  .bar i { transition: none; }
+}
+
+/* ------------------------------------------------------------ tema închisă
+   Site-ul gazdă e pe fundal alb, dar cine îl deschide cu sistemul pe dark
+   merită să nu fie orbit. Doar suprafețele deschise se inversează —
+   secțiunile care sunt DEJA întunecate rămân exact cum sunt. */
+@media (prefers-color-scheme: dark) {
+  body { background: #0B1120; color: #E2E8F0; }
+  .soft, section:not(.dark):not(.night) { background: #0B1120; color: #E2E8F0; }
+  .step, .refusal, .proof div { background: #111A2E; border-color: #1E293B; color: #E2E8F0; }
+  .loop, .proof { background: #1E293B; border-color: #1E293B; }
+  .step p, .refusal p, .proof span { color: #94A3B8; }
+  .step:hover { background: #16203A; }
+  .lede { color: #94A3B8; }
+  .btn-dark { background: var(--teal); color: #04211E; }
+}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="wrap">
+    <a class="brand" href="https://cryptoitdata.eu"><i></i>SENTINEL <small>de CRYPTOITDATA</small></a>
+    <a class="btn btn-primary" href="#contact" style="padding:11px 22px;font-size:.92rem">Cere o evaluare</a>
+  </div>
+</header>
+
+<!-- ═══════════════════════════════════════════════════════════════ HERO ═══ -->
+<section class="hero dark">
+  <div class="wrap hero-grid">
+    <div>
+      <span class="eyebrow">Apărare autonomă pentru servere expuse</span>
+      <h1>Atacul e automat și continuu.<br><span class="hl">Apărarea ta încă așteaptă luni.</span></h1>
+      <p class="lede" style="margin-top:1.5rem;max-width:52ch">
+        Serverul din dreapta nu e o simulare de marketing — e ce primește orice
+        mașină expusă la internet, în fiecare minut, de la programe care nu dorm.
+        Sentinel rulează <em>pe</em> serverul tău: vede, decide, blochează și
+        propune reparația. Iar înainte să schimbe ceva, te întreabă.
+      </p>
+      <div class="hero-actions">
+        <a class="btn btn-primary" href="#contact">Vreau o evaluare a serverului</a>
+        <a class="btn btn-ghost" href="#asimetrie">De ce acum</a>
+      </div>
+      <p class="hero-note">
+        Se instalează pe serverul tău, într-o oră. Fără SIEM, fără agent extern,
+        fără date trimise altundeva.
+      </p>
+    </div>
+
+    <div class="feed" aria-hidden="true">
+      <div class="feed-bar"><span class="dot"></span> trafic ostil · live</div>
+      <div class="feed-body" id="feed"></div>
+      <div class="feed-foot">
+        <span>Încercări: <b id="c-atk">0</b></span>
+        <span>Surse unice: <b id="c-ip">0</b></span>
+        <span>Blocate automat: <b id="c-blk">0</b></span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════ ASIMETRIA ═══ -->
+<section class="night" id="asimetrie">
+  <div class="wrap">
+    <div class="narrow reveal">
+      <span class="eyebrow">Asimetria</span>
+      <h2>Ei automatizează de un an. Tu repari în 43 de zile.</h2>
+      <p class="lede" style="margin-top:1.2rem">
+        Nu mai ești ales de un om. Ești un rând într-o listă generată automat —
+        scanată, clasificată și prioritizată de programe care lucrează non-stop,
+        la un cost per țintă apropiat de zero.
+      </p>
+    </div>
+
+    <div class="gap-grid reveal">
+      <div class="bar-block">
+        <div class="bar-label">
+          <strong class="num" data-count="43">0</strong>
+          <span>zile — timpul median în care o vulnerabilitate e reparată</span>
+        </div>
+        <div class="bar bar-slow"><i data-w="100"></i></div>
+        <p class="bar-note">Ritmul apărării. Uman, planificat, cu ferestre de mentenanță.</p>
+      </div>
+      <div class="bar-block">
+        <div class="bar-label">
+          <strong class="num" style="color:var(--alert)" data-count="5">0</strong>
+          <span>zile — până la exploatarea în masă a unei vulnerabilități KEV</span>
+        </div>
+        <div class="bar bar-fast"><i data-w="11.6"></i></div>
+        <p class="bar-note">Ritmul atacului. Automat, continuu, fără ferestre.</p>
+      </div>
+    </div>
+
+    <div class="verdict narrow reveal">
+      <strong>38 de zile în care ești vulnerabil și știi asta.</strong>
+      Diferența dintre cele două bare nu se închide angajând mai repede. Se
+      închide punând ceva care lucrează în același ritm ca atacatorul.
+    </div>
+
+    <div class="stats reveal">
+      <div class="stat alert"><b class="num" data-count="31" data-suffix="%">0</b>
+        <span>din intruziuni încep prin exploatarea unei vulnerabilități — a depășit
+        credențialele furate pentru prima oară în 19 ani</span></div>
+      <div class="stat alert"><b class="num" data-count="7" data-prefix="×">0</b>
+        <span>creșterea într-un singur an a atacurilor pe echipamentele de perimetru
+        (de la 3% la 22%)</span></div>
+      <div class="stat alert"><b class="num" data-count="96" data-suffix="%">0</b>
+        <span>dintre victimele ransomware sunt firme cu sub 1.000 de angajați</span></div>
+      <div class="stat teal"><b class="num" data-count="80" data-suffix=" zile">0</b>
+        <span>mai repede detectează echipele care folosesc automatizare — și cu
+        1,9&nbsp;mil.&nbsp;$ mai puțin per incident</span></div>
+    </div>
+
+    <a class="source-link reveal" href="https://cryptoitdata.eu/en/blog/servere-expuse-internet-atacuri-ai"
+       target="_blank" rel="noopener">
+      Citește analiza completă: „Servere expuse la internet — nu <em>dacă</em>, ci <em>când</em>" →
+    </a>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════ BUCLA ═══ -->
+<section>
+  <div class="wrap">
+    <div class="narrow reveal">
+      <span class="eyebrow" style="color:var(--blue)">Cum funcționează</span>
+      <h2>O buclă care nu are nevoie de tine ca să vadă. Are nevoie de tine ca să schimbe.</h2>
+      <p class="lede" style="margin-top:1.2rem">
+        Detecția, scorarea și decizia sunt deterministe și rulează continuu, la
+        cost zero. Modelul lingvistic intervine <em>după</em> ce incidentul
+        există și e vizibil — niciodată pe calea critică. Dacă API-ul cade,
+        apărarea funcționează mai departe.
+      </p>
+    </div>
+
+    <div class="loop reveal">
+      <div class="step">
+        <span class="n">01 · VEDE</span>
+        <h3>Șase surse, filtrate la colector</h3>
+        <p>sshd, sudo, nginx, auditd, Suricata, kernel. Zgomotul e respins înainte
+           de bază de date, nu după.</p>
+      </div>
+      <div class="step">
+        <span class="n">02 · ÎNȚELEGE</span>
+        <h3>Reguli, praguri, geo, ASN</h3>
+        <p>400 de încercări de la o adresă devin un incident, nu 400 de alerte.
+           Actorul primește țară și operator.</p>
+      </div>
+      <div class="step">
+        <span class="n">03 · DECIDE</span>
+        <h3>Blocare în secunde</h3>
+        <p>nftables cu expirare în kernel. Sau, în primele 72 de ore, doar îți
+           arată ce <em>ar fi</em> blocat.</p>
+      </div>
+      <div class="step">
+        <span class="n">04 · REPARĂ</span>
+        <h3>Plan de patch, nu un shell</h3>
+        <p>Scanare prioritizată pe KEV și EPSS, apoi o procedură cu backup
+           verificat, health check și revenire automată.</p>
+      </div>
+      <div class="step">
+        <span class="n">05 · TE ANUNȚĂ</span>
+        <h3>Pe telefon, în română</h3>
+        <p>Cu butonul de acțiune sub mesaj. Canalul merge chiar dacă panoul web
+           e picat — nu depinde de el.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═════════════════════════════════════════════════════════════ TELEFON ═══ -->
+<section class="soft">
+  <div class="wrap">
+    <div class="narrow reveal">
+      <span class="eyebrow" style="color:var(--blue)">Controlul</span>
+      <h2>Decizia rămâne a ta. Doar așteptarea dispare.</h2>
+    </div>
+
+    <div class="phone-grid">
+      <div class="phone reveal" aria-hidden="true">
+        <div class="msg">
+          <span class="h">🔴 INCIDENT #482 · CRITICAL</span>
+          Brute-force SSH · 214 încercări în 3 minute<br>
+          Sursă: <code>203.0.113.47</code> · RO · AS-necunoscut<br>
+          <span class="meta">Referințe: CVE-2024-6387 · NVD · Red Hat</span>
+          <div class="tg-btns">
+            <div class="tg-btn">🚫 Blochează 24h</div>
+            <div class="tg-btn">❌ Ignoră</div>
+          </div>
+        </div>
+        <div class="msg">
+          <span class="h">🟠 Plan de patch #12</span>
+          <code>perl-Archive-Tar</code> → 2.38-6.el9_8.2<br>
+          Downtime estimat: <b>0 s</b> · Reversibil: da
+          <div class="tg-btns">
+            <div class="tg-btn">🧪 Dry-run</div>
+            <div class="tg-btn">✅ Aplică…</div>
+          </div>
+        </div>
+        <div class="msg">
+          <span class="h">🟢 Autoverificare</span>
+          32 de verificări · 0 probleme<br>
+          <span class="meta">acum 2 min · 617 ms</span>
+        </div>
+      </div>
+
+      <ul class="checklist reveal">
+        <li><span class="tick">✓</span><div><b>Blocarea automată se livrează OPRITĂ.</b>
+          <span>Primele 72 de ore îți arată ce <em>ar fi</em> blocat, cu buton. Fals-pozitivele ies la suprafață înainte să tai pe cineva la 3 dimineața.</span></div></li>
+        <li><span class="tick">✓</span><div><b>Niciun patch nu se aplică singur.</b>
+          <span>Generarea e automată. Aplicarea cere două confirmări explicite, iar butonul moare dacă planul se regenerează.</span></div></li>
+        <li><span class="tick">✓</span><div><b>Ore de liniște, cu excepții care contează.</b>
+          <span>22:00–06:00 tăcere — dar criticele, PANIC și eșecurile de patch trec oricum. Restul sunt reținute, nu pierdute.</span></div></li>
+        <li><span class="tick">✓</span><div><b>Autoverificare la 5 minute.</b>
+          <span>Nu „rulează procesul?", ci „chiar funcționează?". 32 de verificări care confirmă că fiecare componentă își produce efectul.</span></div></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════ REFUZURI ═══ -->
+<section>
+  <div class="wrap">
+    <div class="narrow reveal">
+      <span class="eyebrow" style="color:var(--alert)">Partea incomodă</span>
+      <h2>Un agent care poate bloca internetul trebuie judecat după ce refuză.</h2>
+      <p class="lede" style="margin-top:1.2rem">
+        Orice produs îți spune ce face. Într-o categorie în care software-ul
+        primește drept de root pe serverul tău, întrebarea care contează e alta:
+        ce nu are voie să facă, și cine îl oprește.
+      </p>
+    </div>
+
+    <div class="refusals reveal">
+      <div class="refusal">
+        <span class="x">REFUZAT</span>
+        <h3>Să te blocheze pe tine</h3>
+        <p>Adresa ta de administrare, rețelele private și loopback-ul sunt într-o
+           listă hard-codată în cod — nu în configurație, nu în baza de date. O
+           compromitere a bazei nu o poate lărgi.</p>
+      </div>
+      <div class="refusal">
+        <span class="x">REFUZAT</span>
+        <h3>Să te blocheze prin eșec</h3>
+        <p>Regula de bază e <span class="mono">policy accept</span>. E un
+           deny-lister, nu un firewall. Dacă procesul moare, baza pică sau
+           configurația e greșită — traficul trece.</p>
+      </div>
+      <div class="refusal">
+        <span class="x">REFUZAT</span>
+        <h3>Să păstreze blocările peste repornire</h3>
+        <p>Deliberat. O repornire e mereu o ieșire dintr-o blocare auto-provocată.
+           Plus un fișier <span class="mono">PANIC</span> care golește tot în sub
+           60 de secunde, verificat de un proces independent.</p>
+      </div>
+      <div class="refusal">
+        <span class="x">REFUZAT</span>
+        <h3>Să execute un plan pe care nu-l poate verifica</h3>
+        <p>Fiecare comandă e o listă, primul element dintr-o listă permisă,
+           <span class="mono">rm</span> interzis. Plan invalid → o singură
+           reîncercare → respins. Niciodată executat parțial.</p>
+      </div>
+      <div class="refusal">
+        <span class="x">REFUZAT</span>
+        <h3>Panoul web să atingă firewall-ul</h3>
+        <p>Interfața e componenta cea mai expusă, deci nu are drum către acțiuni
+           privilegiate. O compromitere a ei scurge date. Nu poate bloca,
+           debloca sau aplica nimic.</p>
+      </div>
+      <div class="refusal">
+        <span class="x">REFUZAT</span>
+        <h3>Să creadă un log</h3>
+        <p>Liniile de log și căile HTTP sunt scrise de atacator. Sunt împachetate
+           ca date neîncrezute, iar un test plantează
+           <span class="mono">IGNORE PREVIOUS INSTRUCTIONS</span> într-un access
+           log și verifică că nu s-a executat nimic.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════════════ PROBĂ ═══ -->
+<section class="soft">
+  <div class="wrap">
+    <div class="narrow reveal">
+      <span class="eyebrow" style="color:var(--blue)">Starea produsului</span>
+      <h2>Construit pe faze, fiecare verificată pe un server real.</h2>
+      <p class="lede" style="margin-top:1.2rem">
+        Rulează în producție pe infrastructura noastră. Cifrele de mai jos sunt
+        din repository, nu din prezentare.
+      </p>
+    </div>
+
+    <div class="proof reveal">
+      <div><b class="num" data-count="812">0</b><span>teste automate</span></div>
+      <div><b class="num" data-count="270">0</b><span>dintre ele verifică faptul că ceva periculos e <em>refuzat</em></span></div>
+      <div><b class="num" data-count="12">0</b><span>servicii systemd, zece dintre ele sub 3.0 la <span class="mono">systemd-analyze security</span></span></div>
+      <div><b class="num" data-count="0">0</b><span>dependențe CDN în interfață — CSP strict, fără JavaScript terț</span></div>
+    </div>
+
+    <p class="lede reveal" style="margin-top:2.4rem;max-width:70ch;font-size:1.02rem">
+      Lipsurile sunt declarate, nu ascunse: logurile din containere nu sunt
+      colectate, nu există monitor dedicat de integritate a fișierelor dincolo de
+      auditd, iar calea de instalare Debian e acoperită de teste dar încă
+      neverificată pe o gazdă Debian reală.
+    </p>
+  </div>
+</section>
+
+<!-- ═════════════════════════════════════════════════════════════════ CTA ═══ -->
+<section class="dark cta" id="contact">
+  <div class="wrap">
+    <div class="reveal">
+      <span class="eyebrow">Următorul pas</span>
+      <h2>Hai să vedem întâi ce se întâmplă pe serverul tău.</h2>
+      <p class="lede">
+        Începem cu o evaluare: ce e expus, ce te atacă acum, ce vulnerabilități
+        sunt deschise și cât de repede ai afla dacă cineva ar intra. Fără
+        obligații și fără să instalăm nimic în prima etapă.
+      </p>
+      <div class="cta-actions">
+        <a class="btn btn-primary" href="https://cryptoitdata.eu/contact">Cere evaluarea</a>
+        <a class="btn btn-ghost" href="https://cryptoitdata.eu/en/blog/servere-expuse-internet-atacuri-ai" target="_blank" rel="noopener">Citește analiza</a>
+      </div>
+      <p class="hero-note" style="margin-top:2rem">
+        Expertiză corporate. Livrată rapid. Fără overhead, fără jargon, fără surprize.
+      </p>
+    </div>
+  </div>
+</section>
+
+<footer class="night foot">
+  <div class="wrap">
+    <span>© <span id="yr">2026</span> CRYPTOITDATA · Sentinel</span>
+    <span><a href="https://cryptoitdata.eu">cryptoitdata.eu</a> · <a href="mailto:hello@cryptoitdata.eu">hello@cryptoitdata.eu</a></span>
+  </div>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+  const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  document.getElementById("yr").textContent = new Date().getFullYear();
+
+  /* ---------------------------------------------------------------------
+     Fluxul de atacuri.
+
+     Adresele sunt din intervalele de documentație RFC 5737 (203.0.113.0/24,
+     198.51.100.0/24) — nu adrese reale. O pagină publică de marketing care
+     afișează IP-uri reale de atacatori publică, de fapt, telemetria unui
+     client, iar dacă unul dintre ele e greșit, acuză pe cineva nevinovat.
+     --------------------------------------------------------------------- */
+  const ATTACKS = [
+    ["sshd",     "Failed password for root"],
+    ["sshd",     "Invalid user admin"],
+    ["sshd",     "Failed password for postgres"],
+    ["nginx",    "GET /wp-admin/setup-config.php"],
+    ["nginx",    "GET /.env"],
+    ["nginx",    "GET /.git/config"],
+    ["nginx",    "POST /xmlrpc.php"],
+    ["nginx",    "GET /vendor/phpunit/eval-stdin.php"],
+    ["suricata", "ET SCAN Suspicious inbound to mySQL port 3306"],
+    ["suricata", "ET EXPLOIT Possible CVE-2021-44228 Attempt"],
+    ["suricata", "ET DROP Dshield Block Listed Source"],
+    ["auditd",   "USER_AUTH res=failed acct=root"],
+    ["nginx",    "GET /actuator/health"],
+    ["sshd",     "Connection closed by invalid user [preauth]"]
+  ];
+  const DEFENCES = [
+    "incident #{n} deschis · brute-force SSH",
+    "{ip} blocat · nftables · TTL 24h",
+    "alertă trimisă pe Telegram · 0,4 s",
+    "sursă corelată · 3 vectori simultan",
+    "verificare automată · 32/32 OK"
+  ];
+
+  const feed = document.getElementById("feed");
+  const cAtk = document.getElementById("c-atk");
+  const cIp  = document.getElementById("c-ip");
+  const cBlk = document.getElementById("c-blk");
+
+  let nAtk = 0, nBlk = 0, nInc = 481;
+  const seen = new Set();
+  const rnd = (a) => a[Math.floor(Math.random() * a.length)];
+  const ip = () => Math.random() < 0.5
+    ? "203.0.113." + (2 + Math.floor(Math.random() * 250))
+    : "198.51.100." + (2 + Math.floor(Math.random() * 250));
+
+  function clock() {
+    const d = new Date();
+    return String(d.getHours()).padStart(2, "0") + ":" +
+           String(d.getMinutes()).padStart(2, "0") + ":" +
+           String(d.getSeconds()).padStart(2, "0");
+  }
+
+  function push(kind, src, text) {
+    if (!feed) return;
+    const el = document.createElement("div");
+    el.className = "line " + kind;
+    // textContent peste tot: liniile astea sunt scrise ca să semene cu ieșirea
+    // unui atacator, iar obiceiul de a le insera ca HTML este exact cel care
+    // face un panou de securitate exploatabil prin propriile loguri.
+    const t = document.createElement("span"); t.className = "t"; t.textContent = clock();
+    const s = document.createElement("span"); s.className = "s"; s.textContent = src;
+    const m = document.createElement("span"); m.className = "m"; m.textContent = text;
+    el.append(t, s, m);
+    feed.appendChild(el);
+    while (feed.childNodes.length > 14) feed.removeChild(feed.firstChild);
+  }
+
+  function tick() {
+    const [src, msg] = rnd(ATTACKS);
+    const addr = ip();
+    seen.add(addr);
+    nAtk += 1 + Math.floor(Math.random() * 3);
+    push("atk", src, addr + "  " + msg);
+    cAtk.textContent = nAtk.toLocaleString("ro-RO");
+    cIp.textContent = seen.size;
+
+    // Răspunsul apare intercalat, nu la final: ideea e că apărarea ține pasul,
+    // nu că ajunge din urmă.
+    if (Math.random() < 0.28) {
+      setTimeout(function () {
+        nBlk++; nInc++;
+        const line = rnd(DEFENCES).replace("{ip}", addr).replace("{n}", nInc);
+        push("def", "sentinel", line);
+        cBlk.textContent = nBlk;
+      }, 260 + Math.random() * 420);
+    }
+  }
+
+  if (feed) {
+    if (reduced) {
+      // Fără mișcare: o singură captură statică, tot informativă.
+      for (let i = 0; i < 9; i++) tick();
+    } else {
+      for (let i = 0; i < 6; i++) tick();
+      setInterval(tick, 1150);
+    }
+  }
+
+  /* ------------------------------------------------------ apariția la scroll */
+
+  function revealAll() {
+    document.querySelectorAll(".reveal").forEach(function (el) {
+      el.classList.add("in");
+      el.querySelectorAll("[data-count]").forEach(count);
+      el.querySelectorAll(".bar i").forEach(function (b) { b.style.width = b.dataset.w + "%"; });
+    });
+  }
+
+  // Fără IntersectionObserver, nimic nu s-ar mai afișa vreodată.
+  if (reduced || !("IntersectionObserver" in window)) {
+    revealAll();
+    return;
+  }
+
+  document.documentElement.classList.add("js-reveal");
+
+  const io = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      if (!e.isIntersecting) return;
+      e.target.classList.add("in");
+      e.target.querySelectorAll("[data-count]").forEach(count);
+      e.target.querySelectorAll(".bar i").forEach(function (bar) {
+        requestAnimationFrame(function () { bar.style.width = bar.dataset.w + "%"; });
+      });
+      io.unobserve(e.target);
+    });
+  }, { threshold: 0.18, rootMargin: "0px 0px -60px 0px" });
+
+  document.querySelectorAll(".reveal").forEach(function (el) { io.observe(el); });
+
+  // Plasă de siguranță. Dacă observatorul nu a arătat nimic în trei secunde —
+  // un browser care nu-l declanșează, o randare fără scroll real, orice
+  // altceva neprevăzut — pagina se arată oricum. O animație ratată e un
+  // detaliu; o pagină goală e o pagină pierdută.
+  setTimeout(function () {
+    if (!document.querySelector(".reveal.in")) revealAll();
+  }, 3000);
+
+  function count(el) {
+    if (el.dataset.done) return;
+    el.dataset.done = "1";
+
+    const target = parseFloat(el.dataset.count);
+    const pre = el.dataset.prefix || "", suf = el.dataset.suffix || "";
+
+    const final = pre + target + suf;
+    el.textContent = final;
+    if (reduced || target === 0) return;
+
+    /* Numărătoarea e decor; cifra e conținut.
+       Scrierea valorii finale înainte de animație nu ajută singură: primul
+       cadru o suprascrie cu 0, iar dacă rAF se oprește acolo — filă în fundal,
+       randare fără cadre, throttling — rămâne „0%" afișat cu încredere unde
+       scria „31%". De asta există și un termen limită care aterizează
+       întotdeauna pe numărul adevărat, indiferent ce face rAF. */
+    const dur = 1100, t0 = performance.now();
+    let settled = false;
+    const land = function () {
+      if (settled) return;
+      settled = true;
+      el.textContent = final;
+    };
+    setTimeout(land, dur + 400);
+
+    (function step(now) {
+      if (settled) return;
+      const p = Math.min(1, (now - t0) / dur);
+      const eased = 1 - Math.pow(1 - p, 3);
+      el.textContent = pre + Math.round(target * eased) + suf;
+      if (p < 1) requestAnimationFrame(step); else land();
+    })(t0);
+  }
+})();
+</script>
+</body>
+</html>
