@@ -366,3 +366,70 @@ def test_the_installer_restarts_every_service():
     for unit in ("sentinel-executor", "sentinel-web", "sentinel-ingest",
                  "sentinel-detect", "sentinel-telegram"):
         assert unit in order, f"{unit} is never restarted by a deploy"
+
+
+# --- boot reconciliation ----------------------------------------------------
+def test_reconcile_calls_block_with_the_signature_that_exists():
+    """A keyword that does not exist raises at the moment it is needed — which
+    for `--reapply` is after a reboot, when nobody is watching."""
+    import inspect
+
+    from sentinel.respond import actions, reconcile as rec
+
+    params = inspect.signature(actions.block).parameters
+    src = inspect.getsource(rec.reconcile)
+    for kw in ("ttl=", "reason=", "by="):
+        assert kw in src
+        assert kw.rstrip("=") in params
+
+
+def test_reconcile_corrects_the_database_not_the_kernel_by_default():
+    """The kernel is the truth about what is blocked; after a reboot that truth
+    is "nothing". Re-applying by default would quietly remove the escape hatch
+    the whole design leans on."""
+    import inspect
+
+    from sentinel.respond import reconcile as rec
+
+    src = inspect.getsource(rec.reconcile)
+    default = src.split("if not reapply:", 1)[1].split("reapplied = 0", 1)[0]
+    assert "mark_unblocked" in default
+    assert "actions.block" not in default
+
+
+def test_the_release_is_written_down_with_a_reason():
+    """An attacker who was blocked and is now not is a fact worth finding later."""
+    import inspect
+
+    from sentinel.respond import reconcile as rec
+
+    assert "repornire" in inspect.getsource(rec.reconcile)
+
+
+def test_the_executor_recreates_the_table_before_accepting_work():
+    """Every block against a missing table fails. Recreating it after the socket
+    opens would leave a window where blocking silently does nothing."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[2] / "executor"
+           / "sentinel_executor.py").read_text(encoding="utf-8")
+    body = src.split("def main(", 1)[1]
+    assert body.index("ensure_table()") < body.index("socket.socket")
+
+
+def test_the_executor_restores_the_allowlist_but_not_the_blocklist():
+    """A table with drop rules and no allowlist is how you firewall your own
+    address. A table WITH the blocklist restored is how a reboot stops being an
+    escape from a self-inflicted block."""
+    from pathlib import Path
+
+    commands = (Path(__file__).resolve().parents[2] / "executor"
+                / "commands.py").read_text(encoding="utf-8")
+    body = commands.split("def ensure_table", 1)[1].split("\ndef ", 1)[0]
+    assert "NFT_ALLOWLIST_FILE" in body
+    # Strip the docstring as well as the comments: it EXPLAINS that blocks are
+    # not restored, so a naive text search finds the word it is looking for in
+    # the sentence promising the opposite.
+    code = body.split('"""')[2] if body.count('"""') >= 2 else body
+    code = "\n".join(l for l in code.splitlines() if not l.strip().startswith("#"))
+    assert "blocklist" not in code.lower(), "the blocklist is being restored"

@@ -266,3 +266,47 @@ def test_entrypoint_scripts_are_executable_in_git():
         has_shebang = (REPO / path).read_bytes().startswith(b"#!")
         if has_shebang:
             assert mode == "100755", f"{path} has a shebang but is committed {mode}"
+
+
+def test_no_shell_script_contains_a_stray_literal_backslash_n():
+    r"""Twice now a scripted edit has written `\n` as two characters into a shell
+    script instead of a real newline. In documentation that produced a command
+    that would not run when pasted; in `install.sh` it put a spurious `n` into a
+    `for` list. `bash -n` accepts both, so nothing catches it but this."""
+    import re
+
+    offenders = []
+    for path in list((REPO / "deploy").rglob("*.sh")) + list((REPO / "scripts").rglob("*.sh")):
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").split("\n"), 1):
+            stripped = line.strip()
+            # Text-producing commands legitimately contain \n, and so do comments.
+            if stripped.startswith("#") or any(
+                    k in line for k in ("printf", "echo", "sed ", "awk ", "grep ", "tr ")):
+                continue
+            for m in re.finditer(r"\n", line):
+                # A trailing backslash is a line continuation, not this bug.
+                if line.rstrip().endswith("\\") and m.end() >= len(line.rstrip()):
+                    continue
+                offenders.append(f"{path.relative_to(REPO)}:{lineno}")
+    assert not offenders, f"literal \n in a shell script: {offenders}"
+
+
+def test_the_nftables_ruleset_and_allowlist_are_persisted():
+    """The table does not survive a reboot and nothing recreated it, so a host
+    came back with no `inet sentinel` at all and every block failed silently for
+    a day. The executor reloads these at startup."""
+    install = (REPO / "deploy" / "install.sh").read_text(encoding="utf-8")
+    assert "libexec/sentinel-table.nft" in install
+    assert "libexec/sentinel-allowlist.nft" in install
+
+
+def test_the_blocklist_is_never_persisted():
+    """"A reboot is always a way out of a self-inflicted block" is a guarantee
+    this design makes and the operator has been told to rely on. Persisting the
+    blocklist would quietly remove it."""
+    install = (REPO / "deploy" / "install.sh").read_text(encoding="utf-8")
+    block = install.split("libexec/sentinel-allowlist.nft", 1)[1].split("}", 1)[0]
+    assert "blocklist" not in block.replace("blocklist are deliberately NOT", "")
+    commands = (REPO / "executor" / "commands.py").read_text(encoding="utf-8")
+    ensure = commands.split("def ensure_table", 1)[1].split("\ndef ", 1)[0]
+    assert "blocklist" not in ensure or "NOT restored" in ensure

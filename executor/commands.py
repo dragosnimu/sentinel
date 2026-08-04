@@ -27,7 +27,33 @@ from typing import Any
 import policy
 from policy import PolicyRefusal
 
+
+def log(level: str, message: str, **fields: Any) -> None:
+    """Same shape as the executor's own logger, defined here rather than
+    imported: `sentinel_executor` imports this module, and importing back would
+    make the one root component in the system depend on an import cycle."""
+    import sys
+
+    record = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "level": level, "service": "sentinel-executor", "msg": message, **fields}
+    print(json.dumps(record, default=str), file=sys.stderr, flush=True)
+
 NFT = "/usr/sbin/nft"
+
+# The table skeleton and the persisted allowlist, both root-owned, installed
+# next to this file.
+#
+# They exist because the table does NOT survive a reboot and nothing recreated
+# it. Observed: a host came back from a reboot with no `inet sentinel` table at
+# all, so seven recorded blocks were fiction and every subsequent block — manual
+# or automatic — would have failed with nobody told.
+#
+# The allowlist is persisted; the blocklist deliberately is not. Rebooting stays
+# an escape from a self-inflicted block, which is a stated guarantee of this
+# design, while the addresses that must NEVER be dropped come back with the
+# table rather than after it.
+NFT_TABLE_FILE = "/opt/sentinel/libexec/sentinel-table.nft"
+NFT_ALLOWLIST_FILE = "/opt/sentinel/libexec/sentinel-allowlist.nft"
 SYSTEMCTL = "/usr/bin/systemctl"
 TABLE = "inet sentinel"
 
@@ -184,8 +210,74 @@ def op_allow_ip(args: dict[str, Any]) -> dict[str, Any]:
     set_name = "allowlist_v4" if network.version == 4 else "allowlist_v6"
     result = _run([NFT, "add", "element", "inet", "sentinel", set_name, f"{{ {network} }}"],
                   timeout=10)
-    return {"applied": result["exit_code"] == 0, "target": str(network),
+    applied = result["exit_code"] == 0
+    if applied:
+        # Persisted immediately. An allowlist entry that only exists in the
+        # kernel is one the next reboot silently removes — and the entry an
+        # operator adds by hand is usually the one that matters most.
+        _persist_allowlist_entry(set_name, str(network))
+    return {"applied": applied, "target": str(network),
             "error": result["stderr"] or None}
+
+
+def _persist_allowlist_entry(set_name: str, element: str) -> None:
+    line = f"add element inet sentinel {set_name} {{ {element} }}" + "\n"
+    try:
+        path = Path(NFT_ALLOWLIST_FILE)
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+        if line in existing:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+        os.chmod(path, 0o644)
+    except OSError as exc:
+        # Not fatal: the entry IS in the kernel and works until the next reboot.
+        log("warning", "could not persist allowlist entry", element=element, error=str(exc))
+
+
+def ensure_table() -> dict[str, Any]:
+    """Make sure `inet sentinel` exists, loading it if it does not.
+
+    Called at startup, before the socket accepts anything. Loads the skeleton
+    and then the persisted allowlist, in that order — allowlist entries have to
+    be present before anything can be dropped, which is the same ordering the
+    installer uses and for the same reason.
+
+    Blocks are NOT restored here. That is the anti-lockout guarantee: a reboot
+    clears the blocklist and is therefore always a way out.
+    """
+    check = _run([NFT, "list", "table", "inet", "sentinel"], timeout=10)
+    if check["exit_code"] == 0:
+        return {"created": False}
+
+    if not Path(NFT_TABLE_FILE).exists():
+        log("error", "nftables table missing and no ruleset to load from",
+            path=NFT_TABLE_FILE)
+        return {"created": False, "error": "ruleset file absent"}
+
+    loaded = _run([NFT, "-f", NFT_TABLE_FILE], timeout=30)
+    if loaded["exit_code"] != 0:
+        log("error", "failed to load the nftables table", error=loaded["stderr"])
+        return {"created": False, "error": loaded["stderr"]}
+
+    allow_count = 0
+    if Path(NFT_ALLOWLIST_FILE).exists():
+        allow = _run([NFT, "-f", NFT_ALLOWLIST_FILE], timeout=30)
+        if allow["exit_code"] != 0:
+            # A table with drops and no allowlist is the dangerous state, so say
+            # so loudly. The blocklist is empty at this point, so nothing is
+            # actually being dropped yet — but the next block would be unsafe.
+            log("error", "table loaded but the allowlist did NOT",
+                error=allow["stderr"])
+        else:
+            allow_count = sum(
+                1 for line in Path(NFT_ALLOWLIST_FILE).read_text(
+                    encoding="utf-8").splitlines() if line.strip())
+
+    log("warning", "nftables table was missing and has been recreated",
+        allowlist_entries=allow_count)
+    return {"created": True, "allowlist_entries": allow_count}
 
 
 def op_flush_blocklist(args: dict[str, Any]) -> dict[str, Any]:

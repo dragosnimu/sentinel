@@ -6,6 +6,7 @@ instead of a traceback in `journalctl`.
 
     sentinel ingest | detect | ai | telegram | web | scan | health | maintenance
     sentinel selfcheck [--print]
+    sentinel reconcile [--reapply]
     sentinel migrate [--dry-run]
     sentinel config-check
     sentinel version
@@ -22,7 +23,7 @@ from sentinel.errors import ConfigError, SentinelError
 from sentinel.logging_setup import setup_logging
 
 SERVICES = ("ingest", "detect", "ai", "telegram", "web", "scan", "health",
-            "maintenance", "selfcheck")
+            "maintenance", "selfcheck", "reconcile")
 
 
 def _run_service(name: str, args: argparse.Namespace) -> int:

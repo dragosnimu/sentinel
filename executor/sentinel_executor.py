@@ -390,6 +390,14 @@ def main() -> int:
     global _audit_prev_hash
     _audit_prev_hash = _load_audit_chain()
 
+    # Before anything can be blocked, there has to be somewhere to put it.
+    # A host that reboots comes back with no `inet sentinel` table, and every
+    # block against a missing table fails — which is how this deployment spent a
+    # day believing it had seven addresses blocked while the kernel had none.
+    table = commands.ensure_table()
+    if table.get("created"):
+        log("warning", "recreated the nftables table at startup", **table)
+
     allowed_uid = expected_uid()
     entries = policy.refresh_runtime_allowlist(_operator_allowlist())
     log("info", "starting", socket=SOCKET_PATH, allowed_uid=allowed_uid,

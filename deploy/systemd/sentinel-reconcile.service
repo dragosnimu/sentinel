@@ -1,0 +1,63 @@
+[Unit]
+# Make the recorded blocklist agree with the kernel, once, at boot.
+#
+# The nftables table is never persisted, so a reboot clears every block. That is
+# deliberate — "a reboot is always a way out of a self-inflicted block" is a
+# guarantee this design makes. What was missing is the other half: after the
+# reboot, the database still claimed seven addresses were blocked, and for a day
+# the dashboard, the Telegram commands and the operator all described a firewall
+# state that did not exist.
+#
+# The kernel is the truth about what is blocked; the database is the record of
+# what was decided. When they disagree, this corrects the record — and writes
+# down why, because an attacker who was blocked and now is not is a fact worth
+# being able to find later.
+#
+# Ordered after the executor because the executor is what recreates the table.
+Description=Sentinel blocklist reconciliation
+Documentation=file:/opt/sentinel/lib/sentinel/respond/reconcile.py
+After=sentinel-executor.service postgresql.service
+Requires=sentinel-executor.service
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+User=sentinel
+Group=sentinel
+WorkingDirectory=/opt/sentinel
+ExecStart=/opt/sentinel/bin/sentinel reconcile
+TimeoutStartSec=120
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/sentinel/lib
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @mount @debug @swap
+
+# Talks to the database and to the executor's unix socket. It changes nftables
+# only THROUGH the executor, which is the same path every other component uses
+# and the reason no capability is needed here.
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/sentinel
+ReadOnlyPaths=/etc/sentinel
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+MemoryMax=128M
+TasksMax=32
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-reconcile
+
+[Install]
+WantedBy=multi-user.target
