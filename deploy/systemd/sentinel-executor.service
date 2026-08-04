@@ -31,21 +31,38 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID CAP_KILL
 AmbientCapabilities=CAP_NET_ADMIN
 
-NoNewPrivileges=false
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-PrivateDevices=false
 ProtectKernelTunables=true
 ProtectKernelModules=true
-ProtectControlGroups=false
+ProtectControlGroups=true
 ProtectClock=true
 ProtectHostname=true
+ProtectKernelLogs=true
 RestrictRealtime=true
-RestrictSUIDSGID=false
 LockPersonality=true
 MemoryDenyWriteExecute=true
-RestrictNamespaces=~CLONE_NEWUSER
+
+# The executor runs nft, systemctl, dnf, tar and rpm. None of them needs to
+# create a namespace, write a SUID file, or execute a foreign ABI — so all
+# three are denied. Each is a genuine restriction rather than a score chase:
+# creating a user namespace is a standard step in turning a code-execution bug
+# into a privilege escalation, and this is the one component where that would
+# matter.
+RestrictNamespaces=yes
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+# NoNewPrivileges and PrivateDevices are deliberately NOT set, and that costs
+# real points on `systemd-analyze security`.
+#
+# This process runs the package manager on the operator's behalf. RPM and dpkg
+# scriptlets legitimately use setuid helpers, and backup/restore touches device
+# nodes. Setting either flag would score better and would break patching at the
+# moment it is needed — which is a worse trade than the score suggests.
+NoNewPrivileges=false
+PrivateDevices=false
 
 # Every path it may write. Adding one here is a security decision, not a
 # convenience: this is the list of things root-level Sentinel can modify.

@@ -44,6 +44,19 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @mount @debug @swap
 
+# Namespaces, realtime scheduling and a restrictive umask. None of these units
+# has any use for a namespace or for realtime priority, and each one denied is
+# a step removed from turning a bug here into something worse.
+RestrictNamespaces=yes
+RestrictRealtime=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+MemoryDenyWriteExecute=true
+UMask=0077
+SystemCallFilter=~@resources
+
 # Talks to the database and to the executor's unix socket. It changes nftables
 # only THROUGH the executor, which is the same path every other component uses
 # and the reason no capability is needed here.

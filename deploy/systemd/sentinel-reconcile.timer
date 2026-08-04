@@ -1,0 +1,20 @@
+[Unit]
+Description=Sentinel blocklist reconciliation, hourly
+Documentation=file:/opt/sentinel/lib/sentinel/respond/reconcile.py
+
+[Timer]
+# Boot is the main event — that is when the kernel loses every block — and the
+# service is wired to multi-user.target for it. This timer covers the rest: an
+# `nft flush ruleset` from another tool, a table dropped by hand, anything that
+# makes the record and the reality drift while the host stays up.
+#
+# Hourly, not every minute. The self-check notices the disagreement within five
+# minutes and says so; this is the repair, and repairing on a slow cadence
+# leaves the operator time to look before the record is rewritten.
+OnBootSec=3min
+OnUnitActiveSec=1h
+AccuracySec=5min
+Unit=sentinel-reconcile.service
+
+[Install]
+WantedBy=timers.target

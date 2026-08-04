@@ -771,13 +771,15 @@ step_start_services() {
         fi
     done
 
-    # Reconciliation is a boot-time oneshot, not a timer: the disagreement
-    # it corrects is created by a reboot and by nothing else.
+    # Reconciliation runs at boot AND hourly. Boot is the main event — that
+    # is when the kernel loses every block — but a table can also be dropped
+    # while the host stays up, by another tool or by hand.
     systemctl enable sentinel-reconcile.service >/dev/null 2>&1 \
         && ok "sentinel-reconcile.service enabled (runs at boot)"
 
     for unit in sentinel-health.timer sentinel-maintenance.timer \
-                sentinel-watchdog.timer sentinel-selfcheck.timer; do
+                sentinel-watchdog.timer sentinel-selfcheck.timer \
+                sentinel-reconcile.timer; do
         [[ -f "/etc/systemd/system/${unit}" ]] && systemctl enable --now "$unit" >/dev/null 2>&1 \
             && ok "${unit} enabled"
     done

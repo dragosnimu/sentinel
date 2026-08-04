@@ -23,7 +23,19 @@ ProtectKernelModules=true
 RestrictSUIDSGID=true
 LockPersonality=true
 SystemCallArchitectures=native
+
+# Namespaces, realtime scheduling and a restrictive umask. Neither unit has any
+# use for a namespace or for realtime priority.
+RestrictNamespaces=yes
+RestrictRealtime=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+MemoryDenyWriteExecute=true
+UMask=0077
 SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug @swap @reboot @raw-io @obsolete
 CapabilityBoundingSet=
 
 ReadWritePaths=/var/lib/sentinel

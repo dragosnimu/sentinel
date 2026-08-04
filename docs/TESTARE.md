@@ -294,4 +294,132 @@ unitate systemd.
 | P7 | Scanare completă în fereastră, fără impact pe latența celorlalte servicii; findings deduplicate și corect prioritizate |
 | P8 | Verdict AI pe un incident HIGH în <2 min; căderea API degradează curat; raport zilnic RO la 08:00; plafonul de buget se aplică |
 | P9 | Canary: generare → dry-run → aplicare → rupere deliberată → rollback automat verificat, cu urmă completă |
-| P10 | Acest document trece integral; `systemd-analyze security` ≤3.0 pe toate unitățile |
+| P10 | Acest document trece integral; `systemd-analyze security` ≤3.0 pe toate unitățile **neprivilegiate** — vezi §11 pentru cele două excepții și de ce sunt |
+
+
+---
+
+## 11. P10 — autoverificare, reconciliere, hardening
+
+### 11.1 Autoverificarea prinde ce `systemctl` nu prinde
+
+Ambele scenarii de mai jos au fost pene reale. În ambele, `systemctl is-active`
+a răspuns „activ".
+
+**Un colector care amuțește.** Oprește ingestia fără să oprești serviciul:
+
+```bash
+# Pe server, simulează un cititor blocat: golește cursorul sshd în viitor
+sudo -u postgres psql -d sentinel -c   "UPDATE collector_cursors SET updated_at = now() - interval '25 hours' WHERE name='sshd'"
+sudo systemctl start sentinel-selfcheck
+sudo -u postgres psql -d sentinel -c "SELECT key, status FROM selfcheck_state WHERE status<>'ok'"
+```
+
+Trece dacă: apare `ingest:sshd` cu `down`, ȘI sosește o alertă pe Telegram, ȘI
+mesajul spune de cât timp.
+
+**O noapte liniștită NU trebuie să alerteze.** Dacă toate sursele tac deodată,
+verificarea raportează o singură dată `ingest:all`, nu câte una per colector.
+Regresia asta contează mai mult decât cealaltă: șase alerte false pentru un
+non-defect e felul în care canalul ajunge mut.
+
+**Tabela nftables lipsă:**
+
+```bash
+sudo nft delete table inet sentinel
+sudo systemctl start sentinel-selfcheck
+```
+
+Trece dacă: `nft:table` e `down`, mesajul spune „nicio blocare nu are efect", și
+acțiunea propusă e comanda care repară.
+
+**Permisiuni, nu absență.** Rulează verificarea fără `CAP_NET_ADMIN`:
+
+```bash
+sudo -u sentinel /opt/sentinel/bin/sentinel selfcheck --print | grep nft:table
+```
+
+Trece dacă raportează `??` (necunoscut), **nu** `DOWN`. Sunt concluzii opuse: una
+spune că ești neprotejat, cealaltă că verificarea e stricată, iar o alarmă falsă
+despre pierderea totală a protecției e cel mai bun mod de a face canalul ignorat.
+
+**Canalul de alertare căzut:**
+
+```bash
+sudo systemctl stop sentinel-telegram
+sudo systemctl start sentinel-selfcheck
+```
+
+Trece dacă mesajul sosește **oricum**, marcat „trimis direct de autoverificare".
+Un mesaj despre un bot mort, pus în coada acelui bot, nu ajunge nicăieri.
+
+### 11.2 Recuperarea după repornire
+
+```bash
+sudo nft delete table inet sentinel      # simulează repornirea
+sudo systemctl restart sentinel-executor
+sudo nft list set inet sentinel allowlist_v4
+```
+
+Trece dacă: tabela e recreată, allowlistul e complet, și **adresa ta de
+administrare e în el**. Asta e invariantul anti-lockout; verifică-l cu ochii,
+nu presupune.
+
+```bash
+sudo -u sentinel /opt/sentinel/bin/sentinel reconcile
+```
+
+Trece dacă: blocările din bază care nu mai există în kernel sunt marcate ca
+eliberate, cu motiv, **și nicio blocare care chiar există nu e atinsă**.
+Reconcilierea compară adresă cu adresă; una care compară doar numere ar elibera
+tot la prima expirare cu o secundă mai devreme.
+
+**Blocarea funcționează după recreare:**
+
+```bash
+sudo -u sentinel env PYTHONPATH=/opt/sentinel/lib /opt/sentinel/venv/bin/python -c "
+import asyncio
+from sentinel.config import load_config
+from sentinel.db.engine import Database
+from sentinel.respond import actions
+async def m():
+    cfg = load_config(); db = Database(cfg); await db.connect()
+    r = await actions.block(db, '9.9.9.9', ttl=60, reason='test', by='verificare')
+    print('aplicat:', r.get('applied'), '· kernel:', await actions.live_blocked())
+    await actions.unblock(db, '9.9.9.9', by='verificare')
+    await db.close()
+asyncio.run(m())
+"
+```
+
+> **Notă despre adresele de test:** `198.51.100.x` și `203.0.113.x` sunt
+> intervale de documentație, dar `ipaddress` din Python le raportează ca
+> **private**, iar garda le refuză. Folosește o adresă publică reală și
+> inofensivă (`9.9.9.9`), deblocată imediat. Blocarea e pe `input`, deci nu
+> afectează traficul de ieșire al gazdei.
+
+### 11.3 Hardening
+
+```bash
+systemd-analyze security 'sentinel-*'
+```
+
+Trece dacă: fiecare unitate **neprivilegiată** e ≤3.0. Cele două root sunt
+excepții documentate — `sentinel-executor` (4.8) și `sentinel-watchdog` (6.1).
+Niciun set de directive nu duce un serviciu root sub 3.0.
+
+Verifică și că hardening-ul nu a rupt nimic: pornește fiecare oneshot manual și
+confirmă `Result=success`. O directivă prea strictă se manifestă ca un serviciu
+care pornește și moare imediat, nu ca o eroare de configurație.
+
+### 11.4 Corelarea expunerii
+
+```bash
+sudo -u postgres psql -d sentinel -c   "SELECT actor_key, match_reason, confidence FROM exposure_crossings ORDER BY detected_at DESC LIMIT 5"
+```
+
+Trece dacă: rândurile apar doar când un atacator sondează o cale care
+corespunde cu software care rulează AICI și are un finding deschis. Testul care
+contează e cel negativ — o cerere `/wp-admin` către o gazdă fără WordPress nu
+trebuie să producă nimic. Fiecare gazdă din internet primește cereri
+`/wp-admin` toată ziua.

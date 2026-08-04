@@ -146,3 +146,36 @@ def _count_nft_elements(data: dict[str, Any]) -> int:
     except (AttributeError, TypeError, KeyError):
         pass
     return 0
+
+
+def _nft_elements(data: dict[str, Any]) -> list[str]:
+    """The element VALUES in `nft -j list set` output, as plain strings.
+
+    Counting was enough for the watchdog's cap; reconciling needs to know WHICH
+    addresses are present, because "the kernel has fewer than the database" and
+    "the kernel is missing these three" call for different repairs.
+
+    Each element is either a bare string, or an object once it carries a
+    timeout: `{"elem": {"val": "203.0.113.4", "timeout": 3600}}`. Both shapes are
+    handled, and anything unrecognised is skipped rather than guessed at — a
+    misparsed element would mean unblocking someone who is still blocked.
+    """
+    out: list[str] = []
+    try:
+        for entry in data.get("nftables", []):
+            if not (isinstance(entry, dict) and "set" in entry):
+                continue
+            for element in entry["set"].get("elem", []) or []:
+                if isinstance(element, str):
+                    out.append(element)
+                elif isinstance(element, dict):
+                    inner = element.get("elem", element)
+                    value = inner.get("val") if isinstance(inner, dict) else None
+                    if isinstance(value, str):
+                        out.append(value)
+                    elif isinstance(value, dict) and "prefix" in value:
+                        prefix = value["prefix"]
+                        out.append(f"{prefix.get('addr')}/{prefix.get('len')}")
+    except (AttributeError, TypeError, KeyError):
+        pass
+    return out

@@ -165,7 +165,19 @@ def op_block_ip(args: dict[str, Any]) -> dict[str, Any]:
 
     result = _run([NFT, "add", "element", "inet", "sentinel", set_name, spec], timeout=10)
     if result["exit_code"] != 0:
-        return {"applied": False, "error": result["stderr"]}
+        # The table can disappear underneath a running system — a reboot, an
+        # `nft flush ruleset` from another tool, someone tidying up. Recreating
+        # it at startup covers the reboot and nothing else, and the moment that
+        # matters most is this one: a block being placed against a table that is
+        # not there. Heal and retry once.
+        healed = ensure_table()
+        if healed.get("created"):
+            result = _run([NFT, "add", "element", "inet", "sentinel", set_name, spec],
+                          timeout=10)
+            log("warning", "table was missing when placing a block; recreated and retried",
+                target=element, applied=result["exit_code"] == 0)
+        if result["exit_code"] != 0:
+            return {"applied": False, "error": result["stderr"]}
 
     _block_times.append(time.monotonic())
     return {

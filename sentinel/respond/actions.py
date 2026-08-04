@@ -110,3 +110,25 @@ async def live_count() -> int:
         return await asyncio.to_thread(_client.blocklist_size)
     except (ExecutorRejected, ExecutorUnavailable):
         return -1
+
+
+async def live_blocked() -> set[str] | None:
+    """WHICH addresses the kernel is actually dropping, or None if unknown.
+
+    None and an empty set mean different things and must not be confused: one
+    is "the executor did not answer", the other is "nothing is blocked". A
+    reconciler that treated the first as the second would mark every block in
+    the database as released the moment the executor hiccupped.
+    """
+    from sentinel.respond.executor_client import _nft_elements
+
+    try:
+        sets = await asyncio.to_thread(_client.list_sets)
+    except (ExecutorRejected, ExecutorUnavailable):
+        return None
+    out: set[str] = set()
+    for name in ("blocklist_v4", "blocklist_v6"):
+        data = sets.get(name)
+        if isinstance(data, dict) and "error" not in data:
+            out.update(_nft_elements(data))
+    return out

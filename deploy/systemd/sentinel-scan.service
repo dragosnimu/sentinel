@@ -41,6 +41,19 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @mount @debug
 
+# Namespaces, realtime scheduling and a restrictive umask. None of these units
+# has any use for a namespace or for realtime priority, and each one denied is
+# a step removed from turning a bug here into something worse.
+RestrictNamespaces=yes
+RestrictRealtime=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+MemoryDenyWriteExecute=true
+UMask=0077
+SystemCallFilter=~@resources
+
 # Scanners read application source and webroots; that is the job.
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH
 AmbientCapabilities=CAP_DAC_READ_SEARCH

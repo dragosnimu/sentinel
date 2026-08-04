@@ -392,7 +392,10 @@ def test_reconcile_corrects_the_database_not_the_kernel_by_default():
     from sentinel.respond import reconcile as rec
 
     src = inspect.getsource(rec.reconcile)
-    default = src.split("if not reapply:", 1)[1].split("reapplied = 0", 1)[0]
+    # The default branch runs from `if not reapply:` to its own `return`.
+    # Splitting on `for row in missing:` would not work — the default branch
+    # opens with one of those too.
+    default = src.split("if not reapply:", 1)[1].split("return result", 1)[0]
     assert "mark_unblocked" in default
     assert "actions.block" not in default
 

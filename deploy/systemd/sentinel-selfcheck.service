@@ -52,6 +52,19 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @mount @debug @swap
 
+# Namespaces, realtime scheduling and a restrictive umask. None of these units
+# has any use for a namespace or for realtime priority, and each one denied is
+# a step removed from turning a bug here into something worse.
+RestrictNamespaces=yes
+RestrictRealtime=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+MemoryDenyWriteExecute=true
+UMask=0077
+SystemCallFilter=~@resources
+
 # Reading the nftables ruleset requires NET_ADMIN even for `list`. Bounded to
 # exactly that: this unit must never be able to CHANGE the ruleset, only look
 # at it — changing it is the executor's job and nobody else's.

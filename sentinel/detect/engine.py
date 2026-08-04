@@ -42,10 +42,24 @@ async def run_once(db: Database, cfg: Config) -> dict[str, int]:
             new_incidents += was_new
 
     await inc_repo.set_detect_cursor(db, max_id)
+
+    # Exposure crossings: an actor probing exactly what this host has not
+    # patched. Deterministic, and deliberately AFTER the cursor advances — a
+    # failure here must not make the loop re-read the same events forever.
+    crossings = 0
+    try:
+        from sentinel.predict import exposure
+
+        found = await exposure.detect(db)
+        crossings = await exposure.record(db, found)
+    except Exception as exc:  # noqa: BLE001 - correlation must not stop detection
+        log.error("exposure crossing pass failed", extra={"detail": str(exc)})
+
     if detections:
         log.info("detections", extra={"detections": detections, "new_incidents": new_incidents,
-                                      "cursor": max_id})
-    return {"detections": detections, "new_incidents": new_incidents}
+                                      "cursor": max_id, "crossings": crossings})
+    return {"detections": detections, "new_incidents": new_incidents,
+            "crossings": crossings}
 
 
 async def _apply(db: Database, cfg: Config, spec: DetectionSpec) -> tuple[int, int]:

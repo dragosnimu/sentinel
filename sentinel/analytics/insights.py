@@ -62,7 +62,8 @@ async def collect(db: Database) -> list[Insight]:
                  _probe_campaign_insights, _blocklist_drift_insight,
                  _incident_flood_insight, _vuln_insight, _trend_insight,
                  _enrichment_insight, _ai_disagreement_insight,
-                 _privilege_insight, _concentrated_asn_insight):
+                 _privilege_insight, _concentrated_asn_insight,
+                 _exposure_crossing_insight):
         try:
             out.extend(await rule(db))
         except Exception:  # noqa: BLE001 - one bad rule must not empty the page
@@ -433,6 +434,43 @@ async def _privilege_insight(db: Database) -> list[Insight]:
 
 
 # --- 12. concentrated attacker infrastructure -------------------------------
+async def _exposure_crossing_insight(db: Database) -> list[Insight]:
+    """Somebody is probing exactly the hole this host has open.
+
+    Ranked above everything else on the page when it fires, and it should be:
+    the other rules describe activity, this one describes activity aimed at a
+    specific unpatched thing on a specific machine. That is the difference
+    between being scanned and being targeted.
+    """
+    from sentinel.predict import exposure
+
+    rows = await exposure.recent(db, hours=24, limit=5)
+    if not rows:
+        return []
+
+    kev = [r for r in rows if r.get("kev")]
+    lead = rows[0]
+    cve = lead.get("cve") or "vulnerabilitatea"
+    actors = len({r["actor_key"] for r in rows})
+
+    return [Insight(
+        level="critical" if kev else "warning",
+        title=(f"{actors} adres{'e' if actors > 1 else 'ă'} sondează exact ce nu e "
+               f"patch-uit aici"),
+        detail=(f"{lead['actor_key']} a cerut o cale care corespunde cu {cve} "
+                f"({lead.get('package') or 'necunoscut'}), deschisă pe "
+                f"{lead.get('asset_name') or 'această gazdă'}"
+                + (" — și e în lista CISA de exploatate activ." if kev else ".")
+                + " O scanare de masă atinge tot; asta atinge fix gaura ta."),
+        action=(f"Patch acum: /vuln pentru detalii, sau blochează sursa: "
+                f"/block {lead['actor_key']} 24h"),
+        evidence={"potriviri": [
+            f"{r['actor_key']} → {r.get('cve') or r.get('package')} "
+            f"({r['match_reason']}, {float(r['confidence']):.0%})"
+            for r in rows]},
+    )]
+
+
 async def _concentrated_asn_insight(db: Database) -> list[Insight]:
     """Many events from very few addresses inside one network operator. That is
     rented attack infrastructure, not a spread of compromised home machines —

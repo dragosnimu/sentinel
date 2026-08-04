@@ -43,6 +43,11 @@ ProtectClock=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
+
+# Creating a user namespace is a standard step in turning a code-execution bug
+# into a privilege escalation. None of these services has any use for one.
+RestrictNamespaces=yes
+RestrictRealtime=true
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources @mount @obsolete

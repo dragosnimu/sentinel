@@ -181,3 +181,104 @@ sudo sentinel config-check -v
 sudo nft list table inet sentinel
 systemctl status 'sentinel-*'
 ```
+
+---
+
+## 8. Autoverificarea — „chiar funcționează?"
+
+Întrebarea la care `systemctl status` nu răspunde. A răspuns „activ" în timpul
+fiecărei pene reale pe care a avut-o instalarea asta: o zi cu tabela nftables
+inexistentă, 21 de ore cu cititorul journald înghețat. Procesele rulau. Nu
+făceau nimic.
+
+De aceea fiecare verificare întreabă dacă o funcție **își produce efectul**, nu
+dacă procesul ei există.
+
+```
+/selfcheck                    din Telegram, starea completă
+sentinel selfcheck --print    pe server, cu cod de ieșire 0/1/2
+```
+
+Rulează automat la 5 minute și la 90 de secunde după boot. Alertează pe Telegram
+**la schimbare**: o dată când se strică, o dată când revine, și o reamintire la
+4 ore cât timp rămâne stricat. Alertele astea ignoră orele de liniște.
+
+### Ce verifică, și de ce fiecare
+
+| Grup | Ce dovedește |
+|---|---|
+| `unit:*` | Procesul există. Cea mai slabă dovadă din listă, și e prima doar fiindcă e cea așteptată |
+| `ingest:*` | Fiecare colector a scris un rând recent. **Asta prinde orbirea** |
+| `detect:cursor` | Detectorul consumă ce scriu colectorii. Ingestia într-o tabelă pe care n-o citește nimeni e o imitație convingătoare de funcționare |
+| `nft:table`, `nft:count` | Kernelul chiar are tabela, iar baza spune același lucru ca el |
+| `nft:allowlist` | Adresa ta de administrare e încă acolo |
+| `executor:socket` | Singura componentă privilegiată răspunde |
+| `code:current` | Serviciile rulează codul instalat, nu pe cel dinaintea ultimului deploy |
+| `alert:telegram` | Canalul care duce toate celelalte alerte chiar livrează |
+| `db:*`, `res:*` | Fundațiile: bază accesibilă, schemă la zi, disc și memorie |
+
+### O sursă tăcută nu e mereu un defect
+
+O gazdă unde nu s-a întâmplat nimic arată identic cu una unde nimeni nu se mai
+uită. Discriminarea: un colector care a amuțit **în timp ce vecinii lui scriu**
+e stricat. Toți tăcuți deodată e o noapte liniștită, raportată o singură dată.
+
+Fără regula asta ai fi primit șase alerte pentru un singur defect, și ai fi
+oprit canalul într-o săptămână.
+
+### Nu repară nimic
+
+Deliberat. O autoverificare care repară ce găsește e una ale cărei descoperiri
+nu mai sunt citite, iar un restart automat de daemon de securitate transformă un
+defect vizibil într-unul intermitent. Îți spune ce s-a stricat și ce comandă
+rezolvă; decizia rămâne a ta.
+
+Singura excepție e la celălalt capăt: dacă **botul însuși** e căzut, mesajul nu
+se pune în coada lui, ci se trimite direct. Un mesaj despre un bot mort, pus în
+coada acelui bot, e un mesaj pe care nu-l citește nimeni.
+
+---
+
+## 9. După o repornire
+
+Blocările nu se persistă — asta e intenționat, și e cea mai ieftină protecție
+împotriva blocării propriei adrese. Ce se întâmplă automat:
+
+1. **Executorul recreează tabela** la pornire, cu allowlistul, înainte să
+   accepte vreo comandă. Allowlistul se persistă tocmai fiindcă o tabelă cu
+   reguli de drop și fără el e felul în care îți dai singur firewall.
+2. **`sentinel-reconcile` corectează evidența.** Kernelul e adevărul despre cine
+   e blocat; după o repornire, adevărul e „nimeni". Blocările din bază care nu
+   mai există în kernel sunt marcate ca eliberate, cu motiv scris.
+
+Nimic nu se reblochează singur. Dacă atacatorii sunt încă activi, detectorul îi
+prinde din nou în câteva minute.
+
+```bash
+sentinel reconcile              # manual, oricând
+sentinel reconcile --reapply    # inversul: reaplică blocările din bază
+```
+
+`--reapply` există pentru cine nu vrea ca un reboot de la 4 dimineața să
+elibereze toți atacatorii. Nu e implicit, fiindcă pornirea lui elimină tăcut
+exact ieșirea de siguranță pe care se bazează restul designului.
+
+---
+
+## 10. Cât de expuse sunt serviciile
+
+```bash
+systemd-analyze security 'sentinel-*'
+```
+
+Zece din douăsprezece unități sunt sub 3.0. Cele două care nu sunt, rulează ca
+root, și niciun set de directive nu duce un serviciu root sub 3.0 — `User=root`
+singur costă 0.4, iar familia „rulează ca root" domină scorul.
+
+| Unitate | Scor | De ce |
+|---|---|---|
+| `sentinel-executor` | 4.8 | Singura componentă privilegiată. Rulează managerul de pachete în numele tău, deci `NoNewPrivileges` și `PrivateDevices` ar arăta mai bine și ar strica patch-ingul exact când ai nevoie de el |
+| `sentinel-watchdog` | 6.1 | Deadman-ul anti-lockout. Trebuie să funcționeze **precis când tot restul a eșuat**, deci nu depinde de nimic și rămâne minimal. Fiecare directivă adăugată acolo e încă un fel în care ar putea să nu pornească — singurul eșec fără recuperare |
+
+Restul (web, detect, telegram, ingest, ai, scan, health, maintenance, selfcheck,
+reconcile) sunt între **1.1 și 2.6**.
