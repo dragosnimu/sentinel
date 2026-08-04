@@ -74,8 +74,21 @@ clear_step() { rm -f "${STATE_MARKERS}/$1"; }
 #
 # Everything listed here is idempotent by construction: the package copy wipes
 # and rewrites, migrations are forward-only and skip what is applied, unit files
-# are overwritten, and the service start is a restart behind a health gate.
-ALWAYS_STEPS="package claude_workspace migrate systemd start_services"
+# are overwritten, the nginx step validates before and after and removes its own
+# files if it broke anything, certificate acquisition short-circuits when a
+# certificate already exists, and the service start is a restart behind a health
+# gate.
+#
+# The rule for this list: does the step carry CONTENT FROM THE REPO that changes
+# between releases? An nginx rate-limit fix that never reaches the server is as
+# useless as a code fix that never reaches it — that happened, and the operator
+# kept getting 429s from the config the installer had declined to update.
+#
+# `nftables` is deliberately absent. Re-creating the table would empty the
+# named sets, which means silently unblocking every attacker currently blocked.
+# Refreshing config is worth a re-run; dropping a live blocklist is not.
+ALWAYS_STEPS="package claude_workspace configs migrate systemd start_services \
+nginx nginx_shared auxiliary"
 
 step_is_always() {
     case " ${ALWAYS_STEPS} " in *" $1 "*) return 0 ;; *) return 1 ;; esac

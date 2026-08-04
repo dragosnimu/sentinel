@@ -30,7 +30,21 @@
 #    directory that is not exclusively ours.
 
 # Namespaced so they cannot collide with zones the operator already defined.
-limit_req_zone $binary_remote_addr zone=sentinel_login:10m rate=5r/m;
+#
+# The login limiter. One clean login is FOUR requests — GET /login, POST /login,
+# GET /totp, POST /totp — so a limit tight enough to matter against guessing is
+# also tight enough to lock out an operator who mistypes a TOTP code once. That
+# shipped at 5r/m and answered a legitimate login with 429.
+#
+# Limiting only POSTs would be better, and the documented way to do it is a
+# `map` returning an empty key for other methods. Tried on nginx 1.20.1 and the
+# GETs were still counted, so it is not used here: a rate limit whose behaviour
+# I cannot demonstrate is not one to put in front of a login page.
+#
+# So: loose enough never to touch a human, tight enough to stop hammering. The
+# real brute-force defence is elsewhere and stays there — Argon2 on every
+# attempt, and a per-account lockout after 5 failures.
+limit_req_zone $binary_remote_addr zone=sentinel_login:10m rate=30r/m;
 limit_req_zone $binary_remote_addr zone=sentinel_api:10m   rate=60r/m;
 limit_req_zone $binary_remote_addr zone=sentinel_all:10m   rate=300r/m;
 limit_conn_zone $binary_remote_addr zone=sentinel_conn:10m;
@@ -133,14 +147,15 @@ server {
     error_log  /var/log/nginx/sentinel-error.log warn;
 
     location = /login {
-        limit_req zone=sentinel_login burst=3 nodelay;
+        limit_req zone=sentinel_login burst=10 nodelay;
         limit_req_status 429;
         include /etc/nginx/conf.d/sentinel-proxy-params.conf;
         proxy_pass http://sentinel_app;
     }
 
     location = /totp {
-        limit_req zone=sentinel_login burst=3 nodelay;
+        limit_req zone=sentinel_login burst=10 nodelay;
+        limit_req_status 429;
         include /etc/nginx/conf.d/sentinel-proxy-params.conf;
         proxy_pass http://sentinel_app;
     }

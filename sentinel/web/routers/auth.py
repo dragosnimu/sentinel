@@ -53,6 +53,14 @@ _ERROR_MESSAGES = {
     "csrf": "Sesiunea a expirat. Încearcă din nou.",
     "expired": "Sesiunea a expirat.",
     "logout": "Ai fost deconectat.",
+    # The one failure a retry can never fix. Saying "expired" here sent the
+    # operator round the login loop until nginx rate-limited them with a 429,
+    # and nothing on screen ever mentioned the real cause.
+    "totp_key": (
+        "Secretul TOTP stocat nu mai poate fi decriptat — cheia de sesiune a "
+        "serverului s-a schimbat. Reînrolează pe server: "
+        "sudo sentinel web --enroll-totp --username <utilizator>"
+    ),
 }
 
 
@@ -215,8 +223,13 @@ async def totp_submit(
             db, request.cookies.get(COOKIE_NAME) or ""
         )
         if still_valid is None:
+            # An undecryptable secret revokes the session too, so it arrives
+            # here looking exactly like an ordinary expiry. It is not: no code
+            # the operator types will ever work, and only re-enrolment fixes it.
+            reason = ("totp_key" if result.outcome == "totp_undecryptable"
+                      else "expired")
             response = RedirectResponse(
-                "/login?e=expired", status_code=status.HTTP_303_SEE_OTHER
+                f"/login?e={reason}", status_code=status.HTTP_303_SEE_OTHER
             )
             response.delete_cookie(COOKIE_NAME, path="/")
             return response

@@ -154,10 +154,20 @@ def test_the_upgrade_steps_are_not_marker_gated():
     completion marker, that re-run skipped the package copy AND the migrations,
     printed success, and changed nothing on the host."""
     assert "ALWAYS_STEPS=" in COMMON
-    for step in ("package", "migrate"):
-        assert step in COMMON.split("ALWAYS_STEPS=", 1)[1].split("\n", 1)[0], \
-            f"step {step} would be skipped on an upgrade"
+    always = COMMON.split("ALWAYS_STEPS=", 1)[1].split('"', 2)[1]
+    # Every step that carries content from the repo. An nginx fix that never
+    # reaches the server is as useless as a code fix that never reaches it.
+    for step in ("package", "migrate", "systemd", "nginx", "nginx_shared", "configs"):
+        assert step in always, f"step {step} would be skipped on an upgrade"
     assert "! step_is_always" in COMMON
+
+
+def test_nftables_is_never_re_run_automatically():
+    """Re-creating the table empties the named sets, which silently unblocks
+    every attacker currently blocked. Refreshing config is worth a re-run;
+    dropping a live blocklist is not."""
+    always = COMMON.split("ALWAYS_STEPS=", 1)[1].split('"', 2)[1]
+    assert "nftables" not in always
 
 
 def test_documented_upgrade_command_matches_the_installer():

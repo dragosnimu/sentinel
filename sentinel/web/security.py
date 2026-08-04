@@ -96,7 +96,8 @@ IP_FAILURE_WINDOW_MINUTES = 15
 IP_FAILURE_LIMIT = 20
 
 LoginOutcome = Literal[
-    "ok", "needs_totp", "bad_credentials", "locked", "disabled", "ip_throttled", "no_totp_enrolled"
+    "ok", "needs_totp", "bad_credentials", "locked", "disabled", "ip_throttled",
+    "no_totp_enrolled", "totp_undecryptable",
 ]
 
 
@@ -393,10 +394,15 @@ class Authenticator:
 
         secret = self.cipher.decrypt(user.totp_secret) if user.totp_secret else None
         if secret is None:
+            # Not a wrong code and not an expired session: the stored secret
+            # cannot be decrypted at all, which means SENTINEL_SESSION_SECRET
+            # changed under it. No retry will ever succeed, so the operator has
+            # to be told that rather than left guessing — `totp_undecryptable`
+            # is what carries that fact past the session revocation below.
             await sessions.revoke(self.db, session.id)
             return LoginResult(
-                "bad_credentials",
-                detail_ro="Secretul TOTP nu poate fi citit. Contactează administratorul serverului.",
+                "totp_undecryptable",
+                detail_ro="Secretul TOTP nu poate fi decriptat. Trebuie reînrolat pe server.",
             )
 
         counter = verify_totp_code(secret, code)
