@@ -12,6 +12,7 @@
 #   --dry-run      run preflight only; change nothing
 #   --rollback     undo a previous deployment
 #   --from-step N  resume an interrupted install
+#   --force-step N re-run one step even though it is marked done
 #   --purge        with --rollback, also drop the database
 #
 # This script is deliberately thin. All the real logic lives in
@@ -28,7 +29,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SECRETS_FILE="${REPO_ROOT}/secrets/.env.local"
 
 HOST=""; USER=""; KEY=""; DOMAIN=""; EMAIL=""; ADMIN_IP=""
-DRY_RUN=0; ROLLBACK=0; PURGE=0; FROM_STEP=""; ASSUME_YES=0
+DRY_RUN=0; ROLLBACK=0; PURGE=0; FROM_STEP=""; FORCE_STEP=""; ASSUME_YES=0
 SSH_PORT=22
 # The dashboard's public HTTPS port. Not 443 — this host serves something else
 # there. Must also be open in the provider's firewall.
@@ -57,6 +58,11 @@ while [[ $# -gt 0 ]]; do
         --admin-ip)  ADMIN_IP="${2:-}"; shift 2 ;;
         --cert-mode) CERT_MODE="${2:-}"; shift 2 ;;
         --from-step) FROM_STEP="${2:-}"; shift 2 ;;
+        # install.sh has always had this; deploy.sh could not pass it
+        # through, so the only way to re-run one step was to ssh in and run
+        # the installed copy — which fails, because the source tree it needs
+        # only exists inside the transferred tarball.
+        --force-step) FORCE_STEP="${2:-}"; shift 2 ;;
         --dry-run)   DRY_RUN=1; shift ;;
         --rollback)  ROLLBACK=1; shift ;;
         --purge)     PURGE=1; shift ;;
@@ -318,6 +324,7 @@ INSTALL_ARGS=(--nginx-mode "$NGINX_MODE" --web-port "$WEB_PORT" --cert-mode "$CE
 [[ -n "$DOMAIN"    ]] && INSTALL_ARGS+=(--domain "$DOMAIN")
 [[ -n "$EMAIL"     ]] && INSTALL_ARGS+=(--email "$EMAIL")
 [[ -n "$FROM_STEP" ]] && INSTALL_ARGS+=(--from-step "$FROM_STEP")
+[[ -n "$FORCE_STEP" ]] && INSTALL_ARGS+=(--force-step "$FORCE_STEP")
 (( ASSUME_YES )) && INSTALL_ARGS+=(--yes)
 
 if ! ssh "${SSH_OPTS[@]}" "${USER}@${HOST}" \
