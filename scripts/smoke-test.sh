@@ -18,6 +18,8 @@ WEB_PORT=8443
 # dedicated = own listener on WEB_PORT; shared = a vhost on the existing nginx,
 # in which case the URL has no port suffix.
 NGINX_MODE=dedicated
+# Distinge „operatorul a cerut dedicated" de „nimeni nu a spus nimic".
+MODE_GIVEN=0
 PASS=0; FAIL=0; WARN=0
 
 _G=$'\033[32m'; _R=$'\033[31m'; _Y=$'\033[33m'; _B=$'\033[34m'; _0=$'\033[0m'
@@ -36,7 +38,7 @@ while [[ $# -gt 0 ]]; do
         --port)   PORT="${2:-}"; shift 2 ;;
         --domain)   DOMAIN="${2:-}"; shift 2 ;;
         --web-port)   WEB_PORT="${2:-}"; shift 2 ;;
-        --nginx-mode) NGINX_MODE="${2:-}"; shift 2 ;;
+        --nginx-mode) NGINX_MODE="${2:-}"; MODE_GIVEN=1; shift 2 ;;
         --help|-h) sed -n '2,12p' "$0"; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
@@ -57,7 +59,65 @@ SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -p "$PORT")
 [[ -n "$KEY" ]] && SSH_OPTS+=(-i "${KEY/#\~/$HOME}")
 r() { ssh "${SSH_OPTS[@]}" "${USER}@${HOST}" "$@" 2>/dev/null; }
 
+# Numără elementele unui set nftables fără `grep -P`.
+#
+# `grep -P` este o extensie GNU, și acest grep rulează LOCAL — pe Git Bash cu un
+# locale non-UTF-8 refuză să pornească. Rezultatul a fost „allowlist is EMPTY"
+# raportat pe un allowlist populat, adică fix alarma falsă care te învață să nu
+# mai citești raportul.
+#
+# Întoarce "?" când nft nu a răspuns deloc, ca apelantul să poată deosebi „setul
+# e gol" de „nu am putut citi". Confuzia dintre cele două a produs eșecul fals.
+count_set_elements() {
+    local raw; raw="$(r "sudo nft list set inet sentinel $1" || true)"
+    [[ -z "$raw" ]] && { printf '?'; return; }
+    printf '%s' "$raw" | tr -d '\n' | sed -n 's/.*elements = {\([^}]*\)}.*/\1/p' \
+        | tr ',' '\n' | sed 's/[[:space:]]//g' | grep -c . || printf '0'
+}
+
 printf '%sSentinel smoke test — %s%s\n' "$_B" "$HOST" "$_0"
+
+# ---------------------------------------------------------------------------
+# What the server actually has, before checking anything against it.
+#
+# The flags above are what the OPERATOR believes is deployed. sentinel.yaml is
+# what IS deployed. When they disagree, every check below is aimed at the wrong
+# port and reports failures that say nothing about the system — "nginx did not
+# answer on :8443" on a host running shared mode, where nothing was ever meant
+# to listen there.
+#
+# Reading the deployed values also makes this script answer the question you
+# need before a re-deploy: install.sh does not persist nginx_mode, so a re-run
+# without --nginx-mode silently reverts to `dedicated` and the nginx step
+# rewrites the vhost of a working dashboard.
+sect "Configurația instalată"
+
+deployed_mode="$(r "sudo grep -E '^[[:space:]]*nginx_mode:' /etc/sentinel/sentinel.yaml | head -1 | awk '{print \$2}' | tr -d \\\"\\'" || true)"
+deployed_domain="$(r "sudo grep -E '^[[:space:]]*domain:' /etc/sentinel/sentinel.yaml | head -1 | awk '{print \$2}' | tr -d \\\"\\'" || true)"
+# Doar `public_port`. Un `port:` generic prinde întâi portul PostgreSQL, care e
+# tot în fișier — raporta port=5432 pentru dashboard.
+deployed_port="$(r "sudo grep -E '^[[:space:]]*public_port:' /etc/sentinel/sentinel.yaml | head -1 | awk '{print \$2}'" || true)"
+
+if [[ -n "$deployed_mode" ]]; then
+    pass "nginx_mode=${deployed_mode} domain=${deployed_domain:-<none>} port=${deployed_port:-?}"
+    # Doar când operatorul a afirmat EXPLICIT altceva. Comparând cu valoarea
+    # implicită, avertismentul apărea la fiecare rulare fără flag — zgomot care
+    # ar face un dezacord real să treacă neobservat.
+    if (( MODE_GIVEN )) && [[ "$NGINX_MODE" != "$deployed_mode" ]]; then
+        warn "ai dat --nginx-mode ${NGINX_MODE}, dar serverul are ${deployed_mode} — folosesc ce e pe server"
+    fi
+    NGINX_MODE="$deployed_mode"
+    [[ -z "$DOMAIN" && -n "$deployed_domain" ]] && DOMAIN="$deployed_domain"
+    if [[ "$NGINX_MODE" == "shared" ]]; then
+        WEB_PORT=443; URL_SUFFIX=""
+    else
+        [[ -n "$deployed_port" ]] && WEB_PORT="$deployed_port"
+        URL_SUFFIX=":${WEB_PORT}"
+    fi
+    printf '    verific dashboard-ul la https://%s%s\n' "${DOMAIN:-<host>}" "$URL_SUFFIX"
+else
+    warn "nu am putut citi /etc/sentinel/sentinel.yaml — verific cu valorile date pe linia de comandă"
+fi
 
 # ---------------------------------------------------------------------------
 sect "Servicii"
@@ -113,12 +173,16 @@ if r "sudo nft list table inet sentinel" | grep -q 'table inet sentinel'; then
 policy here means a bug or a manual edit, and it CAN lock you out."
     fi
 
-    allow_n="$(r "sudo nft list set inet sentinel allowlist_v4" | grep -oP 'elements = \{\K[^}]*' | tr ',' '\n' | grep -c . || echo 0)"
-    (( allow_n > 0 )) && pass "allowlist has ${allow_n} entries" \
-                      || fail "allowlist is EMPTY — nothing protects you from a bad block"
+    allow_n="$(count_set_elements allowlist_v4)"
+    if [[ "$allow_n" == "?" ]]; then
+        warn "nu am putut citi allowlist_v4 — stare necunoscută, nu o raportez ca goală"
+    elif (( allow_n > 0 )); then
+        pass "allowlist has ${allow_n} entries"
+    else
+        fail "allowlist is EMPTY — nothing protects you from a bad block"
+    fi
 
-    block_n="$(r "sudo nft list set inet sentinel blocklist_v4" | grep -oP 'elements = \{\K[^}]*' | tr ',' '\n' | grep -c . || echo 0)"
-    printf '    blocklist: %s entries\n' "$block_n"
+    printf '    blocklist: %s entries\n' "$(count_set_elements blocklist_v4)"
 
     # Blocking Sentinel's own alerting or analysis endpoints would be silent:
     # no error, no alert, just a system that has stopped telling anyone anything.
@@ -137,17 +201,17 @@ fi
 sect "Dashboard"
 
 code="$(r "curl -sk -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:8787/healthz" || echo 000)"
-[[ "$code" =~ ^(200|401|302|503)$ ]] && pass "app answers on 127.0.0.1:8787 (HTTP ${code})" \
+[[ "$code" =~ ^(200|301|302|303|307|308|401|503)$ ]] && pass "app answers on 127.0.0.1:8787 (HTTP ${code})" \
                                      || fail "app did not answer on 8787 (got ${code})"
 
 # nginx in front of it, still over loopback. Separating this from the external
 # check below means a failure names the layer that is wrong, rather than just
 # saying "unreachable".
 code="$(r "curl -sk -o /dev/null -w '%{http_code}' --max-time 10 https://127.0.0.1:${WEB_PORT}/healthz" || echo 000)"
-[[ "$code" =~ ^(200|401|302|503)$ ]] && pass "nginx serving on :${WEB_PORT} (HTTP ${code})" \
+[[ "$code" =~ ^(200|301|302|303|307|308|401|503)$ ]] && pass "nginx serving on :${WEB_PORT} (HTTP ${code})" \
                                      || fail "nginx did not answer on :${WEB_PORT} (got ${code})"
 
-if r "nginx -t"; then pass "nginx config valid"; else fail "nginx -t failed"; fi
+if r "sudo nginx -t"; then pass "nginx config valid"; else fail "nginx -t failed"; fi
 
 if [[ -n "$DOMAIN" ]]; then
     code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://${DOMAIN}${URL_SUFFIX}/healthz" || echo 000)"
@@ -217,7 +281,7 @@ r "sudo /opt/sentinel/bin/sentinel config-check" >/dev/null 2>&1 \
     && pass "config-check passed" \
     || warn "config-check reported problems — run it on the server for detail"
 
-perms="$(r "stat -c '%a %U:%G' /etc/sentinel/secrets.env" || echo '')"
+perms="$(r "sudo stat -c '%a %U:%G' /etc/sentinel/secrets.env" || echo '')"
 if [[ "$perms" == "640 root:sentinel" ]]; then
     pass "secrets.env is 640 root:sentinel"
 else
