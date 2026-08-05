@@ -141,10 +141,46 @@ SOURCE_MAX_SILENCE_MIN: dict[str, int] = {
     "auditd": 60,      # cron, logins, privilege use
     "nginx": 180,      # a low-traffic site can genuinely be quiet
     "sshd": 180,       # ditto, though in practice never is
-    "sudo": 24 * 60,   # only when someone works on the box
-    "su": 7 * 24 * 60,  # rare by design; effectively never alerts
 }
 DEFAULT_MAX_SILENCE_MIN = 180
+
+# Sources whose events exist only when a HUMAN acts. Silence here is not
+# evidence of anything: a server nobody logged into for a day produces zero
+# sudo events, and that is the healthy state.
+#
+# These used to carry thresholds (sudo 24h, su 7d) and the 24h one fired on the
+# first quiet day, announcing "SENTINEL NU FUNCȚIONEAZĂ COMPLET" and advising a
+# restart of a service that was working correctly. That is worse than no check:
+# an alert that cries wolf on a normal weekend trains the operator to dismiss
+# the channel that carries the real ones.
+#
+# The `others_are_live` discriminator below cannot rescue them. It answers "is
+# the host quiet, or is this collector broken?" by comparing against neighbours
+# — which works for traffic-driven sources, because an exposed host is scanned
+# continuously and a silent suricata beside a busy nginx is a genuine fault. It
+# says nothing about whether a person happened to type `sudo`.
+#
+# They are not left unmonitored. sshd, sudo and su come from the SAME journald
+# reader — one `_COMM` match set, one loop, classified into sources after the
+# fact (see JOURNALD_COMMS in services/ingest_service.py). A broken reader takes
+# all three down together, and sshd on an internet-facing host is never quiet.
+# So the sshd row above IS the liveness proof for sudo and su.
+#
+# What this does not catch, stated rather than papered over: a parse-level
+# regression affecting only sudo — a distro changing the sudo log format so the
+# regex in collectors/system.py stops matching — would leave sudo permanently
+# empty while sshd kept flowing. Catching that needs the reader to report what
+# it saw and discarded, which it does not currently track.
+HUMAN_DRIVEN = frozenset({"sudo", "su"})
+
+
+def _ago(minutes: float) -> str:
+    m = int(minutes)
+    if m < 60:
+        return f"{m} min"
+    if m < 24 * 60:
+        return f"{m // 60}h {m % 60}m"
+    return f"{m // (24 * 60)}z {(m % (24 * 60)) // 60}h"
 
 
 async def check_ingest_sources(db: Database, cfg: Config) -> list[CheckResult]:
@@ -177,11 +213,20 @@ async def check_ingest_sources(db: Database, cfg: Config) -> list[CheckResult]:
 
     results: list[CheckResult] = []
     for source, minutes in sorted(ages.items()):
+        if source in HUMAN_DRIVEN:
+            # Reported, never alerted on. The operator still sees the source and
+            # when it last spoke; what changes is that quiet is not a fault.
+            results.append(CheckResult(
+                f"ingest:{source}", f"Colector „{source}”", "ok",
+                detail=(f"fără activitate de {_ago(minutes)} — normal, "
+                        f"evenimentele apar doar când cineva lucrează pe server"),
+                facts={"minutes_silent": int(minutes), "human_driven": True}))
+            continue
         limit = SOURCE_MAX_SILENCE_MIN.get(source, DEFAULT_MAX_SILENCE_MIN)
         if minutes <= limit:
             results.append(CheckResult(
                 f"ingest:{source}", f"Colector „{source}”", "ok",
-                detail=f"ultimul eveniment acum {int(minutes)} min"))
+                detail=f"ultimul eveniment acum {_ago(minutes)}"))
             continue
         if not others_are_live:
             # Everything is quiet together. Report it once, at the top, rather
@@ -189,7 +234,7 @@ async def check_ingest_sources(db: Database, cfg: Config) -> list[CheckResult]:
             continue
         results.append(CheckResult(
             f"ingest:{source}", f"Colector „{source}” a amuțit", "down",
-            detail=(f"niciun eveniment de {int(minutes // 60)}h {int(minutes % 60)}m, "
+            detail=(f"niciun eveniment de {_ago(minutes)}, "
                     f"dar alte surse scriu în continuare"),
             action="systemctl restart sentinel-ingest",
             facts={"minutes_silent": int(minutes), "limit_min": limit}))

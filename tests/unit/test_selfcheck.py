@@ -93,13 +93,42 @@ def test_a_quiet_night_is_not_an_outage():
     assert any(r.key == "ingest:all" and r.status == "down" for r in results)
 
 
-def test_a_rarely_used_source_is_given_room():
-    """`su` fires when a human uses it and never otherwise. Alerting on its
-    silence would mean an alert every day forever."""
-    db = _DB(rows=[_source("su", 60 * 24 * 3), _source("suricata", 1)])
-    su = next(r for r in run(checks.check_ingest_sources(db, _cfg()))
-              if r.key == "ingest:su")
-    assert su.status == "ok"
+def test_a_human_driven_source_is_never_an_alert():
+    """`sudo` and `su` produce events only when a person acts. A server nobody
+    logged into for a day emits zero sudo events, and that is the healthy state.
+
+    This shipped with a 24h threshold and fired on the first quiet day —
+    "SENTINEL NU FUNCȚIONEAZĂ COMPLET", advising a restart of a service that was
+    working. No duration may reproduce that, so the test uses a year."""
+    for name in ("sudo", "su"):
+        db = _DB(rows=[_source(name, 60 * 24 * 365), _source("suricata", 1),
+                       _source("nginx", 2)])
+        r = next(x for x in run(checks.check_ingest_sources(db, _cfg()))
+                 if x.key == f"ingest:{name}")
+        assert r.status == "ok", f"{name} după un an de liniște: {r.detail}"
+        assert not r.bad
+        # Still visible to the operator — silenced, not hidden.
+        assert "normal" in r.detail
+
+
+def test_human_driven_sources_carry_no_threshold():
+    """Belt and braces: the two sets must not overlap. A threshold left behind
+    in SOURCE_MAX_SILENCE_MIN would be dead code that looks authoritative, and
+    the next person to read it would reinstate the bug."""
+    assert not (checks.HUMAN_DRIVEN & set(checks.SOURCE_MAX_SILENCE_MIN))
+
+
+def test_the_shared_journald_reader_still_has_a_watched_source():
+    """sudo and su are exempt because sshd proves the reader is alive — they all
+    come from ONE reader with one _COMM match set. If sshd ever stopped being
+    watched, or stopped sharing that reader, the exemption would silently become
+    a blind spot."""
+    from sentinel.services.ingest_service import JOURNALD_COMMS
+    watched = set(checks.SOURCE_MAX_SILENCE_MIN) - checks.HUMAN_DRIVEN
+    assert "sshd" in watched, "sshd nu mai e supravegheat; sudo/su rămân neacoperite"
+    for comm in ("sudo", "su"):
+        assert comm in JOURNALD_COMMS
+    assert "sshd" in JOURNALD_COMMS, "sshd nu mai vine din același cititor"
 
 
 def test_no_events_at_all_is_reported():
