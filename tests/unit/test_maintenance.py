@@ -166,6 +166,89 @@ def test_rollup_trim_reports_the_real_count():
     assert facts["trimmed"]["event_rollup_1h"] == 42
 
 
+# --- golirea partiției DEFAULT -------------------------------------------
+def test_default_drain_is_capped_and_says_what_is_left():
+    """Rândurile blocate în DEFAULT sunt invizibile pentru retenție, iar mutarea
+    unei zile e o tranzacție care nu se poate întrerupe. Plafonat pe rulare — dar
+    o golire plafonată care tace arată identic cu una completă."""
+    from datetime import date as _d
+    days = [{"day": _d(2026, 7, d), "rows_in_default": 1000 * d} for d in range(20, 30)]
+
+    class DB(_DB):
+        def __init__(self):
+            super().__init__()
+            self.created = []
+
+        async def fetch(self, sql, *a):
+            return days if a[0] == "raw_events" else []
+
+        async def fetchval(self, sql, *a):
+            self.created.append(a)
+            return "part"
+
+    db = DB()
+    detail, facts = run(ms.drain_default(db))
+    assert len(db.created) == ms.MAX_DRAIN_DAYS
+    assert facts["days_remaining"] == len(days) - ms.MAX_DRAIN_DAYS
+    assert "rămase" in detail
+
+
+def test_default_drain_is_quiet_when_nothing_is_stranded():
+    detail, facts = run(ms.drain_default(_DB()))
+    assert facts["days_remaining"] == 0
+    assert facts["moved"] == {}
+
+
+def test_the_drain_runs_before_retention():
+    """Retenția nu vede rândurile din DEFAULT. Dacă ar rula prima, ziua abia
+    mutată ar aștepta încă o oră ca să fie luată în calcul — și pe un disc care
+    se umple, ora aia contează."""
+    order = [c for c in ms.run.__code__.co_consts if isinstance(c, str)]
+    assert order.index("drain_default") < order.index("retention_partitions")
+
+
+# --- bug-urile SQL prinse la prima rulare reală ---------------------------
+def test_the_rollup_functions_do_not_shadow_a_column_name():
+    """`DECLARE n integer` se ciocnea cu coloana `n` din event_rollup_1m, iar
+    PL/pgSQL refuza `SET n = EXCLUDED.n` ca ambiguu. Nu a fost prins niciodată
+    fiindcă nimic nu apela funcția: SQL care se aplică fără eroare nu e SQL care
+    funcționează."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2] / "sentinel" / "db" / "migrations"
+    sql = (root / "0017_partition_fixes.sql").read_text(encoding="utf-8")
+    assert "DECLARE\n    rows_written integer;" in sql
+    # Coloanele tabelei nu au voie să apară ca nume de variabilă declarată.
+    for col in ("n", "uniq_src", "bytes_in", "bytes_out", "bucket"):
+        assert f"    {col} integer;" not in sql, f"variabila `{col}` umbrește o coloană"
+
+
+def test_partition_creation_handles_rows_already_in_default():
+    """Rândurile ajung în DEFAULT când partiția zilei lipsește, iar apoi Postgres
+    refuză să creeze acea partiție. Blocajul se auto-întreține: DEFAULT crește și
+    nu e atins de retenție."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2] / "sentinel" / "db" / "migrations"
+    sql = (root / "0017_partition_fixes.sql").read_text(encoding="utf-8")
+    assert "sentinel_create_partition" in sql
+    assert "ATTACH PARTITION" in sql, "fără ATTACH, rândurile blocate rămân blocate"
+    assert "DELETE FROM %I WHERE" in sql, "rândurile trebuie mutate, nu doar numărate"
+    # CHECK-ul dinainte de ATTACH e ce face validarea instantanee în loc de o
+    # scanare completă a tabelei.
+    assert "ADD CONSTRAINT" in sql and "CHECK" in sql
+
+
+def test_the_partition_key_is_read_from_the_catalog():
+    """Toate trei tabelele partiționează pe `ts` azi. Scris în cod, ar minți
+    tăcut în ziua în care una nu o mai face."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[2] / "sentinel" / "db" / "migrations"
+    sql = (root / "0017_partition_fixes.sql").read_text(encoding="utf-8")
+    assert "pg_partitioned_table" in sql
+    # int2vector nu se indexează ca un array obișnuit; trecerea prin text scoate
+    # întrebarea din discuție.
+    assert "string_to_array(pt.partattrs::text" in sql
+
+
 # --- garda de disc --------------------------------------------------------
 def test_disk_guard_is_quiet_above_the_threshold(monkeypatch):
     monkeypatch.setattr(ms.shutil, "disk_usage",

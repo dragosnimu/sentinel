@@ -63,6 +63,11 @@ PARTITIONS_AHEAD = 3
 # rămâne mult sub TimeoutStartSec.
 MAX_CATCHUP_HOURS = 48
 
+# Zile golite din DEFAULT pe rulare. Mutarea unei zile e o singură
+# tranzacție care nu se poate întrerupe; la un timer orar, șase rulări
+# scurte bat una care lovește TimeoutStartSec și lasă treaba pe jumătate.
+MAX_DRAIN_DAYS = 3
+
 # Ștergerile din tabelele neparticionate se fac în tranșe. Un DELETE care atinge
 # milioane de rânduri ține un lock lung pe o bază care deservește în paralel
 # detecția — iar detecția care așteaptă un lock e detecție oprită.
@@ -122,6 +127,50 @@ async def ensure_partitions(db: Database) -> tuple[str, dict[str, Any]]:
     n = int(created or 0)
     return (f"{n} partiții create în avans" if n else "partițiile existau deja",
             {"created": n, "ahead_days": PARTITIONS_AHEAD})
+
+
+async def drain_default(db: Database) -> tuple[str, dict[str, Any]]:
+    """Mută în partiții proprii rândurile rămase blocate în DEFAULT.
+
+    Rândurile ajung acolo când partiția zilei lipsea — adică exact perioada în
+    care mentenanța nu rula. Sunt invizibile pentru retenție: DEFAULT nu se
+    elimină niciodată, fiindcă a-l arunca ar șterge fix datele sosite cât ceva
+    era stricat.
+
+    Plafonat la câteva zile pe rulare. Mutarea unei zile e o singură tranzacție
+    care nu se poate întrerupe, iar timerul e orar: mai bine șase rulări scurte
+    decât una care lovește TimeoutStartSec și lasă treaba pe jumătate.
+    """
+    moved: dict[str, dict[str, int]] = {}
+    remaining_total = 0
+    for parent, _ in PARTITIONED:
+        rows = await db.fetch("SELECT * FROM sentinel_default_partition_days($1)", parent)
+        if not rows:
+            continue
+        done: dict[str, int] = {}
+        for r in rows[:MAX_DRAIN_DAYS]:
+            day, count = r["day"], int(r["rows_in_default"] or 0)
+            await db.fetchval("SELECT sentinel_create_partition($1, $2)", parent, day)
+            done[day.isoformat()] = count
+            log.info("default partition drained",
+                     extra={"parent": parent, "day": day.isoformat(), "rows": count})
+        left = len(rows) - len(done)
+        remaining_total += left
+        if done:
+            moved[parent] = done
+        if left:
+            # Spus, nu presupus. O golire plafonată care tace arată identic cu
+            # una completă, iar diferența e că restul rândurilor rămân în afara
+            # retenției până la o rulare care nu vine niciodată dacă nimeni nu
+            # știe că mai e ceva de făcut.
+            log.warning("default partition drain capped",
+                        extra={"parent": parent, "days_left": left})
+    n = sum(len(v) for v in moved.values())
+    if not n:
+        return "nimic blocat în DEFAULT", {"moved": {}, "days_remaining": 0}
+    return (f"{n} zile mutate din DEFAULT" +
+            (f", {remaining_total} rămase" if remaining_total else ""),
+            {"moved": moved, "days_remaining": remaining_total})
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +392,7 @@ async def run(db: Database, cfg: Config) -> Report:
 
     # Ordinea contează — vezi antetul modulului.
     await _step(rep, "partitions", ensure_partitions(db))
+    await _step(rep, "drain_default", drain_default(db))
     await _step(rep, "rollup_events", rollup_events(db))
     await _step(rep, "rollup_availability", rollup_availability(db))
     await _step(rep, "retention_partitions", drop_partitions(db, cfg))
