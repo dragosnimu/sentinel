@@ -4,10 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>Sentinel — agent de securitate configurat pentru serverul tău | CRYPTOITDATA</title>
-<meta name="description" content="Sentinel se instalează pe serverul tău și se configurează după ce rulează efectiv acolo: colectorii, regulile, pragurile și lista de excepții sunt ale tale. Livrat, calibrat și predat de CRYPTOITDATA.">
+<title>Sentinel — analiză cu AI în timp real pentru serverul tău | CRYPTOITDATA</title>
+<meta name="description" content="Detecție deterministă non-stop plus analiză cu AI în timp real: triaj în sub două minute, verdict în română, procedură de patch redactată automat. Configurat pentru serverul tău, livrat și calibrat de CRYPTOITDATA.">
 
-<meta property="og:title" content="Sentinel — apărare continuă, configurată pentru infrastructura ta">
+<meta property="og:title" content="Sentinel — analiză cu AI în timp real, configurată pentru serverul tău">
 <meta property="og:description" content="43 de zile ca să repari. 5 zile până la exploatare în masă. Un agent care închide diferența — instalat și calibrat pentru serverul tău.">
 <meta property="og:type" content="product">
 <meta property="og:locale" content="ro_RO">
@@ -187,6 +187,57 @@ section{padding:var(--pad) 0}
   border-bottom:1px solid rgb(38 198 181/.35);padding-bottom:2px;transition:border-color .18s}
 .source-link:hover{border-bottom-color:var(--teal)}
 
+/* --------------------------------------------------------------- stratul AI
+   Cele două verdicte stau UNUL LÂNGĂ ALTUL, cu lățime egală, pentru că exact
+   asta face produsul: opinia modelului se adaugă lângă cea deterministă,
+   niciodată peste ea. Dacă modelul ar fi pus mai mare sau mai sus, layout-ul ar
+   spune altceva decât codul. */
+.ai-demo{display:grid;gap:24px;margin-top:2.8rem}
+@media(min-width:860px){.ai-demo{grid-template-columns:1fr 1fr}}
+.ai-head{display:flex;align-items:center;gap:.6rem;margin-bottom:.9rem;
+  font:600 .92rem/1.4 var(--body)}
+.ai-head em{font-style:normal;color:var(--muted);font-weight:400;font-size:.88rem}
+.tick{width:9px;height:9px;border-radius:50%;flex:none}
+.t-det{background:var(--blue)} .t-ai{background:var(--teal)}
+.ai-card{background:#04060F;border:1px solid rgb(255 255 255/.1);border-radius:16px;
+  padding:20px 22px;min-height:186px;font:400 .86rem/1.7 var(--mono);color:#CBD5E1}
+.ai-card-model{border-color:rgb(38 198 181/.32);background:
+  linear-gradient(#04060F,#04060F) padding-box,
+  linear-gradient(140deg,rgb(38 198 181/.4),rgb(30 136 229/.25)) border-box;
+  border:1px solid transparent}
+.ai-row{display:flex;gap:.8rem;padding:3px 0}
+.ai-row .lbl{color:#475569;flex:none;width:5.6rem}
+.ai-row .val{color:#E2E8F0;min-width:0;overflow-wrap:anywhere}
+.ai-row .val.bad{color:var(--alert)} .ai-row .val.ok{color:var(--teal)}
+.ai-typing{font:400 .9rem/1.75 var(--body);color:#E2E8F0;min-height:5.2em;margin:0}
+.ai-typing .caret{display:inline-block;width:2px;height:1em;background:var(--teal);
+  vertical-align:-.14em;animation:caret 1s step-end infinite}
+@keyframes caret{50%{opacity:0}}
+.ai-meta{margin-top:.9rem;font:500 .78rem/1.5 var(--mono);color:#64748B;min-height:1.2em}
+.ai-meta b{color:var(--teal)}
+.ai-note{margin-top:.85rem;font-size:.88rem;color:var(--muted)}
+
+.ai-split{display:grid;gap:22px;margin-top:2.8rem}
+@media(min-width:860px){.ai-split{grid-template-columns:1fr 1fr}}
+.ai-does,.ai-doesnt{border-radius:var(--r);padding:30px 32px;border:1px solid var(--line);
+  background:var(--white)}
+.ai-does{border-color:rgb(38 198 181/.4);background:rgb(38 198 181/.045)}
+.ai-doesnt{border-color:rgb(240 82 77/.32);background:rgb(240 82 77/.035)}
+.ai-does h3,.ai-doesnt h3{margin-bottom:1.1rem;font-size:1.18rem}
+.ai-does ul,.ai-doesnt ul{list-style:none;padding:0;margin:0;display:grid;gap:13px}
+.ai-does li,.ai-doesnt li{display:flex;gap:.7rem;font-size:.95rem;line-height:1.6;align-items:flex-start}
+.ai-does li i{color:var(--teal);font-style:normal;font-weight:700;flex:none}
+.ai-doesnt li i{color:var(--alert);font-style:normal;font-weight:700;flex:none}
+.ai-does b,.ai-doesnt b{display:inline}
+
+.ai-inject{margin-top:2.4rem;border-radius:var(--r);padding:32px 34px;
+  background:var(--night);color:#fff;border:1px solid rgb(240 82 77/.28)}
+.ai-inject .x{display:inline-block;font:700 .72rem/1 var(--mono);letter-spacing:.1em;
+  color:var(--alert);background:rgb(240 82 77/.14);padding:7px 12px;border-radius:7px;margin-bottom:1rem}
+.ai-inject h3{font-size:1.22rem;margin-bottom:.8rem;max-width:60ch}
+.ai-inject p{color:#94A3B8;font-size:.98rem;max-width:78ch}
+.ai-inject .mono{color:#CBD5E1}
+
 /* ------------------------------------------------------------------ pachete */
 .plans{display:grid;gap:22px;margin-top:2.8rem}
 @media(min-width:900px){.plans{grid-template-columns:repeat(3,1fr)}}
@@ -297,16 +348,17 @@ section{padding:var(--pad) 0}
   <div class="wrap hero-grid">
     <div>
       <span class="pill"><b></b> Produs livrat și calibrat de CRYPTOITDATA</span>
-      <h1>Un agent de securitate <span class="hl">configurat pentru serverul tău</span>, nu un abonament generic.</h1>
-      <p class="lede" style="margin-top:1.4rem;max-width:54ch">
-        Sentinel se instalează pe infrastructura ta și se configurează după ce
-        vede ce rulează efectiv acolo: colectorii, regulile, pragurile și lista
-        de excepții sunt ale tale. Îl instalăm, îl calibrăm 72 de ore pe traficul
-        tău real, apoi ți-l predăm.
+      <h1>Analiză cu AI în timp real, <span class="hl">configurată pentru serverul tău</span>.</h1>
+      <p class="lede" style="margin-top:1.4rem;max-width:55ch">
+        Detecția rulează determinist, non-stop, la cost zero. Un model citește
+        incidentele serioase în sub două minute și îți spune în română ce e
+        real, ce e zgomot și ce ai de făcut — apoi redactează procedura de
+        reparare. Instalat pe infrastructura ta, calibrat 72 de ore pe traficul
+        tău, predat cu tot cu documentație.
       </p>
       <div class="hero-actions">
         <a class="btn btn-primary" href="#oferta">Cere ofertă pentru serverul meu</a>
-        <a class="btn btn-ghost" href="#configurare">Vezi cum se adaptează</a>
+        <a class="btn btn-ghost" href="#ai">Ce face AI-ul, concret</a>
       </div>
       <p class="hero-note">
         O singură mașină sau o flotă. Fără SIEM, fără agent extern, fără date
@@ -425,6 +477,85 @@ section{padding:var(--pad) 0}
   </div>
 </section>
 
+<!-- ══════════════════════════════════════════════════════════ STRATUL AI ══ -->
+<section id="ai">
+  <div class="wrap">
+    <div class="narrow reveal">
+      <span class="eyebrow" style="color:var(--blue)">Analiză cu AI, în timp real</span>
+      <h2>Atacul e industrializat cu AI. Analiza care îl citește trebuie să fie la fel.</h2>
+      <p class="lede" style="margin-top:1.1rem">
+        Un om nu poate citi 20.000 de evenimente ostile pe zi și nu poate scrie
+        la 3 dimineața de ce contează exact acesta. Sentinel pune un model să
+        facă partea de <em>judecată</em> — severitate reală, fals-pozitiv sau
+        nu, ce e de făcut, în română — în mai puțin de două minute de la
+        deschiderea incidentului.
+      </p>
+      <p class="lede" style="margin-top:1rem">
+        Dar decizia de a bloca rămâne deterministă. Asta nu e o limitare: e
+        motivul pentru care poți lăsa produsul să ruleze singur.
+      </p>
+    </div>
+
+    <div class="ai-demo reveal">
+      <div class="ai-col">
+        <div class="ai-head"><span class="tick t-det"></span> Verdict determinist <em>· instant, cost zero</em></div>
+        <div class="ai-card" id="det-card">
+          <div class="ai-row"><span class="lbl">regulă</span><span class="val" id="d1">—</span></div>
+          <div class="ai-row"><span class="lbl">severitate</span><span class="val" id="d2">—</span></div>
+          <div class="ai-row"><span class="lbl">sursă</span><span class="val" id="d3">—</span></div>
+          <div class="ai-row"><span class="lbl">acțiune</span><span class="val" id="d4">—</span></div>
+        </div>
+        <p class="ai-note">Rulează 24/7, pe fiecare eveniment. Nu depinde de nimic din afara serverului.</p>
+      </div>
+
+      <div class="ai-col">
+        <div class="ai-head"><span class="tick t-ai"></span> Verdict AI <em>· adăugat, niciodată suprascris</em></div>
+        <div class="ai-card ai-card-model" id="ai-card">
+          <p class="ai-typing" id="ai-text"></p>
+          <div class="ai-meta" id="ai-meta"></div>
+        </div>
+        <p class="ai-note">Dacă modelul e în dezacord cu regula, vezi <b>ambele</b>. Nimic nu se rescrie în tăcere.</p>
+      </div>
+    </div>
+
+    <div class="ai-split stagger">
+      <div class="ai-does">
+        <h3>Ce face modelul</h3>
+        <ul>
+          <li><i>▸</i><b>Triaj</b> — recalibrează severitatea, marchează fals-pozitivele și scrie rezumatul în română</li>
+          <li><i>▸</i><b>Corelare</b> — leagă incidente separate într-o singură campanie, cu aceeași sursă în spate</li>
+          <li><i>▸</i><b>Redactează procedura de patch</b> — comandă cu comandă, cu backup, verificări și pași de revenire</li>
+          <li><i>▸</i><b>Raport zilnic</b> — ce te-a atacat, ce s-a blocat, ce a rămas deschis</li>
+          <li><i>▸</i><b>Răspunde la întrebări</b> peste propria bază de date, read-only</li>
+        </ul>
+      </div>
+      <div class="ai-doesnt">
+        <h3>Ce nu are voie</h3>
+        <ul>
+          <li><i>✕</i><b>Nu decide blocări.</b> Detecția, scorarea și decizia sunt deterministe și rulează la cost zero</li>
+          <li><i>✕</i><b>Nu execută nimic.</b> Planul pe care îl scrie trece printr-un validator determinist care îl refuză dacă nu e sigur — modelul redactează, validatorul decide</li>
+          <li><i>✕</i><b>Nu stă pe calea critică.</b> API căzut sau buget epuizat: detecția, blocarea și alertarea merg mai departe, marcate „analiză AI indisponibilă"</li>
+          <li><i>✕</i><b>Nu depășește bugetul.</b> Plafonul se verifică înainte de fiecare apel, iar costul per incident e vizibil în panou</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="ai-inject reveal">
+      <span class="x">SUPRAFAȚA DE ATAC PE CARE O ADUCE AI-UL</span>
+      <h3>Liniile din log sunt scrise de atacator. Dacă ajung la un model, aia e injecție de prompt în propria ta unealtă de securitate.</h3>
+      <p>
+        Un atacator poate cere o cale HTTP care conține instrucțiuni. Sentinel
+        le tratează ca date neîncrezute, cu delimitatori expliciți, iar
+        transportul care chiar citește fișiere de pe server rulează
+        <span class="mono">--permission-mode plan</span> — structural incapabil
+        să modifice ceva. Există un test care plantează
+        <span class="mono">IGNORE PREVIOUS INSTRUCTIONS</span> într-un access
+        log și verifică că nu s-a executat nimic.
+      </p>
+    </div>
+  </div>
+</section>
+
 <!-- ═════════════════════════════════════════════════════════════ PACHETE ══ -->
 <section class="soft" id="oferta">
   <div class="wrap">
@@ -448,7 +579,8 @@ section{padding:var(--pad) 0}
         <ul>
           <li><i>✓</i> Evaluare a serverului și inventar confirmat</li>
           <li><i>✓</i> Instalare, configurare pe stack-ul tău, calibrare 72h</li>
-          <li><i>✓</i> Alerte Telegram în română, cu butoane de acțiune</li>
+          <li><i>✓</i> Triaj AI al incidentelor grave, cu verdict în română</li>
+          <li><i>✓</i> Alerte Telegram cu butoane de acțiune</li>
           <li><i>✓</i> Panou web propriu, pe domeniul tău</li>
           <li><i>✓</i> Documentație de operare și predare</li>
           <li class="off"><i>–</i> Monitorizare de către noi</li>
@@ -465,7 +597,7 @@ section{padding:var(--pad) 0}
         <ul>
           <li><i>✓</i> Tot ce e în „Instalare"</li>
           <li><i>✓</i> Revizuim incidentele și ajustăm regulile lunar</li>
-          <li><i>✓</i> Planuri de patch pregătite și verificate de noi</li>
+          <li><i>✓</i> Planuri de patch redactate de AI, verificate de noi înainte să ajungă la tine</li>
           <li><i>✓</i> Raport lunar: ce te-a atacat, ce s-a blocat, ce e deschis</li>
           <li><i>✓</i> Actualizări de produs incluse</li>
           <li><i>✓</i> Suport la incident, în timpul programului</li>
@@ -814,7 +946,72 @@ section{padding:var(--pad) 0}
   render();
 
   /* =======================================================================
-     3. Apariția la scroll, contoarele, barele, cronologia.
+     3. Demonstrația de triaj.
+
+     Verdictul determinist apare instant; cel al modelului se scrie după o
+     pauză scurtă, litera cu litera. Ordinea și decalajul SUNT mesajul: regula
+     a decis deja, modelul explică după. Dacă ar apărea simultan, animația ar
+     sugera că modelul participă la decizie — ceea ce ar fi fals.
+     ======================================================================= */
+  var AI_VERDICT =
+    "Atac real, nu zgomot de fond. Aceeași sursă a încercat SSH, apoi " +
+    "a sondat /wp-admin și /.env pe portul 443 — trei suprafețe în opt " +
+    "minute, tipar de recunoaștere țintită, nu de scanare de masă. " +
+    "Recomand blocare 24h și verificarea versiunii de OpenSSH.";
+  var DET = [
+    ["d1", "auth.ssh_bruteforce", ""],
+    ["d2", "HIGH", "bad"],
+    ["d3", "203.0.113.47 · 214 încercări / 3 min", ""],
+    ["d4", "blocat automat · TTL 24h", "ok"]
+  ];
+
+  function playTriage() {
+    var text = document.getElementById("ai-text");
+    var meta = document.getElementById("ai-meta");
+    if (!text) return;
+
+    DET.forEach(function (d, i) {
+      setTimeout(function () {
+        var el = document.getElementById(d[0]);
+        if (!el) return;
+        el.textContent = d[1];
+        if (d[2]) el.className = "val " + d[2];
+      }, reduced ? 0 : i * 130);
+    });
+
+    if (reduced) {
+      text.textContent = AI_VERDICT;
+      meta.innerHTML = "";
+      meta.appendChild(document.createTextNode("verdict AI · 1,8 s · "));
+      var b0 = document.createElement("b"); b0.textContent = "$0,004";
+      meta.appendChild(b0);
+      return;
+    }
+
+    var caret = document.createElement("span");
+    caret.className = "caret";
+    var i = 0;
+    setTimeout(function type() {
+      // textContent, nu innerHTML: verdictul e text generat de model, iar
+      // obiceiul de a insera așa ceva ca HTML e exact ce transformă o unealtă
+      // de securitate în vectorul propriei compromiteri.
+      text.textContent = AI_VERDICT.slice(0, i);
+      text.appendChild(caret);
+      i += 2;
+      if (i <= AI_VERDICT.length + 2) setTimeout(type, 16);
+      else {
+        text.textContent = AI_VERDICT;
+        meta.textContent = "";
+        meta.appendChild(document.createTextNode("verdict AI · 1,8 s · "));
+        var b = document.createElement("b"); b.textContent = "$0,004";
+        meta.appendChild(b);
+        meta.appendChild(document.createTextNode(" · stocat lângă verdictul deterministic"));
+      }
+    }, 900);
+  }
+
+  /* =======================================================================
+     4. Apariția la scroll, contoarele, barele, cronologia.
      ======================================================================= */
   function countUp(el) {
     if (el.dataset.done) return;
@@ -841,14 +1038,17 @@ section{padding:var(--pad) 0}
     })(t0);
   }
 
+  var triagePlayed = false;
   function activate(el) {
     el.classList.add("in");
     [].forEach.call(el.querySelectorAll("[data-count]"), countUp);
     [].forEach.call(el.querySelectorAll(".bar i"), function (b) { b.style.width = b.dataset.w + "%"; });
     if (el.dataset.count) countUp(el);
+    if (!triagePlayed && el.querySelector(".ai-demo, #ai-text")) { triagePlayed = true; playTriage(); }
   }
   function revealAll() {
     [].forEach.call(document.querySelectorAll(".reveal,.stagger"), activate);
+    if (!triagePlayed) { triagePlayed = true; playTriage(); }
     [].forEach.call(document.querySelectorAll(".stp"), function (s) { s.classList.add("on"); });
     var f = document.getElementById("steps-fill"); if (f) f.style.height = "100%";
   }
