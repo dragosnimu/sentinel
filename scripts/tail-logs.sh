@@ -41,7 +41,11 @@ SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15
           -o ServerAliveInterval=30 -p "$PORT")
 [[ -n "$KEY" ]] && SSH_OPTS+=(-i "${KEY/#\~/$HOME}")
 
-remote="journalctl -u '${UNIT}' -n ${LINES} -o cat --no-pager"
+# sudo, altfel journald răspunde „No journal files were opened due to
+# insufficient permissions" și scriptul pare să funcționeze în timp ce nu arată
+# nimic. Un tailer de loguri care tace când nu are drepturi e mai rău decât
+# unul care lipsește: pare că nu s-a întâmplat nimic.
+remote="sudo journalctl -u '${UNIT}' -n ${LINES} -o cat --no-pager"
 (( FOLLOW ))      && remote+=" -f"
 (( ERRORS_ONLY )) && remote+=" -p err"
 [[ -n "$SINCE" ]] && remote+=" --since '${SINCE}'"

@@ -2,1118 +2,663 @@
 <html lang="ro">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark light">
-<meta name="description" content="Sentinel — agent de securitate pentru server Linux. Prezentare de produs cu date reale din producție.">
+<title>Sentinel by CryptoITData — prezentare de produs</title>
+<!--
+  Prezentare de produs, A4 landscape, pentru export PDF.
+
+  Fonturile sunt de sistem, deliberat: randarea se face cu Chrome headless fără
+  rețea, iar un @font-face către un CDN ar cădea tăcut într-un fallback pe care
+  nu l-am ales. Caracterul vine din greutate, tracking și culoare.
+
+  Fundalurile întunecate sunt doar pe copertă, pe separatoare și pe final. O
+  prezentare comercială ajunge și la imprimantă, iar paisprezece pagini pline
+  de #050811 sunt o factură de toner, nu un argument.
+
+  Fiecare cifră din acest document e măsurată, nu estimată. Sursa e notată în
+  comentariul de deasupra fiecărei secțiuni care afirmă ceva numeric.
+-->
 <style>
+:root{
+  --abyss:#050811; --night:#0E1526; --ink:#0F172A; --body:#334155; --muted:#64748B;
+  --line:#DDE3EC; --soft:#F6F8FB; --paper:#fff;
+  --teal:#1AA394; --teal-br:#26C6B5; --blue:#1E88E5; --alert:#D93A35; --amber:#B8790F;
+  --display:"Segoe UI Semibold","Segoe UI",Inter,system-ui,sans-serif;
+  --text:"Segoe UI",Inter,system-ui,sans-serif;
+  --mono:Consolas,"Cascadia Mono",ui-monospace,monospace;
+}
 *,*::before,*::after{box-sizing:border-box}
-html{-webkit-text-size-adjust:100%}
-body{margin:0}
-img{max-width:100%}
-</style>
-<title>Sentinel — agent de securitate pentru server Linux</title>
+@page{size:A4 landscape;margin:0}
+html,body{margin:0;padding:0}
+body{font:400 10.5pt/1.55 var(--text);color:var(--body);
+  -webkit-print-color-adjust:exact;print-color-adjust:exact}
 
-<style>
-/* ============================================================ tokens
-   Paleta produsului însuși: negru cald cu tentă brună, ambră ca accent.
-   Griurile sunt deviate spre ambră, nu neutre — alese, nu moștenite. */
-:root {
-  --ground:   #0c0a08;
-  --panel:    #16120e;
-  --panel-2:  #1e1813;
-  --edge:     #2a2219;
-  --edge-lit: #3b3125;
+/* 296,8 × 209,7 și nu exact A4: la tipărire, o secțiune care măsoară fix cât
+   pagina se rotunjește ocazional la un pixel peste, iar Chrome inserează o
+   pagină goală după ea. Trei pagini albe într-o prezentare comercială arată ca
+   un fișier stricat. Diferența de 0,3 mm nu se vede. */
+.pg{position:relative;width:296.8mm;height:209.7mm;padding:17mm 20mm 15mm;
+  background:var(--paper);overflow:hidden;page-break-after:always;display:flex;
+  flex-direction:column}
+.pg:last-child{page-break-after:auto}
+/* Bleed. Pagina e cu 0,2–0,5 mm sub coala, ca să nu apară pagini goale din
+   rotunjire — ceea ce lasă o linie de păr albă la margine. Pe un fundal
+   întunecat arată a greșeală de tipar. `outline` se desenează în AFARA cutiei
+   și nu intră în calculul de layout, deci umple marginea fără să readucă
+   problema de paginare. */
+.pg.dark{background:var(--abyss);color:#C9D4E4;outline:2mm solid var(--abyss)}
+.pg.soft{background:var(--soft);outline:2mm solid var(--soft)}
+.pg{outline:2mm solid var(--paper)}
 
-  --ink:      #f4efe9;
-  --ink-mid:  #a29383;
-  --ink-dim:  #75675a;
+/* Numerotare și filet. Pe paginile întunecate filetul e singurul element care
+   leagă vizual coperta de conținut, deci rămâne în ambele variante. */
+.pg::after{content:attr(data-n);position:absolute;right:20mm;bottom:9mm;
+  font:600 8pt/1 var(--text);letter-spacing:.14em;color:var(--muted)}
+.pg.dark::after{color:#475569}
+.pg::before{content:"";position:absolute;left:20mm;bottom:12.4mm;width:14mm;height:2px;
+  background:var(--teal)}
+.pg.dark::before{background:var(--teal-br)}
+.foot{position:absolute;left:20mm;bottom:8mm;font:600 8pt/1 var(--text);
+  letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+.pg.dark .foot{color:#475569}
 
-  --amber:    #f26b1d;
-  --amber-soft: #34200f;
+.eyebrow{font:700 8.5pt/1 var(--text);letter-spacing:.18em;text-transform:uppercase;
+  color:var(--teal);margin:0 0 6mm}
+.pg.dark .eyebrow{color:var(--teal-br)}
+h1{font:600 34pt/1.06 var(--display);letter-spacing:-.025em;color:#fff;margin:0}
+h2{font:600 20pt/1.2 var(--display);letter-spacing:-.02em;color:var(--ink);
+  margin:0 0 4mm;max-width:60ch}
+.pg.dark h2{color:#fff}
+h3{font:600 11.5pt/1.3 var(--display);color:var(--ink);margin:0 0 1.5mm}
+.pg.dark h3{color:#fff}
+p{margin:0 0 3mm;max-width:78ch}
+.lede{font-size:12pt;line-height:1.5;color:var(--muted);max-width:72ch}
+.pg.dark .lede{color:#94A3B8}
+.hl{color:var(--teal)} .pg.dark .hl{color:var(--teal-br)}
+strong{color:var(--ink);font-weight:600} .pg.dark strong{color:#fff}
+code{font:600 9.5pt/1.4 var(--mono);color:var(--teal);
+  background:rgba(26,163,148,.09);padding:1px 4px;border-radius:3px}
+.pg.dark code{color:var(--teal-br);background:rgba(38,198,181,.12)}
 
-  --ok:   #3ecf8e;
-  --warn: #f0a92e;
-  --bad:  #f2564d;
+.body{flex:1;min-height:0;display:flex;flex-direction:column;justify-content:center}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:12mm}
+.cols3{display:grid;grid-template-columns:repeat(3,1fr);gap:8mm}
+.cols4{display:grid;grid-template-columns:repeat(4,1fr);gap:6mm}
 
-  /* Lumea Telegram: rămâne luminoasă în ambele teme — e un telefon. */
-  --tg-ground: #e7ebf0;
-  --tg-card:   #ffffff;
-  --tg-in:     #ffffff;
-  --tg-out:    #eeffde;
-  --tg-blue:   #3390ec;
-  --tg-ink:    #0f1419;
-  --tg-dim:    #707a85;
+.card{background:var(--paper);border:1px solid var(--line);border-radius:4mm;
+  padding:6mm 6.5mm}
+.pg.soft .card{background:#fff}
+.card.on{border-color:var(--teal);border-width:1.5px}
+.card p{font-size:9.5pt;margin:0;color:var(--muted)}
 
-  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+ul{margin:0;padding:0;list-style:none}
+li{position:relative;padding-left:6mm;margin-bottom:2.4mm;font-size:10pt;line-height:1.45}
+li::before{content:"";position:absolute;left:0;top:1.7mm;width:2.6mm;height:2.6mm;
+  border-radius:50%;background:var(--teal)}
+li.no::before{background:none;border:1.2px solid var(--alert);border-radius:0;
+  top:2.4mm;height:0;width:3mm}
+li.no{color:var(--muted)}
+.pg.dark li::before{background:var(--teal-br)}
 
-  --r: 12px;
-  --shadow: 0 1px 2px rgb(0 0 0 / .4), 0 10px 34px rgb(0 0 0 / .3);
-}
+.stat{display:flex;flex-direction:column;gap:1mm}
+.stat b{font:600 30pt/1 var(--display);letter-spacing:-.03em;color:var(--ink)}
+.pg.dark .stat b{color:#fff}
+.stat b.a{color:var(--alert)} .stat b.t{color:var(--teal)}
+.pg.dark .stat b.t{color:var(--teal-br)}
+.stat span{font-size:9pt;color:var(--muted);line-height:1.35}
 
-@media (prefers-color-scheme: light) {
-  :root {
-    --ground:   #f5f2ee;
-    --panel:    #ffffff;
-    --panel-2:  #faf7f3;
-    --edge:     #e4ddd4;
-    --edge-lit: #cabfb2;
-    --ink:      #14100c;
-    --ink-mid:  #6a5c4e;
-    --ink-dim:  #8d8072;
-    --amber:    #cf5510;
-    --amber-soft: #fdefe4;
-    --ok:   #12996a;
-    --warn: #b07714;
-    --bad:  #cf3a31;
-    --shadow: 0 1px 2px rgb(20 16 12 / .05), 0 8px 26px rgb(20 16 12 / .07);
-  }
-}
-:root[data-theme="dark"] {
-  --ground:#0c0a08; --panel:#16120e; --panel-2:#1e1813; --edge:#2a2219;
-  --edge-lit:#3b3125; --ink:#f4efe9; --ink-mid:#a29383; --ink-dim:#75675a;
-  --amber:#f26b1d; --amber-soft:#34200f; --ok:#3ecf8e; --warn:#f0a92e; --bad:#f2564d;
-  --shadow: 0 1px 2px rgb(0 0 0 / .4), 0 10px 34px rgb(0 0 0 / .3);
-}
-:root[data-theme="light"] {
-  --ground:#f5f2ee; --panel:#ffffff; --panel-2:#faf7f3; --edge:#e4ddd4;
-  --edge-lit:#cabfb2; --ink:#14100c; --ink-mid:#6a5c4e; --ink-dim:#8d8072;
-  --amber:#cf5510; --amber-soft:#fdefe4; --ok:#12996a; --warn:#b07714; --bad:#cf3a31;
-  --shadow: 0 1px 2px rgb(20 16 12 / .05), 0 8px 26px rgb(20 16 12 / .07);
-}
+.kv{width:100%;border-collapse:collapse;font-size:9.5pt}
+.kv td{padding:2.6mm 0;border-bottom:1px solid var(--line);vertical-align:top}
+.kv tr:last-child td{border-bottom:0}
+.kv td:first-child{width:34%;color:var(--ink);font-weight:600;padding-right:6mm}
+.pg.dark .kv td{border-color:#1E293B} .pg.dark .kv td:first-child{color:#fff}
 
-*, *::before, *::after { box-sizing: border-box; }
+.tag{display:inline-block;padding:1.2mm 3mm;border-radius:99px;font:700 7.5pt/1 var(--text);
+  letter-spacing:.1em;text-transform:uppercase}
+.tag.t{background:rgba(26,163,148,.12);color:var(--teal)}
+.tag.a{background:rgba(217,58,53,.1);color:var(--alert)}
+.tag.m{background:#EEF2F7;color:var(--muted)}
 
-body {
-  margin: 0;
-  background: var(--ground);
-  color: var(--ink);
-  font: 17px/1.65 var(--sans);
-  -webkit-font-smoothing: antialiased;
-}
-
-.wrap { max-width: 1120px; margin: 0 auto; padding: 0 1.5rem; }
-.narrow { max-width: 68ch; }
-
-/* ============================================================ type */
-h1, h2, h3 { text-wrap: balance; margin: 0; }
-
-h1 {
-  font-size: clamp(2.4rem, 6vw, 4.1rem);
-  font-weight: 800;
-  letter-spacing: -.045em;
-  line-height: 1.02;
-}
-h2 {
-  font-size: clamp(1.6rem, 3.4vw, 2.3rem);
-  font-weight: 750;
-  letter-spacing: -.03em;
-  line-height: 1.12;
-}
-h3 { font-size: 1.12rem; font-weight: 680; letter-spacing: -.012em; }
-
-.eyebrow {
-  font: 600 .76rem/1 var(--sans);
-  letter-spacing: .16em;
-  text-transform: uppercase;
-  color: var(--amber);
-}
-.lede { font-size: 1.16rem; color: var(--ink-mid); margin: 0; }
-p { margin: 0; }
-.mono { font-family: var(--mono); font-size: .93em; }
-.num { font-variant-numeric: tabular-nums; }
-strong { font-weight: 680; color: var(--ink); }
-
-/* ============================================================ layout */
-section { padding: 5.5rem 0; border-top: 1px solid var(--edge); }
-section:first-of-type { border-top: none; }
-.stack { display: flex; flex-direction: column; gap: 1.1rem; }
-.stack-lg { display: flex; flex-direction: column; gap: 2.6rem; }
-.head { display: flex; flex-direction: column; gap: .9rem; max-width: 62ch; }
-
-/* ============================================================ hero */
-.hero { padding: 6rem 0 4.5rem; }
-.hero-grid { display: grid; grid-template-columns: 1fr; gap: 2.6rem; }
-.mark {
-  display: inline-flex; align-items: center; gap: .6rem;
-  font: 800 1.05rem/1 var(--sans); letter-spacing: .1em;
-}
-.mark span:first-child {
-  width: 20px; height: 20px; border-radius: 6px;
-  background: linear-gradient(140deg, var(--amber), #ffb066);
-}
-
-.proof {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-  gap: 1px;
-  background: var(--edge);
-  border: 1px solid var(--edge);
-  border-radius: var(--r);
-  overflow: hidden;
-}
-.proof div { background: var(--panel); padding: 1.15rem 1.2rem; }
-.proof .v {
-  display: block; font-size: 2.15rem; font-weight: 800;
-  letter-spacing: -.04em; line-height: 1; font-variant-numeric: tabular-nums;
-}
-.proof .k { display: block; margin-top: .4rem; font-size: .87rem; color: var(--ink-mid); }
-.proof .v.ok { color: var(--ok); }
-.proof .v.warn { color: var(--warn); }
-
-/* ============================================================ frame
-   Rama de ecran: bara de sus poartă URL-ul real, ca să fie clar
-   că e produsul, nu o ilustrație. */
-.frame {
-  border: 1px solid var(--edge);
-  border-radius: var(--r);
-  background: var(--panel);
-  box-shadow: var(--shadow);
-  overflow: hidden;
-}
-.frame-bar {
-  display: flex; align-items: center; gap: .55rem;
-  padding: .6rem .9rem;
-  background: var(--panel-2);
-  border-bottom: 1px solid var(--edge);
-  font: 500 .82rem/1 var(--sans);
-  color: var(--ink-dim);
-}
-.dot3 { display: flex; gap: .3rem; }
-.dot3 i { width: 9px; height: 9px; border-radius: 50%; background: var(--edge-lit); }
-.frame-url { font-family: var(--mono); font-size: .78rem; margin-left: .5rem; }
-.frame-body { padding: 1.4rem; overflow-x: auto; }
-
-.caption { font-size: .88rem; color: var(--ink-dim); margin-top: .7rem; }
-
-/* ============================================================ app UI */
-.app { display: grid; grid-template-columns: 172px 1fr; gap: 1.3rem; min-width: 620px; }
-.side { display: flex; flex-direction: column; gap: .12rem; }
-.side a {
-  display: block; padding: .42rem .6rem; border-radius: 7px;
-  font-size: .88rem; color: var(--ink-mid); text-decoration: none;
-}
-.side a.on { background: var(--amber-soft); color: var(--amber); font-weight: 650; }
-.side .brandline {
-  font: 800 .82rem/1 var(--sans); letter-spacing: .11em;
-  padding: .3rem .6rem 1rem; color: var(--ink);
-}
-
-.verdict {
-  display: flex; gap: .9rem; align-items: center;
-  padding: .95rem 1.1rem; border: 1px solid var(--edge);
-  border-left: 4px solid var(--warn);
-  border-radius: 10px; background: var(--panel-2);
-}
-.verdict b { display: block; font-size: 1.05rem; }
-.verdict p { font-size: .88rem; color: var(--ink-mid); }
-
-.kpis { display: grid; grid-template-columns: repeat(5, 1fr); gap: .6rem; }
-.kpi {
-  border: 1px solid var(--edge); border-radius: 10px;
-  background: var(--panel-2); padding: .75rem .8rem;
-}
-.kpi .t { display: flex; justify-content: space-between; align-items: center; gap: .4rem; }
-.kpi .l { font-size: .72rem; color: var(--ink-mid); }
-.kpi .v {
-  font-size: 1.5rem; font-weight: 780; letter-spacing: -.035em;
-  line-height: 1.1; font-variant-numeric: tabular-nums; margin-top: .2rem;
-}
-.kpi .n { font-size: .68rem; color: var(--ink-dim); }
-.kpi .v.ok { color: var(--ok); }
-.kpi .v.warn { color: var(--warn); }
-.chip {
-  font-size: .64rem; font-weight: 700; padding: .08rem .34rem;
-  border-radius: 99px; border: 1px solid var(--edge-lit); color: var(--ink-mid);
-}
-.chip.up { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 45%, transparent); }
-
-.panel-b {
-  border: 1px solid var(--edge); border-radius: 10px;
-  background: var(--panel-2); padding: .95rem 1rem;
-}
-.panel-b h4 {
-  margin: 0 0 .75rem; font: 700 .68rem/1 var(--sans);
-  letter-spacing: .09em; text-transform: uppercase; color: var(--ink-mid);
-}
-.bars { display: flex; flex-direction: column; gap: .5rem; }
-.bar { display: grid; grid-template-columns: 2.1rem 1fr auto; gap: .55rem; align-items: center; }
-.bar .k { font-weight: 700; font-size: .82rem; font-variant-numeric: tabular-nums; }
-.bar .track { height: 7px; border-radius: 99px; background: var(--edge); overflow: hidden; }
-.bar .fill {
-  display: block; height: 100%; border-radius: 99px;
-  background: linear-gradient(90deg, var(--amber), #ff9c52);
-}
-.bar .n { font-size: .74rem; color: var(--ink-mid); font-variant-numeric: tabular-nums; }
-
-table { width: 100%; border-collapse: collapse; font-size: .82rem; }
-th {
-  text-align: left; font: 700 .64rem/1 var(--sans); letter-spacing: .07em;
-  text-transform: uppercase; color: var(--ink-mid);
-  padding: .45rem .55rem; border-bottom: 1px solid var(--edge); white-space: nowrap;
-}
-td { padding: .45rem .55rem; border-bottom: 1px solid var(--edge); }
-tr:last-child td { border-bottom: none; }
-td.r, th.r { text-align: right; font-variant-numeric: tabular-nums; }
-.pill {
-  display: inline-block; padding: .06rem .48rem; border-radius: 99px;
-  font-size: .7rem; font-weight: 700; border: 1px solid transparent;
-}
-.pill.bad  { color: var(--bad);  border-color: color-mix(in srgb, var(--bad) 45%, transparent); }
-.pill.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
-.pill.ok   { color: var(--ok);   border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
-
-.ins {
-  display: flex; gap: .75rem; padding: .8rem .95rem;
-  border: 1px solid var(--edge); border-left: 3px solid var(--ink-dim);
-  border-radius: 9px; background: var(--panel-2);
-}
-.ins.w { border-left-color: var(--warn); }
-.ins.i { border-left-color: var(--amber); }
-.ins.g { border-left-color: var(--ok); }
-.ins b { font-size: .92rem; font-weight: 660; }
-.ins p { font-size: .82rem; color: var(--ink-mid); margin-top: .15rem; }
-.ins .do {
-  margin-top: .5rem; font-size: .78rem; font-family: var(--mono);
-  background: var(--panel); border: 1px solid var(--edge);
-  border-radius: 6px; padding: .35rem .5rem; color: var(--ink);
-}
-
-.spark { display: flex; align-items: flex-end; gap: 2px; height: 46px; }
-.spark i { flex: 1; background: var(--amber); opacity: .82; border-radius: 2px 2px 0 0; min-height: 2px; }
-.spark i.pk { background: var(--warn); opacity: 1; }
-
-/* ============================================================ telegram
-   Comută lumea: telefonul din buzunar, nu consola. */
-.tg-world { background: var(--tg-ground); color: var(--tg-ink); }
-.phone {
-  max-width: 420px; margin: 0 auto;
-  background: var(--tg-card); border-radius: 22px;
-  box-shadow: 0 2px 4px rgb(15 20 25 / .1), 0 18px 46px rgb(15 20 25 / .18);
-  overflow: hidden;
-}
-.tg-top {
-  display: flex; align-items: center; gap: .65rem;
-  padding: .8rem 1rem; background: var(--tg-blue); color: #fff;
-}
-.tg-av {
-  width: 32px; height: 32px; border-radius: 50%;
-  background: rgb(255 255 255 / .22); display: grid; place-items: center;
-  font-size: .95rem;
-}
-.tg-top b { display: block; font-size: .92rem; }
-.tg-top span { font-size: .74rem; opacity: .85; }
-.tg-thread {
-  padding: 1rem .8rem; background: var(--tg-ground);
-  display: flex; flex-direction: column; gap: .55rem;
-}
-.bub {
-  max-width: 92%; padding: .55rem .7rem; border-radius: 12px;
-  font-size: .84rem; line-height: 1.5; background: var(--tg-in);
-  box-shadow: 0 1px 1px rgb(15 20 25 / .1);
-}
-.bub.me { align-self: flex-end; background: var(--tg-out); }
-.bub .h { font-weight: 700; }
-.bub .m { font-family: var(--mono); font-size: .95em; }
-.bub .dim { color: var(--tg-dim); font-size: .92em; }
-.tg-btns { display: flex; flex-direction: column; gap: 2px; margin-top: .5rem; }
-.tg-row { display: flex; gap: 2px; }
-.tg-btn {
-  flex: 1; text-align: center; padding: .48rem .5rem;
-  background: rgb(51 144 236 / .08); color: var(--tg-blue);
-  border-radius: 8px; font-size: .8rem; font-weight: 600;
-}
-.tg-time { font-size: .68rem; color: var(--tg-dim); text-align: right; margin-top: .2rem; }
-.tg-note { font-size: .84rem; color: var(--tg-dim); max-width: 62ch; }
-.tg-world h2, .tg-world h3 { color: var(--tg-ink); }
-.tg-world .eyebrow { color: var(--tg-blue); }
-.tg-world .lede { color: #4a5560; }
-
-/* ============================================================ steps
-   Numerotate doar unde ordinea chiar poartă informație: un flux. */
-.flow { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 1px; background: var(--edge); border: 1px solid var(--edge); border-radius: var(--r); overflow: hidden; }
-.flow > div { background: var(--panel); padding: 1.05rem 1.1rem; }
-.flow .s {
-  font: 800 .7rem/1 var(--mono); color: var(--amber);
-  letter-spacing: .06em; margin-bottom: .5rem; display: block;
-}
-.flow h3 { font-size: .96rem; margin-bottom: .3rem; }
-.flow p { font-size: .82rem; color: var(--ink-mid); }
-
-.refuse { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: .8rem; }
-.refuse div {
-  border: 1px solid var(--edge); border-radius: 10px;
-  background: var(--panel); padding: 1rem 1.05rem;
-}
-.refuse b { display: block; font-size: .93rem; margin-bottom: .3rem; }
-.refuse p { font-size: .84rem; color: var(--ink-mid); }
-.refuse .x { color: var(--bad); font-family: var(--mono); font-size: .8rem; }
-
-/* Terminal: aceeași fereastră ca .frame, dar conținut monospațiat. Prompt-ul
-   e un ::before, ca să nu poată fi selectat odată cu comanda. */
-.term {
-  border: 1px solid var(--edge); border-radius: var(--r);
-  background: var(--panel-2); overflow: hidden;
-}
-.term-bar {
-  display: flex; align-items: center; gap: .45rem;
-  padding: .55rem .8rem; background: var(--panel);
-  border-bottom: 1px solid var(--edge);
-  font: 600 .74rem/1 var(--mono); color: var(--ink-dim); letter-spacing: .04em;
-}
-.term-body { padding: 1rem 1.1rem; font: 400 .84rem/1.75 var(--mono); }
-.term-body .c { display: block; color: var(--ink); }
-.term-body .c::before { content: "$ "; color: var(--amber); }
-.term-body .o { display: block; color: var(--ink-mid); }
-.term-body .o.ok { color: var(--ok); }
-.term-body .cm { display: block; color: var(--ink-dim); }
-
-.foot { padding: 3rem 0 4rem; color: var(--ink-dim); font-size: .86rem; }
-
-@media (max-width: 720px) {
-  .app { grid-template-columns: 1fr; min-width: 560px; }
-  .side { flex-direction: row; flex-wrap: wrap; }
-  .side .brandline { display: none; }
-  .kpis { grid-template-columns: repeat(2, 1fr); }
-  section { padding: 4rem 0; }
-}
-@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
-</style>
-<style>
-@page { size: A4; margin: 12mm 10mm; }
-html, body { background: var(--ground); }
-@media print {
-  * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
-  body { font-size: 10.5pt; }
-  .wrap { max-width: 100%; padding: 0 4mm; }
-  section { padding: 9mm 0; }
-  section.pagebreak { break-before: page; }
-  .phone, .proof, .flow, .ins, .refuse > div, .panel-b, .verdict,
-  .kpi, .bars, .spark, table { break-inside: avoid; }
-  .head { break-inside: avoid; break-after: avoid; }
-  h1, h2, h3 { break-after: avoid; }
-  /* zoom, nu transform: transform nu schimbă cutia de layout, deci elementul
-     rămâne la lățimea inițială, iese din pagină și e tăiat tăcut. */
-  .frame-body { overflow: visible; padding: 3mm; }
-  .frame { break-inside: auto; }
-  .app { min-width: 0; zoom: .74; grid-template-columns: 1fr; }
-  .app .side { display: none; }
-  .hero { padding: 4mm 0 8mm; }
-  h1 { font-size: 30pt; } h2 { font-size: 17pt; } .lede { font-size: 11pt; }
-  .spark { height: 34px; }
-  .foot { padding: 6mm 0 0; }
-  a { color: inherit; text-decoration: none; }
-}
+.note{border-left:2.5px solid var(--teal);padding:1mm 0 1mm 5mm;font-size:9.5pt;
+  color:var(--muted);max-width:74ch}
+.note.a{border-color:var(--alert)}
 </style>
 </head>
 <body>
 
-
-<div class="wrap hero">
-  <div class="hero-grid">
-    <div class="stack">
-      <div class="mark"><span></span><span>SENTINEL</span></div>
-      <h1>Serverul tău e atacat<br>chiar acum. Vezi de cine.</h1>
-      <p class="lede narrow">
-        Agent de securitate care rulează 24/7 pe un singur server Linux: colectează
-        din șase surse, ridică incidente, îți dă butonul de blocare pe telefon,
-        scanează vulnerabilități și generează proceduri de patch cu cale de
-        întoarcere verificată.
-      </p>
-      <p class="caption">
-        Cifrele de mai jos sunt reale, dintr-o instalare în producție —
-        AlmaLinux&nbsp;9, 14 aplicații monitorizate, ultimele 24 de ore.
-      </p>
-    </div>
-
-    <div class="proof">
-      <div><span class="v num">1&nbsp;055</span><span class="k">atacatori unici / 24h</span></div>
-      <div><span class="v num warn">2&nbsp;765</span><span class="k">evenimente ostile</span></div>
-      <div><span class="v num">6</span><span class="k">surse de colectare</span></div>
-      <div><span class="v num ok">0</span><span class="k">vulnerabilități deschise</span></div>
-      <div><span class="v num ok">14</span><span class="k">servicii active</span></div>
-    </div>
-  </div>
-</div>
-
-<!-- ═══════════════════════════════════ PANOU ═══════════════════════════ -->
-<section class="pagebreak">
-  <div class="wrap stack-lg">
-    <div class="head">
-      <span class="eyebrow">Panoul de securitate</span>
-      <h2>Prima linie răspunde la o singură întrebare: sunt ok?</h2>
-      <p class="lede">
-        Ordinea de citire e designul. Verdict, apoi cifrele care îl susțin, apoi
-        interpretarea, apoi tabelele din care a ieșit. Cine citește doar prima
-        linie are deja răspunsul corect.
-      </p>
-    </div>
-
-    <div class="frame">
-      <div class="frame-bar">
-        <span class="dot3"><i></i><i></i><i></i></span>
-        <span class="frame-url">sentinel.exemplu.ro</span>
-      </div>
-      <div class="frame-body">
-        <div class="app">
-          <nav class="side">
-            <span class="brandline">SENTINEL</span>
-            <a href="#" class="on">Panou</a>
-            <a href="#">Incidente</a>
-            <a href="#">Vulnerabilități</a>
-            <a href="#">Patch-uri</a>
-            <a href="#">Blocklist</a>
-            <a href="#">Servicii</a>
-            <a href="#">Evenimente</a>
-          </nav>
-
-          <div class="stack">
-            <div class="verdict">
-              <span style="font-size:1.5rem">🟠</span>
-              <div>
-                <b>Sub atac constant, apărarea ține</b>
-                <p>1 055 adrese ostile distincte au generat 2 765 evenimente în
-                   ultimele 24 h. 5 avertismente de verificat.</p>
-              </div>
-            </div>
-
-            <div class="kpis">
-              <div class="kpi">
-                <div class="t"><span class="l">Atacatori unici</span><span class="chip up">↑ 41%</span></div>
-                <div class="v num warn">1055</div><div class="n">ultimele 24 h</div>
-              </div>
-              <div class="kpi">
-                <div class="t"><span class="l">Evenimente ostile</span><span class="chip up">↑ 62%</span></div>
-                <div class="v num">2765</div><div class="n">din 7 031 totale</div>
-              </div>
-              <div class="kpi">
-                <div class="t"><span class="l">Incidente deschise</span></div>
-                <div class="v num bad" style="color:var(--bad)">554</div><div class="n">13 grave</div>
-              </div>
-              <div class="kpi">
-                <div class="t"><span class="l">Vulnerabilități</span></div>
-                <div class="v num ok">0</div><div class="n">niciuna exploatată activ</div>
-              </div>
-              <div class="kpi">
-                <div class="t"><span class="l">IP-uri blocate</span></div>
-                <div class="v num">5</div><div class="n">în evidență</div>
-              </div>
-            </div>
-
-            <div style="display:grid; grid-template-columns:1.35fr 1fr; gap:.7rem">
-              <div class="panel-b">
-                <h4>Originea atacurilor · 7 zile</h4>
-                <div class="bars">
-                  <div class="bar"><span class="k">DE</span><span class="track"><span class="fill" style="width:100%"></span></span><span class="n">1207 ev · 52 IP</span></div>
-                  <div class="bar"><span class="k">US</span><span class="track"><span class="fill" style="width:80%"></span></span><span class="n">970 ev · 402 IP</span></div>
-                  <div class="bar"><span class="k">SG</span><span class="track"><span class="fill" style="width:45%"></span></span><span class="n">545 ev · 15 IP</span></div>
-                  <div class="bar"><span class="k">HK</span><span class="track"><span class="fill" style="width:35%"></span></span><span class="n">428 ev · 26 IP</span></div>
-                  <div class="bar"><span class="k">CN</span><span class="track"><span class="fill" style="width:33%"></span></span><span class="n">394 ev · 16 IP</span></div>
-                  <div class="bar"><span class="k">AD</span><span class="track"><span class="fill" style="width:25%"></span></span><span class="n">299 ev · 8 IP</span></div>
-                </div>
-                <h4 style="margin-top:1.1rem">Operatori de rețea</h4>
-                <div class="bars">
-                  <div class="bar"><span class="k mono" style="font-size:.72rem">AS401116</span><span class="track"><span class="fill" style="width:100%"></span></span><span class="n">666 ev · 3 IP</span></div>
-                  <div class="bar"><span class="k mono" style="font-size:.72rem">AS132203</span><span class="track"><span class="fill" style="width:46%"></span></span><span class="n">306 ev · 1 IP</span></div>
-                  <div class="bar"><span class="k mono" style="font-size:.72rem">AS45102</span><span class="track"><span class="fill" style="width:46%"></span></span><span class="n">305 ev · 25 IP</span></div>
-                </div>
-              </div>
-
-              <div class="panel-b">
-                <h4>Evenimente ostile pe oră</h4>
-                <div class="spark">
-                  <i style="height:12%"></i><i style="height:8%"></i><i style="height:18%"></i>
-                  <i style="height:31%"></i><i style="height:22%"></i><i style="height:14%"></i>
-                  <i style="height:9%"></i><i style="height:26%"></i><i style="height:44%"></i>
-                  <i style="height:38%"></i><i style="height:52%"></i><i style="height:41%"></i>
-                  <i style="height:29%"></i><i style="height:35%"></i><i style="height:61%"></i>
-                  <i style="height:48%"></i><i style="height:73%"></i><i class="pk" style="height:100%"></i>
-                  <i style="height:66%"></i><i style="height:47%"></i><i style="height:39%"></i>
-                  <i style="height:52%"></i><i style="height:44%"></i><i style="height:31%"></i>
-                </div>
-                <h4 style="margin-top:1.1rem">Surse de date</h4>
-                <table>
-                  <tr><td>nginx</td><td class="r num">3242</td><td class="r"><span class="pill ok">activă</span></td></tr>
-                  <tr><td>suricata</td><td class="r num">1465</td><td class="r"><span class="pill ok">activă</span></td></tr>
-                  <tr><td>auditd</td><td class="r num">1364</td><td class="r"><span class="pill ok">activă</span></td></tr>
-                  <tr><td>sshd</td><td class="r num">907</td><td class="r"><span class="pill ok">activă</span></td></tr>
-                  <tr><td>sudo</td><td class="r num">52</td><td class="r"><span class="pill ok">activă</span></td></tr>
-                </table>
-              </div>
-            </div>
-
-            <div class="panel-b">
-              <h4>Cine te atacă · 48 h</h4>
-              <table>
-                <thead><tr><th>Adresă</th><th>Țară</th><th class="r">Surse</th><th>Văzut de</th><th class="r">Ev.</th><th>Stare</th></tr></thead>
-                <tbody>
-                  <tr><td class="mono">203.0.113.41</td><td>HK</td><td class="r">3</td><td class="mono" style="font-size:.74rem;color:var(--ink-mid)">auditd+sshd+suricata</td><td class="r num">281</td><td><span class="pill bad">blocat</span></td></tr>
-                  <tr><td class="mono">203.0.113.42</td><td>DE</td><td class="r">3</td><td class="mono" style="font-size:.74rem;color:var(--ink-mid)">auditd+sshd+suricata</td><td class="r num">113</td><td><span class="pill warn">multi-vector</span></td></tr>
-                  <tr><td class="mono">203.0.113.43</td><td>DE</td><td class="r">3</td><td class="mono" style="font-size:.74rem;color:var(--ink-mid)">auditd+sshd+suricata</td><td class="r num">68</td><td><span class="pill warn">multi-vector</span></td></tr>
-                  <tr><td class="mono">203.0.113.44</td><td>RO</td><td class="r">3</td><td class="mono" style="font-size:.74rem;color:var(--ink-mid)">auditd+sshd+suricata</td><td class="r num">33</td><td><span class="pill warn">multi-vector</span></td></tr>
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-    <p class="caption">
-      Panoul real, cu datele de producție de azi. „Multi-vector” înseamnă că
-      adresa a fost văzută de trei colectoare independente — un scanner de masă
-      atinge o singură suprafață; cine încearcă trei te-a ales.
+<!-- 1 ─────────────────────────────────────────────────────────── COPERTĂ ── -->
+<section class="pg dark" data-n="">
+  <div class="body">
+    <p class="eyebrow" style="margin-bottom:10mm">Prezentare de produs</p>
+    <h1>Sentinel</h1>
+    <p style="font:400 15pt/1.4 var(--text);color:#94A3B8;margin:5mm 0 0;max-width:64ch">
+      Agent autonom de securitate pentru servere Linux expuse la internet.
+      Detecție deterministă non-stop, analiză cu AI în timp real, răspuns
+      și administrare din Telegram.
+    </p>
+    <p style="margin:14mm 0 0;font:600 11pt/1 var(--text);color:#fff;letter-spacing:.02em">
+      by CryptoITData
     </p>
   </div>
+  <span class="foot">cryptoitdata.eu</span>
 </section>
 
-<!-- ═══════════════════════════════════ INSIGHTS ════════════════════════ -->
-<section class="pagebreak">
-  <div class="wrap stack-lg">
-    <div class="head">
-      <span class="eyebrow">Interpretare</span>
-      <h2>Un număr nu e o observație.</h2>
-      <p class="lede">
-        „2 765 de evenimente” e o cifră. „root a fost țintit de 1 086 de ori de la
-        93 de adrese — dezactivează autentificarea cu parolă pentru root” e o
-        observație. Motorul rulează reguli deterministe peste date și scoate doar
-        lucruri pe care poți acționa.
-      </p>
+<!-- 2 ──────────────────────────────────────────────────────── PROBLEMA ──
+     Cifrele 43 și 5: articolul propriu, cryptoitdata.eu/en/blog/
+     servere-expuse-internet-atacuri-ai. Nu sunt măsurători ale acestui
+     produs și nu sunt prezentate ca atare. -->
+<section class="pg dark" data-n="02">
+  <p class="eyebrow">Contextul</p>
+  <div class="body">
+    <h2 style="max-width:52ch">Atacul s-a industrializat. Timpul de reacție al
+      apărării a rămas același.</h2>
+    <p class="lede" style="margin-bottom:9mm">
+      Un server expus nu e „posibil să fie atacat". E scanat continuu, de
+      programe, din prima oră în care are o adresă publică. Automatizarea a
+      scurtat drastic intervalul dintre publicarea unei vulnerabilități și
+      exploatarea ei în masă — dar nu și intervalul în care o organizație
+      obișnuită apucă să repare.
+    </p>
+    <div class="cols3" style="margin-top:2mm">
+      <div class="stat"><b class="a">43</b>
+        <span>zile — media până la aplicarea unui patch într-o organizație
+          fără proces dedicat</span></div>
+      <div class="stat"><b class="t">5</b>
+        <span>zile — intervalul până la exploatarea în masă a unei
+          vulnerabilități nou publicate</span></div>
+      <div class="stat"><b>38</b>
+        <span>de zile în care ești descoperit, știind exact ce ai de reparat</span></div>
     </div>
-
-    <div class="stack" style="gap:.65rem">
-      <div class="ins w">
-        <span>🟠</span>
-        <div>
-          <b>5 adrese te atacă pe mai multe fronturi simultan</b>
-          <p>Apar în 3 surse independente în ultimele 48 h. Un scanner de masă
-             atinge o singură suprafață; cine încearcă trei te-a ales pe tine.</p>
-          <div class="do">De făcut: /block 203.0.113.41 24h</div>
-        </div>
-      </div>
-      <div class="ins w">
-        <span>🟠</span>
-        <div>
-          <b>root e ținta #1 — 1 086 încercări de la 93 adrese</b>
-          <p>Cât timp autentificarea SSH cu parolă pentru root e posibilă, fiecare
-             dintre aceste încercări are o șansă.</p>
-          <div class="do">De făcut: grep PermitRootLogin /etc/ssh/sshd_config</div>
-        </div>
-      </div>
-      <div class="ins w">
-        <span>🟠</span>
-        <div>
-          <b>Infrastructură concentrată de atac: Netiface America, Inc.</b>
-          <p>666 evenimente ostile de la doar 3 adrese din aceeași rețea. Asta e
-             infrastructură închiriată pentru atac, nu calculatoare compromise
-             răspândite — iar următoarea adresă va veni din același loc.</p>
-        </div>
-      </div>
-      <div class="ins w">
-        <span>🟠</span>
-        <div>
-          <b>5 blocări figurează în evidență dar nu mai sunt în firewall</b>
-          <p>Blocările nu supraviețuiesc intenționat unui reboot — e plasa
-             anti-lockout. Panoul ți-o spune în loc să te lase să crezi că ești
-             protejat.</p>
-        </div>
-      </div>
-      <div class="ins i">
-        <span>🔵</span>
-        <div>
-          <b>Campanie activă împotriva GLPI: 560 sondări</b>
-          <p>Persistentă și țintită — dar nu rulezi GLPI, deci nu te poate atinge.
-             E zgomot de fond, util doar ca să știi în ce val ești.</p>
-        </div>
-      </div>
-      <div class="ins g">
-        <span>🟢</span>
-        <div>
-          <b>Zero vulnerabilități de securitate deschise</b>
-          <p>4 716 au fost reparate și confirmate de scanarea următoare.</p>
-        </div>
-      </div>
-    </div>
-
-    <p class="caption">
-      Toate cele 11 observații de mai sus sunt generate din datele reale ale
-      serverului, fără apel la un model — pagina se randează instant și spune
-      același lucru de două ori la rând.
+    <p class="note" style="margin-top:9mm;border-color:#475569;color:#94A3B8">
+      Sursa cifrelor: articolul CryptoITData „Servere expuse la internet în era
+      atacurilor cu AI". Diferența dintre cele două numere este motivul pentru
+      care acest produs există.
     </p>
   </div>
+  <span class="foot">Sentinel by CryptoITData</span>
 </section>
 
-<!-- ═══════════════════════════════════ TELEGRAM 1 ══════════════════════ -->
-<section class="tg-world pagebreak">
-  <div class="wrap stack-lg">
-    <div class="head">
-      <span class="eyebrow">Canalul de urgență</span>
-      <h2>Alerta ajunge pe telefon cu butonul de oprire sub ea.</h2>
-      <p class="lede" style="color:#4a5560">
-        Long-polling, deci niciun port deschis în plus și niciun endpoint public
-        de falsificat. Funcționează chiar dacă nginx sau certificatul sunt stricate
-        — exact când ai nevoie de el.
-      </p>
-    </div>
-
-    <div class="phone">
-      <div class="tg-top">
-        <span class="tg-av">🛡️</span>
-        <div><b>Sentinel</b><span>bot · online</span></div>
-      </div>
-      <div class="tg-thread">
-        <div class="bub">
-          <div class="h">🚨 🟠 INCIDENT NOU #816 · HIGH</div>
-          <div class="h">Brute-force SSH de la 203.0.113.41</div>
-          <div>62 autentificări eșuate în 10 min, utilizatori încercați: 1, a,
-               admin, alex, ansadmin, craft, db2inst1, deploy, dev, ec2-user…</div>
-          <div>Sursă: <span class="m">203.0.113.41</span></div>
-          <div class="dim">Detecții: 91 · stare: open</div>
-          <div class="dim">Detalii: <span class="m">/incident 816</span></div>
-          <div class="tg-btns">
-            <div class="tg-row">
-              <span class="tg-btn">🚫 Blochează 203.0.113.41 (24h)</span>
-              <span class="tg-btn">❌ Ignoră</span>
-            </div>
-          </div>
-          <div class="tg-time">11:42</div>
-        </div>
-
-        <div class="bub me">
-          <div>🛡️ Blocat <span class="m">203.0.113.41</span>.</div>
-          <div class="tg-time">11:42</div>
-        </div>
-
-        <div class="bub me"><div class="m">/blocklist</div><div class="tg-time">11:43</div></div>
-
-        <div class="bub">
-          <div class="h">🚫 Blocklist — 5 active</div>
-          <div class="m">203.0.113.41</div>
-          <div class="m">203.0.113.50</div>
-          <div class="m">203.0.113.51</div>
-          <div class="m">203.0.113.52</div>
-          <div class="tg-btns">
-            <div class="tg-row"><span class="tg-btn">🚨 Golește TOT blocklistul</span></div>
-          </div>
-          <div class="tg-time">11:43</div>
-        </div>
-      </div>
-    </div>
-
-    <p class="tg-note" style="margin:0 auto; text-align:center">
-      Apăsarea butonului trece prin aceeași verificare de rol ca o comandă scrisă,
-      iar executorul refuză oricum să blocheze adresa de administrare — chiar dacă
-      butonul e apăsat din greșeală.
-    </p>
-  </div>
-</section>
-
-<!-- ═══════════════════════════════════ ANATOMIA ════════════════════════ -->
-<section class="pagebreak">
-  <div class="wrap stack-lg">
-    <div class="head">
-      <span class="eyebrow">De la pachet la decizie</span>
-      <h2>Ce se întâmplă între atac și butonul de pe telefon.</h2>
-    </div>
-
-    <div class="flow">
-      <div>
-        <span class="s">01 · COLECTARE</span>
-        <h3>Șase surse, filtrate la colector</h3>
-        <p>sshd, sudo/su, nginx, auditd, Suricata. Zgomotul e respins înainte de
-           bază — 96 000 de diagnostice de motor pe zi nu ajung niciodată acolo.</p>
-      </div>
-      <div>
-        <span class="s">02 · DETECȚIE</span>
-        <h3>Reguli deterministe, la 10 secunde</h3>
-        <p>Praguri oneste peste SQL indexat: brute-force, enumerare web, alerte
-           IDS, anomalie de volum. Zero cost per eveniment.</p>
-      </div>
-      <div>
-        <span class="s">03 · INCIDENT</span>
-        <h3>Deduplicat pe amprentă</h3>
-        <p>400 de încercări de la o adresă devin un incident, nu 400. Actorul
-           primește țară și operator din baze geo locale.</p>
-      </div>
-      <div>
-        <span class="s">04 · TRIAJ AI</span>
-        <h3>Judecată, nu scoruri</h3>
-        <p>Modelul recalibrează severitatea și scrie rezumatul în română.
-           Verdictul determinist rămâne alături — dezacordul e vizibil.</p>
-      </div>
-      <div>
-        <span class="s">05 · DECIZIE</span>
-        <h3>A ta, cu un tap</h3>
-        <p>Auto-block există și e testat, dar se livrează <strong>oprit</strong>.
-           Primele 72 h îți arată ce <em>ar fi</em> blocat.</p>
-      </div>
-    </div>
-  </div>
-</section>
-
-<!-- ═══════════════════════════════════ VULN + PATCH ════════════════════ -->
-<section class="pagebreak">
-  <div class="wrap stack-lg">
-    <div class="head">
-      <span class="eyebrow">Vulnerabilități și patching</span>
-      <h2>Scanarea e ușoară. Ce repari întâi e partea grea.</h2>
-      <p class="lede">
-        Prioritizare din <span class="mono">CVSS × EPSS × KEV × expunere ×
-        criticitate</span>. Un CVSS 6.5 pe lista CISA de exploatare activă întrece
-        un 9.8 pe care nu-l exploatează nimeni.
-      </p>
-    </div>
-
-    <div class="frame">
-      <div class="frame-bar">
-        <span class="dot3"><i></i><i></i><i></i></span>
-        <span class="frame-url">sentinel.exemplu.ro/patches/3</span>
-      </div>
-      <div class="frame-body">
-        <div class="stack" style="min-width:560px">
-          <div>
-            <h3 style="margin-bottom:.3rem">Plan de patch #3
-              <span class="pill warn" style="margin-left:.4rem">validat</span></h3>
-            <p style="font-size:.86rem;color:var(--ink-mid)">
-              țintă <strong>postgresql</strong> · hash
-              <span class="mono">909a1d35a818de31…</span>
-            </p>
-          </div>
-
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:.7rem">
-            <div class="panel-b">
-              <h4>Risc și impact</h4>
-              <table>
-                <tr><td>Nivel de risc</td><td class="r">high</td></tr>
-                <tr><td>Impact</td><td class="r">single-service</td></tr>
-                <tr><td>Downtime estimat</td><td class="r num">0s</td></tr>
-                <tr><td>Reversibil</td><td class="r">da</td></tr>
-                <tr><td>Necesită reboot</td><td class="r">nu</td></tr>
-              </table>
-            </div>
-            <div class="panel-b">
-              <h4>Preflight — verificări înainte</h4>
-              <table>
-                <tr><td class="mono" style="font-size:.76rem">verifica_disc</td><td class="r" style="color:var(--ink-mid)">disk_free</td></tr>
-                <tr><td class="mono" style="font-size:.76rem">fara_incident</td><td class="r" style="color:var(--ink-mid)">no_open_incident</td></tr>
-                <tr><td class="mono" style="font-size:.76rem">curl_instalat</td><td class="r" style="color:var(--ink-mid)">pkg_version</td></tr>
-              </table>
-            </div>
-          </div>
-
-          <div class="panel-b">
-            <h4>Aplicare · Revenire</h4>
-            <table>
-              <tr>
-                <td style="width:6rem;color:var(--ink-mid)">apply</td>
-                <td class="mono">dnf -y update curl</td>
-              </tr>
-              <tr>
-                <td style="color:var(--ink-mid)">rollback</td>
-                <td class="mono">dnf -y downgrade curl-7.76.1-29.el9</td>
-              </tr>
-              <tr>
-                <td style="color:var(--ink-mid)">backup</td>
-                <td class="mono">rpm_state · curl</td>
-              </tr>
-            </table>
-          </div>
-        </div>
-      </div>
-    </div>
-    <p class="caption">
-      Plan real, generat automat și validat din prima încercare. Rollback-ul
-      fixează corect versiunea veche — soluția plictisitoare care funcționează.
+<!-- 3 ─────────────────────────────────────────────────── CE ESTE SENTINEL ── -->
+<section class="pg" data-n="03">
+  <p class="eyebrow">Produsul</p>
+  <div class="body">
+    <h2>Un agent care rulează pe serverul tău și nu trimite nimic în afara lui.</h2>
+    <p class="lede" style="margin-bottom:7mm">
+      Nu este un SIEM, nu este un serviciu cloud și nu instalează un agent care
+      raportează unui terț. Se instalează nativ, sub systemd, cu bază de date
+      locală. Datele tale de securitate rămân pe mașina ta.
     </p>
 
-    <div class="flow">
+    <svg viewBox="0 0 900 210" style="width:100%;height:auto;margin:2mm 0 6mm"
+         role="img" aria-label="Fluxul: colectare, detecție, răspuns">
+      <defs>
+        <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6"
+                markerHeight="6" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="#94A3B8"/></marker>
+      </defs>
+      <g font-family="Segoe UI, sans-serif" font-size="12">
+        <!-- coloana 1: surse -->
+        <text x="8" y="16" font-size="10" font-weight="700" fill="#64748B"
+              letter-spacing="1.6">SURSE</text>
+        <g fill="#0F172A" font-size="12.5">
+          <text x="8" y="46">journald · sshd, sudo, su</text>
+          <text x="8" y="76">nginx / apache access</text>
+          <text x="8" y="106">auditd</text>
+          <text x="8" y="136">Suricata · eve.json</text>
+        </g>
+        <line x1="205" y1="88" x2="258" y2="88" stroke="#94A3B8" stroke-width="1.4"
+              marker-end="url(#a)"/>
+
+        <!-- coloana 2: determinist -->
+        <rect x="266" y="26" width="188" height="132" rx="10" fill="#F6F8FB"
+              stroke="#1AA394" stroke-width="1.6"/>
+        <text x="284" y="52" font-size="10" font-weight="700" fill="#1AA394"
+              letter-spacing="1.4">DETERMINIST · 24/7</text>
+        <g fill="#334155" font-size="12">
+          <text x="284" y="78">normalizare, geo/ASN</text>
+          <text x="284" y="100">4 familii de reguli</text>
+          <text x="284" y="122">actori · incidente</text>
+          <text x="284" y="144">decizia de blocare</text>
+        </g>
+        <line x1="454" y1="88" x2="507" y2="88" stroke="#94A3B8" stroke-width="1.4"
+              marker-end="url(#a)"/>
+
+        <!-- coloana 3: executor -->
+        <!-- 168 și nu 150: la 150, „SO_PEERCRED" ieșea din chenar. -->
+        <rect x="515" y="40" width="168" height="104" rx="10" fill="#fff"
+              stroke="#0F172A" stroke-width="1.6"/>
+        <text x="532" y="66" font-size="10" font-weight="700" fill="#0F172A"
+              letter-spacing="1.4">EXECUTOR · ROOT</text>
+        <g fill="#334155" font-size="12">
+          <text x="532" y="90">497 linii, stdlib</text>
+          <text x="532" y="112" font-size="11">socket unix, SO_PEERCRED</text>
+        </g>
+        <line x1="683" y1="92" x2="718" y2="92" stroke="#94A3B8" stroke-width="1.4"
+              marker-end="url(#a)"/>
+        <text x="726" y="88" font-size="12.5" fill="#0F172A">nftables</text>
+        <text x="726" y="108" font-size="11" fill="#64748B">seturi cu TTL în kernel</text>
+
+        <!-- ramura AI, deliberat sub linia principală și punctată: nu e pe
+             calea critică, iar desenul trebuie să spună asta -->
+        <line x1="360" y1="158" x2="360" y2="186" stroke="#26C6B5" stroke-width="1.4"
+              stroke-dasharray="4 3" marker-end="url(#a)"/>
+        <text x="376" y="184" font-size="11.5" fill="#1AA394">AI · triaj, corelare,
+          plan de patch — asincron, bugetat, niciodată pe calea critică</text>
+      </g>
+    </svg>
+
+    <div class="cols3">
+      <div class="card"><h3>Nu depinde de rețea</h3>
+        <p>Dacă API-ul de AI cade, detecția și blocarea continuă neschimbat.</p></div>
+      <div class="card"><h3>Nu deschide porturi noi</h3>
+        <p>Botul Telegram trage mesajele. Panoul web stă în spatele nginx-ului tău.</p></div>
+      <div class="card"><h3>Nu blochează implicit</h3>
+        <p>Pornește în mod „observă" 72 de ore. Vezi ce ar fi blocat, apoi decizi.</p></div>
+    </div>
+  </div>
+  <span class="foot">Sentinel by CryptoITData</span>
+</section>
+
+<!-- 4 ────────────────────────────────────────────────────── DETERMINIST ──
+     4 familii de reguli: sentinel/detect/rules.py, tuplul RULES. -->
+<section class="pg soft" data-n="04">
+  <p class="eyebrow">Stratul 1</p>
+  <div class="body">
+    <h2>Detecția rulează determinist, non-stop, la cost zero pe eveniment.</h2>
+    <p class="lede" style="margin-bottom:7mm">
+      Regulile nu cer un model și nu cer internet. Consumă evenimentele pe
+      măsură ce apar, construiesc profilul fiecărui actor și decid singure când
+      un tipar devine incident.
+    </p>
+    <div class="cols">
       <div>
-        <span class="s">01</span><h3>Generare</h3>
-        <p>Din faptele deterministe ale scanării. Nu i se dă niciun shell.</p>
+        <table class="kv">
+          <tr><td>Brute-force SSH</td>
+            <td>fereastră de 10 minute, praguri pe severitate: 8 încercări
+              medium, 25 high, 100 critical</td></tr>
+          <tr><td>Enumerare web</td>
+            <td>fereastră de 5 minute pe căi inexistente și tipare de scanare</td></tr>
+          <tr><td>Alerte Suricata</td>
+            <td>semnături ET Open, praguri diferite pe severitate</td></tr>
+          <tr><td>Anomalie de volum</td>
+            <td>mediană și MAD sezonier, nu medie — traficul de atac distruge
+              media. Scor z de la 3,5 în sus</td></tr>
+        </table>
       </div>
       <div>
-        <span class="s">02</span><h3>Validare</h3>
-        <p>Fiecare comandă e o listă, primul element dintr-o listă permisă,
-           <span class="mono">rm</span> interzis. Invalid → o reîncercare → respins.</p>
-      </div>
-      <div>
-        <span class="s">03</span><h3>Aprobare</h3>
-        <p>Două confirmări pe Telegram, token de unică folosință legat de hash.</p>
-      </div>
-      <div>
-        <span class="s">04</span><h3>Backup</h3>
-        <p>Punct verificat prin recitirea arhivelor. Fără el, patch-ul nu pornește.</p>
-      </div>
-      <div>
-        <span class="s">05</span><h3>Aplicare</h3>
-        <p>Pas cu pas, scris în bază <em>înainte</em> de fiecare comandă.</p>
-      </div>
-      <div>
-        <span class="s">06</span><h3>Revenire</h3>
-        <p>Automată la orice eșec. Un rollback eșuat e stare separată, mai gravă.</p>
+        <div class="card on" style="margin-bottom:5mm">
+          <h3>De ce mediană și MAD</h3>
+          <p>O medie mobilă e trasă în sus chiar de atacul pe care ar trebui
+            să îl semnaleze. După câteva ore de scanare, „normalul" include
+            scanarea. Mediana nu se lasă mutată de valorile extreme.</p>
+        </div>
+        <div class="card">
+          <h3>Perioadă de calibrare: 72 de ore</h3>
+          <p>Pragurile se așază pe traficul tău real înainte ca blocarea
+            automată să fie o opțiune. Un agent care poate bloca trafic fără
+            calibrare e un risc, nu o protecție.</p>
+        </div>
       </div>
     </div>
   </div>
+  <span class="foot">Sentinel by CryptoITData</span>
 </section>
 
-<!-- ═══════════════════════════════════ TELEGRAM 2 ══════════════════════ -->
-<section class="tg-world pagebreak">
-  <div class="wrap stack-lg">
-    <div class="head">
-      <span class="eyebrow">Aprobarea patch-urilor</span>
-      <h2>Primul tap nu aplică nimic.</h2>
-      <p class="lede" style="color:#4a5560">
-        Un buton trăiește în istoricul unui chat pentru totdeauna. Deci butonul nu
-        <em>e</em> autoritatea — poartă o referință către una: token de unică
-        folosință, legat de chat și de hash-ul planului, cu expirare.
-      </p>
-    </div>
-
-    <div class="phone">
-      <div class="tg-top">
-        <span class="tg-av">🛡️</span>
-        <div><b>Sentinel</b><span>bot · online</span></div>
+<!-- 5 ───────────────────────────────────────────────────────── STRATUL AI ── -->
+<section class="pg" data-n="05">
+  <p class="eyebrow">Stratul 2</p>
+  <div class="body">
+    <h2>Modelul redactează. Validatorul decide.</h2>
+    <p class="lede" style="margin-bottom:7mm">
+      Analiza cu AI intră după ce regula a decis, nu înainte. Verdictul
+      modelului se stochează <strong>lângă</strong> cel determinist, niciodată
+      peste el.
+    </p>
+    <div class="cols">
+      <div>
+        <p><span class="tag t">Ce face</span></p>
+        <ul style="margin-top:4mm">
+          <li>Triaj: citește incidentul serios și explică în română ce e real,
+            ce e zgomot și ce ai de făcut</li>
+          <li>Corelare: leagă incidente separate într-o singură campanie</li>
+          <li>Redactează procedura de patch, cu backup și rollback</li>
+          <li>Raport zilnic și întrebări libere peste propria bază de date</li>
+        </ul>
       </div>
-      <div class="tg-thread">
-        <div class="bub me"><div class="m">/patch 3</div><div class="tg-time">09:14</div></div>
-
-        <div class="bub">
-          <div class="h">🟠 Plan de patch #3 · risc high</div>
-          <div><b>Țintă:</b> postgresql (database)</div>
-          <div><b>Vulnerabilități:</b> CVE-2026-99999</div>
-          <div style="margin-top:.4rem">⏱️ Downtime estimat: <b>0s</b></div>
-          <div>💥 Impact: single-service</div>
-          <div>↩️ Reversibil: da</div>
-          <div>🔄 Necesită reboot: nu</div>
-          <div class="dim" style="margin-top:.4rem">Pași: 1 de aplicat · 1 de salvat · 1 de revenire</div>
-          <div class="tg-btns">
-            <div class="tg-row"><span class="tg-btn">🧪 Dry-run (nu schimbă nimic)</span></div>
-            <div class="tg-row">
-              <span class="tg-btn">✅ Aplică…</span>
-              <span class="tg-btn">❌ Respinge</span>
-            </div>
-          </div>
-          <div class="tg-time">09:14</div>
-        </div>
-
-        <div class="bub">
-          <div class="h">Confirmi aplicarea?</div>
-          <div style="margin-top:.35rem">Vei modifica <b>postgresql</b> pe acest server.</div>
-          <div>Downtime estimat: <b>0 secunde</b>.</div>
-          <div>Se creează întâi un punct de restaurare verificat.</div>
-          <div class="dim" style="margin-top:.35rem"><i>Confirmarea expiră în 5 minute.</i></div>
-          <div class="tg-btns">
-            <div class="tg-row">
-              <span class="tg-btn">✅ DA, aplică acum</span>
-              <span class="tg-btn">❌ Renunț</span>
-            </div>
-          </div>
-          <div class="tg-time">09:15</div>
-        </div>
-
-        <div class="bub">
-          <div class="h">✅ Patch succeeded (execuție #7)</div>
-          <div class="dim">Pași: 7/7 reușiți</div>
-          <div class="tg-time">09:16</div>
-        </div>
+      <div>
+        <p><span class="tag a">Ce nu are voie</span></p>
+        <ul style="margin-top:4mm">
+          <li class="no">Să decidă o blocare</li>
+          <li class="no">Să execute orice pe server</li>
+          <li class="no">Să stea pe calea critică a detecției</li>
+          <li class="no">Să depășească bugetul — verificat înainte de fiecare apel</li>
+        </ul>
       </div>
     </div>
-
-    <p class="tg-note" style="margin:0 auto; text-align:center">
-      Al doilea ecran aduce informație pe care primul n-o avea — altfel „ești
-      sigur?” e doar un dialog pe care oamenii îl închid din reflex. Dacă planul
-      se regenerează între timp, hash-ul se schimbă și toate butoanele vechi mor.
+    <p class="note a" style="margin-top:8mm">
+      <strong>Suprafața de atac pe care o aduce AI-ul.</strong> Liniile din log
+      sunt scrise de atacator. Dacă ajung la un model fără precauții, aia e
+      injecție de prompt în propria unealtă de securitate. Sunt tratate ca date
+      neîncrezute, transportul e read-only, iar suita de teste plantează
+      <code>IGNORE PREVIOUS INSTRUCTIONS</code> într-un access log și verifică
+      să nu se fi executat nimic.
     </p>
   </div>
+  <span class="foot">Sentinel by CryptoITData</span>
 </section>
 
-<!-- ═══════════════════════════════════ SIGURANȚĂ ═══════════════════════ -->
-<section class="pagebreak">
-  <div class="wrap stack-lg">
-    <div class="head">
-      <span class="eyebrow">Arhitectura de siguranță</span>
-      <h2>Un agent care poate bloca internetul trebuie judecat după ce refuză.</h2>
-      <p class="lede">
-        Tot ce e privilegiat trece printr-un singur proces root de câteva sute de
-        linii, fără dependențe și fără niciun import din restul aplicației.
-        Restul rulează neprivilegiat.
-      </p>
-    </div>
-
-    <div class="refuse">
+<!-- 6 ────────────────────────────────────────────────────────── TELEGRAM ──
+     34 de nume de comenzi înregistrate (alias RO + EN), sentinel/telegram/bot.py -->
+<section class="pg dark" data-n="06">
+  <p class="eyebrow">Interfața de urgență</p>
+  <div class="body">
+    <h2>Incidentul ajunge pe telefon în secunde. Răspunsul pleacă tot de acolo.</h2>
+    <p class="lede" style="margin-bottom:7mm">
+      Nu e un canal de notificări, e consola. Primești incidentul cu butoane de
+      acțiune, blochezi atacatorul cu o apăsare, ceri starea serverului și
+      pornești un patch — fără VPN, fără SSH, fără laptop.
+    </p>
+    <div class="cols">
       <div>
-        <b>Nu te poate încuia afară</b>
-        <p>Două straturi independente: tabela nftables are <span class="mono">policy
-           accept</span> cu allowlist înaintea blocărilor, iar executorul refuză
-           direct adresa de administrare. Verificat live — refuzul funcționează.</p>
+        <h3 style="margin-bottom:3mm">Citire</h3>
+        <p style="font:600 9.5pt/1.9 var(--mono);color:var(--teal-br);max-width:none">
+          /dashboard · /status · /incidente · /vulnerabilitati<br>
+          /servicii · /sanatate · /evenimente · /blocate<br>
+          /patchuri · /autoverificare
+        </p>
+        <h3 style="margin:6mm 0 3mm">Acțiune</h3>
+        <p style="font:600 9.5pt/1.9 var(--mono);color:#FF8A86;max-width:none">
+          /blocheaza · /deblocheaza · /rezolva<br>
+          /falspozitiv · /liniste · /panic
+        </p>
       </div>
       <div>
-        <b>Panoul nu poate bloca pe nimeni</b>
-        <p>Interfața web poate doar <em>anula</em> o blocare, niciodată crea una.
-           Un panou compromis rămâne o scurgere de date, nu o preluare de control.</p>
-      </div>
-      <div>
-        <b class="x">rm</b>
-        <p>Absent din lista de binare permise pentru patch-uri. Ștergerea trece
-           printr-o singură operație, limitată strict la directorul de backup, cu
-           calea reverificată după rezolvare.</p>
-      </div>
-      <div>
-        <b>Scriptul de restaurare se scrie singur</b>
-        <p>Generat <em>în interiorul</em> executorului, din ce vede el pe disc.
-           Text venit din partea neprivilegiată nu devine niciodată o linie
-           executabilă rulată ca root.</p>
-      </div>
-      <div>
-        <b>Un backup gol nu e un backup</b>
-        <p>Arhivele sunt recitite și rehash-uite la sigilare. Un artefact de
-           dimensiune zero e respins — altfel arată ca o cale de întoarcere exact
-           până când ai nevoie de ea.</p>
-      </div>
-      <div>
-        <b>Nu poate fi păcălit prin loguri</b>
-        <p>Liniile de log sunt împachetate ca date neîncrezute, iar modelul poate
-           returna doar un verdict structurat. O injecție reușită schimbă o
-           etichetă, niciodată sistemul.</p>
-      </div>
-      <div>
-        <b>Retenția nu șterge ultima cale</b>
-        <p>Nu se șterge niciodată ultimul punct de restaurare al unui asset,
-           oricât de vechi. O retenție care poate face asta e pierdere de date pe
-           cronometru.</p>
-      </div>
-      <div>
-        <b>Golire de urgență</b>
-        <p><span class="mono">touch /etc/sentinel/PANIC</span> golește blocklistul
-           la fiecare 10 secunde cât timp fișierul există. Blocările nu supraviețuiesc
-           unui reboot — repornirea e mereu o ieșire.</p>
+        <table class="kv">
+          <tr><td>Fără port deschis</td>
+            <td>Botul trage mesajele. Nu există endpoint public de falsificat.</td></tr>
+          <tr><td>Rezistent la cădere</td>
+            <td>Dacă nginx, TLS-ul sau panoul web cad, canalul rămâne în picioare.</td></tr>
+          <tr><td>Confirmare dublă</td>
+            <td>Acțiunile distructive cer o a doua confirmare care restatează ținta.</td></tr>
+          <tr><td>Butoane cu termen</td>
+            <td>Token opac, valabil o singură dată; dacă planul se regenerează,
+              butoanele vechi mor.</td></tr>
+          <tr><td>Ore de liniște</td>
+            <td>Programabile. Alertele critice și cele de autodiagnostic trec
+              întotdeauna.</td></tr>
+        </table>
       </div>
     </div>
   </div>
+  <span class="foot">Sentinel by CryptoITData</span>
 </section>
 
-<!-- ═══════════════════════════════════ INSTALARE ═══════════════════════ -->
-<section class="pagebreak">
-  <div class="wrap stack-lg">
-    <div class="head">
-      <span class="eyebrow">Instalare</span>
-      <h2>O comandă, și nimic nu se schimbă până nu spui da.</h2>
-      <p class="lede">
-        Wizard-ul își dă seama singur unde rulează: pe laptopul tău întreabă o
-        țintă și instalează prin SSH, pe server sare peste jumătatea de SSH.
-      </p>
-    </div>
-
-    <div class="term">
-      <div class="term-bar">bash</div>
-      <div class="term-body">
-        <span class="c">git clone https://github.com/dragosnimu/sentinel.git</span>
-        <span class="c">cd sentinel &amp;&amp; ./scripts/wizard.sh --dry-run</span>
-        <span class="o">&nbsp;</span>
-        <span class="o ok">✓ AlmaLinux 9.8 (familia rhel)</span>
-        <span class="o ok">✓ python3.12 — 5208 MB memorie — 94 GB liberi</span>
-        <span class="o ok">✓ nginx deține 80/443 → modul „shared" e disponibil</span>
-        <span class="o">! portul 8443 e ocupat de altcineva</span>
-        <span class="o">&nbsp;</span>
-        <span class="cm">--dry-run: nu s-a modificat nimic.</span>
-      </div>
-    </div>
-
-    <div class="flow">
+<!-- 7 ───────────────────────────────────────────── RĂSPUNS / ANTI-LOCKOUT ── -->
+<section class="pg soft" data-n="07">
+  <p class="eyebrow">Răspunsul</p>
+  <div class="body">
+    <h2>Poate bloca trafic. Deci prioritatea de proiectare a fost să nu te
+      blocheze pe tine.</h2>
+    <div class="cols" style="margin-top:5mm">
       <div>
-        <span class="s">01 · ÎNTREABĂ</span>
-        <h3>Nimic nu se ghicește tăcut</h3>
-        <p>Ținta, domeniul, modul nginx, adresa ta de administrare, Telegram,
-           cheia AI. Unde există un default rezonabil, îl vezi înainte să-l
-           accepți.</p>
+        <ul>
+          <li><strong>Tabelă nftables proprie, cu <code>policy accept</code>.</strong>
+            E o listă de refuz, nu un firewall. O defecțiune nu închide serverul.</li>
+          <li><strong>Blocările nu se persistă.</strong> Un reboot e întotdeauna
+            o ieșire dintr-o blocare făcută din greșeală.</li>
+          <li><strong>Adresa ta intră în allowlist înainte de orice regulă.</strong>
+            Refuzul e impus în executorul root, nu doar în firewall.</li>
+          <li><strong>Expirare în kernel.</strong> Seturile au TTL propriu, deci
+            blocările expiră corect chiar dacă Sentinel e oprit.</li>
+        </ul>
       </div>
       <div>
-        <span class="s">02 · VERIFICĂ</span>
-        <h3>Doar citește</h3>
-        <p>Distribuție, memorie, disc, cine deține 80/443, dacă portul cerut e
-           liber, dacă domeniul rezolvă aici. Nimic nu se atinge.</p>
-      </div>
-      <div>
-        <span class="s">03 · REZUMĂ</span>
-        <h3>Ultimul punct de ieșire</h3>
-        <p>Tot ce urmează să se schimbe, pe ecran, înainte de confirmare. Un
-           installer care a editat deja nginx când te întreabă, te minte.</p>
-      </div>
-      <div>
-        <span class="s">04 · INSTALEAZĂ</span>
-        <h3>Numerotat și reluabil</h3>
-        <p>Fiecare pas are marker pe disc. Dacă un serviciu al tău s-a oprit,
-           instalarea face rollback singură.</p>
+        <div class="card on">
+          <h3>Watchdog independent, la 60 de secunde</h3>
+          <p style="margin-bottom:3mm">Rulează ca root, fără nicio dependență de
+            restul aplicației — trebuie să funcționeze exact când tot ce e în
+            jur a căzut. Golește lista de blocări dacă:</p>
+          <ul style="margin-top:2mm">
+            <li style="font-size:9pt">există fișierul <code>/etc/sentinel/PANIC</code></li>
+            <li style="font-size:9pt">panoul web e jos de peste 5 minute</li>
+            <li style="font-size:9pt">detectorul e în buclă de repornire</li>
+            <li style="font-size:9pt">se depășește plafonul de blocări</li>
+          </ul>
+        </div>
+        <p class="note" style="margin-top:5mm">
+          Plafoane în cod, nu în configurație: maximum 60 de blocări pe minut și
+          20 000 de elemente. Un detector scăpat de sub control nu poate
+          black-hole-ui internetul.
+        </p>
       </div>
     </div>
+  </div>
+  <span class="foot">Sentinel by CryptoITData</span>
+</section>
 
-    <div class="refuse">
-      <div>
-        <b>Secretele nu ajung în tabela de procese</b>
-        <p>Tokenul de bot și cheia API se citesc cu ecoul stins și călătoresc pe
-           stdin. Ca argument de linie de comandă, <span class="mono">ps</span>
-           le-ar arăta oricărui cont de pe gazdă.</p>
-      </div>
-      <div>
-        <b>Două familii de distribuții, un singur fișier</b>
-        <p>RHEL (AlmaLinux, Rocky, CentOS Stream, Fedora) și Debian (Debian,
-           Ubuntu). Tot ce diferă stă în
-           <span class="mono">deploy/lib/distro.sh</span>.</p>
-      </div>
-      <div>
-        <b>Ce nu e suportat, e refuzat pe nume</b>
-        <p><span class="x">unsupported distribution</span>
-           O gazdă la care instalarea a eșuat vizibil e recuperabilă. Una care
-           pare protejată și nu e, nu.</p>
-      </div>
+<!-- 8 ──────────────────────────────────────────────────────────── PATCHING ── -->
+<section class="pg" data-n="08">
+  <p class="eyebrow">Vulnerabilități</p>
+  <div class="body">
+    <h2>Procedura de reparare se scrie singură. Aplicarea rămâne decizia ta.</h2>
+    <p class="lede" style="margin-bottom:6mm">
+      Prioritizarea contează mai mult decât scanarea: severitatea se combină cu
+      probabilitatea de exploatare, cu prezența în catalogul de vulnerabilități
+      exploatate activ și cu expunerea reală a serviciului pe mașina ta.
+    </p>
+    <div class="cols4" style="margin-bottom:7mm">
+      <div class="card"><h3>1 · Plan</h3>
+        <p>JSON validat de schemă: preflight, backup, aplicare, verificare de
+          sănătate, rollback, post-verificare.</p></div>
+      <div class="card"><h3>2 · Validare</h3>
+        <p>Validator determinist. Comenzile sunt liste de argumente, niciodată
+          text de shell. Listă de binare permise, listă de căi interzise.</p></div>
+      <div class="card"><h3>3 · Aprobare</h3>
+        <p>Pe Telegram: dry-run, aplică, respinge, programează. „Aplică" cere o
+          a doua confirmare care restatează ținta și downtime-ul.</p></div>
+      <div class="card"><h3>4 · Execuție</h3>
+        <p>Pas cu pas, fiecare scris în jurnal înainte de următorul. Rollback
+          automat la orice eșec, cu notificare indiferent de orele de liniște.</p></div>
     </div>
-
-    <p class="caption">
-      Răspunsurile se pot salva și relua neasistat — al doilea server, sau o
-      refacere, nu mai cer nicio întrebare.
+    <p class="note">
+      <strong>Un plan invalid nu se execută niciodată parțial.</strong> Dacă
+      validatorul îl refuză, se regenerează o dată cu erorile reinjectate; dacă
+      și atunci e invalid, se stochează ca respins și nu se atinge serverul.
+      Punctul de restaurare cel mai recent reușit nu se șterge niciodată,
+      indiferent de vechime — nu se elimină singura cale de întoarcere.
     </p>
   </div>
+  <span class="foot">Sentinel by CryptoITData</span>
 </section>
 
-<!-- ═══════════════════════════════════ STARE ═══════════════════════════ -->
-<section class="pagebreak">
-  <div class="wrap stack-lg">
-    <div class="head">
-      <span class="eyebrow">Stadiu</span>
-      <h2>Ce e livrat și rulează în producție.</h2>
+<!-- 9 ────────────────────────────────────────────────────── AUTOVERIFICARE ──
+     32 de verificări: numărul raportat de serviciu în producție. -->
+<section class="pg dark" data-n="09">
+  <p class="eyebrow">Diferența</p>
+  <div class="body">
+    <h2>Se verifică singur, la fiecare 5 minute, și îți spune când nu
+      funcționează.</h2>
+    <p class="lede" style="margin-bottom:8mm">
+      Cel mai periculos mod în care cade un produs de securitate este tăcut:
+      serviciul e activ, jurnalul e curat, dashboard-ul se încarcă — și de
+      douăzeci de ore nu mai colectează nimic. Autodiagnosticul a fost construit
+      exact pentru clasa asta de defect.
+    </p>
+    <div class="cols3" style="margin-bottom:8mm">
+      <div class="stat"><b class="t">32</b>
+        <span>de verificări la fiecare 5 minute, raportate pe Telegram
+          la schimbarea stării</span></div>
+      <div class="stat"><b class="t">814</b>
+        <span>teste automate în suită, rulate la fiecare modificare</span></div>
+      <div class="stat"><b class="t">497</b>
+        <span>linii în singura componentă care rulează ca root, fără nicio
+          dependență externă</span></div>
     </div>
-
-    <div class="proof">
-      <div><span class="v num">514</span><span class="k">teste automate</span></div>
-      <div><span class="v num">31</span><span class="k">invariante de siguranță</span></div>
-      <div><span class="v num">7</span><span class="k">servicii systemd</span></div>
-      <div><span class="v num">13</span><span class="k">migrații de schemă</span></div>
-      <div><span class="v num ok">0</span><span class="k">dependențe CDN</span></div>
-    </div>
-
-    <div class="stack narrow">
-      <p>
-        Colectare din șase surse, detecție deterministă, incidente cu triaj AI,
-        blocare cu buton pe Telegram, scanare de vulnerabilități cu prioritizare
-        KEV, generare și aplicare de patch-uri cu backup verificat și revenire
-        automată. Interfață web fără JavaScript terț, cu politică de securitate
-        strictă și zero resurse externe.
-      </p>
-      <p style="color:var(--ink-mid)">
-        Auto-block-ul se livrează <strong>oprit</strong> — mașinăria e completă și
-        testată, dar primele 72 de ore sunt de observare, ca să găsești
-        fals-pozitivele înainte să tai pe cineva la 3 dimineața. Patch-urile se
-        generează automat; nu se aplică niciodată fără două confirmări explicite.
-      </p>
-    </div>
+    <p style="font-size:10pt;color:#94A3B8;max-width:82ch">
+      Verificările măsoară <strong>efectul</strong>, nu procesul. Că un serviciu
+      e „activ" nu dovedește nimic. Că un colector a scris un rând, că nucleul
+      chiar ține tabela de blocare, că executorul a răspuns, că baza de date
+      înregistrează ce spune interfața — acelea sunt fapte.
+    </p>
   </div>
+  <span class="foot">Sentinel by CryptoITData</span>
 </section>
 
-<div class="wrap foot">
-  <p>
-    Sentinel 0.19.1 · RHEL sau Debian, cu systemd · cifrele din această pagină sunt
-    extrase dintr-o instalare reală în producție, la momentul generării.
-  </p>
-</div>
+<!-- 10 ─────────────────────────────────────────────────── PER CLIENT ── -->
+<section class="pg soft" data-n="10">
+  <p class="eyebrow">Livrarea</p>
+  <div class="body">
+    <h2>Nu se instalează la fel la doi clienți.</h2>
+    <p class="lede" style="margin-bottom:6mm">
+      La instalare, Sentinel descoperă ce rulează pe mașină și scrie un inventar
+      pe care îl confirmi tu. Colectorii, regulile și pragurile se ajustează
+      după el.
+    </p>
+    <table class="kv">
+      <tr><td>Site public</td>
+        <td>colector de acces nginx sau apache, reguli de enumerare, verificări
+          de anteturi și TLS</td></tr>
+      <tr><td>WordPress / PHP</td>
+        <td>reguli pentru tiparele de sondare a pluginurilor, corelare cu
+          vulnerabilitățile deschise ale componentelor instalate</td></tr>
+      <tr><td>Docker</td>
+        <td>lanțul <code>forward</code> inclus în tabelă — fără el, un atacator
+          „blocat" ar ajunge în continuare la porturile publicate ale
+          containerelor</td></tr>
+      <tr><td>Bază de date</td>
+        <td>reguli de acces, verificarea expunerii portului, includere în
+          procedura de backup dinaintea patch-urilor</td></tr>
+      <tr><td>Sub 2,5 GB RAM</td>
+        <td>Suricata rulează în mod log-only. Se pierde inspecția de semnături,
+          se păstrează restul — mai bine decât un serviciu care omoară
+          aplicația pe care serverul există ca să o ruleze</td></tr>
+      <tr><td>Acces din birou</td>
+        <td>intervalul intră permanent în allowlist. Un singur actor rău dintr-o
+          rețea NAT ar bloca altfel toată clădirea</td></tr>
+      <tr><td>Flux de volum mare</td>
+        <td>filtru la nivel de captură pentru telemetrie sau syslog fără valoare
+          de securitate — altfel umple discul</td></tr>
+    </table>
+  </div>
+  <span class="foot">Sentinel by CryptoITData</span>
+</section>
+
+<!-- 11 ─────────────────────────────────────────────────────────── PACHETE ── -->
+<section class="pg" data-n="11">
+  <p class="eyebrow">Comercial</p>
+  <div class="body">
+    <h2>Trei niveluri. Licența e per server.</h2>
+    <div class="cols3" style="margin-top:5mm">
+      <div class="card">
+        <span class="tag m">Instalare</span>
+        <h3 style="margin:3mm 0 2mm">Plată unică</h3>
+        <p style="margin-bottom:3mm">Pentru echipe care au deja pe cineva tehnic
+          și vor unealta, configurată corect.</p>
+        <ul>
+          <li style="font-size:9pt">Evaluare și inventar confirmat</li>
+          <li style="font-size:9pt">Instalare pe stack-ul tău, calibrare 72h</li>
+          <li style="font-size:9pt">Triaj AI cu verdict în română</li>
+          <li style="font-size:9pt">Telegram și panou web propriu</li>
+          <li style="font-size:9pt">Documentație de operare</li>
+        </ul>
+      </div>
+      <div class="card on">
+        <span class="tag t">Administrat · cel mai ales</span>
+        <h3 style="margin:3mm 0 2mm">Abonament lunar</h3>
+        <p style="margin-bottom:3mm">Pentru firme fără om de securitate dedicat.
+          Noi ne uităm, tu decizi ce se aplică.</p>
+        <ul>
+          <li style="font-size:9pt">Tot ce e în „Instalare"</li>
+          <li style="font-size:9pt">Revizuim incidentele și ajustăm regulile lunar</li>
+          <li style="font-size:9pt">Planurile de patch verificate de noi înainte
+            să ajungă la tine</li>
+          <li style="font-size:9pt">Raport lunar și actualizări incluse</li>
+          <li style="font-size:9pt">Suport la incident, în program</li>
+        </ul>
+      </div>
+      <div class="card">
+        <span class="tag m">Flotă</span>
+        <h3 style="margin:3mm 0 2mm">Pe bază de proiect</h3>
+        <p style="margin-bottom:3mm">Pentru mai multe servere sau clienți.
+          Configurație per mașină, vedere unificată.</p>
+        <ul>
+          <li style="font-size:9pt">Tot ce e în „Administrat", pe fiecare mașină</li>
+          <li style="font-size:9pt">Instalare repetabilă din fișier de configurație</li>
+          <li style="font-size:9pt">Praguri și excepții per server</li>
+          <li style="font-size:9pt">Instruire pentru echipa ta</li>
+          <li style="font-size:9pt">SLA negociat</li>
+        </ul>
+      </div>
+    </div>
+    <p class="note" style="margin-top:7mm">
+      Perioada de calibrare de 72 de ore este inclusă în toate pachetele și nu
+      este opțională.
+    </p>
+  </div>
+  <span class="foot">Sentinel by CryptoITData</span>
+</section>
+
+<!-- 12 ────────────────────────────────────────────────────────── LIMITĂRI ──
+     Lista e menținută împreună cu codul. sentinel-maintenance: defect
+     cunoscut, identificat 05.08.2026 în producție. -->
+<section class="pg soft" data-n="12">
+  <p class="eyebrow">Onestitate</p>
+  <div class="body">
+    <h2>Ce nu face, spus înainte de contract.</h2>
+    <p class="lede" style="margin-bottom:6mm">
+      Orice produs de securitate are margini. Un furnizor care nu ți le arată
+      nu înseamnă că nu le are — înseamnă că le vei descoperi singur, la
+      momentul cel mai prost.
+    </p>
+    <div class="cols">
+      <ul>
+        <li>Logurile din interiorul containerelor nu sunt colectate. Se văd
+          evenimentele de rețea și cele ale gazdei, nu ce scrie aplicația
+          în container.</li>
+        <li>Nu există monitor dedicat de integritate a fișierelor dincolo de
+          ce oferă auditd.</li>
+        <li>Instalarea pe Debian e acoperită de teste, dar nu a fost încă
+          rulată pe o gazdă Debian reală.</li>
+      </ul>
+      <ul>
+        <li>Predicția pe tipare istorice are nevoie de câteva săptămâni de date
+          proprii înainte să însemne ceva.</li>
+        <li>Serviciul de mentenanță — retenția partițiilor, agregatele și
+          reîmprospătarea fluxurilor de intelligence — nu este implementat în
+          versiunea curentă. Identificat în producție, în lucru.</li>
+        <li>Nu înlocuiește backup-ul, nu înlocuiește un WAF și nu face
+          audit de conformitate.</li>
+      </ul>
+    </div>
+    <p class="note a" style="margin-top:7mm">
+      Ultimul punct e cel mai recent și e cel mai instructiv: a fost găsit de
+      verificarea post-instalare a produsului însuși, nu de un client. Așa
+      arată un proces care funcționează.
+    </p>
+  </div>
+  <span class="foot">Sentinel by CryptoITData</span>
+</section>
+
+<!-- 13 ───────────────────────────────────────────────────────── CONTACT ── -->
+<section class="pg dark" data-n="13">
+  <p class="eyebrow">Următorul pas</p>
+  <div class="body">
+    <h2 style="font-size:26pt;max-width:44ch">Începem cu o discuție, nu cu o
+      factură.</h2>
+    <p class="lede" style="margin-bottom:10mm;max-width:64ch">
+      Treizeci de minute, gratuit și fără obligații. Ne spui ce server ai și ce
+      rulează pe el. Îți spunem ce e expus, ce te atacă în momentul ăsta și dacă
+      Sentinel are sens în cazul tău — inclusiv dacă răspunsul e „nu încă".
+    </p>
+    <table class="kv" style="max-width:120mm">
+      <tr><td>Web</td><td>cryptoitdata.eu</td></tr>
+      <tr><td>Programare</td><td>cryptoitdata.eu/contact</td></tr>
+      <tr><td>Documentație tehnică</td><td>la cerere, înainte de contract</td></tr>
+    </table>
+    <p style="margin-top:12mm;font:600 11pt/1 var(--text);color:#fff">
+      Sentinel <span style="color:#475569;font-weight:400">by</span> CryptoITData
+    </p>
+  </div>
+  <span class="foot">Expertiză corporate. Livrată rapid.</span>
+</section>
 
 </body>
 </html>
