@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>Sentinel — analiză cu AI în timp real pentru serverul tău | CRYPTOITDATA</title>
-<meta name="description" content="Detecție deterministă non-stop plus analiză cu AI în timp real: triaj în sub două minute, verdict în română, procedură de patch redactată automat. Configurat pentru serverul tău, livrat și calibrat de CRYPTOITDATA.">
+<title>Sentinel by CryptoITData — analiză cu AI în timp real pentru serverul tău</title>
+<meta name="description" content="Detecție deterministă non-stop plus analiză cu AI în timp real: triaj în sub două minute, verdict în română, procedură de patch redactată automat. Raportare și administrare din Telegram. Configurat pentru serverul tău, livrat și calibrat de CryptoITData.">
 
 <meta property="og:title" content="Sentinel — analiză cu AI în timp real, configurată pentru serverul tău">
 <meta property="og:description" content="43 de zile ca să repari. 5 zile până la exploatare în masă. Un agent care închide diferența — instalat și calibrat pentru serverul tău.">
@@ -82,7 +82,9 @@ section{padding:var(--pad) 0}
   color:#fff;text-decoration:none;letter-spacing:-.02em}
 .brand i{width:26px;height:26px;border-radius:8px;flex:none;
   background:linear-gradient(140deg,var(--teal),var(--blue))}
-.brand small{font:500 .7rem/1 var(--body);color:#64748B;letter-spacing:.12em;text-transform:uppercase}
+/* Fără text-transform: numele companiei se scrie CryptoITData, iar un
+   uppercase l-ar transforma în CRYPTOITDATA peste tot unde apare. */
+.brand small{font:500 .74rem/1 var(--body);color:#64748B;letter-spacing:.04em}
 .topbar .btn{padding:11px 22px;font-size:.9rem}
 
 /* --------------------------------------------------------------------- hero */
@@ -316,6 +318,84 @@ section{padding:var(--pad) 0}
   transition:opacity .55s cubic-bezier(.2,.7,.3,1),transform .55s cubic-bezier(.2,.7,.3,1)}
 .js-reveal .stagger.in>*{opacity:1;transform:none}
 
+.topbar .btn .sm{display:none}
+@media(max-width:640px){
+  .topbar .btn{padding:11px 15px;font-size:.84rem;white-space:nowrap}
+  .topbar .btn .lg{display:none}
+  .topbar .btn .sm{display:inline}
+  /* Marca se strânge ca butonul să încapă pe un rând. Preferabil variantei de
+     a ascunde „by CryptoITData" — el e chiar afirmația de proprietate. */
+  .brand{font-size:.95rem;gap:.5rem}
+  .brand i{width:23px;height:23px}
+  .brand small{font-size:.64rem}
+}
+
+/* ── Fundal animat ─────────────────────────────────────────────────────────
+   Aceeași structură ca pe cryptoitdata.eu: canvas full-bleed în hero-ul
+   întunecat, în spatele conținutului, fără evenimente de mouse, mascat să
+   dispară complet spre baza secțiunii. Masca e ce îl face fundal și nu
+   ilustrație — se stinge înainte să atingă textul de jos. */
+.bg-canvas{position:absolute;inset:0;z-index:0;pointer-events:none;overflow:hidden;
+  -webkit-mask-image:linear-gradient(to bottom,#000 55%,transparent 100%);
+          mask-image:linear-gradient(to bottom,#000 55%,transparent 100%)}
+.bg-canvas canvas{display:block;width:100%;height:100%}
+.hero .hero-grid{z-index:1}
+
+/* ── Telegram ──────────────────────────────────────────────────────────── */
+.tg{display:grid;gap:32px;margin-top:54px}
+@media(min-width:1000px){.tg{grid-template-columns:.92fr 1.08fr;align-items:start}}
+
+.phone{background:#04060F;border:1px solid rgb(255 255 255/.09);
+  border-radius:26px;overflow:hidden;box-shadow:0 34px 80px -34px rgb(0 0 0/.85)}
+.tg-bar{display:flex;align-items:center;gap:.65rem;padding:15px 18px;
+  border-bottom:1px solid rgb(255 255 255/.07);
+  font:600 .84rem/1 var(--body);color:#E2E8F0}
+.tg-bar i{width:30px;height:30px;border-radius:50%;flex:none;display:grid;
+  place-items:center;font:800 .82rem/1 var(--body);color:#fff;font-style:normal;
+  background:linear-gradient(140deg,#2AABEE,#229ED9)}
+.tg-bar u{text-decoration:none;font:500 .7rem/1.3 var(--body);color:#64748B;display:block}
+.tg-bar em{margin-left:auto;font-style:normal;display:inline-flex;align-items:center;
+  gap:.4rem;font:600 .7rem/1 var(--body);color:var(--teal)}
+.tg-bar em s{text-decoration:none;width:6px;height:6px;border-radius:50%;
+  background:var(--teal);animation:blip 2s ease-in-out infinite}
+
+.tg-body{padding:16px;display:flex;flex-direction:column;gap:11px;
+  height:452px;overflow:hidden;font:500 .83rem/1.5 var(--body)}
+.msg{max-width:89%;padding:11px 13px;border-radius:15px;
+  opacity:0;transform:translateY(9px);animation:msgIn .32s ease forwards}
+.msg.bot{background:#111A2C;color:#DDE5F0;align-self:flex-start;
+  border:1px solid rgb(255 255 255/.06);border-bottom-left-radius:5px}
+.msg.me{background:#17544D;color:#EAFBF8;align-self:flex-end;
+  border-bottom-right-radius:5px;font:600 .81rem/1.4 var(--mono)}
+.msg b{color:#fff;font-weight:700}
+.msg .sev{color:var(--alert)}
+.msg .go{color:var(--teal)}
+.msg .t{display:block;margin-top:7px;font:500 .68rem/1.3 var(--body);color:#64748B}
+.msg .kb{display:flex;flex-wrap:wrap;gap:6px;margin-top:11px}
+.msg .kb i{font-style:normal;padding:7px 10px;border-radius:9px;
+  background:rgb(255 255 255/.05);border:1px solid rgb(255 255 255/.1);
+  font:600 .73rem/1 var(--body);color:#CBD5E1;transition:all .25s ease}
+.msg .kb i.hit{background:var(--teal);border-color:var(--teal);color:#04211E;
+  animation:tapped .45s ease}
+@keyframes msgIn{to{opacity:1;transform:none}}
+@keyframes tapped{45%{transform:scale(.9)}}
+
+/* Cele trei coloane din dreapta. Ordinea nu e decorativă: primești, execuți,
+   apoi întrebi — exact secvența pe care o joacă transcriptul din stânga. */
+.tg-side{display:grid;gap:14px}
+.tg-card{background:var(--night);border:1px solid rgb(255 255 255/.07);
+  border-radius:var(--r);padding:22px 24px;color:#E2E8F0}
+.tg-card h3{margin:0;font:700 1.06rem/1.3 var(--display);letter-spacing:-.01em}
+.tg-card p{margin:.55rem 0 0;font-size:.92rem;line-height:1.6;color:#94A3B8}
+.tg-card .lat{display:inline-flex;align-items:center;gap:.45rem;margin-bottom:.7rem;
+  padding:5px 11px;border-radius:999px;font:700 .68rem/1 var(--body);
+  letter-spacing:.1em;text-transform:uppercase;
+  background:rgb(38 198 181/.12);color:var(--teal)}
+.cmds{display:flex;flex-wrap:wrap;gap:6px;margin-top:.95rem}
+.cmds code{font:600 .77rem/1 var(--mono);padding:6px 9px;border-radius:8px;
+  background:rgb(38 198 181/.09);border:1px solid rgb(38 198 181/.22);color:var(--teal)}
+.cmds code.act{background:rgb(240 82 77/.09);border-color:rgb(240 82 77/.24);color:#FF8A86}
+
 @media(prefers-reduced-motion:reduce){
   *,*::before,*::after{animation:none!important;transition:none!important}
   .js-reveal .reveal,.js-reveal .stagger>*{opacity:1!important;transform:none!important}
@@ -338,16 +418,21 @@ section{padding:var(--pad) 0}
 
 <header class="topbar">
   <div class="wrap">
-    <a class="brand" href="https://cryptoitdata.eu"><i></i>SENTINEL <small>de CRYPTOITDATA</small></a>
-    <a class="btn btn-primary" href="#oferta">Cere ofertă</a>
+    <a class="brand" href="https://cryptoitdata.eu"><i></i>Sentinel <small>by CryptoITData</small></a>
+    <!-- Eticheta lungă se rupe pe trei rânduri într-o bară de 375px. Textul
+         scurt e pentru telefon, nu o prescurtare de dragul esteticii. -->
+    <a class="btn btn-primary" href="#discutie"
+      ><span class="lg">Programează o discuție gratuită</span
+      ><span class="sm">Discuție gratuită</span></a>
   </div>
 </header>
 
 <!-- ════════════════════════════════════════════════════════════════ HERO ══ -->
 <section class="hero dark">
+  <div class="bg-canvas" aria-hidden="true"></div>
   <div class="wrap hero-grid">
     <div>
-      <span class="pill"><b></b> Produs livrat și calibrat de CRYPTOITDATA</span>
+      <span class="pill"><b></b> Produs livrat și calibrat de CryptoITData</span>
       <h1>Analiză cu AI în timp real, <span class="hl">configurată pentru serverul tău</span>.</h1>
       <p class="lede" style="margin-top:1.4rem;max-width:55ch">
         Detecția rulează determinist, non-stop, la cost zero. Un model citește
@@ -357,8 +442,8 @@ section{padding:var(--pad) 0}
         tău, predat cu tot cu documentație.
       </p>
       <div class="hero-actions">
-        <a class="btn btn-primary" href="#oferta">Cere ofertă pentru serverul meu</a>
-        <a class="btn btn-ghost" href="#ai">Ce face AI-ul, concret</a>
+        <a class="btn btn-primary" href="#discutie">Programează o discuție gratuită</a>
+        <a class="btn btn-ghost" href="#telegram">Vezi cum răspunde pe Telegram</a>
       </div>
       <p class="hero-note">
         O singură mașină sau o flotă. Fără SIEM, fără agent extern, fără date
@@ -556,6 +641,82 @@ section{padding:var(--pad) 0}
   </div>
 </section>
 
+<!-- ════════════════════════════════════════════════════════════ TELEGRAM ══ -->
+<section class="night" id="telegram">
+  <div class="wrap">
+    <div class="narrow reveal">
+      <span class="eyebrow">Canalul de comandă</span>
+      <h2>Incidentul ajunge pe telefon în secunde. Răspunsul pleacă tot de acolo.</h2>
+      <p class="lede" style="margin-top:1.1rem">
+        Nu e un canal de notificări. E consola. Primești incidentul cu butoane
+        de acțiune, blochezi atacatorul cu o apăsare, ceri starea serverului și
+        pornești un patch — fără VPN, fără SSH, fără să deschizi laptopul.
+        Tot ce se poate face din panoul web se poate face din conversație.
+      </p>
+    </div>
+
+    <div class="tg">
+      <!-- Transcript real: mesajele, butoanele și comenzile de mai jos sunt
+           cele pe care le trimite botul, nu o machetă. -->
+      <div class="phone reveal">
+        <div class="tg-bar">
+          <i>S</i>
+          <span>Sentinel<u>bot · serverul tău</u></span>
+          <em><s></s>în timp real</em>
+        </div>
+        <div class="tg-body" id="tg-body" aria-hidden="true"></div>
+      </div>
+
+      <div class="tg-side stagger">
+        <div class="tg-card">
+          <span class="lat">Sub 2 secunde de la detecție</span>
+          <h3>Raportarea vine singură, cu context</h3>
+          <p>
+            Nu aștepți să deschizi un dashboard. Incidentul e împins pe Telegram
+            în momentul în care regula se declanșează, cu sursa, țara, ASN-ul,
+            numărul de încercări și verdictul AI în română — plus butoanele care
+            rezolvă situația pe loc.
+          </p>
+        </div>
+
+        <div class="tg-card">
+          <span class="lat">Execuție, nu doar citire</span>
+          <h3>Administrezi serverul din conversație</h3>
+          <p>
+            Comenzile rulează pe server și îți răspund în sub o secundă. Cele
+            care schimbă ceva cer confirmare separată, iar cele distructive cer
+            o a doua confirmare care restatează ținta.
+          </p>
+          <div class="cmds">
+            <code>/dashboard</code><code>/status</code><code>/incidente</code>
+            <code>/vulnerabilitati</code><code>/servicii</code><code>/sanatate</code>
+            <code>/evenimente</code><code>/blocate</code><code>/patchuri</code>
+            <code>/autoverificare</code>
+            <code class="act">/blocheaza</code><code class="act">/deblocheaza</code>
+            <code class="act">/rezolva</code><code class="act">/falspozitiv</code>
+            <code class="act">/liniste</code><code class="act">/panic</code>
+          </div>
+          <p style="margin-top:.9rem;font-size:.84rem">
+            Verde citește, roșu schimbă. Fiecare comandă are și varianta în
+            engleză, pentru autocompletarea telefonului.
+          </p>
+        </div>
+
+        <div class="tg-card">
+          <span class="lat">De ce Telegram</span>
+          <h3>Funcționează exact când restul nu mai funcționează</h3>
+          <p>
+            Botul trage mesajele, nu le primește: nu există niciun port deschis
+            spre el și niciun endpoint public de falsificat. Dacă nginx, TLS-ul
+            sau panoul web cad, canalul rămâne în picioare — adică e disponibil
+            fix în minutul în care ai nevoie de el.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
 <!-- ═════════════════════════════════════════════════════════════ PACHETE ══ -->
 <section class="soft" id="oferta">
   <div class="wrap">
@@ -721,7 +882,7 @@ section{padding:var(--pad) 0}
   <div class="wrap">
     <div class="narrow reveal">
       <span class="eyebrow" style="color:var(--blue)">Starea produsului</span>
-      <h2>Rulează în producție pe infrastructura noastră, de luni de zile.</h2>
+      <h2>Rulează în producție pe infrastructura noastră.</h2>
       <p class="lede" style="margin-top:1.1rem">
         Cifrele de mai jos sunt din repository, nu din prezentare.
       </p>
@@ -745,18 +906,24 @@ section{padding:var(--pad) 0}
 </section>
 
 <!-- ═════════════════════════════════════════════════════════════════ CTA ══ -->
-<section class="dark cta">
+<section class="dark cta" id="discutie">
   <div class="wrap reveal">
     <span class="eyebrow">Următorul pas</span>
-    <h2>Începem cu o evaluare, nu cu o factură.</h2>
+    <h2>Începem cu o discuție, nu cu o factură.</h2>
     <p class="lede">
-      Ne spui ce server ai și ce rulează pe el. Îți spunem ce e expus, ce te
-      atacă în momentul ăsta și dacă Sentinel are sens în cazul tău — inclusiv
-      dacă răspunsul e „nu încă".
+      Treizeci de minute, gratuit și fără obligații. Ne spui ce server ai și ce
+      rulează pe el. Îți spunem ce e expus, ce te atacă în momentul ăsta și dacă
+      Sentinel are sens în cazul tău — inclusiv dacă răspunsul e „nu încă".
     </p>
     <div class="cta-actions">
-      <a class="btn btn-primary" href="https://cryptoitdata.eu/contact">Cere evaluarea</a>
-      <a class="btn btn-ghost" href="mailto:hello@cryptoitdata.eu">hello@cryptoitdata.eu</a>
+      <a class="btn btn-primary" href="https://cryptoitdata.eu/contact">Programează o discuție gratuită</a>
+      <!-- Adresa nu există nicăieri în sursă, nici măcar cu @ înlocuit: cele
+           două jumătăți sunt stocate inversate, în atribute separate, și se
+           compun la runtime. Asta oprește harvesterul care trece cu regex prin
+           HTML brut — nu și un scraper cu browser headless. Nimic de pe client
+           nu îl oprește pe ăla; formularul de contact e răspunsul acolo. -->
+      <a class="btn btn-ghost" data-u="olleh" data-d="ue.atadtiotpyrc"
+         href="https://cryptoitdata.eu/contact" rel="nofollow">scrie-ne pe email</a>
     </div>
     <p class="hero-note" style="margin-top:1.8rem">
       Expertiză corporate. Livrată rapid. Fără overhead, fără jargon, fără surprize.
@@ -766,8 +933,10 @@ section{padding:var(--pad) 0}
 
 <footer class="night foot">
   <div class="wrap">
-    <span>© <span id="yr">2026</span> CRYPTOITDATA · Sentinel</span>
-    <span><a href="https://cryptoitdata.eu">cryptoitdata.eu</a> · <a href="mailto:hello@cryptoitdata.eu">hello@cryptoitdata.eu</a></span>
+    <span>© <span id="yr">2026</span> Sentinel by CryptoITData</span>
+    <span><a href="https://cryptoitdata.eu">cryptoitdata.eu</a> ·
+      <a data-u="olleh" data-d="ue.atadtiotpyrc" rel="nofollow"
+         href="https://cryptoitdata.eu/contact">contact</a></span>
   </div>
 </footer>
 
@@ -1037,6 +1206,280 @@ section{padding:var(--pad) 0}
       if (p < 1) requestAnimationFrame(step); else land();
     })(t0);
   }
+
+  // ── Adresa de email, compusă la runtime ────────────────────────────────
+  // Sursa nu conține nici adresa, nici un @ de înlocuit: fiecare jumătate e
+  // stocată inversată, în atribute separate. Oprește harvesterul care trece
+  // cu regex prin HTML brut. Nu oprește un scraper cu browser headless —
+  // nimic din client nu îl oprește, iar formularul de contact e răspunsul.
+  [].forEach.call(document.querySelectorAll("[data-u][data-d]"), function (a) {
+    function rev(x) { return x.split("").reverse().join(""); }
+    var addr = rev(a.getAttribute("data-u")) + String.fromCharCode(64) +
+               rev(a.getAttribute("data-d"));
+    a.href = "mailto:" + addr;
+    a.setAttribute("aria-label", "Trimite email la " + addr);
+    if (a.classList.contains("btn")) a.textContent = addr;
+    a.removeAttribute("data-u"); a.removeAttribute("data-d");
+  });
+
+  // ── Transcriptul Telegram ──────────────────────────────────────────────
+  // Mesajele, etichetele butoanelor și numele comenzilor sunt cele reale din
+  // sentinel/telegram/. Secvența e round-trip-ul complet, în ordinea în care
+  // se întâmplă: incidentul vine singur, apeși un buton, acțiunea se execută
+  // pe server, apoi ceri starea și pornești un patch. Asta e afirmația de pe
+  // pagină; dacă transcriptul ar arăta doar notificări, ar contrazice-o.
+  (function () {
+    var body = document.getElementById("tg-body");
+    if (!body) return;
+
+    var steps = [
+      { k: "bot", d: 2600, h:
+        '<b>&#128308; Incident #418 &middot; severitate <span class="sev">&#206;NALT&#258;</span></b><br>' +
+        'Brute-force SSH &middot; <b>203.0.113.47</b><br>' +
+        '214 &#238;ncerc&#259;ri &#238;n 3 min &middot; 7 utilizatori testa&#539;i<br>' +
+        'Germania &middot; AS200651 &middot; f&#259;r&#259; istoric pe acest server' +
+        '<div class="kb"><i data-hit>&#9989; Blocheaz&#259; 203.0.113.47 (24h)</i>' +
+        '<i>&#10060; Ignor&#259;</i></div>' +
+        '<span class="t">19:04:12 &middot; &#238;mpins la 1,3 s de la prima detec&#539;ie</span>' },
+
+      { k: "tap", d: 900 },
+
+      { k: "bot", d: 2100, h:
+        '<b class="go">&#9989; Blocat.</b> 203.0.113.47 este &#238;n nftables, expir&#259; &#238;n 24h.<br>' +
+        'Audit #9912 &middot; ac&#539;iune executat&#259; de pe telefon, nu de pe server.' +
+        '<span class="t">19:04:26 &middot; confirmat &#238;n 0,6 s</span>' },
+
+      { k: "me",  d: 1000, h: '/status' },
+
+      { k: "bot", d: 2600, h:
+        '<b>Sentinel &middot; online de 41 de zile</b><br>' +
+        'Servicii <b class="go">12/12</b> &middot; autoverificare OK acum 2 min<br>' +
+        'Incidente deschise <b>3</b> &middot; blocate &#238;n ultimele 24h <b>14</b><br>' +
+        'Vulnerabilit&#259;&#539;i: <b class="sev">2 critice</b>, 9 importante' +
+        '<span class="t">19:06:02 &middot; r&#259;spuns &#238;n 0,4 s</span>' },
+
+      { k: "me",  d: 1000, h: '/patch 3' },
+
+      { k: "bot", d: 3400, h:
+        '<b>Plan de patch #3</b> &mdash; openssl 3.2.2 &rarr; 3.2.4<br>' +
+        'Backup, aplicare, verificare, rollback &middot; 4 pa&#537;i<br>' +
+        'Downtime estimat 0 s &middot; reversibil &middot; redactat de AI, validat determinist' +
+        '<div class="kb"><i>&#129514; Dry-run</i><i>&#9989; Aplic&#259;&#8230;</i>' +
+        '<i>&#10060; Respinge</i></div>' +
+        '<span class="t">19:06:40 &middot; planul complet e &#537;i &#238;n panoul web</span>' }
+    ];
+
+    function bubble(kind, html) {
+      var d = document.createElement("div");
+      d.className = "msg " + kind;
+      d.innerHTML = html;
+      return d;
+    }
+
+    if (reduced) {
+      steps.forEach(function (st) {
+        if (st.k !== "tap") body.appendChild(bubble(st.k, st.h));
+      });
+      var hit = body.querySelector(".kb i[data-hit]");
+      if (hit) hit.classList.add("hit");
+      return;
+    }
+
+    var timer = null, i = 0, live = false;
+
+    function tick() {
+      if (!live) return;
+      if (i >= steps.length) {
+        timer = setTimeout(function () { body.innerHTML = ""; i = 0; tick(); }, 5200);
+        return;
+      }
+      var st = steps[i++];
+      if (st.k === "tap") {
+        // Apăsarea butonului: pauza dinaintea ei e intenționată. Alerta se
+        // citește întâi, decizia vine după — invers ar sugera un automatism
+        // pe care produsul chiar nu îl are aici.
+        var b = body.querySelector('.kb i[data-hit]');
+        if (b) b.classList.add("hit");
+      } else {
+        body.appendChild(bubble(st.k, st.h));
+        body.scrollTop = body.scrollHeight;
+      }
+      timer = setTimeout(tick, st.d);
+    }
+
+    function start() { if (!live) { live = true; tick(); } }
+    function stop()  { live = false; clearTimeout(timer); }
+
+    // Observatorul e o optimizare, nu condiția de existență. Dacă nu se
+    // declanșează — lipsă de suport, randare fără layout, orice — panoul ar
+    // rămâne gol pe secțiunea care susține cea mai tare afirmație a paginii.
+    // Aceeași plasă de siguranță ca la reveal, din același motiv.
+    var ioSeen = false;
+    if ("IntersectionObserver" in window) {
+      new IntersectionObserver(function (es) {
+        ioSeen = true;
+        es.forEach(function (e) { e.isIntersecting ? start() : stop(); });
+      }, { threshold: 0.2 }).observe(body);
+    } else { start(); }
+    setTimeout(function () { if (!ioSeen) start(); }, 2500);
+
+    document.addEventListener("visibilitychange", function () {
+      if (document.hidden) stop();
+    });
+  })();
+
+  // ── Fundalul animat din hero ───────────────────────────────────────────
+  // Structura e a site-ului: canvas full-bleed, în spatele conținutului,
+  // mascat să se stingă spre bază. Motivul e al produsului — urme care vin
+  // din exterior către gazdă și se opresc pe o limită. Ținut deliberat foarte
+  // discret: teza paginii e fluxul de atacuri din dreapta, iar un fundal care
+  // concurează cu ea o slăbește în loc să o susțină.
+  (function () {
+    var host = document.querySelector(".bg-canvas");
+    if (!host) return;
+    var cv = document.createElement("canvas");
+    host.appendChild(cv);
+    var ctx = cv.getContext && cv.getContext("2d");
+    if (!ctx) return;
+
+    var W = 0, H = 0, dots = [], traces = [], raf = null, last = 0, since = 0;
+
+    function focal() {
+      return { x: W * 0.62, y: H * 0.44, r: Math.min(W, H) * 0.17 };
+    }
+
+    function build() {
+      dots = [];
+      var n = Math.max(18, Math.min(60, Math.round(W * H / 17000)));
+      for (var i = 0; i < n; i++) {
+        dots.push({
+          x: Math.random() * W, y: Math.random() * H,
+          vx: (Math.random() - 0.5) * 0.09, vy: (Math.random() - 0.5) * 0.09,
+          r: 0.7 + Math.random() * 1.2,
+          a: 0.05 + Math.random() * 0.10,
+          teal: Math.random() < 0.32
+        });
+      }
+    }
+
+    function size() {
+      var r = host.getBoundingClientRect();
+      if (!r.width || !r.height) return;
+      var dpr = Math.min(window.devicePixelRatio || 1, 2);
+      W = r.width; H = r.height;
+      cv.width = Math.round(W * dpr);
+      cv.height = Math.round(H * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      build();
+    }
+
+    function spawn() {
+      var f = focal(), ang = Math.random() * Math.PI * 2,
+          far = Math.max(W, H) * 0.8;
+      traces.push({
+        sx: f.x + Math.cos(ang) * far, sy: f.y + Math.sin(ang) * far,
+        ex: f.x + Math.cos(ang) * f.r, ey: f.y + Math.sin(ang) * f.r,
+        p: 0, sp: 0.0055 + Math.random() * 0.005, flash: 0
+      });
+      if (traces.length > 16) traces.shift();
+    }
+
+    function paintStatic() {
+      ctx.clearRect(0, 0, W, H);
+      var f = focal();
+      ctx.beginPath(); ctx.arc(f.x, f.y, f.r, 0, Math.PI * 2);
+      ctx.strokeStyle = "rgba(38,198,181,.07)"; ctx.lineWidth = 1; ctx.stroke();
+      for (var i = 0; i < dots.length; i++) {
+        var d = dots[i];
+        ctx.beginPath(); ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2);
+        ctx.fillStyle = (d.teal ? "rgba(38,198,181," : "rgba(150,178,210,") + d.a + ")";
+        ctx.fill();
+      }
+    }
+
+    function frame(ts) {
+      var dt = Math.min(48, ts - (last || ts)); last = ts;
+      paintStatic();
+
+      for (var i = 0; i < dots.length; i++) {
+        var d = dots[i];
+        d.x += d.vx * dt; d.y += d.vy * dt;
+        if (d.x < -4) d.x = W + 4; else if (d.x > W + 4) d.x = -4;
+        if (d.y < -4) d.y = H + 4; else if (d.y > H + 4) d.y = -4;
+      }
+
+      since += dt;
+      if (since > 640) { since = 0; spawn(); }
+
+      for (var j = traces.length - 1; j >= 0; j--) {
+        var t = traces[j];
+        if (t.flash > 0) {
+          // Punctul în care se oprește. Asta e tot argumentul, în imagine:
+          // urma nu ajunge la gazdă, se termină pe limită.
+          ctx.beginPath();
+          ctx.arc(t.ex, t.ey, (1 - t.flash) * 9 + 2, 0, Math.PI * 2);
+          ctx.strokeStyle = "rgba(38,198,181," + (t.flash * 0.45).toFixed(3) + ")";
+          ctx.lineWidth = 1.3; ctx.stroke();
+          t.flash -= dt * 0.02;
+          if (t.flash <= 0) traces.splice(j, 1);
+          continue;
+        }
+        t.p += t.sp * dt;
+        if (t.p >= 1) { t.p = 1; t.flash = 1; }
+        var hx = t.sx + (t.ex - t.sx) * t.p, hy = t.sy + (t.ey - t.sy) * t.p,
+            tp = Math.max(0, t.p - 0.14),
+            bx = t.sx + (t.ex - t.sx) * tp, by = t.sy + (t.ey - t.sy) * tp;
+        var g = ctx.createLinearGradient(bx, by, hx, hy);
+        g.addColorStop(0, "rgba(38,198,181,0)");
+        g.addColorStop(1, "rgba(38,198,181,.32)");
+        ctx.strokeStyle = g; ctx.lineWidth = 1.2;
+        ctx.beginPath(); ctx.moveTo(bx, by); ctx.lineTo(hx, hy); ctx.stroke();
+      }
+      raf = requestAnimationFrame(frame);
+    }
+
+    function run()  { if (!raf && !reduced) { last = 0; raf = requestAnimationFrame(frame); } }
+    function halt() { if (raf) { cancelAnimationFrame(raf); raf = null; } }
+
+    // Un cadru desenat imediat, nu la primul rAF. Fără el hero-ul rămâne gol
+    // până se programează animația — și complet gol dacă rAF nu se declanșează
+    // niciodată, cum se întâmplă în unele webview-uri. Fundalul static e o
+    // degradare acceptabilă; fundalul absent arată ca o pagină stricată.
+    size();
+    paintStatic();
+    if (reduced) return;
+
+    // ResizeObserver e calea principală, nu doar pentru redimensionare: se
+    // declanșează și la prima măsurătoare validă. `size()` de mai sus poate
+    // pica pe o lățime de zero dacă rulează înainte de layout, iar fără asta
+    // singura recuperare ar fi ca vizitatorul să redimensioneze fereastra.
+    if ("ResizeObserver" in window) {
+      new ResizeObserver(function () { size(); paintStatic(); }).observe(host);
+    }
+    var rt = null;
+    window.addEventListener("resize", function () {
+      clearTimeout(rt);
+      rt = setTimeout(function () { size(); paintStatic(); }, 180);
+    });
+    document.addEventListener("visibilitychange", function () {
+      document.hidden ? halt() : run();
+    });
+
+    var ioSeen = false;
+    if ("IntersectionObserver" in window) {
+      new IntersectionObserver(function (es) {
+        ioSeen = true;
+        es.forEach(function (e) { e.isIntersecting ? run() : halt(); });
+      }, { threshold: 0 }).observe(host);
+    } else { run(); }
+    setTimeout(function () {
+      if (ioSeen) return;
+      // Ultima cale de recuperare, și singura care nu depinde de un observator
+      // sau de rAF. Pictează un cadru înainte să ceară animația, ca fundalul
+      // să existe chiar dacă animația nu pornește niciodată.
+      size(); paintStatic(); run();
+    }, 2200);
+  })();
 
   var triagePlayed = false;
   function activate(el) {
