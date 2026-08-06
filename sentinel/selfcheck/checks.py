@@ -86,6 +86,12 @@ async def check_units(cfg: Config) -> list[CheckResult]:
         # A build without the AI layer configured legitimately has no ai unit.
         if unit == "sentinel-ai.service" and not cfg.ai.enabled:
             continue
+        # Idem beaconul: fără un martor extern configurat, unitatea nu are ce
+        # face și e oprită intenționat. A o raporta „down" ar fi exact alarma
+        # falsă pe care sursele conduse de om au produs-o deja o dată.
+        if unit == "sentinel-beacon.service" and not getattr(
+                getattr(cfg, "beacon", None), "enabled", False):
+            continue
         state = await asyncio.to_thread(_systemctl, "is-active", unit)
         if state == "active":
             results.append(CheckResult(f"unit:{unit}", f"Serviciul {unit}", "ok",

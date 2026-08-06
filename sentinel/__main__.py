@@ -23,7 +23,7 @@ from sentinel.errors import ConfigError, SentinelError
 from sentinel.logging_setup import setup_logging
 
 SERVICES = ("ingest", "detect", "ai", "telegram", "web", "scan", "health",
-            "maintenance", "selfcheck", "reconcile")
+            "maintenance", "selfcheck", "reconcile", "beacon")
 
 
 def _run_service(name: str, args: argparse.Namespace) -> int:

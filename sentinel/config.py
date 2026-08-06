@@ -120,6 +120,29 @@ class ResponseConfig:
 
 
 @dataclass
+class BeaconConfig:
+    """Semnalul periodic către un martor din afara gazdei.
+
+    Există fiindcă un agent găzduit nu poate garanta că raportează propria
+    dispariție: cine îl oprește controlează și canalul. Singura ieșire e ca
+    absența semnalului să fie ea însăși alarma, iar judecata să stea altundeva.
+
+    Dezactivat implicit. Fără un martor configurat, serviciul pornește, spune o
+    dată în jurnal că nu are unde trimite, și se oprește — un expeditor care
+    încearcă la nesfârșit o adresă goală e doar zgomot.
+    """
+    enabled: bool = False
+    url: str = ""
+    interval_s: int = 60
+    # Cât așteaptă un răspuns. Scurt dinadins: martorul indisponibil nu are voie
+    # să devină o problemă a serverului monitorizat.
+    timeout_s: int = 10
+    # Un semnal mai vechi de atât e refuzat de martor ca reluare. Trimis în
+    # payload ca să fie explicit de ambele părți, nu presupus.
+    max_age_s: int = 120
+
+
+@dataclass
 class TelegramConfig:
     enabled: bool = True
     allowed_chat_ids: list[int] = field(default_factory=list)
@@ -299,6 +322,7 @@ class Config:
     detection: DetectionConfig = field(default_factory=DetectionConfig)
     response: ResponseConfig = field(default_factory=ResponseConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
+    beacon: BeaconConfig = field(default_factory=BeaconConfig)
     web: WebConfig = field(default_factory=WebConfig)
     ai: AIConfig = field(default_factory=AIConfig)
     scan: ScanConfig = field(default_factory=ScanConfig)
@@ -370,6 +394,7 @@ def load_secrets(path: Path = SECRETS_PATH) -> Secrets:
         "SENTINEL_DB_DSN",
         "SENTINEL_SESSION_SECRET",
         "TELEGRAM_APPLY_PIN",
+        "SENTINEL_BEACON_SECRET",
     ):
         if env_value := os.environ.get(key):
             values[key] = env_value

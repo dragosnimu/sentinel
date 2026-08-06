@@ -1,0 +1,71 @@
+[Unit]
+# Expeditorul semnalului către martorul din afara gazdei.
+#
+# Motivul pentru care există: un agent găzduit nu poate garanta că raportează
+# propria dispariție. Cine îl oprește controlează și canalul. Serviciul ăsta
+# trimite periodic contoare care trebuie să crească, iar absența semnalului
+# devine alarma — pe o mașină pe care atacatorul nu o controlează.
+#
+# Oprirea lui E semnalul. Nu e o problemă că poate fi oprit; asta e proiectarea.
+Description=Sentinel beacon (semnal către martorul extern)
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+PartOf=sentinel.target
+
+# În [Unit], nu în [Service] — acolo systemd le ignoră tăcut.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=exec
+User=sentinel
+Group=sentinel
+WorkingDirectory=/opt/sentinel
+ExecStart=/opt/sentinel/bin/sentinel beacon
+# on-failure, nu always: cand beaconul nu e configurat, serviciul spune o data
+# in jurnal si iese cu 0. Cu `always`, systemd l-ar reporni la nesfarsit pentru
+# o iesire care nu e o eroare, pana ar lovi limita si ar ramane `failed`.
+Restart=on-failure
+RestartSec=10
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/opt/sentinel/lib
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=yes
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug @swap @reboot @raw-io @obsolete
+CapabilityBoundingSet=
+UMask=0077
+
+# Nu scrie nimic pe disc. Citește configul, citește baza, trimite.
+ReadOnlyPaths=/etc/sentinel
+# Doar ieșire HTTPS și socketul bazei de date.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+MemoryMax=128M
+TasksMax=16
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-beacon
+
+[Install]
+WantedBy=multi-user.target

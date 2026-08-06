@@ -236,6 +236,7 @@ SYSTEMD_UNITS: Final[tuple[str, ...]] = (
     "sentinel-telegram.service",
     "sentinel-web.service",
     "sentinel-executor.service",
+    "sentinel-beacon.service",
 )
 
 # ---------------------------------------------------------------------------
