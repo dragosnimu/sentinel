@@ -450,3 +450,50 @@ async def cmd_selfcheck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 def _now():
     from datetime import datetime, timezone
     return datetime.now(timezone.utc)
+
+
+async def cmd_behaviour(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ce a învățat agentul despre comportamentul normal al serverului.
+
+    Există fiindcă „învață câteva zile" e o promisiune pe care operatorul are
+    dreptul să o verifice. Fără comanda asta, perioada de încălzire e o cutie
+    neagră: nu se poate deosebi „încă învață" de „nu funcționează", iar
+    diferența dintre ele contează exact cât întreaga funcționalitate.
+    """
+    from sentinel.predict import behaviour as bh
+
+    db: Database = context.bot_data["db"]
+    rows = await bh.status(db)
+
+    warm = [r for r in rows if r["warm"]]
+    lines = [f"<b>Profil de comportament</b> · {len(warm)}/{len(rows)} dimensiuni active", ""]
+
+    for r in rows:
+        if r["warm"]:
+            lines.append(
+                f"✅ <b>{esc(r['label'])}</b>\n"
+                f"    {r['distinct_keys']} valori cunoscute · "
+                f"{r['observations']:,} observații · {r['days']:.0f} zile")
+        else:
+            lines.append(
+                f"⏳ <b>{esc(r['label'])}</b>\n"
+                f"    învață · {r['distinct_keys']} valori · "
+                f"{r['observations']:,} observații · mai are {esc(r['needs'] or '')}")
+
+    if not warm:
+        lines += ["", "<i>Cât timp o dimensiune învață, nu alertează deloc. "
+                  "Altfel prima zi ar produce o alertă pentru fiecare utilizator, "
+                  "fiecare rețea și fiecare binar de pe server.</i>"]
+    else:
+        recent = await db.fetch(
+            "SELECT dimension, key, first_seen FROM behaviour_profiles "
+            "WHERE first_seen > now() - interval '7 days' "
+            "ORDER BY first_seen DESC LIMIT 8")
+        if recent:
+            lines += ["", "<b>Valori noi în ultimele 7 zile</b>"]
+            for r in recent:
+                lines.append(f"  <code>{esc(r['key'])}</code> · "
+                             f"{esc(r['dimension'])} · "
+                             f"{r['first_seen'].strftime('%d.%m %H:%M')}")
+
+    await update.effective_message.reply_html(clamp("\n".join(lines)))

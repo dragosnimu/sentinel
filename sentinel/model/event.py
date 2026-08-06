@@ -22,8 +22,25 @@ SOURCES = (
     "docker", "journald", "fim", "conntrack", "internal",
 )
 
+# Acțiuni de post-compromitere, produse de regulile de supraveghere auditd.
+#
+# Separate de `file_write` generic dinadins: severitatea și textul alertei
+# depind de CE s-a atins, iar decizia aia se ia o singură dată, la colectare,
+# unde există cheia regulii de audit. O regulă de detecție care ar trebui să
+# reconstruiască „e sudoers sau e un log oarecare" din calea fișierului ar
+# refface o clasificare pe care kernelul a făcut-o deja corect.
+POST_COMPROMISE_ACTIONS = (
+    "identity_change",    # passwd, shadow, group
+    "sudoers_change",
+    "ssh_key_change",     # sshd_config, /root/.ssh, /home/*/.ssh
+    "cron_change",
+    "unit_change",        # unitate systemd creată sau modificată
+    "webroot_change",
+    "suspicious_exec",    # nc, ncat, socat, wget, curl, chmod, module de kernel
+)
+
 # Normalised outcome. Rules match on this rather than on source-specific text.
-ACTIONS = (
+ACTIONS = POST_COMPROMISE_ACTIONS + (
     "accept", "deny", "auth_fail", "auth_ok", "request",
     "exec", "file_write", "file_read", "connect", "disconnect",
     "start", "stop", "error", "alert", "unknown",

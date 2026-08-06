@@ -874,6 +874,7 @@ def build_application(cfg: Config, secrets: Secrets) -> Application:
         (("services", "servicii"),                     cmd_services),
         (("health", "sanatate"),                       cmd_health),
         (("selfcheck", "autoverificare"),              views.cmd_selfcheck),
+        (("comportament", "behaviour", "profil"),      views.cmd_behaviour),
         (("blocklist", "blocate"),                     views.cmd_blocklist_full),
         (("patches", "patch", "patchuri"),             cmd_patches),
     ]

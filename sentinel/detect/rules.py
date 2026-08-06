@@ -13,10 +13,12 @@ read the rule and know exactly why an incident fired.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Any
 
 from sentinel.db.engine import Database
+# DetectionSpec trăiește în `spec`, ca modulele de reguli să se poată importa
+# între ele fără ciclu. Re-exportat de aici: e importat din `rules` peste tot.
+from sentinel.detect.spec import DetectionSpec  # noqa: F401
 
 # SSH brute-force: failed logins from one source in a window.
 SSH_WINDOW_MIN = 10
@@ -27,27 +29,6 @@ SSH_THRESHOLDS = ((100, "critical"), (25, "high"), (8, "medium"))
 WEB_WINDOW_MIN = 5
 WEB_404_THRESHOLD = 30
 
-
-@dataclass
-class DetectionSpec:
-    rule_id: str
-    rule_family: str
-    severity: str
-    # An attacker address for the network rules; None for an anomaly whose
-    # subject is an asset, not a host. actor_key then carries the subject.
-    src_ip: str | None
-    fingerprint: str
-    title: str
-    summary: str
-    evidence: dict[str, Any]
-    event_ids: list[int]
-    dst_port: int | None = None
-    asset_id: int | None = None
-    actor_key: str = ""
-
-    def __post_init__(self) -> None:
-        if not self.actor_key:
-            self.actor_key = self.src_ip or ""
 
 
 def _severity_for(count: int, thresholds: tuple[tuple[int, str], ...]) -> str | None:
@@ -277,4 +258,21 @@ async def volume_anomaly(db: Database, cursor: int) -> list[DetectionSpec]:
     return specs
 
 
-RULES = (ssh_bruteforce, web_enumeration, suricata_alert, volume_anomaly)
+_ATTEMPT_RULES = (ssh_bruteforce, web_enumeration, suricata_alert, volume_anomaly)
+
+
+def _all_rules() -> tuple:
+    """Tentativele plus post-compromiterea.
+
+    Separarea în două module e intenționată. Regulile de mai sus răspund la
+    „cine încearcă?"; cele din `intrusion` la „a reușit cineva?". Sunt întrebări
+    diferite, cu praguri diferite — tentativele contează în rafală, o
+    compromitere contează de la prima apariție — și le ține împreună doar faptul
+    că motorul le rulează pe amândouă.
+    """
+    from sentinel.detect.intrusion import INTRUSION_RULES
+    from sentinel.detect.novelty import NOVELTY_RULES
+    return _ATTEMPT_RULES + INTRUSION_RULES + NOVELTY_RULES
+
+
+RULES = _all_rules()

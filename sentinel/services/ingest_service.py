@@ -30,7 +30,7 @@ import signal
 from pathlib import Path
 
 from sentinel.collectors import nginx_tail
-from sentinel.collectors.auditd import parse_auditd
+from sentinel.collectors.auditd import parse_auditd_lines
 from sentinel.collectors.nginx import parse_nginx
 from sentinel.collectors.sshd import parse_sshd
 from sentinel.collectors.suricata_eve import parse_suricata
@@ -150,10 +150,10 @@ class Ingest:
             lines, new_cursor = nginx_tail.read_new_lines(self._audit_path, self._audit_cursor)
             if new_cursor != self._audit_cursor:
                 audit_new = new_cursor
-            for line in lines:
-                ev = parse_auditd(line)
-                if ev is not None:
-                    batch.append(ev)
+            # Pe lot, nu pe linie: o acțiune supravegheată produce mai multe
+            # linii care împart un serial, iar cine, ce binar și pe ce fișier
+            # sunt împrăștiate între ele.
+            batch.extend(parse_auditd_lines(lines))
 
         batch = [e for e in batch if e.source not in self.exclude]
         for ev in batch:
