@@ -270,9 +270,10 @@ def _all_rules() -> tuple:
     compromitere contează de la prima apariție — și le ține împreună doar faptul
     că motorul le rulează pe amândouă.
     """
+    from sentinel.detect.accounts import ACCOUNT_RULES
     from sentinel.detect.intrusion import INTRUSION_RULES
     from sentinel.detect.novelty import NOVELTY_RULES
-    return _ATTEMPT_RULES + INTRUSION_RULES + NOVELTY_RULES
+    return _ATTEMPT_RULES + INTRUSION_RULES + ACCOUNT_RULES + NOVELTY_RULES
 
 
 RULES = _all_rules()

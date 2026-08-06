@@ -322,10 +322,78 @@ async def webroot_tampering(db: Database, cursor: int) -> list[DetectionSpec]:
     return out
 
 
+
+
+# ---------------------------------------------------------------------------
+# 6. Conturi: evenimentul
+# ---------------------------------------------------------------------------
+async def account_created(db: Database, cursor: int) -> list[DetectionSpec]:
+    """`useradd`, `usermod`, `groupadd` — cu numele contului.
+
+    Regula de escaladare de mai sus spune CĂ s-a scris în `/etc/passwd`. Asta
+    spune CE cont a apărut, ceea ce e diferența dintre o alertă pe care o
+    investighezi și una pe care o poți judeca din prima citire.
+
+    Sursa e alta: auditd emite ADD_USER / USER_MGMT ca înregistrări de sine
+    stătătoare, cu câmpul `acct`, independent de supravegherea pe fișier. Dacă
+    una dintre cele două căi e ocolită, cealaltă rămâne.
+    """
+    rows = await db.fetch(
+        """
+        SELECT e.id, e.ts, e.username, e.process, e.src_ip, e.raw
+        FROM raw_events e
+        WHERE e.id > $1 AND e.source = 'auditd' AND e.action = 'account_change'
+          AND e.ts > now() - make_interval(mins => $2)
+        ORDER BY e.id DESC LIMIT 200
+        """,
+        cursor, WINDOW_MIN)
+    if not rows:
+        return []
+
+    by_acct: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        raw = r["raw"] if isinstance(r["raw"], dict) else {}
+        acct = raw.get("acct") or r["username"] or "?"
+        slot = by_acct.setdefault(acct, {"ids": [], "ops": set(), "n": 0,
+                                         "by": set(), "types": set()})
+        slot["n"] += 1
+        slot["ids"].append(r["id"])
+        if raw.get("op"):
+            slot["ops"].add(raw["op"][:60])
+        if raw.get("record_type"):
+            slot["types"].add(raw["record_type"])
+        slot["by"].add(raw.get("auid") or raw.get("uid") or "?")
+
+    out: list[DetectionSpec] = []
+    for acct, slot in by_acct.items():
+        ops = ", ".join(sorted(slot["ops"])) or ", ".join(sorted(slot["types"])) or "modificare"
+        out.append(DetectionSpec(
+            rule_id="intrusion.account_change",
+            rule_family="intrusion",
+            severity="critical",
+            src_ip=None,
+            actor_key="host",
+            fingerprint=f"intrusion.account_change:{acct}",
+            title=f"Cont de sistem modificat: {acct}",
+            summary=(f"Operație: {ops} · executată de auid {', '.join(sorted(slot['by']))} · "
+                     f"{slot['n']} înregistrări în {WINDOW_MIN} min. "
+                     f"Dacă nu ai creat tu contul `{acct}`, cineva își asigură accesul."),
+            evidence={"account": acct, "operations": sorted(slot["ops"]),
+                      "record_types": sorted(slot["types"]),
+                      "by_auid": sorted(slot["by"]), "count": slot["n"]},
+            event_ids=slot["ids"][:200],
+        ))
+    return out
+
+
+# Definit la final: fiecare regulă trebuie să existe înainte de a fi numită aici,
+# iar un tuplu care numește o funcție definită mai jos pică la import — adică
+# serviciul nu pornește deloc, în loc să eșueze o singură regulă.
 INTRUSION_RULES = (
     persistence,
     privilege_escalation,
     successful_login_after_bruteforce,
     attacker_tooling,
     webroot_tampering,
+    account_created,
 )
