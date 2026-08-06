@@ -11,6 +11,19 @@ Requires=postgresql.service
 Wants=sentinel-executor.service
 PartOf=sentinel.target
 
+# Mai mult de 5 reporniri în 5 minute și systemd renunță. Watchdog-ul observă
+# unitatea în stare `failed` și golește blocklistul — mai bine un detector oprit
+# decât unul care se rotește și ia decizii de blocare din stare pe jumătate
+# inițializată.
+#
+# În [Unit], nu în [Service]. Au stat în [Service], unde systemd le ignoră cu
+# „Unknown key name ... ignoring" în jurnal, iar unitatea se repornea la
+# nesfârșit în loc să se oprească. Plasa de siguranță a ținut — watchdog-ul are
+# și o cale pe NRestarts, independentă de asta — dar intenția scrisă în
+# comentariu nu s-a aplicat niciodată.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Type=exec
 User=sentinel
@@ -19,11 +32,6 @@ WorkingDirectory=/opt/sentinel
 ExecStart=/opt/sentinel/bin/sentinel detect
 Restart=always
 RestartSec=5
-# More than 5 restarts in 5 minutes and systemd gives up. The watchdog notices
-# the unit is failed and flushes; better a stopped detector than a flapping one
-# making blocking decisions from half-initialised state.
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
