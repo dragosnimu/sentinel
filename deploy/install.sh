@@ -552,7 +552,31 @@ step_configs() {
     install_config "${SCRIPT_DIR}/config/notifications.yaml.example" \
                    "${SENTINEL_CONFIG_DIR}/notifications.yaml" 0640
 
-    install -D -m 0644 "${SCRIPT_DIR}/logrotate/sentinel" /etc/logrotate.d/sentinel
+    # Sentinel ships NO logrotate configuration, and removes the one earlier
+    # versions installed.
+    #
+    # It claimed /var/log/nginx/sentinel-*.log and /var/log/suricata/*, all of
+    # which the nginx and suricata packages already rotate. logrotate treats a
+    # path claimed twice as a fatal error and skips BOTH files entirely — so a
+    # config written to guarantee rotation was the reason rotation stopped.
+    # Suricata's eve.json and stats.log grew unrotated for days.
+    #
+    # The `create 0640 nginx adm` line looked load-bearing for the collectors.
+    # It was not: step_suricata and step_auxiliary set DEFAULT ACLs on both log
+    # directories, so files logrotate creates are readable by the sentinel user
+    # whatever mode and owner the distribution's config asks for. The ACL is the
+    # mechanism; the logrotate stanza only ever looked like it.
+    if [[ -f /etc/logrotate.d/sentinel ]]; then
+        rm -f /etc/logrotate.d/sentinel
+        ok "removed /etc/logrotate.d/sentinel (it duplicated distribution-owned paths)"
+    fi
+
+    # Validate what is left. A duplicate claimed by any package silently stops
+    # rotating the file it names, and the first symptom is a full disk.
+    if have logrotate && ! logrotate --debug /etc/logrotate.conf >/dev/null 2>&1; then
+        warn "logrotate reports a configuration error. Rotation may be stopped for \
+some files. Inspect with:  logrotate --debug /etc/logrotate.conf"
+    fi
 
     rm -rf "$tmp"
 }
