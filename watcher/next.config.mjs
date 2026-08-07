@@ -1,12 +1,17 @@
 /**
  * Configurația martorului.
  *
- * `standalone` produce un director care se poate copia pe găzduire fără
- * `node_modules` — pornește cu `node server.js`. E modul care merge pe cele mai
- * multe planuri de Node hosting, inclusiv cele fără acces la npm pe server.
+ * `output: "standalone"` NU e activat implicit. Produce un pachet care rulează
+ * cu `node server.js` fără npm install, ceea ce e util pe unele găzduiri — dar
+ * validatorul de proiect al altora se uită la config și respinge structura ca
+ * fiind nestandard. Pornirea obișnuită, `npm run build && npm start`, merge
+ * peste tot.
+ *
+ * Dacă ai nevoie de pachetul autonom, decomentează linia și rulează build-ul;
+ * README-ul explică ce se copiază.
  */
 const nextConfig = {
-  output: "standalone",
+  // output: "standalone",
   // Nu expunem versiunea framework-ului. Un antet care spune ce rulezi e un
   // cadou gratuit pentru cine face recunoaștere.
   poweredByHeader: false,

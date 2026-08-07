@@ -1,0 +1,3 @@
+# Martorul nu are ce căuta în indexuri.
+User-agent: *
+Disallow: /
