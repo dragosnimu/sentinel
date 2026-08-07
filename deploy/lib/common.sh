@@ -156,6 +156,33 @@ port_owner() {
     ss -tlnpH "sport = :$1" 2>/dev/null | head -1 | sed 's/.*users:((//; s/).*//' || true
 }
 
+# The systemd unit named in a /proc/PID/cgroup, read from stdin. Empty when the
+# process belongs to no unit — a container, a login session, a bare fork.
+#
+# Its own function so it can be tested without a live process. The extraction
+# is one regex over kernel-supplied text, which is exactly the shape of thing
+# that breaks quietly and stays broken.
+#
+# Matched anywhere in the path rather than only at the end: a service that forks
+# into sub-cgroups appends further components after the unit name.
+cgroup_unit() {
+    sed -n 's#.*/\([A-Za-z0-9@_.-]*\.service\).*#\1#p' | head -1
+}
+
+# Which systemd unit owns the process listening on a port, if any.
+#
+# The process name cannot answer "is this ours". Sentinel's dashboard reports
+# itself as `python`, and so does every other Python service on the host. The
+# cgroup path can: the kernel writes it, and any process could call itself
+# python but cannot place itself in another unit's cgroup.
+port_owner_unit() {
+    local pid
+    pid="$(ss -tlnpH "sport = :$1" 2>/dev/null | head -1 |
+           sed -n 's/.*pid=\([0-9]\+\).*/\1/p')"
+    [[ -n "$pid" ]] || return 0
+    cgroup_unit < "/proc/${pid}/cgroup" 2>/dev/null
+}
+
 mem_available_mb() {
     awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo
 }

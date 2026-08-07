@@ -138,9 +138,17 @@ for port in "${SENTINEL_PORTS[@]}"; do
         ok "port ${port} free"
     else
         owner="$(port_owner "$port")"
+        unit="$(port_owner_unit "$port")"
         if [[ "$port" == "5432" ]]; then
             warn "port 5432 is in use by ${owner:-unknown} — an existing PostgreSQL. \
 The installer will reuse it and create a separate 'sentinel' database and role."
+        elif [[ "$unit" == sentinel-* ]]; then
+            # Preflight has to run identically on a first install and on an
+            # upgrade. On an upgrade the port is held by the previous version of
+            # the very service being deployed, which is not a conflict — it is
+            # the expected state. Reporting it as blocking told the operator to
+            # stop Sentinel in order to deploy Sentinel.
+            ok "port ${port} held by ${unit} — the running Sentinel; the installer restarts it"
         else
             fail "port ${port} is in use by ${owner:-unknown}. Sentinel needs it. \
 Pick another with --web-port, or stop that service."
