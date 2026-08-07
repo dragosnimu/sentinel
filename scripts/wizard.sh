@@ -209,7 +209,11 @@ PROBE="$(remote '
     echo "NGINX=$(command -v nginx >/dev/null 2>&1 && echo yes || echo no)"
     echo "P80=$(ss -tln 2>/dev/null | grep -qE ":80 " && echo busy || echo free)"
     echo "P443=$(ss -tln 2>/dev/null | grep -qE ":443 " && echo busy || echo free)"
-    echo "IP=$(ip route get 1.1.1.1 2>/dev/null | grep -oP "src \K\S+" | head -1)"
+    # Doar o căutare în tabela de rutare — nu pleacă niciun pachet. Adresa e din
+    # spațiul de documentație (RFC 5737), nu a unui rezolver public: o adresă
+    # reală scrisă aici ajunge, mai devreme sau mai târziu, copiată într-o
+    # comandă care chiar trimite ceva acolo.
+    echo "IP=$(ip route get 203.0.113.1 2>/dev/null | grep -oP "src \K\S+" | head -1)"
     echo "PEER=${SSH_CLIENT%% *}"
 ' 2>/dev/null)" || die "verificarea serverului a eșuat"
 

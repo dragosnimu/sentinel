@@ -32,7 +32,7 @@ is broad enough to be a privilege escalation for anyone who gets execution as
 file. `systemctl` lets you install a unit.
 
 A daemon can validate *what* is being asked, not just *which binary*. `nft add
-element ... blocklist_v4 { 1.2.3.4 }` is fine; `nft flush ruleset` is not. A
+element ... blocklist_v4 { 203.0.113.7 }` is fine; `nft flush ruleset` is not. A
 sudoers rule cannot tell them apart.
 
 There is a fallback sudoers file in `deploy/sudoers/sentinel` for environments

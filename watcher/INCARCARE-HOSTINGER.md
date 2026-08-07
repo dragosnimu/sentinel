@@ -1,7 +1,12 @@
 # Instalarea martorului pe găzduire
 
-Procedura de mai jos **a fost executată și a funcționat** pe
-`sentinel.exemplu.eu`, pe 7 august 2026. Nu e o presupunere.
+Procedura de mai jos **a fost executată și a funcționat** pe o găzduire
+Hostinger reală, pe 7 august 2026. Nu e o presupunere.
+
+Domeniul martorului nu apare nicăieri în acest depozit, dinadins. E singura
+mașină pe care un atacator cu root pe serverul monitorizat nu o controlează, și
+primul lucru pe care l-ar căuta e unde anume pleacă semnalul. Un depozit public
+nu e locul în care să afle.
 
 ## De ce nu prin ecranul de încărcare
 

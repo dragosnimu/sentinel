@@ -9,7 +9,7 @@
 #   ./install.sh --domain sentinel.example.com
 #                [--nginx-mode dedicated|shared] [--web-port 8443]
 #                [--cert-mode auto|webroot|dns|selfsigned|none]
-#                [--admin-ip 1.2.3.4] [--from-step N] [--force-step N]
+#                [--admin-ip 203.0.113.10] [--from-step N] [--force-step N]
 #                [--skip-preflight]
 #
 # Two ways to expose the dashboard, chosen with --nginx-mode:
