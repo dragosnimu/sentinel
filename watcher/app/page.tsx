@@ -57,10 +57,26 @@ export default async function Page({
   );
 
   const status = !last ? "unknown" : verdict.kind === null ? "ok" : "bad";
+
+  // Un titlu per verdict, fiindcă „a amuțit" și „raportează o problemă internă"
+  // sunt situații complet diferite pentru cel care citește.
+  //
+  // Toate trei purtau înainte „Sentinel nu răspunde". Prima dată când pagina a
+  // arătat asta pentru un autodiagnostic cu 32 din 33 de verificări trecute,
+  // concluzia cititorului a fost că serverul e căzut — pentru un serviciu care
+  // trimitea semnal la fiecare 60 de secunde. O pagină care există ca să spună
+  // adevărul despre o tăcere nu are voie să inventeze una.
+  const HEADLINE: Record<string, string> = {
+    silent: "Sentinel nu răspunde",
+    stalled: "Sentinel trăiește, dar nu mai colectează",
+    selfcheck: "Sentinel raportează o problemă",
+    replay: "Semnal refuzat: secvență reluată",
+    forged: "Semnal refuzat: semnătură invalidă",
+  };
   const headline =
     status === "unknown" ? "Niciun semnal încă"
       : status === "ok" ? "Sentinel e în viață"
-        : "Sentinel nu răspunde";
+        : HEADLINE[verdict.kind ?? ""] ?? "Sentinel raportează o problemă";
 
   return (
     <main className={`card ${status}`}>
