@@ -66,6 +66,12 @@ def _config_check(args: argparse.Namespace) -> int:
         required += ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CALLBACK_HMAC_KEY"]
     if cfg.ai.enabled:
         required += ["ANTHROPIC_API_KEY"]
+    # Without the shared key the beacon cannot sign, so it says so once and
+    # exits 0 — a clean exit that looks identical to "not configured". Naming
+    # the missing secret here is the difference between a five-second fix and
+    # an evening spent wondering why the watcher never hears anything.
+    if cfg.beacon.enabled:
+        required += ["SENTINEL_BEACON_SECRET"]
     missing = [k for k in required if not secrets.has(k)]
 
     print(f"config:   OK  ({cfg.hostname or 'hostname unset'}, tz={cfg.timezone})")

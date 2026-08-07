@@ -783,6 +783,18 @@ step_start_services() {
         [[ -f "/etc/systemd/system/${unit}" ]] && systemctl enable --now "$unit" >/dev/null 2>&1 \
             && ok "${unit} enabled"
     done
+
+    # The beacon is opt-in and deliberately NOT in the ordered list above. That
+    # list dies on a unit that will not stay running, which is right for the
+    # pipeline and wrong here: with beacon.enabled false the process says so
+    # once in the journal and exits 0, leaving the unit inactive rather than
+    # failed. Aborting an install over a component the operator has not turned
+    # on yet would be absurd. Enable it either way, so that turning it on later
+    # is one `systemctl restart`, not an archaeology session.
+    if [[ -f /etc/systemd/system/sentinel-beacon.service ]]; then
+        systemctl enable --now sentinel-beacon.service >/dev/null 2>&1 \
+            && ok "sentinel-beacon.service enabled"
+    fi
 }
 
 # --- 33 -------------------------------------------------------------------

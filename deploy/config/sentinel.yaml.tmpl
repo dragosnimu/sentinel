@@ -312,3 +312,27 @@ suricata:
   # Suricata's own memory ceiling. On a small VPS this is the difference
   # between a NIDS and an OOM kill.
   memcap_mb: 128
+
+# ---------------------------------------------------------------------------
+# Beacon — semnalul periodic către un martor din afara acestei gazde.
+#
+# De ce există: un agent găzduit nu poate raporta credibil propria dispariție.
+# Cine oprește serviciile controlează și canalul prin care ar fi anunțat. Așa
+# că Sentinel trimite periodic câteva contoare care TREBUIE să crească, iar
+# absența semnalului devine alarma — pe o mașină pe care atacatorul nu o are.
+#
+# Oprirea beaconului nu e o slăbiciune a lui; e exact semnalul.
+#
+# `url` e ruta /api/sentinel/beat a martorului. Cheia HMAC NU stă aici — stă în
+# SENTINEL_BEACON_SECRET din secrets.env, aceeași valoare la ambele capete.
+# Fără ea, serviciul spune o dată în jurnal și iese curat; nu pretinde că
+# raportează.
+beacon:
+  enabled: false
+  url: ""
+  interval_s: 60
+  timeout_s: 10
+  # Cât de vechi poate fi un semnal când ajunge la martor. Protejează împotriva
+  # reluării unui pachet capturat: semnătura e validă la nesfârșit, prospețimea
+  # nu.
+  max_age_s: 120
