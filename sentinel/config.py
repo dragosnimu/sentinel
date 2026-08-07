@@ -54,6 +54,22 @@ class RetentionConfig:
     # partitions early and alerts, rather than letting the disk fill.
     disk_guard_free_pct: int = 15
 
+    # How long an incident may sit with no new detection before it is closed
+    # automatically, per severity. Nothing is deleted: the row keeps its
+    # evidence, its timeline gains an entry, and renewed activity opens a fresh
+    # incident rather than reviving this one.
+    #
+    # The numbers are not a retention policy, they are a reading policy. A queue
+    # of 851 open incidents is not read by anyone, and the one that mattered is
+    # hidden by the 850 that did not — which is the failure this prevents.
+    #
+    # `critical` is deliberately absent and never auto-closes. A critical nobody
+    # has looked at for two weeks is a finding about the operator, not about the
+    # incident, and hiding it would be the one thing worse than a long queue.
+    incident_stale_days: dict[str, int] = field(default_factory=lambda: {
+        "info": 1, "low": 2, "medium": 7, "high": 21,
+    })
+
 
 @dataclass
 class IngestConfig:

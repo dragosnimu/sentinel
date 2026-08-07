@@ -317,3 +317,106 @@ def test_the_unit_can_write_where_the_service_writes():
     rw = next(l for l in unit.splitlines() if l.startswith("ReadWritePaths="))
     assert "/var/backups/sentinel" in rw
     assert "Type=oneshot" in unit
+
+
+# --- închiderea automată a incidentelor tăcute ----------------------------
+#
+# Serverul avea 851 de incidente deschise de la 799 de adrese distincte, adunate
+# în șapte zile. Nu era o campanie, era fundalul internetului plus faptul că
+# nimic nu închidea nimic. O coadă de mărimea aceea nu e citită de nimeni, iar
+# incidentul care conta se ascunde perfect printre cele care nu contau.
+
+def _cfg_stale(**over):
+    days = {"info": 1, "low": 2, "medium": 7, "high": 21}
+    days.update(over)
+    return SimpleNamespace(retention=SimpleNamespace(incident_stale_days=days))
+
+
+class _IncDB(_DB):
+    """Ține minte și argumentele, ca aserțiunile să fie pe praguri, nu pe text."""
+
+    def __init__(self, closed_ids=None):
+        super().__init__()
+        self._closed = closed_ids or {}
+        self.args: list[tuple] = []
+        self.timeline: list[tuple] = []
+
+    async def fetch(self, sql, *a):
+        self.sql.append(sql)
+        self.args.append(a)
+        if "UPDATE incidents" in sql:
+            return [{"id": i} for i in self._closed.get(a[0], [])]
+        return []
+
+    async def execute(self, sql, *a):
+        self.sql.append(sql)
+        if "incident_timeline" in sql:
+            self.timeline.append(a)
+
+
+def test_stale_incidents_are_closed_per_severity():
+    db = _IncDB(closed_ids={"medium": [1, 2, 3], "low": [4]})
+    detail, evidence = run(ms.close_stale_incidents(db, _cfg_stale()))
+    assert evidence["closed"] == {"low": 1, "medium": 3}
+    assert "4 incidente" in detail
+
+
+def test_each_severity_uses_its_own_threshold():
+    """Un `high` tăcut de două zile nu e același lucru cu un `info` tăcut de
+    două zile. Un singur prag pentru toate ar însemna ori că informativele se
+    adună, ori că cele grave dispar prea repede."""
+    db = _IncDB()
+    run(ms.close_stale_incidents(db, _cfg_stale()))
+    passed = {a[0]: a[1] for a in db.args}
+    assert passed == {"info": 1, "low": 2, "medium": 7, "high": 21}
+
+
+def test_critical_is_never_auto_closed_even_if_configured():
+    """Pragul e configurabil, deci cineva îl poate adăuga — în graba de a face
+    coada să arate mai bine. Refuzul stă în cod, unde un fișier de configurare
+    nu îl poate anula.
+
+    Un critic la care nu s-a uitat nimeni de două săptămâni e o constatare
+    despre operator, nu despre incident."""
+    db = _IncDB(closed_ids={"critical": [9, 9, 9]})
+    _, evidence = run(ms.close_stale_incidents(db, _cfg_stale(critical=1)))
+    assert "critical" not in evidence["closed"]
+    assert all(a[0] != "critical" for a in db.args)
+
+
+def test_closing_writes_a_timeline_entry_naming_the_closer():
+    """Peste șase luni, întrebarea va fi «cine a decis asta». Un rând închis
+    fără urmă în cronologie nu poate răspunde."""
+    db = _IncDB(closed_ids={"medium": [42]})
+    run(ms.close_stale_incidents(db, _cfg_stale()))
+    assert len(db.timeline) == 1
+    incident_id, kind, actor, detail = db.timeline[0]
+    assert incident_id == 42
+    assert actor == ms.CLOSED_BY
+    assert '"auto": true' in detail and '"reason": "stale"' in detail
+
+
+def test_nothing_is_deleted():
+    """Închiderea e o schimbare de stare, nu o ștergere. Probele rămân, altfel
+    un incident redeschis mai târziu ar fi imposibil de reconstituit."""
+    db = _IncDB(closed_ids={"medium": [1]})
+    run(ms.close_stale_incidents(db, _cfg_stale()))
+    joined = " ".join(db.sql)
+    assert "DELETE" not in joined.upper()
+    assert "UPDATE incidents SET status = 'resolved'" in joined
+
+
+def test_only_open_and_acknowledged_are_touched():
+    """Un incident deja marcat fals-pozitiv nu are voie să fie rescris ca
+    «rezolvat» — s-ar pierde judecata pe care a dat-o cineva."""
+    db = _IncDB()
+    run(ms.close_stale_incidents(db, _cfg_stale()))
+    assert "status IN ('open', 'acknowledged')" in db.sql[0]
+
+
+def test_the_step_is_registered_in_the_run():
+    """O sarcină scrisă și neapelată nu rulează niciodată, în tăcere — exact
+    cum a lipsit tot serviciul ăsta dintr-un build livrat."""
+    import inspect
+    src = inspect.getsource(ms.run)
+    assert "close_stale_incidents" in src

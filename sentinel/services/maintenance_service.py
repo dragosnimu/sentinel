@@ -50,6 +50,7 @@ from typing import Any
 
 from sentinel.config import Config, get_config
 from sentinel.db.engine import Database
+from sentinel.db.repo import incidents as inc_repo
 from sentinel.logging_setup import get_logger, setup_logging
 
 log = get_logger(__name__)
@@ -385,6 +386,69 @@ async def prune_backups(db: Database, cfg: Config) -> tuple[str, dict[str, Any]]
 
 
 # ---------------------------------------------------------------------------
+# 9. Incidente tăcute
+# ---------------------------------------------------------------------------
+# Cine a închis. Nu un nume de om, fiindcă nu a fost un om — iar cronologia
+# trebuie să poată fi citită peste șase luni de cineva care întreabă „cine a
+# decis asta".
+CLOSED_BY = "sentinel-maintenance"
+
+
+async def close_stale_incidents(db: Database, cfg: Config) -> tuple[str, dict[str, Any]]:
+    """Închide incidentele fără activitate nouă, pe praguri de severitate.
+
+    Motivul nu e spațiul pe disc — un incident ocupă câțiva octeți. Motivul e
+    că o coadă de 851 de incidente deschise nu e citită de nimeni, iar cel care
+    conta se ascunde perfect printre cele 850 care nu contau. Pragurile de aici
+    sunt o politică de citire, nu una de retenție.
+
+    Ce NU face:
+
+    * nu șterge nimic. Rândul rămâne cu toate probele, iar cronologia câștigă o
+      intrare care spune cine a închis, când și de ce;
+    * nu învie nimic. Indexul unic pe amprentă acoperă doar `open` și
+      `acknowledged`, deci activitate nouă deschide un incident NOU. Asta e și
+      corect: un atacator care revine după trei săptămâni e un eveniment, nu o
+      continuare;
+    * nu atinge `critical`. Un critic la care nu s-a uitat nimeni de două
+      săptămâni e o constatare despre operator, nu despre incident, iar
+      ascunderea lui ar fi singurul lucru mai rău decât o coadă lungă.
+    """
+    closed: dict[str, int] = {}
+    for severity, days in sorted(cfg.retention.incident_stale_days.items()):
+        if severity == "critical":
+            # Configurabil, deci cineva îl poate adăuga. Refuzăm în cod, unde
+            # refuzul nu poate fi anulat dintr-un fișier de configurare editat
+            # în graba de a face coada să arate mai bine.
+            log.warning("refusing to auto-close critical incidents; ignoring the setting")
+            continue
+        rows = await db.fetch(
+            """
+            UPDATE incidents SET status = 'resolved', resolved_at = now(),
+                resolution_note = $3
+            WHERE status IN ('open', 'acknowledged')
+              AND severity = $1
+              AND last_detection_at < now() - ($2::int * interval '1 day')
+            RETURNING id
+            """,
+            severity, int(days),
+            f"închis automat: fără activitate nouă de {days} zile")
+        for r in rows:
+            await inc_repo.add_timeline(
+                db, r["id"], "status", CLOSED_BY,
+                {"status": "resolved", "auto": True,
+                 "reason": "stale", "stale_days": int(days)})
+        if rows:
+            closed[severity] = len(rows)
+
+    total = sum(closed.values())
+    detail = (", ".join(f"{k}: {v}" for k, v in closed.items())
+              if closed else "nimic de închis")
+    return (f"{total} incidente închise ({detail})" if total else detail,
+            {"closed": closed})
+
+
+# ---------------------------------------------------------------------------
 # Rularea
 # ---------------------------------------------------------------------------
 async def run(db: Database, cfg: Config) -> Report:
@@ -400,6 +464,7 @@ async def run(db: Database, cfg: Config) -> Report:
     await _step(rep, "disk_guard", disk_guard(db, cfg))
     await _step(rep, "intel", refresh_intel(db))
     await _step(rep, "backups", prune_backups(db, cfg))
+    await _step(rep, "stale_incidents", close_stale_incidents(db, cfg))
     return rep
 
 
