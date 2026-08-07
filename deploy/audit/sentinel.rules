@@ -31,6 +31,13 @@
 # --- SSH --------------------------------------------------------------------
 # A write to authorized_keys is persistence. A change to sshd_config could be
 # anyone widening the way in.
+#
+# /home is watched whole because the kernel cannot glob: there is no way to say
+# "only /home/*/.ssh/". That makes this the broadest rule in the file — every
+# file any user writes anywhere in their home directory arrives here. The
+# narrowing happens downstream, in detect/intrusion.py, which alerts only on
+# paths under a .ssh directory. Without that filter the rule reported a shell
+# history write as an SSH key change, 62 times in one deployment.
 -w /etc/ssh/sshd_config -p wa -k sentinel_ssh
 -w /root/.ssh           -p wa -k sentinel_ssh
 -w /home                -p wa -k sentinel_ssh
@@ -65,11 +72,26 @@
 
 # --- SUID changes -----------------------------------------------------------
 # A new SUID binary is a privilege-escalation foothold.
--a always,exit -F arch=b64 -S chmod,fchmod,fchmodat -F auid>=1000 -F auid!=unset -F key=sentinel_exec
+#
+# The mode-bit filter is the whole rule. Without it this matches EVERY chmod by
+# every logged-in user, which on a host where anyone deploys anything means
+# hundreds of events per deployment — and, because they shared a key with the
+# network tools below, they were reported as "attacker tool executed: install".
+# A rule that fires on `chmod 0644` is not watching for privilege escalation,
+# it is watching for work being done.
+#
+# 07000 is setuid|setgid|sticky. Two rules because the mode argument is a1 for
+# chmod and fchmod but a2 for fchmodat — one rule covering all three would
+# silently test the wrong argument for the third.
+-a always,exit -F arch=b64 -S chmod,fchmod -F a1&07000 -F auid>=1000 -F auid!=unset -k sentinel_suid
+-a always,exit -F arch=b64 -S fchmodat -F a2&07000 -F auid>=1000 -F auid!=unset -k sentinel_suid
 
 # --- Module loading ---------------------------------------------------------
 # Kernel module insertion on a VPS that loads no custom modules is not routine.
--a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k sentinel_exec
+# No auid filter here, deliberately: a rootkit loads its module from whatever
+# context it can reach, and a module arriving with no login session behind it is
+# more alarming than one that has.
+-a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k sentinel_module
 
 # --- What is NOT watched, and why ------------------------------------------
 #

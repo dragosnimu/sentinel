@@ -71,11 +71,25 @@ def _fmt_paths(paths: list[str | None]) -> str:
     return ", ".join(f"`{p}`" for p in seen) or "—"
 
 
-async def _grouped(db: Database, cursor: int, actions: tuple[str, ...]) -> list[Any]:
+async def _grouped(db: Database, cursor: int, actions: tuple[str, ...], *,
+                   narrow_action: str | None = None,
+                   narrow_paths: tuple[str, ...] | None = None) -> list[Any]:
     """Evenimentele proaspete pentru un set de acțiuni, grupate pe gazdă.
 
     Gruparea e pe acțiune, nu pe fișier: cinci fișiere atinse de același proces
     în același minut sunt un incident, nu cinci.
+
+    `narrow_action` + `narrow_paths` îngustează O SINGURĂ acțiune după calea
+    fișierului, pentru urmăririle pe care nucleul nu le poate îngusta singur.
+    `-w /home` nu are cum să spună „doar /home/*/.ssh/", fiindcă auditd nu
+    cunoaște globuri; fără filtrul ăsta, scrierea în istoricul de shell al
+    oricui ajunge raportată ca schimbare de cheie SSH. Celelalte acțiuni trec
+    neatinse — /etc/crontab și /etc/systemd/system sunt deja exact ce ne
+    interesează.
+
+    Un eveniment fără cale se elimină din acțiunea îngustată: la o urmărire pe
+    fișier, absența căii înseamnă că nu știm ce s-a atins, iar „nu știu" nu e
+    motiv de alertă critică.
     """
     return await db.fetch(
         """
@@ -95,9 +109,18 @@ async def _grouped(db: Database, cursor: int, actions: tuple[str, ...]) -> list[
           AND e.source = 'auditd'
           AND e.action = ANY($2::text[])
           AND e.ts > now() - make_interval(mins => $3)
+          AND ($4::text IS NULL
+               OR e.action <> $4::text
+               OR (e.file_path IS NOT NULL AND e.file_path LIKE ANY($5::text[])))
         GROUP BY e.action
         """,
-        cursor, list(actions), WINDOW_MIN)
+        cursor, list(actions), WINDOW_MIN, narrow_action,
+        list(narrow_paths) if narrow_paths else None)
+
+
+# Ce înseamnă de fapt „schimbare de cheie SSH", odată ce urmărirea de nucleu
+# acoperă tot /home. Un director `.ssh` oriunde, plus configurația demonului.
+SSH_PATHS = ("%/.ssh/%", "%/.ssh", "%sshd_config%", "%authorized_keys%")
 
 
 def _spec(row: Any, *, rule_id: str, severity: str, title: str,
@@ -139,7 +162,10 @@ async def persistence(db: Database, cursor: int) -> list[DetectionSpec]:
     l-a pus acolo.
     """
     out: list[DetectionSpec] = []
-    for row in await _grouped(db, cursor, ("ssh_key_change", "cron_change", "unit_change")):
+    for row in await _grouped(db, cursor,
+                              ("ssh_key_change", "cron_change", "unit_change"),
+                              narrow_action="ssh_key_change",
+                              narrow_paths=SSH_PATHS):
         kind = {
             "ssh_key_change": ("chei SSH sau configurație sshd", "acces care supraviețuiește schimbării parolei"),
             "cron_change":    ("sarcini programate", "execuție repetată, la interval, fără sesiune"),
@@ -279,7 +305,15 @@ async def attacker_tooling(db: Database, cursor: int) -> list[DetectionSpec]:
 
     out: list[DetectionSpec] = []
     for name, slot in by_tool.items():
-        sev = TOOL_WEIGHT.get(name, "high")
+        # Only binaries this rule has an opinion about. It used to default
+        # unknown names to `high` and title them "attacker tool executed",
+        # which is how `install`, `chmod` and `logrotate` were reported as
+        # attacker tooling for two days. The kernel rules are narrow again, so
+        # nothing else should arrive here — but a rule whose failure mode is
+        # crying wolf does not get to rely on that.
+        sev = TOOL_WEIGHT.get(name)
+        if sev is None:
+            continue
         argv = slot["argv"][:3]
         out.append(DetectionSpec(
             rule_id=f"intrusion.tooling.{name}",
@@ -389,6 +423,62 @@ async def account_created(db: Database, cursor: int) -> list[DetectionSpec]:
 # Definit la final: fiecare regulă trebuie să existe înainte de a fi numită aici,
 # iar un tuplu care numește o funcție definită mai jos pică la import — adică
 # serviciul nu pornește deloc, în loc să eșueze o singură regulă.
+# ---------------------------------------------------------------------------
+# 7. Un binar a devenit setuid
+# ---------------------------------------------------------------------------
+async def suid_change(db: Database, cursor: int) -> list[DetectionSpec]:
+    """`chmod u+s` — cea mai curată ușă din dos pe care o poate lăsa cineva.
+
+    Un binar setuid-root scris de un utilizator obișnuit înseamnă că acel
+    utilizator poate redeveni root oricând, fără parolă, fără sudo, fără urmă
+    în jurnalul de autentificare. E o singură comandă, e reversibilă în două
+    secunde, și supraviețuiește repornirii.
+
+    Semnalul ăsta exista de la început în regulile de nucleu, dar împărțea
+    cheia cu uneltele de rețea, deci ajungea în regula de tooling și era
+    raportat ca „unealtă de atacator executată: chmod". Adevărata întrebare —
+    CE fișier a devenit setuid — nu apărea nicăieri.
+    """
+    out: list[DetectionSpec] = []
+    for row in await _grouped(db, cursor, ("suid_change",)):
+        out.append(_spec(
+            row, rule_id="intrusion.suid_change", severity="critical",
+            title="Bit setuid/setgid pus pe un fișier",
+            summary=(f"{row['n']} modificări de mod în {WINDOW_MIN} min · "
+                     f"{_fmt_paths(row['paths'] or [])} · "
+                     f"proces: {', '.join((row['procs'] or [])[:3]) or '—'} · "
+                     f"auid: {', '.join((row['users'] or [])[:3]) or '—'}. "
+                     f"Un binar setuid-root înseamnă root fără parolă, la cerere. "
+                     f"Verifică fișierul înainte de orice altceva.")))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 8. Modul de kernel încărcat
+# ---------------------------------------------------------------------------
+async def module_load(db: Database, cursor: int) -> list[DetectionSpec]:
+    """Sub kernel nu mai există nimic care să observe.
+
+    Pe o gazdă care nu încarcă module proprii, o inserție e ori o actualizare
+    de sistem, ori un rootkit. Diferența nu se poate face din spațiul
+    utilizatorului — care e exact motivul pentru care merită întrebat.
+
+    Fără filtru pe `auid`, spre deosebire de restul: un modul care sosește fără
+    nicio sesiune de autentificare în spate e mai alarmant, nu mai puțin.
+    """
+    out: list[DetectionSpec] = []
+    for row in await _grouped(db, cursor, ("module_load",)):
+        out.append(_spec(
+            row, rule_id="intrusion.module_load", severity="critical",
+            title="Modul de kernel încărcat sau descărcat",
+            summary=(f"{row['n']} operații în {WINDOW_MIN} min · "
+                     f"proces: {', '.join((row['procs'] or [])[:3]) or '—'} · "
+                     f"auid: {', '.join((row['users'] or [])[:3]) or '—'}. "
+                     f"Dacă nu ai actualizat nucleul sau un driver acum, "
+                     f"nimic din ce rulează pe gazda asta nu mai poate fi crezut.")))
+    return out
+
+
 INTRUSION_RULES = (
     persistence,
     privilege_escalation,
@@ -396,4 +486,6 @@ INTRUSION_RULES = (
     attacker_tooling,
     webroot_tampering,
     account_created,
+    suid_change,
+    module_load,
 )

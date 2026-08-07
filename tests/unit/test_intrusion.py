@@ -29,6 +29,7 @@ class _DB:
     def __init__(self, rows=None, vals=None):
         self.rows, self.vals = rows or {}, vals or {}
         self.sql: list[str] = []
+        self.args: list[tuple] = []
 
     def _pick(self, table, sql, default=None):
         for k, v in table.items():
@@ -38,6 +39,10 @@ class _DB:
 
     async def fetch(self, sql, *a):
         self.sql.append(sql)
+        # Argumentele, nu doar textul. Interogarea e o constantă în modul, deci
+        # o aserțiune pe textul ei trece chiar dacă apelantul nu mai cere
+        # îngustarea — exact felul de test care pare să acopere ceva.
+        self.args.append(a)
         v = self._pick(self.rows, sql, [])
         return v(*a) if callable(v) else v
 
@@ -276,3 +281,91 @@ def test_a_full_intrusion_produces_alerts_at_each_stage():
     # Amprente distincte: patru incidente separate, nu unul actualizat de patru
     # ori. Operatorul trebuie să vadă progresia, nu ultima stare.
     assert len({s.fingerprint for s in stages}) == 4
+
+
+# --- ce am învățat din 851 de incidente reale ------------------------------
+#
+# Serverul a produs, în șapte zile, incidente `high` intitulate „Unealtă de
+# atacator executată: install / chmod / logrotate / sefcontext_compile", plus
+# un „chei SSH modificate" cu 62 de detecții. Niciunul nu era ce spunea că e.
+# Testele de aici descriu cele patru cauze, în ordinea în care se compuneau.
+
+@pytest.mark.parametrize("binar", ["install", "chmod", "logrotate",
+                                   "sefcontext_compile", "sed", "python3"])
+def test_ordinary_binaries_are_not_attacker_tools(binar):
+    """Regula avea `TOOL_WEIGHT.get(name, "high")`.
+
+    Orice binar necunoscut primea severitate ridicată și titlul „Unealtă de
+    atacator executată". `install` și `chmod` sunt utilitare pe care le rulează
+    orice instalare — inclusiv a noastră. O regulă al cărei mod de eșec e să
+    strige „lupul" nu are voie să aibă o valoare implicită permisivă.
+    """
+    db = _DB(rows={"suspicious_exec": [{
+        "id": 1, "ts": NOW, "process": f"/usr/bin/{binar}",
+        "username": "1000", "raw": {}}]})
+    assert run(intrusion.attacker_tooling(db, 0)) == []
+
+
+def test_the_tools_it_does_know_still_fire():
+    """Îngustarea nu are voie să stingă semnalul pentru care există regula."""
+    db = _DB(rows={"suspicious_exec": [
+        {"id": 1, "ts": NOW, "process": "/usr/bin/ncat", "username": "1000", "raw": {}},
+        {"id": 2, "ts": NOW, "process": "/usr/bin/wget", "username": "1000", "raw": {}},
+    ]})
+    specs = run(intrusion.attacker_tooling(db, 0))
+    assert {s.evidence["tool"] for s in specs} == {"ncat", "wget"}
+
+
+def test_ssh_watch_is_narrowed_to_ssh_paths_in_sql():
+    """`-w /home` prinde tot ce scrie oricine în directorul lui.
+
+    Nucleul nu cunoaște globuri, deci nu are cum să urmărească doar
+    /home/*/.ssh/. Îngustarea trebuie să existe în interogare — dacă ar fi
+    făcută după grupare, numărul de evenimente ar rămâne umflat cu scrierile
+    irelevante chiar dacă titlul ar arăta corect.
+    """
+    db = _DB(rows={"e.source = 'auditd'": [_row(
+        action="ssh_key_change", n=1, paths=["/root/.ssh/authorized_keys"])]})
+    run(intrusion.persistence(db, 0))
+
+    assert "e.action <> $4::text" in db.sql[0]
+    # Interogarea o suportă; aserțiunea care contează e că APELANTUL o cere.
+    narrow_action, narrow_paths = db.args[0][3], db.args[0][4]
+    assert narrow_action == "ssh_key_change"
+    assert narrow_paths, "regula nu trimite tiparele de cale"
+    # Și numai acțiunea aceea e îngustată: /etc/crontab și /etc/systemd/system
+    # sunt deja exact ce ne interesează.
+    assert all("ssh" in t or "authorized_keys" in t for t in narrow_paths)
+
+
+def test_setuid_gets_its_own_rule_naming_the_file():
+    """Semnalul exista, dar împărțea cheia de audit cu uneltele de rețea.
+
+    Ajungea în regula de tooling și era raportat ca „unealtă de atacator
+    executată: chmod". Întrebarea care conta — CE fișier a devenit setuid — nu
+    apărea nicăieri.
+    """
+    db = _DB(rows={"e.source = 'auditd'": [_row(
+        action="suid_change", n=1, paths=["/tmp/.hidden/rootshell"],
+        procs=["/usr/bin/chmod"], users=["1000"])]})
+    s = run(intrusion.suid_change(db, 0))[0]
+    assert s.severity == "critical"
+    assert "/tmp/.hidden/rootshell" in s.summary
+    assert "unealt" not in s.title.lower()
+
+
+def test_module_load_is_its_own_rule():
+    db = _DB(rows={"e.source = 'auditd'": [_row(
+        action="module_load", n=1, procs=["/usr/sbin/insmod"], users=["1000"])]})
+    s = run(intrusion.module_load(db, 0))[0]
+    assert s.severity == "critical"
+    assert "kernel" in s.title.lower()
+
+
+def test_every_intrusion_rule_is_registered():
+    """O regulă scrisă și neînregistrată nu rulează niciodată, în tăcere."""
+    import inspect
+    defined = {n for n, f in vars(intrusion).items()
+               if inspect.iscoroutinefunction(f) and not n.startswith("_")}
+    registered = {f.__name__ for f in intrusion.INTRUSION_RULES}
+    assert defined == registered, f"neînregistrate: {defined - registered}"

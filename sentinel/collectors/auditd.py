@@ -62,7 +62,13 @@ _WATCH_KEYS = {
     "sentinel_cron":     "cron_change",
     "sentinel_systemd":  "unit_change",
     "sentinel_webroot":  "webroot_change",
-    "sentinel_exec":     "suspicious_exec",
+    # Three separate keys where there used to be one. They are three different
+    # questions — "did someone run a network tool", "did a binary become
+    # setuid", "was a kernel module loaded" — and sharing a key meant one
+    # detection rule answered all three with the same sentence.
+    "sentinel_exec":     "suspicious_exec",   # nc, ncat, socat, wget, curl
+    "sentinel_suid":     "suid_change",
+    "sentinel_module":   "module_load",
 }
 
 _SERIAL = re.compile(r"msg=audit\(\d+\.\d+:(?P<serial>\d+)\)")
