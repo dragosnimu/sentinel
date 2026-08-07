@@ -116,7 +116,7 @@ server {
     # traffic than the operator's sites.
     ssl_session_cache shared:SentinelTLS:10m;
 
-    include /etc/nginx/conf.d/sentinel-security-headers.conf;
+    include /etc/nginx/sentinel/security-headers.conf;
 
     # ---------------------------------------------------------------------
     # OPTIONAL BUT RECOMMENDED: restrict the dashboard to your own addresses.
@@ -149,25 +149,25 @@ server {
     location = /login {
         limit_req zone=sentinel_login burst=10 nodelay;
         limit_req_status 429;
-        include /etc/nginx/conf.d/sentinel-proxy-params.conf;
+        include /etc/nginx/sentinel/proxy-params.conf;
         proxy_pass http://sentinel_app;
     }
 
     location = /totp {
         limit_req zone=sentinel_login burst=10 nodelay;
         limit_req_status 429;
-        include /etc/nginx/conf.d/sentinel-proxy-params.conf;
+        include /etc/nginx/sentinel/proxy-params.conf;
         proxy_pass http://sentinel_app;
     }
 
     location /api/ {
         limit_req zone=sentinel_api burst=30 nodelay;
-        include /etc/nginx/conf.d/sentinel-proxy-params.conf;
+        include /etc/nginx/sentinel/proxy-params.conf;
         proxy_pass http://sentinel_app;
     }
 
     location = /stream {
-        include /etc/nginx/conf.d/sentinel-proxy-params.conf;
+        include /etc/nginx/sentinel/proxy-params.conf;
         proxy_pass http://sentinel_app;
         # SSE holds the connection open; buffering would batch events and defeat
         # the point of a live incident feed. proxy_http_version and the empty
@@ -187,13 +187,13 @@ server {
     }
 
     location = /healthz {
-        include /etc/nginx/conf.d/sentinel-proxy-params.conf;
+        include /etc/nginx/sentinel/proxy-params.conf;
         proxy_pass http://sentinel_app;
         access_log off;
     }
 
     location / {
-        include /etc/nginx/conf.d/sentinel-proxy-params.conf;
+        include /etc/nginx/sentinel/proxy-params.conf;
         proxy_pass http://sentinel_app;
     }
 

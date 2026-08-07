@@ -829,15 +829,43 @@ step_start_services() {
     fi
 }
 
+# Fragmentele incluse de vhost-urile Sentinel.
+#
+# NU in /etc/nginx/conf.d/. Acel director e inclus de nginx.conf in contextul
+# `http`, iar un fisier de `add_header` pus acolo se aplica FIECARUI site de pe
+# gazda care nu-si defineste propriile antete. Sentinel a impus astfel un
+# `Content-Security-Policy: default-src 'self'` si un HSTS cu includeSubDomains
+# tuturor site-urilor operatorului - adica a stricat orice pagina care incarca
+# un script de CDN sau un font extern, si a fortat HTTPS pe subdomenii pentru un
+# an, memorat in browserele vizitatorilor.
+#
+# Un agent de monitorizare nu are voie sa schimbe comportamentul lucrurilor pe
+# care le monitorizeaza. Fragmentele stau intr-un director propriu si sunt
+# incluse explicit, doar in blocurile `server` ale Sentinel.
+SENTINEL_NGINX_SNIPPET_DIR=/etc/nginx/sentinel
+
+install_sentinel_nginx_snippets() {
+    install -d -m 0755 "$SENTINEL_NGINX_SNIPPET_DIR"
+    install -m 0644 "${SCRIPT_DIR}/nginx/sentinel-security-headers.conf"         "${SENTINEL_NGINX_SNIPPET_DIR}/security-headers.conf"
+    install -m 0644 "${SCRIPT_DIR}/nginx/sentinel-proxy-params.conf"         "${SENTINEL_NGINX_SNIPPET_DIR}/proxy-params.conf"
+
+    # Versiunile vechi le lasau in conf.d, unde continua sa se aplice global.
+    # Un upgrade trebuie sa le si elimine, altfel reparatia nu repara nimic pe
+    # exact gazdele care au nevoie de ea.
+    for stale in /etc/nginx/conf.d/sentinel-security-headers.conf                  /etc/nginx/conf.d/sentinel-proxy-params.conf; do
+        if [[ -f "$stale" ]]; then
+            rm -f "$stale"
+            ok "removed ${stale} - it applied to every site on this host"
+        fi
+    done
+}
+
 # --- 33 -------------------------------------------------------------------
 step_nginx() {
     # The vhost `include`s both of these. Installing the vhost without them
     # makes `nginx -t` fail with a confusing "open() failed" before certbot ever
     # gets a chance to run.
-    install -D -m 0644 "${SCRIPT_DIR}/nginx/sentinel-security-headers.conf" \
-        /etc/nginx/conf.d/sentinel-security-headers.conf
-    install -D -m 0644 "${SCRIPT_DIR}/nginx/sentinel-proxy-params.conf" \
-        /etc/nginx/conf.d/sentinel-proxy-params.conf
+    install_sentinel_nginx_snippets
 
     # A placeholder certificate so the `listen … ssl` block is valid on a fresh
     # host. certbot replaces it later; without it, nginx -t fails on a missing
@@ -922,6 +950,10 @@ competing for :80."
 # ---------------------------------------------------------------------------
 SENTINEL_NGINX_FILES=(
     /etc/nginx/conf.d/sentinel-shared.conf
+    /etc/nginx/sentinel/security-headers.conf
+    /etc/nginx/sentinel/proxy-params.conf
+    # Locul vechi, pastrat in lista ca dezinstalarea sa curete si
+    # gazdele instalate inainte de mutare.
     /etc/nginx/conf.d/sentinel-security-headers.conf
     /etc/nginx/conf.d/sentinel-proxy-params.conf
 )
@@ -959,10 +991,7 @@ configuration first — Sentinel will not add a vhost to a broken nginx."
     fi
     ok "nginx -t passes before any change"
 
-    install -D -m 0644 "${SCRIPT_DIR}/nginx/sentinel-security-headers.conf" \
-        /etc/nginx/conf.d/sentinel-security-headers.conf
-    install -D -m 0644 "${SCRIPT_DIR}/nginx/sentinel-proxy-params.conf" \
-        /etc/nginx/conf.d/sentinel-proxy-params.conf
+    install_sentinel_nginx_snippets
 
     ensure_placeholder_certificate
 
