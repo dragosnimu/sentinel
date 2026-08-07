@@ -118,3 +118,33 @@ def test_execve_rules_still_only_name_network_tools(lines: list[str]) -> None:
             watched.add(m.group(1))
     assert watched, "nicio regulă de execve"
     assert watched <= set(TOOL_WEIGHT), f"urmărite fără severitate: {watched - set(TOOL_WEIGHT)}"
+
+
+# --- instalarea, nu doar conținutul ----------------------------------------
+INSTALL_SH = RULES.parents[1] / "install.sh"
+
+
+def test_rule_loading_does_not_discard_the_kernel_s_complaints() -> None:
+    """`augenrules --load 2>/dev/null` face o regulă respinsă să arate ca una
+    încărcată: fișierul e pe disc, pasul spune „installed", iar detecția care
+    o citește pur și simplu nu se declanșează niciodată."""
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    assert "augenrules --load 2>/dev/null" not in text
+    assert "augenrules --load 2>&1" in text
+
+
+def test_loaded_rules_are_verified_against_the_kernel() -> None:
+    """Intenția noastră nu e o dovadă. O sintaxă pe care nucleul care rulează nu
+    o suportă e altfel imposibil de deosebit de una pe care o suportă."""
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    assert "auditctl -l" in text
+    assert "NOT loaded by the kernel" in text
+
+
+def test_the_beacon_is_restarted_not_merely_enabled() -> None:
+    """`enable --now` pe un serviciu deja pornit nu face nimic. Procesul ar
+    continua să ruleze codul de la deploy-ul anterior — pornit, sănătos, și
+    fără reparația tocmai livrată."""
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    assert "systemctl restart sentinel-beacon.service" in text
+    assert "systemctl enable --now sentinel-beacon.service" not in text

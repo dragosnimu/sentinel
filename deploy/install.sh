@@ -816,8 +816,16 @@ step_start_services() {
     # on yet would be absurd. Enable it either way, so that turning it on later
     # is one `systemctl restart`, not an archaeology session.
     if [[ -f /etc/systemd/system/sentinel-beacon.service ]]; then
-        systemctl enable --now sentinel-beacon.service >/dev/null 2>&1 \
-            && ok "sentinel-beacon.service enabled"
+        systemctl enable sentinel-beacon.service >/dev/null 2>&1 || true
+        # restart, not `enable --now`: on a host where the beacon is already
+        # running, `--now` is a no-op and the process keeps executing the code
+        # from the previous deployment. It would look enabled, report healthy,
+        # and quietly never pick up a fix.
+        if systemctl restart sentinel-beacon.service 2>/dev/null; then
+            ok "sentinel-beacon.service enabled and restarted"
+        else
+            info "sentinel-beacon.service installed but not started (beacon.enabled is false)"
+        fi
     fi
 }
 
@@ -1350,8 +1358,37 @@ step_suricata() {
 step_auxiliary() {
     if [[ -f "${SCRIPT_DIR}/audit/sentinel.rules" ]]; then
         install -D -m 0640 "${SCRIPT_DIR}/audit/sentinel.rules" /etc/audit/rules.d/sentinel.rules
-        augenrules --load 2>/dev/null || warn "could not reload audit rules"
-        ok "auditd rules installed"
+
+        # NOT `2>/dev/null`. The kernel validates each rule on load and rejects
+        # the ones it does not understand, one at a time, on stderr. Discarding
+        # that output means a rejected rule looks exactly like a loaded one:
+        # the file is on disk, the step says "installed", and the detection it
+        # feeds simply never fires. Silence is the failure mode this whole
+        # project keeps running into.
+        local load_err
+        if ! load_err="$(augenrules --load 2>&1)"; then
+            warn "augenrules failed: ${load_err}"
+        elif [[ -n "$load_err" ]]; then
+            warn "the kernel complained while loading audit rules: ${load_err}"
+        fi
+
+        # And then verify against the kernel rather than against our intent.
+        # Every key the rules file uses must actually be present in the loaded
+        # ruleset; a syntax the running kernel does not support is otherwise
+        # indistinguishable from one it does.
+        local want got missing=()
+        want="$(grep -oE 'sentinel_[a-z_]+' "${SCRIPT_DIR}/audit/sentinel.rules" | sort -u)"
+        got="$(auditctl -l 2>/dev/null || true)"
+        for key in $want; do
+            grep -q -- "$key" <<< "$got" || missing+=("$key")
+        done
+        if (( ${#missing[@]} )); then
+            warn "audit keys written but NOT loaded by the kernel: ${missing[*]}
+    The detections that read them will never fire. Inspect with:
+        auditctl -l | grep sentinel_"
+        else
+            ok "auditd rules installed and confirmed loaded"
+        fi
     fi
     if [[ -f "${SCRIPT_DIR}/fail2ban/sentinel-web.conf" ]] && have fail2ban-client; then
         install -D -m 0644 "${SCRIPT_DIR}/fail2ban/sentinel-web.conf" \
