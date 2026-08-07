@@ -93,3 +93,61 @@ def test_snippets_contain_only_directives_meant_to_be_scoped(snippet: Path) -> N
     assert f"/etc/nginx/sentinel/{snippet.stem.replace('sentinel-', '')}.conf" in \
            "\n".join(t.read_text(encoding="utf-8") for t in NGINX_DIR.glob("*.tmpl")), \
         f"{snippet.name} conține {found} dar niciun vhost nu îl include din directorul privat"
+
+
+# --- reincarcarea trebuie dovedita, nu presupusa ---------------------------
+#
+# `systemctl reload nginx` intoarce 0 daca a reusit sa TRIMITA semnalul. Cand
+# masterul respinge configuratia, isi pastreaza procesele vechi si continua sa
+# serveasca versiunea precedenta, cu un [emerg] pe care nu-l citeste nimeni.
+#
+# Pe productie: o zona `limit_req` isi schimbase cheia, iar cheia unei zone de
+# memorie partajata nu se poate schimba la reload. Patru reincarcari consecutive
+# au raportat succes; procesele nginx erau de trei zile vechi. Doua reparatii
+# livrate in ziua aceea pareau sa nu functioneze, si erau amandoua corecte.
+
+def test_every_reload_goes_through_the_verified_helper() -> None:
+    """Un `systemctl reload nginx` gol, oriunde in instalator, reintroduce bug-ul."""
+    body = [ln for ln in INSTALL_SH.splitlines()
+            if "systemctl reload nginx" in ln
+            and not ln.strip().startswith("#")]
+    # Unul singur, in interiorul helperului. Restul apeleaza helperul.
+    assert len(body) <= 2, f"reload nginx neverificat: {body}"
+
+
+def test_the_helper_proves_the_reload_by_new_processes() -> None:
+    """Singura dovada e aparitia unor procese noi.
+
+    Nu codul de iesire, nu absenta unei erori, nu `nginx -t` — acela trece
+    tocmai in cazul care ne-a pacalit, fiindca verifica sintaxa unei analize
+    noi, nu compatibilitatea cu zonele de memorie deja alocate.
+    """
+    assert "nginx_workers()" in INSTALL_SH
+    assert "pgrep -f 'nginx: worker process'" in INSTALL_SH
+    assert 'before="$(nginx_workers)"' in INSTALL_SH
+    assert 'after="$(nginx_workers)"' in INSTALL_SH
+
+    # Prezenta variabilelor nu e dovada ca din ele iese decizia. O prima
+    # versiune a testului verifica doar numele, si a trecut cand am inlocuit
+    # toata comparatia cu `new="da"` — adica exact presupunerea pe care regula
+    # o interzice, imbracata in variabilele corecte.
+    assert "for pid in $after" in INSTALL_SH
+    assert '[[ " $before " == *" $pid "* ]]' in INSTALL_SH
+
+
+def test_a_failed_reload_is_escalated_not_ignored() -> None:
+    """Si nu se repornește orbeste: daca `nginx -t` nu trece, un restart ar lasa
+    nginx OPRIT, iar acum inca serveste."""
+    assert "a pastrat procesele vechi" in INSTALL_SH
+    assert "systemctl restart nginx" in INSTALL_SH
+    assert "Nu repornesc: ar lasa" in INSTALL_SH
+
+
+def test_the_helper_is_not_recursive() -> None:
+    """Prima varianta se apela pe sine in loc sa cheme systemctl.
+
+    Ar fi trecut orice test care verifica doar prezenta numelui.
+    """
+    body = INSTALL_SH.split("reload_nginx() {", 1)[1].split("\n}", 1)[0]
+    assert "systemctl reload nginx" in body
+    assert "\n    reload_nginx\n" not in body

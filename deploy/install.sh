@@ -842,6 +842,60 @@ step_start_services() {
 # Un agent de monitorizare nu are voie sa schimbe comportamentul lucrurilor pe
 # care le monitorizeaza. Fragmentele stau intr-un director propriu si sunt
 # incluse explicit, doar in blocurile `server` ale Sentinel.
+# Reincarca nginx SI verifica faptul, nu codul de iesire.
+#
+# `systemctl reload nginx` intoarce 0 daca a reusit sa TRIMITA semnalul, nu daca
+# noua configuratie a fost aplicata. Cand masterul respinge configuratia, isi
+# pastreaza procesele vechi si continua sa serveasca versiunea precedenta - cu
+# un [emerg] in error.log pe care nu-l citeste nimeni.
+#
+# S-a intamplat pe productie. O zona `limit_req` isi schimbase cheia, iar cheia
+# unei zone de memorie partajata nu se poate schimba la reload, doar la restart.
+# `nginx -t` trecea, fiindca verifica sintaxa unei analize noi, nu
+# compatibilitatea cu zonele deja alocate. Patru reincarcari consecutive au
+# raportat succes; procesele nginx erau de trei zile vechi. Doua reparatii
+# livrate in ziua aceea pareau sa nu functioneze, si erau amandoua corecte.
+#
+# Dovada ca reincarcarea a avut loc e aparitia unor procese noi. Nimic altceva
+# nu o dovedeste.
+nginx_workers() { pgrep -f 'nginx: worker process' 2>/dev/null | sort -n | tr '
+' ' '; }
+
+reload_nginx() {
+    local before after new
+    before="$(nginx_workers)"
+    systemctl reload nginx || die "nginx reload failed"
+    sleep 1
+    after="$(nginx_workers)"
+
+    new=""
+    for pid in $after; do
+        [[ " $before " == *" $pid "* ]] || new="${new}${pid} "
+    done
+    if [[ -n "$new" ]]; then
+        ok "nginx reloaded (procese noi: ${new% })"
+        return 0
+    fi
+
+    local why
+    why="$(grep -F '[emerg]' /var/log/nginx/error.log 2>/dev/null | tail -1)"
+    warn "nginx a ACCEPTAT semnalul de reincarcare dar a pastrat procesele vechi.
+    Configuratia de pe disc NU e in vigoare. Motivul din error.log:
+      ${why:-<nimic in /var/log/nginx/error.log>}"
+
+    # `nginx -t` trece, deci un restart e sigur si e singura cale de aplicare.
+    # Alternativa - sa mergem mai departe - inseamna ca tot ce urmeaza
+    # (certificate, antete, vhost) se raporteaza reusit fara sa fie in vigoare.
+    if nginx -t >/dev/null 2>&1; then
+        warn "nginx -t trece, deci se reporneste. Cateva conexiuni in curs vor cadea."
+        systemctl restart nginx || die "restartul nginx a esuat. INSPECTEAZA /etc/nginx ACUM."
+        ok "nginx repornit; configuratia e acum in vigoare"
+    else
+        die "nginx -t NU trece si reincarcarea nu s-a aplicat. Nu repornesc: ar lasa
+    nginx oprit, iar acum inca serveste. Repara configuratia si reporneste manual."
+    fi
+}
+
 SENTINEL_NGINX_SNIPPET_DIR=/etc/nginx/sentinel
 
 install_sentinel_nginx_snippets() {
@@ -940,7 +994,7 @@ competing for :80."
 
     nginx -t || die "nginx configuration is invalid; not reloading"
     systemctl enable --now nginx
-    systemctl reload nginx
+    reload_nginx
 
     obtain_certificate
 }
@@ -1022,7 +1076,7 @@ INSPECT /etc/nginx NOW — do not restart nginx until nginx -t passes."
     fi
     ok "nginx -t passes with Sentinel's vhost added"
 
-    systemctl reload nginx || die "nginx reload failed"
+    reload_nginx
     ok "nginx reloaded"
 
     obtain_certificate
@@ -1225,7 +1279,7 @@ link_certificate() {
     # would confirm which domain lives on this address.
 
     nginx -t || { warn "nginx -t failed after pointing at the certificate"; return 1; }
-    systemctl reload nginx
+    reload_nginx
     return 0
 }
 
