@@ -1,4 +1,4 @@
-# Martorul extern — instalare pe găzduirea Next.js
+# Martorul extern — aplicație Next.js de sine stătătoare
 
 Jumătatea din afara serverului monitorizat. Primește semnalul periodic de la
 Sentinel, iar când semnalul se oprește sau contoarele încetează să avanseze,
@@ -7,18 +7,52 @@ alertează pe Telegram — **de pe altă mașină decât cea compromisă.**
 Asta e toată ideea: un agent găzduit nu poate garanta că raportează propria
 dispariție, fiindcă cine îl oprește controlează și canalul.
 
-## Ce se copiază
+E o aplicație completă, nu un set de fișiere de copiat undeva. Trei dependențe
+în total — Next, React, React DOM — fiindcă fiecare dependență a unei componente
+de securitate e suprafață de atac, iar o pagină care arată un singur verdict nu
+are nevoie de un sistem de design.
+
+## Ce conține
 
 ```
+app/page.tsx                       pagina de stare (singura interfață)
 app/api/sentinel/beat/route.ts     primește semnalul
 app/api/sentinel/check/route.ts    întreabă „a tăcut?" și alertează
 app/api/sentinel/status/route.ts   200 dacă e viu, 503 dacă nu
 lib/store.ts  lib/verify.ts  lib/telegram.ts
 ```
 
-Se pun peste structura `app/` existentă. Importurile folosesc aliasul `@/lib/…`;
-dacă proiectul tău nu îl are configurat în `tsconfig.json`, schimbă-le în căi
-relative.
+## Instalare pe Hostinger
+
+Panoul hPanel, secțiunea Node.js (sau Website → Hosting → Node.js, în funcție
+de plan). Aplicația e construită cu `output: "standalone"`, deci merge și pe
+planuri fără npm pe server.
+
+**Varianta A — build pe server**, dacă planul permite:
+
+```bash
+npm ci
+npm run build
+npm start          # sau comanda de start din panou
+```
+
+**Varianta B — build local, urci rezultatul.** Necesară pe planurile fără
+toolchain de build:
+
+```bash
+npm ci && npm run build
+# urci: .next/standalone/, .next/static/ (în .next/standalone/.next/static/),
+#       public/ dacă există
+# pornire: node server.js
+```
+
+Variabilele de mediu se pun în panou, nu într-un fișier urcat. Vezi
+`.env.example` pentru lista completă.
+
+**Domeniu:** un subdomeniu separat e mai curat decât o cale pe site-ul
+principal — de exemplu `martor.domeniul-tau`. Ține martorul independent de
+publicarea site-ului, ca o schimbare de conținut să nu îl poată opri din
+greșeală.
 
 ## Variabile de mediu
 
@@ -51,6 +85,21 @@ Cineva trebuie să întrebe periodic. Două variante, ideal amândouă:
 **Un monitor de uptime** îndreptat spre `/api/sentinel/status`. Întoarce `503`
 când semnalul e vechi, deci alertarea proprie a monitorului devine escaladarea
 ta. Nu cere cron, dar adaugă un terț în lanț.
+
+## Verificat local, înainte de a-l primi
+
+Aplicația a fost compilată și rulată, iar drumul complet a fost testat cu
+expeditorul real din Python: 16 verificări cap-coadă, toate trecute — semnal
+autentic acceptat, semnătură invalidă refuzată cu 401, reluare refuzată cu 409,
+semnal vechi refuzat cu 400, ruta de check protejată, contoarele care nu
+avansează detectate corect, pagina randată, `no-store` prezent.
+
+Plus alarma însăși: cu ultimul semnal îmbătrânit la 10 minute, `/status` a
+căzut la 503 și `/check` a produs verdictul `silent`.
+
+Ce NU e verificat e comportamentul pe Hostinger — CDN-ul, persistența
+fișierului de stare între publicări, cronul. Alea se verifică o singură dată,
+mai jos, și merită făcute înainte să te bazezi pe martor.
 
 ## Verificarea de acceptanță
 
