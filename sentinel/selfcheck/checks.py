@@ -20,6 +20,7 @@ of them quiet together is a quiet night.
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -316,11 +317,27 @@ async def check_enforcement(db: Database, cfg: Config) -> list[CheckResult]:
     """
     present, detail = await asyncio.to_thread(_nft_table_present)
     if present is None:
+        # systemd sets INVOCATION_ID for every unit it starts. Its absence means
+        # this is a hand-run — `sudo -u sentinel sentinel selfcheck --print` —
+        # and the unit's ambient CAP_NET_ADMIN was never granted, because
+        # capabilities come from the unit, not from the user.
+        #
+        # Worth distinguishing, because a hand-run is exactly how an operator
+        # debugs, and pointing them at the unit file when the unit file is
+        # already correct wastes the trip. An operator who is sent chasing a
+        # non-problem twice stops reading the output.
+        under_systemd = bool(os.environ.get("INVOCATION_ID"))
         return [CheckResult(
             "nft:table", "Nu pot citi regulile nftables", "unknown",
-            detail=f"{detail} — nu știu dacă blocarea funcționează sau nu",
-            action="Verificarea are nevoie de CAP_NET_ADMIN: "
-                   "systemctl show sentinel-selfcheck -p AmbientCapabilities")]
+            detail=(f"{detail} — nu știu dacă blocarea funcționează sau nu"
+                    + ("" if under_systemd else
+                       ". Rulat manual, deci fără capabilitatea pe care i-o dă "
+                       "unitatea — nu e neapărat o problemă de configurare")),
+            action=("Verificarea are nevoie de CAP_NET_ADMIN: "
+                    "systemctl show sentinel-selfcheck -p AmbientCapabilities"
+                    if under_systemd else
+                    "Rulează verificarea prin systemd, care acordă capabilitatea: "
+                    "systemctl start sentinel-selfcheck && journalctl -u sentinel-selfcheck -n 40"))]
     if not present:
         return [CheckResult(
             "nft:table", "Tabela nftables lipsește", "down",

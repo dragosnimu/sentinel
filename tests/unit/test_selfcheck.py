@@ -365,6 +365,9 @@ def test_being_unable_to_read_the_ruleset_is_not_the_same_as_it_missing(monkeypa
     channel that stops being read."""
     monkeypatch.setattr(checks, "_nft_table_present",
                         lambda: (None, "Operation not permitted (you must be root)"))
+    # Sub systemd, unde sfatul despre capabilitate e cel corect. Varianta
+    # rulată manual e verificată separat, mai jos.
+    monkeypatch.setenv("INVOCATION_ID", "test")
     result = run(checks.check_enforcement(_DB(val=0), _cfg()))[0]
     assert result.status == "unknown"
     assert "nu știu dacă blocarea funcționează" in result.detail
@@ -465,3 +468,34 @@ def test_the_executor_restores_the_allowlist_but_not_the_blocklist():
     code = body.split('"""')[2] if body.count('"""') >= 2 else body
     code = "\n".join(l for l in code.splitlines() if not l.strip().startswith("#"))
     assert "blocklist" not in code.lower(), "the blocklist is being restored"
+
+
+# --- un mesaj care nu trimite operatorul pe pistă greșită ------------------
+def test_nft_check_distinguishes_a_hand_run_from_a_misconfigured_unit(monkeypatch):
+    """Capabilitățile vin de la unitate, nu de la utilizator.
+
+    `sudo -u sentinel sentinel selfcheck --print` nu primește CAP_NET_ADMIN
+    oricât de corectă ar fi unitatea. Mesajul vechi trimitea operatorul să
+    verifice un fișier care era deja bun — iar cine e trimis de două ori după
+    un non-problem se oprește din citit ieșirea.
+    """
+    import asyncio as _a
+    from types import SimpleNamespace
+    from sentinel.selfcheck import checks as c
+
+    monkeypatch.setattr(c, "_nft_table_present", lambda: (None, "Operation not permitted"))
+    cfg = SimpleNamespace(response=SimpleNamespace(admin_ip=None))
+
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    hand = _a.run(c.check_enforcement(None, cfg))[0]
+    assert "Rulat manual" in hand.detail
+    assert "systemctl start sentinel-selfcheck" in (hand.action or "")
+
+    monkeypatch.setenv("INVOCATION_ID", "abc123")
+    unit = _a.run(c.check_enforcement(_DB(val=0), _cfg()))[0]
+    assert "Rulat manual" not in unit.detail
+    assert "AmbientCapabilities" in (unit.action or "")
+
+    # În ambele cazuri starea rămâne „nu știu" — a nu putea citi regulile NU e
+    # o dovadă că blocarea funcționează.
+    assert hand.status == unit.status == "unknown"
