@@ -300,13 +300,25 @@ $stamp     = Get-Date -Format 'yyyyMMdd-HHmmss'
 $remoteDir = "/tmp/sentinel-deploy-$stamp"
 $tarball   = Join-Path $env:TEMP "sentinel-$stamp.tar.gz"
 
+# Source, vendored dashboard assets and the deploy tree compress to roughly
+# 1 MB. Twenty is not a budget, it is a tripwire: nothing legitimate grows
+# twentyfold between releases. Must match PACKAGE_MAX_KB in deploy.sh.
+$PackageMaxKb = 20480
+
 Write-Info 'packaging the repository'
 Push-Location $RepoRoot
 try {
     # secrets/ is excluded. Secrets go over stdin; a tarball lands in /tmp on
     # the server and lingers there.
+    #
+    # watcher/ is excluded on purpose, not to save bytes. It is the external
+    # witness, and its whole value is running somewhere the monitored host
+    # cannot reach. Shipping a copy here would put the thing that reports
+    # Sentinel's death on the machine whose death it reports.
     & $tar --exclude='./secrets' --exclude='./.git' --exclude='./tests' `
-           --exclude='./docs' --exclude='__pycache__' --exclude='*.pyc' `
+           --exclude='./docs' --exclude='./watcher' --exclude='./dist' `
+           --exclude='node_modules' --exclude='.next' `
+           --exclude='__pycache__' --exclude='*.pyc' `
            --exclude='.venv' --exclude='.pytest_cache' --exclude='.mypy_cache' `
            --exclude='.ruff_cache' `
            -czf $tarball .
@@ -315,6 +327,15 @@ try {
 
 $sizeKb = [math]::Round((Get-Item $tarball).Length / 1KB)
 Write-Ok "package built ($sizeKb KB)"
+
+# The exclude list above was written before watcher/ existed, and for a while
+# every deploy quietly compressed 400 MB of node_modules. It did not fail; it
+# just appeared to hang. A ceiling turns the next such omission into one clear
+# line instead of a wait long enough to reach for Ctrl+C.
+if ($sizeKb -gt $PackageMaxKb) {
+    Remove-Item $tarball -Force -ErrorAction SilentlyContinue
+    Die "package is $sizeKb KB, over the $PackageMaxKb KB ceiling. Something large is being shipped that should not be. Add it to the exclude list in this script."
+}
 
 # A CRLF in a .sh or .service file fails on Linux as `bad interpreter:
 # /bin/bash^M`. .gitattributes covers a git checkout; this catches a zip

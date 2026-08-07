@@ -230,14 +230,28 @@ STAMP="$(date -u +%Y%m%d-%H%M%S)"
 REMOTE_DIR="/tmp/sentinel-deploy-${STAMP}"
 TARBALL="${TMPDIR:-/tmp}/sentinel-${STAMP}.tar.gz"
 
+# Source, vendored dashboard assets and the GeoIP-less deploy tree compress to
+# roughly 1 MB. Twenty is not a budget, it is a tripwire: nothing legitimate
+# grows twentyfold between releases.
+PACKAGE_MAX_KB=20480
+
 info "packaging the repository"
 
 # secrets/ is excluded from the tarball. Secrets travel on stdin only — a
 # tarball lands in /tmp on the server and lingers there.
+#
+# watcher/ is excluded on purpose, not to save bytes. It is the external
+# witness, and its whole value is running somewhere the monitored host cannot
+# reach. Shipping a copy here would put the thing that reports Sentinel's death
+# on the machine whose death it reports.
 tar --exclude='./secrets' \
     --exclude='./.git' \
     --exclude='./tests' \
     --exclude='./docs' \
+    --exclude='./watcher' \
+    --exclude='./dist' \
+    --exclude='node_modules' \
+    --exclude='.next' \
     --exclude='__pycache__' \
     --exclude='*.pyc' \
     --exclude='.venv' \
@@ -248,6 +262,17 @@ tar --exclude='./secrets' \
 
 size_kb=$(( $(stat -c%s "$TARBALL" 2>/dev/null || stat -f%z "$TARBALL") / 1024 ))
 ok "package built (${size_kb} KB)"
+
+# The exclude list above was written before watcher/ existed, and for a while
+# every deploy quietly compressed 400 MB of node_modules. It did not fail; it
+# just appeared to hang. A ceiling turns the next such omission into one clear
+# line instead of a wait long enough to reach for Ctrl+C.
+if (( size_kb > PACKAGE_MAX_KB )); then
+    die "package is ${size_kb} KB, over the ${PACKAGE_MAX_KB} KB ceiling.
+    Something large is being shipped that should not be. Inspect with:
+    tar -tzf ${TARBALL} | head -50
+    then add it to the exclude list above."
+fi
 
 # A CRLF in a .sh or .service file fails on Linux as `bad interpreter:
 # /bin/bash^M`, which is a confusing twenty minutes if you have not seen it.
