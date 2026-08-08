@@ -529,6 +529,22 @@ async def cmd_unblock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text(f"Eroare: {_esc(exc)}")
 
 
+# Referit de două ori mai jos și nedefinit nicăieri: `/mute` fără argumente și
+# `/mute <ceva neînțeles>` ridicau amândouă NameError. Comanda de status nu a
+# funcționat niciodată, iar singurul mod de a afla era să o folosești exact
+# atunci când voiai să verifici dacă ești în liniște.
+_MUTE_HELP = (
+    "<b>Liniște</b> — pentru acest chat, nu pentru toți.\n\n"
+    "<code>/mute 22:00-06:00</code> — în fiecare zi\n"
+    "<code>/mute 22:00-06:00; vi,sa 22:00-09:00</code> — plus weekendul\n"
+    "<code>/mute 2h</code> — pauză unică, expiră singură\n"
+    "<code>/mute off</code> — șterge tot\n\n"
+    "<i>Zile: lu ma mi jo vi sa du, sau `weekend`, `lucratoare`. "
+    "O fereastră care trece peste miezul nopții aparține serii în care începe — "
+    "pentru liniște sâmbătă dimineața, noaptea care contează e a lui vineri.</i>"
+)
+
+
 async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """`/mute` — set, inspect or clear the quiet window for THIS chat.
 
@@ -554,11 +570,11 @@ async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # --- status ---
     if not arg:
-        window = quiet.parse_window(prefs.quiet_hours or cfg.telegram.quiet_hours or "")
-        state = quiet.evaluate(now=datetime.now(_tz.utc), window=window,
+        sched = quiet.parse_schedule(prefs.quiet_hours or cfg.telegram.quiet_hours or "")
+        state = quiet.evaluate(now=datetime.now(_tz.utc), schedule=sched,
                                muted_until=prefs.muted_until, tz_name=tz_name)
         lines = [_MUTE_HELP, ""]
-        lines.append(f"Interval: <b>{window or 'niciunul'}</b>")
+        lines.append(f"Program: <b>{_esc(quiet.describe(sched))}</b>")
         if prefs.muted_until and prefs.muted_until > datetime.now(_tz.utc):
             lines.append(f"Pauză activă până la <b>{_fmt_local(prefs.muted_until, tz_name)}</b>")
         lines.append(
@@ -576,15 +592,21 @@ async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # --- recurring window ---
-    if (window := quiet.parse_window(arg)) is not None:
-        await chats_repo.set_quiet_hours(db, chat_id, str(window), tz=tz_name)
-        log.warning("quiet hours set", extra={"chat_id": chat_id, "window": str(window)})
-        crosses = " (peste miezul nopții)" if window.crosses_midnight else ""
+    if (sched := quiet.parse_schedule(arg)) is not None:
+        await chats_repo.set_quiet_hours(db, chat_id, str(sched), tz=tz_name)
+        log.warning("quiet hours set", extra={"chat_id": chat_id, "schedule": str(sched)})
+
+        # Ce ACOPERĂ fiecare regulă, nu doar ce s-a scris. O fereastră care trece
+        # peste miezul nopții aparține zilei în care începe, deci
+        # „weekend 22:00-09:00" liniștește diminețile de duminică și luni — nu pe
+        # cele de sâmbătă și duminică. Spus aici, corectarea costă o comandă;
+        # descoperit singur, costă o dimineață trezită.
+        detail = "\n".join(f"• {_esc(quiet.covers(r))}" for r in sched.rules)
         await update.message.reply_text(
-            f"🔕 Liniște în fiecare zi între <b>{window}</b>{crosses}.\n"
+            f"🔕 <b>{_esc(str(sched))}</b>\n{detail}\n"
             f"Fus orar: <code>{_esc(str(quiet.zone(tz_name)))}</code>\n\n"
-            "<i>Criticele, PANIC și eșecurile de patch trec oricum. "
-            "Restul sosesc la sfârșitul intervalului.</i>",
+            "<i>Criticele, PANIC, autoverificarea și eșecurile de patch trec "
+            "oricum. Restul sosesc la sfârșitul intervalului.</i>",
             parse_mode=ParseMode.HTML)
         return
 
@@ -682,8 +704,8 @@ async def _quiet_chats(cfg: Config, db: Database) -> set[int]:
     out: set[int] = set()
     for chat_id in cfg.telegram.allowed_chat_ids:
         p = prefs.get(chat_id)
-        window = quiet.parse_window((p.quiet_hours if p else None) or default or "")
-        state = quiet.evaluate(now=now, window=window,
+        sched = quiet.parse_schedule((p.quiet_hours if p else None) or default or "")
+        state = quiet.evaluate(now=now, schedule=sched,
                                muted_until=p.muted_until if p else None,
                                tz_name=(p.timezone if p else None)
                                or getattr(cfg.telegram, "timezone", None))

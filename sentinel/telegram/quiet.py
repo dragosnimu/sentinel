@@ -107,6 +107,207 @@ def parse_window(text: str) -> Window | None:
     return Window(time(sh, sm), time(eh, em))
 
 
+# ---------------------------------------------------------------------------
+# Program: aceeași fereastră nu se potrivește tuturor zilelor
+# ---------------------------------------------------------------------------
+# Sâmbăta dimineața la 06:00 nu e ca marțea dimineața la 06:00. Un operator care
+# vrea liniște până la 09:00 în weekend are două variante proaste fără asta: ori
+# mută fereastra la 09:00 în fiecare zi și pierde trei ore de acoperire în
+# fiecare dimineață de lucru, ori nu o mută și e trezit sâmbăta. A doua e cea
+# care duce la un canal oprit permanent.
+
+_DAY_NAMES: dict[str, int] = {
+    # Luni = 0, ca în `datetime.weekday()`. Prescurtările sunt cele pe care le
+    # scrie cineva care se grăbește, în română și în engleză.
+    "lu": 0, "luni": 0, "mon": 0, "monday": 0,
+    "ma": 1, "marti": 1, "marți": 1, "tue": 1, "tuesday": 1,
+    "mi": 2, "miercuri": 2, "wed": 2, "wednesday": 2,
+    "jo": 3, "joi": 3, "thu": 3, "thursday": 3,
+    "vi": 4, "vineri": 4, "fri": 4, "friday": 4,
+    "sa": 5, "sambata": 5, "sâmbătă": 5, "sat": 5, "saturday": 5,
+    "du": 6, "duminica": 6, "duminică": 6, "sun": 6, "sunday": 6,
+}
+
+_DAY_GROUPS: dict[str, frozenset[int]] = {
+    "weekend": frozenset({5, 6}),
+    "wk": frozenset({5, 6}),
+    "lucratoare": frozenset({0, 1, 2, 3, 4}),
+    "lucrătoare": frozenset({0, 1, 2, 3, 4}),
+    "weekdays": frozenset({0, 1, 2, 3, 4}),
+    "zilnic": frozenset(range(7)),
+    "toate": frozenset(range(7)),
+}
+
+_DAY_LABEL = ("luni", "marți", "miercuri", "joi", "vineri", "sâmbătă", "duminică")
+
+
+def parse_days(text: str) -> frozenset[int] | None:
+    """„weekend", „sa,du", „lu-vi" → mulțimea de zile, sau None dacă nu e una."""
+    raw = (text or "").strip().lower()
+    if not raw:
+        return None
+    if raw in _DAY_GROUPS:
+        return _DAY_GROUPS[raw]
+
+    days: set[int] = set()
+    for part in re.split(r"[,\s]+", raw):
+        if not part:
+            continue
+        if part in _DAY_GROUPS:
+            days |= _DAY_GROUPS[part]
+            continue
+        if "-" in part:
+            a, _, b = part.partition("-")
+            if a not in _DAY_NAMES or b not in _DAY_NAMES:
+                return None
+            start, end = _DAY_NAMES[a], _DAY_NAMES[b]
+            # Un interval poate trece peste sfârșitul săptămânii: „vi-lu".
+            days |= {(start + i) % 7 for i in range((end - start) % 7 + 1)}
+            continue
+        if part not in _DAY_NAMES:
+            return None
+        days.add(_DAY_NAMES[part])
+    return frozenset(days) or None
+
+
+def _label(days: frozenset[int]) -> str:
+    if days == frozenset(range(7)):
+        return "în fiecare zi"
+    for name, group in (("în weekend", _DAY_GROUPS["weekend"]),
+                        ("în zilele lucrătoare", _DAY_GROUPS["lucratoare"])):
+        if days == group:
+            return name
+    return "; ".join(_DAY_LABEL[d] for d in sorted(days))
+
+
+@dataclass(frozen=True)
+class Rule:
+    """O fereastră care se aplică numai în anumite zile."""
+
+    days: frozenset[int]
+    window: Window
+
+    def __str__(self) -> str:
+        if self.days == frozenset(range(7)):
+            return str(self.window)
+        return f"{_compact_days(self.days)} {self.window}"
+
+    @property
+    def specific(self) -> bool:
+        return self.days != frozenset(range(7))
+
+
+def _compact_days(days: frozenset[int]) -> str:
+    for name, group in (("weekend", _DAY_GROUPS["weekend"]),
+                        ("lucratoare", _DAY_GROUPS["lucratoare"])):
+        if days == group:
+            return name
+    return ",".join(("lu", "ma", "mi", "jo", "vi", "sa", "du")[d] for d in sorted(days))
+
+
+@dataclass(frozen=True)
+class Schedule:
+    """Regulile de liniște, în ordinea în care au fost scrise.
+
+    Câte o regulă per set de zile. Regula care numește zile bate regula care se
+    aplică tuturor: cine scrie „22:00-06:00; weekend 22:00-09:00" vrea evident
+    ca sâmbăta să câștige, nu să fie ignorată fiindcă prima regulă s-a potrivit
+    deja.
+    """
+
+    rules: tuple[Rule, ...]
+
+    def __str__(self) -> str:
+        return "; ".join(str(r) for r in self.rules)
+
+    def active_at(self, local: datetime) -> tuple[Rule, datetime] | None:
+        """Regula care tace ACUM și momentul în care se termină.
+
+        Cazul care se greșește ușor: o fereastră care trece peste miezul nopții
+        aparține zilei în care a ÎNCEPUT. „sâmbătă 22:00-09:00" acoperă duminică
+        la 08:00 — dar numai fiindcă a început sâmbătă seara, nu fiindcă
+        duminica ar fi în regulă. Verificat pe ambele capete, separat.
+        """
+        today, yesterday = local.weekday(), (local.weekday() - 1) % 7
+        moment = local.time()
+        matches: list[tuple[Rule, bool]] = []
+
+        for rule in self.rules:
+            w = rule.window
+            if w.start == w.end:
+                continue
+            if w.crosses_midnight:
+                if moment >= w.start and today in rule.days:
+                    matches.append((rule, False))       # partea de seară
+                elif moment < w.end and yesterday in rule.days:
+                    matches.append((rule, True))        # partea de dimineață
+            elif today in rule.days and w.start <= moment < w.end:
+                matches.append((rule, False))
+
+        if not matches:
+            return None
+        # Cea mai specifică regulă câștigă; la egalitate, prima scrisă.
+        rule, _ = min(matches, key=lambda m: (not m[0].specific,))
+        return rule, _rule_end(local, rule.window)
+
+
+def parse_schedule(text: str) -> Schedule | None:
+    """„22:00-06:00; weekend 22:00-09:00" → Schedule.
+
+    O fereastră singură, fără zile, rămâne validă și înseamnă „în fiecare zi".
+    Formatul vechi e cel scris în bazele de date existente și în fișierele de
+    configurare livrate; a-l invalida ar face ca o repornire să dezactiveze
+    tăcut liniștea pe care operatorul o setase.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+
+    rules: list[Rule] = []
+    for chunk in raw.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        window = parse_window(chunk)
+        if window is not None:
+            rules.append(Rule(frozenset(range(7)), window))
+            continue
+        # „weekend 22:00-09:00": zilele înaintea ferestrei.
+        head, _, tail = chunk.rpartition(" ")
+        window = parse_window(tail)
+        days = parse_days(head)
+        if window is None or days is None:
+            return None
+        rules.append(Rule(days, window))
+
+    return Schedule(tuple(rules)) if rules else None
+
+
+def covers(rule: Rule) -> str:
+    """Ce acoperă regula, în seri și dimineți.
+
+    Există fiindcă „weekend 22:00-09:00" nu înseamnă ce pare. O fereastră
+    aparține zilei în care începe, deci aceea acoperă sâmbătă și duminică
+    SEARA — adică diminețile de duminică și luni. Cine voia liniște sâmbătă
+    dimineața trebuie să scrie `vi,sa`.
+
+    Regula nu se schimbă ca să ghicească; propoziția asta se spune în clipa
+    setării, când corectarea costă o comandă în loc de o dimineață trezită.
+    """
+    if not rule.window.crosses_midnight:
+        return f"{_label(rule.days)}, între {rule.window.start:%H:%M} și {rule.window.end:%H:%M}"
+    mornings = frozenset((d + 1) % 7 for d in rule.days)
+    return (f"{_label(rule.days)} seara de la {rule.window.start:%H:%M}, "
+            f"până {_label(mornings)} dimineața la {rule.window.end:%H:%M}")
+
+
+def describe(schedule: Schedule | None) -> str:
+    """Programul, în cuvinte, pentru un răspuns în chat."""
+    if schedule is None or not schedule.rules:
+        return "niciunul"
+    return " · ".join(f"{_label(r.days)} {r.window}" for r in schedule.rules)
+
+
 def parse_duration(text: str) -> timedelta | None:
     """"2h", "30m", "45 minute" → timedelta, capped at 24 hours."""
     m = _DURATION_RE.match(text or "")
@@ -186,22 +387,37 @@ class MuteState:
     until: datetime | None = None
 
 
-def evaluate(*, now: datetime, window: Window | None, muted_until: datetime | None,
+def evaluate(*, now: datetime, muted_until: datetime | None,
+             schedule: Schedule | Window | None = None,
+             window: Schedule | Window | None = None,
              tz_name: str | None = None) -> MuteState:
-    """Is the channel quiet right now, and until when?"""
+    """Is the channel quiet right now, and until when?
+
+    Acceptă și un `Window` simplu, sub oricare dintre cele două nume. Parametrul
+    `window=` a existat înainte ca liniștea să aibă zile, iar un apelant uitat
+    care trece o fereastră trebuie să continue să tacă la aceleași ore — nu să
+    primească tăcut un canal fără liniște deloc.
+    """
     tz = zone(tz_name)
     local = now.astimezone(tz)
 
     if muted_until is not None and muted_until > now:
         return MuteState(True, "pauză temporară", muted_until)
 
-    if window is not None and window.contains(local.time()):
-        return MuteState(True, f"ore de liniște ({window})", _window_end(local, window, tz))
+    spec = schedule if schedule is not None else window
+    if isinstance(spec, Window):
+        spec = Schedule((Rule(frozenset(range(7)), spec),))
+
+    if spec is not None:
+        hit = spec.active_at(local)
+        if hit is not None:
+            rule, ends = hit
+            return MuteState(True, f"ore de liniște ({rule})", ends)
 
     return MuteState(False, "activ")
 
 
-def _window_end(local: datetime, window: Window, tz: ZoneInfo | timezone) -> datetime:
+def _rule_end(local: datetime, window: Window) -> datetime:
     """The next moment this window stops, as an absolute instant.
 
     Built by replacing the time on a local date and re-attaching the zone rather

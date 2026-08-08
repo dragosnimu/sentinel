@@ -330,3 +330,148 @@ def test_the_migration_does_not_silence_anyone():
            / "0015_quiet_hours.sql").read_text(encoding="utf-8")
     assert "UPDATE telegram_chats" not in sql
     assert "DEFAULT '22:00" not in sql
+
+
+# --- programul pe zile ------------------------------------------------------
+#
+# Sambata dimineata la 06:00 nu e ca martea dimineata la 06:00. Fara reguli pe
+# zile, operatorul are doua variante proaste: muta fereastra la 09:00 in fiecare
+# zi si pierde trei ore de acoperire in fiecare dimineata de lucru, ori nu o
+# muta si e trezit in weekend. A doua duce la un canal oprit permanent.
+
+WEEKEND = "22:00-06:00; weekend 22:00-09:00"
+# Ce voia de fapt operatorul: liniste SAMBATA si DUMINICA dimineata. Noptile
+# care conteaza sunt ale lui vineri si sambata.
+MORNINGS = "22:00-06:00; vi,sa 22:00-09:00"
+
+
+def _at(day: int, hour: int, minute: int = 0) -> datetime:
+    """August 2026: 3 = luni, 8 = sambata, 9 = duminica."""
+    return datetime(2026, 8, day, hour, minute, tzinfo=UTC)
+
+
+def _muted(spec: str, moment: datetime) -> bool:
+    return quiet.evaluate(now=moment, schedule=quiet.parse_schedule(spec),
+                          muted_until=None, tz_name="UTC").muted
+
+
+def test_a_bare_window_still_means_every_day():
+    """Formatul vechi e scris in bazele de date existente si in configurarile
+    livrate. A-l invalida ar face ca o repornire sa dezactiveze tacut linistea
+    pe care operatorul o setase — cea mai proasta scurgere posibila."""
+    s = quiet.parse_schedule("22:00-06:00")
+    assert len(s.rules) == 1
+    assert s.rules[0].days == frozenset(range(7))
+    assert str(s) == "22:00-06:00"
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("weekend", {5, 6}),
+    ("sa,du", {5, 6}),
+    ("lu-vi", {0, 1, 2, 3, 4}),
+    ("vi-lu", {4, 5, 6, 0}),        # trece peste sfarsitul saptamanii
+    ("lucratoare", {0, 1, 2, 3, 4}),
+    ("sâmbătă", {5}),
+    ("sat sun", {5, 6}),
+])
+def test_day_sets_parse(text, expected):
+    assert quiet.parse_days(text) == frozenset(expected)
+
+
+@pytest.mark.parametrize("text", ["", "luni-", "marte", "weekendul", "8"])
+def test_nonsense_days_are_refused(text):
+    """Refuzate, nu interpretate generos. O zi ghicita gresit inseamna liniste
+    intr-o zi in care operatorul voia sa fie treaz."""
+    assert quiet.parse_days(text) is None
+
+
+def test_the_specific_rule_beats_the_everyday_one():
+    """Cine scrie „22:00-06:00; weekend 22:00-09:00" vrea evident ca weekendul
+    sa castige, nu sa fie ignorat fiindca prima regula s-a potrivit deja."""
+    # Duminica 07:00: regula zilnica s-ar fi terminat la 06:00.
+    assert _muted(WEEKEND, _at(9, 7))
+
+
+def test_a_crossing_window_belongs_to_the_evening_it_started():
+    """Capcana centrala a functionalitatii.
+
+    „weekend 22:00-09:00" acopera diminetile de DUMINICA si LUNI, fiindca
+    ferestrele incep sambata si duminica seara. Sambata dimineata ramane pe
+    regula zilnica, si se termina la 06:00.
+    """
+    assert not _muted(WEEKEND, _at(8, 7))       # sambata 07:00 — activ
+    assert _muted(WEEKEND, _at(9, 7))           # duminica 07:00 — liniste
+    assert _muted(WEEKEND, _at(10, 7))          # luni 07:00 — liniste, din duminica seara
+
+
+def test_and_the_phrasing_that_gives_the_operator_what_they_asked_for():
+    """`vi,sa` acopera exact diminetile de sambata si duminica."""
+    assert _muted(MORNINGS, _at(8, 7))          # sambata 07:00
+    assert _muted(MORNINGS, _at(9, 7))          # duminica 07:00
+    assert not _muted(MORNINGS, _at(10, 7))     # luni 07:00 — inapoi la 06:00
+
+
+def test_the_confirmation_names_the_mornings_not_just_the_evenings():
+    """Diferenta dintre cele doua variante costa o comanda daca e spusa la
+    setare, si o dimineata trezita daca e descoperita singur."""
+    rule = quiet.parse_schedule("weekend 22:00-09:00").rules[0]
+    text = quiet.covers(rule)
+    assert "seara" in text and "diminea" in text
+    assert "duminică" in text and "luni" in text     # diminetile acoperite
+
+
+def test_outside_every_rule_the_channel_is_loud():
+    for moment in (_at(4, 12), _at(8, 12), _at(9, 21, 59)):
+        assert not _muted(WEEKEND, moment)
+
+
+def test_the_end_reported_is_the_end_of_the_rule_that_matched():
+    """Daca raportam sfarsitul regulii zilnice cat timp cea de weekend tine,
+    mesajele retinute ar fi eliberate cu trei ore mai devreme — adica exact in
+    orele pe care operatorul le ceruse linistite."""
+    state = quiet.evaluate(now=_at(9, 7), schedule=quiet.parse_schedule(WEEKEND),
+                           muted_until=None, tz_name="UTC")
+    assert state.until.hour == 9
+
+
+def test_a_schedule_round_trips_through_text():
+    """Se salveaza ca text in baza de date si se reciteste la fiecare pornire.
+    O reprezentare care nu se reciteste identic pierde tacut o regula."""
+    for spec in (WEEKEND, MORNINGS, "22:00-06:00", "lu 01:00-02:00"):
+        once = quiet.parse_schedule(spec)
+        twice = quiet.parse_schedule(str(once))
+        assert str(once) == str(twice)
+        assert once == twice
+
+
+def test_an_old_style_window_object_still_works():
+    """Un apelant uitat care trece un `Window` trebuie sa taca la aceleasi ore,
+    nu sa primeasca tacut un canal fara liniste deloc."""
+    w = quiet.parse_window("22:00-06:00")
+    assert quiet.evaluate(now=_at(4, 23), window=w, muted_until=None, tz_name="UTC").muted
+    assert not quiet.evaluate(now=_at(4, 12), window=w, muted_until=None, tz_name="UTC").muted
+
+
+def test_critical_still_passes_whatever_the_schedule_says():
+    """Programul e despre cand suna telefonul degeaba, nu despre ce poate fi
+    ascuns. Nicio combinatie de zile nu are voie sa atinga asta."""
+    assert quiet.passes_anyway("critical")
+    assert quiet.passes_anyway("info", kind="panic")
+    assert quiet.passes_anyway("info", kind="selfcheck")
+
+
+def test_when_two_rules_both_match_the_specific_one_decides_the_end():
+    """Duminica la 23:00 se potrivesc AMANDOUA: si regula zilnica (22:00-06:00),
+    si cea de weekend (22:00-09:00). Daca invinge prima scrisa, mesajele
+    retinute pleaca la 06:00 — cu trei ore mai devreme decat a cerut operatorul,
+    si exact in orele pe care le voia linistite.
+
+    Prima varianta a acestui test folosea duminica la 07:00, cand regula zilnica
+    nu se mai potriveste deloc. Trecea si cu „prima castiga", deci nu testa
+    precedenta, ci doar ca ceva se potriveste.
+    """
+    state = quiet.evaluate(now=_at(9, 23), schedule=quiet.parse_schedule(WEEKEND),
+                           muted_until=None, tz_name="UTC")
+    assert state.muted
+    assert state.until.hour == 9, "a castigat regula zilnica in locul celei de weekend"
+    assert "weekend" in state.reason

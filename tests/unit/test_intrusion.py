@@ -142,8 +142,19 @@ def test_webroot_tampering_asks_the_disambiguating_question():
 
 # --- profilul de comportament ---------------------------------------------
 def _learning(dimension, *, days, obs, distinct, warm=None):
-    return {"started_at": NOW - timedelta(days=days), "observations": obs,
-            "distinct_keys": distinct, "warm_at": warm}
+    """Vârsta se măsoară față de ceasul REAL, nu față de `NOW`.
+
+    `_promote_warm` compară `started_at` cu `datetime.now()`, aşa cum trebuie —
+    o dimensiune se încălzeşte în timp calendaristic. Construind `started_at`
+    dintr-un `NOW` îngheţat, vârsta cazului „prea puţine zile" creştea cu o zi
+    la fiecare zi care trecea de la scrierea testului. A trecut trei zile şi a
+    început să pice, fără ca nimic din cod să se schimbe.
+
+    Un test care depinde de ziua în care e rulat e mai rău decât niciunul: cade
+    într-o zi în care nimeni nu a atins zona, iar prima reacţie e să fie crezut.
+    """
+    return {"started_at": datetime.now(timezone.utc) - timedelta(days=days),
+            "observations": obs, "distinct_keys": distinct, "warm_at": warm}
 
 
 def test_a_dimension_needs_both_days_and_observations():
