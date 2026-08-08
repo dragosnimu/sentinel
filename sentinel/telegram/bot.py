@@ -334,6 +334,68 @@ async def cmd_false_positive(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await _close_incident(update, context, "false_positive", "fals-pozitiv")
 
 
+async def cmd_exposures(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/expuneri` — ce ascultă pe toate interfețele, și ce anume e fiecare.
+
+    Nu e o listă de porturi; aia exista deja și a fost citită o dată. Fiecare
+    rând spune CE e serviciul și dacă operatorul a decis că e intenționat.
+    """
+    from sentinel.detect import exposed
+
+    db: Database = context.bot_data["db"]
+    rows = await exposed.list_exposures(db)
+    if not rows:
+        await update.message.reply_text(
+            "Niciun serviciu clasificat legat pe toate interfețele.\n"
+            "<i>Clasificarea e după port; un serviciu pe un port neobișnuit nu apare.</i>",
+            parse_mode=ParseMode.HTML)
+        return
+
+    icon = {"critical": "🔴", "high": "🟠", "medium": "🟡", "info": "⚪"}
+    lines = ["<b>Servicii legate pe toate interfețele</b>", ""]
+    for r in rows:
+        mark = " ✅ <i>intenționat</i>" if r["acknowledged"] else ""
+        lines.append(f"{icon.get(r['severity'], '⚪')} <code>{r['key']}</code> — "
+                     f"{_esc(r['service'])}{mark}")
+    lines += ["", "<code>/stiu tcp/10000</code> marchează o expunere ca intenționată.",
+              "<code>/stiu tcp/10000 nu</code> anulează marcajul."]
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_ack_exposure(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/stiu <cheie> [nu]` — „știu, e al meu".
+
+    Rolul se verifică aici: a face o alertă critică să tacă permanent e o
+    acțiune, nu o citire, chiar dacă nu schimbă nimic pe server.
+    """
+    from sentinel.detect import exposed
+
+    cfg: Config = context.bot_data["cfg"]
+    if not _can_act(cfg, update.effective_chat.id):
+        await update.message.reply_text("Doar owner/operator pot marca expuneri.")
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Folosire: <code>/stiu tcp/10000</code> — marchează ca intenționat\n"
+            "<code>/stiu tcp/10000 nu</code> — anulează marcajul",
+            parse_mode=ParseMode.HTML)
+        return
+
+    key = context.args[0]
+    on = not (len(context.args) > 1 and context.args[1].lower() in ("nu", "no", "off"))
+    db: Database = context.bot_data["db"]
+    if await exposed.acknowledge(db, key, on=on):
+        await update.message.reply_text(
+            f"<code>{_esc(key)}</code> " + ("marcat ca intenționat — nu mai alertează."
+                                            if on else
+                                            "nu mai e marcat; revine la raportare."),
+            parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(
+            f"Nu am observat <code>{_esc(key)}</code>. Vezi <code>/expuneri</code>.",
+            parse_mode=ParseMode.HTML)
+
+
 async def cmd_incident(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db: Database = context.bot_data["db"]
     if not context.args or not context.args[0].isdigit():
@@ -876,6 +938,7 @@ def build_application(cfg: Config, secrets: Secrets) -> Application:
         (("selfcheck", "autoverificare"),              views.cmd_selfcheck),
         (("comportament", "behaviour", "profil"),      views.cmd_behaviour),
         (("blocklist", "blocate"),                     views.cmd_blocklist_full),
+        (("expuneri", "exposures", "expunere"),        cmd_exposures),
         (("patches", "patch", "patchuri"),             cmd_patches),
     ]
     for names, handler in read_only:
@@ -887,6 +950,7 @@ def build_application(cfg: Config, secrets: Secrets) -> Application:
     acting = [
         (("resolve", "rezolva"),   cmd_resolve),
         (("fp", "falspozitiv"),    cmd_false_positive),
+        (("stiu", "știu", "ack"),  cmd_ack_exposure),
         (("block", "blocheaza"),   cmd_block),
         (("unblock", "deblocheaza"), cmd_unblock),
         (("panic",),               cmd_panic),

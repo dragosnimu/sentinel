@@ -271,9 +271,11 @@ def _all_rules() -> tuple:
     că motorul le rulează pe amândouă.
     """
     from sentinel.detect.accounts import ACCOUNT_RULES
+    from sentinel.detect.exposed import EXPOSURE_RULES
     from sentinel.detect.intrusion import INTRUSION_RULES
     from sentinel.detect.novelty import NOVELTY_RULES
-    return _ATTEMPT_RULES + INTRUSION_RULES + ACCOUNT_RULES + NOVELTY_RULES
+    return (_ATTEMPT_RULES + INTRUSION_RULES + ACCOUNT_RULES + NOVELTY_RULES
+            + EXPOSURE_RULES)
 
 
 RULES = _all_rules()
