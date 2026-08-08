@@ -296,22 +296,19 @@ def test_commands_have_romanian_names():
         assert f'"{ro}"' in src and f'"{en}"' in src
 
 
-def test_every_command_name_is_one_telegram_accepts():
-    """Telegram allows [a-z0-9_] and 1-32 characters, and rejects the ENTIRE
-    handler set if one name is invalid — so a single Romanian diacritic in an
-    alias crash-loops the bot and takes down the emergency channel. That
-    shipped: `vulnerabilități` stopped the service from starting at all."""
-    import re
-
-    from sentinel.telegram import bot
-
-    src = inspect.getsource(bot.build_application)
-    table = src[src.index("read_only = ["):src.index("# Inline confirm")]
-    names = re.findall(r'\("([^"]+)"', table) + re.findall(r'"([^"]+)"\)', table)
-    assert names, "no command names found — the extraction broke, not the code"
-    for name in names:
-        assert re.fullmatch(r"[a-z0-9_]{1,32}", name), \
-            f"{name!r} is not a name Telegram will accept"
+# Validarea numelor de comenzi s-a mutat în
+# `tests/security/test_telegram_command_names.py`.
+#
+# Testul care stătea aici extrăgea numele cu două expresii regulate —
+# `\("([^"]+)"` pentru primul alias și `"([^"]+)"\)` pentru ultimul. Aliasul din
+# MIJLOCUL unui tuplu de trei nu era prins de niciuna, iar acolo era exact
+# `(("stiu", "știu", "ack"), ...)`: testul a trecut verde pe codul care a doborât
+# botul pentru o zi. Docstring-ul lui afirma totuși că validează toate numele.
+#
+# Nu l-am reparat, l-am înlocuit. Două teste care afirmă același lucru, unul cu
+# punct orb, sunt mai rele decât unul corect: al doilea dă încrederea pe care
+# primul n-o merită. Cel nou citește AST-ul și acoperă și înregistrările directe
+# prin `CommandHandler(...)`, în afara tabelelor.
 
 
 def test_help_lists_what_is_registered():

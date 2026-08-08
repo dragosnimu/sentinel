@@ -761,6 +761,11 @@ EOF
 }
 
 # --- 32 -------------------------------------------------------------------
+# Cat timp supraveghem fiecare serviciu dupa pornire, inainte sa trecem la
+# urmatorul. Trebuie sa depaseasca cel mai lung RestartSec din deploy/systemd/
+# (azi 10s), ca o repornire automata sa aiba loc INAUNTRU si sa fie vazuta.
+SERVICE_SETTLE_S=${SERVICE_SETTLE_S:-15}
+
 step_start_services() {
     # One at a time, each behind a health gate. Starting six units at once and
     # then discovering three are broken is a much worse debugging session.
@@ -803,18 +808,41 @@ step_start_services() {
         #
         # Numărul de reporniri e dovada. Dacă creşte cât ne uităm, unitatea e în
         # buclă, oricât de `active` ar părea la un moment dat.
-        local before after
-        before="$(systemctl show "$unit" -p NRestarts --value 2>/dev/null || echo 0)"
-        sleep 8
-        after="$(systemctl show "$unit" -p NRestarts --value 2>/dev/null || echo 0)"
-
-        if [[ "$after" != "$before" ]] || ! systemctl is-active --quiet "$unit"; then
-            journalctl -u "$unit" -n 40 --no-pager >&2
-            die "${unit} se reporneşte în buclă (${before} → ${after} reporniri în 8s).
-    Era 'active' la prima verificare, ceea ce nu înseamnă nimic pentru un
-    proces care moare şi e repornit. Nu pornesc nimic mai departe."
-        fi
-        ok "${unit} active şi stabil (${after} reporniri)"
+        # Supravegheat, nu eşantionat la un moment calculat.
+        #
+        # O versiune anterioară deducea fereastra din `RestartUSec`, pe premisa
+        # că systemd o dă în microsecunde. Nu o dă: systemd 252 formatează
+        # întotdeauna uman — `2s`, `10s`, `100ms`. Extrăgând cifrele, `100ms`
+        # devenea 100 şi producea o fereastră de 105 secunde per unitate, iar
+        # `1min` devenea 1 şi producea una de 8 secunde, mai SCURTĂ decât
+        # intervalul de repornire — exact defectul pe care schimbarea pretindea
+        # că îl elimină.
+        #
+        # Nu e nevoie de niciun calcul. Un proces care moare petrece timp în
+        # `activating` până la repornire, oricât de lung ar fi intervalul, iar
+        # unul care reporneşte repede creşte contorul. Verificate amândouă, o
+        # dată pe secundă. Prima abatere opreşte instalarea; nu aşteptăm restul
+        # ferestrei ca să confirmăm ce ştim deja.
+        local before now_state waited=0
+        before="$(systemctl show "$unit" -p NRestarts --value 2>/dev/null)"
+        while (( waited < SERVICE_SETTLE_S )); do
+            sleep 1; waited=$((waited + 1))
+            now_state="$(systemctl is-active "$unit" 2>/dev/null || true)"
+            if [[ "$now_state" != "active" ]]; then
+                journalctl -u "$unit" -n 40 --no-pager >&2
+                die "${unit} nu a rămas pornit: după ${waited}s e '${now_state:-necunoscut}'.
+    'active' la o singură verificare nu înseamnă nimic pentru un proces care
+    moare şi e repornit. Nu pornesc nimic mai departe."
+            fi
+            local nrestarts
+            nrestarts="$(systemctl show "$unit" -p NRestarts --value 2>/dev/null)"
+            if [[ "$nrestarts" != "$before" ]]; then
+                journalctl -u "$unit" -n 40 --no-pager >&2
+                die "${unit} se reporneşte în buclă: ${before} → ${nrestarts} reporniri în ${waited}s.
+    Nu pornesc nimic mai departe."
+            fi
+        done
+        ok "${unit} active şi stabil ${SERVICE_SETTLE_S}s (${before:-?} reporniri)"
     done
 
     # Reconciliation runs at boot AND hourly. Boot is the main event — that

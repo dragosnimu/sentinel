@@ -133,6 +133,46 @@ sect "Servicii"
 units="$(r "ls /etc/systemd/system/sentinel-*.service 2>/dev/null | xargs -r -n1 basename" || true)"
 [[ -n "$units" ]] || units="sentinel-executor.service sentinel-web.service"
 
+# Componente opt-in: oprite prin configurare, nu stricate.
+#
+# `beacon` poate fi dezactivat în sentinel.yaml. Serviciul iese atunci cu
+# 0 și rămâne `inactive`, iar el nu are timer, deci nu se poate deosebi de
+# un daemon căzut fără să te uiți în configurare.
+#
+# Autoverificarea agentului avea deja excepția asta (`selfcheck/checks.py`);
+# smoke-testul nu, iar prima versiune a enumerării dinamice raporta „deployment
+# eșuat" pe o instalare perfect corectă cu beaconul oprit — exact alarma falsă
+# pe care restul codului o numește „cea care te învață să nu mai citești
+# raportul".
+# Întrebăm ÎNCĂRCĂTORUL de configurare, nu fișierul.
+#
+# O primă versiune făcea grep după `enabled:` sub numele secțiunii. Cădea pe
+# CRLF, pe un comentariu la capătul liniei, pe `False`, pe `no`, pe un comentariu
+# între secțiune și cheie — și, cel mai rău, pe absența completă a secțiunii:
+# `BeaconConfig.enabled` e implicit `false`, deci o instalare fără `beacon:` are
+# beaconul legitim oprit, iar grep-ul nu întorcea nimic și raporta eșec.
+#
+# Codul produsului știe toate astea deja. Îl întrebăm pe el.
+opt_in_off=""
+opt_in_raw="$(r "sudo -u sentinel PYTHONPATH=/opt/sentinel/lib /opt/sentinel/venv/bin/python -c \
+    'from sentinel.config import get_config as g; c=g(); print(\"beacon\", c.beacon.enabled); print(\"ai\", c.ai.enabled)'" || true)"
+if [[ -z "$opt_in_raw" ]]; then
+    warn "nu am putut citi configurarea încărcată — tratez beacon/ai ca pornite"
+else
+    while read -r comp enabled; do
+        # Doar beaconul. `run_forever` iese imediat cand e dezactivat, si unitatea
+        # are `Restart=on-failure`, deci ramane `inactive` — indistinct de un
+        # daemon cazut fara sa te uiti in configurare.
+        #
+        # `ai` NU: workerul bucleaza la nesfarsit indiferent de `ai.enabled`, iar
+        # unitatea are `Restart=always`. O unitate `Restart=always` nu poate fi
+        # legitim `inactive`, deci scutirea ar fi mascat o cadere reala. Am scris
+        # initial ca „ambele ies cu 0" — fals pentru ai, si contrazicea chiar
+        # poarta din install.sh, care moare daca sentinel-ai nu ramane activ.
+        [[ "$comp" == "beacon" && "$enabled" == "False" ]]             && opt_in_off="${opt_in_off} sentinel-${comp}.service"
+    done <<< "$opt_in_raw"
+fi
+
 for unit in $units; do
     # Unitățile oneshot pornite de timer sunt `inactive` între rulări — starea
     # lor normală. A le raporta ca oprite ar fi o alarmă falsă la fiecare rulare.
@@ -142,10 +182,27 @@ for unit in $units; do
         active)   pass "${unit} active" ;;
         inactive) if [[ -n "$triggered" ]]; then
                       pass "${unit} inactive (pornit de ${triggered// /, })"
+                  elif [[ " ${opt_in_off} " == *" ${unit} "* ]]; then
+                      pass "${unit} inactive (dezactivat în sentinel.yaml)"
                   else
                       fail "${unit} inactive — journalctl -u ${unit} -n 50"
                   fi ;;
         failed)   fail "${unit} FAILED — journalctl -u ${unit} -n 50" ;;
+        # `activating` înseamnă două lucruri complet diferite, iar `TriggeredBy`
+        # le desparte.
+        #
+        # O unitate oneshot pornită de timer e `activating` CÂT TIMP RULEAZĂ —
+        # `sentinel-health` la fiecare 30 de secunde, `sentinel-scan` timp de 74
+        # de secunde pe zi. O primă versiune a acestei ramuri le trata ca eșec, și
+        # 3 din 20 de rulări raportau „deployment eșuat" pe o gazdă sănătoasă.
+        #
+        # Un daemon fără timer, în schimb, e `activating` doar între moartea
+        # procesului și repornirea lui: acolo e bucla.
+        activating) if [[ -n "$triggered" ]]; then
+                        pass "${unit} rulează acum (pornit de ${triggered// /, })"
+                    else
+                        fail "${unit} ACTIVATING fără timer — se reporneşte în buclă? journalctl -u ${unit} -n 50"
+                    fi ;;
         *)        warn "${unit} stare necunoscută: ${state:-?}" ;;
     esac
 done
