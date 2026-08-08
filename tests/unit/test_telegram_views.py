@@ -333,6 +333,14 @@ def test_read_only_commands_are_separated_from_acting_ones():
 
     src = inspect.getsource(bot.build_application)
     assert "read_only = [" in src and "acting = [" in src
-    acting = src.split("acting = [", 1)[1].split("]", 1)[0]
+
+    # Felia se termină la linia care conține DOAR paranteza de închidere.
+    #
+    # Varianta anterioară tăia la primul `]` din text, deci un comentariu care
+    # menționa `[a-z0-9_]` scurta lista la două intrări și testul cădea pentru
+    # un cod perfect corect. Un test care se strică la un comentariu îl învață
+    # pe următorul să nu comenteze.
+    body = src.split("acting = [", 1)[1]
+    acting = body.split("\n    ]", 1)[0]
     for name in ("block", "panic", "resolve"):
-        assert f'"{name}"' in acting
+        assert f'"{name}"' in acting, f"/{name} nu mai e în lista care verifică rolul"

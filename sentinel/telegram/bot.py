@@ -972,7 +972,11 @@ def build_application(cfg: Config, secrets: Secrets) -> Application:
     acting = [
         (("resolve", "rezolva"),   cmd_resolve),
         (("fp", "falspozitiv"),    cmd_false_positive),
-        (("stiu", "știu", "ack"),  cmd_ack_exposure),
+        # Fără diacritice: Telegram acceptă doar [a-z0-9_] în numele unei
+        # comenzi, iar `python-telegram-bot` ridică ValueError la înregistrare —
+        # adică ÎNAINTE ca botul să pornească. Un singur `ș` a oprit tot canalul
+        # de alertare, cu 1113 reporniri până s-a observat.
+        (("stiu", "ack"),          cmd_ack_exposure),
         (("block", "blocheaza"),   cmd_block),
         (("unblock", "deblocheaza"), cmd_unblock),
         (("panic",),               cmd_panic),

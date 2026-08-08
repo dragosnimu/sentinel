@@ -122,13 +122,31 @@ fi
 # ---------------------------------------------------------------------------
 sect "Servicii"
 
-for unit in sentinel-executor sentinel-web; do
+# Ce e INSTALAT pe gazdă, nu o listă scrisă aici.
+#
+# Lista era codată fix — `sentinel-executor` și `sentinel-web` — de pe vremea
+# când doar alea existau. De atunci s-au adăugat ingest, detect, ai, telegram și
+# beacon, iar smoke-testul a continuat să raporteze „toate serviciile active"
+# fără să se fi uitat vreodată la conducta de detecție. Un raport de verificare
+# care numără doar ce știa autorul la scriere e mai rău decât unul care lipsește:
+# spune un număr, iar numărul e crezut.
+units="$(r "ls /etc/systemd/system/sentinel-*.service 2>/dev/null | xargs -r -n1 basename" || true)"
+[[ -n "$units" ]] || units="sentinel-executor.service sentinel-web.service"
+
+for unit in $units; do
+    # Unitățile oneshot pornite de timer sunt `inactive` între rulări — starea
+    # lor normală. A le raporta ca oprite ar fi o alarmă falsă la fiecare rulare.
+    triggered="$(r "systemctl show ${unit} -p TriggeredBy --value" || true)"
     state="$(r "systemctl is-active ${unit}" || true)"
     case "$state" in
         active)   pass "${unit} active" ;;
-        inactive) fail "${unit} inactive — journalctl -u ${unit} -n 50" ;;
+        inactive) if [[ -n "$triggered" ]]; then
+                      pass "${unit} inactive (pornit de ${triggered// /, })"
+                  else
+                      fail "${unit} inactive — journalctl -u ${unit} -n 50"
+                  fi ;;
         failed)   fail "${unit} FAILED — journalctl -u ${unit} -n 50" ;;
-        *)        warn "${unit} not installed in this build" ;;
+        *)        warn "${unit} stare necunoscută: ${state:-?}" ;;
     esac
 done
 
@@ -280,6 +298,38 @@ sect "Configurație și secrete"
 r "sudo /opt/sentinel/bin/sentinel config-check" >/dev/null 2>&1 \
     && pass "config-check passed" \
     || warn "config-check reported problems — run it on the server for detail"
+
+# Ce spune Sentinel despre sine.
+#
+# Are 33 de verificări proprii, mult mai amănunțite decât orice poate întreba un
+# script de la distanță — cursorul de detecție, tăcerea fiecărui colector,
+# concordanța dintre nucleu și baza de date. Nu erau citite de aici, deci un
+# deployment putea trece „27 din 27" în timp ce agentul raporta el însuși
+# probleme, iar singurul loc unde se vedea era un mesaj pe telefon.
+#
+# Rulat prin systemd, nu direct: verificarea de nftables are nevoie de
+# CAP_NET_ADMIN, iar capabilitatea vine de la unitate, nu de la utilizator.
+# Citit din ieşirea `--print`, nu ghicit din formatul JSON al jurnalului.
+#
+# Prima versiune căuta în journald un tipar inventat de mine. Nu s-a potrivit
+# niciodată, deci raporta „autoverificarea nu raportează nimic" în timp ce
+# agentul spunea `down · 31/33`. Un rezultat verde care nu s-a uitat la nimic e
+# mai rău decât o verificare absentă: absenţa se vede în listă.
+selfcheck="$(r "sudo -u sentinel /opt/sentinel/bin/sentinel selfcheck --print 2>/dev/null" || true)"
+if [[ -z "$selfcheck" ]]; then
+    warn "nu am putut rula autoverificarea — încearcă /autoverificare pe Telegram"
+else
+    # `[??]` e „nu ştiu", nu „e rău": rulată de mână, verificarea de nftables nu
+    # primeşte CAP_NET_ADMIN, fiindcă acela vine de la unitate.
+    bad="$(grep -vE '^\[  ok\]|^\[  \?\?\]|^ ' <<< "$selfcheck" | grep -E '^\[' || true)"
+    if [[ -z "$bad" ]]; then
+        pass "autoverificarea nu raportează nimic ($(grep -c '^\[  ok\]' <<< "$selfcheck") verificări ok)"
+    else
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && fail "autoverificare: ${line}"
+        done <<< "$bad"
+    fi
+fi
 
 perms="$(r "sudo stat -c '%a %U:%G' /etc/sentinel/secrets.env" || echo '')"
 if [[ "$perms" == "640 root:sentinel" ]]; then

@@ -787,12 +787,34 @@ step_start_services() {
             sleep 1; waited=$((waited + 1))
         done
 
-        if systemctl is-active --quiet "$unit"; then
-            ok "${unit} active"
-        else
+        if ! systemctl is-active --quiet "$unit"; then
             journalctl -u "$unit" -n 30 --no-pager >&2
             die "${unit} did not stay running. Nothing further will be started."
         fi
+
+        # `is-active` o dată nu dovedeşte că serviciul RĂMÂNE pornit.
+        #
+        # Un proces care moare la pornire şi e repornit de systemd trece prin
+        # `active` la fiecare ciclu, iar o verificare care se uită o dată îl
+        # prinde exact acolo. Aşa a trecut de poarta asta un bot de Telegram care
+        # crăpa în `build_application`: deploy-ul a raportat „active", iar
+        # contorul de reporniri a ajuns la 1113 înainte să observe cineva că
+        # nu mai vine nicio alertă.
+        #
+        # Numărul de reporniri e dovada. Dacă creşte cât ne uităm, unitatea e în
+        # buclă, oricât de `active` ar părea la un moment dat.
+        local before after
+        before="$(systemctl show "$unit" -p NRestarts --value 2>/dev/null || echo 0)"
+        sleep 8
+        after="$(systemctl show "$unit" -p NRestarts --value 2>/dev/null || echo 0)"
+
+        if [[ "$after" != "$before" ]] || ! systemctl is-active --quiet "$unit"; then
+            journalctl -u "$unit" -n 40 --no-pager >&2
+            die "${unit} se reporneşte în buclă (${before} → ${after} reporniri în 8s).
+    Era 'active' la prima verificare, ceea ce nu înseamnă nimic pentru un
+    proces care moare şi e repornit. Nu pornesc nimic mai departe."
+        fi
+        ok "${unit} active şi stabil (${after} reporniri)"
     done
 
     # Reconciliation runs at boot AND hourly. Boot is the main event — that
