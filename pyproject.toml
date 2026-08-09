@@ -131,7 +131,15 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = "-q --strict-markers"
+# `-rfEs`, nu `-rs`: motivul fiecărui skip apare în sumar, fără să se piardă
+# rezumatul eșecurilor. `-r` ÎNLOCUIEȘTE lista implicită (`fE`), deci un `-rs`
+# singur ar fi ascuns exact liniile „FAILED ..." — un flag pus pentru
+# vizibilitate care scădea vizibilitatea.
+#
+# Motivul skip-ului contează fiindcă garda de sanitizare se sare pe o mașină
+# fără magazia locală de secrete, iar „n-am putut verifica" trebuie să se
+# distingă de „e curat". Fără el, tot semnalul era cifra din „1 skipped".
+addopts = "-q --strict-markers -rfEs"
 markers = [
     "integration: requires a live PostgreSQL instance",
     "security: hostile-input and injection tests (must never be skipped in CI)",

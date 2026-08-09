@@ -62,7 +62,15 @@ def L(port, addr="0.0.0.0", proto="tcp"):
 
 # --- ce trebuie spus -------------------------------------------------------
 def test_an_admin_panel_on_all_interfaces_is_critical(monkeypatch):
-    """Clasa de expunere care motiveaza regula: un panou de administrare legat pe toate interfetele."""
+    """Clasa de expunere care motivează regula: un panou de administrare legat
+    pe toate interfețele.
+
+    Portul și numele produsului de mai jos vin din tabelul de servicii al lui
+    `exposed.py` — sunt intrarea de test pentru clasa asta, nu o observație
+    despre vreo gazdă anume. Depozitul e public; un docstring care spune „așa
+    arată serverul nostru" e recunoaștere gratuită, iar aici n-ar adăuga nimic
+    testului.
+    """
     _listeners(monkeypatch, L(10000))
     specs = run(exposed.exposed_services(_DB(), 0))
     assert len(specs) == 1

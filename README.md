@@ -193,7 +193,11 @@ mypy sentinel executor
 ```
 
 Integration tests need a local PostgreSQL 16; they are skipped without one.
-Security tests (`-m security`) must never be skipped.
+Security tests (`-m security`) must never be skipped, with one named exception:
+the check that compares the tree against the local secret store can only run
+where that store exists, so on a fresh clone it reports SKIP with the reason
+spelled out. Read the reason — "could not check" and "clean" are different
+states. Any other skip under `-m security` is a defect.
 
 ---
 

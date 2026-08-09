@@ -59,10 +59,20 @@ Sau, mai simplu:
 ```bash
 pip install -e ".[dev]"
 pytest                      # tot verde
-pytest -m security          # NU au voie să fie skip
+pytest -m security          # NU au voie să fie skip — vezi excepția de mai jos
 ruff check .
 mypy sentinel executor
 ```
+
+**Singura excepție de la „fără skip":**
+`test_no_value_from_the_local_secret_store_appears_in_the_tree` compară arborele
+cu valorile reale din `secrets/.env.local`. Fișierul e ignorat de git, deci pe o
+clonă proaspătă lipsește, iar testul raportează SKIP cu motivul scris —
+`addopts` conține `-rfEs` tocmai ca motivul să apară în sumar.
+
+Skip-ul ăla înseamnă „n-am putut verifica", nu „e curat". Înainte de un push,
+rulează pe mașina care are magazia de secrete și confirmă că **nu** e sărit.
+Orice alt skip sub `-m security` e un defect.
 
 Verifică și că skill-ul e descoperit: deschide Claude Code în
 `C:\dev\Agent CyberSecurity` și cere ceva legat de incidente sau de un plan de

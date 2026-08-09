@@ -71,8 +71,14 @@ to hunt, not as a checklist:
 ## How to verify
 
 Run things. Do not reason about whether the tests pass — run them:
-`python -m pytest tests/ -q`. Import the changed modules. Execute shell scripts
+`python -m pytest tests/`. Import the changed modules. Execute shell scripts
 with `bash -n`, and where safe, execute their logic with fabricated input.
+
+Do not add `-q`. `addopts` in `pyproject.toml` already carries one; a second
+makes it `-qq`, and at `-qq` pytest stops printing the summary line entirely —
+so the run that reports "1449 passed" prints nothing at all, and silence reads
+like success. `FAILED` and `SKIPPED` lines survive, but only because `addopts`
+also carries `-rfEs`. Measured on pytest 9.1.1, 2026-08-10.
 
 **Falsify the tests.** Take each test the change added, break the code it
 covers, and confirm it fails. A test that stays green while you break its

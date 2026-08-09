@@ -1,0 +1,184 @@
+# Sentinel asset inventory — exemplu completat, cu date INVENTATE.
+#
+# Perechea lui e inventory.yaml.example: șablonul aproape gol pe care install.sh
+# îl copiază în /etc/sentinel/inventory.yaml. Fișierul ăsta nu se instalează
+# nicăieri și nu e citit de niciun serviciu — există ca să se vadă cum arată un
+# inventar deja completat, cu câmpurile la lucru.
+#
+# Serviciile, porturile, unitățile systemd și criticitățile de mai jos sunt
+# inventate. Nu descriu niciun server. Nu le înlocui cu inventarul unei gazde
+# reale: depozitul e public, iar un inventar e o hartă de servicii, porturi și
+# expuneri — adică exact partea scumpă a recunoașterii, oferită gratis.
+#
+# Nu ipotetic. Fișierul ăsta a conținut inventarul real al gazdei monitorizate
+# și a fost publicat așa. Conținutul curat de acum NU anulează publicarea:
+# versiunea veche rămâne în istoricul git, accesibilă după hash, și poate fi
+# deja în forkuri și cache-uri. Ce s-a făcut și ce nu se poate face:
+# docs/SECURITATE.md §7.
+#
+# Inventarul se scrie de mână. Nimic nu-l rescrie: sincronizarea din
+# sentinel/scan/inventory.py doar îl citește.
+#
+# Două câmpuri cântăresc mai mult decât restul:
+#
+#   protected: true
+#     Niciun plan de patch automat nu are voie să vizeze asset-ul. Se pune pe
+#     orice nu ești dispus să lași atins de o procedură automată.
+#
+#   confirmed_by_operator: true
+#     Necesar înainte ca Sentinel să scaneze activ (DAST) asset-ul. Faptul că un
+#     serviciu există nu e o autorizație să-l ataci — decizia e a ta, și trebuie
+#     să fie, fiindcă scanarea a ceva ce nu-ți aparține e o problemă juridică,
+#     nu una tehnică.
+#
+# Metoda de sondare se deduce din `kind`, nu se configurează
+# (sentinel/db/repo/assets.py, `Asset.probe_kind`):
+#
+#   web       -> cerere HTTP pe "/" prin loopback; orice răspuns <500 = activ
+#   container -> docker inspect
+#   database  -> connect TCP
+#   service   -> systemctl is-active dacă are `systemd_unit`, altfel connect TCP
+#   host      -> nimic; sonda întoarce `unknown`
+#
+# De aia nu apare mai jos niciun asset fără metodă de sondare — nici `kind:
+# host`, nici o bază din container care nu-și publică portul pe gazdă.
+# `unknown` se numără la fel ca `down`: după `health.down_after_failures` probe
+# consecutive se deschide o pană, iar pana se închide doar la o probă `up`, care
+# în cazul ăsta nu vine niciodată (sentinel/health/prober.py). Un rând veșnic
+# roșu în pagina de Servicii e felul în care operatorul învață să n-o mai
+# citească. Disponibilitatea aplicației care folosește o astfel de bază acoperă
+# implicit starea ei.
+
+assets:
+
+  # ── Sentinel și infrastructura gazdei (protejate — fără patch automat) ──────
+  - name: sentinel.web
+    kind: web
+    bind_addr: 127.0.0.1
+    port: 8787
+    is_internet_exposed: true          # ajunge din internet prin nginx
+    criticality: 3
+    protected: true                    # Sentinel nu se patchează pe sine
+    confirmed_by_operator: false
+    systemd_unit: sentinel-web.service
+    tags: [sentinel, infrastructura]
+
+  - name: sshd
+    kind: service
+    port: 22
+    is_internet_exposed: true
+    criticality: 5
+    protected: true
+    confirmed_by_operator: false
+    systemd_unit: sshd.service
+    tags: [infrastructura, acces]
+    notes: "Criticitate 5: pierderea SSH înseamnă pierderea accesului la server. sshd_config e oricum pe lista de căi interzise pentru patch-uri."
+
+  - name: nginx
+    kind: service
+    is_internet_exposed: true
+    criticality: 5
+    protected: true
+    confirmed_by_operator: false
+    systemd_unit: nginx.service
+    tags: [infrastructura, reverse-proxy]
+    notes: Fără port aici dinadins — are unit, deci se sondează cu systemctl is-active, nu prin conectare la 443.
+
+  - name: docker
+    kind: service
+    criticality: 4
+    protected: true
+    confirmed_by_operator: false
+    systemd_unit: docker.service
+    tags: [infrastructura, containere]
+
+  - name: postgresql
+    kind: database
+    bind_addr: 127.0.0.1
+    port: 5432
+    is_internet_exposed: false
+    criticality: 4
+    protected: true                    # baza Sentinel; actualizarea ei e manuală
+    confirmed_by_operator: false
+    systemd_unit: postgresql.service
+    tags: [infrastructura, baza-de-date]
+    notes: "`kind: database` se sondează prin TCP chiar dacă are unit — de aia are nevoie de port."
+
+  # ── Aplicațiile gazdei ──────────────────────────────────────────────────────
+  - name: vitrina
+    kind: web
+    bind_addr: 127.0.0.1
+    port: 8080
+    is_internet_exposed: true          # vitrina.example.com, prin nginx
+    criticality: 4
+    protected: false
+    confirmed_by_operator: true        # asta e ce autorizează DAST pe el
+    stack: python-django
+    systemd_unit: vitrina.service
+    vhost_file: /etc/nginx/conf.d/vitrina.conf
+    webroot: /var/www/vitrina
+    databases:
+      - engine: postgres
+        name: vitrina
+        host: 127.0.0.1
+        port: 5432
+    tags: [aplicatie, productie]
+    notes: Fără `databases`, un plan de patch ar salva fișierele și ar rata tăcut schema și datele pe care actualizarea le schimbă la fel de mult.
+
+  - name: intranet
+    kind: web
+    bind_addr: 127.0.0.1
+    port: 8090
+    is_internet_exposed: false         # doar loopback; se ajunge prin VPN
+    criticality: 3
+    protected: false
+    confirmed_by_operator: true
+    stack: node-express
+    systemd_unit: intranet.service
+    tags: [aplicatie, intern]
+
+  - name: procesare-imagini
+    kind: container
+    container_id: procesare-imagini
+    container_image: exemplu/procesare-imagini:2.4
+    is_internet_exposed: false
+    criticality: 2
+    protected: false
+    confirmed_by_operator: false
+    tags: [aplicatie, containere]
+    notes: Sondat cu `docker inspect`, deci userul sentinel trebuie să fie în grupul docker — install.sh îl adaugă dacă grupul există. Fără asta comanda eșuează și sonda raportează `down` la nesfârșit, nu „nu știu".
+
+  - name: redis-sesiuni
+    kind: service
+    bind_addr: 127.0.0.1
+    port: 6379
+    is_internet_exposed: false
+    criticality: 3
+    protected: false
+    confirmed_by_operator: false
+    tags: [aplicatie, cache]
+    notes: Pornit de compose-ul aplicației, deci n-are unit systemd — un `service` fără `systemd_unit` cade pe connect TCP, și de aia portul e obligatoriu aici.
+
+  # ── Alte produse care rulează pe acest server ───────────────────────────────
+  # Un stack livrat de altcineva, pe care nu vrei să-l atingă nimic automat, se
+  # declară aici cu `protected: true`. Disponibilitatea îi este în continuare
+  # monitorizată, deci afli dacă pică; doar că nu se generează niciodată un plan
+  # de patch pentru el.
+  #
+  # Adaugă-i și directoarele în `patch.extra_protected_paths` din sentinel.yaml:
+  # `protected` blochează planurile pentru asset, iar lista de căi blochează
+  # orice plan care i-ar atinge fișierele din alt motiv.
+  - name: casa-de-marcat
+    kind: web
+    bind_addr: 127.0.0.1
+    port: 8443
+    is_internet_exposed: false
+    criticality: 4
+    protected: true
+    confirmed_by_operator: false       # fără DAST pe software care nu e al tău
+    tags: [aplicatie, third-party]
+    notes: Actualizat manual de furnizor. Nu se atinge automat.
+
+# Scris de tine, revizuit de tine. Runtime-ul citește DOAR `assets:` — orice
+# altă cheie de nivel înalt e ignorată în tăcere de sentinel/scan/inventory.py,
+# deci ce nu e mai sus nu e monitorizat.

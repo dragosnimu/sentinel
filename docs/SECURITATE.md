@@ -206,6 +206,47 @@ nu poți aproba planul A și să se execute planul B.
   toate `<Secrets: N value(s), redacted>`.
 - Citirea căilor de secrete e interzisă în settings-ul runtime-ului Claude.
 
+### Un exemplu completat din producție a fost publicat
+
+Depozitul e public. Un fișier din `deploy/config/` care se numea „example"
+conținea inventarul real al gazdei monitorizate: zece servicii cu porturile
+lor, care dintre ele erau expuse la internet, și cu ce unitate systemd. A
+intrat în depozit odată cu primul commit public.
+
+Conținutul a fost înlocuit cu un exemplu inventat, iar numele vechi — care
+purta în el numele domeniului real — a dispărut odată cu fișierul. Ce a rămas
+în locul lui e `deploy/config/inventory-filled.yaml.example`.
+
+**Înlocuirea nu anulează publicarea.** Blobul vechi rămâne accesibil după hash,
+poate fi deja în forkuri, cache-uri și indexuri, iar o rescriere de istoric n-ar
+schimba nimic pentru copiile deja făcute.
+
+**Și nu curăță nici starea curentă.** Verificat pe 10 august 2026 prin citirea
+arborelui și a lui `origin/main`, nu dedus: numele reale a cinci dintre
+serviciile gazdei mai apar în ce clonezi azi — într-un comentariu de cod, de
+două ori în changelog, și într-o fixtură de test. Toate patru locurile sunt deja
+la `origin/main`, deci nici ele nu se mai pot lua înapoi. Nu sunt enumerate aici
+dinadins: o listă strânsă într-un singur loc, într-un document care confirmă că
+alea sunt serviciile reale, valorează pentru cititor mai mult decât mențiunile
+risipite din care e făcută. Scoaterea lor din starea curentă e o schimbare
+separată, care la data asta **nu e făcută**.
+
+Deci ce s-a obținut prin înlocuire e oprirea expunerii de aici înainte și
+scoaterea hărții *complete și structurate* — serviciu, port, expunere, unitate,
+criticitate, într-un singur fișier — din starea curentă. Nu un arbore curat.
+Consecința se tratează ca după o recunoaștere reușită, nu ca după un fișier
+șters: se presupune că lista de servicii, porturi și expuneri e cunoscută.
+
+Un fișier de exemplu curat nu înseamnă că a fost dintotdeauna curat. Scris aici
+ca următorul om să nu deducă din liniște că nu s-a întâmplat nimic.
+
+Garda care prinde forma asta e
+`tests/security/test_example_artifacts_are_fictional.py`: un artefact numit
+„example" care își declară în text originea într-o gazdă reală. Docstring-ul lui
+spune și ce **nu** prinde, iar partea aia contează mai mult — un exemplu cu
+porturi reale și fără antet trece în continuare, deci revizia umană rămâne prima
+apărare, nu a doua.
+
 ---
 
 ## 8. Auditul
