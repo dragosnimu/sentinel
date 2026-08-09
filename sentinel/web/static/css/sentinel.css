@@ -47,6 +47,20 @@
 
   --shadow: 0 1px 2px rgb(0 0 0 / .35), 0 6px 22px rgb(0 0 0 / .22);
   --sidebar-w: 236px;
+
+  /* Categorical series colours for the report charts. Eight, because a stacked
+     bar with more bands than that is a colour-matching puzzle rather than a
+     chart — reports.py folds the tail into "altele" before it gets there.
+     Every band is also labelled in the legend and in its <title>, so the colour
+     is never the only way to read it. */
+  --rep-c0: #f26b1d;
+  --rep-c1: #35c98a;
+  --rep-c2: #4aa3f0;
+  --rep-c3: #f0a92e;
+  --rep-c4: #b98bf5;
+  --rep-c5: #f2564d;
+  --rep-c6: #46c9c0;
+  --rep-c7: #9aa0a6;
 }
 
 @media (prefers-color-scheme: light) {
@@ -67,6 +81,17 @@
     --warn: #b57a12;
     --bad:  #cf3a31;
     --shadow: 0 1px 2px rgb(23 19 16 / .05), 0 5px 18px rgb(23 19 16 / .06);
+
+    /* Darker series colours: the dark-theme set washes out to pastel on white
+       and two of the bands become indistinguishable. */
+    --rep-c0: #d4560c;
+    --rep-c1: #12996a;
+    --rep-c2: #1c6fbf;
+    --rep-c3: #b57a12;
+    --rep-c4: #7b4fc0;
+    --rep-c5: #cf3a31;
+    --rep-c6: #10857e;
+    --rep-c7: #6b6b6b;
   }
 }
 
@@ -168,6 +193,8 @@ body {
               mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Crect x='3' y='3' width='18' height='7' rx='2'/%3E%3Crect x='3' y='14' width='18' height='7' rx='2'/%3E%3Cpath d='M7 6.5h.01M7 17.5h.01'/%3E%3C/svg%3E"); }
 .ico-list   { -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01'/%3E%3C/svg%3E");
               mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01'/%3E%3C/svg%3E"); }
+.ico-chart  { -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 3v16a2 2 0 0 0 2 2h16'/%3E%3Crect x='7' y='11' width='3' height='6' rx='.5'/%3E%3Crect x='12.5' y='7' width='3' height='10' rx='.5'/%3E%3Crect x='18' y='13' width='3' height='4' rx='.5'/%3E%3C/svg%3E");
+              mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 3v16a2 2 0 0 0 2 2h16'/%3E%3Crect x='7' y='11' width='3' height='6' rx='.5'/%3E%3Crect x='12.5' y='7' width='3' height='10' rx='.5'/%3E%3Crect x='18' y='13' width='3' height='4' rx='.5'/%3E%3C/svg%3E"); }
 
 .sidebar-foot { margin-top: auto; display: flex; flex-direction: column; gap: .6rem; }
 
@@ -529,6 +556,92 @@ table.events .path { color: var(--fg); word-break: break-all; }
 table.events td { vertical-align: top; }
 .filterlinks { margin-left: auto; font-size: .95rem; }
 .filterlinks a.active { color: var(--fg); font-weight: 650; }
+
+/* ================================================================ reports
+ *
+ * The report charts are inline SVG rendered by the server (analytics/reports.py
+ * computes every coordinate). No charting library, and — importantly — no
+ * `style` attribute on any element: the CSP is `style-src 'self'` with no
+ * `unsafe-inline`, and CSP3 falls `style-src-attr` back to `style-src`, so a
+ * bar sized with `style="height:…"` is discarded by the browser and renders as
+ * nothing. Nothing is exactly what "no attacks" looks like, which is why the
+ * geometry lives in SVG presentation attributes and only the colour is CSS.
+ */
+.rep-card { margin-bottom: 1.1rem; }
+.rep-chart { display: block; width: 100%; height: auto; margin: .3rem 0 .2rem; }
+
+.rep-grid { stroke: var(--border-lit); stroke-width: 1; }
+.rep-axis { fill: var(--fg-dim); font-family: var(--mono); font-size: 11px; }
+.rep-axis-y { text-anchor: end; }
+
+.rep-seg { stroke: var(--bg-raised); stroke-width: .5; }
+/* Hover and focus, so a bar is discoverable with a mouse and with a keyboard —
+   each one is a real link, so it is in the tab order already. */
+.rep-chart a:hover .rep-seg,
+.rep-chart a:focus-visible .rep-seg { stroke: var(--fg); stroke-width: 1.5; }
+
+/* The hatch that means "retention deleted this interval". Deliberately not a
+   colour in the series palette: it must not read as another category. */
+.rep-hatch { stroke: var(--off); stroke-width: 2; opacity: .45; }
+
+/* "Not aggregated yet" — the rows are still in raw_events, the rollup has not
+   reached this bucket. Quieter than the hatch on purpose: it turns up at the
+   right-hand edge most hours, and if it looked the same as a deleted month the
+   hatch would stop meaning anything. */
+.rep-pending { stroke: var(--fg-dim); stroke-width: 1; stroke-dasharray: 3 4; opacity: .5; }
+
+.rep-c0 { fill: var(--rep-c0); } .rep-c1 { fill: var(--rep-c1); }
+.rep-c2 { fill: var(--rep-c2); } .rep-c3 { fill: var(--rep-c3); }
+.rep-c4 { fill: var(--rep-c4); } .rep-c5 { fill: var(--rep-c5); }
+.rep-c6 { fill: var(--rep-c6); } .rep-c7 { fill: var(--rep-c7); }
+
+/* Severity and patch state keep the page's own semantics rather than a
+   categorical hue: critical must be the same red everywhere in the interface. */
+.rep-crit { fill: var(--bad); }
+.rep-high { fill: var(--accent); }
+.rep-med  { fill: var(--warn); }
+.rep-low  { fill: var(--rep-c2); }
+.rep-info { fill: var(--off); }
+.rep-ok   { fill: var(--ok); }
+
+.rep-legend {
+  list-style: none; margin: .5rem 0 .6rem; padding: 0;
+  display: flex; flex-wrap: wrap; gap: .35rem 1.1rem;
+  font-size: .9rem; color: var(--fg-muted);
+}
+.rep-legend li { display: flex; align-items: center; gap: .4rem; }
+.rep-swatch { width: 11px; height: 11px; border-radius: 3px; flex: none; background: var(--off); }
+.rep-swatch.rep-c0 { background: var(--rep-c0); }
+.rep-swatch.rep-c1 { background: var(--rep-c1); }
+.rep-swatch.rep-c2 { background: var(--rep-c2); }
+.rep-swatch.rep-c3 { background: var(--rep-c3); }
+.rep-swatch.rep-c4 { background: var(--rep-c4); }
+.rep-swatch.rep-c5 { background: var(--rep-c5); }
+.rep-swatch.rep-c6 { background: var(--rep-c6); }
+.rep-swatch.rep-c7 { background: var(--rep-c7); }
+.rep-swatch.rep-crit { background: var(--bad); }
+.rep-swatch.rep-high { background: var(--accent); }
+.rep-swatch.rep-med  { background: var(--warn); }
+.rep-swatch.rep-low  { background: var(--rep-c2); }
+.rep-swatch.rep-info { background: var(--off); }
+.rep-swatch.rep-ok   { background: var(--ok); }
+.rep-swatch-gap {
+  background: repeating-linear-gradient(45deg,
+    var(--off) 0 2px, transparent 2px 5px);
+}
+.rep-swatch-pending { background: transparent; border: 1px dashed var(--fg-dim); }
+
+/* A parenthetical qualifying one windowed phrase, not the headline figure above
+   it. See the cov_inline macro in reports.html for why the distinction earns
+   its own class. */
+.cov-inline { color: var(--warn); }
+
+.rep-foot { margin: .8rem 0 0; }
+
+/* A counter whose window is not fully covered by the data behind it. Amber and
+   spelled out, next to the number — a caveat printed elsewhere on the page is
+   not read at the same time as the figure it qualifies. */
+.kpi-note-warn { display: block; color: var(--warn); margin-top: .15rem; }
 
 /* ================================================================ motion */
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }

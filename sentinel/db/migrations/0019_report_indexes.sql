@@ -1,0 +1,56 @@
+-- 0019_report_indexes: indexul de care are nevoie pagina de rapoarte.
+--
+-- Un singur index, și motivul pentru care celelalte două la care m-am gândit nu
+-- sunt aici contează la fel de mult: un index care nu e folosit nu e gratuit —
+-- se scrie la fiecare INSERT și nu se citește niciodată.
+--
+-- ## Ce se adaugă
+--
+-- `incidents (first_detection_at DESC)`. Seriile temporale de incidente și
+-- drill-down-ul filtrează pe momentul DESCHIDERII incidentului. Indecșii
+-- existenți sunt:
+--
+--     incidents_status_idx   (status, last_detection_at DESC)  — altă coloană
+--     incidents_actor_idx    (actor_key, first_detection_at DESC)
+--     incidents_asset_idx    (asset_id,  first_detection_at DESC)
+--
+-- Ultimii doi CONȚIN coloana, pe poziția a doua. Corecția e importantă, fiindcă
+-- prima variantă a comentariului ăstuia spunea că nu pot fi folosiți, iar
+-- `EXPLAIN` pe gazda reală arată contrariul: planificatorul face `Bitmap Index
+-- Scan on incidents_actor_idx` cu `Index Cond` chiar pe interval. Ce nu poate
+-- face e să LIMITEZE citirea — fără o valoare pentru prima coloană trebuie să
+-- parcurgă tot indexul și să filtreze, deci costul crește liniar cu tabela.
+-- Indexul de aici dă în schimb o citire mărginită direct pe interval.
+--
+-- La 978 de rânduri, cât are tabela acum, planificatorul alege oricum un seq
+-- scan și niciunul dintre cei trei nu e atins. Indexul e pentru volumul de
+-- mâine, nu pentru cel de azi: incidentele nu se șterg niciodată — pragurile de
+-- închidere automată din `maintenance_service` sunt o politică de citire, nu una
+-- de retenție — deci tabela crește la zeci de mii de rânduri pe an și momentul
+-- în care indexul începe să conteze vine fără să anunțe.
+--
+-- ## Ce NU se adaugă, și de ce
+--
+-- `patch_executions (started_at)` — tabela are zeci de rânduri pe an. Planner-ul
+-- va alege oricum un seq scan, deci indexul ar fi cost de scriere fără nicio
+-- citire în schimb.
+--
+-- `findings (first_seen)` — interogarea din raport numără deschise, KEV, grave,
+-- noi și rezolvate într-o singură trecere cu `FILTER`. O trecere peste o tabelă
+-- de câteva mii de rânduri e mai ieftină decât cinci scanări de index, iar
+-- indexul nu ar fi atins de planul ăla. `findings_age_idx` acoperă deja cazul
+-- parțial pe `status = 'open'`.
+--
+-- `event_rollup_1m` / `event_rollup_1h` — cheia primară e
+-- (bucket, asset_id, source, action), deci `bucket` e prima coloană și
+-- intervalul se citește din index. Nimic de adăugat.
+--
+-- ## De ce nu CONCURRENTLY
+--
+-- Runner-ul aplică fiecare fișier într-o tranzacție, iar `CREATE INDEX
+-- CONCURRENTLY` este interzis într-una. Pe `incidents` blocarea scrierilor ține
+-- milisecunde la dimensiunea actuală. Dacă tabela ajunge vreodată la milioane de
+-- rânduri, următorul index se creează separat, în afara unei migrații.
+
+CREATE INDEX incidents_first_detection_idx
+    ON incidents (first_detection_at DESC);

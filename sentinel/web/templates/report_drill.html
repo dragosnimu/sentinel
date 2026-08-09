@@ -1,0 +1,175 @@
+{% extends "base.html" %}
+{% set active = 'reports' %}
+{% block title %}Detaliu raport · Sentinel{% endblock %}
+
+{#
+  Ce se ascunde în spatele unei bare. Tot ce e sub coloana „sursă" e scris de
+  atacator — utilizatori, căi, gazde HTTP. Autoescaparea Jinja (pornită pentru
+  tot mediul) e ce face ca o cale de forma `<script>` să apară ca text, adică
+  exact motivul pentru care o colectăm.
+
+  Pagina spune mereu CE fereastră a fost citită, nu doar ce s-a găsit: pentru
+  evenimente, fereastra citită poate fi mai mică decât bucket-ul (vezi nota) și
+  o listă goală trebuie să poată fi deosebită de o listă necitită.
+#}
+
+{% block content %}
+<h1>Detaliu · {{ value_label }}</h1>
+<p class="page-sub">
+  {{ bucket_from.strftime('%d.%m.%Y %H:%M') }} →
+  {{ bucket_to.strftime('%d.%m.%Y %H:%M') }} UTC ({{ spec.label }})
+</p>
+
+<p class="statline">
+  <a href="{{ back }}" class="btn btn-quiet btn-sm">← Înapoi la rapoarte</a>
+  {% if all_categories %}
+  <span class="pill pill-off">toate categoriile</span>
+  {% else %}
+  <span class="pill pill-off">{{ dim }} = {{ value or 'necunoscut' }}</span>
+  {% endif %}
+  <span class="muted small">{{ rows | length }} rânduri</span>
+</p>
+
+{% if at_limit %}
+<div class="notice notice-info">
+  <strong>Lista e tăiată la {{ limit }} de rânduri.</strong>
+  <p>Sunt cele mai recente din interval. Numărul total rămâne cel din grafic;
+     aici se citește doar cât încape pe un ecran fără să ținem baza ocupată.</p>
+</div>
+{% endif %}
+
+{% if kind == 'events' and window.expired %}
+<div class="notice notice-warn" role="alert">
+  <strong>Detaliul brut pentru acest interval nu mai există.</strong>
+  <p>
+    Partițiile <code>raw_events</code> se elimină la expirarea retenției, iar
+    intervalul cerut e integral mai vechi decât cea mai veche partiție rămasă
+    ({% if raw_from %}{{ raw_from.strftime('%d.%m.%Y') }}{% else %}necunoscut{% endif %}).
+    Agregatul din grafic rămâne corect — doar evenimentele individuale au fost
+    aruncate. Tabelul de mai jos e gol pentru că nu s-a putut citi nimic, nu
+    pentru că nu s-a întâmplat nimic.
+  </p>
+</div>
+{% elif kind == 'events' and window.narrowed %}
+<div class="notice notice-info">
+  <strong>S-a citit doar o parte din interval.</strong>
+  <p>
+    {# Două cauze diferite, cu remedii diferite: una se rezolvă alegând un
+       bucket mai mic, cealaltă nu se rezolvă deloc. A le spune la fel ar
+       trimite pe cineva să caute date care nu mai există. #}
+    {% if window.capped %}
+      Bucket-ul e mai lung decât fereastra maximă de detaliu, iar o citire pe
+      tot intervalul ar parcurge zeci sau sute de partiții zilnice în timp ce
+      detecția folosește aceeași bază.
+    {% endif %}
+    {% if window.trimmed %}
+      Începutul intervalului e mai vechi decât cea mai veche partiție
+      <code>raw_events</code> rămasă
+      ({% if raw_from %}{{ raw_from.strftime('%d.%m.%Y') }}{% else %}necunoscut{% endif %}),
+      deci partea aceea a fost ștearsă de retenție, nu sărită.
+    {% endif %}
+    Fereastra citită efectiv:
+    <strong>{{ window.start.strftime('%d.%m.%Y %H:%M') }} →
+    {{ window.end.strftime('%d.%m.%Y %H:%M') }}</strong> UTC.
+    {% if window.capped and not window.trimmed %}
+    Pentru detaliu pe tot intervalul, alege un bucket mai mic în grafic.
+    {% endif %}
+  </p>
+</div>
+{% endif %}
+
+{# ── INCIDENTE ──────────────────────────────────────────────────────────── #}
+{% if kind == 'incidents' %}
+<div class="table-scroll">
+  <table>
+    <thead>
+      <tr><th>Deschis (UTC)</th><th>Severitate</th><th>Stare</th><th>Titlu</th>
+          <th>Actor</th><th class="num">Detecții</th></tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr class="{{ 'row-bad' if r.severity in ('high', 'critical') }}">
+        <td class="mono nowrap small">{{ r.first_detection_at.strftime('%d.%m %H:%M') }}</td>
+        <td>{{ severity_ro.get(r.severity, r.severity) }}</td>
+        <td class="muted">{{ r.status }}</td>
+        <td><a href="/incidents/{{ r.id }}">{{ r.title }}</a></td>
+        <td class="mono small">{{ r.actor_key or '—' }}</td>
+        <td class="num">{{ r.detection_count }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="muted">Niciun incident în acest interval și această categorie.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{# ── PATCH-URI ──────────────────────────────────────────────────────────── #}
+{% elif kind == 'patches' %}
+<div class="table-scroll">
+  <table>
+    <thead>
+      <tr><th>Pornit (UTC)</th><th>Stare</th><th>Asset</th><th>Risc</th>
+          <th class="num">Durată</th><th>Verificare finală</th><th>Motiv</th></tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr class="{{ 'row-bad' if r.status in ('failed', 'rollback_failed', 'aborted') }}">
+        <td class="mono nowrap small">{{ r.started_at.strftime('%d.%m %H:%M') }}</td>
+        <td><a href="/patches/{{ r.plan_id }}">{{ exec_status_ro.get(r.status, r.status) }}</a></td>
+        <td>{{ r.asset_name or '—' }}</td>
+        <td class="muted">{{ r.risk_level or '—' }}</td>
+        <td class="num mono">{{ (r.duration_ms ~ ' ms') if r.duration_ms is not none else '—' }}</td>
+        <td>
+          {%- if r.post_verification_passed is none %}<span class="muted">nerulată</span>
+          {%- elif r.post_verification_passed %}<span class="pill pill-ok">trecută</span>
+          {%- else %}<span class="pill pill-bad">încă se reproduce</span>{% endif -%}
+        </td>
+        <td class="muted small">{{ r.rollback_reason or r.error or '—' }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="7" class="muted">Nicio aplicare în acest interval și această stare.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+{# ── EVENIMENTE ─────────────────────────────────────────────────────────── #}
+{% else %}
+<div class="table-scroll">
+  <table class="events">
+    <thead>
+      <tr><th>Când (UTC)</th><th>Sursă</th><th>Acțiune</th><th>Sursă IP</th>
+          <th>Detaliu</th><th class="num">Stare</th></tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr>
+        <td class="mono nowrap">{{ r.ts.strftime('%m-%d %H:%M:%S') }}</td>
+        <td class="muted">{{ r.source }}</td>
+        <td>{{ r.action }}</td>
+        <td class="mono">
+          {% if r.src_ip %}<a href="/events?ip={{ r.src_ip }}">{{ r.src_ip }}</a>{% else %}—{% endif %}
+          {% if r.geo_country %}<span class="tag">{{ r.geo_country }}</span>{% endif %}
+        </td>
+        <td class="detail">
+          {# Valorile de aici sunt scrise de atacator; Jinja le escapează. #}
+          {% if r.source == 'nginx' %}
+            <span class="mono">{{ r.http_method }} <span class="path">{{ r.http_path }}</span></span>
+            {% if r.http_host %}<span class="muted small">@{{ r.http_host }}</span>{% endif %}
+          {% elif r.source == 'sshd' %}
+            user <span class="mono">{{ r.username or '—' }}</span>
+          {% else %}
+            {{ r.process or '' }} {{ r.http_path or '' }}
+          {% endif %}
+        </td>
+        <td class="num mono">{{ r.http_status if r.http_status is not none else '—' }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="muted">Niciun eveniment citit pentru această categorie în fereastra de mai sus.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+{% endblock %}

@@ -8,7 +8,7 @@
 
   The sidebar collapses into a horizontal strip under 900px rather than hiding
   behind a hamburger — a menu you must open costs a tap during an incident, and
-  seven links fit across a phone.
+  eight links fit across a phone (below 560px they collapse to icons).
 #}
 <!DOCTYPE html>
 <html lang="ro">
@@ -19,8 +19,13 @@
   <meta name="robots" content="noindex, nofollow, noarchive">
   <meta name="referrer" content="no-referrer">
   <title>{% block title %}Sentinel{% endblock %}</title>
-  <link rel="stylesheet" href="/static/css/sentinel.css">
-  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  {# Versioned by content digest, never bare. nginx serves /static/ with
+     `expires 7d` + `immutable`, so an unversioned href keeps a pre-deploy
+     stylesheet for a week — and a page whose charts get their colours only from
+     CSS then renders as blank strips, with no error anywhere. See
+     web/jinja.py:asset_url. #}
+  <link rel="stylesheet" href="{{ asset_url('css/sentinel.css') }}">
+  <link rel="icon" href="{{ asset_url('favicon.svg') }}" type="image/svg+xml">
   {% block head_extra %}{% endblock %}
 </head>
 <body class="{% block body_class %}{% endblock %}">
@@ -37,6 +42,7 @@
     <nav class="sidenav" aria-label="Navigare principală">
       {% set items = [
         ('/',          'dashboard',  'Panou',            'grid'),
+        ('/reports',   'reports',    'Rapoarte',         'chart'),
         ('/incidents', 'incidents',  'Incidente',        'alert'),
         ('/findings',  'findings',   'Vulnerabilități',  'shield'),
         ('/patches',   'patches',    'Patch-uri',        'wrench'),

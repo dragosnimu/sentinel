@@ -11,6 +11,7 @@ Two rules that the rest of the web layer relies on:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, status
@@ -19,6 +20,24 @@ from sentinel.config import Config, Secrets
 from sentinel.db.engine import Database
 from sentinel.db.repo import sessions, users
 from sentinel.web.security import COOKIE_NAME, Authenticator
+
+
+def now_utc() -> datetime:
+    """The request's clock, read exactly once, as a dependency.
+
+    A handler that calls `datetime.now()` inline cannot be tested across a time
+    boundary: the test picks a moment, the handler picks another a few
+    milliseconds later, and once in a while those two land on opposite sides of
+    an hour. On the reports page that difference decides whether the newest
+    bucket has data, so the guard tests for a shipped blocker would fail at
+    random — an alarm that says "the blocker is back" when it is not. A test
+    that cries wolf 0.4% of the time is a test that gets ignored, and this
+    repository has already paid for one that "passed for exactly three days".
+
+    Overridable through `app.dependency_overrides`, which is the only reason it
+    is a dependency and not a module function.
+    """
+    return datetime.now(timezone.utc)
 
 
 def get_db(request: Request) -> Database:

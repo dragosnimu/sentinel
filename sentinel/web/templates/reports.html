@@ -1,0 +1,352 @@
+{% extends "base.html" %}
+{% set active = 'reports' %}
+{% block title %}Rapoarte · Sentinel{% endblock %}
+
+{#
+  Graficele sunt SVG generat pe server. Niciun <script>, nicio bibliotecă de
+  charting, niciun atribut `style` — CSP-ul e `script-src 'self'` fără
+  `unsafe-inline`, iar `style-src 'self'` fără `unsafe-inline` face ca un
+  `style="height:…"` să fie aruncat de browser. O bară desenată așa nu se vede,
+  și arată exact ca „nu s-a întâmplat nimic".
+
+  Geometria (x, y, width, height) sunt atribute de prezentare SVG, nu CSS, deci
+  trec. Culoarea vine din clase, din sentinel.css.
+
+  Fără meta-refresh aici, spre deosebire de Panou: un raport pe un an care se
+  reîncarcă singur ar reface agregările degeaba și ar muta pagina sub degetul
+  cuiva care citește.
+#}
+
+{% macro chart_svg(id, c, aria) %}
+<svg class="rep-chart" viewBox="0 0 {{ c.width }} {{ c.height }}" width="100%"
+     height="{{ c.height }}" role="img" aria-label="{{ aria }}">
+  <defs>
+    {# Hașura marchează „nu avem datele", ca să nu semene cu o bară de zero. #}
+    <pattern id="hatch-{{ id }}" width="6" height="6" patternUnits="userSpaceOnUse"
+             patternTransform="rotate(45)">
+      <line x1="0" y1="0" x2="0" y2="6" class="rep-hatch"></line>
+    </pattern>
+  </defs>
+
+  {% for g in c.grid %}
+  <line x1="46" y1="{{ g.y }}" x2="{{ c.width - 8 }}" y2="{{ g.y }}" class="rep-grid"></line>
+  <text x="40" y="{{ g.y + 4 }}" class="rep-axis rep-axis-y">{{ g.label }}</text>
+  {% endfor %}
+
+  {# Două motive diferite pentru „nicio cifră aici", desenate diferit:
+     hașura = retenția a șters intervalul; conturul punctat = agregarea nu a
+     ajuns încă acolo. Dacă ar arăta la fel, hașura ar apărea la marginea din
+     dreapta mai în fiecare oră și ar înceta să mai însemne ceva — iar hașura e
+     singurul semn care spune că martie chiar a dispărut. #}
+  {% for gap in c.gaps %}
+    {#- `missed` primește tot hașură: pentru operator rezultatul e același —
+        nu există nimic și nu va exista — doar cauza diferă, iar cauza e în
+        tooltip. Nu e wallpaper: apare doar când mentenanța a fost stricată mai
+        mult decât retenția brută, adică mult după ce bannerul `stale` sună. -#}
+    {%- if gap.kind in ('unknown', 'missed') %}
+  <rect x="{{ gap.x }}" y="{{ gap.y }}" width="{{ gap.w }}" height="{{ gap.h }}"
+        fill="url(#hatch-{{ id }})"><title>{{ gap.title }}</title></rect>
+    {%- else %}
+      {%- if gap.href %}<a href="{{ gap.href }}">{% endif -%}
+  <rect x="{{ gap.x }}" y="{{ gap.y }}" width="{{ gap.w }}" height="{{ gap.h }}"
+        fill="none" class="rep-pending"><title>{{ gap.title }}</title></rect>
+      {%- if gap.href %}</a>{% endif -%}
+    {%- endif %}
+  {% endfor %}
+
+  {% for s in c.segments %}
+    {%- if s.href %}<a href="{{ s.href }}">{% endif -%}
+    <rect x="{{ s.x }}" y="{{ s.y }}" width="{{ s.w }}" height="{{ s.h }}"
+          class="rep-seg {{ s.cls }}"><title>{{ s.title }}</title></rect>
+    {%- if s.href %}</a>{% endif -%}
+  {% endfor %}
+
+  {% for t in c.ticks %}
+  <text x="{{ t.x }}" y="{{ c.height - 12 }}" class="rep-axis" text-anchor="middle">{{ t.label }}</text>
+  {% endfor %}
+</svg>
+{% endmacro %}
+
+{#
+  Acoperirea unei cifre, lipită de cifră.
+
+  Fără asta, „7z" și „30z" afișau exact același număr pe o gazdă cu 5,8 zile de
+  agregat păstrat, iar luna următoare aceeași cifră „30z" ar fi fost de cinci
+  ori mai mare doar fiindcă s-a umplut retenția. Un paragraf discret în altă
+  parte a paginii nu ține locul: nu e atașat de număr, deci nu e citit odată cu
+  el.
+#}
+{% macro cov_span(cov) -%}
+{%- if cov.hours_requested <= 48 -%}{{ '%.1f'|format(cov.hours_covered) }} h din {{ cov.hours_requested }} h
+{%- else -%}{{ '%.1f'|format(cov.hours_covered / 24) }} z din {{ (cov.hours_requested / 24) | round | int }} z
+{%- endif -%}
+{%- endmacro %}
+
+{#
+  Varianta de bloc: DOAR pentru cartonașe a căror cifră mare e ea însăși
+  ferestruită (Evenimente, Patch-uri aplicate).
+
+  Pe „Incidente deschise" și „Vulnerabilități deschise" cifra mare e „în acest
+  moment" și e completă — `overview()` nu le ferestruiește dinadins. Un
+  avertisment sub ele se citea ca „58 e o subestimare", ceea ce e fals. Acolo se
+  folosește `cov_inline`, lipit de fraza care chiar e ferestruită.
+#}
+{% macro cov_note(cov) %}
+{%- if cov.unknown %}
+<span class="kpi-note kpi-note-warn">nu se știe ce interval acoperă — magazia nu poate fi citită</span>
+{%- elif cov.partial %}
+<span class="kpi-note kpi-note-warn">acoperă doar {{ cov_span(cov) }} ·
+  datele încep la {{ cov.covered_from.strftime('%d.%m %H:%M') }}</span>
+{%- endif %}
+{% endmacro %}
+
+{% macro cov_inline(cov) -%}
+{%- if cov.unknown %} <span class="cov-inline">(interval necunoscut)</span>
+{%- elif cov.partial %} <span class="cov-inline">(din {{ cov_span(cov) }} acoperite)</span>
+{%- endif -%}
+{%- endmacro %}
+
+{% block content %}
+<h1>Rapoarte</h1>
+<p class="page-sub">
+  Agregări pe interval, cu detaliu la click pe orice bară. Toate orele sunt UTC.
+</p>
+
+{# ── ONESTITATEA DATELOR ────────────────────────────────────────────────────
+   Înainte de orice cifră: din ce se calculează și până când e actualizat.
+   Un grafic gol dintr-un agregat care nu a rulat arată identic cu o perioadă
+   liniștită, iar diferența e tot ce contează.                               #}
+{% if coverage.never_ran %}
+<div class="notice notice-critical" role="alert">
+  <strong>Agregatul orar de evenimente este gol.</strong>
+  <p>
+    <code>event_rollup_1h</code> nu conține niciun rând, deci graficele de
+    evenimente de mai jos nu au din ce să fie desenate. Asta nu înseamnă că nu
+    s-a întâmplat nimic — înseamnă că pasul de agregare din
+    <code>sentinel-maintenance.timer</code> nu a rulat cu succes niciodată.
+    Verifică: <code>systemctl status sentinel-maintenance.service</code>
+  </p>
+</div>
+{% elif coverage.stale %}
+<div class="notice notice-warn" role="alert">
+  <strong>Agregatul orar are întârziere de {{ coverage.lag_hours }} ore.</strong>
+  <p>
+    Ultimul interval agregat este
+    {{ coverage.latest.strftime('%d.%m.%Y %H:%M') }} UTC. Timerul de mentenanță
+    e orar, deci o întârziere mai mare de câteva ore înseamnă că rulările
+    eșuează. Până se repară, coada graficelor de evenimente lipsește — nu e
+    liniște, e lipsă de date.
+  </p>
+</div>
+{% endif %}
+
+<p class="muted small">
+  Interval afișat: <strong>{{ range_from.strftime('%d.%m.%Y %H:%M') }}</strong> →
+  <strong>{{ range_to.strftime('%d.%m.%Y %H:%M') }}</strong> UTC.
+  {% if coverage.latest %}
+  Evenimentele sunt agregate până la {{ coverage.latest.strftime('%d.%m %H:%M') }};
+  {% endif %}
+  {% if coverage.earliest %}
+  cel mai vechi interval păstrat în agregat este
+  {{ coverage.earliest.strftime('%d.%m.%Y') }}.
+  {% endif %}
+  {% if raw_from %}
+  Detaliul brut (evenimente individuale) există de la
+  {{ raw_from.strftime('%d.%m.%Y') }}.
+  {% else %}
+  <span class="pill pill-off">detaliul brut: necunoscut</span>
+  {% endif %}
+</p>
+
+{# ── SELECTOARE ─────────────────────────────────────────────────────────── #}
+{# Buton de submit, nu onchange: fără `unsafe-inline` nu există JS de formular. #}
+<form method="get" action="/reports" class="filterbar">
+  <label>Fereastra cifrelor
+    <select name="window">
+      {% for w in windows %}
+      <option value="{{ w }}" {% if window == w %}selected{% endif %}>{{ w }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>Bucket grafice
+    <select name="bucket">
+      {% for key, b in buckets.items() %}
+      <option value="{{ key }}" {% if bucket == key %}selected{% endif %}>{{ b.label }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <button type="submit" class="btn btn-quiet">Aplică</button>
+  <span class="muted small">
+    {{ spec.span }} intervale {{ spec.label }} · cifrele de mai jos acoperă
+    {{ overview.since.strftime('%d.%m %H:%M') }} → acum
+    {#- Fereastra e rotunjită în jos la oră fiindcă agregatul e orar. Rotunjirea
+        e spre exterior: „24h" acoperă cel puțin 24 de ore, niciodată 23. -#}
+  </span>
+</form>
+
+{# ── CIFRELE MARI ───────────────────────────────────────────────────────── #}
+<div class="kpis">
+  <div class="kpi {{ 'kpi-bad' if overview.incidents.open_grave else ('kpi-warn' if overview.incidents.open_total) }}">
+    <div class="kpi-head"><span class="kpi-label">Incidente deschise</span></div>
+    <div class="kpi-main"><span class="kpi-value">{{ overview.incidents.open_total }}</span></div>
+    {# Cifra mare e „acum" și e completă; doar „noi în {{ window }}" e ferestruită. #}
+    <span class="kpi-note">
+      {{ overview.incidents.open_grave }} grave ·
+      {{ overview.incidents.new_total }} noi în {{ window }}{{ cov_inline(overview.incidents.coverage) }}
+    </span>
+  </div>
+
+  <div class="kpi">
+    <div class="kpi-head"><span class="kpi-label">Evenimente</span></div>
+    <div class="kpi-main"><span class="kpi-value">{{ overview.events.total }}</span></div>
+    <span class="kpi-note">{{ overview.events.hostile }} ostile (auth_fail / alert)</span>
+    {{ cov_note(overview.events.coverage) }}
+  </div>
+
+  <div class="kpi {{ 'kpi-bad' if overview.patches.failed else ('kpi-ok' if overview.patches.succeeded) }}">
+    <div class="kpi-head"><span class="kpi-label">Patch-uri aplicate</span></div>
+    <div class="kpi-main"><span class="kpi-value">{{ overview.patches.succeeded }}</span></div>
+    <span class="kpi-note">
+      {{ overview.patches.failed }} eșuate · {{ overview.patches.rolled_back }} revenite
+    </span>
+    {{ cov_note(overview.patches.coverage) }}
+  </div>
+
+  <div class="kpi {{ 'kpi-bad' if overview.findings.kev else ('kpi-ok' if not overview.findings.open) }}">
+    <div class="kpi-head"><span class="kpi-label">Vulnerabilități deschise</span></div>
+    <div class="kpi-main"><span class="kpi-value">{{ overview.findings.open }}</span></div>
+    {# La fel: „deschise acum" e complet, „noi în {{ window }}" nu. #}
+    <span class="kpi-note">
+      {%- if overview.findings.kev %}{{ overview.findings.kev }} exploatate activ
+      {%- else %}niciuna exploatată activ{% endif %} ·
+      {{ overview.findings.new }} noi în {{ window }}{{ cov_inline(overview.findings.coverage) }}
+    </span>
+  </div>
+</div>
+
+<div class="grid">
+  <section class="card">
+    <h2>Incidente deschise pe severitate</h2>
+    <dl class="kv">
+      {% for sev in ['critical', 'high', 'medium', 'low', 'info'] %}
+      <dt>{{ severity_ro[sev] }}</dt>
+      <dd>{{ overview.incidents.open.get(sev, 0) }}</dd>
+      {% endfor %}
+    </dl>
+    <p class="muted small rep-foot"><a href="/incidents">Vezi lista →</a></p>
+  </section>
+
+  <section class="card">
+    <h2>Evenimente pe sursă · ultimele {{ window }}</h2>
+    {# Coada e pliată în „altele" cu suma exactă, ca în grafic. Cardul se oprea
+       pur și simplu la a opta sursă, ceea ce îl făcea singurul loc din pagină
+       de unde o categorie putea dispărea fără urmă. #}
+    <dl class="kv">
+      {% for s in overview.events.by_source %}
+      <dt>{{ s.key }}{% if s.folded %} <span class="muted small">({{ s.folded }} surse)</span>{% endif %}</dt>
+      <dd class="mono">{{ s.n }}</dd>
+      {% else %}
+      <dd class="muted">Agregatul nu conține nimic pentru această fereastră.</dd>
+      {% endfor %}
+    </dl>
+    {% if overview.events.sources_truncated %}
+    <p class="muted small rep-foot">Citirea a atins plafonul de surse — lista de mai
+       sus, inclusiv „altele”, este incompletă.</p>
+    {% endif %}
+    {{ cov_note(overview.events.coverage) }}
+  </section>
+
+  <section class="card">
+    <h2>Vulnerabilități · ultimele {{ window }}</h2>
+    {# Primele trei rânduri sunt „acum" și complete; ultimele două sunt
+       ferestruite, deci doar ele poartă calificarea. #}
+    <dl class="kv">
+      <dt>Deschise acum</dt><dd>{{ overview.findings.open }}</dd>
+      <dt>Grave (high / critical)</dt><dd>{{ overview.findings.grave }}</dd>
+      <dt>Exploatate activ (KEV)</dt><dd>{{ overview.findings.kev }}</dd>
+      <dt>Apărute în fereastră</dt>
+      <dd>{{ overview.findings.new }}{{ cov_inline(overview.findings.coverage) }}</dd>
+      <dt>Rezolvate în fereastră</dt>
+      <dd>{{ overview.findings.resolved }}{{ cov_inline(overview.findings.coverage) }}</dd>
+    </dl>
+    <p class="muted small rep-foot"><a href="/findings">Vezi lista →</a></p>
+  </section>
+</div>
+
+{# ── GRAFICELE ──────────────────────────────────────────────────────────── #}
+{% for c in charts %}
+<section class="card rep-card">
+  <div class="panel-head">
+    <h2>{{ c.title }}</h2>
+    <span class="muted small">{{ spec.label }} · {{ c.series.grand_total }} în total</span>
+  </div>
+
+  {# Cazul amestecat e cel normal pe o instalare tânără: câteva intervale
+     acoperite și chiar goale, restul mai vechi decât datele păstrate. Ramura
+     „intervalul nu e acoperit" dădea vina pe retenție pentru un zero real, iar
+     pe graficele pe an două coloane rămân hașurate încă doi ani, deci ORICE
+     tabelă vie fără rânduri în anul curent primea propoziția greșită. #}
+  {% if c.series.empty %}
+  <p class="muted">
+    {#- Fiecare fel de coloană e numărat separat, iar cele trei numere adună
+        exact câte coloane are graficul. Formularea anterioară spunea „celelalte
+        N", ceea ce implica un rest — și restul ieșea greșit fix cu numărul de
+        coloane încă neagregate, pe o pagină al cărei subiect e numărătoarea
+        onestă. Tot atunci, „tot intervalul e acoperit" se tipărea în timp ce
+        graficul desena coloane pending, contrazicându-se cu propria legendă. -#}
+    {%- if c.series.covered_buckets %}
+    Zero în {{ c.series.covered_buckets }} din {{ c.series.starts | length }} intervale —
+    acolo intervalul e acoperit de date, deci zero înseamnă chiar zero.
+    {%- else %}
+    Niciunul dintre cele {{ c.series.starts | length }} intervale afișate nu e acoperit
+    de date, deci nu se poate spune nimic despre ele — nici măcar că au fost liniștite.
+    {%- endif %}
+    {%- if c.series.unknown_buckets %}
+    {{ c.series.unknown_buckets }} sunt mai vechi decât datele păstrate.
+    {%- endif %}
+    {#- „Neagregat" și „neagregat, iar detaliul a expirat" sunt lucruri diferite,
+        iar codul are cu ce să le deosebească: marginea partițiilor brute e
+        citită de același handler, cu două linii mai sus. Prima formă promite
+        rânduri care chiar există; a doua promitea rânduri tăiate de retenție de
+        luni de zile, pe pagina a cărei teză e chiar distincția asta. -#}
+    {%- if c.series.missed_buckets %}
+    {{ c.series.missed_buckets }} nu au fost agregate, iar datele din care s-ar fi
+    putut reface au expirat — pentru ele nu a mai rămas nimic.
+    {%- endif %}
+    {#- Fără nicio afirmație despre detaliul brut: pentru unele coloane pending
+        el mai există, pentru altele a expirat deja, iar afirmația se verifică
+        per coloană în tooltip, nu în rezumat. Ce e adevărat pentru toate e că
+        se refac — de aceea `MISSED` se uită la tabela de minute, nu la cea
+        brută: între cele două retenții sunt șaizeci de zile. -#}
+    {%- if c.series.pending_buckets %}
+    {{ c.series.pending_buckets }} nu au fost încă agregate — se refac când
+    mentenanța repornește.
+    {%- endif %}
+  </p>
+  {% endif %}
+
+  {{ chart_svg(c.id, c.chart, c.title) }}
+
+  <ul class="rep-legend">
+    {% for key, label, cls, total in c.chart.legend %}
+    <li><span class="rep-swatch {{ cls }}" aria-hidden="true"></span>{{ label }}
+      <span class="muted mono">{{ total }}</span></li>
+    {% else %}
+    <li class="muted">fără categorii</li>
+    {% endfor %}
+    {# O singură intrare pentru hașură: „fără date păstrate" e adevărat și
+       pentru intervalele scoase din agregat, și pentru cele neagregate al căror
+       detaliu a expirat. Două intrări cu același model ar fi de nedeosebit. #}
+    {% if c.series.has_unknown or c.series.has_missed %}
+    <li><span class="rep-swatch rep-swatch-gap" aria-hidden="true"></span>fără date păstrate</li>
+    {% endif %}
+    {% if c.series.has_pending %}
+    <li><span class="rep-swatch rep-swatch-pending" aria-hidden="true"></span>încă neagregat</li>
+    {% endif %}
+  </ul>
+
+  <p class="muted small">{{ c.note }} Click pe o bară pentru lista din spatele ei.</p>
+</section>
+{% endfor %}
+
+{% endblock %}

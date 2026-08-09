@@ -309,10 +309,12 @@ def create_app(
     app.state.templates = templates
 
     from sentinel.web.routers import (
-        auth, blocklist, dashboard, events, findings, incidents, patches, services,
+        auth, blocklist, dashboard, events, findings, incidents, patches, reports,
+        services,
     )
 
     app.include_router(dashboard.router)
+    app.include_router(reports.router)
     app.include_router(services.router)
     app.include_router(events.router)
     app.include_router(incidents.router)
