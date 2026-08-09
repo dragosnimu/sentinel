@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import html
 import ipaddress
+from datetime import datetime, timezone
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -85,7 +86,38 @@ def _guard(handler):
         try:
             await handler(update, context)
         except Exception as exc:  # noqa: BLE001 - a broken command must not kill the bot
-            log.error("telegram handler failed", extra={"detail": str(exc)})
+            # Linia veche — `extra={"detail": str(exc)}` — chiar a funcționat
+            # pentru eșecul de CHECK al lui `/mute`: asyncpg pune în mesaj și
+            # numele constrângerii, și rândul respins, deci acolo se vedeau și
+            # chat_id-ul, și valoarea. Dar asta a fost noroc, nu proiectare — a
+            # ținut fiindcă excepția venea din baza de date și purta rândul cu ea.
+            #
+            # Cazul în care nu ține e chiar celălalt defect din fișierul ăsta:
+            # `_fmt_local`, apelat din trei locuri și nedefinit. Tot ce spunea
+            # linia veche despre el era `name '_fmt_local' is not defined` — fără
+            # chat, fără comandă, și fără să distingă între `/mute 2h` și `/mute`
+            # cu o pauză activă. Adaugă deci exact ce lipsea acolo:
+            #   * `exc_info` — traceback-ul, adică LINIA care a picat;
+            #   * textul comenzii — aici argumentul e cel care declanșează, nu
+            #     numele comenzii, iar el nu apare în nicio excepție;
+            #   * chat_id și tipul excepției explicit, ca să nu mai depindă de ce
+            #     se întâmplă să conțină mesajul.
+            # Textul e trunchiat, fiindcă vine de la un client și lungimea lui nu
+            # e mărginită de nimic; `RedactingFilter` curăță ce arată a credențial
+            # pe drumul spre jurnal.
+            chat = update.effective_chat
+            message = update.effective_message
+            text = (message.text or message.caption or "") if message else ""
+            log.error(
+                "telegram handler failed",
+                exc_info=exc,
+                extra={
+                    "handler": getattr(handler, "__name__", repr(handler)),
+                    "chat_id": chat.id if chat else None,
+                    "command": text[:200] or None,
+                    "detail": f"{type(exc).__name__}: {exc}",
+                },
+            )
             if update.message:
                 await update.message.reply_text("A apărut o eroare la procesarea comenzii.")
     return wrapper
@@ -543,6 +575,37 @@ _MUTE_HELP = (
     "O fereastră care trece peste miezul nopții aparține serii în care începe — "
     "pentru liniște sâmbătă dimineața, noaptea care contează e a lui vineri.</i>"
 )
+
+
+# Al doilea nume apelat și nedefinit din același fișier, după `_MUTE_HELP`:
+# chemat de trei ori mai jos, deci `/mute 2h` și `/mute` fără argumente cu o
+# pauză activă ridicau amândouă NameError — adică exact formele pe care textul de
+# ajutor le oferă. Ramuri rar atinse: nu se văd la import și nu se văd în
+# happy-path-ul unde nu e nicio liniște setată.
+def _fmt_local(moment: datetime, tz_name: str | None) -> str:
+    """A moment in the chat's own local time, for a reply the operator reads.
+
+    Same shape as everywhere else the bot prints an expiry — `%d.%m %H:%M`, as
+    in the blocklist listing. Nothing here is ever more than 24 hours away (an
+    ad-hoc mute is capped, and a quiet window ends within the day), so the year
+    would be noise.
+    """
+    if moment.tzinfo is None:
+        # Un `datetime` naiv nu e un moment, e o ghicitoare. `.astimezone()` l-ar
+        # citi tăcut în ora procesului, care pe gazdă e UTC și pe altă mașină nu
+        # e — adică o oră afișată greșit fără nimic care să spună asta. Baza
+        # întoarce `timestamptz`, deci dacă ajunge aici unul naiv, altceva e
+        # stricat și trebuie să se vadă.
+        log.warning("naive datetime in a chat reply, reading it as UTC",
+                    extra={"moment": moment.isoformat()})
+        moment = moment.replace(tzinfo=timezone.utc)
+    # `quiet.zone` decide ce înseamnă `tz_name=None` — fusul gazdei, după nume, cu
+    # eroare în jurnal dacă un fus cerut explicit nu există. Aceeași funcție e cea
+    # al cărei nume îl tipărește confirmarea lui `/mute`, deci ora afișată și
+    # fusul anunțat nu pot să nu fie de acord.
+    from sentinel.telegram import quiet
+
+    return moment.astimezone(quiet.zone(tz_name)).strftime("%d.%m %H:%M")
 
 
 async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -475,3 +475,467 @@ def test_when_two_rules_both_match_the_specific_one_decides_the_end():
     assert state.muted
     assert state.until.hour == 9, "a castigat regula zilnica in locul celei de weekend"
     assert "weekend" in state.reason
+
+
+# --- parserul si constrangerea din baza de date -----------------------------
+#
+# Ce s-a intamplat: `parse_schedule` accepta „22:00-06:00; vi,sa 22:00-09:00",
+# adica exact exemplul pe care il ofera textul de ajutor al comenzii, iar CHECK-ul
+# creat de migratia 0015 il respingea la scriere. Toate cele trei incercari ale
+# operatorului au raspuns „A aparut o eroare la procesarea comenzii.", si ultima
+# valoare salvata cu succes era de dinainte ca regulile pe zile sa existe.
+#
+# Cauza nu a fost pragul gresit, ci ca gramatica era scrisa de doua ori — o data
+# in Python, o data in SQL — fara nimic care sa le lege. Testele de aici sunt
+# legatura: iau valorile pe care le produce EFECTIV `str(Schedule)` si le trec
+# prin regexul citit din FISIERUL DE MIGRATIE, nu dintr-o constanta Python. Un
+# test care ar verifica parserul contra propriei lui constante ar trece si daca
+# migratia ar lipsi cu totul.
+
+import ast          # noqa: E402 - sectiune adaugata la sfarsitul fisierului
+import asyncio      # noqa: E402
+import functools    # noqa: E402
+import re           # noqa: E402
+from pathlib import Path  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+_REPO = Path(__file__).resolve().parents[2]
+MIGRATIONS = _REPO / "sentinel" / "db" / "migrations"
+CONSTRAINT = "telegram_chats_quiet_hours_shape"
+BOT_SOURCE = _REPO / "sentinel" / "telegram" / "bot.py"
+
+# Regexul din 0015, cel care a produs defectul. Pastrat aici ca sa se poata
+# demonstra ca noul e o supramultime a lui.
+OLD_SHAPE = r"^[0-2][0-9]:[0-5][0-9]-[0-2][0-9]:[0-5][0-9]$"
+
+
+def _body(path: Path) -> str:
+    """Fisierul fara liniile de comentariu — ce ajunge de fapt la PostgreSQL."""
+    return "\n".join(line for line in path.read_text(encoding="utf-8").splitlines()
+                     if not line.lstrip().startswith("--"))
+
+
+def _shape_migrations() -> list[Path]:
+    """Migratiile care (re)definesc constrangerea de forma, in ordinea versiunii."""
+    found = [f for f in MIGRATIONS.glob("*.sql") if CONSTRAINT in _body(f)]
+    assert found, f"nicio migratie nu mai defineste {CONSTRAINT}"
+    return sorted(found, key=lambda f: int(re.match(r"^(\d+)_", f.name).group(1)))
+
+
+def _effective_shape_migration() -> Path:
+    """ULTIMA migratie care atinge constrangerea — aia decide ce e pe gazda.
+
+    Cautata, nu numita. Prima varianta compara cu `0020_quiet_schedule.sql`
+    hard-codat, iar mesajul ei de esec spunea „scrie o migratie noua". Cine facea
+    exact asta ramanea rosu, fiindca testul se uita in continuare la 0020 —
+    singura cale spre verde era sa EDITEZE 0020, pe care `db/migrate.py` il
+    refuza pe orice gazda unde a fost deja aplicat („Migrations are immutable
+    once applied"), iar `deploy/install.sh` transforma refuzul in `die`. Adica
+    fixarea indruma spre singura editare pe care runner-ul e construit s-o
+    respinga.
+    """
+    return _shape_migrations()[-1]
+
+
+def _migration_body() -> str:
+    return _body(_effective_shape_migration())
+
+
+@functools.lru_cache(maxsize=1)
+def _constraint_pattern() -> str:
+    latest = _effective_shape_migration()
+    found = re.findall(r"quiet_hours\s*~\s*'([^']*)'", _body(latest))
+    assert len(found) == 1, \
+        f"astept exact un regex de forma in {latest.name}, am gasit {len(found)}: {found}"
+    return found[0]
+
+
+def _accepted_by_postgres(value: str) -> bool:
+    """`quiet_hours ~ '<regex>'` evaluat ca in PostgreSQL, nu ca in Python.
+
+    In Python `$` potriveste si INAINTEA unui newline final; in PostgreSQL
+    potriveste doar sfarsitul sirului. Fara conversia asta, o valoare terminata
+    in newline ar trece aici si ar fi respinsa pe gazda — exact genul de
+    verificare care confirma intentia in loc de efect.
+    """
+    pattern = _constraint_pattern()
+    assert pattern.endswith("$"), "regexul din migratie nu mai e ancorat la sfarsit"
+    return re.search(pattern[:-1] + r"\Z", value) is not None
+
+
+def _accepted_by_the_old_constraint(value: str) -> bool:
+    return re.search(OLD_SHAPE[:-1] + r"\Z", value) is not None
+
+
+# --- ce ar scrie de fapt comanda --------------------------------------------
+
+# Id de fixtura, nu al operatorului. Depozitul e public, iar un chat id real
+# leaga depozitul de contul lui de Telegram — pe lista de sanitizare scrie
+# explicit „fara chat id".
+#
+# Telegram NU are un interval rezervat pentru exemple, cum are RFC 5737 pentru
+# adrese: id-urile se aloca secvential, deci orice numar scris aici poate fi al
+# cuiva. Sirul 1..0 e ales fiindca se citeste ca substituent din prima privire,
+# iar codul nu trimite nimic catre el: acelasi numar ajunge si in
+# `allowed_chat_ids`, si in `effective_chat.id`, deci se verifica doar ca cele
+# doua coincid.
+FIXTURE_CHAT_ID = 1234567890
+
+
+def _cfg(chat_id: int) -> SimpleNamespace:
+    return SimpleNamespace(telegram=SimpleNamespace(
+        allowed_chat_ids=[chat_id], owner_chat_id=None, operator_chat_ids=[],
+        quiet_hours=None, timezone="Europe/Bucharest"))
+
+
+class _Written:
+    """Ce a ajuns in fiecare coloana, dupa o rulare a lui `cmd_mute`."""
+
+    def __init__(self) -> None:
+        self.quiet_hours: list[str | None] = []
+        self.muted_until: list[object] = []
+        self.cleared = 0
+        self.replies: list[str] = []
+
+
+def _run_mute(arg: str, monkeypatch, chat_id: int = FIXTURE_CHAT_ID, *,
+              prefs: dict | None = None) -> _Written:
+    """Ruleaza `cmd_mute` cu argumentul asta si raporteaza ce s-a scris.
+
+    Prin comanda reala, nu printr-o reimplementare a ramurilor ei: o copie a
+    ordinii `off` / program / durata ar ramane in urma tacut, si tocmai despre
+    ramas-in-urma-tacut e tot fisierul asta.
+    """
+    pytest.importorskip("telegram")
+    from sentinel.db.repo import chats as chats_repo
+    from sentinel.telegram import bot
+
+    seen = _Written()
+
+    async def fake_get_prefs(db, cid):
+        return chats_repo.ChatPrefs(chat_id=cid, **(prefs or {}))
+
+    async def fake_set_quiet_hours(db, cid, window, *, tz=None):
+        seen.quiet_hours.append(window)
+
+    async def fake_set_muted_until(db, cid, until):
+        seen.muted_until.append(until)
+
+    async def fake_clear_all_mutes(db, cid):
+        seen.cleared += 1
+
+    monkeypatch.setattr(chats_repo, "get_prefs", fake_get_prefs)
+    monkeypatch.setattr(chats_repo, "set_quiet_hours", fake_set_quiet_hours)
+    monkeypatch.setattr(chats_repo, "set_muted_until", fake_set_muted_until)
+    monkeypatch.setattr(chats_repo, "clear_all_mutes", fake_clear_all_mutes)
+
+    async def reply_text(text, **_kw):
+        seen.replies.append(text)
+
+    message = SimpleNamespace(text=f"/mute {arg}", caption=None, reply_text=reply_text)
+    update = SimpleNamespace(effective_chat=SimpleNamespace(id=chat_id),
+                             effective_message=message, message=message)
+    context = SimpleNamespace(args=arg.split(), bot_data={"cfg": _cfg(chat_id), "db": object()})
+
+    asyncio.run(bot.cmd_mute(update, context))
+    return seen
+
+
+def _mute_help_examples() -> list[str]:
+    """Argumentele `/mute ...` oferite operatorului, scoase din `_MUTE_HELP`.
+
+    Prin `ast`, din sursa, nu prin import: `bot.py` importa `telegram`, iar un
+    `importorskip` la nivel de colectare ar face ca lista sa iasa goala si testul
+    parametrizat sa dispara tacut — exact tiparul de test care nu verifica nimic.
+    """
+    tree = ast.parse(BOT_SOURCE.read_text(encoding="utf-8"))
+    text = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "_MUTE_HELP" for t in node.targets):
+            text = ast.literal_eval(node.value)
+    assert text, "_MUTE_HELP nu a fost gasit in bot.py"
+    return [m.group(1).strip() for m in re.finditer(r"<code>/mute ([^<]*)</code>", text)]
+
+
+def test_the_help_text_examples_were_actually_extracted():
+    """Guard pe guard: daca extragerea din `_MUTE_HELP` iese goala, testul
+    parametrizat de mai jos trece cu zero cazuri si nu mai apara nimic — iar
+    exemplul cu doua reguli e chiar cel care pica pe gazda."""
+    examples = _mute_help_examples()
+    assert len(examples) >= 4, examples
+    assert any(";" in e for e in examples), "exemplul cu doua reguli a disparut din ajutor"
+    assert "off" in examples
+    assert any(quiet.parse_duration(e) is not None for e in examples)
+
+
+@pytest.mark.parametrize("example", _mute_help_examples())
+def test_every_example_in_the_help_text_can_actually_be_saved(example, monkeypatch):
+    """Bug-ul raportat, in forma lui exacta.
+
+    Textul de ajutor al comenzii ofera `/mute 22:00-06:00; vi,sa 22:00-09:00` ca
+    exemplu, iar constrangerea din baza il respingea. O comanda care isi
+    contrazice propriul ajutor lasa operatorul convins ca a gresit el.
+    """
+    seen = _run_mute(example, monkeypatch)
+    assert seen.replies, f"/mute {example} nu a raspuns nimic"
+    assert "Nu am inteles" not in seen.replies[-1] and "Nu am înțeles" not in seen.replies[-1], \
+        f"/mute {example} nu mai e inteles de parser"
+
+    for value in seen.quiet_hours:
+        assert value is not None
+        assert _accepted_by_postgres(value), (
+            f"/mute {example} scrie {value!r}, pe care CHECK-ul din 0020 il respinge")
+
+    if example.lower() == "off":
+        # `off` sterge scriind NULL; ramura `IS NULL` a constrangerii o acopera.
+        assert seen.cleared == 1 and not seen.quiet_hours
+    elif quiet.parse_schedule(example) is not None:
+        assert len(seen.quiet_hours) == 1
+    else:
+        # `2h` — pauza ad-hoc, alta coloana; nu atinge `quiet_hours` deloc.
+        assert seen.muted_until and not seen.quiet_hours
+
+
+# Fiecare forma pe care o descrie ajutorul, plus fiecare prescurtare si fiecare
+# grup pe care le cunoaste parserul. Scrise ca INTRARI ale operatorului; ce se
+# verifica e ce iese din `str(Schedule)`.
+TYPEABLE_SCHEDULES = [
+    "22:00-06:00",
+    "22:00-06:00; du,sa 22:00-09:00",
+    "22:00-06:00; vi,sa 22:00-09:00",
+    "22:00-06:00; weekend 22:00-09:00",
+    "22:00-06:00; lucratoare 23:00-07:00",
+    "weekend 22:00-09:00",
+    "lucratoare 23:00-07:00",
+    "lu-vi 23:00-07:00",
+    "vi-lu 22:00-09:00",
+    "sâmbătă 08:00-09:00",
+    "sat sun 22:00-09:00",
+    "zilnic 00:00-23:59",
+    "lu 01:00-02:00; ma 02:00-03:00; mi 03:00-04:00; jo 04:00-05:00",
+    "22:00 - 06:00",
+    "9:30-17:00",
+    "00:00-23:59",
+] + [f"{day} 22:00-06:00" for day in ("lu", "ma", "mi", "jo", "vi", "sa", "du",
+                                      "luni", "marti", "marți", "miercuri", "joi",
+                                      "vineri", "sambata", "sâmbătă", "duminica",
+                                      "duminică", "mon", "tue", "wed", "thu", "fri",
+                                      "sat", "sun")
+  ] + [f"{group} 22:00-06:00" for group in ("weekend", "wk", "lucratoare", "lucrătoare",
+                                            "weekdays", "zilnic", "toate")]
+
+
+@pytest.mark.parametrize("typed", TYPEABLE_SCHEDULES)
+def test_every_schedule_the_parser_accepts_is_one_the_database_accepts(typed, monkeypatch):
+    """Directia care a produs pana: parserul spune da, baza spune nu, si
+    operatorul afla ca „a aparut o eroare".
+
+    Numele complete de zile si grupurile alternative sunt aici pentru ca
+    `str(Schedule)` le NORMALIZEAZA — „duminică" devine „du", „toate" dispare cu
+    totul. Daca normalizarea se schimba si incepe sa scrie forma tastata, regexul
+    nu o mai accepta si testul pica aici, nu la 22:00 pe telefonul cuiva.
+    """
+    assert quiet.parse_schedule(typed) is not None, f"{typed!r} nu mai e acceptat de parser"
+    seen = _run_mute(typed, monkeypatch)
+    assert len(seen.quiet_hours) == 1, f"/mute {typed} nu a mai ajuns pe ramura de program"
+    stored = seen.quiet_hours[0]
+    assert _accepted_by_postgres(stored), \
+        f"/mute {typed} scrie {stored!r}, pe care CHECK-ul din 0020 il respinge"
+    # Si se recitește identic: coloana e recitita la fiecare pornire a botului.
+    assert str(quiet.parse_schedule(stored)) == stored
+
+
+def test_the_constraint_accepts_every_clock_value_the_formatter_can_print():
+    """`%H:%M` produce 00:00–23:59. O ora pe care formatorul o scrie si regexul
+    nu o accepta ar face ca `/mute` sa mearga pentru unele ore si nu pentru
+    altele — cel mai greu fel de defect de crezut cand il raporteaza cineva."""
+    for hour in range(24):
+        for minute in (0, 1, 30, 59):
+            spec = f"{hour:02d}:{minute:02d}-{(hour + 1) % 24:02d}:{minute:02d}"
+            stored = str(quiet.parse_schedule(spec))
+            assert _accepted_by_postgres(stored), stored
+            assert _accepted_by_postgres(str(quiet.parse_schedule(f"vi,sa {spec}")))
+
+
+def test_nothing_the_old_constraint_allowed_becomes_invalid():
+    """`ADD CONSTRAINT` valideaza randurile existente inainte sa se aplice. Daca
+    noul regex e mai ingust undeva, migratia cade pe gazda si schema se opreste
+    la 19 — inclusiv pentru toate migratiile de dupa.
+
+    Regexul din 0015 accepta ore pana la 29, pe care parserul nu le produce, dar
+    pe care cineva le-ar fi putut scrie direct in coloana."""
+    for hour in range(30):
+        for minute in range(60):
+            value = f"{hour:02d}:{minute:02d}-{hour:02d}:{minute:02d}"
+            assert _accepted_by_the_old_constraint(value), value
+            assert _accepted_by_postgres(value), \
+                f"0015 accepta {value!r}, 0020 nu — ADD CONSTRAINT cade pe randul asta"
+
+
+@pytest.mark.parametrize("junk", [
+    "",                                  # gol nu e o stare; „fara program" e NULL
+    " ",
+    "22:00",
+    "noapte",
+    "vi,sa",                             # zile fara fereastra
+    "22:00-06:00 vi,sa",                 # zilele dupa fereastra
+    "weekendul 22:00-06:00",
+    "; 22:00-06:00",
+    "22:00-06:00; ",
+    "22:00-06:00\n",                     # `$` in PostgreSQL nu iarta newline-ul
+    "22:00-06:00\n22:00-06:00",
+    "DROP TABLE telegram_chats",
+    "22:00-06:00; DROP TABLE telegram_chats",
+])
+def test_the_constraint_still_keeps_garbage_out(junk):
+    """CHECK-ul a fost largit, nu desfiintat. O coloana in care incape orice text
+    inseamna ca la urmatoarea pornire `parse_schedule` returneaza None si
+    linistea dispare tacut — operatorul crede ca e setata si telefonul suna."""
+    assert not _accepted_by_postgres(junk), f"{junk!r} nu ar trebui acceptat"
+
+
+def test_the_latest_migration_carries_exactly_the_regex_the_parser_publishes():
+    """Legatura care lipsea.
+
+    Daca gramatica se largeste in `quiet.py` — o zi noua, un separator nou — si
+    nimeni nu scrie o migratie, `SCHEDULE_SQL_REGEX` se schimba, ultima migratie
+    nu, si testul asta pica. Fara el, urmatoarea largire repeta exact aceeasi
+    pana cu alt prag.
+
+    Se uita la ULTIMA migratie care atinge constrangerea, gasita prin cautare.
+    Cu un nume hard-codat, remediul pe care il recomanda — „scrie o migratie
+    noua" — nu ar fi functionat: cine scria un 0021 corect ramanea rosu, si
+    singura cale spre verde era sa editeze o migratie deja aplicata, exact ce
+    refuza `db/migrate.py`.
+    """
+    latest = _effective_shape_migration()
+    assert _constraint_pattern() == quiet.SCHEDULE_SQL_REGEX, (
+        f"regexul din {latest.name} nu mai e cel produs de "
+        "quiet.SCHEDULE_SQL_REGEX.\n"
+        "Adauga o migratie NOUA, cu numar mai mare (nu edita una aplicata), care "
+        "sa recreeze constrangerea cu:\n  " + quiet.SCHEDULE_SQL_REGEX
+    )
+
+
+def test_clearing_the_schedule_is_still_possible():
+    """`/mute off` sterge scriind NULL. O constrangere fara ramura `IS NULL` ar
+    face ca oprirea linistii sa fie ea insasi o eroare — adica un canal pe care
+    nu-l mai poti reporni de pe telefon."""
+    assert re.search(r"CHECK\s*\(\s*quiet_hours IS NULL OR quiet_hours ~", _migration_body())
+
+
+@pytest.mark.parametrize("path", _shape_migrations(), ids=lambda p: p.name)
+def test_no_migration_touches_anyone_s_schedule(path):
+    """Ca la 0015: o migratie care ar rescrie programele existente ar schimba
+    orele in care serverul cuiva nu mai e supravegheat, fara sa ceara nimeni.
+
+    Toate migratiile care ating constrangerea, nu doar ultima: interdictia e
+    despre coloana, si se aplica si celei pe care o scrie urmatorul om.
+    """
+    body = _body(path)
+    assert "UPDATE telegram_chats" not in body
+    assert "DELETE" not in body.upper()
+
+
+# --- momentul afisat operatorului -------------------------------------------
+#
+# `_fmt_local` era apelat din trei locuri din `bot.py` si nu era definit
+# nicaieri — al doilea nume de felul asta in acelasi fisier, dupa `_MUTE_HELP`.
+# Consecinta: `/mute 2h` si `/mute` fara argumente cu o pauza activa ridicau
+# NameError si raspundeau „A aparut o eroare la procesarea comenzii." — adica
+# exact simptomul pentru care operatorul tocmai raportase constrangerea, pe alta
+# cauza. Ramuri rar atinse: nu se vad la import si nu se vad cand nu e nicio
+# liniste setata.
+
+BUCHAREST_ZONE = "Europe/Bucharest"
+
+
+def _local_parts(moment: datetime) -> tuple[int, int, int, int]:
+    """(zi, luna, ora, minut) in fusul chatului, calculate independent de bot."""
+    from zoneinfo import ZoneInfo
+
+    local = moment.astimezone(ZoneInfo(BUCHAREST_ZONE))
+    return local.day, local.month, local.hour, local.minute
+
+
+def _shown_moments(reply: str) -> list[tuple[int, int, int, int]]:
+    return [(int(d), int(mo), int(h), int(mi))
+            for d, mo, h, mi in re.findall(r"(\d{2})\.(\d{2}) (\d{2}):(\d{2})", reply)]
+
+
+def test_an_adhoc_pause_answers_with_the_moment_it_expires(monkeypatch):
+    """`/mute 2h` e o forma pe care `_MUTE_HELP` o ofera explicit, si raspunsul ei
+    e singurul loc in care operatorul afla PANA CAND a tacut canalul. Fara
+    momentul asta, comanda de pauza e o comanda pe care nu o poti verifica."""
+    seen = _run_mute("2h", monkeypatch)
+
+    assert len(seen.muted_until) == 1 and not seen.quiet_hours
+    until = seen.muted_until[0]
+    assert seen.replies and "Pauză până la" in seen.replies[0]
+
+    shown = _shown_moments(seen.replies[0])
+    assert shown == [_local_parts(until)], \
+        f"raspunsul arata {shown}, momentul scris in baza e {_local_parts(until)}"
+
+
+def test_the_moment_is_shown_in_the_chat_s_zone_not_in_utc(monkeypatch):
+    """Gazda ruleaza UTC si baza stocheaza UTC. Un „pana la 21:00" citit in UTC
+    de un operator din Bucuresti inseamna doua-trei ore de tacere pe care nu le-a
+    cerut si nu le poate explica."""
+    seen = _run_mute("2h", monkeypatch)
+    until = seen.muted_until[0]
+    day, month, hour, minute = _shown_moments(seen.replies[0])[0]
+
+    assert (hour, minute) != (until.hour, until.minute), \
+        "momentul e afisat in UTC — `astimezone` lipseste"
+    assert (day, month, hour, minute) == _local_parts(until)
+
+
+def test_the_status_reply_shows_an_active_pause_and_when_it_lifts(monkeypatch):
+    """`/mute` fara argumente e comanda cu care afli DACA esti in liniste. Cand
+    exista o pauza activa, ea atingea doua apeluri catre `_fmt_local` si pica —
+    deci singurul mod de a descoperi ca statusul nu merge era sa-l ceri exact
+    atunci cand chiar aveai nevoie de el.
+
+    Momentul e fixat in decembrie, deci Bucurestiul e UTC+2 si nu UTC+3: un fus
+    citit cu offset fix in loc de dupa nume ar da alta ora aici.
+    """
+    pause_ends = datetime(2026, 12, 24, 20, 30, tzinfo=UTC)
+    seen = _run_mute("", monkeypatch, prefs={"muted_until": pause_ends})
+
+    assert len(seen.replies) == 1
+    reply = seen.replies[0]
+    assert "Pauză activă până la" in reply
+    assert "pauză temporară" in reply, "linia de stare curenta nu s-a randat"
+    # 20:30 UTC pe 24 decembrie = 22:30 la Bucuresti.
+    assert _shown_moments(reply) == [(24, 12, 22, 30), (24, 12, 22, 30)]
+    assert not seen.quiet_hours and not seen.muted_until and seen.cleared == 0
+
+
+def test_a_naive_datetime_is_not_read_silently_as_process_local_time(caplog):
+    """Baza intoarce `timestamptz`, deci un moment naiv inseamna ca altceva e
+    stricat. `.astimezone()` l-ar citi tacut in ora procesului — corect pe gazda,
+    gresit oriunde altundeva, si fara nimic care sa spuna ca s-a ghicit."""
+    import logging
+
+    pytest.importorskip("telegram")
+    from sentinel.telegram import bot
+
+    naive = datetime(2026, 12, 24, 20, 30)
+    with caplog.at_level(logging.WARNING, logger="sentinel.telegram.bot"):
+        shown = bot._fmt_local(naive, BUCHAREST_ZONE)
+
+    assert shown == "24.12 22:30", shown       # citit ca UTC, afisat la Bucuresti
+    assert any("naive datetime" in r.getMessage() for r in caplog.records)
+
+
+def test_the_format_is_the_one_the_rest_of_the_bot_already_uses():
+    """Blocklistul tipareste expirarile ca `%d.%m %H:%M`. Un al doilea format
+    pentru acelasi lucru — „pana cand" — face doua mesaje sa nu poata fi
+    comparate dintr-o privire pe telefon."""
+    pytest.importorskip("telegram")
+    from sentinel.telegram import bot
+
+    moment = datetime(2026, 8, 9, 21, 5, tzinfo=UTC)
+    assert bot._fmt_local(moment, "UTC") == "09.08 21:05"

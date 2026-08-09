@@ -197,12 +197,24 @@ class Rule:
         return self.days != frozenset(range(7))
 
 
+# Prescurtările pe care le SCRIE `_compact_days`, și grupurile pe care le
+# preferă în locul unei enumerări. Ținute aparte, nu inline, fiindcă din exact
+# aceleași tabele se construiește și `SCHEDULE_SQL_REGEX` de mai jos: o zi sau un
+# grup adăugat aici schimbă automat și regexul constrângerii, iar testul care
+# compară regexul cu literalul din fișierul de migrație pică până când
+# constrângerea e lărgită la rândul ei.
+_COMPACT_DAY: tuple[str, ...] = ("lu", "ma", "mi", "jo", "vi", "sa", "du")
+_COMPACT_GROUPS: tuple[tuple[str, frozenset[int]], ...] = (
+    ("weekend", _DAY_GROUPS["weekend"]),
+    ("lucratoare", _DAY_GROUPS["lucratoare"]),
+)
+
+
 def _compact_days(days: frozenset[int]) -> str:
-    for name, group in (("weekend", _DAY_GROUPS["weekend"]),
-                        ("lucratoare", _DAY_GROUPS["lucratoare"])):
+    for name, group in _COMPACT_GROUPS:
         if days == group:
             return name
-    return ",".join(("lu", "ma", "mi", "jo", "vi", "sa", "du")[d] for d in sorted(days))
+    return ",".join(_COMPACT_DAY[d] for d in sorted(days))
 
 
 @dataclass(frozen=True)
@@ -249,6 +261,46 @@ class Schedule:
         # Cea mai specifică regulă câștigă; la egalitate, prima scrisă.
         rule, _ = min(matches, key=lambda m: (not m[0].specific,))
         return rule, _rule_end(local, rule.window)
+
+
+# ---------------------------------------------------------------------------
+# Aceeași gramatică, o singură dată — și pentru PostgreSQL
+# ---------------------------------------------------------------------------
+# Coloana `telegram_chats.quiet_hours` are o constrângere CHECK cu un regex.
+# Până la migrația 0020 acel regex accepta o SINGURĂ fereastră zilnică, fiindcă
+# fusese scris înainte ca liniștea să aibă zile și reguli multiple. Rezultatul:
+# parserul de aici accepta `22:00-06:00; vi,sa 22:00-09:00`, exact exemplul din
+# textul de ajutor al comenzii, iar baza îl respingea la scriere. Operatorul
+# primea „A apărut o eroare la procesarea comenzii." și nimic altceva.
+#
+# Cauza nu a fost pragul greșit, ci faptul că gramatica era scrisă de două ori,
+# în două limbaje, fără nimic care să le lege. Deci: șirul de mai jos e SINGURA
+# definiție a formei acceptate, e construit din tabelele pe care le folosește
+# `_compact_days` la scriere, și e copiat verbatim în fișierul de migrație. Un
+# test compară cele două și trece prin regex fiecare ieșire pe care o produce
+# `str(Schedule)` — o gramatică lărgită aici fără o migrație nouă pică local, nu
+# pe telefonul operatorului.
+#
+# Dialect: subsetul comun între `re` din Python și ARE din PostgreSQL — clase de
+# caractere, alternanță, grupuri, `*`, `?`. Fără `\d`, fără lookaround, fără
+# backreferințe, ca ambele motoare să dea același răspuns.
+#
+# Orele rămân `[0-2][0-9]`, ca în 0015, deși `%H` nu produce niciodată peste 23:
+# regexul nou trebuie să fie o supramulțime STRICTĂ a celui vechi, altfel
+# `ADD CONSTRAINT` validează rândurile existente și migrația cade pe o gazdă
+# unde cineva a scris manual în coloană. Forma exactă rămâne treaba lui
+# `parse_schedule`; CHECK-ul ține gunoiul afară, cum spunea deja 0015.
+
+def _schedule_sql_regex() -> str:
+    day = "(" + "|".join(_COMPACT_DAY) + ")"
+    groups = "|".join(name for name, _ in _COMPACT_GROUPS)
+    days = f"({day}(,{day})*|{groups})"
+    window = "[0-2][0-9]:[0-5][0-9]-[0-2][0-9]:[0-5][0-9]"
+    rule = f"({days} )?{window}"          # `Rule.__str__`: zilele înaintea ferestrei
+    return f"^{rule}(; {rule})*$"         # `Schedule.__str__`: reguli unite cu „; "
+
+
+SCHEDULE_SQL_REGEX = _schedule_sql_regex()
 
 
 def parse_schedule(text: str) -> Schedule | None:
