@@ -26,6 +26,29 @@ It does not restart anything. A self-check that repairs what it finds is a
 self-check whose findings you stop reading, and an automatic restart of a
 security daemon is a way to turn a visible fault into an intermittent one.
 It reports; the operator decides.
+
+## Why a run has to clean up after itself
+
+`selfcheck_state` holds the latest result per check, written by upsert. Upsert
+alone only ever adds and updates, so a check that stops being emitted keeps its
+last state forever — and if that state was `down`, the panel stays red until
+someone deletes the row by hand. That is not hypothetical: `ingest:all` is
+emitted only while every source is silent, it fired on 9 August, the sources
+came back 85 minutes later, and the operator was told Sentinel was broken for
+the following 26 hours.
+
+So a run reconciles: a key present in the table and absent from the run is no
+longer a finding, and the row goes. The one case where that would lie is a run
+that never reached the check — a crashed group emits none of its keys, and
+deleting them would report health that nobody measured. `RunOutcome.complete`
+separates the two: a complete run deletes, an incomplete one marks the survivors
+`stale` and leaves them alone, to be shown as last-known rather than current.
+
+Withdrawals the operator was told about are announced. They are deliberately not
+called a recovery: the runner knows the check stopped producing the finding, and
+that is all it knows — the condition may have cleared, or the check may no
+longer cover it (a source that fell out of the 30-day window, a unit disabled in
+config). Saying the narrower true thing costs one line and cannot be wrong.
 """
 
 from __future__ import annotations
@@ -37,7 +60,7 @@ from typing import Any
 from sentinel.config import Config
 from sentinel.db.engine import Database
 from sentinel.logging_setup import get_logger
-from sentinel.selfcheck.checks import CheckResult, run_all, worst
+from sentinel.selfcheck.checks import CheckResult, run_groups, worst
 
 log = get_logger(__name__)
 
@@ -51,7 +74,8 @@ _EMOJI = {"down": "🔴", "degraded": "🟡", "ok": "🟢", "unknown": "⚪"}
 async def run_and_alert(db: Database, cfg: Config, *, quiet: bool = False) -> dict[str, Any]:
     """One pass. Returns a summary for the caller to log or print."""
     started = time.monotonic()
-    results = await run_all(db, cfg)
+    outcome = await run_groups(db, cfg)
+    results = outcome.results
     duration_ms = int((time.monotonic() - started) * 1000)
 
     previous = await _load_state(db)
@@ -73,18 +97,28 @@ async def run_and_alert(db: Database, cfg: Config, *, quiet: bool = False) -> di
         elif not r.bad and prev_status in ("down", "degraded"):
             recovered.append(r)
 
+    emitted = {r.key for r in results}
+    # Only the ones the operator was actually told about. A withdrawn `ok` row
+    # is bookkeeping; announcing it would be noise for a non-event. And a run
+    # that emitted nothing withdraws nothing — same reason `_reconcile_state`
+    # refuses to touch the table in that case.
+    withdrawn = [
+        prev for key, prev in previous.items()
+        if key not in emitted and prev["status"] in ("down", "degraded")
+    ] if (outcome.complete and emitted) else []
+
     await _save_state(db, results, previous)
+    await _reconcile_state(db, emitted, complete=outcome.complete)
     await db.execute(
         "INSERT INTO selfcheck_runs (duration_ms, worst_status, checks_run, checks_bad) "
         "VALUES ($1::int, $2::text, $3::int, $4::int)",
         duration_ms, worst(results), len(results), sum(1 for r in results if r.bad))
 
     announced = changed_bad + still_bad
-    if announced and not quiet:
-        await _announce(db, cfg, announced, recovered)
-        await _mark_alerted(db, [r.key for r in announced])
-    elif recovered and not quiet:
-        await _announce(db, cfg, [], recovered)
+    if (announced or recovered or withdrawn) and not quiet:
+        await _announce(db, cfg, announced, recovered, withdrawn)
+        if announced:
+            await _mark_alerted(db, [r.key for r in announced])
 
     return {
         "worst": worst(results),
@@ -92,6 +126,8 @@ async def run_and_alert(db: Database, cfg: Config, *, quiet: bool = False) -> di
         "bad": [r.key for r in results if r.bad],
         "new": [r.key for r in changed_bad],
         "recovered": [r.key for r in recovered],
+        "withdrawn": [w["key"] for w in withdrawn],
+        "incomplete": list(outcome.failed_groups),
         "duration_ms": duration_ms,
     }
 
@@ -99,7 +135,7 @@ async def run_and_alert(db: Database, cfg: Config, *, quiet: bool = False) -> di
 # ---------------------------------------------------------------------------
 async def _load_state(db: Database) -> dict[str, dict]:
     rows = await db.fetch(
-        "SELECT key, status, since, last_alert_at FROM selfcheck_state")
+        "SELECT key, status, title, since, last_alert_at, stale FROM selfcheck_state")
     return {r["key"]: dict(r) for r in rows}
 
 
@@ -114,14 +150,44 @@ async def _save_state(db: Database, results: list[CheckResult],
         keep_since = prev is not None and prev["status"] == r.status
         await db.execute(
             """
-            INSERT INTO selfcheck_state (key, status, title, detail, facts, since, last_seen)
-            VALUES ($1::text, $2::text, $3::text, $4::text, $5::jsonb, now(), now())
+            INSERT INTO selfcheck_state (key, status, title, detail, facts, since,
+                                         last_seen, stale)
+            VALUES ($1::text, $2::text, $3::text, $4::text, $5::jsonb, now(), now(), false)
             ON CONFLICT (key) DO UPDATE SET
                 status = $2::text, title = $3::text, detail = $4::text, facts = $5::jsonb,
-                last_seen = now(),
+                last_seen = now(), stale = false,
                 since = CASE WHEN $6::boolean THEN selfcheck_state.since ELSE now() END
             """,
             r.key, r.status, r.title, r.detail, json.dumps(r.facts), keep_since)
+
+
+async def _reconcile_state(db: Database, emitted: set[str], *, complete: bool) -> None:
+    """Make the table agree with what this run actually produced.
+
+    A key in the table and not in the run is a leftover, not a finding: nobody
+    computed it this time, so nobody can vouch for it. On a complete run it is
+    deleted — the check withdrew it, and the row would otherwise keep a status
+    that no longer has an author. That is the whole bug this exists for.
+
+    On an incomplete run the same rows are kept and flagged, because "the check
+    crashed" and "the condition cleared" are indistinguishable from here and
+    only one of them is good news. `stale` is what the panel reads to say
+    "last known" instead of "current".
+    """
+    if not emitted:
+        # A run with no results at all is not evidence that nothing is wrong;
+        # it is evidence that nothing ran. Deleting the entire table on it would
+        # be the loudest possible version of this bug.
+        log.error("selfcheck produced no results; state left untouched")
+        return
+    keys = sorted(emitted)
+    if complete:
+        await db.execute(
+            "DELETE FROM selfcheck_state WHERE NOT (key = ANY($1::text[]))", keys)
+        return
+    await db.execute(
+        "UPDATE selfcheck_state SET stale = true "
+        "WHERE NOT (key = ANY($1::text[])) AND NOT stale", keys)
 
 
 async def _mark_alerted(db: Database, keys: list[str]) -> None:
@@ -147,7 +213,8 @@ def _human(delta: timedelta) -> str:
 
 # ---------------------------------------------------------------------------
 def format_alert(bad: list[CheckResult], recovered: list[CheckResult],
-                 state: dict[str, dict] | None = None) -> str:
+                 state: dict[str, dict] | None = None,
+                 withdrawn: list[dict] | None = None) -> str:
     """The message. Worst first, and every line says what to do about it."""
     from html import escape
 
@@ -176,15 +243,34 @@ def format_alert(bad: list[CheckResult], recovered: list[CheckResult],
         lines.append("🟢 <b>Revenit la normal</b>")
         for r in recovered:
             lines.append(f"   {esc(r.title)}")
+    if withdrawn:
+        if lines:
+            lines.append("")
+        # Not filed under "revenit la normal", and the difference is not
+        # pedantry: what is known is that the check no longer produces the
+        # finding. Usually the condition cleared; sometimes the check simply
+        # stopped covering it (a unit disabled in config, a source past the
+        # 30-day window). The age is the age of the finding — never printed as
+        # if it were the length of an outage.
+        lines.append("⚪ <b>Nu se mai raportează</b>")
+        lines.append("   <i>verificarea nu mai produce constatările de mai jos — "
+                     "fie condiția a dispărut, fie nu mai sunt acoperite</i>")
+        for w in withdrawn:
+            age = ""
+            if w.get("since"):
+                age = f" · constatare veche de {_human(_age(w['since']))}"
+            lines.append(f"   {_EMOJI.get(w.get('status'), '⚪')} "
+                         f"{esc(w.get('title') or w.get('key'))}{age}")
     lines.append("")
     lines.append("<i>Verificare automată · /selfcheck pentru starea completă</i>")
     return "\n".join(lines)
 
 
 async def _announce(db: Database, cfg: Config, bad: list[CheckResult],
-                    recovered: list[CheckResult]) -> None:
+                    recovered: list[CheckResult],
+                    withdrawn: list[dict] | None = None) -> None:
     state = await _load_state(db)
-    text = format_alert(bad, recovered, state)
+    text = format_alert(bad, recovered, state, withdrawn)
     severity = "critical" if any(r.status == "down" for r in bad) else "high"
 
     await db.execute(

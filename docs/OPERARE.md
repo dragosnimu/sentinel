@@ -211,7 +211,6 @@ Rulează automat la 5 minute și la 90 de secunde după boot. Alertează pe Tele
 | `ingest:*` | Fiecare colector a scris un rând recent. **Asta prinde orbirea** |
 | `detect:cursor` | Detectorul consumă ce scriu colectorii. Ingestia într-o tabelă pe care n-o citește nimeni e o imitație convingătoare de funcționare |
 | `nft:table`, `nft:count` | Kernelul chiar are tabela, iar baza spune același lucru ca el |
-| `nft:allowlist` | Adresa ta de administrare e încă acolo |
 | `executor:socket` | Singura componentă privilegiată răspunde |
 | `code:current` | Serviciile rulează codul instalat, nu pe cel dinaintea ultimului deploy |
 | `alert:telegram` | Canalul care duce toate celelalte alerte chiar livrează |

@@ -49,7 +49,13 @@ async def _main(quiet: bool, print_all: bool) -> int:
         summary = await run_and_alert(db, cfg, quiet=quiet)
         # WARNING rather than INFO when something is wrong, so the operator's
         # `journalctl -p warning` shows it without knowing to look for it.
-        if summary["bad"]:
+        #
+        # `incomplete` counts as wrong. A run where a check group raised finds
+        # no faults BECAUSE it did not look, and `worst()` ranks `unknown` above
+        # `degraded`, so the exit code is 0. Logging that as "selfcheck clean"
+        # put the one word the operator greps for on the one run that proved
+        # nothing — the fact was in `extra`, contradicted by the message.
+        if summary["bad"] or summary["incomplete"]:
             log.warning("selfcheck found problems", extra=summary)
         else:
             log.info("selfcheck clean", extra=summary)

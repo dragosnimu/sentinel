@@ -13,6 +13,7 @@ matter here are about the checks that do not ask systemd.
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -166,16 +167,36 @@ def test_agreement_is_ok(monkeypatch):
     assert next(r for r in results if r.key == "nft:count").status == "ok"
 
 
-def test_the_admin_address_missing_from_the_allowlist_is_flagged(monkeypatch):
-    """The anti-lockout invariant, checked rather than assumed."""
-    monkeypatch.setattr(checks, "_nft_table_present",
-                        lambda: (True, "table inet sentinel { }"))
-    from sentinel.respond import actions
-    monkeypatch.setattr(actions, "live_count", _async(0))
-    cfg = _cfg(response=SimpleNamespace(
-        auto_block=SimpleNamespace(enabled=True), admin_ip="203.0.113.7"))
-    results = run(checks.check_enforcement(_DB(val=0), cfg))
-    assert any(r.key == "nft:allowlist" and r.bad for r in results)
+# Aici a stat `test_the_admin_address_missing_from_the_allowlist_is_flagged`,
+# cu docstring-ul „The anti-lockout invariant, checked rather than assumed."
+# Era presupus: verificarea citea `cfg.response.admin_ip`, câmp pe care
+# `ResponseConfig` nu-l are, deci cheia `nft:allowlist` nu s-a emis niciodată în
+# producție. Testul trecea fiindcă își fabrica un `SimpleNamespace(admin_ip=…)`
+# pe care `Config`-ul real nu-l poate produce — un test verde peste cod mort,
+# exact tiparul „aserțiune pe prezența unui nume, nu pe decizia luată din el".
+#
+# Verificarea a fost scoasă (vezi comentariul din `check_enforcement`), deci și
+# testul. Testul de mai jos păzește ce a mai rămas: că un `Config` real chiar nu
+# poate produce cheia — ca nimeni să nu reintroducă garda fără câmp.
+def test_no_check_reads_a_config_field_that_does_not_exist():
+    """Un `getattr(cfg.x, "y", None)` pe un câmp inexistent nu dă eroare: dă
+    `None`, iar verificarea din spatele lui nu rulează niciodată. Așa a stat
+    invariantul anti-lockout, nerulat și necontestat, cu un test verde peste el.
+
+    Fiecare câmp de configurație citit de verificări trebuie să existe pe
+    dataclass-ul real, nu doar pe obiectul fabricat de teste."""
+    import inspect
+
+    from sentinel.config import Config, ResponseConfig
+
+    src = inspect.getsource(checks)
+    for attr in re.findall(r"getattr\(\s*cfg\.response\s*,\s*[\"'](\w+)[\"']", src):
+        assert hasattr(ResponseConfig(), attr), \
+            f"check_enforcement citește response.{attr}, care nu există în ResponseConfig"
+    # Și câmpul mort anume, ca reintroducerea lui să pice aici.
+    assert not hasattr(ResponseConfig(), "admin_ip"), \
+        "admin_ip a fost adăugat — atunci verificarea allowlist trebuie rescrisă și testată"
+    assert hasattr(Config(), "response")
 
 
 # --- the detection loop -----------------------------------------------------
@@ -318,6 +339,473 @@ def _async(value):
     async def _f(*a, **k):
         return value
     return _f
+
+
+# --- o constatare pe care nimeni n-o mai calculează -------------------------
+#
+# Pe 9 august 2026, la 07:00, toate sursele au tăcut și `ingest:all` s-a scris cu
+# `down`. La 08:25 și-au revenit, deci verificarea a încetat s-o mai emită — și
+# nimic nu împăca tabela de stare cu ce emisese rularea. Botul i-a arătat
+# operatorului „🔴 Sentinel nu funcționează complet" încă 26 de ore, peste 317
+# rulări verzi consecutive, cu vechimea rândului blocat prezentată drept durata
+# unei pene.
+#
+# Testele de mai jos rulează scenariul real: cheia apare cu `down`, dispare din
+# rularea următoare, iar operatorul trebuie să vadă verde. Și scenariul invers:
+# aceeași cheie dispare fiindcă rularea s-a întrerupt, caz în care starea ei NU
+# are voie să fie curățată.
+class _StateDB:
+    """`selfcheck_state` și `selfcheck_runs`, cât să se poată juca mai multe rulări.
+
+    Reimplementează în Python semantica instrucțiunilor SQL — deci dovedește
+    logica runner-ului, nu SQL-ul însuși. Ce nu poate arăta fișierul ăsta:
+    dacă PostgreSQL acceptă `NOT (key = ANY($1::text[]))` și dacă migrația 0021
+    se aplică. Alea se verifică pe o bază reală.
+    """
+
+    def __init__(self):
+        self.state: dict[str, dict] = {}
+        self.runs: list[dict] = []
+        self.notifications: list[str] = []
+        self.sql: list[tuple[str, tuple]] = []
+
+    def _now(self):
+        return datetime.now(timezone.utc)
+
+    async def fetch(self, sql, *a):
+        self.sql.append((sql, a))
+        if "FROM selfcheck_state" in sql:
+            return [dict(v) for v in self.state.values()]
+        if "FROM selfcheck_runs" in sql:      # ORDER BY started_at DESC LIMIT 2
+            return list(reversed(self.runs))[:2]
+        return []
+
+    async def fetchrow(self, sql, *a):
+        self.sql.append((sql, a))
+        if "FROM selfcheck_runs" in sql:
+            return self.runs[-1] if self.runs else None
+        return None
+
+    async def fetchval(self, sql, *a):
+        self.sql.append((sql, a))
+        return 0
+
+    async def execute(self, sql, *a):
+        self.sql.append((sql, a))
+        if "INSERT INTO selfcheck_state" in sql:
+            key, status, title, detail, _facts, keep_since = a
+            old = self.state.get(key)
+            self.state[key] = {
+                "key": key, "status": status, "title": title, "detail": detail,
+                "since": old["since"] if (old and keep_since) else self._now(),
+                "last_seen": self._now(), "stale": False,
+                "last_alert_at": old["last_alert_at"] if old else None,
+            }
+        elif "DELETE FROM selfcheck_state" in sql:
+            keep = set(a[0])
+            for key in [k for k in self.state if k not in keep]:
+                del self.state[key]
+        elif "UPDATE selfcheck_state SET stale" in sql:
+            keep = set(a[0])
+            for key, row in self.state.items():
+                if key not in keep:
+                    row["stale"] = True
+        elif "UPDATE selfcheck_state SET last_alert_at" in sql:
+            for key in a[0]:
+                if key in self.state:
+                    self.state[key]["last_alert_at"] = self._now()
+        elif "INSERT INTO selfcheck_runs" in sql:
+            duration_ms, worst_status, checks_run, checks_bad = a
+            self.runs.append({
+                "started_at": self._now(), "worst_status": worst_status,
+                "checks_run": checks_run, "checks_bad": checks_bad,
+                "duration_ms": duration_ms})
+        elif "INSERT INTO notifications" in sql:
+            self.notifications.append(a[-1])
+
+    async def healthy(self):
+        return True
+
+
+def _outcome(results, failed=()):
+    async def _run_groups(db, cfg):
+        return checks.RunOutcome(list(results), tuple(failed))
+    return _run_groups
+
+
+_LIVE = CheckResult("ingest:suricata", "Colector „suricata”", "ok",
+                    detail="ultimul eveniment acum 1 min")
+_ALL_QUIET = CheckResult("ingest:all", "Toate sursele au amuțit", "down",
+                         detail="cea mai recentă acum 94 min")
+
+
+def _panel(db) -> str:
+    """Ce vede operatorul la /selfcheck, din aceleași rânduri."""
+    pytest.importorskip("telegram")
+    from types import SimpleNamespace as NS
+
+    from sentinel.telegram import views
+
+    sent: list[str] = []
+
+    class _Msg:
+        async def reply_text(self, text, **kw):
+            sent.append(text)
+
+    msg = _Msg()
+    run(views.cmd_selfcheck(NS(effective_message=msg, message=msg),
+                            NS(bot_data={"db": db}, args=[])))
+    return sent[0]
+
+
+def test_a_finding_the_check_stopped_producing_stops_being_red(monkeypatch):
+    """Scenariul real, cap-coadă.
+
+    O cheie condiționată apare cu `down`, condiția dispare, deci verificarea nu
+    o mai emite. Fără reconciliere rândul rămâne `down` pentru totdeauna și
+    panoul îi spune operatorului că agentul de securitate e stricat, cât timp
+    nimeni nu șterge rândul cu mâna. A durat 26 de ore și 317 rulări verzi.
+    """
+    from sentinel.selfcheck import runner
+
+    db = _StateDB()
+
+    monkeypatch.setattr(runner, "run_groups", _outcome([_LIVE, _ALL_QUIET]))
+    run(runner.run_and_alert(db, _cfg()))
+    assert db.state["ingest:all"]["status"] == "down"
+    assert "nu funcționează complet" in _panel(db)
+
+    # Sursele revin: verificarea nu mai are ce emite pentru cheia asta.
+    monkeypatch.setattr(runner, "run_groups", _outcome([_LIVE]))
+    run(runner.run_and_alert(db, _cfg()))
+    assert "ingest:all" not in db.state, "restul rămâne și ține panoul roșu"
+
+    # A treia rulare: operatorul vede verde.
+    summary = run(runner.run_and_alert(db, _cfg()))
+    assert summary["worst"] == "ok"
+    panel = _panel(db)
+    assert "Totul funcționează" in panel
+    assert "Toate sursele au amuțit" not in panel
+
+
+def test_a_key_that_disappears_because_a_feature_was_turned_off_recovers_too(monkeypatch):
+    """`ingest:all` a fost prinsă fiindcă a ținut 26 de ore. Una care se stinge
+    repede ar fi invizibilă — de exemplu `unit:sentinel-ai.service`.
+
+    `check_units` sare peste unitatea AI când `ai.enabled` e fals. Ordinea reală
+    care doare: unitatea intră în `down`, operatorul dezactivează stratul AI ca
+    să oprească zgomotul, cheia nu se mai emite — și panoul rămâne roșu pentru o
+    unitate pe care nimeni n-o mai pornește, la nesfârșit."""
+    from sentinel.selfcheck import runner
+
+    db = _StateDB()
+    other = CheckResult("unit:sentinel-web.service", "Serviciul sentinel-web", "ok")
+    ai_down = CheckResult("unit:sentinel-ai.service", "Serviciul sentinel-ai",
+                          "down", detail="stare: failed · reporniri: 12")
+
+    monkeypatch.setattr(runner, "run_groups", _outcome([other, ai_down]))
+    run(runner.run_and_alert(db, _cfg()))
+    assert "nu funcționează complet" in _panel(db)
+
+    # `ai.enabled = false` — check_units nu mai emite cheia deloc.
+    monkeypatch.setattr(runner, "run_groups", _outcome([other]))
+    run(runner.run_and_alert(db, _cfg()))
+    assert "unit:sentinel-ai.service" not in db.state
+    assert "Totul funcționează" in _panel(db)
+
+
+# --- verificări care nu emit nimic când n-au putut să se uite ---------------
+def test_an_unreadable_install_tree_is_unknown_not_silence(monkeypatch, tmp_path):
+    """`step_package` din install.sh face `rm -rf` apoi `cp -r`, iar timerul de
+    autoverificare bate la 5 minute în tot acest timp. `rglob("*.py")` poate ieși
+    gol sau poate cursa un fișier care dispare.
+
+    Verificarea returna `[]` — nicio cheie, nicio excepție — deci rularea se
+    raporta COMPLETĂ, iar runner-ul ștergea constatarea `code:current` și îi
+    spunea operatorului că nu se mai raportează. Constatarea aia e „servicii
+    rulează cod vechi", adevărată tocmai în minutele din jurul unei instalări."""
+    lib = tmp_path / "lib" / "sentinel"
+    lib.mkdir(parents=True)
+
+    def _explode(*a, **k):
+        raise OSError("No such file or directory")
+
+    monkeypatch.setattr(checks.Path, "rglob", _explode)
+    monkeypatch.setattr(checks, "Path", lambda *a: lib)
+
+    results = run(checks.check_running_code_is_current())
+    assert [r.key for r in results] == ["code:current"]
+    assert results[0].status == "unknown"
+    assert not results[0].bad
+
+
+def test_an_unreadable_proc_stat_is_unknown_not_silence(monkeypatch, tmp_path):
+    """A doua ieșire tăcută din aceeași funcție, pe cealaltă ramură.
+
+    Fără `btime` nu se poate converti momentul pornirii unui serviciu din
+    monotonic în timp real, deci întrebarea „a pornit înainte sau după
+    instalare?" n-are răspuns. Un `return []` aici raporta din nou o rulare
+    completă fără cheia `code:current`, iar constatarea era ștearsă."""
+    import builtins
+
+    lib = tmp_path / "lib" / "sentinel"
+    lib.mkdir(parents=True)
+    (lib / "x.py").write_text("# cod", encoding="utf-8")
+    monkeypatch.setattr(checks, "Path", lambda *a: lib)
+    # Un serviciu chiar a pornit, deci bucla ajunge la citirea lui /proc/stat.
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "123456789")
+
+    real_open = builtins.open
+
+    def _no_proc(path, *a, **k):
+        if str(path) == "/proc/stat":
+            raise OSError("Permission denied")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", _no_proc)
+
+    results = run(checks.check_running_code_is_current())
+    assert [r.key for r in results] == ["code:current"]
+    assert results[0].status == "unknown"
+    assert "/proc/stat" in results[0].detail
+
+
+def test_a_missing_install_tree_stays_silent(monkeypatch, tmp_path):
+    """Singura tăcere rămasă, și singura sigură: pe o gazdă fără arbore instalat
+    cheia nu s-a emis niciodată, deci nu există constatare de retras."""
+    monkeypatch.setattr(checks, "Path", lambda *a: tmp_path / "nu-exista")
+    assert run(checks.check_running_code_is_current()) == []
+
+
+def test_an_unreadable_ruleset_still_reports_the_blocklist_comparison(monkeypatch):
+    """Aceeași regulă, celălalt loc unde se aplica: când regulile nftables nu se
+    pot citi, `check_enforcement` ieșea devreme și nu mai emitea `nft:count`.
+
+    Rularea rămâne completă (nimeni n-a ridicat), deci o constatare adevărată —
+    „blocklistul din bază nu corespunde cu kernelul" — era ștearsă fiindcă
+    verificarea n-a putut să se uite."""
+    monkeypatch.setattr(checks, "_nft_table_present",
+                        lambda: (None, "Operation not permitted"))
+    monkeypatch.setenv("INVOCATION_ID", "test")
+    results = run(checks.check_enforcement(_DB(val=7), _cfg()))
+    keys = {r.key for r in results}
+    assert keys == {"nft:table", "nft:count"}
+    assert all(r.status == "unknown" for r in results)
+    assert all(not r.bad for r in results)
+
+
+def test_the_operator_is_told_the_red_line_is_gone(monkeypatch):
+    """Operatorul a primit „🔴 Toate sursele au amuțit". Dacă nimeni nu-i spune
+    că nu mai e cazul, ultimul mesaj rămâne adevărul lui — iar panoul, reparat,
+    contrazice în tăcere alerta.
+
+    Mesajul spune exact cât se știe: verificarea nu mai produce constatarea. Nu
+    „revenit la normal" — o cheie poate dispărea și fiindcă verificarea nu o mai
+    acoperă (o unitate dezactivată în config, o sursă ieșită din fereastra de 30
+    de zile), iar diferența nu se poate stabili de aici."""
+    from sentinel.selfcheck import runner
+
+    db = _StateDB()
+    monkeypatch.setattr(runner, "run_groups", _outcome([_LIVE, _ALL_QUIET]))
+    run(runner.run_and_alert(db, _cfg()))
+    db.notifications.clear()
+
+    monkeypatch.setattr(runner, "run_groups", _outcome([_LIVE]))
+    summary = run(runner.run_and_alert(db, _cfg()))
+
+    assert summary["withdrawn"] == ["ingest:all"]
+    assert db.notifications, "nimeni nu i-a spus operatorului"
+    text = db.notifications[-1]
+    assert "Toate sursele au amuțit" in text
+    assert "Nu se mai raportează" in text
+    assert "Revenit la normal" not in text, "afirmă mai mult decât se știe"
+
+
+def test_a_withdrawn_ok_row_is_not_announced(monkeypatch):
+    """Un rând care era deja verde și dispare nu e o veste. Un mesaj pentru
+    fiecare non-eveniment e felul în care canalul ajunge să nu mai fie citit."""
+    from sentinel.selfcheck import runner
+
+    db = _StateDB()
+    extra = CheckResult("unit:sentinel-ai.service", "Serviciul sentinel-ai", "ok")
+    monkeypatch.setattr(runner, "run_groups", _outcome([_LIVE, extra]))
+    run(runner.run_and_alert(db, _cfg()))
+    db.notifications.clear()
+
+    monkeypatch.setattr(runner, "run_groups", _outcome([_LIVE]))
+    summary = run(runner.run_and_alert(db, _cfg()))
+    assert "unit:sentinel-ai.service" not in db.state
+    assert summary["withdrawn"] == []
+    assert not db.notifications
+
+
+def test_an_interrupted_run_does_not_clean_up_state(monkeypatch):
+    """Celălalt sens al aceleiași greșeli. O cheie poate lipsi dintr-o rulare și
+    fiindcă grupul care o produce a crăpat — atunci ștergerea ar transforma o
+    verificare stricată într-un buletin de sănătate curat. Exact schimbul pe
+    care întreg pachetul ăsta există ca să-l împiedice."""
+    from sentinel.selfcheck import runner
+
+    db = _StateDB()
+    monkeypatch.setattr(runner, "run_groups", _outcome([_LIVE, _ALL_QUIET]))
+    run(runner.run_and_alert(db, _cfg()))
+    db.notifications.clear()
+
+    # Grupul „ingest" crapă: nu emite nicio cheie a lui, doar propriul eșec.
+    broken = CheckResult("selfcheck:ingest", "Verificarea „ingest” a eșuat", "unknown",
+                         detail="connection reset")
+    monkeypatch.setattr(runner, "run_groups", _outcome([broken], failed=("ingest",)))
+    summary = run(runner.run_and_alert(db, _cfg()))
+
+    assert "ingest:all" in db.state, "starea a fost curățată de o rulare incompletă"
+    assert db.state["ingest:all"]["status"] == "down"
+    assert db.state["ingest:all"]["stale"] is True
+    assert summary["withdrawn"] == []
+    assert summary["incomplete"] == ["ingest"]
+    assert not db.notifications, "o rulare întreruptă nu anunță nicio revenire"
+
+
+def test_a_kept_row_is_shown_as_a_finding_not_as_an_outage(monkeypatch):
+    """„de 27h 54m" lângă un titlu care descrie o pană curentă se citește ca
+    durata penei. Era vechimea rândului blocat.
+
+    Un rând păstrat peste o rulare întreruptă e ultima constatare cunoscută, nu
+    starea de acum, iar panoul trebuie să spună asta cu cuvinte."""
+    from sentinel.selfcheck import runner
+
+    db = _StateDB()
+    monkeypatch.setattr(runner, "run_groups", _outcome([_LIVE, _ALL_QUIET]))
+    run(runner.run_and_alert(db, _cfg()))
+
+    broken = CheckResult("selfcheck:ingest", "Verificarea „ingest” a eșuat", "unknown")
+    monkeypatch.setattr(runner, "run_groups", _outcome([broken], failed=("ingest",)))
+    run(runner.run_and_alert(db, _cfg()))
+
+    panel = _panel(db)
+    assert "Neevaluate la ultima rulare" in panel
+    assert "constatare veche de" in panel
+    assert "ultima constatare, nu starea de acum" in panel
+    # Nu dispare din verdict: ultimul lucru știut e că era stricat.
+    assert "nu funcționează complet" in panel
+    # Iar verificarea care a crăpat e vizibilă, nu tăcută.
+    assert "a eșuat" in panel
+
+
+def test_the_next_complete_run_finally_clears_what_the_crash_preserved(monkeypatch):
+    """Altfel „păstrează la rulare incompletă" ar fi doar o altă cale către un
+    rând care nu moare niciodată."""
+    from sentinel.selfcheck import runner
+
+    db = _StateDB()
+    monkeypatch.setattr(runner, "run_groups", _outcome([_LIVE, _ALL_QUIET]))
+    run(runner.run_and_alert(db, _cfg()))
+    broken = CheckResult("selfcheck:ingest", "Verificarea „ingest” a eșuat", "unknown")
+    monkeypatch.setattr(runner, "run_groups", _outcome([broken], failed=("ingest",)))
+    run(runner.run_and_alert(db, _cfg()))
+    assert db.state["ingest:all"]["stale"] is True
+
+    monkeypatch.setattr(runner, "run_groups", _outcome([_LIVE]))
+    run(runner.run_and_alert(db, _cfg()))
+    assert "ingest:all" not in db.state
+    assert "Totul funcționează" in _panel(db)
+
+
+def test_a_run_that_produced_nothing_deletes_nothing(monkeypatch):
+    """Zero rezultate nu e dovadă că totul e în regulă, e dovadă că nimic n-a
+    rulat. Reconcilierea pe o listă goală ar goli toată tabela — versiunea cea
+    mai zgomotoasă a bug-ului pe care fișierul ăsta îl repară."""
+    from sentinel.selfcheck import runner
+
+    db = _StateDB()
+    monkeypatch.setattr(runner, "run_groups", _outcome([_LIVE, _ALL_QUIET]))
+    run(runner.run_and_alert(db, _cfg()))
+
+    monkeypatch.setattr(runner, "run_groups", _outcome([]))
+    run(runner.run_and_alert(db, _cfg()))
+    assert set(db.state) == {"ingest:suricata", "ingest:all"}
+
+
+def test_a_crashed_group_is_named_by_the_run(monkeypatch):
+    """Reconcilierea se sprijină pe „rularea a văzut tot". Dacă `run_groups` ar
+    raporta o rulare crăpată drept completă, ștergerea ar porni exact în cazul
+    în care nu are voie."""
+    async def _boom(db, cfg):
+        raise RuntimeError("nft exploded")
+
+    monkeypatch.setattr(checks, "CHECKS", (("enforcement", _boom),
+                                           ("autonomy", checks.check_autonomy)))
+    outcome = run(checks.run_groups(_DB(), _cfg()))
+    assert outcome.failed_groups == ("enforcement",)
+    assert outcome.complete is False
+    assert any(r.key == "mode:autoblock" for r in outcome.results), "rularea s-a oprit"
+
+    monkeypatch.setattr(checks, "CHECKS", (("autonomy", checks.check_autonomy),))
+    assert run(checks.run_groups(_DB(), _cfg())).complete is True
+
+
+def _service_log(monkeypatch, summary):
+    """Rulează `sentinel selfcheck` cu un rezumat dat și întoarce (nivel, mesaj)."""
+    from sentinel.services import selfcheck_service as svc
+
+    class _FakeDB:
+        def __init__(self, *a, **k):
+            pass
+
+        async def connect(self):
+            pass
+
+        async def close(self):
+            pass
+
+    async def _fake_run(db, cfg, *, quiet=False):
+        return summary
+
+    seen: list[tuple[str, str]] = []
+    monkeypatch.setattr(svc, "get_config", lambda: _cfg())
+    monkeypatch.setattr(svc, "Database", _FakeDB)
+    monkeypatch.setattr(svc, "run_and_alert", _fake_run)
+    monkeypatch.setattr(svc.log, "warning", lambda m, **k: seen.append(("warning", m)))
+    monkeypatch.setattr(svc.log, "info", lambda m, **k: seen.append(("info", m)))
+    run(svc._main(True, False))
+    return seen
+
+
+_CLEAN = {"worst": "ok", "checks": 33, "bad": [], "new": [], "recovered": [],
+          "withdrawn": [], "incomplete": [], "duration_ms": 710}
+
+
+def test_an_incomplete_run_is_not_logged_as_clean(monkeypatch):
+    """O rulare în care un grup a crăpat nu găsește defecte fiindcă nu s-a
+    uitat, iar `worst()` clasează `unknown` deasupra lui `degraded`, deci codul
+    de ieșire e 0 și systemd e mulțumit.
+
+    Se loga „selfcheck clean", la INFO — exact cuvântul pe care operatorul îl
+    caută, pus pe singura rulare care n-a dovedit nimic, invizibilă la
+    `journalctl -p warning`."""
+    seen = _service_log(monkeypatch, {**_CLEAN, "worst": "unknown",
+                                      "incomplete": ["enforcement"]})
+    assert seen == [("warning", "selfcheck found problems")]
+
+
+def test_a_complete_clean_run_is_still_logged_as_clean(monkeypatch):
+    """Reversul: dacă ORICE rulare s-ar loga ca problemă, avertismentul n-ar mai
+    însemna nimic."""
+    assert _service_log(monkeypatch, _CLEAN) == [("info", "selfcheck clean")]
+
+
+def test_a_timer_whose_state_cannot_be_read_stays_on_the_list(monkeypatch):
+    """`systemctl` care nu răspunde (lipsă, eroare, timeout de 10s) returnează
+    un șir gol. Verificarea sărea peste cheie — iar de când o cheie absentă
+    dintr-o rulare completă e ștearsă, o singură sondă lentă ar retrage o
+    constatare `down` și i-ar spune operatorului că nu mai e raportată.
+
+    „Nu se știe" și „e bine" sunt stări diferite."""
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "")
+    results = run(checks.check_timers(_cfg()))
+    assert results, "timerele au dispărut din rulare"
+    assert {r.status for r in results} == {"unknown"}
+    assert all(not r.bad for r in results)
+    assert "nu am putut citi" in results[0].detail
 
 
 # --- the unit ---------------------------------------------------------------

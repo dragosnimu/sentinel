@@ -41,9 +41,12 @@ _UNVERIFIABLE = "<construit dinamic>"
 def _command_names() -> list[tuple[str, int]]:
     """Fiecare nume care ajunge la `CommandHandler`, cu linia lui.
 
-    Două surse, fiindcă una singură se poate ocoli:
+    Trei surse, fiindcă una singură se poate ocoli:
 
-    * tabelele `(("nume", "alias"), handler)` — forma obişnuită;
+    * rândurile `Command(("nume", "alias"), handler, "descriere")` — forma de
+      azi, de când din acelaşi tabel se derivă şi meniul publicat la Telegram;
+    * tabelele `(("nume", "alias"), handler)` — forma dinaintea meniului,
+      păstrată fiindcă o revenire la ea nu trebuie să lase testul orb;
     * orice `CommandHandler("nume", ...)` scris direct, oriunde în fişier.
 
     A doua a fost adăugată după ce un verificator a demonstrat că o comandă
@@ -57,6 +60,21 @@ def _command_names() -> list[tuple[str, int]]:
     tree = ast.parse(BOT.read_text(encoding="utf-8"), filename=str(BOT))
     found: list[tuple[str, int]] = []
     for node in ast.walk(tree):
+        # Rândurile `Command((nume...), handler, descriere)`.
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "Command"):
+            names = next((k.value for k in node.keywords if k.arg == "names"),
+                         node.args[0] if node.args else None)
+            if isinstance(names, (ast.Tuple, ast.List, ast.Set)):
+                for elt in names.elts:
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        found.append((elt.value, elt.lineno))
+                    else:
+                        # Acelaşi motiv ca mai jos: un nume care nu se poate citi
+                        # static nu se poate declara corect.
+                        found.append((_UNVERIFIABLE, node.lineno))
+            else:
+                found.append((_UNVERIFIABLE, node.lineno))
         # Tabelele: o listă de tupluri (tuplu_de_nume, handler).
         if isinstance(node, ast.Tuple) and len(node.elts) == 2:
             names, _handler = node.elts

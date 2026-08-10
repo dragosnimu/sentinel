@@ -280,14 +280,19 @@ def test_patch_failures_are_flagged_as_unmutable():
 # --- the command ------------------------------------------------------------
 def test_mute_is_registered_with_an_unmute_escape_hatch():
     pytest.importorskip("telegram")
-    import inspect
 
     from sentinel.telegram import bot
-    src = inspect.getsource(bot.build_application)
-    # Registered from the alias table rather than one call per command, so the
-    # assertion is on the table.
-    assert '("mute", "liniste")' in src
-    assert '("unmute",)' in src
+    # Se citea textul sursă al lui `build_application`, unde stătea tabelul. De
+    # când din același tabel se derivă și meniul publicat la Telegram, tabelul e
+    # la nivel de modul — deci aserțiunea e pe structură, care e și ce se
+    # înregistrează de fapt.
+    names = {n for c in bot.COMMANDS for n in c.names}
+    assert {"mute", "liniste", "unmute"} <= names
+
+    # Și în meniu, amândouă: o liniște pe care operatorul o poate seta dintr-un
+    # meniu, fără să vadă acolo și cum se oprește, e o capcană.
+    published = {c.command for c in bot.menu_commands()}
+    assert {"mute", "unmute"} <= published
 
 
 def test_unmute_clears_both_mechanisms():

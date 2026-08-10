@@ -363,6 +363,29 @@ sudo systemctl start sentinel-selfcheck
 Trece dacă mesajul sosește **oricum**, marcat „trimis direct de autoverificare".
 Un mesaj despre un bot mort, pus în coada acelui bot, nu ajunge nicăieri.
 
+**O constatare care încetează să mai fie emisă.** Verificările condiționate —
+`ingest:all`, `unit:sentinel-ai.service` — există doar cât timp
+condiția lor e adevărată. Când dispar, rândul lor trebuie să dispară cu ele:
+
+```bash
+# Plantează un rest exact ca cel care a ținut panoul roșu 26 de ore
+sudo -u postgres psql -d sentinel -c "INSERT INTO selfcheck_state (key, status, title, since, last_seen) VALUES ('ingest:all','down','Toate sursele au amuțit', now() - interval '27 hours', now() - interval '27 hours')"
+sudo systemctl start sentinel-selfcheck
+sudo -u postgres psql -d sentinel -c "SELECT key, status, stale FROM selfcheck_state WHERE key='ingest:all'"
+```
+
+Trece dacă: rândul **nu mai există** după rulare, `/selfcheck` arată verde, iar
+numărul din antet e egal cu numărul de rânduri afișate. Nu trece dacă rândul
+rămâne cu `down`, oricâte rulări verzi ar fi în `selfcheck_runs` — asta e exact
+defectul.
+
+Și invers, o rulare întreruptă nu are voie să curețe nimic. Rupe un grup de
+verificări (de exemplu oprind PostgreSQL pentru interogarea de ingest e prea
+brutal; mai curat e din teste), și confirmă că rândul supraviețuiește cu
+`stale = true`, iar `/selfcheck` îl arată sub „Neevaluate la ultima rulare", cu
+vechimea numită **constatare**, nu pană. Un rând șters fiindcă verificarea a
+crăpat e o verificare stricată transformată într-un buletin de sănătate curat.
+
 ### 11.2 Recuperarea după repornire
 
 ```bash

@@ -15,6 +15,23 @@ happened looks identical to a host where nothing is being watched, and the only
 way to tell them apart from the inside is to compare sources against each other.
 A collector that has gone quiet while its neighbours keep writing is broken. All
 of them quiet together is a quiet night.
+
+## Emitting nothing is a statement, and it is not "fine"
+
+Many keys here are conditional: `ingest:all` exists only while every source is
+silent, `ingest:any` only while nothing has been collected at all, `unit:…ai`
+only while the AI layer is configured, `res:disk:/x` only while that mount
+exists. The runner reconciles `selfcheck_state` against the keys a run emits, so
+a key absent from a run is treated as a finding the check withdrew.
+
+That makes "I did not emit this key" a load-bearing claim, and it must only ever
+mean *the check looked and had nothing to report* — never *the check could not
+look*. A check that returns nothing because a probe failed would have its own
+previous finding deleted, and the operator would be shown a recovery that never
+happened. When a check cannot read what it needs, it emits `unknown`; it does
+not fall silent. (`ingest:{source}` has one honest gap left: a source that goes
+quiet for more than the 30-day window drops out of the query altogether. Worth
+knowing about before extending that window's use.)
 """
 
 from __future__ import annotations
@@ -123,7 +140,18 @@ async def check_timers(cfg: Config) -> list[CheckResult]:
                  "sentinel-selfcheck.timer"):
         state = await asyncio.to_thread(_systemctl, "is-active", unit)
         if not state:
-            continue  # systemd not reachable; check_units already said so
+            # An empty answer means `systemctl` is missing, errored, or timed
+            # out — not that the timer is fine. This used to `continue`, on the
+            # grounds that check_units reports the same outage anyway. Dropping
+            # the key is no longer free: the runner reconciles state against the
+            # keys a run emits, so a timer that was `down` and then vanished for
+            # one flaky probe would be deleted and reported as no longer a
+            # finding. One slow `systemctl` must not produce a recovery.
+            results.append(CheckResult(
+                f"timer:{unit}", f"Timerul {unit}", "unknown",
+                detail="nu am putut citi starea — systemctl nu a răspuns",
+                action=f"systemctl list-timers {unit}"))
+            continue
         if state != "active":
             results.append(CheckResult(
                 f"timer:{unit}", f"Timerul {unit}", "down",
@@ -327,17 +355,27 @@ async def check_enforcement(db: Database, cfg: Config) -> list[CheckResult]:
         # already correct wastes the trip. An operator who is sent chasing a
         # non-problem twice stops reading the output.
         under_systemd = bool(os.environ.get("INVOCATION_ID"))
-        return [CheckResult(
-            "nft:table", "Nu pot citi regulile nftables", "unknown",
-            detail=(f"{detail} — nu știu dacă blocarea funcționează sau nu"
-                    + ("" if under_systemd else
-                       ". Rulat manual, deci fără capabilitatea pe care i-o dă "
-                       "unitatea — nu e neapărat o problemă de configurare")),
-            action=("Verificarea are nevoie de CAP_NET_ADMIN: "
-                    "systemctl show sentinel-selfcheck -p AmbientCapabilities"
-                    if under_systemd else
-                    "Rulează verificarea prin systemd, care acordă capabilitatea: "
-                    "systemctl start sentinel-selfcheck && journalctl -u sentinel-selfcheck -n 40"))]
+        return [
+            CheckResult(
+                "nft:table", "Nu pot citi regulile nftables", "unknown",
+                detail=(f"{detail} — nu știu dacă blocarea funcționează sau nu"
+                        + ("" if under_systemd else
+                           ". Rulat manual, deci fără capabilitatea pe care i-o dă "
+                           "unitatea — nu e neapărat o problemă de configurare")),
+                action=("Verificarea are nevoie de CAP_NET_ADMIN: "
+                        "systemctl show sentinel-selfcheck -p AmbientCapabilities"
+                        if under_systemd else
+                        "Rulează verificarea prin systemd, care acordă capabilitatea: "
+                        "systemctl start sentinel-selfcheck && journalctl -u sentinel-selfcheck -n 40")),
+            # Emis, nu omis. Fără el, o rulare care n-a putut citi regulile ar
+            # raporta o rulare COMPLETĂ fără cheia asta, iar runner-ul ar șterge
+            # o constatare „blocklistul nu corespunde cu kernelul" adevărată și
+            # nereparată, spunându-i operatorului că nu se mai raportează.
+            CheckResult(
+                "nft:count", "Nu pot compara blocklistul cu kernelul", "unknown",
+                detail="fără regulile nftables nu știu câte adrese ține de fapt kernelul",
+                action="systemctl show sentinel-selfcheck -p AmbientCapabilities"),
+        ]
     if not present:
         return [CheckResult(
             "nft:table", "Tabela nftables lipsește", "down",
@@ -347,13 +385,26 @@ async def check_enforcement(db: Database, cfg: Config) -> list[CheckResult]:
 
     results = [CheckResult("nft:table", "Tabela nftables", "ok", detail="prezentă")]
 
-    # The anti-lockout invariant, checked rather than assumed.
-    admin = getattr(cfg.response, "admin_ip", None) or ""
-    if admin and admin not in detail:
-        results.append(CheckResult(
-            "nft:allowlist", "Adresa ta de administrare nu e în allowlist", "degraded",
-            detail=f"{admin} lipsește din setul allowlist — te poți bloca singur afară",
-            action=f"sentinel allow {admin}"))
+    # AICI A STAT `nft:allowlist`, „invariantul anti-lockout, verificat nu
+    # presupus". Nu a rulat niciodată. Citea `cfg.response.admin_ip` printr-un
+    # `getattr(..., None)`, iar `ResponseConfig` n-are câmpul — deci garda era
+    # întotdeauna falsă, cheia nu s-a emis niciodată, și acțiunea propusă,
+    # `sentinel allow <ip>`, e o comandă care nu există în CLI. Trei straturi de
+    # ficțiune, dintre care testul verifica doar unul: își construia un
+    # `SimpleNamespace(admin_ip=...)` pe care `Config`-ul real nu-l poate
+    # produce, deci trecea verde peste cod mort.
+    #
+    # Scos, nu reparat, și scos deliberat într-o schimbare care NU e despre el.
+    # Adresa de administrare chiar ajunge în configurație — `install.sh:631-635`
+    # o pune ca prima intrare în `response.extra_allowlist` — deci o verificare
+    # reală există și merită scrisă: compară `cfg.response.extra_allowlist` cu
+    # setul din kernel. Ce o face muncă de sine stătătoare e potrivirea: setul
+    # are `flags interval`, deci nftables normalizează și îmbină elementele, iar
+    # un `x in text` naiv trece pentru `192.168.1.1` când în set e
+    # `192.168.1.10`. Fals-OK pe exact invariantul care ține operatorul afară
+    # din propriul server e mai rău decât nicio verificare — și e ce era aici.
+    #
+    # Până atunci, invariantul se verifică cu ochii, prin docs/TESTARE.md §11.2.
 
     # Kernel vs database. They should agree; when they do not, one of them is
     # lying about who is blocked, and averaging that away is how it stays hidden.
@@ -513,11 +564,27 @@ async def check_running_code_is_current() -> list[CheckResult]:
     """
     lib = Path("/opt/sentinel/lib/sentinel")
     if not lib.exists():
+        # The ONLY silent exit left in this function, and the only one that is
+        # safe: on a host with no installed tree this check has never emitted
+        # `code:current`, so there is no finding for the runner to withdraw. The
+        # two below are different — there the key exists and the probe failed.
         return []
     try:
         code_mtime = max(p.stat().st_mtime for p in lib.rglob("*.py"))
     except (OSError, ValueError):
-        return []
+        # `step_package` in install.sh does `rm -rf` then `cp -r`, so during a
+        # deploy this glob can come back empty (ValueError) or race a file that
+        # disappears mid-stat (OSError) — and the timer keeps firing every five
+        # minutes throughout. Returning [] here reported a COMPLETE run that had
+        # simply not looked, so the runner deleted the `code:current` row and
+        # told the operator the finding was no longer reported. Those are the
+        # exact minutes around a deploy, which are exactly the minutes when
+        # "services are running old code" is true.
+        return [CheckResult(
+            "code:current", "Nu pot citi codul instalat", "unknown",
+            detail="fișierele din /opt/sentinel/lib se schimbau în timpul citirii "
+                   "— nu știu dacă serviciile rulează versiunea instalată",
+            action="Reia verificarea după instalare: systemctl start sentinel-selfcheck")]
 
     stale: list[str] = []
     for unit in SYSTEMD_UNITS:
@@ -530,7 +597,11 @@ async def check_running_code_is_current() -> list[CheckResult]:
             with open("/proc/stat") as fh:
                 btime = next(int(l.split()[1]) for l in fh if l.startswith("btime"))
         except (OSError, StopIteration):
-            return []
+            return [CheckResult(
+                "code:current", "Nu pot citi momentul pornirii sistemului", "unknown",
+                detail="/proc/stat nu a putut fi citit — fără el nu pot spune dacă "
+                       "serviciile au pornit înainte sau după ultima instalare",
+                action="cat /proc/stat | grep btime")]
         started_at = btime + int(started) / 1_000_000
         if code_mtime > started_at + 5:
             stale.append(unit)
@@ -577,15 +648,41 @@ CHECKS: tuple[tuple[str, Callable], ...] = (
 )
 
 
-async def run_all(db: Database, cfg: Config) -> list[CheckResult]:
+@dataclass(frozen=True)
+class RunOutcome:
+    """What a pass produced — and whether it produced all of it.
+
+    The second field is the one that matters. The runner reconciles
+    `selfcheck_state` against the keys a run emitted, and that is only sound if
+    "this key is missing" means the check withdrew it. A group that raised
+    emitted none of its keys for a reason that has nothing to do with the host,
+    so an incomplete run must reconcile nothing: deleting a finding because the
+    code that produces it crashed would turn a broken check into a clean bill of
+    health — the exact swap this whole package exists to prevent.
+    """
+
+    results: list[CheckResult]
+    failed_groups: tuple[str, ...] = ()
+
+    @property
+    def complete(self) -> bool:
+        return not self.failed_groups
+
+
+async def run_groups(db: Database, cfg: Config) -> RunOutcome:
     """Every check, each isolated.
 
     A check that raises reports itself as broken and the run continues. The
     alternative — one exception ending the run — would mean the self-check goes
     quiet for the same reason everything else does, and quiet is the thing it
     exists to make impossible.
+
+    The group is also named in `failed_groups`, because "the run continued" and
+    "the run saw everything" are different facts and only the caller can act on
+    the difference.
     """
     out: list[CheckResult] = []
+    failed: list[str] = []
     for name, fn in CHECKS:
         try:
             sig = fn.__code__.co_varnames[:fn.__code__.co_argcount]
@@ -596,12 +693,18 @@ async def run_all(db: Database, cfg: Config) -> list[CheckResult]:
                 args.append(cfg)
             out.extend(await fn(*args))
         except Exception as exc:  # noqa: BLE001
+            failed.append(name)
             log.error("selfcheck group failed", extra={"group": name, "detail": str(exc)})
             out.append(CheckResult(
                 f"selfcheck:{name}", f"Verificarea „{name}” a eșuat", "unknown",
                 detail=str(exc)[:200],
                 action="Verificarea însăși e stricată — asta trebuie reparat întâi"))
-    return out
+    return RunOutcome(out, tuple(failed))
+
+
+async def run_all(db: Database, cfg: Config) -> list[CheckResult]:
+    """The results alone, for callers that only print them (`--print`)."""
+    return (await run_groups(db, cfg)).results
 
 
 def since(moment: datetime | None) -> timedelta | None:

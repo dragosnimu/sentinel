@@ -398,46 +398,103 @@ async def cmd_selfcheck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     nftables and the executor, and letting a chat message trigger all of that on
     demand is a way to turn a curious operator into load. The timer runs every
     five minutes, so the answer is never stale enough to matter.
+
+    **One source.** The verdict, the count and every line below come from
+    `selfcheck_state`; `selfcheck_runs` supplies only the timestamp and the
+    duration — it dates the answer, it does not give it. This screen used to
+    take "33 verificări" from the runs table and the red line from the state
+    table, and the two disagreed for 26 hours: the state table still held a
+    finding that no run had produced since the previous morning. The runner now
+    reconciles that table after every complete run, so counting the rows shown
+    here is the same number the run produced, by construction rather than by
+    coincidence.
+
+    A row that survived an INCOMPLETE run is marked `stale` and shown apart. Its
+    age is the age of the FINDING, said in those words — an old row presented
+    with a bare "· de 27h 54m" next to a headline about a current outage reads
+    as the length of the outage, and it is not.
     """
     db: Database = context.bot_data["db"]
 
-    run = await db.fetchrow(
+    # Two runs, for one reason: to notice that the number of checks dropped.
+    # A conditional key can stop being emitted because a source fell out of the
+    # collector's 30-day window, and if that key was `ok` nothing announces it —
+    # the panel just quietly counts one fewer check than yesterday. That is
+    # silent loss of coverage, and a panel that counts something different from
+    # one day to the next has to say so.
+    runs = await db.fetch(
         "SELECT started_at, worst_status, checks_run, checks_bad, duration_ms "
-        "FROM selfcheck_runs ORDER BY started_at DESC LIMIT 1")
-    if run is None:
+        "FROM selfcheck_runs ORDER BY started_at DESC LIMIT 2")
+    if not runs:
         await _reply(update, "Autoverificarea nu a rulat încă.\n"
                              "<code>systemctl start sentinel-selfcheck</code>")
         return
+    run = runs[0]
 
     rows = await db.fetch(
-        "SELECT key, status, title, detail, since FROM selfcheck_state "
+        "SELECT key, status, title, detail, since, stale FROM selfcheck_state "
         "ORDER BY CASE status WHEN 'down' THEN 0 WHEN 'degraded' THEN 1 "
         "WHEN 'unknown' THEN 2 ELSE 3 END, key")
+    if not rows:
+        # A run without a single recorded check is not "everything is fine".
+        await _reply(update, "⚪ <b>Nu știu dacă Sentinel funcționează</b>\n"
+                             "Ultima rulare nu a lăsat nicio verificare în stare.\n"
+                             "<code>journalctl -u sentinel-selfcheck -n 50</code>")
+        return
 
     emoji = {"down": "🔴", "degraded": "🟡", "ok": "🟢", "unknown": "⚪"}
     age_min = int((_now() - run["started_at"]).total_seconds() // 60)
-    bad = [r for r in rows if r["status"] in ("down", "degraded")]
 
-    head = ("🟢 <b>Totul funcționează</b>" if not bad else
-            "🔴 <b>Sentinel nu funcționează complet</b>"
-            if any(r["status"] == "down" for r in bad) else
-            "🟡 <b>Sentinel funcționează degradat</b>")
-    lines = [
-        head,
-        f"<i>{run['checks_run']} verificări · ultima rulare acum {age_min} min "
-        f"· {run['duration_ms']} ms</i>",
-    ]
+    current = [r for r in rows if not r["stale"]]
+    stale = [r for r in rows if r["stale"]]
+    bad = [r for r in current if r["status"] in ("down", "degraded")]
+    unsure = [r for r in current if r["status"] == "unknown"]
+    ok_rows = [r for r in current if r["status"] == "ok"]
 
-    if bad:
+    # A finding kept from an incomplete run still counts against the verdict:
+    # the last thing known about it was that it was broken, and not having
+    # re-checked is not evidence to the contrary.
+    verdict_rows = bad + [r for r in stale if r["status"] in ("down", "degraded")]
+    if any(r["status"] == "down" for r in verdict_rows):
+        head = "🔴 <b>Sentinel nu funcționează complet</b>"
+    elif verdict_rows:
+        head = "🟡 <b>Sentinel funcționează degradat</b>"
+    elif unsure or stale:
+        head = "⚪ <b>Sentinel pare în regulă, dar nu tot s-a putut verifica</b>"
+    else:
+        head = "🟢 <b>Totul funcționează</b>"
+
+    count = f"<i>{len(current)} verificări · ultima rulare acum {age_min} min " \
+            f"· {run['duration_ms']} ms"
+    if stale:
+        count += f" · {len(stale)} neevaluate"
+    lines = [head, count + "</i>"]
+
+    previous_count = int(runs[1]["checks_run"]) if len(runs) > 1 else len(current)
+    if len(current) < previous_count:
+        lines.append(f"<i>⚪ cu {previous_count - len(current)} verificări mai puțin "
+                     f"decât la rularea anterioară ({previous_count} → {len(current)}) "
+                     f"— o constatare s-a retras sau o sursă a ieșit din acoperire</i>")
+
+    # `unsure` is listed with the faults, not folded into "În regulă": a check
+    # that could not look is the state this whole package exists to keep
+    # distinct from a check that looked and was satisfied. It used to appear in
+    # neither list and so was invisible.
+    if bad or unsure:
         lines.append("")
-        for r in bad:
-            since_min = int((_now() - r["since"]).total_seconds() // 60)
-            age = f"{since_min // 60}h {since_min % 60}m" if since_min >= 60 else f"{since_min}m"
-            lines.append(f"{emoji[r['status']]} <b>{esc(r['title'])}</b> · de {age}")
-            if r["detail"]:
-                lines.append(f"   {esc(r['detail'])}")
+    for r in bad + unsure:
+        lines.append(f"{emoji[r['status']]} <b>{esc(r['title'])}</b> · de {_since(r)}")
+        if r["detail"]:
+            lines.append(f"   {esc(r['detail'])}")
 
-    ok_rows = [r for r in rows if r["status"] == "ok"]
+    if stale:
+        lines += ["", f"<b>Neevaluate la ultima rulare ({len(stale)})</b>",
+                  "<i>o rulare întreruptă nu le-a reevaluat; mai jos e ultima "
+                  "constatare, nu starea de acum</i>"]
+        for r in stale:
+            lines.append(f"{emoji[r['status']]} {esc(r['title'])} "
+                         f"· constatare veche de {_since(r)}")
+
     if ok_rows:
         lines += ["", f"<b>În regulă ({len(ok_rows)})</b>"]
         lines.append(" · ".join(esc(r["title"]) for r in ok_rows[:14]))
@@ -450,6 +507,12 @@ async def cmd_selfcheck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 def _now():
     from datetime import datetime, timezone
     return datetime.now(timezone.utc)
+
+
+def _since(row) -> str:
+    """How long this row has held its current status."""
+    minutes = int((_now() - row["since"]).total_seconds() // 60)
+    return f"{minutes // 60}h {minutes % 60}m" if minutes >= 60 else f"{minutes}m"
 
 
 async def cmd_behaviour(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

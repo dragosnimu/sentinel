@@ -1,8 +1,9 @@
-"""Per-chat notification preferences.
+"""Per-chat notification preferences, and per-chat use of the bot.
 
-A row appears the first time a chat sets something. Chats that have never
-touched their settings have no row, and fall back to the deployment config —
-which is why every read here tolerates a missing row rather than creating one.
+A row appears the first time a chat sets something — or, since `record_command`,
+the first time it sends a command. Chats that have done neither have no row and
+fall back to the deployment config, which is why every read here tolerates a
+missing row rather than creating one.
 """
 
 from __future__ import annotations
@@ -89,4 +90,29 @@ async def touch(db: Database, chat_id: int, **_: Any) -> None:
     """Record that a chat exists, without changing any preference."""
     await db.execute(
         "INSERT INTO telegram_chats (chat_id) VALUES ($1) ON CONFLICT DO NOTHING",
+        chat_id)
+
+
+async def record_command(db: Database, chat_id: int) -> None:
+    """Count one accepted command against the chat that sent it.
+
+    `commands_count` and `last_command_at` have been in the schema since 0006
+    and were written by nothing at all, so they read 0 and NULL on a host whose
+    operator had been using the bot for weeks. Two columns shaped exactly like a
+    record of that use, containing the same thing an unused bot would contain —
+    which is how they were read during a diagnosis, and why it went the wrong
+    way for an hour.
+
+    A row may not exist yet (a chat that never set a preference has none), so
+    this inserts rather than assuming, and increments in SQL rather than
+    read-modify-write: two commands arriving together must count as two.
+    """
+    await db.execute(
+        """
+        INSERT INTO telegram_chats (chat_id, commands_count, last_command_at)
+        VALUES ($1, 1, now())
+        ON CONFLICT (chat_id) DO UPDATE
+            SET commands_count = telegram_chats.commands_count + 1,
+                last_command_at = now()
+        """,
         chat_id)

@@ -15,6 +15,13 @@ address are both refused.
 Push is a plain asyncio task, not the PTB job-queue, so the base
 python-telegram-bot install (no [job-queue] extra) is enough. It polls for
 incidents the operator has not been told about yet and sends them.
+
+The command menu comes from the same table the handlers are registered from, is
+published at startup to each allowed chat's own scope (never the default one —
+see `_publish_commands`), and is read back before anything says it worked. It
+was missing entirely until August 2026: twenty-three working commands, an empty
+`getMyCommands`, and an operator reporting a command as broken because nothing
+in the interface admitted it existed.
 """
 
 from __future__ import annotations
@@ -22,10 +29,18 @@ from __future__ import annotations
 import asyncio
 import html
 import ipaddress
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
@@ -35,11 +50,13 @@ from sentinel.db.engine import Database
 from sentinel.db.repo import assets as assets_repo
 from sentinel.db.repo import blocklist as blocklist_repo
 from sentinel.db.repo import capacity as capacity_repo
+from sentinel.db.repo import chats as chats_repo
 from sentinel.db.repo import health as health_repo
 from sentinel.db.repo import incidents as inc_repo
 from sentinel.errors import ExecutorRejected, ExecutorUnavailable
 from sentinel.logging_setup import get_logger
 from sentinel.respond import actions
+from sentinel.telegram import views
 
 log = get_logger(__name__)
 
@@ -83,6 +100,42 @@ def _guard(handler):
             log.warning("unauthorized telegram command",
                         extra={"chat_id": chat.id if chat else None})
             return
+
+        # `_authorized` returned true, so there is a chat.
+        chat = update.effective_chat
+        message = update.effective_message
+        text = (message.text or message.caption or "") if message else ""
+
+        # `telegram_chats.commands_count` and `.last_command_at` have existed
+        # since 0006 and were never written by anything. Two columns that look
+        # exactly like a record of the operator's commands, holding 0 and NULL
+        # on a host where commands demonstrably arrived — read as evidence
+        # during a diagnosis, they sent it down the wrong road for an hour.
+        #
+        # Written HERE, before the handler runs, and not after it returns: a
+        # command that reached a handler and then crashed still arrived, and
+        # "did my command get here at all" is the question these columns are
+        # looked at to answer. The success line below is the one that says it
+        # also worked.
+        #
+        # Two columns are not an audit trail — they cannot say WHICH command —
+        # so the journal line below carries that. What they do hold, and
+        # nothing else does, is per-chat usage that survives log rotation.
+        db = context.bot_data.get("db")
+        if db is not None:
+            try:
+                await chats_repo.record_command(db, chat.id)
+            except Exception as exc:  # noqa: BLE001 - a counter must never eat a command
+                # Not fatal, and not silent either: if this starts failing, the
+                # columns go stale, and a stale counter read as current is the
+                # very defect this code exists to remove.
+                log.warning("command not recorded",
+                            extra={"chat_id": chat.id,
+                                   "detail": f"{type(exc).__name__}: {exc}"})
+        # `db` missing is not reported here on purpose: every handler reads it
+        # from the same dict and fails loudly one line later, so a second
+        # warning would only add noise to an already-loud failure.
+
         try:
             await handler(update, context)
         except Exception as exc:  # noqa: BLE001 - a broken command must not kill the bot
@@ -105,9 +158,6 @@ def _guard(handler):
             # Textul e trunchiat, fiindcă vine de la un client și lungimea lui nu
             # e mărginită de nimic; `RedactingFilter` curăță ce arată a credențial
             # pe drumul spre jurnal.
-            chat = update.effective_chat
-            message = update.effective_message
-            text = (message.text or message.caption or "") if message else ""
             log.error(
                 "telegram handler failed",
                 exc_info=exc,
@@ -120,6 +170,23 @@ def _guard(handler):
             )
             if update.message:
                 await update.message.reply_text("A apărut o eroare la procesarea comenzii.")
+        else:
+            # Nothing logged a command that WORKED. For a control channel that
+            # can block addresses and flush the firewall, "what was asked, by
+            # whom, when" existed only for the failures — the successful half
+            # left no trace anywhere, in the journal or in the database.
+            #
+            # One line per accepted command, same fields as the failure line so
+            # the two can be read together. Truncated for the same reason, and
+            # `RedactingFilter` cleans it on the way out.
+            log.info(
+                "telegram command",
+                extra={
+                    "handler": getattr(handler, "__name__", repr(handler)),
+                    "chat_id": chat.id,
+                    "command": text[:200] or None,
+                },
+            )
     return wrapper
 
 
@@ -975,6 +1042,179 @@ async def _push_loop(app: Application, cfg: Config, db: Database) -> None:
         await asyncio.sleep(interval)
 
 
+# --- the command table ------------------------------------------------------
+@dataclass(frozen=True)
+class Command:
+    """One command: the names it answers to, the handler, and the menu text.
+
+    `names[0]` is the canonical name — the ONLY one published to Telegram. The
+    rest are aliases: they keep working, they just do not clutter the menu.
+    Canonical is not "the English one" and not "the Romanian one"; it is **the
+    name the bot itself tells the operator to type** — `/ajutor` in the reply of
+    `/status`, `/expuneri` in the reply of `/stiu`, `/incident <id>` at the foot
+    of every alert, and the twenty in `views.HELP`. Any other rule would have
+    the menu and the bot's own text disagreeing about the name of the same
+    thing, which is worse than either choice.
+
+    The description is interface text, so Romanian, and says what the command
+    does FOR the operator rather than what it queries.
+
+    Publishing is not optional in this structure: there is no entry without a
+    description, and no way to add a command that the menu then does not carry.
+    That is the point — the menu was empty on the host for as long as the bot
+    has existed, because it was a second list nobody had written.
+    """
+
+    names: tuple[str, ...]
+    handler: Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]
+    description: str
+
+    @property
+    def canonical(self) -> str:
+        return self.names[0]
+
+
+# Every command, and the Romanian name for each one. The interface language is
+# Romanian, so `/incidente` has to work; the English names stay because they are
+# what the documentation and the phone's autocomplete already learned, and
+# dropping them would break both.
+#
+# No diacritics anywhere in a NAME: Telegram accepts [a-z0-9_] and
+# `python-telegram-bot` raises ValueError at REGISTRATION — before the bot
+# starts. One `ș` in one alias stopped the whole alerting channel, with 1113
+# restarts before anyone noticed. Descriptions are free text and may have them.
+READ_ONLY = [
+    Command(("ajutor", "start", "help"), views.cmd_help,
+            "Toate comenzile, pe grupe"),
+    Command(("dashboard", "panou"), views.cmd_dashboard,
+            "Verdict, cifre, observații, top atacatori"),
+    Command(("status",), cmd_status,
+            "O linie: incidente deschise și servicii"),
+    Command(("incidente", "incidents"), cmd_incidents,
+            "Incidentele deschise, cele mai recente"),
+    Command(("incident",), cmd_incident,
+            "Dosarul unui incident: /incident 42"),
+    Command(("vulnerabilitati", "vulns"), views.cmd_vulns,
+            "Vulnerabilități deschise, prioritizate"),
+    Command(("vuln",), views.cmd_vuln,
+            "Detaliul unei vulnerabilități: /vuln 7"),
+    Command(("evenimente", "events"), views.cmd_events,
+            "Evenimente brute, opțional pentru un IP"),
+    Command(("servicii", "services"), cmd_services,
+            "Fiecare serviciu: activ, degradat sau picat"),
+    Command(("health", "sanatate"), cmd_health,
+            "Capacitate: CPU, RAM, disc, conexiuni"),
+    Command(("selfcheck", "autoverificare"), views.cmd_selfcheck,
+            "Chiar funcționează Sentinel? fiecare componentă"),
+    Command(("comportament", "behaviour", "profil"), views.cmd_behaviour,
+            "Ce a învățat agentul despre ce e normal aici"),
+    Command(("blocklist", "blocate"), views.cmd_blocklist_full,
+            "Ce IP-uri sunt blocate acum, și până când"),
+    Command(("expuneri", "exposures", "expunere"), cmd_exposures,
+            "Ce ascultă pe toate interfețele"),
+    Command(("patches", "patch", "patchuri"), cmd_patches,
+            "Planuri de patch în așteptare; /patch 3 pentru unul"),
+]
+
+# State-changing. Each re-checks the role itself; `_guard` only enforces the
+# chat allowlist, which is not the same thing.
+ACTING = [
+    Command(("rezolva", "resolve"), cmd_resolve,
+            "Închide un incident: /rezolva 42 [notă]"),
+    Command(("fp", "falspozitiv"), cmd_false_positive,
+            "Închide un incident ca fals-pozitiv: /fp 42"),
+    Command(("stiu", "ack"), cmd_ack_exposure,
+            "Marchează o expunere ca intenționată: /stiu tcp/10000"),
+    Command(("block", "blocheaza"), cmd_block,
+            "Blochează un IP: /block 203.0.113.7 24h"),
+    Command(("unblock", "deblocheaza"), cmd_unblock,
+            "Deblochează un IP: /unblock 203.0.113.7"),
+    Command(("panic",), cmd_panic,
+            "Golește tot blocklist-ul (cere confirmare)"),
+    Command(("mute", "liniste"), cmd_mute,
+            "Liniște pentru acest chat: /mute 22:00-06:00"),
+    Command(("unmute",), cmd_unmute,
+            "Gata cu liniștea: alertele revin în acest chat"),
+]
+
+COMMANDS = [*READ_ONLY, *ACTING]
+
+
+def menu_commands() -> list[BotCommand]:
+    """The menu Telegram is asked to show, derived from the table above.
+
+    Derived, never written out a second time: a grammar in two places, a
+    vocabulary in two places and a key list in two places have each cost this
+    repository an outage, and a menu typed by hand next to the handlers would be
+    the same defect with a friendlier face.
+    """
+    return [BotCommand(c.canonical, c.description) for c in COMMANDS]
+
+
+async def _publish_commands(app: Application, cfg: Config) -> None:
+    """Put the menu in front of the operator, and check that it is really there.
+
+    Scoped per chat, not to the default scope. The default scope is what anyone
+    who knows the bot's username sees, and this file's posture is that an
+    unauthorised chat learns nothing — not even that the bot exists (see the
+    module docstring). A menu listing /panic and /block would say a great deal.
+
+    Two calls per chat, on purpose. `setMyCommands` returning True means the
+    request was accepted; it is not proof the menu is there, and this repository
+    has shipped that confusion in five other shapes (see CLAUDE.md).
+    `getMyCommands` for the same scope is the observable fact, and it is a real
+    round trip — PTB does not cache it.
+
+    Never raises. The menu is a convenience; the alerting channel is not, and a
+    rate limit at startup must not cost the operator the only way this agent can
+    speak. Never silent either: an hour went into a symptom that had left no
+    trace in the journal.
+    """
+    commands = menu_commands()
+    wanted = {(c.command, c.description) for c in commands}
+    chat_ids = list(cfg.telegram.allowed_chat_ids)
+    if not chat_ids:
+        log.warning("no allowed chat, so no command menu was published")
+        return
+
+    published = 0
+    for chat_id in chat_ids:
+        scope = BotCommandScopeChat(chat_id=chat_id)
+        try:
+            await app.bot.set_my_commands(commands, scope=scope)
+        except Exception as exc:  # noqa: BLE001 - a menu is never worth the channel
+            log.warning("command menu not published",
+                        extra={"chat_id": chat_id, "commands": len(commands),
+                               "detail": f"{type(exc).__name__}: {exc}"})
+            continue
+        try:
+            live = await app.bot.get_my_commands(scope=scope)
+        except Exception as exc:  # noqa: BLE001
+            # Sent, and unconfirmed. That is a third state, not a success: say
+            # so, because "unknown" and "fine" are different things.
+            log.warning("command menu sent but not confirmed",
+                        extra={"chat_id": chat_id,
+                               "detail": f"{type(exc).__name__}: {exc}"})
+            continue
+        # Equality, not "everything we sent is in there": if Telegram holds a
+        # command we no longer have a handler for, the menu offers the operator
+        # something that will never answer, and that is worth a line too.
+        have = {(c.command, c.description) for c in live}
+        if have != wanted:
+            log.warning("command menu is not what was sent",
+                        extra={"chat_id": chat_id, "live": len(live),
+                               "missing": ", ".join(sorted(n for n, _ in wanted - have))[:300],
+                               "unexpected": ", ".join(sorted(n for n, _ in have - wanted))[:300]})
+            continue
+        published += 1
+
+    if published:
+        log.info("command menu published",
+                 extra={"chats": published, "commands": len(commands)})
+    else:
+        log.warning("command menu reached no chat", extra={"chats": len(chat_ids)})
+
+
 def build_application(cfg: Config, secrets: Secrets) -> Application:
     token = secrets.require("TELEGRAM_BOT_TOKEN")
     app = Application.builder().token(token).build()
@@ -985,6 +1225,10 @@ def build_application(cfg: Config, secrets: Secrets) -> Application:
         application.bot_data["db"] = db
         application.bot_data["cfg"] = cfg
         application.bot_data["push_task"] = asyncio.create_task(_push_loop(application, cfg, db))
+        # After the push loop is running, deliberately: publishing talks to
+        # Telegram and can sit on the library's timeouts, and no menu is worth
+        # delaying the first alert of the day.
+        await _publish_commands(application, cfg)
         log.info("telegram bot ready", extra={"chats": len(cfg.telegram.allowed_chat_ids)})
 
     async def post_shutdown(application: Application) -> None:
@@ -998,57 +1242,10 @@ def build_application(cfg: Config, secrets: Secrets) -> Application:
     app.post_init = post_init
     app.post_shutdown = post_shutdown
 
-    from sentinel.telegram import views
+    for command in COMMANDS:
+        for name in command.names:
+            app.add_handler(CommandHandler(name, _guard(command.handler)))
 
-    # Every command, and the Romanian name for each one. The interface language
-    # is Romanian, so `/incidente` has to work; the English names stay because
-    # they are what the documentation and the phone's autocomplete already
-    # learned, and dropping them would break both.
-    #
-    # (name, handler) — registered for each alias in the tuple.
-    read_only = [
-        (("start", "help", "ajutor"),                  views.cmd_help),
-        (("dashboard", "panou"),                       views.cmd_dashboard),
-        (("status",),                                  cmd_status),
-        (("incidents", "incidente"),                   cmd_incidents),
-        (("incident",),                                cmd_incident),
-        # No diacritics: Telegram accepts [a-z0-9_] in a command name and
-        # REJECTS the whole handler set otherwise, which crash-loops the bot —
-        # i.e. one bad alias takes down the emergency channel.
-        (("vulns", "vulnerabilitati"),                 views.cmd_vulns),
-        (("vuln",),                                    views.cmd_vuln),
-        (("events", "evenimente"),                     views.cmd_events),
-        (("services", "servicii"),                     cmd_services),
-        (("health", "sanatate"),                       cmd_health),
-        (("selfcheck", "autoverificare"),              views.cmd_selfcheck),
-        (("comportament", "behaviour", "profil"),      views.cmd_behaviour),
-        (("blocklist", "blocate"),                     views.cmd_blocklist_full),
-        (("expuneri", "exposures", "expunere"),        cmd_exposures),
-        (("patches", "patch", "patchuri"),             cmd_patches),
-    ]
-    for names, handler in read_only:
-        for name in names:
-            app.add_handler(CommandHandler(name, _guard(handler)))
-
-    # State-changing. Each re-checks the role itself; `_guard` only enforces the
-    # chat allowlist, which is not the same thing.
-    acting = [
-        (("resolve", "rezolva"),   cmd_resolve),
-        (("fp", "falspozitiv"),    cmd_false_positive),
-        # Fără diacritice: Telegram acceptă doar [a-z0-9_] în numele unei
-        # comenzi, iar `python-telegram-bot` ridică ValueError la înregistrare —
-        # adică ÎNAINTE ca botul să pornească. Un singur `ș` a oprit tot canalul
-        # de alertare, cu 1113 reporniri până s-a observat.
-        (("stiu", "ack"),          cmd_ack_exposure),
-        (("block", "blocheaza"),   cmd_block),
-        (("unblock", "deblocheaza"), cmd_unblock),
-        (("panic",),               cmd_panic),
-        (("mute", "liniste"),      cmd_mute),
-        (("unmute",),              cmd_unmute),
-    ]
-    for names, handler in acting:
-        for name in names:
-            app.add_handler(CommandHandler(name, _guard(handler)))
     # Inline confirm buttons. The callbacks re-check authorisation themselves,
     # so they are registered without the message-oriented _guard wrapper.
     # Patch buttons first: they carry opaque tokens and must not fall through to
