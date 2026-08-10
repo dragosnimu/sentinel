@@ -282,3 +282,156 @@ singur costă 0.4, iar familia „rulează ca root" domină scorul.
 
 Restul (web, detect, telegram, ingest, ai, scan, health, maintenance, selfcheck,
 reconcile) sunt între **1.1 și 2.6**.
+
+---
+
+## 11. Rotirea parolei bazei de date
+
+Se rotește când a fost văzută de cineva care nu trebuia, când pleacă un om care
+o știa, sau când ai un motiv să crezi că gazda a fost atinsă. Nu e o operație de
+rutină și nu are nevoie să fie.
+
+### Ce se schimbă, și de ce sunt inseparabile
+
+Parola trăiește în **două** locuri, iar între ele nu există nicio sincronizare
+automată:
+
+| Unde | Cine o scrie | Ce se întâmplă dacă rămâne veche |
+|---|---|---|
+| Rolul `sentinel` din PostgreSQL | pasul **22**, `ALTER ROLE sentinel PASSWORD` | daemonii se conectează cu ce au și merg mai departe |
+| `/etc/sentinel/secrets.env` | pasul **27**, rescrie fișierul | daemonii primesc parola veche și baza îi refuză |
+
+Doi pași care rulează la **fiecare** trecere a instalatorului fac ca separarea
+lor să fie imposibilă: `migrate` (pasul 28), care se conectează la bază cu ce
+scrie în `secrets.env`, și `start_services` (pasul 32), care repornește toți
+daemonii. Amândoi sunt în `ALWAYS_STEPS`.
+
+Deci, dacă forțezi un singur pas:
+
+- **doar 22**: baza are parola nouă, `secrets.env` pe cea veche. Pasul 28 nu se
+  mai poate conecta și instalarea moare acolo, înainte de repornirea
+  serviciilor. Daemonii porniți merg mai departe pe conexiunile deja deschise și
+  cad la prima reconectare — o gazdă care pare vie și se strică mai târziu.
+- **doar 27**: exact invers, iar pasul 28 pică la fel. Dacă ai reporni
+  serviciile după, ar porni direct în eșec de autentificare.
+
+Nicio ordine nu duce la o gazdă întreagă, iar a doua rulare, cea care ar
+„completa" prima, pornește de la o instalare deja eșuată. De aceea se forțează
+**amândoi pașii într-o singură rulare**; lista de la `--force-step` există exact
+pentru asta.
+
+### Procedura
+
+```bash
+# 1. Pune valoarea nouă în secrets/.env.local (local, nu pe server).
+#    Generarea: openssl rand -base64 32   — fără caractere care cer ghilimele.
+#    Amprenta VALORII, nu a liniei. Ghilimelele din jur sunt scoase de installer
+#    înainte de scriere, deci se scot și aici — altfel amprentele diferă după o
+#    rotire perfect corectă și crezi că a eșuat:
+NOUA=$(sed -n 's/^SENTINEL_DB_PASSWORD=//p' secrets/.env.local \
+       | sed -e 's/^"//' -e 's/"$//' | sha256sum)
+
+# 2. Verifică întâi că valoarea nouă chiar E nouă.
+VECHEA=$(ssh ... "sudo sed -n 's/^SENTINEL_DB_PASSWORD=//p' /etc/sentinel/secrets.env" \
+         | sha256sum)
+[ "$NOUA" = "$VECHEA" ] && echo "IDENTICE — nu ai pus încă valoarea nouă"
+#    Dacă sunt identice, oprește-te aici. Rotirea ar rula fără să schimbe nimic,
+#    dovada (c) de mai jos ar pica, iar textul ei te-ar trimite să cauți un pas
+#    22 care de fapt a rulat. S-a întâmplat.
+
+# 3. Notează ce chei are gazda ACUM — numele, niciodată valorile. Pasul 27
+#    rescrie fișierul de la zero; asta e lista pe care o compari după.
+ssh ... "sudo grep -oE '^[A-Za-z_][A-Za-z0-9_]*' /etc/sentinel/secrets.env | sort" \
+    > /tmp/chei-inainte.txt
+
+# 4. O singură rulare, ambii pași:
+./scripts/deploy.sh --host ... --user ... --key ... --domain ... \
+    --force-step 22,27
+```
+
+Din PowerShell, identic:
+
+```powershell
+.\scripts\deploy.ps1 -HostName ... -User ... -Key ... -Domain ... -ForceStep 22,27
+```
+
+Instalatorul refuză din start o listă care nu e formată din numere și una care
+conține un pas inexistent, refuză combinația `--force-step N` sub
+`--from-step M`, și se oprește la final dacă vreunul dintre pașii ceruți nu a
+rulat efectiv. Nu poate „reuși pe jumătate".
+
+### Cum dovedești că s-a întâmplat
+
+Codul de ieșire nu dovedește nimic aici — el spune doar că scriptul a ajuns la
+capăt. Patru fapte observabile, în ordinea asta:
+
+```bash
+# a) NICIO cheie nu a dispărut. Pasul 27 rescrie fișierul de la zero, deci asta
+#    se verifică prima: e singura care prinde pierderea unei chei despre care
+#    nici tu, nici instalatorul nu vă gândeați în ziua aia.
+ssh ... "sudo grep -oE '^[A-Za-z_][A-Za-z0-9_]*' /etc/sentinel/secrets.env | sort" \
+    > /tmp/chei-dupa.txt
+diff /tmp/chei-inainte.txt /tmp/chei-dupa.txt     # trebuie să nu spună nimic
+
+# b) Fișierul de pe gazdă poartă valoarea nouă. Compari amprentele, nu valorile.
+ssh ... "sudo sed -n 's/^SENTINEL_DB_PASSWORD=//p' /etc/sentinel/secrets.env" | sha256sum
+#    Trebuie să fie amprenta de la pasul 1. Dacă e cea veche, pasul 27 nu a rulat.
+
+# c) Parola VECHE este refuzată de bază. Ăsta e testul care contează:
+#    dacă vechea valoare încă merge, nu s-a rotit nimic.
+ssh ... "PGPASSWORD='<parola-veche>' psql -h 127.0.0.1 -U sentinel -d sentinel -c 'select 1'"
+#    Aștepți un refuz de autentificare pentru utilizatorul sentinel
+#    (`password authentication failed`), nu un rând de rezultat.
+
+# d) Serviciile s-au reconectat, iar martorul din afară aude din nou.
+ssh ... "sudo sentinel config-check -v"
+#    Linia `secrets:` trebuie să fie OK. Dacă spune MISSING, îți dă numele cheii.
+ssh ... "sudo sentinel selfcheck --print"
+#    Grupurile db:* și ingest:* verzi.
+ssh ... "journalctl -u sentinel-beacon -n 20 --no-pager"
+#    Aștepți `beacon started`. `beacon disabled` înseamnă că unitatea a pornit,
+#    a văzut că nu are cheie și a ieșit — cu cod 0.
+```
+
+Apoi, pe panoul martorului extern, **„Ultimul semnal"** trebuie să arate sub un
+minut (intervalul e 60s). Ăsta e singurul rând din care se citește dovada fără
+secret: numărul semnalului și contoarele apar doar în vizualizarea detaliată, la
+`?key=<SENTINEL_CHECK_SECRET>`. Dacă vrei să vezi `seq` crescând, folosește
+cheia; altfel te uiți la vârsta ultimului semnal, care e suficientă.
+
+De ce toate patru: (b) fără (c) spune doar că fișierul a fost scris, nu că
+`ALTER ROLE` a avut loc; (c) fără (d) spune că parola veche a murit, nu că
+serviciile au primit-o pe cea nouă; iar (a) există fiindcă (b), (c) și (d) pot
+trece toate în timp ce o cheie fără legătură a fost ștearsă din fișier.
+
+**Beaconul nu se verifică prin `systemctl`.** Când cheia lipsește, procesul
+spune o dată în jurnal și iese cu **0** — deliberat, ca să nu intre în buclă
+când martorul nu e configurat. Deci `systemctl restart` întoarce 0, instalatorul
+scrie `sentinel-beacon.service enabled and restarted`, iar unitatea e oprită.
+Singurele dovezi sunt linia din jurnal și semnalul ajuns la martor.
+
+Dacă (c) încă acceptă parola veche, **nu reporni serviciile** și nu relua
+deploy-ul înainte de a înțelege de ce. Două cauze, în ordinea probabilității:
+valoarea din `.env.local` era aceeași cu cea de pe gazdă (de asta există pasul 2
+al procedurii), sau pasul 22 chiar nu a rulat. O a doua rulare care forțează
+doar 27 e exact eroarea descrisă mai sus.
+
+### Celelalte secrete
+
+`ANTHROPIC_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` și
+`TELEGRAM_APPLY_PIN` trăiesc doar în `secrets.env`, deci se rotesc cu
+`--force-step 27` singur. Cheile generate pe gazdă (sesiuni web, TOTP) sunt
+păstrate de pasul 27 dacă există deja; rotirea lor deconectează sesiunile și
+invalidează înrolările TOTP, deci nu se face din reflex.
+
+`SENTINEL_BEACON_SECRET` e altfel: e o cheie **comună** cu martorul din afară.
+Nu o generează instalatorul și nu are voie să o genereze — o valoare nouă doar
+pe o parte înseamnă că beaconul semnează fericit, iar martorul respinge fiecare
+semnal ca semnătură greșită, ceea ce arată la fel ca o gazdă tăcută. Se rotește
+schimbând-o în **ambele** locuri, iar dovada e (d) de mai sus.
+
+Pasul 27 duce mai departe orice cheie găsită deja în `secrets.env`, nu doar pe
+cele pe care le cunoaște. Nu a fost mereu așa: până în august 2026 rescria
+fișierul din două liste fixe și ștergea restul, iar cheia beaconului era exact
+„restul". Verificarea (a) e acolo pentru clasa asta de defect, nu pentru cazul
+ăla anume — el e reparat.

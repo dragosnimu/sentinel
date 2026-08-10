@@ -631,9 +631,33 @@ marker în `/var/lib/sentinel/.install-state/`.
 # Repari cauza, apoi continui de la pasul respectiv
 ./scripts/deploy.sh --host ... --user ... --key ... --from-step 22
 
-# Sau reiei un singur pas
-ssh ... 'sudo /opt/sentinel/deploy/install.sh --force-step 29'
+# Sau reiei pași anume, chiar dacă sunt marcați ca făcuți
+./scripts/deploy.sh --host ... --user ... --key ... --force-step 29
+./scripts/deploy.sh --host ... --user ... --key ... --force-step 22,27
 ```
+
+**Cele două flaguri nu fac același lucru, și diferența costă.**
+
+| Flag | Ce face |
+|---|---|
+| `--from-step N` | Sare peste pașii de **sub** N. De la N în sus, un marker existent tot câștigă — deci **nu re-rulează** nimic deja făcut. E pentru reluarea unei instalări întrerupte |
+| `--force-step L` | Șterge markerele pașilor din listă, ca să ruleze din nou. Un număr, sau o listă separată prin virgulă: `--force-step 22,27` |
+
+Un `--from-step 22` pe o gazdă unde pasul 22 e deja marcat afișează
+`(already done)` și trece mai departe. De la versiunea asta o spune în galben și
+o rezumă la final, cu numerele care ar fi trebuit date lui `--force-step` — după
+o rotire de parolă în care mesajul a trecut neobservat într-o ieșire de 100 de
+linii, iar rularea s-a încheiat cu „installation finished".
+
+Lista există pentru că **unii pași sunt o singură operație**: rotirea parolei
+bazei cere 22 (`ALTER ROLE`) și 27 (`secrets.env`) în aceeași trecere, fiindcă
+serviciile sunt repornite la sfârșitul ei. Procedura completă, cu felul în care
+dovedești că s-a întâmplat, e în [OPERARE.md](OPERARE.md) §11.
+
+Instalatorul refuză din start o listă care nu e formată din numere
+(`--force-step 22,twenty-seven`), un pas care nu există (`--force-step 22,72`)
+și un `--force-step` sub `--from-step`; iar la final se oprește dacă un pas
+cerut nu a rulat efectiv. Nu poate reuși pe jumătate.
 
 Dacă ai instalat cu wizard-ul, îl poți relua pur și simplu: pașii deja făcuți
 sunt sărite. Ca să nu răspunzi din nou la toate întrebările, salvează-le de la

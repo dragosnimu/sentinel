@@ -9,8 +9,18 @@
 #   ./install.sh --domain sentinel.example.com
 #                [--nginx-mode dedicated|shared] [--web-port 8443]
 #                [--cert-mode auto|webroot|dns|selfsigned|none]
-#                [--admin-ip 203.0.113.10] [--from-step N] [--force-step N]
+#                [--admin-ip 203.0.113.10] [--from-step N] [--force-step N[,N…]]
 #                [--skip-preflight]
+#
+#   --from-step N    skips every step BELOW N. At or above N a completion marker
+#                    still wins, so this resumes an interrupted install; it does
+#                    not re-run anything already done.
+#   --force-step L   clears the markers of the listed steps so their bodies run
+#                    again: one number, or a comma-separated list. The list form
+#                    exists because some steps are one operation — rotating
+#                    SENTINEL_DB_PASSWORD needs 22 (ALTER ROLE) and 27
+#                    (secrets.env) in the SAME pass, since the services are
+#                    restarted at the end of it. See docs/OPERARE.md §11.
 #
 # Two ways to expose the dashboard, chosen with --nginx-mode:
 #
@@ -100,10 +110,41 @@ while [[ $# -gt 0 ]]; do
         --skip-preflight) SKIP_PREFLIGHT=1; shift ;;
         --allow-firewalld) export ALLOW_FIREWALLD=1; shift ;;
         --yes|-y)         export SENTINEL_ASSUME_YES=1; shift ;;
-        --help|-h)        sed -n '2,25p' "$0"; exit 0 ;;
+        # The range covers the header block down to the end of the nginx-mode
+        # description. It is a line count, so it moves when the header does —
+        # tests/unit/test_force_step_list.py pins that --help still shows the
+        # flags it documents.
+        --help|-h)        sed -n '2,36p' "$0"; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
+
+# Step selection is resolved here, before anything is touched.
+#
+# Both refusals below happen at startup on purpose. An installer that starts,
+# forces half of what it was asked, and then discovers the rest was nonsense
+# leaves the host in a state nobody asked for — for a password rotation, that
+# state is "database changed, services still holding the old value".
+assert_force_steps_above_from_step() {
+    [[ -n "$FROM_STEP" ]] || return 0
+    local forced
+    for forced in ${FORCE_STEPS[@]+"${FORCE_STEPS[@]}"}; do
+        # --from-step is applied first in run_step, so a forced step below it is
+        # skipped rather than forced. Refuse the combination instead of quietly
+        # obeying one half of it.
+        if (( forced < FROM_STEP )); then
+            die "--force-step ${forced} is below --from-step ${FROM_STEP}, so it would be \
+skipped rather than re-run. Drop one of the two flags."
+        fi
+    done
+}
+
+if [[ -n "$FROM_STEP" && ! "$FROM_STEP" =~ ^[0-9]+$ ]]; then
+    die "--from-step: '${FROM_STEP}' is not a step number"
+fi
+parse_force_steps "$FORCE_STEP"
+assert_force_steps_exist "${BASH_SOURCE[0]}"
+assert_force_steps_above_from_step
 
 need_root
 
@@ -114,12 +155,77 @@ need_root
 # shown the lockout warning and taken the operator's confirmation locally, so
 # prompting again here would only deadlock on EOF.
 declare -A SECRETS=()
-if [[ ! -t 0 ]]; then
-    while IFS='=' read -r key value; do
-        [[ -z "$key" || "$key" == \#* ]] && continue
+SECRETS_BAD_LINES=()
+SECRETS_CRLF_LINES=0
+
+# A line that is not NAME=value is not a secret, and it is not a name either.
+#
+# This was `while IFS='=' read -r key value`, which puts a line with no `=`
+# entirely into `key`. So the second line of a value an editor had wrapped
+# became a "key name" made of secret material — and the installer then printed
+# that name, verbatim, when it declined to write it. The tail of an API key
+# ended up on the operator's console and in the deploy log.
+#
+# The rule is the same one the on-disk path already follows: what does not look
+# like an environment variable name is reported by LINE NUMBER, never by
+# content, because on a malformed line the content is the secret.
+#
+# Leading whitespace is tolerated on comments and on keys, because
+# sentinel/config.py:load_secrets strips before parsing. A key the product would
+# read and the installer would call garbage is a key the installer would delete.
+read_stdin_secrets() {
+    local line stripped lineno=0 key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$((lineno + 1))
+
+        # A CR from a secrets/.env.local edited on Windows. It has to come off
+        # HERE, before anything reads the value, and the reason is not tidiness:
+        #
+        #   value arrives as `"secret"<CR>` → the trailing-quote strip below no
+        #   longer matches, so the value becomes `secret"<CR>`. That exact string
+        #   is what step 22 hands to `ALTER ROLE ... PASSWORD` and what step 27
+        #   writes to secrets.env — but sentinel/config.py strips the line when
+        #   the daemons read it, so they authenticate with `secret"` against a
+        #   database expecting `secret"<CR>`. Every daemon fails to connect after
+        #   a rotation that reported success.
+        #
+        # Only the stdin path is normalised. A CR already inside secrets.env on
+        # the host is left exactly as it is: the database was given that value
+        # too, and quietly rewriting it here would break the match rather than
+        # repair it.
+        if [[ "$line" == *$'\r' ]]; then
+            SECRETS_CRLF_LINES=$((SECRETS_CRLF_LINES + 1))
+            line="${line%$'\r'}"
+        fi
+
+        stripped="${line#"${line%%[![:space:]]*}"}"
+        [[ -z "$stripped" || "$stripped" == \#* ]] && continue
+
+        if [[ ! "$stripped" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            SECRETS_BAD_LINES+=("$lineno")
+            continue
+        fi
+        key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
         value="${value%\"}"; value="${value#\"}"
         SECRETS["$key"]="$value"
     done
+}
+
+if [[ ! -t 0 ]]; then
+    read_stdin_secrets
+    if (( SECRETS_CRLF_LINES )); then
+        warn "${SECRETS_CRLF_LINES} line(s) arrived with CRLF endings. They were \
+handled, and nothing here is wrong now — but secrets/.env.local was saved by an \
+editor that writes Windows line endings, and that file is not covered by \
+.gitattributes. Convert it to LF before the next edit."
+    fi
+    if (( ${#SECRETS_BAD_LINES[@]} )); then
+        warn "${#SECRETS_BAD_LINES[@]} line(s) on stdin were neither a comment nor \
+KEY=value and were ignored — line(s): ${SECRETS_BAD_LINES[*]}"
+        warn "The content is deliberately not shown: on a wrapped line it is the \
+secret itself. The usual cause is a value broken across two lines in \
+secrets/.env.local — if so, the key ABOVE it arrived truncated."
+    fi
     export SENTINEL_ASSUME_YES=1
 fi
 
@@ -595,12 +701,41 @@ some files. Inspect with:  logrotate --debug /etc/logrotate.conf"
 # dashboard with "TOTP incorrect", and no message anywhere said why.
 GENERATED_SECRET_KEYS=(TELEGRAM_CALLBACK_HMAC_KEY SENTINEL_SESSION_SECRET)
 
+# Keys the DEPLOY CHANNEL may set. This is not a list of what the file may
+# contain — everything already in the file is carried forward regardless, see
+# step_secrets. It is a list of what a value arriving on stdin is allowed to
+# name.
+#
+# THIS IS NOT A PRIVILEGE BOUNDARY, and an earlier version of this comment
+# claimed it was: it said secrets.env is an EnvironmentFile for units that run
+# as root, so an invented name could set a root process's environment. That is
+# false. No unit references this file at all — sentinel/config.py:load_secrets
+# reads it directly, looks up a fixed set of names, and nothing else is ever
+# consulted. An unknown name in the file is inert. Written down because a
+# security reason nobody can check is a constraint the next person preserves
+# without knowing why.
+#
+# The real reason is duller and still good: a name this installer does not know
+# is far more likely a typo in secrets/.env.local (SENTINEL_DB_PASWORD=) than a
+# new secret. Writing it would leave the operator with a rotation that looked
+# like it worked while the real key kept its old value. So stdin may set a name
+# this installer knows or one this host already has — and a name it invents is
+# refused out loud, with the fix: put it on the host once, and every later run
+# carries it.
+OPERATOR_SECRET_KEYS=(ANTHROPIC_API_KEY TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID
+                      SENTINEL_DB_PASSWORD TELEGRAM_APPLY_PIN)
+
 # Read a key out of the secrets file already on disk, if there is one.
+#
+# Leading whitespace is allowed for the same reason step_secrets allows it when
+# it decides which keys exist: the two must agree. If the scan accepts an
+# indented `  KEY=value` and this does not, the key is kept in the new file with
+# its value silently emptied — a deletion wearing the shape of a preservation.
 existing_secret() {
     local target="${SENTINEL_CONFIG_DIR}/secrets.env" key="$1"
     [[ -r "$target" ]] || return 1
     local line
-    line="$(grep -m1 "^${key}=" "$target" 2>/dev/null)" || return 1
+    line="$(grep -m1 "^[[:space:]]*${key}=" "$target" 2>/dev/null)" || return 1
     printf '%s' "${line#*=}"
 }
 
@@ -613,42 +748,123 @@ step_secrets() {
     chown "root:${SENTINEL_USER}" "${target}.tmp"
     chmod 0640 "${target}.tmp"
 
-    local key value kept=0 made=0
+    # EVERY key already in the file is carried over, whatever its name.
+    #
+    # This step used to rebuild the file from two hard-coded lists and nothing
+    # else, so a re-run deleted every key outside them. SENTINEL_BEACON_SECRET
+    # was added to this host after those lists were written, which made the
+    # documented password rotation (--force-step 22,27) destroy the only copy of
+    # it: it is not in secrets/.env.local, so stdin cannot restore it, and it
+    # must never be regenerated because the external watcher holds the same
+    # value and the pair is the whole point.
+    #
+    # It would also have failed in silence at both ends. This step prints a
+    # green line about the keys it DID keep, and sentinel-beacon exits 0 when
+    # the secret is missing (deliberately — see the unit), so `systemctl
+    # restart` returns 0 over a unit that is now dead and step 36 reports
+    # "enabled and restarted".
+    #
+    # A hard-coded list of keys-to-preserve ages exactly like a hard-coded list
+    # of steps: quietly, at the next key added, and the symptom arrives months
+    # later during an unrelated rotation.
+    local key value line stripped kept=0 made=0 lineno=0
+    local -a ordered=() carried=() unparsed=() on_disk=()
+
+    for key in "${OPERATOR_SECRET_KEYS[@]}" "${GENERATED_SECRET_KEYS[@]}"; do
+        ordered+=("$key")
+    done
+
+    if [[ -r "$target" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            lineno=$((lineno + 1))
+            # Leading whitespace off before deciding what the line is: an
+            # indented comment is a comment, and an indented KEY=value is a key
+            # — that is how sentinel/config.py reads this file, so treating
+            # either as garbage would report a loss that had not happened, or
+            # cause one that had not been asked for.
+            stripped="${line#"${line%%[![:space:]]*}"}"
+            [[ -z "$stripped" || "$stripped" == \#* ]] && continue
+            if [[ ! "$stripped" =~ ^([A-Za-z_][A-Za-z0-9_]*)= ]]; then
+                # Never the content: this file is nothing but secrets. The line
+                # number is enough to find it, and cannot leak a value.
+                unparsed+=("$lineno")
+                continue
+            fi
+            key="${BASH_REMATCH[1]}"
+            on_disk+=("$key")
+            in_list "$key" "${ordered[@]}" || { ordered+=("$key"); carried+=("$key"); }
+        done < "$target"
+    fi
+
     {
         echo "# Generated by install.sh at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
         echo "# Mode 0640 root:sentinel. Never commit, never copy, never echo."
 
-        # Operator-supplied values. Precedence: what was just handed to us wins,
-        # then whatever is already on disk. An upgrade run that supplies no
-        # secrets must not erase the ones that are working.
-        for key in ANTHROPIC_API_KEY TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID \
-                   SENTINEL_DB_PASSWORD TELEGRAM_APPLY_PIN; do
+        for key in "${ordered[@]}"; do
+            # Precedence: what was just handed to us wins, then whatever is
+            # already on disk. An upgrade run that supplies no secrets must not
+            # erase the ones that are working.
             value="${SECRETS[$key]:-}"
             [[ -z "$value" ]] && value="$(existing_secret "$key" || true)"
-            [[ -n "$value" ]] && printf '%s=%s\n' "$key" "$value"
-        done
 
-        # Host-generated keys. Kept if they exist, in any form, from anywhere.
-        for key in "${GENERATED_SECRET_KEYS[@]}"; do
-            value="${SECRETS[$key]:-}"
-            [[ -z "$value" ]] && value="$(existing_secret "$key" || true)"
-            if [[ -n "$value" ]]; then
-                kept=$((kept + 1))
-            else
-                value="$(openssl rand -hex 32)"
-                made=$((made + 1))
+            # Host-generated keys, and only those, may be created from nothing.
+            if in_list "$key" "${GENERATED_SECRET_KEYS[@]}"; then
+                if [[ -n "$value" ]]; then
+                    kept=$((kept + 1))
+                else
+                    value="$(openssl rand -hex 32)"
+                    made=$((made + 1))
+                fi
             fi
-            printf '%s=%s\n' "$key" "$value"
+
+            # An empty value is still written IF the key was in the old file.
+            # Reporting a key as carried over and then dropping it because its
+            # value happened to be empty is intent reported as effect — the
+            # exact shape this whole change exists to remove — and it would also
+            # make the key-name diff in OPERARE.md §11 (a) show a loss.
+            if [[ -n "$value" ]] || in_list "$key" ${on_disk[@]+"${on_disk[@]}"}; then
+                printf '%s=%s\n' "$key" "$value"
+            fi
         done
     } >> "${target}.tmp"
 
     mv "${target}.tmp" "$target"
     ok "secrets written to ${target} (0640 root:${SENTINEL_USER})"
     (( kept )) && ok "kept ${kept} existing key(s) — TOTP enrolments stay valid"
+    if (( ${#carried[@]} )); then
+        ok "carried over ${#carried[@]} key(s) this installer does not manage: ${carried[*]}"
+    fi
+    if (( ${#unparsed[@]} )); then
+        warn "${#unparsed[@]} line(s) in the previous ${target} were neither a comment"
+        warn "nor KEY=value and were NOT carried over — line(s): ${unparsed[*]}"
+        warn "The old file is gone; recover them from a backup if they mattered."
+    fi
     if (( made )); then
         warn "generated ${made} new key(s). If this host had TOTP enrolments"
         warn "from an older secret, they must be re-enrolled:"
         warn "    sudo sentinel web --enroll-totp --username <user>"
+    fi
+
+    # A value supplied on stdin under a name this host has never had is dropped
+    # — see OPERATOR_SECRET_KEYS for why — but never in silence: the operator
+    # put it there on purpose and would otherwise be left believing it landed.
+    if (( ${#SECRETS[@]} )); then
+        for key in "${!SECRETS[@]}"; do
+            in_list "$key" "${ordered[@]}" && continue
+            # The name is only safe to print once it looks like a name. The
+            # stdin reader already refuses anything else, and this is the second
+            # lock on the same door: a caller that populates SECRETS some other
+            # way must not be able to turn a wrapped secret into a log line.
+            if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                warn "a value supplied on stdin carries a name that is not an \
+environment variable name; it was NOT saved. The name is withheld on purpose — on a \
+malformed line it is secret material, not a name."
+                continue
+            fi
+            warn "${key} was supplied on stdin but this installer does not write it \
+and this host does not already have it. It was NOT saved. If it belongs here, add it \
+to ${target} on the host first; a later run will then carry it over."
+        done
     fi
 
     unset SECRETS
@@ -1643,6 +1859,14 @@ main() {
     run_step 37 smoke_test        step_smoke_test
     run_step 38 verify_intact     step_verify_nothing_broken
     run_step 39 notify            step_notify
+
+    # Before the success banner, not after it: what the run declined to do, and
+    # whether what it was told to force actually ran. `assert_forced_steps_ran`
+    # can end the run here, which is the point — "installation finished" printed
+    # over an unperformed request is what sent an operator away believing a
+    # password had been rotated when it had not.
+    report_marked_skips
+    assert_forced_steps_ran
 
     section "Instalare completă"
     cat <<EOF

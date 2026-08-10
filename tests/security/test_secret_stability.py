@@ -63,10 +63,28 @@ def test_both_long_lived_keys_are_covered():
 
 def test_an_upgrade_that_supplies_nothing_does_not_erase_working_secrets():
     """A re-run with no secrets on stdin must keep the API key and bot token
-    already on the host, not drop the lines entirely."""
+    already on the host, not drop the lines entirely.
+
+    The behaviour itself is executed in test_secrets_preserved.py, against the
+    shipped step. This stays as the structural half: the fallback to the file on
+    disk must be on the path taken by EVERY key, not by a hand-picked list —
+    that list is what deleted SENTINEL_BEACON_SECRET.
+    """
     body = _func(INSTALL, "step_secrets")
-    operator_block = body.split("ANTHROPIC_API_KEY TELEGRAM_BOT_TOKEN", 1)[1]
-    assert 'value="$(existing_secret "$key"' in operator_block
+    write_loop = body.split('for key in "${ordered[@]}"', 1)
+    assert len(write_loop) == 2, "the write loop no longer iterates every key it collected"
+    assert 'value="$(existing_secret "$key"' in write_loop[1]
+
+
+def test_the_file_on_disk_decides_which_keys_exist():
+    """Every KEY= already in secrets.env has to be carried over, whatever it is.
+
+    A hard-coded list of keys-to-preserve goes stale at the next key added, and
+    the symptom is a deletion during an unrelated rotation, months later.
+    """
+    body = _func(INSTALL, "step_secrets")
+    assert 'while IFS= read -r line' in body and 'done < "$target"' in body
+    assert "BASH_REMATCH" in body, "the existing file is not parsed for its key names"
 
 
 def test_generating_a_new_key_says_what_it_just_broke():

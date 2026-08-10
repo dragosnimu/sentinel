@@ -144,7 +144,7 @@ Altfel repari cauza, apoi:
 | 21 external_tools | `checksum mismatch` | **Nu ocoli asta.** Ori download corupt, ori mirror compromis. Reîncearcă; dacă persistă, investighează |
 | 22 postgres | `initdb` eșuează | RHEL: `/var/lib/pgsql/data` există deja și nu e gol. Pe Debian clusterul e creat de postinst-ul pachetului, deci nu se rulează `initdb` deloc — vezi `pg_lsclusters` |
 | 23 venv | `pip install` eșuează | Lipsesc `gcc` și headerele Python (`python3.N-devel` pe RHEL, `python3-dev` pe Debian), sau nu e rețea |
-| 28 migrate | Nu se conectează | Parola rolului nu corespunde. Reia pasul 22 cu `--force-step 22` |
+| 28 migrate | Nu se conectează | Parola rolului nu corespunde între bază și `secrets.env`. Se reia cu `--force-step 22,27` — **amândoi**, în aceeași rulare: doar 22 schimbă parola în bază și lasă serviciile cu cea veche, doar 27 face invers. Vezi OPERARE.md §11 |
 | 33 nginx | certbot eșuează | DNS nu rezolvă aici, sau portul 80 nu e accesibil din internet |
 
 Dacă nimic nu ajută:

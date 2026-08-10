@@ -53,7 +53,8 @@ section() {
 # Idempotency
 # --------------------------------------------------------------------------
 # Every install step is guarded by a marker file. Re-running the installer is
-# safe and fast; --from-step N re-runs from a point; --force-step N re-runs one.
+# safe and fast; --from-step N re-runs from a point; --force-step N[,N…] re-runs
+# the listed steps.
 step_done() { [[ -f "${STATE_MARKERS}/$1" ]]; }
 
 mark_done() {
@@ -62,6 +63,191 @@ mark_done() {
 }
 
 clear_step() { rm -f "${STATE_MARKERS}/$1"; }
+
+# --------------------------------------------------------------------------
+# --force-step: a LIST, not one number
+# --------------------------------------------------------------------------
+# One number was enough while every step stood on its own. Rotating
+# SENTINEL_DB_PASSWORD is not: step 22 runs `ALTER ROLE sentinel PASSWORD` and
+# step 27 rewrites /etc/sentinel/secrets.env — one value, two places, no
+# synchronisation between them.
+#
+# Force one without the other, in either order, and the run does not survive its
+# own next step: `migrate` (28) is in ALWAYS_STEPS and connects to the database
+# with whatever secrets.env holds, so it dies on the mismatch. Had it not, the
+# ALWAYS `start_services` (32) would have restarted every daemon into the same
+# mismatch at the end of that pass. Both halves belong to one operation, so they
+# have to be forceable in one pass.
+#
+# Parsed once, up front, into decimal integers. A value that is not a list of
+# numbers is refused before any step runs — half a rotation is worse than none.
+FORCE_STEPS=()
+FORCE_STEPS_RAN=()
+STEPS_SKIPPED_MARKED=()
+FORCE_STEPS_PARSED=0
+
+parse_force_steps() {
+    local raw="${1:-}" item
+    FORCE_STEPS=()
+    FORCE_STEPS_PARSED=1
+    [[ -z "$raw" ]] && return 0
+
+    # Whitespace is tolerated only AROUND the commas. Stripping it everywhere
+    # first would turn "22 27" — a plausible way to type a list — into the
+    # single number 2227, which matches no step and would be obeyed silently.
+    # So the shape is checked on the raw value, before anything is removed.
+    if [[ ! "$raw" =~ ^[[:space:]]*[0-9]+([[:space:]]*,[[:space:]]*[0-9]+)*[[:space:]]*$ ]]; then
+        die "--force-step: '${raw}' is not a step number or a comma-separated list of them (e.g. 22 or 22,27)"
+    fi
+
+    local -a parts=()
+    IFS=',' read -r -a parts <<< "${raw//[[:space:]]/}"
+    for item in "${parts[@]}"; do
+        # 10# so a value typed as 022 means step 22 rather than an invalid
+        # octal literal that would abort the arithmetic.
+        FORCE_STEPS+=("$((10#$item))")
+    done
+}
+
+force_step_requested() {
+    local want="$1" n
+    for n in ${FORCE_STEPS[@]+"${FORCE_STEPS[@]}"}; do
+        (( n == 10#$want )) && return 0
+    done
+    return 1
+}
+
+# Refuse a number that is not a step of THIS installer.
+#
+# `--force-step 22,72` would clear one marker, run one step, and finish green
+# having done half of what was asked — which for a password rotation means the
+# database changed and the services did not. The step numbers are read from the
+# installer's own `run_step` lines, so this cannot drift away from them.
+assert_force_steps_exist() {
+    local script="$1" want n hit
+    (( ${#FORCE_STEPS[@]} )) || return 0
+
+    local -a known=() unknown=()
+    while read -r n; do known+=("$n"); done < <(
+        grep -oE '^[[:space:]]*run_step[[:space:]]+[0-9]+' "$script" | awk '{print $2}')
+
+    # An empty list would accept every number instead of none. If the extraction
+    # ever stops matching, that has to be a refusal, not a free pass.
+    if (( ${#known[@]} == 0 )); then
+        die "internal: no run_step lines found in ${script}; cannot check --force-step"
+    fi
+
+    for want in "${FORCE_STEPS[@]}"; do
+        hit=0
+        for n in "${known[@]}"; do
+            (( 10#$n == want )) && { hit=1; break; }
+        done
+        (( hit )) || unknown+=("$want")
+    done
+
+    if (( ${#unknown[@]} )); then
+        die "--force-step: no such step: ${unknown[*]}. This installer has steps: $(
+            printf '%s ' "${known[@]}")"
+    fi
+}
+
+# The proof that --force-step did anything is that the step's BODY ran.
+#
+# Clearing a marker is intent; running the body is effect. A step that
+# --from-step had already skipped past, or one whose branch was not taken, would
+# otherwise leave the run ending with "installation finished" and the operator's
+# request quietly unperformed — which is how the rotation that prompted all this
+# went unnoticed in the first place.
+assert_forced_steps_ran() {
+    local want ran missed=()
+    (( ${#FORCE_STEPS[@]} )) || return 0
+
+    for want in "${FORCE_STEPS[@]}"; do
+        local hit=0
+        for ran in ${FORCE_STEPS_RAN[@]+"${FORCE_STEPS_RAN[@]}"}; do
+            (( ran == want )) && { hit=1; break; }
+        done
+        (( hit )) || missed+=("$want")
+    done
+
+    if (( ${#missed[@]} )); then
+        die "--force-step a cerut pașii [${missed[*]}], dar corpul lor nu a rulat.
+        Nimic din ce depinde de ei nu s-a întâmplat. Verifică dacă nu cumva
+        --from-step a sărit peste ei în aceeași rulare."
+    fi
+    ok "--force-step: re-rulați efectiv pașii ${FORCE_STEPS_RAN[*]}"
+}
+
+# Steps that are NOT offered in a generated --force-step suggestion.
+#
+# Not "steps you may never force" — the flag still takes them, and there are
+# good reasons to. This is the narrower claim: re-running them has a side effect
+# beyond the step itself, so the installer will not put them in a line the
+# operator is invited to paste. The reason is printed next to the step, because
+# a refusal without one gets pasted anyway.
+#
+# Only what this repository can point at is listed. 29 is here because
+# ALWAYS_STEPS excludes it for the same reason, in the comment right below.
+force_step_is_flagged() {
+    case "$((10#$1))" in
+        29) return 0 ;;
+        *)  return 1 ;;
+    esac
+}
+
+force_step_flag_reason() {
+    case "$((10#$1))" in
+        29) printf '%s' "re-rularea reîncarcă tabela nftables. ALWAYS_STEPS o ține \
+deoparte fiindcă asta poate goli seturile, adică deblochează tăcut tot ce e blocat \
+acum. Dacă chiar vrei, adaugă-l tu, uitându-te întâi la 'nft list table inet sentinel'" ;;
+        *)  printf '%s' "re-rularea are efecte în afara pasului" ;;
+    esac
+}
+
+# What --from-step did NOT do, said once, at the end, where it is still on screen.
+#
+# The operator ran `--from-step 22` to rotate a password. Steps 22 and 27 printed
+# "(already done)" in green, in the middle of a hundred lines, and the run
+# finished with "installation finished". Nothing had been rotated.
+#
+# --from-step only skips the steps BELOW N; at or above N a marker still wins.
+# That is right for resuming an interrupted install and wrong for re-running a
+# step, and the difference is invisible unless it is spelled out.
+report_marked_skips() {
+    [[ -n "${FROM_STEP:-}" ]] || return 0
+    (( ${#STEPS_SKIPPED_MARKED[@]} )) || return 0
+
+    warn "--from-step ${FROM_STEP}: ${#STEPS_SKIPPED_MARKED[@]} pas(i) de la ${FROM_STEP} în sus \
+erau deja marcați și NU au rulat:"
+    warn "    ${STEPS_SKIPPED_MARKED[*]}"
+    warn "--from-step sare doar pașii de SUB N; unul marcat rămâne marcat. Ca să reiei"
+    warn "pași marcați, dă-le numerele lui --force-step, toate în aceeași rulare."
+
+    # The suggested command is generated, so it reads as advice. It must not
+    # advise something this same file calls dangerous a few lines below: step 29
+    # is kept out of ALWAYS_STEPS precisely because re-running it touches the
+    # live nftables table. A paste-ready line containing 29 would have been an
+    # instruction to do that, printed by the installer itself.
+    local key num
+    local -a safe=() flagged=()
+    for key in "${STEPS_SKIPPED_MARKED[@]}"; do
+        num="${key%%_*}"
+        if force_step_is_flagged "$num"; then flagged+=("$key"); else safe+=("$num"); fi
+    done
+
+    if (( ${#safe[@]} )); then
+        warn "    --force-step $(IFS=,; printf '%s' "${safe[*]}")"
+        warn "Comanda re-rulează exact pașii ăia, nimic altceva: scoate-i pe cei pe care"
+        warn "nu-i vrei, în loc s-o dai așa cum e."
+    else
+        warn "Niciunul dintre ei nu e sugerat automat — vezi mai jos."
+    fi
+
+    for key in ${flagged[@]+"${flagged[@]}"}; do
+        num="${key%%_*}"
+        warn "    ${key} NU e în comanda de mai sus: $(force_step_flag_reason "$num")"
+    done
+}
 
 # Steps that must run on EVERY invocation, marker or not.
 #
@@ -101,21 +287,39 @@ run_step() {
     key="$(printf '%02d_%s' "$num" "$name")"
     STEP_CURRENT="$key"
 
+    # A raw --force-step that reached run_step unparsed would be ignored in
+    # silence, which is the failure this whole mechanism exists to remove.
+    if [[ -n "${FORCE_STEP:-}" ]] && (( ! FORCE_STEPS_PARSED )); then
+        die "internal: --force-step was set but parse_force_steps was never called"
+    fi
+
     if [[ -n "${FROM_STEP:-}" ]] && (( num < FROM_STEP )); then
         printf '%s[-]%s step %-28s (skipped: below --from-step)\n' "$_C_BLUE" "$_C_RESET" "$key"
         return 0
     fi
-    if [[ "${FORCE_STEP:-}" == "$num" ]]; then
+    if force_step_requested "$num"; then
         clear_step "$key"
     fi
     if step_done "$key" && ! step_is_always "$name"; then
-        printf '%s[=]%s step %-28s (already done)\n' "$_C_GREEN" "$_C_RESET" "$key"
+        # Yellow, and said differently, when --from-step is in play: that is the
+        # run in which the operator asked for something and this line is the
+        # answer "no". In a plain re-run it is just idempotency, and green.
+        if [[ -n "${FROM_STEP:-}" ]]; then
+            STEPS_SKIPPED_MARKED+=("$key")
+            printf '%s[=]%s step %-28s (already done — --from-step does not re-run it)\n' \
+                "$_C_YELLOW" "$_C_RESET" "$key"
+        else
+            printf '%s[=]%s step %-28s (already done)\n' "$_C_GREEN" "$_C_RESET" "$key"
+        fi
         return 0
     fi
 
     printf '\n%s[>] step %s%s\n' "$_C_BOLD" "$key" "$_C_RESET"
     "$@"
     mark_done "$key"
+    if force_step_requested "$num"; then
+        FORCE_STEPS_RAN+=("$((10#$num))")
+    fi
     STEP_CURRENT=""
 }
 
@@ -123,6 +327,26 @@ run_step() {
 # Small utilities
 # --------------------------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Exact membership: in_list NEEDLE ITEM...
+#
+# Whole-element comparison, and that is the entire point. The callers pass
+# secret key names, where anything looser is a deletion: with a prefix match, a
+# key on disk called SENTINEL_SESSION would be judged already-known because
+# SENTINEL_SESSION_SECRET is in the list, and would then be dropped from the
+# rewritten file — the failure this whole path exists to prevent.
+#
+# (step_is_always uses `case " $list " in *" $1 "*` on a space-padded string,
+# which is a whole-WORD match and is correct for what it does. An earlier
+# version of this comment called it a substring match. It is not.)
+in_list() {
+    local needle="$1"; shift
+    local item
+    for item in "$@"; do
+        [[ "$item" == "$needle" ]] && return 0
+    done
+    return 1
+}
 
 need_root() {
     [[ "$(id -u)" -eq 0 ]] || die "this must run as root (the deploy script uses sudo)"

@@ -54,6 +54,19 @@
     With -Rollback, also drop the database. That database is the entire
     security history.
 
+.PARAMETER FromStep
+    Resume an interrupted install: every step BELOW N is skipped. At or above N
+    a completion marker still wins, so this does NOT re-run anything already
+    done. To re-run a step, use -ForceStep.
+
+.PARAMETER ForceStep
+    Clear the completion markers of the listed steps so their bodies run again.
+    One number, or a comma-separated list: -ForceStep 22,27 re-runs both in the
+    same pass, which is what rotating a secret requires — step 22 changes the
+    password in PostgreSQL and step 27 writes it into /etc/sentinel/secrets.env,
+    and the services are restarted at the end of that same run. See
+    docs/OPERARE.md §11.
+
 .EXAMPLE
     .\scripts\deploy.ps1 -HostName 203.0.113.10 -User deploy `
         -Key $HOME\.ssh\sentinel_deploy -Domain sentinel.exemplu.ro -DryRun
@@ -81,6 +94,14 @@ param(
     # from a different address than you deploy from.
     [string]$AdminIp,
     [int]$FromStep,
+    # [string[]], not [string], and that is not a style choice. In argument mode
+    # PowerShell reads a bare comma as an ARRAY constructor, so `-ForceStep 22,27`
+    # binds @('22','27'). Declared [string] it is then coerced back with $OFS —
+    # arriving as "22 27", two arguments on the remote command line, and the
+    # installer dies on the second. Declared [string[]] and joined with a comma,
+    # all four forms the operator might type (22,27 / '22,27' / 22, 27 /
+    # '22, 27') produce the same 22,27. Measured on Windows PowerShell 5.1.
+    [string[]]$ForceStep,
     [switch]$DryRun,
     [switch]$Rollback,
     [switch]$Purge,
@@ -97,6 +118,29 @@ function Write-Info { param($m) Write-Host "[.] $m" -ForegroundColor Blue }
 function Write-Ok   { param($m) Write-Host "[+] $m" -ForegroundColor Green }
 function Write-Warn { param($m) Write-Host "[!] $m" -ForegroundColor Yellow }
 function Die        { param($m) Write-Host "error: $m" -ForegroundColor Red; exit 1 }
+
+function Get-StepList {
+    <# Normalise a step list into what install.sh expects: 22 or 22,27.
+
+       The value ends up inside the remote command STRING, where a space would
+       split it into two arguments. So the spaces go — but only after the shape
+       has been checked, because "22 27" (a list typed without commas) must be
+       refused rather than squeezed into 2227, a number that means nothing and
+       would be obeyed in silence. Refusing the whole list is the point: a run
+       that forces half of a rotation is worse than one that forces none of it. #>
+    param([string[]]$Value, [string]$Flag)
+    $raw = $Value -join ','
+    if ($raw -notmatch '^\s*\d+(\s*,\s*\d+)*\s*$') {
+        Die "${Flag}: '$raw' is not a step number or a comma-separated list of them (e.g. 22 or 22,27)"
+    }
+    return ($raw -replace '\s', '')
+}
+
+# Resolved before anything is packaged or transferred: a typo should cost a
+# second, not a round trip. install.sh checks it again on the server, where it
+# remains the authority on which numbers are real steps.
+$forceStepList = ''
+if ($ForceStep) { $forceStepList = Get-StepList -Value $ForceStep -Flag '-ForceStep' }
 
 # ---------------------------------------------------------------------------
 # Tooling
@@ -412,6 +456,7 @@ if ($AdminIp)  { $installArgs += "--admin-ip '$AdminIp'" }
 if ($Domain)   { $installArgs += "--domain '$Domain'" }
 if ($Email)    { $installArgs += "--email '$Email'" }
 if ($FromStep) { $installArgs += "--from-step $FromStep" }
+if ($forceStepList) { $installArgs += "--force-step $forceStepList" }
 
 Write-Info 'installing (secrets go over stdin, never argv)'
 

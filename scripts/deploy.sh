@@ -11,8 +11,13 @@
 #   --cert-mode M  auto|webroot|dns|selfsigned|none — see docs/DEPLOYMENT.md §2.1
 #   --dry-run      run preflight only; change nothing
 #   --rollback     undo a previous deployment
-#   --from-step N  resume an interrupted install
-#   --force-step N re-run one step even though it is marked done
+#   --from-step N  resume an interrupted install. It skips the steps BELOW N;
+#                  at or above N a completion marker still wins, so it does NOT
+#                  re-run anything already done
+#   --force-step L re-run the listed steps even though they are marked done.
+#                  One number, or a comma-separated list: --force-step 22,27
+#                  re-runs both in the SAME pass, which is what rotating a
+#                  secret requires — see docs/OPERARE.md §11
 #   --purge        with --rollback, also drop the database
 #
 # This script is deliberately thin. All the real logic lives in
@@ -43,7 +48,25 @@ info() { printf '\033[34m[.]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[32m[+]\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[!]\033[0m %s\n' "$*" >&2; }
 
-usage() { sed -n '2,20p' "$0"; exit 0; }
+usage() { sed -n '2,25p' "$0"; exit 0; }
+
+# --force-step is passed through to install.sh, which stays the authority on
+# what the numbers mean. Two things still have to happen here:
+#
+#   * the value lands in an UNQUOTED expansion of INSTALL_ARGS inside the remote
+#     command string, so "22, 27" would arrive at the installer as two separate
+#     arguments and it would die on the second. The spaces are removed.
+#   * "22 27" — a comma-less list — must be REFUSED, not squeezed into 2227.
+#     That is why the shape is checked before any whitespace is stripped: a
+#     silently mangled step number is exactly the class of bug this flag exists
+#     to stop.
+normalize_step_list() {
+    local raw="$1" flag="$2"
+    if [[ ! "$raw" =~ ^[[:space:]]*[0-9]+([[:space:]]*,[[:space:]]*[0-9]+)*[[:space:]]*$ ]]; then
+        die "${flag}: '${raw}' is not a step number or a comma-separated list of them (e.g. 22 or 22,27)"
+    fi
+    printf '%s' "${raw//[[:space:]]/}"
+}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -62,6 +85,9 @@ while [[ $# -gt 0 ]]; do
         # through, so the only way to re-run one step was to ssh in and run
         # the installed copy — which fails, because the source tree it needs
         # only exists inside the transferred tarball.
+        #
+        # It takes a list now: some steps are one operation and forcing half of
+        # one leaves the host inconsistent. See normalize_step_list above.
         --force-step) FORCE_STEP="${2:-}"; shift 2 ;;
         --dry-run)   DRY_RUN=1; shift ;;
         --rollback)  ROLLBACK=1; shift ;;
@@ -74,6 +100,13 @@ done
 
 [[ -n "$HOST" ]] || die "--host is required"
 [[ -n "$USER" ]] || die "--user is required"
+
+# Refused here, before a tarball is built or an SSH session opened. The
+# installer checks it again on the server — it is the authority — but a typo
+# should cost a second, not a round trip.
+if [[ -n "$FORCE_STEP" ]]; then
+    FORCE_STEP="$(normalize_step_list "$FORCE_STEP" --force-step)" || exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # SSH key
