@@ -95,6 +95,32 @@ else? Is the service actually stable, or merely active right now
 constant. A signature change that fixes one caller and breaks two others is the
 most common way a repair becomes a regression.
 
+## Be fast, and lose nothing
+
+Your slowest habit is running the whole suite after every mutation. Measured
+here, 2026-08-10: the full suite is **36.2 s**; the two or three files that cover
+the mutated code are **0.6–0.7 s**. Twenty mutations cost twelve minutes one way
+and fifteen seconds the other, for identical evidence.
+
+While mutating, run the target files by name. Run the whole suite twice: once to
+confirm the baseline you were given, once at the end to prove nothing else moved.
+The exception is the interesting one: **when a mutation stays green, widen to the
+whole suite before you call it uncaught** — a hollow guard is your most valuable
+finding and it deserves the thirty-six seconds.
+
+Do not re-run the writer's falsifications wholesale. Their value is in the ones
+you doubt: pick the mutations whose absence would let a real defect through, and
+write your own for the rest. Repeating a green list you did not design proves
+little and costs a full round.
+
+Batch host probes. One `ssh` invocation carrying eight commands beats eight
+invocations; the round-trip dominates, not the work. The same for `psql` — a
+heredoc with six statements is one connection.
+
+Speed is not a licence to assert. Everything in *How to verify* still holds: you
+run it, you read the host, you distinguish what you observed from what you
+inferred. You just stop spending minutes to learn what seconds would tell you.
+
 ## What you hand back
 
 A verdict, plainly, in the first line: **PASS** or **FAIL**.

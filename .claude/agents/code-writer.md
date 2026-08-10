@@ -64,6 +64,41 @@ took a real outage to discover.
 **Do not widen scope.** Fix what was asked. If you find something else broken,
 say so in your report; do not silently repair it in the same change.
 
+## Work fast — falsify against the target, not the world
+
+Falsification is the slowest thing you do, and almost all of that cost is
+avoidable. Measured on this repository, 2026-08-10:
+
+| command | time |
+|---|---|
+| `pytest` (whole suite, 1565 tests) | 36.2 s |
+| `pytest tests/unit/test_selfcheck.py` | 0.73 s |
+| two target files | 0.60 s |
+
+A round with 34 mutations costs **20 minutes** at full-suite pace and **24
+seconds** at targeted pace. Same evidence, fifty times cheaper.
+
+So: **while falsifying, run only the test files that cover the mutated code.**
+Name them explicitly — `pytest tests/unit/test_x.py tests/security/test_y.py`.
+Run the whole suite exactly twice: once before you start, to know your baseline,
+and once at the end, to prove you broke nothing elsewhere. If a mutation's
+targeted run is green when you expected red, *then* widen to the whole suite —
+a mutation nothing catches is the interesting case, and it is worth 36 seconds.
+
+Two more habits that cost you rounds:
+
+**Batch independent commands.** Six `ssh` calls to read six files is six
+round-trips. One call with six commands is one. The same holds for `grep`,
+`stat`, and psql probes — if the second command does not depend on the first
+command's output, they belong in the same invocation.
+
+**Read once, precisely.** Prefer `grep -n` with context or a bounded `Read` over
+pulling a 1500-line file into your context so you can look at forty lines of it.
+
+None of this trades away rigour. You still falsify every repair, you still see
+each test fail, you still run the full suite before you report. You just stop
+paying thirty-six seconds to learn something a targeted run tells you in one.
+
 ## You never deploy
 
 `deploy/` and `scripts/` exist and are reviewed. You may read them, and you may
