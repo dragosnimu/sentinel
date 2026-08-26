@@ -1,0 +1,25 @@
+# Binare externe instalate de `step_external_tools` (pasul 21 din install.sh).
+#
+# Format: <nume> <url> <sha256>
+#
+# Regula, scrisă în install.sh și repetată aici fiindcă e cea care contează:
+# niciodată `curl | bash`. Fiecare binar se descarcă, se verifică față de suma
+# fixată mai jos, și abia apoi se instalează. La nepotrivire, instalarea se
+# oprește cu `fail` — nu se ocolește, nu se reîncearcă fără verificare. O
+# unealtă de securitate care conduce internetul într-un shell n-are ce audita.
+#
+# Suma de control e citită din fișierul de checksums publicat de proiect,
+# alături de release, peste HTTPS. Asta dovedește că binarul descărcat e cel
+# pe care proiectul l-a publicat. Nu dovedește că proiectul n-a fost compromis
+# la sursă — pentru asta există semnăturile Sigstore, pe care instalatorul nu
+# le verifică încă.
+#
+# Când actualizezi o versiune: schimbă URL-ul ȘI suma, în același commit.
+# O sumă rămasă în urmă face instalarea să eșueze — ceea ce e comportamentul
+# corect, nu un inconvenient.
+#
+# Fișierul lipsea până pe 10 august 2026. Pasul 21 avertiza și returna 0, deci
+# se marca „gata" fără să instaleze nimic, iar scanarea de vulnerabilități a
+# lipsit unsprezece zile fără ca ceva să raporteze un defect.
+
+trivy https://github.com/aquasecurity/trivy/releases/download/v0.73.0/trivy_0.73.0_Linux-64bit.tar.gz 2edd39da482bb4e9831962487b68f68e3928ec3137794757f54d00383d79547b

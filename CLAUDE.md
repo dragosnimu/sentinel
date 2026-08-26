@@ -9,9 +9,17 @@ ordinea asta, înainte de commit:
 2. **`code-verifier`** încearcă să demonstreze că e greșit — rulează testele,
    le falsifică, și citește gazda de producție prin ssh (doar citire).
 
-Se repară și se reia până trece. Dacă aceeași cauză e respinsă de două ori,
-asta se spune operatorului — nu ca oprire, ca informare că abordarea se
-învârte.
+Se repară și se reia, **cel mult trei runde**. O rundă e o trecere a
+scriitorului plus una a verificatorului.
+
+Dacă aceeași cauză e respinsă de două ori, asta se spune operatorului atunci,
+nu la final — nu ca oprire, ca informare că abordarea se învârte.
+
+Dacă runda a treia tot pică, munca se oprește acolo și decide operatorul.
+Predarea conține ce s-a reparat și s-a dovedit, ce e încă greșit, unde nu sunt
+de acord cele două părți, și ce decizie se cere. **Nu se livrează nimic pe
+motiv că s-au terminat rundele** — plafonul mărginește cât se ceartă doi
+agenți, nu coboară ștacheta.
 
 **Ce trece:** cod, configurații, scripturi de deploy, reguli auditd, SQL,
 unități systemd, vhosturi nginx, TypeScript.
@@ -20,6 +28,12 @@ unități systemd, vhosturi nginx, TypeScript.
 Regula a fost cerută de operator pe 8 august 2026, după o zi în care un
 diacritic într-un alias de comandă a oprit canalul de alertare timp de 24 de
 ore, iar trei mecanisme separate au raportat succes fără să verifice efectul.
+
+Plafonul de trei runde a fost adăugat pe 13 august 2026, după o schimbare care
+a luat patru: apartenența la martorul extern a fost greșită întâi fiindcă se
+încredea în director, apoi fiindcă se încredea în configurație. A treia rundă
+a fost cea care a schimbat proiectarea în loc s-o petice. Un plafon face ca
+runda aceea să vină din regulă, nu din faptul că a observat cineva la timp.
 
 ## De ce: tiparul care produce bug-urile de aici
 

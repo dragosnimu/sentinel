@@ -16,7 +16,7 @@ from sentinel.db.engine import Database
 from sentinel.db.repo import findings as fx
 from sentinel.intel import kev
 from sentinel.logging_setup import get_logger
-from sentinel.scan import os_packages, prioritize
+from sentinel.scan import announce, os_packages, prioritize
 
 log = get_logger(__name__)
 
@@ -39,6 +39,20 @@ async def run_all(db: Database, cfg: Config, *, triggered_by: str = "schedule") 
         summary["dnf"] = await _run_os_packages(db, triggered_by)
 
     summary["patch_plans"] = await _draft_plans(db, cfg)
+
+    # Anuntul, la SFARSIT: dupa ce fiecare scaner si-a incheiat rularea si dupa
+    # ce planurile au fost schitate. Trimis dupa fiecare scaner in parte, un
+    # operator cu trei scanere ar primi trei mesaje pentru aceeasi rulare.
+    #
+    # Constatarile se aduna din TOATE scanerele care raporteaza `new_items`, nu
+    # dintr-unul anume: un scaner adaugat maine intra in anunt fara sa editeze
+    # nimeni linia asta, iar unul care nu raporteaza nimic nu strica nimic.
+    fresh: list[dict] = []
+    for result in summary.values():
+        fresh.extend(result.get("new_items") or [])
+    if fresh:
+        summary["announced"] = {"chats": await announce.announce(cfg, fresh),
+                                "findings": len(fresh)}
     return summary
 
 
@@ -99,6 +113,11 @@ async def _run_os_packages(db: Database, triggered_by: str) -> dict:
         kev_map = await kev.lookup(db, cves)
 
         seen: list[str] = []
+        # Constatarile NOI, pastrate intregi, nu doar numarate: mesajul de pe
+        # Telegram are nevoie de CVE, pachet, versiuni si de steagul KEV, iar
+        # toate sunt deja in `f`. O a doua interogare care le-ar citi inapoi ar
+        # putea intoarce altceva — intre timp o alta rulare poate atinge randul.
+        new_items: list[dict] = []
         new = 0
         for f in raw:
             due = kev_map.get(f.get("cve", ""))
@@ -110,6 +129,7 @@ async def _run_os_packages(db: Database, triggered_by: str) -> dict:
             f["priority"] = prioritize.score(f, exposed=True, criticality=3)
             if await fx.upsert_finding(db, f):
                 new += 1
+                new_items.append(dict(f))
             seen.append(f["finding_key"])
 
         resolved = await fx.mark_resolved_absent(db, "dnf", None, seen)
@@ -120,7 +140,11 @@ async def _run_os_packages(db: Database, triggered_by: str) -> dict:
                  extra={"findings": len(raw), "new": new, "resolved": resolved,
                         "kev": len(kev_map)})
         return {"status": "completed", "findings": len(raw), "new": new,
-                "resolved": resolved, "kev": len(kev_map)}
+                "resolved": resolved, "kev": len(kev_map),
+                # Lista, nu doar numarul: `run_all` o duce la anunt. Ramane in
+                # sumar si cand e goala, ca apelantul sa nu trebuiasca sa
+                # deosebeasca „n-a fost nimic nou" de „scanarea asta nu spune".
+                "new_items": new_items}
     except Exception as exc:  # noqa: BLE001 - record and surface, do not crash the pass
         await fx.finish_scan(db, scan_id, status="failed", error=str(exc)[:500])
         log.error("dnf scan crashed", extra={"detail": str(exc)})

@@ -273,8 +273,15 @@ erau deja marcați și NU au rulat:"
 # `nftables` is deliberately absent. Re-creating the table would empty the
 # named sets, which means silently unblocking every attacker currently blocked.
 # Refreshing config is worth a re-run; dropping a live blocklist is not.
+# `snapshot` is here for a SECOND reason, not the one above: it carries no repo
+# content at all. It is here because a pre-deploy snapshot whose contents predate
+# the deploy is not a rollback point — it is a rollback point's costume. Marked
+# done once and skipped forever, step 18 left every later deploy advertising the
+# first snapshot ever taken; on 21 August 2026 a deploy printed one whose files
+# were dated 31 July. Cheap to redo (a few `nft list`, `rpm -qa` and a tar), and
+# worthless if stale, so it re-runs every time.
 ALWAYS_STEPS="package claude_workspace configs migrate systemd start_services \
-nginx nginx_shared auxiliary"
+nginx nginx_shared auxiliary snapshot"
 
 step_is_always() {
     case " ${ALWAYS_STEPS} " in *" $1 "*) return 0 ;; *) return 1 ;; esac

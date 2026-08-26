@@ -110,6 +110,7 @@ deploy/lib/distro.sh           Every RHEL-vs-Debian difference, in one file and 
 scripts/wizard.sh              The guided installer — start here
 scripts/                       Operator-side tooling (bash + PowerShell, runs from Windows too)
 docs/                          Romanian documentation — start with docs/DEPLOYMENT.md
+docs/ISTORIC-SESIUNI.md        Who logged in, what they ran, and what is deliberately not recorded
 tests/                         unit / integration / security
 ```
 

@@ -263,6 +263,66 @@ Un lanț rupt e detectabil și alertează. Vezi [DEPANARE.md](DEPANARE.md) §11.
 
 ---
 
+## 8b. Istoricul de comenzi, și ce poate ajunge în el
+
+Din 24 august 2026, Sentinel înregistrează **fiecare comandă** rulată într-o
+sesiune cu login: binarul, argumentele, directorul, terminalul și procesul
+părinte. Retenție nelimitată pe gazdă, 180 de zile pe agregator. Detaliile de
+folosire sunt în [ISTORIC-SESIUNI.md](ISTORIC-SESIUNI.md); aici stă doar
+consecința de securitate.
+
+### `argv` e un loc în care ajung secrete
+
+Linia de comandă a oricărui proces e vizibilă în `/proc` pentru orice utilizator
+de pe gazdă. De-asta `scripts/deploy.sh` trimite secretele pe **stdin, niciodată
+în argv**. Dar restul lumii nu respectă regula: `mysql -pparola`,
+`curl -H "Authorization: Bearer …"`, `PGPASSWORD=x psql`.
+
+Fără nicio măsură, tabela de istoric ar fi devenit locul în care se adună
+secretele scrise greșit de altcineva — cu retenție nelimitată, în backup-uri, și
+replicate pe o găzduire partajată unde personalul furnizorului are acces la bază.
+
+`sentinel/redact.py` taie valorile care arată a secret **la colectare**, înainte
+ca rândul să atingă baza. Redactat la citire, secretul ar fi rămas oriunde.
+
+### Ce NU prinde redactarea
+
+E o listă de tipare, nu o garanție. Trec întregi:
+
+* un secret pus ca **argument pozițional** fără nume în față, dacă nu e destul de
+  lung sau nu amestecă litere și cifre — `./tool parolamea`;
+* un secret într-un **URL cu parametri** — `curl https://api/x?k=SECRET`;
+* o parolă care **arată ca un cuvânt obișnuit**;
+* orice opțiune de o literă a unui program care nu e în lista scurtă
+  (`ssh-keygen -N`, `openssl -passin`, `htpasswd -b`).
+
+Pragul de lungime pentru un token fără nume e 32 de caractere, iar șirurile
+formate dintr-un singur fel de caractere sunt lăsate în pace — altfel fiecare
+cale absolută lungă ar dispărea din istoric, iar un istoric în care jumătate din
+linii sunt `«redactat»` nu se mai citește.
+
+**Consecința practică:** tratează baza Sentinel și backup-urile ei ca pe un loc
+în care *poate* exista un secret scăpat. Nu ca pe unul în care sigur nu există.
+
+### Ce nu se înregistrează deloc
+
+Comenzile rulate **înăuntrul unui container** — `docker exec -it x bash` — nu
+apar: procesele din container n-au `auid`. Intrarea în container se
+înregistrează; ce urmează, nu. E o gaură cunoscută, și e calea pe care ar
+folosi-o cineva care știe ce face.
+
+### Contul de automatizare are `sudo` nelimitat
+
+`sentinel-deploy` primește `NOPASSWD: ALL`. Motivul și compromisul sunt scrise
+în [ISTORIC-SESIUNI.md](ISTORIC-SESIUNI.md): o listă de comenzi care rămâne în
+urmă face un deploy să pice la jumătate. Ce face asta suportabil e că fiecare
+comandă a contului ajunge în istoric, cu argumente, pentru totdeauna.
+
+Cine obține cheia contului ăluia obține root pe gazdă. Cheia privată nu există
+niciodată pe server — se generează pe mașina operatorului.
+
+---
+
 ## 9. Ce NU protejează Sentinel
 
 Sinceritatea aici contează mai mult decât lista de funcționalități.

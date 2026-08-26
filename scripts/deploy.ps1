@@ -20,10 +20,29 @@
     reserves $Host for the console object.)
 
 .PARAMETER User
-    SSH user with sudo.
+    SSH account to deploy as. Defaults to sentinel-deploy, the account
+    deploy/install.sh creates with NOPASSWD sudo, and the account named in
+    history.skip_command_accounts.
+
+    That pairing is the whole point of the default. auid is the LOGIN uid and
+    survives sudo, so deploying under a human account files all 405 777
+    terminal-less commands of a run under that human's name — a name the filter
+    does not know, and must not, because the same operator's remote diagnostics
+    run under it and are worth keeping. Override only if you installed with a
+    different DEPLOY_ACCOUNT, and change the config to match.
 
 .PARAMETER Key
-    Path to the private key.
+    Path to the private key. Defaults to $HOME\.ssh\sentinel_deploy, the key
+    authorized on the sentinel-deploy account -User also defaults to.
+
+    The two are one decision. sentinel-deploy authorizes that key and no other,
+    so keeping the new -User with an older key ends the run at the first ssh with
+    "Permission denied (publickey)" — and the way out of that is to put -User
+    back, which makes the history filter inert again.
+
+    Only a default: a -Key you pass is used as given and must exist, and a
+    missing default is a warning, not an error, because an agent or an
+    IdentityFile in ~/.ssh/config are legitimate and this script cannot see them.
 
 .PARAMETER Domain
     Domain for the dashboard. Without it, certbot is skipped and a self-signed
@@ -68,8 +87,8 @@
     docs/OPERARE.md §11.
 
 .EXAMPLE
-    .\scripts\deploy.ps1 -HostName 203.0.113.10 -User deploy `
-        -Key $HOME\.ssh\sentinel_deploy -Domain sentinel.exemplu.ro -DryRun
+    .\scripts\deploy.ps1 -HostName 203.0.113.10 `
+        -Domain sentinel.exemplu.ro -DryRun
 #>
 
 [CmdletBinding()]
@@ -77,7 +96,10 @@ param(
     # -Host cannot be used: PowerShell reserves $Host. The aliases exist because
     # `-Host` and `-SshHost` are what everyone types first.
     [Parameter(Mandatory = $true)][Alias('SshHost','Server','H')][string]$HostName,
-    [Parameter(Mandatory = $true)][string]$User,
+    # Not Mandatory, and hardcoded rather than read from the environment: on
+    # Windows $env:USERNAME is always set, so a default derived from it would
+    # silently be the old behaviour on the exact machine this fixes.
+    [string]$User = 'sentinel-deploy',
     [string]$Key,
     [int]$Port = 22,
     [string]$Domain,
@@ -180,6 +202,22 @@ $scpArgs = @(
     '-o', 'ConnectTimeout=15'
     '-P', "$Port"          # scp spells it -P, ssh spells it -p
 )
+
+# Paired with $User above: sentinel-deploy authorizes this key and no other, so
+# the account default is only usable together with the key default. Applied only
+# when the file is really there — substituting a path that does not exist would
+# turn "ssh, choose an identity" into a hard error on machines that worked.
+$DeployKeyDefault = Join-Path $HOME '.ssh\sentinel_deploy'
+if (-not $Key) {
+    if (Test-Path $DeployKeyDefault) {
+        $Key = $DeployKeyDefault
+        Write-Info "using default key $Key (pairs with -User $User)"
+    } else {
+        Write-Warn "no -Key and $DeployKeyDefault does not exist; ssh will choose an identity."
+        Write-Warn "If it picks the one for your own login, $User@$HostName refuses it with"
+        Write-Warn "'Permission denied (publickey)' — that account authorizes sentinel_deploy."
+    }
+}
 
 if ($Key) {
     $Key = [System.Environment]::ExpandEnvironmentVariables($Key)
@@ -359,8 +397,25 @@ try {
     # witness, and its whole value is running somewhere the monitored host
     # cannot reach. Shipping a copy here would put the thing that reports
     # Sentinel's death on the machine whose death it reports.
+    #
+    # aggregator/ is excluded for the same reason and one more. It runs on the
+    # same external hosting as the witness, and it is the archive of what left
+    # this machine — "what left cannot be deleted from here" stops being true
+    # the moment a copy of the archive's schema and credentials-handling code
+    # sits on the host being archived. Nothing under deploy/ or sentinel/ reads
+    # it.
+    #
+    # scratchpad/ holds verification harnesses and their `.bak` copies of
+    # install.sh, config.py and the signing module — source nothing on the host
+    # runs, second copies of files whose single-copy-ness is the point, and a
+    # stale harness that can be run against a newer tree. The size ceiling below
+    # sees none of that. This list must stay identical to the one in deploy.sh;
+    # tests/security/test_package_contents.py compares them, because a Windows
+    # deploy that ships what a Linux deploy excludes is the same hole.
     & $tar --exclude='./secrets' --exclude='./.git' --exclude='./tests' `
-           --exclude='./docs' --exclude='./watcher' --exclude='./dist' `
+           --exclude='./docs' --exclude='./watcher' --exclude='./aggregator' `
+           --exclude='./scratchpad' `
+           --exclude='./dist' `
            --exclude='node_modules' --exclude='.next' `
            --exclude='__pycache__' --exclude='*.pyc' `
            --exclude='.venv' --exclude='.pytest_cache' --exclude='.mypy_cache' `
@@ -382,14 +437,22 @@ if ($sizeKb -gt $PackageMaxKb) {
 }
 
 # A CRLF in a .sh or .service file fails on Linux as `bad interpreter:
-# /bin/bash^M`. .gitattributes covers a git checkout; this catches a zip
-# download, a copy through an editor, or a merge that lost the attributes.
-$crlf = Get-ChildItem (Join-Path $RepoRoot 'deploy') -Recurse -File -Include *.sh, *.service, *.timer, *.nft |
-    Where-Object { (Get-Content $_.FullName -Raw) -match "`r`n" }
-if ($crlf) {
-    Write-Host "error: CRLF line endings found — these will not execute on Linux:" -ForegroundColor Red
-    $crlf | ForEach-Object { Write-Host "    $($_.FullName)" -ForegroundColor Red }
-    Die "Re-clone with .gitattributes applied, or convert them before deploying."
+# /bin/bash^M`. A CRLF in deploy/audit/sentinel.rules is worse, because it is
+# quiet: the key becomes `sentinel_ssh^M`, auditd accepts the rule, and the
+# collector matches nothing until somebody notices.
+#
+# The check is on the PACKAGE, after tar and before the transfer, so it reads
+# the exact bytes that are about to leave this machine. .gitattributes
+# normalises on commit; this is what catches a file a tool rewrote between
+# commit and deploy. Criterion and exemptions are argued in the script itself,
+# which is the twin of the one deploy.sh calls.
+#
+# Any non-zero exit stops the deploy, including exit 2 — "I could not inspect
+# the package" is not permission to send it.
+& (Join-Path $PSScriptRoot 'lib\Check-LineEndings.ps1') -Package $tarball -SourceRoot $RepoRoot
+if ($LASTEXITCODE -ne 0) {
+    Remove-Item $tarball -Force -ErrorAction SilentlyContinue
+    Die 'refusing to deploy this package — see above.'
 }
 
 Write-Info "transferring to ${HostName}:$remoteDir"

@@ -18,7 +18,15 @@
 
 <style>
 /* ===========================================================================
-   Sentinel — landing comercial pentru cryptoitdata.eu
+   Sentinel — landing comercial
+
+   Domeniul e scris `exemplu.ro` peste tot, inclusiv în atributele `data-d`
+   (adresa de e-mail scrisă inversat, contra recoltatoarelor). Depozitul e
+   public, iar din domeniul înregistrabil al operatorului subdomeniul martorului
+   extern iese dintr-un jurnal de transparență a certificatelor în câteva
+   secunde — vezi `tests/security/test_repo_is_sanitised.py`. Înainte de
+   publicare se înlocuiește cu domeniul real; slug-urile articolelor sunt
+   păstrate, deci sursele rămân găsibile după titlu.
 
    Paleta, fonturile, razele și ritmul secțiunilor sunt citite din stilurile
    calculate ale site-ului: Space Grotesk 900 cu tracking negativ, Inter pentru
@@ -331,7 +339,7 @@ section{padding:var(--pad) 0}
 }
 
 /* ── Fundal animat ─────────────────────────────────────────────────────────
-   Aceeași structură ca pe cryptoitdata.eu: canvas full-bleed în hero-ul
+   Aceeași structură ca pe exemplu.ro: canvas full-bleed în hero-ul
    întunecat, în spatele conținutului, fără evenimente de mouse, mascat să
    dispară complet spre baza secțiunii. Masca e ce îl face fundal și nu
    ilustrație — se stinge înainte să atingă textul de jos. */
@@ -418,7 +426,7 @@ section{padding:var(--pad) 0}
 
 <header class="topbar">
   <div class="wrap">
-    <a class="brand" href="https://cryptoitdata.eu"><i></i>Sentinel <small>by CryptoITData</small></a>
+    <a class="brand" href="https://exemplu.ro"><i></i>Sentinel <small>by CryptoITData</small></a>
     <!-- Eticheta lungă se rupe pe trei rânduri într-o bară de 375px. Textul
          scurt e pentru telefon, nu o prescurtare de dragul esteticii. -->
     <a class="btn btn-primary" href="#discutie"
@@ -555,7 +563,7 @@ section{padding:var(--pad) 0}
         1,9&nbsp;mil.&nbsp;$ mai puțin per incident</span></div>
     </div>
 
-    <a class="source-link reveal" href="https://cryptoitdata.eu/en/blog/servere-expuse-internet-atacuri-ai"
+    <a class="source-link reveal" href="https://exemplu.ro/en/blog/servere-expuse-internet-atacuri-ai"
        target="_blank" rel="noopener">
       Analiza completă pe blogul nostru: „Servere expuse la internet — nu <em>dacă</em>, ci <em>când</em>" →
     </a>
@@ -747,7 +755,7 @@ section{padding:var(--pad) 0}
           <li class="off"><i>–</i> Monitorizare de către noi</li>
           <li class="off"><i>–</i> Aplicarea patch-urilor</li>
         </ul>
-        <a class="btn btn-dark" href="https://cryptoitdata.eu/contact">Cere ofertă</a>
+        <a class="btn btn-dark" href="https://exemplu.ro/contact">Cere ofertă</a>
       </div>
 
       <div class="plan feat">
@@ -764,7 +772,7 @@ section{padding:var(--pad) 0}
           <li><i>✓</i> Suport la incident, în timpul programului</li>
           <li class="off"><i>–</i> Intervenție în afara programului</li>
         </ul>
-        <a class="btn btn-primary" href="https://cryptoitdata.eu/contact">Cere ofertă</a>
+        <a class="btn btn-primary" href="https://exemplu.ro/contact">Cere ofertă</a>
       </div>
 
       <div class="plan">
@@ -779,7 +787,7 @@ section{padding:var(--pad) 0}
           <li><i>✓</i> Sesiune de instruire pentru echipa ta</li>
           <li><i>✓</i> SLA negociat</li>
         </ul>
-        <a class="btn btn-dark" href="https://cryptoitdata.eu/contact">Discutăm</a>
+        <a class="btn btn-dark" href="https://exemplu.ro/contact">Discutăm</a>
       </div>
     </div>
   </div>
@@ -916,14 +924,14 @@ section{padding:var(--pad) 0}
       Sentinel are sens în cazul tău — inclusiv dacă răspunsul e „nu încă".
     </p>
     <div class="cta-actions">
-      <a class="btn btn-primary" href="https://cryptoitdata.eu/contact">Programează o discuție gratuită</a>
+      <a class="btn btn-primary" href="https://exemplu.ro/contact">Programează o discuție gratuită</a>
       <!-- Adresa nu există nicăieri în sursă, nici măcar cu @ înlocuit: cele
            două jumătăți sunt stocate inversate, în atribute separate, și se
            compun la runtime. Asta oprește harvesterul care trece cu regex prin
            HTML brut — nu și un scraper cu browser headless. Nimic de pe client
            nu îl oprește pe ăla; formularul de contact e răspunsul acolo. -->
-      <a class="btn btn-ghost" data-u="olleh" data-d="ue.atadtiotpyrc"
-         href="https://cryptoitdata.eu/contact" rel="nofollow">scrie-ne pe email</a>
+      <a class="btn btn-ghost" data-u="olleh" data-d="or.ulpmexe"
+         href="https://exemplu.ro/contact" rel="nofollow">scrie-ne pe email</a>
     </div>
     <p class="hero-note" style="margin-top:1.8rem">
       Expertiză corporate. Livrată rapid. Fără overhead, fără jargon, fără surprize.
@@ -934,9 +942,9 @@ section{padding:var(--pad) 0}
 <footer class="night foot">
   <div class="wrap">
     <span>© <span id="yr">2026</span> Sentinel by CryptoITData</span>
-    <span><a href="https://cryptoitdata.eu">cryptoitdata.eu</a> ·
-      <a data-u="olleh" data-d="ue.atadtiotpyrc" rel="nofollow"
-         href="https://cryptoitdata.eu/contact">contact</a></span>
+    <span><a href="https://exemplu.ro">exemplu.ro</a> ·
+      <a data-u="olleh" data-d="or.ulpmexe" rel="nofollow"
+         href="https://exemplu.ro/contact">contact</a></span>
   </div>
 </footer>
 

@@ -16,9 +16,13 @@ bot token.
 Except for the one case that breaks: **when the alerting channel is itself the
 thing that is down.** A message about a dead bot, queued for that bot, is a
 message nobody will ever read. So a failure of `alert:*` escalates to a direct
-send, using the token from the secrets file this process can already read. It is
-the only place in the codebase that sends outside the bot, and it exists because
-the alternative is a silence that looks exactly like health.
+send, using the token from the secrets file this process can already read. It
+exists because the alternative is a silence that looks exactly like health.
+
+Sending outside the bot happens in exactly two places — here, and `sentinel
+telegram --send-test`, which the installer runs to prove the channel before
+anyone is relying on it. Both go through `telegram/direct.py`, so "did it
+actually arrive" is decided once.
 
 ## What it never does
 
@@ -291,22 +295,32 @@ async def _send_direct(cfg: Config, text: str) -> None:
 
     Best-effort by design: this runs when things are already broken, and a
     failure here must not stop the self-check from recording what it found.
+
+    Best-effort is not the same as unverified, though. This used to log
+    "selfcheck alerted directly" after any POST that did not raise — a 400 from
+    Telegram ("chat not found", "bot was blocked by the user") produced the same
+    green line as a delivered message, in the one path that exists for when
+    every other path is broken. The per-chat outcome is logged now: a message_id
+    is delivery, anything else says which chat and why.
     """
     try:
-        import httpx
-
         from sentinel.config import get_secrets
+        from sentinel.telegram.direct import send_to_chats
 
         token = get_secrets().get("TELEGRAM_BOT_TOKEN")
         if not token or not cfg.telegram.allowed_chat_ids:
             return
-        async with httpx.AsyncClient(timeout=15) as client:
-            for chat_id in cfg.telegram.allowed_chat_ids:
-                await client.post(
-                    f"https://api.telegram.org/bot{token}/sendMessage",
-                    json={"chat_id": chat_id, "parse_mode": "HTML",
-                          "text": "⚠️ <i>trimis direct de autoverificare — "
-                                  "botul nu răspunde</i>\n\n" + text})
-        log.warning("selfcheck alerted directly; the bot is down")
+        outcomes = await send_to_chats(
+            token, cfg.telegram.allowed_chat_ids,
+            "⚠️ <i>trimis direct de autoverificare — botul nu răspunde</i>\n\n" + text,
+            parse_mode="HTML", timeout_s=15)
+        delivered = [o.chat_id for o in outcomes if o.ok]
+        failed = [o.describe() for o in outcomes if not o.ok]
+        if delivered:
+            log.warning("selfcheck alerted directly; the bot is down",
+                        extra={"chats": ",".join(str(c) for c in delivered)})
+        if failed:
+            log.error("direct selfcheck alert did not reach every chat",
+                      extra={"detail": "; ".join(failed)})
     except Exception as exc:  # noqa: BLE001
         log.error("direct selfcheck alert failed", extra={"detail": str(exc)})

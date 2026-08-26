@@ -8,6 +8,12 @@ try it during an incident. The way back is the pre-deploy snapshot.
 Each file runs inside a single transaction. PostgreSQL supports transactional
 DDL, so a failing migration leaves nothing half-applied.
 
+One thing besides migrations happens here: the instance identity is mirrored
+into `instance_identity`, on the same connection, after the schema is known to
+be current. It lives here because that is the only place where "the mirror table
+exists" is an observed fact rather than an assumption about some other command —
+see `sentinel/db/identity_mirror.py`. It never fails the run.
+
     sentinel migrate --dry-run
     sentinel migrate
 """
@@ -23,6 +29,7 @@ from pathlib import Path
 import asyncpg
 
 from sentinel.config import database_dsn
+from sentinel.db.identity_mirror import mirror_instance_id
 from sentinel.errors import StorageError
 from sentinel.logging_setup import get_logger
 
@@ -105,13 +112,23 @@ async def _apply(dsn: str, dry_run: bool) -> int:
                     "new one instead of editing this."
                 )
 
-        if not pending:
-            log.info("schema up to date", extra={"applied": len(applied)})
-            return 0
-
         if dry_run:
             for m in pending:
                 print(f"would apply {m.version:04d}_{m.name}  ({len(m.sql)} bytes)")
+            # `--dry-run` nu are voie să scrie, nici măcar urma încercării: e
+            # comanda pe care o rulează cineva care încearcă să afle ce s-ar
+            # întâmpla, nu să facă să se întâmple.
+            return 0
+
+        if not pending:
+            log.info("schema up to date", extra={"applied": len(applied)})
+            # Oglinda se scrie și aici, nu doar când au fost migrații de aplicat.
+            # Pe orice gazdă instalată deja, 0022 e demult aplicată, deci ramura
+            # asta e SINGURA care se atinge la o reinstalare — un `return 0` mai
+            # devreme ar fi însemnat că oglinda nu se scrie niciodată acolo unde
+            # contează, iar `check_instance_identity` ar fi rămas pe „oglinda nu
+            # e scrisă încă" pentru totdeauna.
+            await mirror_instance_id(conn)
             return 0
 
         for m in pending:
@@ -139,6 +156,11 @@ async def _apply(dsn: str, dry_run: bool) -> int:
                 extra={"version": m.version, "migration": m.name, "duration_ms": duration_ms},
             )
 
+        # După migrații, pe aceeași conexiune: aici „tabela oglinzii există" e un
+        # fapt din procesul ăsta, nu o presupunere despre altă comandă. Vezi
+        # `sentinel/db/identity_mirror.py` pentru de ce scriitorul stă aici și nu
+        # la pornirea serviciilor.
+        await mirror_instance_id(conn)
         return 0
     finally:
         await conn.close()

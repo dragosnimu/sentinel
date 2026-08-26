@@ -11,6 +11,31 @@ secrets/*
 telegram.conf
 credentiale*.txt
 
+# Fișiere cu variabile de mediu, sub numele pe care le dă un om.
+#
+# `.env` și `.env.*` de mai sus acoperă doar convenția dotfile. Pe 15 august
+# 2026, în rădăcina depozitului stătea `env.txt`: neurmărit, NEIGNORAT, cu chei
+# de instanță în el — adică la un `git add -A` distanță de un depozit public.
+# Nu e un accident izolat: procedura din `watcher/INCARCARE-HOSTINGER.md` cere
+# operatorului să construiască un fișier de import cu chei de producție, fiindcă
+# importul unui `.env` e singura operație pe care panoul găzduirii o aplică
+# efectiv. Fișierul ăla se va scrie din nou, la fiecare rotire de cheie. Ce
+# variază e numele lui, nu existența lui.
+#
+# Deci se acoperă familia, nu un nume: sufixul `.env` pe orice bază
+# (`hostinger.env`, `sentinel.env`, `watcher.env`), și `env` sau `variabile` în
+# numele unui `.txt`. Verificat pe 15 august 2026 că niciun fișier urmărit nu
+# intră sub ele, iar `deploy/tools/manifest.txt` rămâne în afară.
+#
+# Preferăm să ignorăm de prisos un fișier de note decât să lăsăm neignorat unul
+# cu chei: un fișier ignorat din greșeală se vede la `git status`, unul publicat
+# din greșeală nu se mai poate lua înapoi. Regula asta e a DOUA linie de
+# apărare — prima e ca fișierul de import să nu se scrie deloc în arbore, și e
+# scrisă acolo unde se scrie el.
+*.env
+*env*.txt
+variabile*.txt
+
 # ---- Python ----
 __pycache__/
 *.py[cod]
@@ -66,6 +91,19 @@ deploy/wheels/*.whl
 *.tar.gz
 *.tar.zst
 deploy-package-*/
+
+# ---- Verification scratch ----
+# Falsification harnesses keep working copies here — `.bak` snapshots of
+# install.sh, config.py, signing.py. Three separate reasons this must never be
+# committed or shipped: the repository is public and a snapshot is a second copy
+# of something whose single-copy-ness is the point; nothing on the server runs
+# it; and a stale harness left behind can be executed against a newer tree,
+# which clobbered this working tree twice during E2.2.
+#
+# Ignored here AND excluded from the tarball in both deploy scripts. The two are
+# different holes: this one is `git add -A` on a public repo, that one is a
+# package landing in /tmp on the server.
+scratchpad/
 
 # ---- Editors / OS ----
 .vscode/

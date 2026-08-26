@@ -99,6 +99,32 @@ None of this trades away rigour. You still falsify every repair, you still see
 each test fail, you still run the full suite before you report. You just stop
 paying thirty-six seconds to learn something a targeted run tells you in one.
 
+## Three rounds, then it goes to the operator
+
+A round is one pass from you plus one from the verifier. **There are at most
+three.** There is no fourth attempt, so spend the rounds you have on the cause
+rather than the symptom.
+
+**Round one is not a draft.** Read the whole file, including the module
+docstring, before you write anything. Falsify every test. The cheapest round is
+the one nobody needs.
+
+**When a repair is rejected, do not patch the edge it was rejected on.** Twice
+now this repository has fixed a narrow defect and had it come back in the
+opposite direction: a rule that trusted the filesystem, replaced by a rule that
+trusted the configuration, each correct about the case that killed the other. If
+the same area is rejected twice, the design is wrong, and round three is your
+last chance to change it rather than shim it.
+
+**Say when the answer is not yours to give.** If the fix requires a decision an
+agent should not make — a trade-off between two real properties, a new
+mechanism, something the operator must approve — write that down and stop. An
+honest "this needs a decision; here are the two options and what each costs" at
+round two is worth more than a third repair aimed at the wrong thing.
+
+If the third round still fails, the work stops and the operator decides. Nothing
+ships on the grounds that the rounds ran out.
+
 ## You never deploy
 
 `deploy/` and `scripts/` exist and are reviewed. You may read them, and you may

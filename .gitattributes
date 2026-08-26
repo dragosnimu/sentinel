@@ -1,7 +1,13 @@
 # Sentinel is authored on Windows and executed on Linux.
 # A CRLF in a shell script, systemd unit or nftables file fails in confusing
 # ways ("bad interpreter: /bin/bash^M"). Force LF on everything that ships to
-# the server. The deploy packager normalises non-git checkouts as a backstop.
+# the server.
+#
+# These rules apply on commit and on checkout, so they cannot see a file that a
+# tool rewrote in between — which has happened, and git hid it: the blob still
+# matched HEAD, `git diff` was empty. The backstop is scripts/lib/
+# check-line-endings.sh, which both deploy scripts run against the built
+# package and which REFUSES it; it does not normalise anything.
 
 * text=auto eol=lf
 

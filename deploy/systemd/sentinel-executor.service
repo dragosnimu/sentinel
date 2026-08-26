@@ -26,9 +26,34 @@ RuntimeDirectoryMode=0750
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 
-# Root, but not unlimited root. Only the capabilities nftables management and
-# backup/restore genuinely need.
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID CAP_KILL
+# Root, but not unlimited root. Only the capabilities nftables management,
+# backup/restore, and reading the audit subsystem's status genuinely need.
+#
+# CAP_AUDIT_CONTROL is the newest one and the one that deserves an argument,
+# because it is the capability that can also SWITCH AUDITING OFF.
+#
+# It is here for one read-only operation, `audit_status`, which takes no
+# arguments and runs `auditctl -s`. That reads the kernel's `lost` counter — how
+# many audit records were thrown away because the backlog filled. The command
+# history depends entirely on that counter: a dropped record looks exactly like a
+# command that was never run, so without this number the history can develop
+# holes and nothing says so.
+#
+# Measured on the host on 25 August 2026: without the capability the check
+# reported `unknown` on EVERY pass, forever. Honest as a sentence, useless as a
+# guard — nobody would ever have looked at the counter.
+#
+# Why the marginal risk is small, stated rather than assumed: this process
+# already has `service_action`, which can stop auditd outright, and
+# `patch_step_exec`, which runs validated commands as root. Anything able to
+# abuse CAP_AUDIT_CONTROL to blind the auditing can already blind it by stopping
+# the daemon. The capability widens what the process CAN do; it does not widen
+# what a compromise of it could achieve.
+#
+# NOT in AmbientCapabilities: the bounding set is enough for a child process
+# started by root, and an ambient capability is inherited by everything the
+# executor spawns — including patch steps.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID CAP_KILL CAP_AUDIT_CONTROL
 AmbientCapabilities=CAP_NET_ADMIN
 
 ProtectSystem=strict

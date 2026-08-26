@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Sequence
 
 from sentinel.config import get_config
 from sentinel.db.engine import Database
 from sentinel.logging_setup import get_logger, setup_logging
 from sentinel.scan import orchestrator
+from sentinel.services import parse_service_args
 
 log = get_logger(__name__)
 
@@ -32,10 +34,10 @@ async def _main() -> int:
     return 0
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="sentinel scan", add_help=False)
     parser.add_argument("--log-level", default="INFO")
-    args, _ = parser.parse_known_args()
+    args = parse_service_args(parser, argv)
     setup_logging("sentinel-scan", args.log_level)
     try:
         return asyncio.run(_main())

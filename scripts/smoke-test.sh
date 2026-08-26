@@ -28,6 +28,49 @@ pass() { PASS=$((PASS+1)); printf '%s[+]%s %s\n' "$_G" "$_0" "$*"; }
 fail() { FAIL=$((FAIL+1)); printf '%s[x]%s %s\n' "$_R" "$_0" "$*"; }
 warn() { WARN=$((WARN+1)); printf '%s[!]%s %s\n' "$_Y" "$_0" "$*"; }
 sect() { printf '\n%s== %s ==%s\n' "$_B" "$*" "$_0"; }
+
+# Traduce ieşirea lui `sentinel selfcheck --print` în pass/warn/fail.
+#
+# Funcţie separată ca să poată fi probată fără o gazdă — vezi
+# `tests/unit/test_smoke_test_selfcheck.py`. Blocul dinainte era inline şi de
+# aceea netestat, iar asta a costat: linia care alegea problemele arunca marcajul
+# `[  ??]`, apoi anunţa „autoverificarea nu raportează nimic".
+#
+# `??` NU e „e rău", dar nici „e bine": e „întrebarea n-a primit răspuns".
+# Rulată de mână, verificarea de nftables chiar nu poate răspunde — nu primeşte
+# CAP_NET_ADMIN, fiindcă acela vine de la unitate, iar asta e motivul pentru care
+# fusese scoasă din listă. Preţul l-am aflat pe 21 august 2026: fluxul
+# `selfcheck_state` nu pleca deloc de luni de zile, agentul îl raporta corect ca
+# `unknown`, iar smoke-testul îl arunca şi raporta verde. De aceea `??` devine
+# AVERTISMENT numărat şi numit, nu tăcere: costă o linie galbenă la fiecare
+# rulare de mână, şi cumpără faptul că nicio necunoscută nu mai trece nevăzută.
+report_selfcheck() {
+    local text="$1" bad unknown ok_count unknown_count
+
+    bad="$(grep -vE '^\[  ok\]|^\[  \?\?\]|^ ' <<< "$text" | grep -E '^\[' || true)"
+    unknown="$(grep -E '^\[  \?\?\]' <<< "$text" || true)"
+    ok_count="$(grep -c '^\[  ok\]' <<< "$text" || true)"
+    unknown_count=0
+    [[ -n "$unknown" ]] && unknown_count="$(grep -c . <<< "$unknown")"
+
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && fail "autoverificare: ${line}"
+    done <<< "$bad"
+
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && warn "autoverificare, fără răspuns: ${line}"
+    done <<< "$unknown"
+
+    if [[ -n "$bad" ]]; then
+        return 0
+    fi
+    if (( unknown_count > 0 )); then
+        # Nu „nu raportează nimic": raportează ceva ce nu se poate citi.
+        pass "autoverificare: ${ok_count} ok, ${unknown_count} fără răspuns"
+    else
+        pass "autoverificarea nu raportează nimic (${ok_count} verificări ok)"
+    fi
+}
 die()  { printf '%serror:%s %s\n' "$_R" "$_0" "$*" >&2; exit 1; }
 
 while [[ $# -gt 0 ]]; do
@@ -135,15 +178,25 @@ units="$(r "ls /etc/systemd/system/sentinel-*.service 2>/dev/null | xargs -r -n1
 
 # Componente opt-in: oprite prin configurare, nu stricate.
 #
-# `beacon` poate fi dezactivat în sentinel.yaml. Serviciul iese atunci cu
-# 0 și rămâne `inactive`, iar el nu are timer, deci nu se poate deosebi de
-# un daemon căzut fără să te uiți în configurare.
+# `beacon` și `shipper` pot fi dezactivate în sentinel.yaml. Serviciul iese
+# atunci cu 0 și rămâne `inactive`, iar niciunul nu are timer, deci nu se pot
+# deosebi de un daemon căzut fără să te uiți în configurare.
 #
 # Autoverificarea agentului avea deja excepția asta (`selfcheck/checks.py`);
 # smoke-testul nu, iar prima versiune a enumerării dinamice raporta „deployment
 # eșuat" pe o instalare perfect corectă cu beaconul oprit — exact alarma falsă
 # pe care restul codului o numește „cea care te învață să nu mai citești
-# raportul".
+# raportul". Expeditorul a repetat-o: unitatea a fost adăugată în
+# `deploy/systemd/`, pasul de instalare o copiază automat, iar enumerarea de mai
+# sus o găsește — dar scutirea era scrisă pe un singur nume, deci FIECARE gazdă
+# cu `ship.enabled: false` (adică toate) ar fi raportat deployment eșuat.
+#
+# Regula, ca să nu mai depindă de cine își amintește să vină aici: un daemon
+# care poate fi legitim `inactive` e unul cu `Restart=on-failure`, `Type=exec` și
+# fără timer. Păzită de `tests/security/test_systemd_hardening.py`, care o
+# derivă din `deploy/systemd/*.service` și cere ca fiecare astfel de unitate să
+# apară mai jos.
+#
 # Întrebăm ÎNCĂRCĂTORUL de configurare, nu fișierul.
 #
 # O primă versiune făcea grep după `enabled:` sub numele secțiunii. Cădea pe
@@ -153,25 +206,87 @@ units="$(r "ls /etc/systemd/system/sentinel-*.service 2>/dev/null | xargs -r -n1
 # beaconul legitim oprit, iar grep-ul nu întorcea nimic și raporta eșec.
 #
 # Codul produsului știe toate astea deja. Îl întrebăm pe el.
-opt_in_off=""
+#
+# Numele UNITĂȚII vine din one-liner, nu construit aici din numele secțiunii:
+# secțiunea e `ship`, unitatea e `sentinel-shipper.service`, iar un
+# `sentinel-${comp}.service` ar fi produs `sentinel-ship.service` — un nume care
+# nu se potrivește cu nimic, deci o scutire care nu scutește nimic și un eșec
+# fals păstrat intact.
+#
+# DE CE ULTIMA LINIE E UN MARCAJ ȘI DE CE E OBLIGATORIU.
+#
+# One-linerul rulează pe gazdă, cu codul de acolo. Scriptul ăsta vine din
+# depozit. Când depozitul e mai nou — între `git pull` și deploy, sau dacă
+# cineva rulează verificarea înainte de instalare — o secțiune de configurare pe
+# care codul gazdei nu o are ridică `AttributeError` la mijlocul one-linerului.
+#
+# Ce se întâmplă atunci NU e ce pare. Măsurat, nu dedus:
+#
+#   $ python -c 'print("a"); raise AttributeError'   ->   stdout: "a"
+#
+# Python golește liniile deja tipărite la închidere, traceback-ul pleacă pe
+# stderr — unde `$( )` nu se uită —, iar `|| true` înghite codul de ieșire. Deci
+# `opt_in_raw` NU e gol: conține DOAR liniile de dinaintea celei care a crăpat.
+# Ramura „gol" nu se ia, avertismentul nu apare, iar daemonii de DUPĂ linia
+# ruptă rămân nescutiți în tăcere — adică exact eșecul fals de mai sus, doar că
+# fără nimic care să-l explice.
+#
+# Astăzi ordinea salvează situația din întâmplare (`ship` e ultimul). Al treilea
+# daemon opt-in o pierde. Deci: ultima instrucțiune tipărește un marcaj, iar
+# absența lui înseamnă „citire parțială" — o stare distinctă atât de „gol" cât și
+# de „complet". Parțial se tratează ca necunoscut, nu ca adevăr parțial: nu se
+# scutește nimic, fiindcă nu se știe ce n-a fost citit.
+OPT_IN_DONE="__citire_completa__"
+
+# Clasificarea, ca funcție, ca să poată fi rulată de un test cu intrări
+# fabricate. Aserțiunea pe textul scriptului nu poate deosebi o citire parțială
+# de una completă — asta e chiar deosebirea care lipsea.
+#
+# Scrie în OPT_IN_OFF și OPT_IN_STATUS (gol | parțial | complet).
+read_opt_in_units() {
+    local raw="$1" unit_name enabled
+    OPT_IN_OFF=""
+    if [[ -z "$raw" ]]; then
+        OPT_IN_STATUS="gol"
+        return 0
+    fi
+    if [[ "$raw" != *"$OPT_IN_DONE"* ]]; then
+        OPT_IN_STATUS="parțial"
+        return 0
+    fi
+    while read -r unit_name enabled; do
+        [[ "$unit_name" == "$OPT_IN_DONE" ]] && continue
+        # `ai` NU e aici, dinadins: workerul bucleaza la nesfarsit indiferent de
+        # `ai.enabled`, iar unitatea are `Restart=always`. O unitate
+        # `Restart=always` nu poate fi legitim `inactive`, deci scutirea ar fi
+        # mascat o cadere reala. Am scris initial ca „ambele ies cu 0" — fals
+        # pentru ai, si contrazicea chiar poarta din install.sh, care moare daca
+        # sentinel-ai nu ramane activ.
+        [[ -n "$unit_name" && "$enabled" == "False" ]] \
+            && OPT_IN_OFF="${OPT_IN_OFF} ${unit_name}"
+    done <<< "$raw"
+    OPT_IN_STATUS="complet"
+}
+
 opt_in_raw="$(r "sudo -u sentinel PYTHONPATH=/opt/sentinel/lib /opt/sentinel/venv/bin/python -c \
-    'from sentinel.config import get_config as g; c=g(); print(\"beacon\", c.beacon.enabled); print(\"ai\", c.ai.enabled)'" || true)"
-if [[ -z "$opt_in_raw" ]]; then
-    warn "nu am putut citi configurarea încărcată — tratez beacon/ai ca pornite"
-else
-    while read -r comp enabled; do
-        # Doar beaconul. `run_forever` iese imediat cand e dezactivat, si unitatea
-        # are `Restart=on-failure`, deci ramane `inactive` — indistinct de un
-        # daemon cazut fara sa te uiti in configurare.
-        #
-        # `ai` NU: workerul bucleaza la nesfarsit indiferent de `ai.enabled`, iar
-        # unitatea are `Restart=always`. O unitate `Restart=always` nu poate fi
-        # legitim `inactive`, deci scutirea ar fi mascat o cadere reala. Am scris
-        # initial ca „ambele ies cu 0" — fals pentru ai, si contrazicea chiar
-        # poarta din install.sh, care moare daca sentinel-ai nu ramane activ.
-        [[ "$comp" == "beacon" && "$enabled" == "False" ]]             && opt_in_off="${opt_in_off} sentinel-${comp}.service"
-    done <<< "$opt_in_raw"
-fi
+    'from sentinel.config import get_config as g; c=g(); print(\"sentinel-beacon.service\", c.beacon.enabled); print(\"sentinel-shipper.service\", c.ship.enabled); print(\"__citire_completa__\")'" || true)"
+read_opt_in_units "$opt_in_raw"
+opt_in_off="$OPT_IN_OFF"
+case "$OPT_IN_STATUS" in
+    gol)
+        warn "nu am putut citi configurarea încărcată — tratez beacon/shipper ca pornite" ;;
+    parțial)
+        # Numit, nu ghicit: cauza aproape sigură e cod pe gazdă mai vechi decât
+        # scriptul ăsta, iar reparația e o singură comandă.
+        warn "citirea configurării s-a oprit la mijloc — codul de pe gazdă nu"
+        warn "cunoaște toate secțiunile pe care le cere verificarea asta (cel mai"
+        warn "probabil e mai vechi decât depozitul de aici). Nu scutesc niciun"
+        warn "serviciu opt-in, deci unele pot apărea mai jos ca eșec fără să fie."
+        warn "Rulează întâi deploy-ul, apoi verificarea:"
+        warn "    ./scripts/deploy.sh --host <gazdă> --user <utilizator>"
+        warn "Detaliu: journalctl nu are nimic; rulează pe gazdă"
+        warn "    sudo -u sentinel /opt/sentinel/venv/bin/python -c 'from sentinel.config import get_config; get_config()'" ;;
+esac
 
 for unit in $units; do
     # Unitățile oneshot pornite de timer sunt `inactive` între rulări — starea
@@ -376,16 +491,7 @@ selfcheck="$(r "sudo -u sentinel /opt/sentinel/bin/sentinel selfcheck --print 2>
 if [[ -z "$selfcheck" ]]; then
     warn "nu am putut rula autoverificarea — încearcă /autoverificare pe Telegram"
 else
-    # `[??]` e „nu ştiu", nu „e rău": rulată de mână, verificarea de nftables nu
-    # primeşte CAP_NET_ADMIN, fiindcă acela vine de la unitate.
-    bad="$(grep -vE '^\[  ok\]|^\[  \?\?\]|^ ' <<< "$selfcheck" | grep -E '^\[' || true)"
-    if [[ -z "$bad" ]]; then
-        pass "autoverificarea nu raportează nimic ($(grep -c '^\[  ok\]' <<< "$selfcheck") verificări ok)"
-    else
-        while IFS= read -r line; do
-            [[ -n "$line" ]] && fail "autoverificare: ${line}"
-        done <<< "$bad"
-    fi
+    report_selfcheck "$selfcheck"
 fi
 
 perms="$(r "sudo stat -c '%a %U:%G' /etc/sentinel/secrets.env" || echo '')"

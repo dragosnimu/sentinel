@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import html
 import ipaddress
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -255,6 +256,28 @@ def _incident_ip(inc: inc_repo.IncidentRow) -> str | None:
     except ValueError:
         return None
     return inc.actor_key
+
+
+def _kb_from_row(row: Any) -> InlineKeyboardMarkup | None:
+    """Tastatura unei notificari generice, din coloana `buttons`.
+
+    Pana acum coloana exista si nu era citita niciodata: coada generica trimitea
+    numai text. Un buton scris in tabela si neafisat e mai rau decat lipsa lui —
+    producatorul crede ca a oferit o actiune care nu ajunge nicaieri.
+
+    Datele de apel sunt OPACE aici: se trec asa cum au fost scrise, iar
+    verificarea de autorizare se face in `_on_callback`, la apasare. O tastatura
+    care ar decide singura ce e permis ar fi un al doilea loc in care se scrie
+    politica.
+    """
+    try:
+        butoane = json.loads(row["buttons"]) if isinstance(row["buttons"], str) \
+            else (row["buttons"] or [])
+    except (TypeError, ValueError):
+        return None
+    randuri = [[InlineKeyboardButton(b["text"], callback_data=b["data"])
+                for b in butoane if b.get("text") and b.get("data")]]
+    return InlineKeyboardMarkup(randuri) if randuri[0] else None
 
 
 def _incident_block_kb(inc: inc_repo.IncidentRow, cfg: Config) -> InlineKeyboardMarkup | None:
@@ -585,6 +608,56 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if data == "cancel":
         await query.edit_message_text("Anulat.")
         return
+    if data.startswith("nteu:"):
+        # „Nu sunt eu": blochează adresa sesiunii ȘI o închide.
+        #
+        # Butonul poartă identificatorul SESIUNII, nu adresa. Adresa se citește
+        # ACUM din rândul sesiunii — un buton care ar purta-o ar putea fi apăsat
+        # peste trei ore, când de pe adresa aia e conectat altcineva.
+        session_id = data.split(":", 1)[1]
+        db = context.bot_data["db"]
+        row = await db.fetchrow(
+            "SELECT session_key, host(src_ip) AS ip, username, closed_at "
+            "FROM login_sessions WHERE id = $1::bigint",
+            int(session_id) if session_id.isdigit() else -1)
+        if row is None or not row["ip"]:
+            await query.edit_message_text("Sesiunea nu mai există în evidență.")
+            return
+        try:
+            rezultat = await actions.block_and_terminate(
+                db, row["ip"], row["session_key"],
+                by=f"telegram:{update.effective_chat.id}",
+                reason="operator: nu sunt eu")
+        except Exception as exc:  # noqa: BLE001
+            await query.edit_message_text(f"Nu am putut: {_esc(exc)}")
+            return
+
+        linii = []
+        if rezultat["allowlisted"]:
+            # Se SPUNE ce nu s-a făcut și de ce. Un buton care raportează succes
+            # după ce a sărit peste jumătate din ce promitea e mai rău decât unul
+            # care eșuează: cine îl apasă pleacă crezând că adresa e blocată.
+            linii.append(f"⚠️ <code>{_esc(row['ip'])}</code> e în allowlist — "
+                         f"NU am blocat-o. Ar fi însemnat să te închizi singur "
+                         f"afară. Dacă chiar vrei: <code>/block "
+                         f"{_esc(row['ip'])}</code>")
+        else:
+            linii.append(f"🚫 Blocat <code>{_esc(row['ip'])}</code>.")
+        linii.append("🔒 Sesiune închisă." if rezultat["terminated"]
+                     else "⚠️ Sesiunea nu s-a putut închide — poate se "
+                          "terminase deja.")
+        linii.append("")
+        linii.append("Deblocarea readuce accesul, nu și sesiunea.")
+        kb = None
+        if rezultat["blocked"]:
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton(f"↩️ Deblochează {row['ip']}",
+                                     callback_data=f"unblk:{row['ip']}"),
+            ]])
+        await query.edit_message_text("\n".join(linii),
+                                      parse_mode=ParseMode.HTML, reply_markup=kb)
+        return
+
     if data.startswith("unblk:"):
         ip = data.split(":", 1)[1]
         db = context.bot_data["db"]
@@ -998,14 +1071,39 @@ async def _push_notifications(app: Application, cfg: Config, db: Database,
     token itself, writes a row here.
     """
     rows = await db.fetch(
-        "SELECT id, severity, title, body FROM notifications "
+        "SELECT id, severity, title, body, kind, buttons FROM notifications "
         "WHERE state = 'queued' AND channel = 'telegram' "
         "ORDER BY enqueued_at LIMIT 5")
+    from sentinel.telegram.quiet import passes_anyway
+
+    all_quiet = quiet_chats >= set(cfg.telegram.allowed_chat_ids)
+
     for row in rows:
-        # `selfcheck` is never held: the message says part of the security agent
-        # has stopped working, and that does not keep until morning.
-        sent = await _broadcast(app, cfg, row["body"], quiet_chats=quiet_chats,
-                                severity=row["severity"], kind="selfcheck")
+        # ȚINUT, nu marcat eșuat. Distincția asta lipsea, iar consecința era că
+        # un mesaj amânat de fereastra de liniște se PIERDEA: `_broadcast`
+        # întorcea 0, iar rândul primea `failed` și nu se mai încerca niciodată.
+        # Calea incidentelor face lucrul corect de mult (`notified_at` rămâne
+        # NULL); asta nu-l făcea, deci „se ține până se ridică fereastra" era o
+        # afirmație din documentație pe care codul o contrazicea.
+        #
+        # Rămâne `queued`, deci pleacă la ciclul următor de după ridicarea
+        # ferestrei — și nu se atinge `attempts`, fiindcă n-a fost o încercare.
+        # Felul CALATORESTE pe rand, de la 0026. Ghicit la livrare — cum era
+        # pana acum, cu `"selfcheck"` scris in cod — al doilea producator ar fi
+        # fost tacut de fereastra de liniste, iar simptomul ar fi fost liniste:
+        # adica nimic de observat.
+        kind = row["kind"]
+        if all_quiet and not passes_anyway(row["severity"], kind=kind):
+            log.info("notification held for quiet hours",
+                     extra={"id": row["id"], "severity": row["severity"]})
+            continue
+
+        # Ce se ține și ce nu se decide din SEVERITATE și din FEL: vezi nota
+        # lungă din `telegram/quiet.py` despre jumătatea care a fost scoasă din
+        # scutire, și cea despre `login`, care nu se tace niciodată.
+        sent = await _broadcast(app, cfg, row["body"], _kb_from_row(row),
+                                quiet_chats=quiet_chats,
+                                severity=row["severity"], kind=kind)
         await db.execute(
             "UPDATE notifications SET state = $2::text, sent_at = now(), "
             "attempts = attempts + 1 WHERE id = $1",

@@ -349,6 +349,182 @@ def test_ssh_watch_is_narrowed_to_ssh_paths_in_sql():
     assert all("ssh" in t or "authorized_keys" in t for t in narrow_paths)
 
 
+def test_the_collector_and_the_sql_gate_share_one_definition_of_an_ssh_path():
+    """Îngustarea se face acum în două locuri: la clasificare, în colector, și
+    în interogare, pentru rândurile deja scrise sub eticheta veche. Cu două
+    liste separate ar diverge la prima modificare, iar divergența s-ar vedea ca
+    un fals-negativ tăcut — o cheie SSH scrisă și neraportată."""
+    from sentinel.collectors.auditd import SSH_PATH_LIKE, looks_like_ssh_path
+
+    assert intrusion.SSH_PATHS is SSH_PATH_LIKE
+    # Și că predicatul din Python chiar înseamnă ce înseamnă tiparele LIKE.
+    for path in ("/home/x/.ssh/authorized_keys", "/home/x/.ssh",
+                 "/etc/ssh/sshd_config", "/root/.ssh/id_rsa"):
+        assert looks_like_ssh_path(path), path
+    for path in ("/home/deploy/=", "/home/deploy/rotateCount",
+                 "/home/x/.bash_history", "/var/www/html/x.php"):
+        assert not looks_like_ssh_path(path), path
+
+
+# --- garda pe forma evidenței (incidentul 4268) ----------------------------
+def _pathless_spec(**kw):
+    from sentinel.detect.spec import DetectionSpec
+
+    base = dict(
+        rule_id="intrusion.persistence.ssh_key_change", rule_family="intrusion",
+        severity="critical", src_ip=None, actor_key="host",
+        fingerprint="intrusion.persistence.ssh_key_change:ssh_key_change",
+        title="Mecanism de persistență modificat: chei SSH sau configurație",
+        summary="6 modificări în 10 min", event_ids=[1], path_backed=True,
+        # Evidența exactă a incidentului 4268.
+        evidence={"auid": ["1000"], "count": 6, "paths": ["=", "rotateCount"],
+                  "processes": ["/usr/bin/bash"], "window_min": 10})
+    base.update(kw)
+    return DetectionSpec(**base)
+
+
+def test_a_detection_that_cannot_name_a_file_is_not_critical():
+    """`=` și `rotateCount` nu sunt căi de fișier.
+
+    Un critic fals repetat de zeci de ori face mai mult rău decât unul lipsă:
+    operatorul încetează să citească toate celelalte. O regulă al cărei titlu
+    spune „fișierul X s-a modificat" și care nu poate arăta niciun X nu susține
+    ce afirmă.
+    """
+    from sentinel.detect.spec import enforce_path_evidence
+
+    s = enforce_path_evidence(_pathless_spec())
+    assert s.severity != "critical"
+    assert s.evidence["evidence_guard"] == "no_plausible_path"
+    assert s.evidence["severity_claimed"] == "critical"
+
+
+def test_a_degraded_detection_is_still_above_the_notification_floor():
+    """Degradarea nu are voie să însemne tăcere.
+
+    Botul e singurul consumator al alertelor și citește `unnotified()` cu pragul
+    din `telegram.min_severity`. Coborâtă sub el, o detecție degradată nu ar
+    ajunge niciodată la operator — iar `medium` e, pe gazda asta, o coadă cu 433
+    de incidente deschise și 422 nenotificate. Un `chmod u+s` nimerit peste o
+    graniță de citire produce un eveniment fără cale, deci ajunge exact aici.
+    """
+    from sentinel.config import TelegramConfig
+    from sentinel.constants import SEVERITIES
+    from sentinel.detect.spec import UNSUPPORTED_SEVERITY
+
+    rank = SEVERITIES.index
+    assert rank(UNSUPPORTED_SEVERITY) >= rank(TelegramConfig.min_severity), (
+        "severitatea degradată e sub pragul de notificare livrat: garda ar fi "
+        "suprimare, nu degradare")
+    # Și cea mai de sus treaptă care nu e `critical`: mai jos ar fi o alegere
+    # despre cât de tare vrem să nu deranjăm, nu despre ce știm.
+    assert SEVERITIES[rank(UNSUPPORTED_SEVERITY) + 1] == "critical"
+
+
+def test_the_degraded_detection_is_still_written_and_says_why():
+    """Garda nu are voie să ascundă un colector stricat.
+
+    O alertă care dispare în tăcere ar face invizibilă exact cauza care a
+    produs zgomotul. Detecția rămâne, cu motivul în evidență și cu un titlu
+    care spune ce se știe de fapt.
+    """
+    from sentinel.detect.spec import enforce_path_evidence
+
+    s = enforce_path_evidence(_pathless_spec())
+    assert "fără cale" in s.title
+    assert "auditd" in s.summary
+    # Amprentă separată: altfel detecțiile degradate s-ar aduna în incidentul
+    # critic real și i-ar umfla contorul — fix simptomul „62 de detecții".
+    assert s.fingerprint != _pathless_spec().fingerprint
+
+
+def test_one_real_path_is_enough_to_keep_the_severity():
+    """Îngustarea nu are voie să stingă semnalul pentru care există regula. O
+    scriere reală în authorized_keys rămâne critică chiar dacă lângă ea, în
+    aceeași fereastră, a nimerit și un token fără sens."""
+    from sentinel.detect.spec import enforce_path_evidence
+
+    s = enforce_path_evidence(_pathless_spec(
+        evidence={"paths": ["=", "/root/.ssh/authorized_keys"]}))
+    assert s.severity == "critical"
+    assert "fără cale" not in s.title
+    assert "evidence_guard" not in s.evidence
+
+
+def test_a_rule_that_never_promised_a_path_is_left_alone():
+    """`init_module` nu are înregistrare PATH și textul alertei nu promite una.
+    O gardă pornită implicit ar retrograda tăcut încărcarea unui modul de
+    kernel — sub care nu mai există nimic care să observe."""
+    from sentinel.detect.spec import enforce_path_evidence
+
+    s = enforce_path_evidence(_pathless_spec(path_backed=False, evidence={"paths": []}))
+    assert s.severity == "critical"
+
+    # Și că regula chiar se declară așa.
+    db = _DB(rows={"e.source = 'auditd'": [_row(
+        action="module_load", n=1, procs=["/usr/sbin/insmod"])]})
+    assert run(intrusion.module_load(db, 0))[0].path_backed is False
+
+
+def test_the_path_rules_declare_themselves_path_backed():
+    """O regulă pe fișier care nu se declară așa ocolește garda în tăcere."""
+    cases = {
+        "ssh_key_change": intrusion.persistence,
+        "sudoers_change": intrusion.privilege_escalation,
+        "webroot_change": intrusion.webroot_tampering,
+        "suid_change": intrusion.suid_change,
+    }
+    for action, rule in cases.items():
+        db = _DB(rows={"e.source = 'auditd'": [_row(action=action, paths=["/etc/x"])]})
+        specs = run(rule(db, 0))
+        assert specs and specs[0].path_backed, action
+
+
+def test_the_engine_applies_the_guard_before_writing_the_detection(monkeypatch):
+    """Garda trăiește în motor, nu în fiecare regulă.
+
+    Pusă în reguli, o regulă nouă ar putea să o uite, iar uitarea s-ar vedea
+    abia ca un critic fals în telefonul operatorului.
+    """
+    from sentinel.db.repo import incidents as inc_repo
+    from sentinel.detect import engine
+    from sentinel.respond import decider
+
+    seen: dict = {}
+
+    async def _false(*a, **kw):
+        return False
+
+    async def _none(*a, **kw):
+        return None
+
+    async def _record(db, **kw):
+        seen.update(kw)
+        return 1
+
+    async def _upsert_incident(db, **kw):
+        seen["incident_severity"] = kw["severity"]
+        return 7, True
+
+    async def _consider(*a, **kw):
+        return "observed"
+
+    monkeypatch.setattr(inc_repo, "actor_is_allowlisted", _false)
+    monkeypatch.setattr(inc_repo, "upsert_actor", _none)
+    monkeypatch.setattr(inc_repo, "record_detection", _record)
+    monkeypatch.setattr(inc_repo, "upsert_incident", _upsert_incident)
+    monkeypatch.setattr(inc_repo, "link_detection", _none)
+    monkeypatch.setattr(inc_repo, "add_timeline", _none)
+    monkeypatch.setattr(decider, "consider", _consider)
+
+    cfg = SimpleNamespace(detection=SimpleNamespace(enabled=True))
+    run(engine._apply(_DB(), cfg, _pathless_spec()))
+    from sentinel.detect.spec import UNSUPPORTED_SEVERITY
+
+    assert seen["severity"] == UNSUPPORTED_SEVERITY != "critical"
+    assert seen["incident_severity"] == UNSUPPORTED_SEVERITY
+
+
 def test_setuid_gets_its_own_rule_naming_the_file():
     """Semnalul exista, dar împărțea cheia de audit cu uneltele de rețea.
 

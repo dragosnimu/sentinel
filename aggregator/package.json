@@ -1,0 +1,31 @@
+{
+  "name": "sentinel-aggregator",
+  "version": "0.1.0",
+  "description": "Agregator extern pentru N instante Sentinel — arhiva, panoul si martorul",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "test": "node run-tests.mjs",
+    "typecheck": "tsc --noEmit",
+    "migrate": "node --import tsx bin/migrate.ts",
+    "instance": "node --import tsx bin/instance.ts",
+    "user": "node --import tsx bin/user.ts",
+    "verify-chain": "node --import tsx bin/verify-chain.ts",
+    "purge-automation": "node --import tsx bin/purge-automation-commands.ts"
+  },
+  "dependencies": {
+    "hash-wasm": "^4.12.0",
+    "mysql2": "^3.11.0",
+    "next": "^15.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "19.2.18",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.0"
+  }
+}

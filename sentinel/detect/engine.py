@@ -13,6 +13,7 @@ from sentinel.config import Config
 from sentinel.db.engine import Database
 from sentinel.db.repo import incidents as inc_repo
 from sentinel.detect.rules import RULES, DetectionSpec
+from sentinel.detect.spec import enforce_path_evidence
 from sentinel.logging_setup import get_logger
 from sentinel.respond import decider
 
@@ -63,6 +64,11 @@ async def run_once(db: Database, cfg: Config) -> dict[str, int]:
 
 
 async def _apply(db: Database, cfg: Config, spec: DetectionSpec) -> tuple[int, int]:
+    # Înainte de orice se scrie: o detecție pe fișier care nu poate arăta niciun
+    # fișier se înregistrează, dar nu ca CRITIC. Aici, nu în fiecare regulă, ca
+    # o regulă nouă să nu poată uita garda.
+    spec = enforce_path_evidence(spec)
+
     if await inc_repo.actor_is_allowlisted(db, spec.actor_key):
         return 0, 0
 

@@ -72,6 +72,74 @@ async def block(
     return result
 
 
+class SelfLockoutRefused(Exception):
+    """Adresa e a operatorului. Blocarea ei l-ar închide pe el afară."""
+
+
+async def is_allowlisted(db: Database, ip: str) -> bool:
+    """Adresa e în allowlist — adică declarată a ta.
+
+    `>>=` e operatorul de apartenență al lui PostgreSQL: „rețeaua asta conține
+    adresa asta". Allowlist-ul ține CIDR-uri, nu adrese: un `=` ar rata un
+    `198.51.100.0/24` pus acolo tocmai fiindcă adresa de acasă se schimbă în
+    interiorul lui. Iar o gardă de auto-încuiere care ratează exact cazul pentru
+    care a fost scrisă e mai rea decât una absentă.
+    """
+    return bool(await db.fetchval(
+        """
+        SELECT 1 FROM allowlist
+         WHERE confirmed = true
+           AND (expires_at IS NULL OR expires_at > now())
+           AND cidr >>= $1::inet
+         LIMIT 1
+        """,
+        ip))
+
+
+async def block_and_terminate(db: Database, ip: str, session_key: str, *,
+                              by: str, reason: str) -> dict[str, Any]:
+    """Blochează adresa ȘI închide sesiunea deschisă. Butonul «nu sunt eu».
+
+    Ordinea contează și e cea aleasă dinadins: întâi blocarea, apoi închiderea.
+    Invers, cine e închis se poate reconecta în secunda dintre cele două — iar
+    fereastra aia e exact cât îi trebuie cuiva care se uită la ecran.
+
+    ## Garda de auto-încuiere
+
+    O adresă din allowlist NU se blochează, oricât ar fi apăsat butonul. Sentinel
+    are deja lista aia cu peer-ul SSH al operatorului, iar butonul ăsta e cel mai
+    ușor de apăsat greșit din tot sistemul: sosește pe telefon, la ora la care
+    tocmai te-ai logat, cu textul «cineva s-a logat pe server».
+
+    Costul, spus pe față: dacă cineva chiar intră de pe adresa ta, butonul nu-l
+    scoate. Rămân `/block` — care nu are garda asta — și consola VPS-ului.
+
+    Sesiunea SE ÎNCHIDE oricum, chiar dacă adresa e a ta: închiderea nu te lasă
+    pe dinafară, doar te deconectează, iar dacă chiar altcineva folosește
+    adresa ta, aia e jumătatea care contează.
+    """
+    protejata = await is_allowlisted(db, ip)
+    rezultat: dict[str, Any] = {"ip": ip, "session_key": session_key,
+                                "blocked": False, "terminated": False,
+                                "allowlisted": protejata}
+
+    if not protejata:
+        await block(db, ip, ttl=None, reason=reason, by=by)
+        rezultat["blocked"] = True
+
+    inchisa = await asyncio.to_thread(_client.terminate_session, session_key)
+    rezultat["terminated"] = bool(inchisa.get("terminated"))
+
+    await audit_repo.record(
+        db, actor=by, source="respond", operation="block_and_terminate", target=ip,
+        params={"session_key": session_key, "reason": reason,
+                "allowlisted": protejata},
+        result="ok" if rezultat["terminated"] else "partial",
+    )
+    log.info("session terminated", extra=rezultat)
+    return rezultat
+
+
 async def unblock(db: Database, ip: str, *, by: str, reason: str = "manual") -> dict[str, Any]:
     result = await asyncio.to_thread(_client.unblock_ip, ip)
     n = await blocklist_repo.mark_unblocked(db, ip, by=by, reason=reason)

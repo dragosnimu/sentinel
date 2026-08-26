@@ -462,7 +462,13 @@ def test_critical_still_passes_whatever_the_schedule_says():
     ascuns. Nicio combinatie de zile nu are voie sa atinga asta."""
     assert quiet.passes_anyway("critical")
     assert quiet.passes_anyway("info", kind="panic")
-    assert quiet.passes_anyway("info", kind="selfcheck")
+    # `selfcheck` a fost SCOS din scutirea pe fel pe 24 august 2026: emite si
+    # `degraded`, care prin definitie inseamna „pe gazda nu s-a oprit nimic", iar
+    # sub scutire suna degeaba in fiecare ora. Jumatatea care conta trece in
+    # continuare — `runner._announce` pune `critical` cand ceva e `down`, iar
+    # severitatea aia e in `NEVER_MUTED_SEVERITIES`.
+    assert quiet.passes_anyway("critical", kind="selfcheck")
+    assert not quiet.passes_anyway("info", kind="selfcheck")
 
 
 def test_when_two_rules_both_match_the_specific_one_decides_the_end():

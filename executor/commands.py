@@ -40,6 +40,15 @@ def log(level: str, message: str, **fields: Any) -> None:
 
 NFT = "/usr/sbin/nft"
 
+#: Calea absoluta a lui `loginctl`. Absoluta si nu cautata in PATH:
+#: executorul ruleaza privilegiat, iar un PATH mostenit e cea mai veche cale
+#: de a-i pune in mana alt binar decat cel cerut.
+LOGINCTL = "/usr/bin/loginctl"
+
+#: Calea absoluta a lui `auditctl`. Pe RHEL sta in `/sbin`, care e legatura
+#: catre `/usr/sbin` — se scrie tinta, ca sa nu depinda de legatura.
+AUDITCTL = "/usr/sbin/auditctl"
+
 # The table skeleton and the persisted allowlist, both root-owned, installed
 # next to this file.
 #
@@ -608,6 +617,71 @@ def op_disk_free(args: dict[str, Any]) -> dict[str, Any]:
             "used_pct": round(100 * usage.used / usage.total, 2)}
 
 
+def op_audit_status(args: dict[str, Any]) -> dict[str, Any]:
+    """`auditctl -s`, parsat. Read-only, fara niciun argument.
+
+    ## De ce trece prin executor
+
+    `auditctl` cere `CAP_AUDIT_CONTROL`, adica root. Autodiagnosticul ruleaza ca
+    `sentinel`, deci apelul lui esua mereu — masurat pe gazda pe 25 august 2026,
+    verificarea raporta `unknown` la FIECARE trecere.
+
+    Un `unknown` permanent e cinstit ca propozitie si inutil ca paza: nu se
+    uita nimeni niciodata la contorul de inregistrari pierdute, iar istoricul de
+    comenzi — care atarna de el — poate avea goluri fara ca nimic sa spuna.
+
+    Nu se adauga o regula `sudoers` pentru `sentinel`: separarea de privilegii a
+    proiectului spune ca exista UN singur drum catre root, si acesta e el.
+
+    Fara argumente dinadins: n-are ce valida, deci n-are cum sa fie folosit
+    pentru altceva.
+    """
+    result = _run([AUDITCTL, "-s"], timeout=10)
+    if result["exit_code"] != 0:
+        return {"ok": False, "error": result["stderr"][:200]}
+    parsed: dict[str, int] = {}
+    for line in result["stdout"].splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].lstrip("-").isdigit():
+            parsed[parts[0]] = int(parts[1])
+    # Un raspuns fara `lost` nu e o stare de audit: se spune, nu se intoarce un
+    # dictionar gol pe care apelantul l-ar citi ca „zero pierderi".
+    if "lost" not in parsed:
+        return {"ok": False, "error": "iesirea lui auditctl nu contine `lost`"}
+    return {"ok": True, **parsed}
+
+
+def op_terminate_session(args: dict[str, Any]) -> dict[str, Any]:
+    """Inchide o sesiune de login, dupa cheia data de nucleu.
+
+    Cerut de operator pe 24 august 2026, ca a doua jumatate a butonului «nu sunt
+    eu»: blocarea adresei opreste urmatoarea conexiune, dar cine e DEJA inauntru
+    ramane inauntru. Prima fara a doua e o reparatie care arata completa.
+
+    `loginctl terminate-session` si nu `pkill -t`: logind stie ce procese apartin
+    sesiunii, inclusiv cele detasate de terminal. `pkill` dupa terminal ar rata
+    exact un proces pornit cu `nohup`, adica exact ce lasa in urma cineva care
+    stie ce face.
+
+    IREVERSIBIL, si spus pe fata: o sesiune inchisa nu se poate redeschide.
+    Deblocarea adresei readuce accesul, nu si sesiunea.
+    """
+    key = policy.check_session_key(args.get("session_key"))
+    result = _run([LOGINCTL, "terminate-session", key], timeout=15)
+    # Codul de iesire NU e dovada. `loginctl` intoarce 0 si pentru o sesiune
+    # care nu mai exista, iar noi vrem sa raportam ce s-a intamplat, nu ce am
+    # cerut. Deci se citeste inapoi lista de sesiuni.
+    ramase = _run([LOGINCTL, "list-sessions", "--no-legend"], timeout=10)
+    inca_acolo = any(line.split()[:1] == [key]
+                     for line in ramase["stdout"].splitlines() if line.split())
+    return {
+        "session_key": key,
+        "terminated": not inca_acolo,
+        "exit_code": result["exit_code"],
+        "detail": result["stderr"][:400] if inca_acolo else None,
+    }
+
+
 def op_ping(args: dict[str, Any]) -> dict[str, Any]:
     """Liveness probe for the watchdog and the health page."""
     return {"pong": True, "pid": os.getpid(), "uptime_s": int(time.monotonic())}
@@ -627,5 +701,7 @@ OPERATIONS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "backup_prune": op_backup_prune,
     "backup_restore": op_backup_restore,
     "disk_free": op_disk_free,
+    "audit_status": op_audit_status,
+    "terminate_session": op_terminate_session,
     "ping": op_ping,
 }

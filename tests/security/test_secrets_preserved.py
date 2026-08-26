@@ -88,7 +88,19 @@ chmod() {{ printf 'chmod %s size=%s\\n' "$*" "$(wc -c < "$2" 2>/dev/null || echo
 
 # openssl is stubbed so that generation is OBSERVABLE. Asserting a value did not
 # change is weaker than asserting no new one was ever minted.
-openssl() {{ printf 'openssl %s\\n' "$*" >> "$CALLS"; printf 'FRESHLY-GENERATED'; }}
+#
+# `rand -hex 32` mints a SECRET and must never happen when the host already has
+# one; `rand -hex 16` mints the instance id, which step 27 does create on a
+# fresh host by design. So the assertions below name the width rather than the
+# binary, and this stub answers -hex 16 with something of the right SHAPE —
+# `ensure_instance_id` re-reads the file and refuses anything else, and a stub
+# that returned the placeholder for both would abort the step with a fatal
+# error about the wrong thing.
+openssl() {{
+    printf 'openssl %s\\n' "$*" >> "$CALLS"
+    if [[ "$*" == "rand -hex 16" ]]; then printf '0123456789abcdef0123456789abcdef'
+    else printf 'FRESHLY-GENERATED'; fi
+}}
 
 declare -A SECRETS=({stdin})
 step_secrets
@@ -300,9 +312,18 @@ def test_the_carried_keys_are_named_in_the_output(tmp_path):
     The step already printed a green line about the keys it kept while deleting
     another one — an accurate sentence that produced a false impression. Names
     only; a value here would be a value in the deploy log.
+
+    The key used here has to be one the installer genuinely does not manage.
+    SENTINEL_BEACON_SECRET was that key until 19 August 2026, when it joined
+    OPERATOR_SECRET_KEYS and stopped being carried at all — so a test still
+    naming it would have gone green on a line that no longer proves anything.
     """
-    out = run_step_secrets(tmp_path, HOST_SECRETS, {})
-    assert "SENTINEL_BEACON_SECRET" in out["proc"].stdout
+    host = dict(HOST_SECRETS, A_KEY_THIS_INSTALLER_NEVER_HEARD_OF="f" * 64)
+    out = run_step_secrets(tmp_path, host, {})
+    assert "A_KEY_THIS_INSTALLER_NEVER_HEARD_OF" in out["proc"].stdout
+    assert "f" * 64 not in out["proc"].stdout + out["proc"].stderr
+    assert out["keys"]["A_KEY_THIS_INSTALLER_NEVER_HEARD_OF"] == "f" * 64
+    # And the value of a key it DOES manage stays out of the log too.
     assert "c" * 64 not in out["proc"].stdout + out["proc"].stderr
 
 
@@ -313,7 +334,7 @@ def test_an_unknown_key_is_not_regenerated_but_carried(tmp_path):
     out = run_step_secrets(tmp_path, HOST_SECRETS, {})
     assert out["keys"]["SENTINEL_BEACON_SECRET"] == "c" * 64
     assert "FRESHLY-GENERATED" not in out["keys"].values()
-    assert "openssl" not in out["calls"], "a key was minted when all eight existed"
+    assert "rand -hex 32" not in out["calls"], "a key was minted when all eight existed"
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +354,7 @@ def test_only_the_generated_keys_may_be_created_from_nothing(tmp_path):
     assert out["proc"].returncode == 0, out["proc"].stderr
     assert "TELEGRAM_APPLY_PIN" not in out["keys"], \
         f"a PIN was invented: {out['keys'].get('TELEGRAM_APPLY_PIN')!r}"
-    assert "openssl" not in out["calls"]
+    assert "rand -hex 32" not in out["calls"]
 
 
 def test_generated_keys_are_created_only_when_the_host_has_none(tmp_path):
@@ -345,7 +366,7 @@ def test_generated_keys_are_created_only_when_the_host_has_none(tmp_path):
 
     again = run_step_secrets(tmp_path / "b", HOST_SECRETS, {})
     assert again["keys"]["SENTINEL_SESSION_SECRET"] == "b" * 64
-    assert "openssl" not in again["calls"]
+    assert "rand -hex 32" not in again["calls"]
 
 
 def test_an_upgrade_supplying_nothing_erases_nothing(tmp_path):
@@ -395,6 +416,43 @@ def test_a_key_already_on_the_host_may_be_updated_from_stdin(tmp_path):
     out = run_step_secrets(tmp_path, HOST_SECRETS,
                            {"SENTINEL_BEACON_SECRET": "d" * 64})
     assert out["keys"]["SENTINEL_BEACON_SECRET"] == "d" * 64
+
+
+def test_a_shared_key_lands_on_a_host_that_never_had_it(tmp_path):
+    """The failure this prevents: a second server is installed, the operator
+    supplies SENTINEL_SHIP_SECRET through the deploy channel, and the installer
+    drops it as an unknown name. Everything reports success -- the unit is
+    enabled, the process starts, and `ship` exits 0 when the secret is missing
+    -- so the only symptom is a panel that never gains that instance's data,
+    discovered whenever somebody happens to look.
+
+    HOST_SECRETS has no ship key, so this is the FIRST placement, not a
+    rotation. That is the case the carry-forward rule cannot cover, because
+    there is nothing yet to carry."""
+    out = run_step_secrets(tmp_path, HOST_SECRETS,
+                           {"SENTINEL_SHIP_SECRET": "e" * 64})
+    assert out["keys"]["SENTINEL_SHIP_SECRET"] == "e" * 64, (
+        "the ship key was dropped as an unknown name; a new host cannot be "
+        "given one through the reviewed path")
+    assert "SENTINEL_SHIP_SECRET" not in out["proc"].stderr, (
+        "the key landed but was also reported as refused")
+    # The keys already on the host are untouched by the new name.
+    assert out["keys"]["SENTINEL_BEACON_SECRET"] == "c" * 64
+    assert out["keys"]["SENTINEL_SESSION_SECRET"] == "b" * 64
+
+
+def test_a_shared_key_nobody_supplied_is_not_written_empty(tmp_path):
+    """Adding names to OPERATOR_SECRET_KEYS must not create empty lines.
+
+    `sentinel/config.py:load_secrets` reads this file directly. A line
+    `SENTINEL_SHIP_SECRET=` is a key that EXISTS with no value, which reads as
+    configured-but-broken rather than absent -- and the two get different
+    diagnoses from anyone reading the file."""
+    out = run_step_secrets(tmp_path, HOST_SECRETS, {})
+    assert "SENTINEL_SHIP_SECRET" not in out["keys"], (
+        "a key nobody supplied was written anyway")
+    body = (tmp_path / "etc" / "secrets.env").read_text(encoding="utf-8")
+    assert "SENTINEL_SHIP_SECRET=" not in body
 
 
 def test_a_malformed_name_is_never_printed_even_if_it_reaches_this_step(tmp_path):

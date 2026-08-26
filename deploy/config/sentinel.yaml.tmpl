@@ -10,6 +10,17 @@
 
 timezone: Europe/Bucharest
 hostname: "@@HOSTNAME@@"
+
+# Numele sub care vrei să vezi instalarea asta într-un panou care adună mai
+# multe servere. Ex.: "prod-web-1". Gol e în regulă — atunci se arată
+# identificatorul.
+#
+# Doar cosmetic. NU e cheie și nu e identificator: identitatea instalării e
+# valoarea aleatoare din /etc/sentinel/instance_id, generată o dată la instalare
+# și niciodată regenerată. Schimbarea etichetei de aici redenumește o linie
+# într-un panou și nu mută nimic dintr-o istorie în alta.
+instance_label: ""
+
 log_level: INFO
 
 database:
@@ -79,6 +90,33 @@ ingest:
 
   batch_size: 500
   flush_interval_ms: 1000
+
+history:
+  # Conturile de automatizare ale căror comenzi FĂRĂ TERMINAL nu se scriu în
+  # `session_commands`. `sentinel-deploy` e contul creat de pasul 36 al
+  # instalării; dacă ai pornit instalatorul cu alt `DEPLOY_ACCOUNT`, pune aici
+  # numele ăla — numele se compară exact.
+  #
+  # Motivul e o măsurătoare: un singur deploy a produs 405 777 de comenzi în 140
+  # de secunde — `systemctl` de 320 591 de ori și `sleep` de 173 376, adică
+  # buclele de așteptare ale instalatorului —, iar replica externă a crescut de
+  # la 83 MB la 909 MB în câteva ore.
+  #
+  # Ce NU face lista asta, ca să nu fie citită drept mai mult decât e:
+  #
+  #   * regulile auditd rămân neatinse, deci `/var/log/audit/audit.log` are în
+  #     continuare tot ce a rulat contul. Se taie doar proiecția în bază;
+  #   * rândul de sesiune rămâne: „s-a deschis o sesiune de deploy" e faptul cu
+  #     valoare de securitate;
+  #   * o logare INTERACTIVĂ pe contul ăsta (`ssh sentinel-deploy@gazdă` cu
+  #     shell adevărat) capătă `pts0`, deci comenzile ei se păstrează, sesiunea
+  #     se promovează și alerta de logare pleacă. Filtrul e pe terminalul
+  #     comenzii, nu pe cont — altfel contul de automatizare ar fi chiar o cale
+  #     de intrare pe care nu s-ar anunța nimic.
+  #
+  # Lista goală înseamnă „nu se aruncă nimic".
+  skip_command_accounts:
+    - sentinel-deploy
 
 detection:
   enabled: true
@@ -246,6 +284,13 @@ ai:
 scan:
   enabled: true
   window: "03:00-05:00"
+
+  # Telegram alert for NEW vulnerabilities, right after the scan.
+  # Only findings this run inserted for the first time — a scan that
+  # re-finds the same two hundred sends nothing. A channel that repeats
+  # the same list every run is one the operator mutes, and then the
+  # alert that mattered is lost with it.
+  announce_new: true
   os_packages: true
   containers: true
   filesystem: true
@@ -355,3 +400,41 @@ beacon:
   # reluării unui pachet capturat: semnătura e validă la nesfârșit, prospețimea
   # nu.
   max_age_s: 120
+
+# ---------------------------------------------------------------------------
+# Ship — expedierea rândurilor către un agregator extern.
+#
+# Alt lucru decât beaconul, deși seamănă. Beaconul trimite câteva CONTOARE și
+# absența lui e alarma; expeditorul trimite CONȚINUT, ca să existe o copie a
+# jurnalului de audit pe o mașină pe care cine intră aici nu o controlează.
+# Servicii separate, chei separate: purtarea beaconului (nu reîncearcă, nu
+# blochează) e o proprietate de securitate, iar un bug în expeditor nu are voie
+# să fie o pană de heartbeat.
+#
+# Cheia HMAC NU stă aici — stă în SENTINEL_SHIP_SECRET din secrets.env, și e
+# DISTINCTĂ de cea a beaconului: o cheie comună înseamnă că root pe o gazdă
+# poate fabrica date în numele alteia.
+#
+# Regula pe care stă totul: cursorul avansează doar când răspunsul ecouă exact
+# filigranul trimis, pe flux. Nu pe HTTP 200 — un 200 de la un CDN, de la un
+# vhost greșit rutat sau de la un agregator care nu cunoaște fluxul arată la fel.
+ship:
+  enabled: false
+  url: ""
+  interval_s: 60
+  # Mai lung decât la beacon: un lot de mii de rânduri nu e un heartbeat.
+  timeout_s: 30
+  max_age_s: 300
+  # Cea mai mare cerere pe care o poate produce o rundă. O pană lungă a
+  # agregatorului se recuperează în multe cereri mici, nu într-una uriașă care
+  # expiră și se reia la nesfârșit fără să progreseze.
+  max_rows_per_batch: 2000
+  # De unde începe un flux la PRIMA rundă, când încă nu există cursor. Rândurile
+  # mai vechi de atât nu vor pleca niciodată — scris în jurnal atunci și
+  # raportat permanent de verificarea `ship:lag`, ca să nu fie o omisiune
+  # tăcută. După ce cursorul există, limita asta nu mai sare peste nimic: o
+  # restanță de o lună se recuperează întreagă.
+  max_backfill_days: 7
+  # Backoff exponențial cu jitter, plafonat.
+  backoff_base_s: 30
+  backoff_max_s: 3600

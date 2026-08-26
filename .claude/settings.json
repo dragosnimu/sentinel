@@ -37,7 +37,12 @@
       "Bash(git status:*)",
       "Bash(git diff:*)",
       "Bash(git log:*)",
-      "Bash(shellcheck:*)"
+      "Bash(shellcheck:*)",
+
+      "mcp__hostinger-hosting__hosting_deployJsApplication",
+      "mcp__hostinger-hosting__hosting_restartNode_jsApplicationV1",
+      "mcp__hostinger-hosting__hosting_listJsDeployments",
+      "mcp__hostinger-hosting__hosting_showJsDeploymentLogs"
     ],
 
     "deny": [

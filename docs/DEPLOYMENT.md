@@ -52,13 +52,28 @@ contează, iar certificatul nu mai are nevoie de nicio intervenție.
 
 ```bash
 # shared — nginx deține deja 80/443
-./scripts/deploy.sh --host 203.0.113.10 --user deploy \
+./scripts/deploy.sh --host 203.0.113.10 --user sentinel-deploy \
     --key ~/.ssh/sentinel_deploy --domain sentinel.exemplu.ro --nginx-mode shared
 
 # dedicated — altceva (Apache, Caddy, un container) deține 80/443
-./scripts/deploy.sh --host 203.0.113.10 --user deploy \
+./scripts/deploy.sh --host 203.0.113.10 --user sentinel-deploy \
     --key ~/.ssh/sentinel_deploy --domain sentinel.exemplu.ro --web-port 8443
 ```
+
+`--user sentinel-deploy` e **implicitul** din 25 august 2026 și e scris mai sus
+doar ca să se vadă; îl dai explicit numai dacă ai instalat cu alt
+`DEPLOY_ACCOUNT`. Motivul e în `docs/ISTORIC-SESIUNI.md`: `auid` e uid-ul de
+LOGARE și supraviețuiește lui `sudo`, deci un deploy rulat sub contul tău își
+scrie cele ~405 000 de comenzi sub numele tău, unde filtrul de istoric nu le
+poate deosebi de munca ta.
+
+`--key ~/.ssh/sentinel_deploy` e **tot implicit**, din același motiv și în
+aceeași măsură: contul ăla autorizează cheia asta și nicio alta, deci un
+implicit de cont fără implicitul de cheie e `Permission denied (publickey)` la
+prima conexiune — iar reflexul care rezolvă asta e `--user` înapoi pe contul
+tău, adică filtrul inert la loc. Dacă fișierul nu există, scriptul spune și
+merge mai departe: un agent ssh sau un `IdentityFile` din `~/.ssh/config` sunt
+la fel de legitime și nu se văd de aici.
 
 #### Ce protejează modul shared
 
@@ -403,7 +418,7 @@ vezi vreodată.
 #### Pasul 2 — Verificare fără modificări
 
 ```bash
-./scripts/deploy.sh --host 203.0.113.10 --user deploy \
+./scripts/deploy.sh --host 203.0.113.10 --user sentinel-deploy \
     --key ~/.ssh/sentinel_deploy --domain sentinel.exemplu.ro \
     --web-port 8443 --dry-run
 ```
@@ -424,21 +439,21 @@ informative. Cele mai frecvente:
 #### Pasul 3 — Instalarea propriu-zisă
 
 ```bash
-./scripts/deploy.sh --host 203.0.113.10 --user deploy \
+./scripts/deploy.sh --host 203.0.113.10 --user sentinel-deploy \
     --key ~/.ssh/sentinel_deploy --domain sentinel.exemplu.ro --web-port 8443
 ```
 
 Sau, în modul `shared`, dacă nginx deține deja 80/443:
 
 ```bash
-./scripts/deploy.sh --host 203.0.113.10 --user deploy \
+./scripts/deploy.sh --host 203.0.113.10 --user sentinel-deploy \
     --key ~/.ssh/sentinel_deploy --domain sentinel.exemplu.ro --nginx-mode shared
 ```
 
 Din PowerShell, echivalent:
 
 ```powershell
-.\scripts\deploy.ps1 -HostName 203.0.113.10 -User deploy -Key "$HOME\.ssh\sentinel_deploy" -Domain sentinel.exemplu.ro -NginxMode shared
+.\scripts\deploy.ps1 -HostName 203.0.113.10 -User sentinel-deploy -Key "$HOME\.ssh\sentinel_deploy" -Domain sentinel.exemplu.ro -NginxMode shared
 ```
 
 Parametrul se numește `-HostName`, nu `-Host`: PowerShell rezervă `$Host` pentru
@@ -462,10 +477,21 @@ Instalarea se termină cu:
    funcționează: config încărcat, secrete citite, rețea, token valid, chat id
    corect. Un log verde de instalare dovedește mult mai puțin.
 
+   Pasul 39 raportează ce a răspuns Telegram, nu ce a încercat el să facă:
+   verde doar dacă API-ul a întors un `message_id` pentru fiecare chat permis,
+   albastru dacă Telegram e dezactivat din config (nu s-a trimis nimic, și nici
+   nu era ce), galben în rest — inclusiv dacă nu se întoarce în 60 de secunde.
+   Galben înseamnă „canalul de alertare NU e dovedit", nu „instalarea a picat".
+   Îl poți relua oricând, singur:
+
+   ```bash
+   sudo /opt/sentinel/bin/sentinel telegram --send-test
+   ```
+
 ### 3.3 Verificare
 
 ```bash
-./scripts/smoke-test.sh --host 203.0.113.10 --user deploy \
+./scripts/smoke-test.sh --host 203.0.113.10 --user sentinel-deploy \
     --key ~/.ssh/sentinel_deploy --domain sentinel.exemplu.ro --web-port 8443
 ```
 
@@ -606,7 +632,7 @@ Apoi `nginx -t && systemctl reload nginx`.
 
 ```bash
 # Loguri, formatate lizibil
-./scripts/tail-logs.sh --host 203.0.113.10 --user deploy --key ~/.ssh/sentinel_deploy
+./scripts/tail-logs.sh --host 203.0.113.10 --user sentinel-deploy --key ~/.ssh/sentinel_deploy
 
 # Doar un serviciu, doar erori
 ./scripts/tail-logs.sh --host ... --unit sentinel-detect --errors
@@ -692,7 +718,7 @@ sunt sărite. Ca să nu răspunzi din nou la toate întrebările, salvează-le d
 ### 6.3 Rollback complet
 
 ```bash
-./scripts/deploy.sh --host 203.0.113.10 --user deploy \
+./scripts/deploy.sh --host 203.0.113.10 --user sentinel-deploy \
     --key ~/.ssh/sentinel_deploy --rollback
 ```
 
@@ -746,6 +772,116 @@ Verifică înainte dacă release-ul aduce migrații noi:
 git diff --name-only HEAD@{1} -- sentinel/db/migrations/
 ```
 
+### Identitatea instalării, la un upgrade
+
+`instance_id` — valoarea după care un panou extern deosebește serverele — se
+creează în `/etc/sentinel/instance_id`. **Deploy-ul obișnuit de mai sus o
+asigură la fiecare rulare**, inclusiv pe o gazdă instalată înainte ca ea să
+existe: apelul nu e supus marcajelor de pas, exact ca `resolve_config`, tocmai
+fiindcă pasul 27 e marcat ca făcut din ziua instalării și nu e în
+`ALWAYS_STEPS`. N-ai de făcut nimic special.
+
+`--force-step 27` **nu** e calea pentru asta și nu o repară — pasul acela
+rescrie `secrets.env`. Îl folosești doar în cazul rar în care fișierul există
+dar nu e o identitate (octeți NUL după o cădere de curent, valoare pusă de
+mână): instalatorul refuză deliberat să rescrie așa ceva, avertizează, iar tu
+te uiți în el, îl ștergi și ceri pasul:
+
+```bash
+ssh <utilizator>@<gazdă> 'sudo od -c /etc/sentinel/instance_id'
+./scripts/deploy.sh --host <gazdă> --user <utilizator> --force-step 27
+```
+
+Dovada că gazda are identitate e valoarea de pe disc, nu codul de ieșire al
+deploy-ului:
+
+```bash
+ssh <utilizator>@<gazdă> 'sudo cat /etc/sentinel/instance_id'   # 32 hexa
+ssh <utilizator>@<gazdă> 'sudo sentinel selfcheck --print | grep identity'
+```
+
+Generarea nu se repetă: pe o gazdă care are deja o identitate validă, deploy-ul
+îi reafirmă drepturile și o lasă în pace (vezi OPERARE.md §12).
+
+**La prima trecere vei primi o alertă critică despre `default`. Este așteptată.**
+Din clipa în care gazda are identitate, beaconul trimite sub ea — o instanță pe
+care martorul nu o cunoaște încă, deci o refuză cu 401. Iar instanța `default`,
+sub care gazda bătea până atunci, nu mai primește nimic, și după 180 de secunde
+plus latența cronului (până la 5 minute) martorul o declară tăcută: **🔴 default
+— silent**, la 3–8 minute după deploy.
+
+**Nu retragi `default` ca să eviți alerta.** Se poate, tehnic — martorul are
+acum `SENTINEL_RETIRED_INSTANCES`, iar o identitate retrasă e refuzată cu 401
+înainte de orice scriere, deci beaconul vechi nu-i mai poate recrea fișierul de
+stare. Tocmai de-aia e periculos: `default` e găleata comună a **fiecărui**
+server care nu trimite încă `X-Sentinel-Instance`. Retrasă prea devreme, ea
+scoate din registru serverele alea — dispar de pe `/status`, de pe pagină și din
+`/check`, fără nicio alertă, în timp ce martorul raportează „ok".
+
+Deci: **așteaptă exact o alertă, și tratează orice a doua ca reală.** Un operator
+căruia i se promite că nu va primi niciuna tratează alerta primită ca pe un
+incident, iar unul care nu e prevenit deloc învață că alertele martorului sunt
+zgomot — amândouă mai scumpe decât o propoziție.
+
+Pașii de mai jos o fac cât mai scurtă:
+
+1. **înainte de deploy**, citești identitatea dacă gazda are deja una
+   (comanda de mai sus). Dacă nu are, faci deploy-ul, apoi o citești — între
+   deploy și pasul 2 martorul nu primește semnale de la gazda asta;
+2. adaugi identitatea și cheia ei în `SENTINEL_INSTANCE_SECRETS` la martor;
+3. confirmi în jurnal că semnalul e acceptat:
+   `journalctl -u sentinel-beacon -n 20` — un `beacon rejected` cu `status 401`
+   înseamnă că pasul 2 nu a ajuns unde credeai;
+4. **retragi `default` doar după ce ai dovedit că nimeni nu mai bate sub ea.**
+   Dovada nu e „am actualizat toate gazdele", e citită din martor: fiecare server
+   real apare în `/status` sub `instance_id`-ul lui, iar `default` apare cu
+   **`"status": "silent"`**.
+
+   ```bash
+   curl -s https://<domeniul-martorului>/api/sentinel/status
+   ```
+
+   `silent` e verdictul pe care îl calculează martorul însuși (`aggregator/lib/verify.ts`),
+   după ce trec trei intervale ratate — `max(interval_s, 30) * 3`, adică 180 de
+   secunde la configurația implicită. **Un server care încă bate nu poate produce
+   verdictul ăsta.**
+
+   Nu te uita la `age_s` și nu-l compara între două interogări. O versiune
+   anterioară a pasului ăstuia cerea exact asta — două interogări la 30 de
+   secunde, cu `age_s` în creștere — și e nesigură: 30 de secunde e jumătate din
+   intervalul implicit de bătaie, deci ambele probe pot cădea în același gol
+   dintre două bătăi, iar `age_s` crește cu exact 30 ori de câte ori nicio bătaie
+   nu nimerește fereastra. Măsurat: `age_s 15 → 45`, „a crescut", în timp ce
+   serverul bătuse cu 15 secunde înainte de prima interogare și bătea din nou la
+   15 secunde după a doua. Rândul de alături spunea `"status": "ok"`, dar pasul
+   nu cerea nimănui să se uite acolo.
+
+   Abia atunci adaugi `default` în `SENTINEL_RETIRED_INSTANCES` la martor și
+   repornești aplicația — variabilele se citesc la pornire. Verifici prin efect:
+   `default` dispare din `instances`, iar
+   `/api/sentinel/status?instance=default` întoarce `503 unknown`.
+
+   **Ștergerea `SENTINEL_BEACON_SECRET` nu e o retragere** și nici nu e posibilă
+   pe găzduirea martorului (o variabilă nu se poate șterge și nu poate fi goală —
+   măsurat, vezi `watcher/INCARCARE-HOSTINGER.md`). Chiar dacă ar fi: martorul
+   consideră membră orice instanță al cărei fișier de stare se identifică singur,
+   indiferent de chei (`aggregator/lib/store.ts`, sursa 1), deci `default` ar rămâne
+   pe hartă și ar alarma critic la fiecare 4 ore.
+
+   **Ștergerea fișierului ei de stare** — procedura dinainte — nu e nici ea o
+   retragere: nu revocă cheia. Cine deține `SENTINEL_BEACON_SECRET` poate
+   continua să scrie sub `default`, iar fișierul reapare la primul semnal.
+   Retragerea taie ambele: identitatea iese din registru **și** cheia ei nu mai
+   autentifică. Cheia rămâne totuși scrisă pe gazda dezafectată — **rotește-o**.
+
+Cât timp gazda **nu** are identitate, beaconul nu trimite nimic și spune de ce
+în jurnal (`beacon has no instance identity`). Asta e intenționat: un semnal
+fără nume ar ateriza în găleata comună `default`, amestecând istoria gazdei
+ăsteia cu a oricărei alte gazde neidentificate — exact lucrul pentru care există
+identitatea. De aceea deploy-ul asigură fișierul înainte să repornească
+serviciile, și de aceea refuză să repornească beaconul dacă tot nu poate: un
+proces vechi care încă bate e mai bun decât unul nou care tace.
+
 ---
 
 ## 8. Referință rapidă
@@ -757,6 +893,7 @@ git diff --name-only HEAD@{1} -- sentinel/db/migrations/
 | Praguri detecție | `/etc/sentinel/detection.yaml` |
 | Notificări | `/etc/sentinel/notifications.yaml` |
 | Secrete | `/etc/sentinel/secrets.env` (0640 root:sentinel) |
+| Identitatea instalării | `/etc/sentinel/instance_id` (0640 root:sentinel) — OPERARE.md §12 |
 | Cod | `/opt/sentinel/lib/sentinel/` |
 | Executor (root) | `/opt/sentinel/libexec/sentinel_executor.py` |
 | Workspace Claude | `/opt/sentinel/claude-workspace/` |

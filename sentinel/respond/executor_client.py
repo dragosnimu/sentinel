@@ -103,6 +103,12 @@ class ExecutorClient:
     def allow_ip(self, ip: str) -> dict[str, Any]:
         return self.call("allow_ip", ip=ip)
 
+    def audit_status(self) -> dict[str, Any]:
+        return self.call("audit_status")
+
+    def terminate_session(self, session_key: str) -> dict[str, Any]:
+        return self.call("terminate_session", session_key=session_key)
+
     def flush_blocklist(self, reason: str) -> dict[str, Any]:
         return self.call("flush_blocklist", reason=reason)
 

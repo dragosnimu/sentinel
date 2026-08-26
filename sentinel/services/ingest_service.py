@@ -27,6 +27,7 @@ import argparse
 import asyncio
 import contextlib
 import signal
+from collections.abc import Sequence
 from pathlib import Path
 
 from sentinel.collectors import nginx_tail
@@ -35,12 +36,14 @@ from sentinel.collectors.nginx import parse_nginx
 from sentinel.collectors.sshd import parse_sshd
 from sentinel.collectors.suricata_eve import parse_suricata
 from sentinel.collectors.system import parse_system
-from sentinel.config import Config, get_config
+from sentinel.config import Config, get_config, resolve_skip_command_accounts
 from sentinel.db.engine import Database
 from sentinel.db.repo import events as events_repo
+from sentinel.db.repo import logins
 from sentinel.enrich.geoip import GeoEnricher
 from sentinel.logging_setup import get_logger, setup_logging
 from sentinel.model.event import Event
+from sentinel.services import parse_service_args
 
 log = get_logger(__name__)
 
@@ -61,6 +64,29 @@ class Ingest:
         self.cfg = cfg
         self.db = db
         self.exclude = set(cfg.ingest.exclude_sources)
+        # Read once, at construction, like `exclude` above: a missing or
+        # malformed section then fails when the daemon starts, not silently on
+        # the first batch that happens to carry a command.
+        #
+        # Resolved, not taken literally: the same account reaches the table
+        # under its name AND under its numeric auid, and the filter compares on
+        # exact equality. See `SkipAccounts` for the measurement and the edge.
+        self.skip_accounts = resolve_skip_command_accounts(
+            cfg.history.skip_command_accounts)
+        self.skip_command_accounts = self.skip_accounts.matches
+        # A configured account that does not exist on this host is a filter that
+        # can never match. Said once, at start, because the alternative is a
+        # section that looks configured and drops nothing — which is exactly how
+        # the first version of this filter spent a week doing nothing.
+        if not self.skip_accounts.lookup_ok:
+            log.warning(
+                "cannot read the account database; skip_command_accounts "
+                "resolved by name only",
+                extra={"configured": list(cfg.history.skip_command_accounts)})
+        elif self.skip_accounts.unresolved:
+            log.warning(
+                "skip_command_accounts names accounts absent from this host",
+                extra={"unresolved": list(self.skip_accounts.unresolved)})
         self.geo = GeoEnricher()
         self._journald = None
         self._nginx_cursors: dict[str, str | None] = {}
@@ -161,6 +187,23 @@ class Ingest:
 
         if batch:
             await events_repo.insert_batch(self.db, batch)
+            # DUPA scrierea brutului, nu in locul lui. `raw_events` ramane sursa
+            # completa chiar daca proiectia are un defect, iar o sesiune care nu
+            # s-a construit corect se poate reface din evenimentele ei.
+            proiectat = await logins.project(
+                self.db, batch, self.skip_command_accounts)
+            # `commands_skipped` intra in conditie, nu doar in dictionar: un
+            # deploy produce sute de loturi cu comenzi si NICIO logare, deci un
+            # filtru care taie 405 777 de randuri n-ar lasa nicio urma in jurnal.
+            # Un filtru tacut care intr-o zi prinde si altceva decat trebuie nu
+            # s-ar vedea niciodata.
+            if (proiectat["sessions_opened"] or proiectat["sessions_closed"]
+                    or proiectat["commands_skipped"]):
+                # `extra=`, nu argumente cu nume. `Logger._log()` nu le accepta,
+                # iar exceptia cade IN bucla de ingestie: pe 25 august 2026 asta
+                # a oprit colectarea pentru toate sursele, si numai atunci cand
+                # chiar se deschidea o sesiune — deci a aratat intermitent.
+                log.info("login sessions projected", extra=proiectat)
 
         # Advance cursors only after the batch they cover is committed.
         if sshd_cursor is not None:
@@ -220,8 +263,9 @@ async def _main() -> int:
     return 0
 
 
-def main() -> int:
-    argparse.ArgumentParser(prog="sentinel ingest", add_help=False).parse_known_args()
+def main(argv: Sequence[str] | None = None) -> int:
+    parse_service_args(
+        argparse.ArgumentParser(prog="sentinel ingest", add_help=False), argv)
     setup_logging("sentinel-ingest")
     try:
         return asyncio.run(_main())

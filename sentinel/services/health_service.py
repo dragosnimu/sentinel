@@ -21,12 +21,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Sequence
 
 from sentinel.config import Config, get_config
 from sentinel.db.engine import Database
 from sentinel.health import capacity, prober, sla
 from sentinel.logging_setup import get_logger, setup_logging
 from sentinel.scan import inventory
+from sentinel.services import parse_service_args
 
 log = get_logger(__name__)
 
@@ -63,12 +65,12 @@ async def _run(args: argparse.Namespace) -> int:
         await db.close()
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="sentinel health", add_help=False)
     parser.add_argument("--probe-only", action="store_true")
     parser.add_argument("--capacity-only", action="store_true")
     parser.add_argument("--rollup", action="store_true", help="roll up yesterday's availability and exit")
-    args, _ = parser.parse_known_args()
+    args = parse_service_args(parser, argv)
 
     setup_logging("sentinel-health")
     try:

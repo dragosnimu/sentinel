@@ -1,0 +1,13 @@
+node_modules/
+.next/
+.env
+.env.local
+*.tsbuildinfo
+# Generat de `next build`/`next dev` la fiecare rulare, ca la martor.
+next-env.d.ts
+# Directoare temporare create de teste ÎNĂUNTRUL agregatorului: `--import tsx` se
+# rezolvă urcând după `node_modules`, deci puntea către implementarea livrată nu
+# poate rula din `tmp`. Neignorate, ajung în garda de sanitizare ca fișiere
+# urmărite-și-dispărute, iar aia o face instabilă — un test care face garda
+# instabilă e un test care o va face ignorată.
+.tmp-*/

@@ -32,16 +32,49 @@ _PLACEHOLDERS = ", ".join(
 _INSERT = f"INSERT INTO raw_events ({', '.join(_COLS)}) VALUES ({_PLACEHOLDERS})"
 
 
+#: Ce se pune în locul unui octet NUL care a ajuns până aici.
+#:
+#: Un spațiu, fiindcă în practic toate cazurile în care apare — `argv` de la
+#: auditd, un câmp binar dintr-un jurnal — NUL e un SEPARATOR. Șters, două
+#: cuvinte s-ar lipi într-unul.
+_NUL_REPLACEMENT = " "
+
+
+def _scrub(value: Any) -> Any:
+    """Scoate octeții NUL dintr-un text.
+
+    PostgreSQL refuză `\u0000` în `text` și în `jsonb`. Un singur rând cu un NUL
+    face să eșueze `executemany` pentru LOTUL ÎNTREG — deci un octet dintr-o
+    linie de jurnal oprește colectarea pentru toate sursele, iar simptomul e
+    tăcere, nu o eroare pe rândul vinovat.
+
+    S-a întâmplat pe 25 august 2026: decodorul de argumente hexa al colectorului
+    de auditd a început să producă NUL-uri (`argv` e NUL-separat în nucleu), iar
+    ingestia a căzut în întregime.
+
+    Reparația adevărată e la sursă, și e făcută acolo. Asta e plasa: `raw_events`
+    primește text din cinci colectoare, iar al șaselea care va produce un octet
+    nepotrivit nu are voie să oprească din nou totul.
+    """
+    if isinstance(value, str):
+        return value.replace("\x00", _NUL_REPLACEMENT)
+    if isinstance(value, dict):
+        return {k: _scrub(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub(v) for v in value]
+    return value
+
+
 def _row_tuple(ev: Event) -> tuple[Any, ...]:
     row = ev.to_row()
     values: list[Any] = []
     for c in _COLS:
         if c == "raw":
-            values.append(json.dumps(row.get("raw") or {}))
+            values.append(json.dumps(_scrub(row.get("raw") or {})))
         elif c == "reputation":
             values.append(list(row.get("reputation") or []))
         else:
-            values.append(row.get(c))
+            values.append(_scrub(row.get(c)))
     return tuple(values)
 
 

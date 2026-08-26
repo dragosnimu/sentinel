@@ -1,0 +1,459 @@
+{
+  "README": [
+    "Corpusul comun al contractului de semnare. Citit de",
+    "tests/unit/test_signing.py si de watcher/tests/canonical.test.ts.",
+    "`canonical` si `hmac` sunt vector de aur: fiecare capat se compara cu",
+    "sirurile astea, nu unul cu celalalt.",
+    "Cazurile pe care JSON nu le poate purta identic in ambele limbaje",
+    "(60.0, NaN, Infinity, tuplu, adancime) sunt declarate nativ",
+    "in fiecare fisier de test.",
+    "NU se regenereaza cu un script. Generatorul a fost un harness de",
+    "verificare din E2.1 si nu a fost pastrat: un harness care supravietuieste",
+    "rundei lui ajunge sa fie rulat peste un arbore mai nou, ceea ce a stricat",
+    "arborele de lucru de doua ori in E2.2. Si oricum, un vector de aur",
+    "regenerat de una dintre implementari inceteaza sa mai fie o verificare",
+    "incrucisata. Un caz nou se adauga cu mana, cu octetii si HMAC-ul lui,",
+    "si trece prin ambele suite."
+  ],
+  "secret": "cheie-de-test-0123456789abcdef",
+  "cases": [
+    {
+      "name": "beat-real",
+      "why": "Semnalul cu forma pe care o trimite collect() azi, cu identitate si eticheta cu diacritice.",
+      "expect": "accept",
+      "payload": {
+        "instance_id": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "instance_label": "Server produc\u021bie",
+        "seq": 4471,
+        "sent_at": "2026-08-12T09:15:04.512345+00:00",
+        "max_age_s": 120,
+        "interval_s": 60,
+        "last_event_id": 918273,
+        "detect_cursor": 918200,
+        "incidents_open": 2,
+        "blocklist_size": 37,
+        "audit_head": "3f9c1d0e6b2a48f7c5e0d1a2b3c4d5e60718293a4b5c6d7e8f90a1b2c3d4e5f6",
+        "selfcheck": {
+          "worst": "ok",
+          "checks": 33,
+          "bad": 0,
+          "ran_at": "2026-08-12T09:14:31+00:00"
+        }
+      },
+      "canonical": "{\"audit_head\":\"3f9c1d0e6b2a48f7c5e0d1a2b3c4d5e60718293a4b5c6d7e8f90a1b2c3d4e5f6\",\"blocklist_size\":37,\"detect_cursor\":918200,\"incidents_open\":2,\"instance_id\":\"a1b2c3d4e5f60718293a4b5c6d7e8f90\",\"instance_label\":\"Server produc\u021bie\",\"interval_s\":60,\"last_event_id\":918273,\"max_age_s\":120,\"selfcheck\":{\"bad\":0,\"checks\":33,\"ran_at\":\"2026-08-12T09:14:31+00:00\",\"worst\":\"ok\"},\"sent_at\":\"2026-08-12T09:15:04.512345+00:00\",\"seq\":4471}",
+      "hmac": "98d34da11517dcf63e8eb9f10efee4f619fce0405250c6ab6488a2c294eb731f"
+    },
+    {
+      "name": "chei-intregi",
+      "why": "DIVERGENTA 1: JS reaseaza cheile de tip index numeric. Ordinea ceruta e pe puncte de cod.",
+      "expect": "accept",
+      "payload": {
+        "1": "unu",
+        "2": "doi",
+        "10": "zece",
+        "20": "douazeci",
+        "3": "trei"
+      },
+      "canonical": "{\"1\":\"unu\",\"10\":\"zece\",\"2\":\"doi\",\"20\":\"douazeci\",\"3\":\"trei\"}",
+      "hmac": "4e6270bd341d04bedd73502824a321b36eb4e0f7d843f437c03a1c31fb936ced"
+    },
+    {
+      "name": "chei-intregi-imbricate",
+      "why": "DIVERGENTA 2: aceeasi cauza sub un nivel, unde o sortare doar la radacina n-o vede.",
+      "expect": "accept",
+      "payload": {
+        "a": {
+          "10": 1,
+          "2": 2
+        },
+        "b": [
+          {
+            "100": 1,
+            "20": 2
+          }
+        ]
+      },
+      "canonical": "{\"a\":{\"10\":1,\"2\":2},\"b\":[{\"100\":1,\"20\":2}]}",
+      "hmac": "532f679465ba7d457ba9368ae4f9380bb2ae7c0d69ebf49d03a5d30d66b891ed"
+    },
+    {
+      "name": "chei-mixte-ascii",
+      "why": "Cifre, majuscule, minuscule, underscore, punct, spatiu: ordinea punctelor de cod nu e cea alfabetica.",
+      "expect": "accept",
+      "payload": {
+        "Z": 1,
+        "a": 2,
+        "A": 3,
+        "_x": 4,
+        "0": 5,
+        "z.y": 6,
+        "z_y": 7,
+        " ": 8
+      },
+      "canonical": "{\" \":8,\"0\":5,\"A\":3,\"Z\":1,\"_x\":4,\"a\":2,\"z.y\":6,\"z_y\":7}",
+      "hmac": "b5d3a177c0e99d2f2e18d317afb4dd099fd74b22906699650e57313929dabe1e"
+    },
+    {
+      "name": "diacritice",
+      "why": "Valori romanesti. Cu ensure_ascii la un capat si fara la celalalt, orice text de alerta ar pica.",
+      "expect": "accept",
+      "payload": {
+        "nota": "autentificare reu\u0219it\u0103 \u0219i \u00eenchis\u0103: \u0103\u00e2\u00ee\u0219\u021b",
+        "mare": "\u0102\u00c2\u00ce\u0218\u021a"
+      },
+      "canonical": "{\"mare\":\"\u0102\u00c2\u00ce\u0218\u021a\",\"nota\":\"autentificare reu\u0219it\u0103 \u0219i \u00eenchis\u0103: \u0103\u00e2\u00ee\u0219\u021b\"}",
+      "hmac": "3f5672c2c23edf40d3960bd00a3b2d19096f7d24cf578f5f67beea565f65ed60"
+    },
+    {
+      "name": "sir-gol-si-null",
+      "why": "Eticheta goala se trimite MEREU, inclusiv goala. Si null nu inseamna acelasi lucru ca absent.",
+      "expect": "accept",
+      "payload": {
+        "instance_label": "",
+        "": "cheie goala",
+        "ran_at": null,
+        "z": null
+      },
+      "canonical": "{\"\":\"cheie goala\",\"instance_label\":\"\",\"ran_at\":null,\"z\":null}",
+      "hmac": "3a8304e7d7ed2a43b1038e3d305c77101bf963293febd2f8e6ebf07dce34e5a3"
+    },
+    {
+      "name": "obiect-gol-si-tablou-gol",
+      "why": "Un selfcheck fara randuri si o lista de dovezi fara elemente.",
+      "expect": "accept",
+      "payload": {
+        "selfcheck": {},
+        "evidence": [],
+        "nested": {
+          "a": {},
+          "b": [
+            [],
+            {}
+          ]
+        }
+      },
+      "canonical": "{\"evidence\":[],\"nested\":{\"a\":{},\"b\":[[],{}]},\"selfcheck\":{}}",
+      "hmac": "2de10067cfa4444d99fe216f42b88aed52876bac628687f6e50f0a2df2e093c5"
+    },
+    {
+      "name": "intreg-mare-exact",
+      "why": "Cel mai mare intreg pe care ambele capete il scriu identic; limita trebuie sa fie exacta.",
+      "expect": "accept",
+      "payload": {
+        "last_event_id": 9007199254740991,
+        "negativ": -9007199254740991,
+        "zero": 0,
+        "minus_unu": -1
+      },
+      "canonical": "{\"last_event_id\":9007199254740991,\"minus_unu\":-1,\"negativ\":-9007199254740991,\"zero\":0}",
+      "hmac": "6741bfb057e374feb0904723c34420b8d919c1ea73258a9ff7f232998c96b68e"
+    },
+    {
+      "name": "booleeni",
+      "why": "true/false, nu 1/0. In Python bool E int, deci un emitent neatent ar scrie 1.",
+      "expect": "accept",
+      "payload": {
+        "enabled": true,
+        "disabled": false,
+        "unu": 1,
+        "zero": 0
+      },
+      "canonical": "{\"disabled\":false,\"enabled\":true,\"unu\":1,\"zero\":0}",
+      "hmac": "8a789ec175b872abcc99c18a3451b2261c11bc58d53f447da6f07ca222ac04d4"
+    },
+    {
+      "name": "escape-uri",
+      "why": "Ghilimea, backslash, controale C0 si DEL. Lista de scurtaturi trebuie sa fie aceeasi la ambele capete.",
+      "expect": "accept",
+      "payload": {
+        "raw": "ghilimea \" backslash \\ slash / tab \t nl \n cr \r bs \b ff \f",
+        "control": "\u0000\u0001\u001f",
+        "del": "\u007f"
+      },
+      "canonical": "{\"control\":\"\\u0000\\u0001\\u001f\",\"del\":\"\u007f\",\"raw\":\"ghilimea \\\" backslash \\\\ slash / tab \\t nl \\n cr \\r bs \\b ff \\f\"}",
+      "hmac": "40478006e5b7d36e2072ad1e9d77bb96d193a15c10315dd464d5d2f6a8f45688"
+    },
+    {
+      "name": "astral-si-separatori",
+      "why": "Emoji (peste BMP), separatorii de linie U+2028/U+2029 din jurnale web, zona privata, U+FFFD.",
+      "expect": "accept",
+      "payload": {
+        "emoji": "\ud83d\ude00 alarma",
+        "sep": "\u2028\u2029",
+        "pua": "\ue000",
+        "replacement": "\ufffd"
+      },
+      "canonical": "{\"emoji\":\"\ud83d\ude00 alarma\",\"pua\":\"\ue000\",\"replacement\":\"\ufffd\",\"sep\":\"\u2028\u2029\"}",
+      "hmac": "8a7be494a5e184128012b4c269038c6e7fffcc344bdd87a00532719c89c7bd70"
+    },
+    {
+      "name": "chei-la-marginea-ascii",
+      "why": "Marginile exacte ale intervalului de chei: 0x20, 0x21, 0x7D, 0x7E. O limita nefixata trece neobservata.",
+      "expect": "accept",
+      "payload": {
+        " ": 1,
+        "!": 2,
+        "}": 3,
+        "~": 4
+      },
+      "canonical": "{\" \":1,\"!\":2,\"}\":3,\"~\":4}",
+      "hmac": "79e83c400bedb59b0f4fc5fc6e253e179f974af1ac55c6e2a3e7d69b3af36d3b"
+    },
+    {
+      "name": "adancime-la-limita",
+      "why": "Exact MAX_DEPTH containere. Cazul de sub limita nu spune nimic despre limita insasi.",
+      "expect": "accept",
+      "payload": {
+        "a": [
+          {
+            "a": [
+              {
+                "a": [
+                  {
+                    "a": [
+                      {
+                        "a": [
+                          {
+                            "a": [
+                              {
+                                "a": [
+                                  {
+                                    "a": [
+                                      {
+                                        "a": [
+                                          {
+                                            "a": [
+                                              {
+                                                "a": [
+                                                  {
+                                                    "a": [
+                                                      {
+                                                        "a": [
+                                                          {
+                                                            "a": [
+                                                              {
+                                                                "a": [
+                                                                  {
+                                                                    "a": [
+                                                                      1
+                                                                    ]
+                                                                  }
+                                                                ]
+                                                              }
+                                                            ]
+                                                          }
+                                                        ]
+                                                      }
+                                                    ]
+                                                  }
+                                                ]
+                                              }
+                                            ]
+                                          }
+                                        ]
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "canonical": "{\"a\":[{\"a\":[{\"a\":[{\"a\":[{\"a\":[{\"a\":[{\"a\":[{\"a\":[{\"a\":[{\"a\":[{\"a\":[{\"a\":[{\"a\":[{\"a\":[{\"a\":[{\"a\":[1]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}]}",
+      "hmac": "490f45a756bba2081529df2d8b91aea9b4c8eddc4fe4d0433866135473c05e13"
+    },
+    {
+      "name": "imbricare-adanca",
+      "why": "Forma reala din E2: randuri cu obiecte in tablouri in obiecte.",
+      "expect": "accept",
+      "payload": {
+        "rows": {
+          "audit_log": [
+            {
+              "id": 1,
+              "prev_hash": "",
+              "entry_hash": "aa"
+            },
+            {
+              "id": 2,
+              "prev_hash": "aa",
+              "entry_hash": "bb"
+            }
+          ]
+        },
+        "cursors": {
+          "audit_log": 2
+        }
+      },
+      "canonical": "{\"cursors\":{\"audit_log\":2},\"rows\":{\"audit_log\":[{\"entry_hash\":\"aa\",\"id\":1,\"prev_hash\":\"\"},{\"entry_hash\":\"bb\",\"id\":2,\"prev_hash\":\"aa\"}]}}",
+      "hmac": "6c76b3fb963ef8d0d2b4dcd8c4741702800f572ba30e31e59a6a38f88d82d317"
+    },
+    {
+      "name": "cheie-non-ascii",
+      "why": "DIVERGENTA 4: Python sorteaza pe puncte de cod, Array.sort() pe unitati UTF-16.",
+      "expect": "reject",
+      "payload": {
+        "\ue000": 1,
+        "\ufffd": 2,
+        "\ud83d\ude00": 3,
+        "a": 4
+      },
+      "python_reason": "$: cheia '\\ue000' con\u021bine U+E000; cheile trebuie s\u0103 fie ASCII tip\u0103ribil (U+0020-U+007E)"
+    },
+    {
+      "name": "cheie-diacritic",
+      "why": "O cheie scrisa in romana e o greseala de protocol, nu o cerinta. Refuzata la ambele capete.",
+      "expect": "reject",
+      "payload": {
+        "eticheta": 1,
+        "not\u0103": 2
+      },
+      "python_reason": "$: cheia 'not\u0103' con\u021bine U+0103; cheile trebuie s\u0103 fie ASCII tip\u0103ribil (U+0020-U+007E)"
+    },
+    {
+      "name": "cheie-control",
+      "why": "Un control C0 intr-un nume de camp nu e un nume de camp.",
+      "expect": "reject",
+      "payload": {
+        "a\u0001b": 1
+      },
+      "python_reason": "$: cheia 'a\\x01b' con\u021bine U+0001; cheile trebuie s\u0103 fie ASCII tip\u0103ribil (U+0020-U+007E)"
+    },
+    {
+      "name": "cheie-del",
+      "why": "DEL (0x7F) e exact peste marginea de sus. `_KEY_MAX = 0x7F` in loc de 0x7E ar diverge tacut.",
+      "expect": "reject",
+      "payload": {
+        "a\u007fb": 1
+      },
+      "python_reason": "$: cheia 'a\\x7fb' con\u021bine U+007F; cheile trebuie s\u0103 fie ASCII tip\u0103ribil (U+0020-U+007E)"
+    },
+    {
+      "name": "cheie-sub-limita",
+      "why": "0x1F e exact sub marginea de jos, langa spatiu (0x20), care e permis.",
+      "expect": "reject",
+      "payload": {
+        "\u001f": 1
+      },
+      "python_reason": "$: cheia '\\x1f' con\u021bine U+001F; cheile trebuie s\u0103 fie ASCII tip\u0103ribil (U+0020-U+007E)"
+    },
+    {
+      "name": "adancime-peste-limita",
+      "why": "MAX_DEPTH + 1 containere. Impreuna cu `adancime-la-limita` fixeaza limita, nu doar existenta ei.",
+      "expect": "reject",
+      "payload": {
+        "a": {
+          "a": [
+            {
+              "a": [
+                {
+                  "a": [
+                    {
+                      "a": [
+                        {
+                          "a": [
+                            {
+                              "a": [
+                                {
+                                  "a": [
+                                    {
+                                      "a": [
+                                        {
+                                          "a": [
+                                            {
+                                              "a": [
+                                                {
+                                                  "a": [
+                                                    {
+                                                      "a": [
+                                                        {
+                                                          "a": [
+                                                            {
+                                                              "a": [
+                                                                {
+                                                                  "a": [
+                                                                    {
+                                                                      "a": [
+                                                                        1
+                                                                      ]
+                                                                    }
+                                                                  ]
+                                                                }
+                                                              ]
+                                                            }
+                                                          ]
+                                                        }
+                                                      ]
+                                                    }
+                                                  ]
+                                                }
+                                              ]
+                                            }
+                                          ]
+                                        }
+                                      ]
+                                    }
+                                  ]
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "python_reason": "$.a.a[0].a[0].a[0].a[0].a[0].a[0].a[0].a[0].a[0].a[0].a[0].a[0].a[0].a[0].a[0].a: imbricare peste 32 niveluri"
+    },
+    {
+      "name": "float-fractionar",
+      "why": "Fara float: doi algoritmi numar-catre-sir de acord pe majoritatea valorilor si nu pe toate.",
+      "expect": "reject",
+      "payload": {
+        "interval_s": 1.5
+      },
+      "python_reason": "$.interval_s: float (1.5) nu se poate semna \u2014 cele dou\u0103 capete \u00eel scriu diferit. Trimite un \u00eentreg, sau un \u0219ir dac\u0103 zecimalele conteaz\u0103"
+    },
+    {
+      "name": "float-exponent",
+      "why": "DIVERGENTA 3: Python scrie 1e-07, JavaScript 1e-7.",
+      "expect": "reject",
+      "payload": {
+        "rata": 1e-07
+      },
+      "python_reason": "$.rata: float (1e-07) nu se poate semna \u2014 cele dou\u0103 capete \u00eel scriu diferit. Trimite un \u00eentreg, sau un \u0219ir dac\u0103 zecimalele conteaz\u0103"
+    },
+    {
+      "name": "intreg-peste-limita",
+      "why": "2^53: JS nu-l mai reprezinta exact, deci un receptor care recalculeaza forma canonica ar refuza un semnal corect.",
+      "expect": "reject",
+      "payload": {
+        "last_event_id": 9007199254740992
+      },
+      "python_reason": "$.last_event_id: \u00eentregul 9007199254740992 dep\u0103\u0219e\u0219te \u00b12^53-1, deci cel\u0103lalt cap\u0103t nu \u00eel poate reprezenta exact"
+    },
+    {
+      "name": "surogat-neimperecheat",
+      "why": "Python nu-l poate codifica in UTF-8, JS il scrie ca \\udXXX. Singura forma de sir care nu se poate scrie la fel.",
+      "expect": "reject",
+      "payload": {
+        "s": "\ud800"
+      },
+      "python_reason": "$.s: surogat ne\u00eemperecheat U+D800 \u00eentr-un \u0219ir; cele dou\u0103 capete nu \u00eel pot scrie la fel"
+    }
+  ]
+}

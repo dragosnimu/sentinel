@@ -1,0 +1,116 @@
+## Plic de transport pentru loturile de expediere (25 august 2026)
+
+### Pana
+
+Marginea găzduirii agregatorului extern are un WAF **cu
+punctaj** care inspectează corpul JSON al cererii. `session_commands` e singurul
+flux al cărui conținut e format din linii de comandă, deci singurul care adună
+punctaj. Peste prag, marginea răspunde `403 Forbidden` în text simplu — nu
+formatul nostru; niciun `403` nu există pe calea `/api/sentinel/sync` în codul
+nostru. Cursorul avansează doar pe ecoul filigranului, deci lotul se retrimite la
+infinit, tot ce vine după stă în spate, iar autodiagnosticul raportează
+`ship:lag`.
+
+**Cât de puțin trebuie ca să se rupă**, măsurat pe gazdă cu cereri nesemnate
+(aplicația răspunde `401` la orice ajunge la ea, deci `401` = a trecut de
+margine): **trei treceri, șase picate.** Nu mărimea (4 MB dintr-o singură literă
+trec), nu numărul de rânduri (400 de rânduri sintetice trec), nu un rând ostil
+anume (`cat /etc/passwd; curl …|sh` singur trece). Scorul cumulat, atins de
+patru–șase apariții ale unei comenzi banale: `cat`, `wc -c`,
+`python3 /tmp/mkbody.py 400`. Tabelul întreg e în capul lui
+`sentinel/report/envelope.py`.
+
+### Reparația
+
+Corpul cererii devine opac pentru orice intermediar care încearcă să-l citească
+drept conținut: `gzip`, apoi `base64`, într-un câmp al unui plic JSON. E varianta
+probată în măsurătoare (rândul cu `401`), nu una raționată.
+
+    {"enc":"gzip+base64","v":1,"pad":"","body":"H4sIA…"}
+
+Ce **nu** se schimbă, și e scris pe față în cod fiindcă e felul în care cineva ar
+strica lucrurile mai târziu:
+
+* **semnătura rămâne peste octeții canonici DINĂUNTRU.**
+  `sentinel/report/signing.py` și `aggregator/lib/verify.ts` rămân gemeni
+  identici la octet; plicul e transport, nu conținut semnat. Semnat peste plic,
+  semnătura ar depinde de versiunea zlib de pe gazdă, iar simptomul ar fi 401 la
+  fiecare lot — adică exact ce arată o cheie greșită;
+* **antetele rămân în afara plicului.** `X-Sentinel-Instance` se citește ca să se
+  găsească cheia, înaintea oricărei verificări. Ordinea din protocol devine:
+  antet → cheie → *(dacă e plic) se deschide, mărginit* → HMAC peste octeții
+  semnați → `payload.instance_id == antet`;
+* **`Content-Type` rămâne `application/json`.** Un corp binar cu alt tip nu a
+  fost probat pe margine, deci nu e o variantă de afirmat.
+
+### Amândouă formele, în timpul rulării
+
+Agregatorul acceptă și JSON în clar, și plic, fără comutator și fără
+configurație. Ordinea de livrare e **agregatorul, apoi gazda** — aceeași ordine
+ca la martor în `docs/PLAN-arhitectura-distribuita.md`. Discriminatorul e
+prefixul `{"enc":"gzip+base64"`, comparat în timp constant: forma canonică începe
+întotdeauna cu `{"batch_seq":`, fiindcă cheile se emit sortate pe puncte de cod.
+
+### Plafoanele la decomprimare
+
+Plicul se deschide **înainte** de verificarea semnăturii — nu poate fi altfel,
+fiindcă semnătura e peste ce iese din el —, deci un plic mic care se desface în
+gigaocteți e o cerere nesemnată care consumă memoria agregatorului.
+
+* **absolut:** cel mult `MAX_BODY_BYTES`, adică exact cât acceptă și calea în
+  clar. Aplicat **în timpul** decomprimării: verificat după, gigaoctetul e deja
+  alocat;
+* **raport:** corpul semnat poate fi cel mult de 64 de ori mai mare decât plicul
+  primit.
+
+Al doilea nu e un filtru peste ce poate produce gzip, și motivul e măsurat: un
+lot **legitim** atinge orice raport pe care îl atinge o bombă. `argv` e
+nemărginit la sursă și călătorește neatins, deci un singur rând cu o linie de
+comandă lungă comprimă de 992 de ori, iar 8 MB din același octet de 1026. Un
+plafon pus între ele e o lamă de cuțit; unul mai jos ar opri un lot valid pentru
+totdeauna **și i-ar da oricui are shell pe gazda monitorizată o comandă prin care
+oprește arhiva externă** — exact proprietatea pentru care există arhiva.
+
+Deci raportul e o inegalitate pe care **expeditorul o respectă prin
+construcție**, umplând plicul (`pad`) până când e destul de mare. Receptorul o
+verifică. Costul, pe cel mai comprimabil lot măsurat: plicul crește de la 25 KB
+la 131 KB — tot de 64 de ori mai mic decât cei 8,4 MB în clar. Pe loturile
+normale umplutura e zero.
+
+### Câștigul, măsurat
+
+Loturi de `session_commands` de 2000 de rânduri, forma canonică → plic pe sârmă:
+
+| conținut | în clar | pe sârmă | raport |
+|---|---|---|---|
+| comenzi amestecate | 479 KB | 38 KB | 12,5× |
+| aceeași comandă repetată | 504 KB | 31 KB | 16,2× |
+| 24 de rânduri reale (vectorul din teste) | 6,3 KB | 1,0 KB | 6,3× |
+
+Raportul obținut se scrie în jurnal la fiecare lot expediat
+(`shipper batch wrapped for transport`), ca o scădere la 1× să fie observabilă,
+nu presupusă. Pe o gazdă liniștită sunt câteva linii pe oră; la drenarea unei
+restanțe, una pe secundă cât ține drenarea.
+
+### Fișiere
+
+* `sentinel/report/envelope.py` — nou; `wrap()`, constantele, măsurătorile.
+* `sentinel/report/shipper.py` — `ship_once` împachetează DUPĂ semnare; un eșec
+  al împachetării iese ca verdict per flux, nu ca excepție.
+* `aggregator/lib/envelope.ts` — nou; `unwrap()`, `inflateBounded()`.
+* `aggregator/app/api/sentinel/sync/route.ts` — pasul nou, între identitate și
+  semnătură.
+* `tests/fixtures/transport-envelope.json` — vector comun, produs de partea
+  Python și citit de partea TypeScript.
+* `tests/unit/test_transport_envelope.py`, `aggregator/tests/envelope.test.ts`,
+  plus probe noi în `tests/unit/test_shipper.py` și
+  `aggregator/tests/sync.route.test.ts`.
+
+### Ce rămâne de decis
+
+* **base64 rezolvă azi; nu e garantat că ține.** Un WAF poate scora și blocurile
+  base64 (entropie, lungimea unui singur token). Dacă se întâmplă, planul B nu e
+  gata: corpul binar cu alt `Content-Type` **nu a fost probat** pe margine.
+* **Paginile de panou SERVESC linii de comandă în răspuns** (`/panel/sesiuni`
+  redă `argv`). Dacă marginea inspectează și răspunsurile, pagina aia s-ar putea
+  bloca singură. Nu e reparat aici.

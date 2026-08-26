@@ -65,14 +65,42 @@ mypy sentinel executor
 ```
 
 **Singura excepție de la „fără skip":**
-`test_no_value_from_the_local_secret_store_appears_in_the_tree` compară arborele
-cu valorile reale din `secrets/.env.local`. Fișierul e ignorat de git, deci pe o
-clonă proaspătă lipsește, iar testul raportează SKIP cu motivul scris —
-`addopts` conține `-rfEs` tocmai ca motivul să apară în sumar.
+`test_no_value_from_the_local_secret_store_appears_in_the_tree` și
+`test_no_operator_identity_appears_in_the_tree` compară arborele cu valorile
+reale din `secrets/.env.local`. Fișierul e ignorat de git, deci pe o clonă
+proaspătă lipsește, iar testele raportează SKIP cu motivul scris — `addopts`
+conține `-rfEs` tocmai ca motivul să apară în sumar.
 
 Skip-ul ăla înseamnă „n-am putut verifica", nu „e curat". Înainte de un push,
-rulează pe mașina care are magazia de secrete și confirmă că **nu** e sărit.
+rulează pe mașina care are magazia de secrete și confirmă că **nu** sunt sărite.
 Orice alt skip sub `-m security` e un defect.
+
+### Cheile de identitate din `secrets/.env.local`
+
+`test_no_operator_identity_appears_in_the_tree` caută în arbore numele de
+utilizator și domeniul înregistrabil ale operatorului. Nu le poate ghici și nu
+au voie să fie scrise în test — un test care conține valoarea pe care o apără e
+el însuși scurgerea. Le citește din magazia locală, sub două chei:
+
+```
+SANITISE_USERNAMES=cont1,cont2
+SANITISE_DOMAINS=domeniu1.tld,domeniu2.tld
+```
+
+Liste despărțite prin virgulă; domeniile sunt cele **înregistrabile**, nu
+subdomeniile — subdomeniul martorului se deduce din domeniul înregistrabil
+printr-un jurnal de transparență a certificatelor, deci ăsta e nivelul care
+trebuie păzit.
+
+Dacă magazia există dar cheile lipsesc, sunt goale sau au intrări sub 6
+caractere, testul **pică** și le enumeră. Nu e o alegere de strictețe: dacă ar
+trece, ar da exact aceeași bifă verde ca o verificare care chiar s-a uitat.
+Magazia care lipsește de tot e altceva — acolo nu există nimic de protejat, și
+testul raportează SKIP.
+
+`deploy/install.sh` primește cheile astea pe stdin ca pe orice altă linie din
+fișier și avertizează o dată per cheie că nu le scrie. Avertismentul e corect:
+serverul nu are ce face cu ele.
 
 Verifică și că skill-ul e descoperit: deschide Claude Code în
 `C:\dev\Agent CyberSecurity` și cere ceva legat de incidente sau de un plan de

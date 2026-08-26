@@ -41,7 +41,29 @@ def _split_nvra(nvra: str) -> tuple[str, str]:
     return m.group("name"), ver
 
 
-async def _run(argv: list[str], timeout: int = 120) -> tuple[int, str, str]:
+#: Unde isi tine scanerul metadatele dnf.
+#:
+#: Creat de systemd prin `CacheDirectory=sentinel-dnf` in
+#: `deploy/systemd/sentinel-scan.service`, cu proprietarul serviciului. Calea e
+#: repetata aici fiindca dnf o cere ca argument, iar `test_scan_cache_dir.py`
+#: cere ca cele doua sa fie ACEEASI — despartite, una s-ar muta si cealalta ar
+#: scrie in continuare intr-un director pe care nimeni nu-l mai creeaza.
+CACHE_DIR = "/var/cache/sentinel-dnf"
+
+#: Cat asteptam dupa dnf.
+#:
+#: Masurat pe gazda reala, 21 august 2026: 7 secunde ca root (cu cache-ul
+#: sistemului), 82 ca utilizatorul neprivilegiat FARA cache, 2,4 CU cache-ul lui.
+#: Plafonul era 120, iar rularile reale luau intre 82 si 120 — deci in fiecare
+#: noapte era o moneda aruncata, si a picat de patru ori in doua saptamani.
+#:
+#: Cache-ul rezolva cazul obisnuit. Plafonul de aici acopera cazul RAU care
+#: ramane: prima rulare dupa ce cache-ul e sters, masurata la 87 de secunde.
+#: Marginea e peste dublu, ca o gazda incarcata sa nu-l atinga.
+TIMEOUT_S = 300
+
+
+async def _run(argv: list[str], timeout: int = TIMEOUT_S) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
         *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     try:
@@ -55,9 +77,19 @@ async def _run(argv: list[str], timeout: int = 120) -> tuple[int, str, str]:
 async def scan() -> tuple[list[dict], str | None]:
     """Return (findings, error). One finding per (CVE, package) that has a
     security update available. `error` is set only on a hard failure."""
-    # No --refresh: refreshing metadata needs root; the unprivileged scanner
-    # reads the cache the system already maintains. list cves gives CVE-level rows.
-    rc, out, err = await _run(["dnf", "-q", "updateinfo", "list", "cves", "--security"])
+    # `cachedir` explicit, si nu e un reglaj de viteza — e ce tine scanarea in
+    # viata. Comentariul de aici spunea pana pe 21 august 2026 ca „scanerul
+    # neprivilegiat citeste cache-ul pe care sistemul il intretine deja". Nu-l
+    # citeste: /var/cache/dnf apartine lui root, iar dnf rulat ca `sentinel` il
+    # reconstruia in intregime la fiecare rulare. Masurat: 82 de secunde in loc
+    # de 2,4, contra unui plafon de 120 — de patru ori a trecut de el si scanarea
+    # a murit, lasand lista de vulnerabilitati inghetata fara ca nimeni sa afle.
+    #
+    # Tot fara `--refresh`: reimprospatarea ramane treaba lui `dnf-makecache`.
+    # Ce se schimba e ca acum exista un cache in care sa scrie.
+    rc, out, err = await _run([
+        "dnf", "-q", f"--setopt=cachedir={CACHE_DIR}",
+        "updateinfo", "list", "cves", "--security"])
     if rc not in (0, 100) and not out.strip():
         # dnf uses 100 for "updates available"; a real failure has no output.
         return [], (err.strip() or f"dnf exited {rc}")[:500]

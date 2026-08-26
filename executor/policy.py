@@ -364,6 +364,41 @@ def check_argv(argv: Any) -> list[str]:
     return list(argv)
 
 
+#: Cea mai mare valoare pe care o poate lua o cheie de sesiune de la nucleu.
+#:
+#: `ses` e un `unsigned int` pe 32 de biti. `4294967295` e chiar valoarea
+#: rezervata pentru «nicio sesiune», deci e refuzata separat mai jos: inchisa,
+#: ar insemna «omoara tot ce nu are sesiune», adica fiecare daemon de pe gazda.
+MAX_SESSION_KEY = 4294967294
+
+#: Sesiunea marcata de nucleu drept «niciun login».
+NO_SESSION_KEY = "4294967295"
+
+
+def check_session_key(value: Any) -> str:
+    """Cheia unei sesiuni de login, ca text, sau refuz.
+
+    Valoarea ajunge in `loginctl terminate-session`, deci trebuie sa fie exact
+    o insiruire de CIFRE. Nu se citeaza si nu se escapeaza — se refuza orice
+    altceva: o validare care accepta si apoi curata e o validare pe care cineva
+    o va ocoli, iar aici capatul e o comanda privilegiata.
+
+    Zero e refuzat: `ses=0` e sesiunea nucleului insusi pe unele versiuni, si
+    nu e nimic de inchis acolo.
+    """
+    text = str(value).strip()
+    if not text.isdigit():
+        raise PolicyRefusal("session key must be digits only")
+    if text == NO_SESSION_KEY:
+        raise PolicyRefusal(
+            "refusing to terminate the 'no session' key: it would mean every "
+            "process without a login behind it")
+    number = int(text)
+    if not 1 <= number <= MAX_SESSION_KEY:
+        raise PolicyRefusal(f"session key out of range: {number}")
+    return text
+
+
 def check_unit(unit: Any, action: Any) -> tuple[str, str]:
     """Validate a systemd unit and the action requested on it."""
     if not isinstance(unit, str) or not CONTROLLABLE_UNIT_RE.match(unit):

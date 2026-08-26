@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Sequence
 
 from sentinel.config import get_config
 from sentinel.db.engine import Database
 from sentinel.logging_setup import get_logger, setup_logging
 from sentinel.respond.reconcile import reconcile
+from sentinel.services import parse_service_args
 
 log = get_logger(__name__)
 
@@ -35,12 +37,12 @@ async def _main(reapply: bool) -> int:
         await db.close()
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="sentinel reconcile", add_help=False)
     parser.add_argument("--reapply", action="store_true",
                         help="push stored blocks back into the kernel instead")
     parser.add_argument("--log-level", default="INFO")
-    args, _ = parser.parse_known_args()
+    args = parse_service_args(parser, argv)
     setup_logging("sentinel-reconcile", args.log_level)
     try:
         return asyncio.run(_main(args.reapply))

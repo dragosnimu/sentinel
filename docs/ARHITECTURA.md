@@ -206,6 +206,58 @@ O distribuție din afara celor două familii e **refuzată pe nume**. O gazdă p
 care instalarea a eșuat vizibil e recuperabilă; una care pare protejată și nu e,
 nu.
 
+
+### 3.13 Filigranul entităților mutabile: trigger, nu tabelă outbox
+
+Ce pleacă spre agregatorul extern se citește cu un cursor. Pentru `audit_log` —
+append-only, un singur scriitor serializat — cursorul e ultimul `id` expediat:
+monoton, fără goluri, **independent de ceas**.
+
+Entitățile care se schimbă nu pot folosi asta. Un incident închis nu-și schimbă
+`id`-ul, deci `WHERE id > cursor` nu-l vede niciodată. Cursorul lor e
+`(updated_at, id)`, iar `updated_at` e ținut de un trigger `BEFORE UPDATE` pe
+fiecare tabelă expediată (`sentinel/db/migrations/0023_ship_watermarks.sql`).
+
+Alternativa era o tabelă outbox: exactă, ordonată, independentă de ceas. A fost
+respinsă fiindcă cere editat fiecare modul din `sentinel/db/repo/` care mută o
+entitate expediată — și fiecare editare e un loc unde se poate uita. Un `UPDATE`
+scris peste șase luni pe o cale nouă nu scrie în outbox, rândul lui nu pleacă
+niciodată, și nimic nu raportează lipsa. **Un trigger nu se uită.** Costul —
+un rând atins la mijlocul ferestrei se trimite de două ori — e inofensiv, fiindcă
+ingestia agregatorului e upsert.
+
+**Prețul real e altul, și e plătit explicit: un cursor pe timp se încrede în
+ceasul serverului.** Un salt înapoi lasă filigranul înaintea lui `now()`, iar
+fluxul se oprește — interogarea rămâne validă, întoarce zero rânduri, și arată
+identic cu o gazdă pe care nu s-a schimbat nimic. Deci derapajul se măsoară
+(filigranul comparat cu `now()` al bazei), oprește runda cu eroare, și ajunge la
+operator ca o constatare cu titlu propriu. Regula pe care stă tot: **„n-am
+expediat nimic fiindcă nu s-a schimbat nimic" și „n-am expediat nimic fiindcă
+ceasul a sărit" nu au voie să arate la fel.**
+
+Ce NU face agentul: nu retrage filigranul singur. Ar salva rândurile din
+fereastră, dar pe un ceas care oscilează ar retrimite aceeași fereastră la
+fiecare rundă, la nesfârșit. Alegerea dintre o pierdere mărginită și un cost
+nemărginit e a operatorului — procedura e în `docs/OPERARE.md` §13.
+
+Ceasul nu e singura presupunere pe care mecanismul o face, iar celelalte două
+sunt și ele măsurate în loc să fie crezute:
+
+* **ordinea commit-urilor.** `now()` e ora de început a tranzacției, deci un rând
+  atins într-o tranzacție lungă poate deveni vizibil deja *sub* filigran.
+  Expeditorul mărginește cazul (nu trimite rândurile mai proaspete de 30 de
+  secunde) **și îl măsoară**: la runda următoare re-numără fereastra tocmai
+  citită, care e închisă prin construcție, deci orice rând găsit acolo în plus a
+  fost comis cu întârziere. Se raportează cu numărul lui și se ține minte
+  (`docs/OPERARE.md` §14). Mărginirea singură ar fi o presupunere care se strică
+  fără să spună nimic;
+* **că `updated_at` chiar se mișcă.** Toată mecanica stă pe un trigger dintr-un
+  fișier de migrație, iar un fișier pe disc nu e dovadă că nucleul l-a acceptat.
+  Fără trigger, fluxul e mort și arată perfect sănătos: zero rânduri, ceas bun,
+  restanță zero, unitate `active`. Deci fiecare rundă întreabă `pg_trigger` —
+  inclusiv `tgenabled`, fiindcă un trigger dezactivat rămâne în catalog — și
+  lipsa **oprește** fluxul în loc să-l lase să pară la zi (`docs/OPERARE.md` §15).
+
 ---
 
 ## 4. Predicția — ce este de fapt

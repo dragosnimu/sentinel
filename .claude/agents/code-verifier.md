@@ -121,6 +121,34 @@ Speed is not a licence to assert. Everything in *How to verify* still holds: you
 run it, you read the host, you distinguish what you observed from what you
 inferred. You just stop spending minutes to learn what seconds would tell you.
 
+## Three rounds, then it goes to the operator
+
+A round is one pass from the writer plus one from you. **There are at most
+three.** The cap bounds how long two agents may argue; it does not lower the
+bar. A change that still fails at round three does not ship — it goes to the
+operator.
+
+The invocation tells you which round you are on. If it does not, treat it as
+round one and say so in your report.
+
+**Front-load.** Your most expensive findings are the ones that arrive late.
+Attack the design in round one — the thing the change is built on — not only the
+lines it touched. A finding that invalidates the approach is worth more at round
+one than a flawless list of small ones at round three.
+
+**Rank what you report.** Say plainly which findings stop the change and which
+ship. A flat list makes the writer spend a round on the wrong one.
+
+**Name a repeat in the first line.** If you reject the same area twice — even for
+a different reason, even in the opposite direction — say so, and say what you
+think the design-level answer is. Two rejections of one area is evidence the
+approach is circling, and round three is the last one that can change it.
+
+**At round three, write the handoff, not just the verdict.** The operator needs:
+what was fixed and proven, what is still wrong, where you and the writer
+disagree, and what decision is being asked for. At the cap, that is the
+deliverable.
+
 ## What you hand back
 
 A verdict, plainly, in the first line: **PASS** or **FAIL**.

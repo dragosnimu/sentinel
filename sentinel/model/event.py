@@ -29,6 +29,14 @@ SOURCES = (
 # unde există cheia regulii de audit. O regulă de detecție care ar trebui să
 # reconstruiască „e sudoers sau e un log oarecare" din calea fișierului ar
 # refface o clasificare pe care kernelul a făcut-o deja corect.
+#
+# Lista asta e o jumătate dintr-un vocabular ținut în două locuri: cealaltă e
+# `collectors/auditd._WATCH_KEYS`, care traduce cheile regulilor livrate în
+# acțiunile de aici. Cele două au divergat — `suid_change` și `module_load`
+# erau încărcate în nucleu și traduse de colector, dar lipseau de aici, deci
+# `Event.__post_init__` ridica ValueError pe primul `chmod u+s` sau
+# `init_module`, iar lotul întreg cădea. Legătura se verifică acum derivat, din
+# `collectors/auditd.EMITTED_ACTIONS`, nu dintr-o listă scrisă de mână.
 POST_COMPROMISE_ACTIONS = (
     "identity_change",    # passwd, shadow, group
     "sudoers_change",
@@ -36,7 +44,17 @@ POST_COMPROMISE_ACTIONS = (
     "cron_change",
     "unit_change",        # unitate systemd creată sau modificată
     "webroot_change",
-    "suspicious_exec",    # nc, ncat, socat, wget, curl, chmod, module de kernel
+    "suspicious_exec",    # nc, ncat, socat, wget, curl
+    # Trei întrebări diferite, trei acțiuni diferite. `chmod u+s` și un modul de
+    # kernel au împărțit cândva cheia cu uneltele de rețea de mai sus, iar o
+    # singură regulă de detecție răspundea la toate cu aceeași propoziție: „unealtă
+    # de atacator executată: chmod". Ce fișier a devenit setuid nu apărea nicăieri.
+    "suid_change",        # bit setuid/setgid pus pe un fișier
+    # init_module, finit_module ȘI delete_module: numele spune „load" fiindcă
+    # regula de detecție care îl consumă se numește așa, dar acoperă și
+    # descărcarea — de asta textul alertei din `detect/intrusion.py` spune
+    # „încărcat sau descărcat".
+    "module_load",
 )
 
 # Normalised outcome. Rules match on this rather than on source-specific text.
@@ -46,6 +64,12 @@ ACTIONS = POST_COMPROMISE_ACTIONS + (
     "start", "stop", "error", "alert", "unknown",
     # Post-compromise activity: what happened after someone got in.
     "privilege_use", "login", "account_change", "audit_config_change",
+    # Istoricul de sesiuni si de comenzi.
+    #
+    # `logout` e perechea lui `login`: fara ea o sesiune deschisa nu se mai
+    # inchide niciodata in date, iar panoul ar arata oameni conectati de
+    # saptamani. `command` e fiecare `execve` dintr-o sesiune cu login.
+    "logout", "command",
     "process_crash", "promiscuous", "avc_denial",
 )
 

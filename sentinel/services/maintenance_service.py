@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import shutil
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -52,6 +53,7 @@ from sentinel.config import Config, get_config
 from sentinel.db.engine import Database
 from sentinel.db.repo import incidents as inc_repo
 from sentinel.logging_setup import get_logger, setup_logging
+from sentinel.services import parse_service_args
 
 log = get_logger(__name__)
 
@@ -491,10 +493,10 @@ async def _main() -> int:
     return 0
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="sentinel maintenance", add_help=False)
     parser.add_argument("--log-level", default="INFO")
-    args, _ = parser.parse_known_args()
+    args = parse_service_args(parser, argv)
     setup_logging("sentinel-maintenance", args.log_level)
     try:
         return asyncio.run(_main())

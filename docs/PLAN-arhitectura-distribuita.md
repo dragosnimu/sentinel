@@ -1,6 +1,6 @@
 # Plan — arhitectură distribuită: logica pe server, martorul în afara lui
 
-**Status:** propunere, neimplementată. Cere trei decizii de la operator (§7).
+**Status:** propunere, neimplementată. Cere patru decizii de la operator (§7).
 **Problema pe care o rezolvă:** un atacator cu root pe serverul monitorizat poate
 opri toate serviciile Sentinel, iar în arhitectura de azi nimeni nu află.
 
@@ -118,7 +118,8 @@ POST https://<gazdă>/api/sentinel/beat        la fiecare 60 s
   "selfcheck": { "worst": "ok", "checks": 32, "bad": 0, "ran_at": "..." },
   "incidents_open": 3,
   "blocklist_size": 17,
-  "audit_head":     "sha256:...",     // capul lanțului de audit (vezi §5)
+  "audit_head":     "9f3c...e1",      // audit_log.entry_hash, 64 hexa (vezi §5)
+                                      // "" = jurnal gol, "unavailable" = n-a putut fi citit
   "version":        "commit scurt"
 }
 ```
@@ -140,6 +141,18 @@ Semnătura acoperă și `sent_at`, iar martorul refuză orice semnal mai vechi d
 
 Alerta pleacă **de pe găzduire**, cu propriile credențiale Telegram. Dacă ar
 folosi tokenul de pe serverul monitorizat, ar depinde de exact ce s-a stricat.
+
+**Ce întârzie rândul „staționar peste 15 min":** martorul consideră că
+contoarele s-au mișcat dacă **oricare** din `last_event_id`, `detect_cursor` sau
+`audit_head` s-a schimbat, iar fiecare are și o valoare de rezervă când sonda
+respectivă eșuează — deci o sondă care pică intermitent arată ca mișcare și
+amână alarma cu până la 15 minute de fiecare dată. La `audit_head` mai există un
+caz, măsurat pe producție pe 10 august 2026: din 114 scrieri în `audit_log` în 7
+zile, 107 sunt `block_ip` din `respond`, care e în aval de ingestie și deci nu
+poate masca o pană; rămân 6 rânduri `web`. Adică **un operator care se
+autentifică tocmai ca să investigheze de ce nu se întâmplă nimic scrie un rând
+de audit și își amână singur alarma**. E comportamentul proiectat, nu o
+regresie, dar merită știut înainte să fie descoperit la 3 dimineața.
 
 ---
 
@@ -179,9 +192,22 @@ care oprește Sentinel fără să se gândească la consecințe.
 care a compromis-o. O citește și poate fabrica semnale cu cifre care cresc.
 
 Atenuare parțială, nu soluție: `audit_head` e capul lanțului de hash-uri din
-jurnalul de audit, iar martorul verifică continuitatea. Ca să falsifice
-convingător, atacatorul trebuie să mențină consistent un lanț criptografic, nu
-doar să incrementeze un număr. E o barieră reală, dar nu una absolută.
+jurnalul de audit. Ca să falsifice convingător, atacatorul trebuie să mențină
+consistent un lanț criptografic, nu doar să incrementeze un număr. E o barieră
+reală, dar nu una absolută.
+
+**Cât din bariera asta există azi** (10 august 2026, după ce sonda a fost
+reparată): expeditorul trimite capul corect, iar martorul îl compară doar cu cel
+primit anterior — „s-a mișcat ceva". Nu verifică înlănțuirea și nici nu are cu
+ce: pentru asta i-ar trebui în semnal și `prev_hash`-ul capului, și `id`-ul lui,
+plus codul care le compară la celălalt capăt. Până atunci, propoziția onestă e
+„martorul vede când capul se schimbă", nu „martorul verifică lanțul".
+
+Până pe 10 august 2026 nu exista nici măcar atât: interogarea cerea o coloană
+`hash` care nu a existat niciodată, eșua la fiecare rundă, iar martorul primea
+un șir gol în locul capului. Semnalul a fost incomplet de la instalare și nimic
+nu a spus-o — de aceea o sondă care nu poate citi trimite acum `"unavailable"`,
+care se deosebește de un jurnal gol.
 
 **Formularea corectă pentru un client:** heartbeatul transformă tăcerea în
 alarmă și scoate dovezile de pe mașina compromisă. Nu face imposibilă
@@ -241,6 +267,22 @@ până sună telefonul. Dacă nu sună, nimic din planul ăsta nu contează.
 3. **Un bot Telegram separat pentru martor, sau același?** Separat e mai curat —
    dacă tokenul de pe serverul monitorizat se scurge, canalul de alarmă rămâne
    nealterat. Costă un bot nou și o comandă `/start`.
+4. **Argon2id la `m=65536` încape în planul de găzduire?** Autentificarea
+   panoului agregator e geamăna celei de pe server (`sentinel/web/security.py`),
+   iar parametrul **nu se coboară**: panoul e singurul control care apără
+   istoricul derivat a N servere pe o gazdă care n-are niciuna dintre apărările
+   enumerate în §1.2 — fără `IPAddressDeny`, fără sandbox systemd, fără SELinux,
+   fără fail2ban al nostru, cu personalul furnizorului având acces la bază.
+   Costul e memoria: 64 MiB per verificare **concurentă**, iar același proces
+   Node servește și `/api/sentinel/sync`, deci o rafală de cereri neautentificate
+   pe `/login` ar putea opri ingestia arhivei de dovezi a tuturor instanțelor.
+   Măsurat pe mașina de dezvoltare (Node 24, chiar parametrii livrați): 16
+   verificări simultane costă 2203 ms și 1091 MiB rss, adică concurența nu
+   cumpără debit și costă memoria întreagă. Plafonul de memorie al PLANULUI de
+   găzduire nu e măsurat: E0 cerea o rută de unică folosință care hashuiește o
+   dată și întoarce timpul și memoria, iar măsurătoarea aia nu există.
+   Deci: ori se face măsurătoarea, ori se acceptă plafonul de concurență ales
+   fără ea în `aggregator/lib/auth/password.ts` (`MAX_CONCURRENT_ARGON2`).
 
 ---
 

@@ -1,0 +1,5 @@
+# Nici pagina martorului, nici formularul de autentificare al panoului n-au ce
+# căuta într-un index: un rezultat de căutare care duce la un formular de
+# autentificare e o invitație la scanare.
+User-agent: *
+Disallow: /

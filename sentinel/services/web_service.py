@@ -13,12 +13,14 @@ import argparse
 import asyncio
 import getpass
 import sys
+from collections.abc import Sequence
 
 from sentinel import __version__
 from sentinel.config import Config, Secrets, get_config, get_secrets
 from sentinel.db.engine import Database
 from sentinel.db.repo import audit, sessions, users
 from sentinel.logging_setup import get_logger, setup_logging
+from sentinel.services import parse_service_args
 from sentinel.web.security import (
     Authenticator,
     generate_totp_secret,
@@ -64,8 +66,8 @@ def serve(cfg: Config) -> int:
     return 0
 
 
-def main() -> int:
-    """Called by `sentinel web [flags]`."""
+def main(argv: Sequence[str] | None = None) -> int:
+    """Called by `sentinel web [flags]`, with the flags the dispatcher did not use."""
     parser = argparse.ArgumentParser(prog="sentinel web", add_help=True)
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--create-admin", action="store_true",
@@ -81,7 +83,11 @@ def main() -> int:
     group.add_argument("--list-users", action="store_true")
     parser.add_argument("--username")
     parser.add_argument("--role", choices=users.ROLES, default="owner")
-    args = parser.parse_args(sys.argv[2:] if len(sys.argv) > 2 else [])
+    # The dispatcher hands over what it did not consume. Slicing sys.argv[2:]
+    # here was a guess at where this command's own flags began, and it was wrong
+    # for `sentinel --log-level DEBUG web --list-users`: the slice started at
+    # "DEBUG" and argparse rejected the subcommand name as an argument.
+    args = parse_service_args(parser, argv)
 
     cfg = get_config()
     sec = get_secrets()

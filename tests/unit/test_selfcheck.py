@@ -58,6 +58,21 @@ def _cfg(**over):
         ai=SimpleNamespace(enabled=True),
         telegram=SimpleNamespace(enabled=True, allowed_chat_ids=[1]),
         response=SimpleNamespace(auto_block=SimpleNamespace(enabled=False), admin_ip=""),
+        # Ca pe `Config`-ul real: `check_ship_lag` citește `cfg.ship.enabled`
+        # direct, nu printr-un `getattr` cu valoare de rezervă — vezi
+        # `test_no_check_reads_a_config_field_that_does_not_exist` mai jos, care
+        # există fiindcă un `getattr` a ținut o verificare moartă un an.
+        ship=SimpleNamespace(enabled=False, url="", interval_s=60),
+        # Idem pentru `check_beacon_delivery`. Fără câmpul ăsta, un test care
+        # cheamă rularea ÎNTREAGĂ ar vedea grupul „beacon" raportat ca stricat,
+        # iar cauza — un dublu de configurație rămas în urmă — n-are nicio
+        # legătură cu gazda.
+        beacon=SimpleNamespace(enabled=False, url="", interval_s=60),
+        # `check_command_history_filter` citește cheia înapoi din
+        # configurația încărcată. Lipsa secțiunii ar face grupul „history”
+        # să pice în orice test care rulează trecerea întreagă, dintr-un
+        # motiv care n-are nicio legătură cu gazda.
+        history=SimpleNamespace(skip_command_accounts=[]),
     )
     for k, v in over.items():
         setattr(base, k, v)
@@ -184,19 +199,71 @@ def test_no_check_reads_a_config_field_that_does_not_exist():
     invariantul anti-lockout, nerulat și necontestat, cu un test verde peste el.
 
     Fiecare câmp de configurație citit de verificări trebuie să existe pe
-    dataclass-ul real, nu doar pe obiectul fabricat de teste."""
+    dataclass-ul real, nu doar pe obiectul fabricat de teste.
+
+    Expresia s-a uitat până pe 15 august 2026 DOAR la `getattr(cfg.response, …)`.
+    Consecința era cea obișnuită pentru o gardă îngustă: singura linie din
+    `checks.py` care se potrivea cu tiparul păzit — `getattr(getattr(cfg,
+    "beacon", None), "enabled", False)`, în `check_units` — era exact cea la care
+    testul nu se uita. Acum se caută ambele forme, pe orice secțiune.
+    """
     import inspect
 
     from sentinel.config import Config, ResponseConfig
 
     src = inspect.getsource(checks)
-    for attr in re.findall(r"getattr\(\s*cfg\.response\s*,\s*[\"'](\w+)[\"']", src):
-        assert hasattr(ResponseConfig(), attr), \
-            f"check_enforcement citește response.{attr}, care nu există în ResponseConfig"
+    cfg = Config()
+
+    SECTIUNE = r"getattr\(\s*cfg\s*,\s*[\"'](\w+)[\"']"
+    CAMP = r"getattr\(\s*cfg\.(\w+)\s*,\s*[\"'](\w+)[\"']"
+
+    # Garda gărzii, și e obligatorie aici: azi `checks.py` nu mai are niciun
+    # `getattr` pe `cfg`, deci ambele bucle de mai jos sunt goale. O expresie
+    # stricată ar găsi tot nimic, buclele s-ar sări la fel, și testul ar trece
+    # verde uitându-se la nimic — chiar tiparul „listă parametrizată ieșită goală
+    # și sărită tăcut" din CLAUDE.md. Măsurat: mutația care strică expresia
+    # trecea VERDE fără proba asta.
+    #
+    # Proba e o sursă fabricată care conține exact cele două forme. Dacă
+    # expresiile încetează să le vadă, se vede aici, indiferent ce conține
+    # `checks.py`.
+    proba = ('if not getattr(cfg, "beacon", None):\n'
+             '    x = getattr(cfg.response, "admin_ip", None)\n')
+    assert re.findall(SECTIUNE, proba) == ["beacon"], \
+        "expresia pentru `getattr(cfg, \"<secțiune>\")` nu mai vede forma"
+    assert re.findall(CAMP, proba) == [("response", "admin_ip")], \
+        "expresia pentru `getattr(cfg.<secțiune>, \"<câmp>\")` nu mai vede forma"
+
+    # `getattr(cfg, "<secțiune>", …)` — secțiunea trebuie să existe pe `Config`.
+    sectiuni = re.findall(SECTIUNE, src)
+    for name in sectiuni:
+        assert hasattr(cfg, name), (
+            f"o verificare citește cfg.{name} printr-un getattr cu valoare de "
+            f"rezervă, iar `Config` n-are secțiunea asta — deci rezerva e ce se "
+            f"folosește, la fiecare rulare, tăcut")
+
+    # `getattr(cfg.<secțiune>, "<câmp>", …)` — câmpul trebuie să existe pe ea.
+    campuri = re.findall(CAMP, src)
+    for sectiune, attr in campuri:
+        assert hasattr(cfg, sectiune), f"cfg.{sectiune} nu există"
+        assert hasattr(getattr(cfg, sectiune), attr), (
+            f"o verificare citește {sectiune}.{attr}, care nu există pe "
+            f"dataclass-ul real — verificarea din spatele lui nu rulează niciodată")
+
+    # Numărul măsurat, ca lista să nu poată ieși goală în tăcere: o expresie
+    # stricată n-ar mai găsi nimic, buclele de mai sus s-ar sări, iar testul ar
+    # trece verde fără să se fi uitat la nimic. Exact felul de test care a costat
+    # deja o pană aici. Azi `checks.py` nu mai are niciun `getattr` pe `cfg`;
+    # dacă apare unul, numărul se ridică ODATĂ cu el.
+    assert len(sectiuni) + len(campuri) == 0, (
+        f"au apărut {len(sectiuni) + len(campuri)} citiri prin getattr pe `cfg` "
+        f"({sectiuni}, {campuri}). Nu sunt interzise, dar numărul de aici e o "
+        f"măsurătoare: ridică-l odată cu ele, ca bucla să nu se poată goli tăcut")
+
     # Și câmpul mort anume, ca reintroducerea lui să pice aici.
     assert not hasattr(ResponseConfig(), "admin_ip"), \
         "admin_ip a fost adăugat — atunci verificarea allowlist trebuie rescrisă și testată"
-    assert hasattr(Config(), "response")
+    assert hasattr(cfg, "response")
 
 
 # --- the detection loop -----------------------------------------------------
@@ -279,13 +346,42 @@ def test_recovery_is_announced():
     assert "Revenit la normal" in text and "Colector sshd" in text
 
 
-def test_selfcheck_alerts_are_never_muted():
-    """Holding this until 06:00 would mean the hours you stop watching your
-    phone are the hours nobody watches the server either."""
+def test_a_selfcheck_that_says_something_STOPPED_is_never_muted():
+    """Jumatatea pentru care exista scutirea, si numai ea.
+
+    Ținută până la 06:00, o veste care spune că o parte din agent s-a oprit ar
+    face ca orele în care nu te uiți la telefon să fie exact orele în care nimeni
+    nu se uită nici la server.
+
+    `runner._announce` pune `critical` exact când vreun rezultat e `down`, deci
+    severitatea POARTĂ deja distincția — nu mai e nevoie de o scutire pe fel.
+    """
     from sentinel.telegram.quiet import passes_anyway
 
-    assert passes_anyway("high", "selfcheck")
-    assert passes_anyway(None, "selfcheck")
+    assert passes_anyway("critical", "selfcheck"), (
+        "o autoverificare care spune că ceva s-a OPRIT nu trece prin mute")
+
+
+def test_a_selfcheck_that_only_says_DEGRADED_is_held():
+    """Cealaltă jumătate, și motivul pentru care regula s-a îngustat.
+
+    `degraded` înseamnă, prin definiția din `check_ship_lag`, „pe gazdă nu s-a
+    oprit nimic; ce e în urmă e o copie din afara ei". Ținută sub scutirea făcută
+    pentru o oprire reală, vestea aia a devenit exact ce scutirea voia să
+    prevină: un canal care sună degeaba și pe care operatorul îl închide.
+
+    Cerut de operator pe 24 august 2026, după câteva zile de „Sentinel
+    funcționează degradat" primite în perioada de mute.
+
+    Ținut NU e pierdut — vezi
+    `test_a_held_notification_stays_queued_instead_of_being_marked_failed`.
+    """
+    from sentinel.telegram.quiet import passes_anyway
+
+    assert not passes_anyway("high", "selfcheck"), (
+        "un `degraded` trece prin mute, deci mute-ul nu înseamnă nimic pentru "
+        "canalul care sună cel mai des")
+    assert not passes_anyway(None, "selfcheck")
 
 
 def test_a_dead_bot_escalates_to_a_direct_send():
@@ -987,3 +1083,908 @@ def test_nft_check_distinguishes_a_hand_run_from_a_misconfigured_unit(monkeypatc
     # În ambele cazuri starea rămâne „nu știu" — a nu putea citi regulile NU e
     # o dovadă că blocarea funcționează.
     assert hand.status == unit.status == "unknown"
+
+
+def test_a_direct_alert_telegram_refused_is_not_logged_as_delivered(monkeypatch, caplog):
+    """The escalation path exists for the moment the bot is dead. Until now it
+    logged "selfcheck alerted directly" after any POST that did not raise — so
+    a 400 ("chat not found", "bot was blocked by the user") produced the same
+    line as a delivered message.
+
+    That is the last channel there is, reporting success it did not have. The
+    operator would read one warning about a dead bot and believe they had been
+    told; nothing else would ever mention it again.
+
+    The fake asserts Telegram's contract: 200 + {"ok": true, "result":
+    {"message_id": N}} is delivery, a 4xx with {"ok": false, "description": …}
+    is not.
+    """
+    import asyncio as _a
+    import logging
+
+    import httpx
+
+    from sentinel import config as config_mod
+    from sentinel.config import Secrets
+    from sentinel.selfcheck import runner
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.read().decode("utf-8")
+        if '"chat_id": 222' in body or '"chat_id":222' in body:
+            return httpx.Response(400, json={"ok": False,
+                                             "description": "Bad Request: chat not found"})
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 3}})
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient",
+                        lambda **kw: real_client(transport=transport, **kw))
+    monkeypatch.setattr(config_mod, "get_secrets",
+                        lambda: Secrets({"TELEGRAM_BOT_TOKEN": "fixture-token"}))
+
+    cfg = SimpleNamespace(telegram=SimpleNamespace(allowed_chat_ids=[111, 222]))
+    with caplog.at_level(logging.INFO, logger="sentinel.selfcheck.runner"):
+        _a.run(runner._send_direct(cfg, "botul nu răspunde"))
+
+    levels = {r.levelno: r.getMessage() for r in caplog.records}
+    assert logging.ERROR in levels, "the refused chat was never reported"
+    assert "did not reach every chat" in levels[logging.ERROR]
+    assert logging.WARNING in levels, "the chat that DID receive it went unreported"
+
+
+# ---------------------------------------------------------------------------
+# Filtrul de istoric: „configurat" și „în vigoare" sunt afirmații diferite
+# ---------------------------------------------------------------------------
+def _cu_uid(monkeypatch, uid_of):
+    """Rezolvarea conturilor, cu o bază de conturi fabricată.
+
+    Gazda de test nu are `sentinel-deploy` în `/etc/passwd`, iar pe Windows nu
+    există `pwd` deloc — deci fără injecția asta testele ar proba platforma pe
+    care rulează, nu decizia verificării.
+    """
+    from sentinel.config import resolve_skip_command_accounts as real
+
+    monkeypatch.setattr(checks, "resolve_skip_command_accounts",
+                        lambda n: real(n, uid_of=uid_of))
+
+
+def _istoric(**over):
+    """Un `cfg` cu secțiunea `history`, plus dublul de bază pentru efect."""
+    return _cfg(history=SimpleNamespace(**over))
+
+
+@pytest.fixture(autouse=True)
+def _config_intr_un_loc_care_nu_exista(monkeypatch, tmp_path):
+    """`sentinel.yaml.new` se caută lângă configurația încărcată.
+
+    Pe o mașină pe care fișierul ăla chiar există — gazda —, testele care nu-l
+    fabrică singure ar citi starea gazdei și ar pica sau ar trece în funcție de
+    ea. Toate pornesc de la „nu există", iar cine are nevoie de el îl scrie.
+    """
+    monkeypatch.setattr(checks, "CONFIG_PATH", tmp_path / "sentinel.yaml")
+
+
+def _felie(username, fara_terminal, cu_terminal=0, ora=0):
+    """Comenzile unui cont într-o ORĂ, despărțite după terminal.
+
+    Se dau ca grupuri, nu ca rânduri, ca un test să poată descrie 174 839 de
+    comenzi fără să le construiască. Cine le numără cum e treaba dublului, iar
+    el CITEȘTE regula din instrucțiunea primită — vezi `_HistDB.fetch`.
+
+    `ora` e câte ore în urmă e găleata. Gruparea pe oră e chiar unitatea în care
+    s-au măsurat și furtuna de deploy, și munca de om.
+    """
+    inceput = NOW - timedelta(hours=ora)
+    return {"username": username,
+            "ora": inceput.replace(minute=0, second=0, microsecond=0),
+            "fara_terminal": fara_terminal,
+            "cu_terminal": cu_terminal,
+            "oldest": inceput - timedelta(minutes=59),
+            "newest": inceput}
+
+
+class _HistDB(_DB):
+    """Dublu care răspunde la CELE DOUĂ interogări ale verificării.
+
+    Se cere textul instrucțiunii, nu doar rezultatul: verificarea trebuie să
+    întrebe despre rândurile care N-AR TREBUI SĂ EXISTE, nu despre configurație.
+    Parametrii se rețin, fiindcă o fereastră schimbată tăcut e chiar felul în
+    care verificarea ar înceta să vadă un deploy fără ca nimic să pice.
+
+    Regula de terminal NU e reimplementată din memorie: se citește din chiar
+    instrucțiunea dată, cu chiar tiparul trimis ca parametru. O interogare care
+    ar pierde `FILTER`-ul ar număra și comenzile tastate de un om — și ar
+    răspunde exact ca dublul care „știe" răspunsul bun.
+    """
+
+    def __init__(self, *, total=0, interzise=0, newest=None, felie=None):
+        super().__init__()
+        self.total, self.interzise, self.newest = total, interzise, newest
+        self.felie = felie if felie is not None else []
+        self.params: list[tuple] = []
+
+    async def fetch(self, sql, *a):
+        self.sql.append(sql)
+        self.params.append(a)
+        assert "FROM session_commands" in sql, sql
+        assert "ORDER BY ts DESC" in sql, sql
+        assert "LIMIT $1" in sql, sql
+        # Felia se ia după `ts DESC` ÎNAINTE de orice filtrare pe `tty`: predicatul
+        # de terminal n-are voie să apară în `WHERE`-ul CTE-ului (înainte de
+        # `LIMIT`), altfel costul ar depinde de câte comenzi cu terminal are gazda,
+        # iar felia n-ar mai fi mărginită prin construcție. Mutat acolo, testul
+        # ăsta pică; lăsat în `FILTER`-ul de după CTE, trece.
+        assert "tty IS NULL OR tty !~" not in sql.split("LIMIT $1")[0], sql
+
+        tipar = a[2]
+        are_filtru = "FILTER (WHERE tty IS NULL OR tty !~ $3)" in sql
+        # Și gruparea se citește din instrucțiune: fără ora din `GROUP BY`,
+        # serverul întoarce O SINGURĂ găleată pe cont, adică totalul lui pe toată
+        # felia. Dublul trebuie să facă la fel, altfel testul care spune «o zi
+        # întinsă nu e o furtună» ar trece peste chiar interogarea care nu mai
+        # poate deosebi ziua de rafală.
+        pe_ora = "GROUP BY 1, 2" in sql
+        randuri: dict[tuple, dict] = {}
+        for g in self.felie:
+            comenzi = [(None, g["fara_terminal"]), ("pts0", g["cu_terminal"])]
+            total = sum(n for _, n in comenzi)
+            fara = (sum(n for tty, n in comenzi
+                        if tty is None or not re.match(tipar, tty))
+                    if are_filtru else total)
+            cheie = (g["username"], g["ora"]) if pe_ora else (g["username"],)
+            r = randuri.setdefault(cheie, {
+                "username": g["username"], "ora": g["ora"], "total": 0,
+                "fara_terminal": 0, "oldest": g["oldest"], "newest": g["newest"]})
+            r["total"] += total
+            r["fara_terminal"] += fara
+            r["oldest"] = min(r["oldest"], g["oldest"])
+            r["newest"] = max(r["newest"], g["newest"])
+        return list(randuri.values())
+
+    async def fetchrow(self, sql, *a):
+        self.sql.append(sql)
+        self.params.append(a)
+        assert "FROM session_commands" in sql, sql
+        assert "tty IS NULL OR tty !~" in sql, sql
+        # `newest` trebuie să fie `max(ts)` peste RÂNDURILE INTERZISE, nu peste
+        # toate: un `max(ts)` nefiltrat ar aluneca pe o comandă tastată legitim și
+        # ar data „acum" un set de rânduri interzise vechi, acuzând filtrul pentru
+        # ce a scris procesul dinainte.
+        assert "max(ts) FILTER" in sql, sql
+        return {"total": self.total, "interzise": self.interzise,
+                "newest": self.newest}
+
+
+def test_an_empty_history_section_is_reported_as_dropping_nothing():
+    """Lista goală, pe o gazdă unde nimic n-o contrazice, e o stare VALIDĂ.
+
+    O gazdă care păstrează tot istoricul e implicitul livrat, nu o defecțiune —
+    deci nu are voie să iasă roșu. Ce s-a schimbat pe 25 august 2026 e că `ok`-ul
+    ăsta nu mai vine din configurație: se dă numai după ce datele au fost
+    întrebate și n-au arătat nicio furtună, și după ce s-a verificat că nu zace
+    un `sentinel.yaml.new` care cere altceva.
+    """
+    r = run(checks.check_command_history_filter(
+        _HistDB(), _istoric(skip_command_accounts=[])))[0]
+    assert r.status == "ok", "lista goală raportată ca defect"
+    assert r.key == "history:filter"
+    assert "gol" in r.detail
+    assert "datele n-o contrazic" in r.detail, (
+        "`ok`-ul nu spune pe ce se sprijină, deci nu se poate deosebi de unul "
+        "dat înainte de orice întrebare pusă bazei")
+
+
+def test_an_unmerged_new_file_makes_the_empty_filter_a_finding(tmp_path, monkeypatch):
+    """Starea reală a gazdei pe 25 august 2026, raportată `ok` de prima scriere.
+
+    `/etc/sentinel/sentinel.yaml` era din 20 august și NU avea secțiunea
+    `history:`; lângă el stăteau `sentinel.yaml.new` și `inventory.yaml.new` din
+    25 august, neîmbinate. Verificarea ieșea pe ramura «listă goală» și întorcea
+    `ok` înainte de orice SQL — deci verificarea scrisă tocmai ca să deosebească
+    intenția de efect nu deosebea «am ales să nu arunc nimic» de «nimeni n-a
+    îmbinat fișierul», iar în tabelă erau 1 266 de rânduri interzise.
+
+    Discriminatorul e chiar fișierul: dacă `.new` cere conturi pe care
+    configurația încărcată nu le are, filtrul pe care operatorul crede că l-a
+    pornit nu rulează nicăieri.
+    """
+    monkeypatch.setattr(checks, "CONFIG_PATH", tmp_path / "sentinel.yaml")
+    (tmp_path / "sentinel.yaml.new").write_text(
+        "history:\n  skip_command_accounts:\n    - sentinel-deploy\n",
+        encoding="utf-8")
+
+    r = run(checks.check_command_history_filter(
+        _HistDB(), _istoric(skip_command_accounts=[])))[0]
+    assert r.status == "degraded", "configurația neîmbinată a trecut drept aleasă"
+    assert "sentinel-deploy" in r.detail
+    assert "sentinel.yaml.new" in r.detail
+    assert "diff" in r.action, "operatorul nu primește pasul care arată diferența"
+    assert r.facts["unmerged_accounts"] == ["sentinel-deploy"]
+
+
+def test_a_new_file_that_says_the_same_thing_is_not_a_finding(tmp_path, monkeypatch):
+    """Instalatorul scrie `.new` la FIECARE rulare, îmbinat sau nu.
+
+    Dacă simpla lui prezență ar fi un defect, verificarea ar fi roșie permanent
+    pe orice gazdă livrată de două ori — iar o constatare care nu se stinge
+    niciodată e cum ajunge operatorul să nu mai citească niciuna.
+    """
+    monkeypatch.setattr(checks, "CONFIG_PATH", tmp_path / "sentinel.yaml")
+    (tmp_path / "sentinel.yaml.new").write_text(
+        "history:\n  skip_command_accounts:\n    - sentinel-deploy\n"
+        "web:\n  port: 8443\n", encoding="utf-8")
+
+    _cu_uid(monkeypatch, lambda _n: 1002)
+    r = run(checks.check_command_history_filter(
+        _HistDB(), _istoric(skip_command_accounts=["sentinel-deploy"])))[0]
+    assert r.status == "ok", r.detail
+
+
+def test_a_stale_new_file_does_not_call_a_hand_merged_filter_unmerged(
+        tmp_path, monkeypatch):
+    """Reacția firească la constatarea de deasupra n-are voie s-o facă permanentă.
+
+    Operatorul citește «configurația filtrului n-a fost îmbinată», deschide
+    `/etc/sentinel/sentinel.yaml` și adaugă contul de mână. Atât trebuia făcut, și
+    filtrul chiar rulează după repornire. Dar `.new` rămâne pe disc așa cum era —
+    pe gazdă e cel din 25 august 2026, fără secțiunea `history:` deloc.
+
+    Comparate pe EGALITATE, cele două fișiere ar face constatarea roșie pentru
+    totdeauna, cu un text care spune exact pe dos: că filtrul nu e îmbinat,
+    tocmai când el e cel care rulează. Iar o constatare care nu se stinge
+    niciodată e cum ajunge operatorul să nu mai citească niciuna — și ar lua cu
+    ea furtunile adevărate, care se raportează sub aceeași cheie.
+    """
+    monkeypatch.setattr(checks, "CONFIG_PATH", tmp_path / "sentinel.yaml")
+    # Un `.new` dinaintea filtrului: valid, doar că nu știe de `history:`.
+    (tmp_path / "sentinel.yaml.new").write_text(
+        "web:\n  port: 8443\n", encoding="utf-8")
+
+    _cu_uid(monkeypatch, lambda _n: 1002)
+    r = run(checks.check_command_history_filter(
+        _HistDB(), _istoric(skip_command_accounts=["sentinel-deploy"])))[0]
+    assert r.status == "ok", r.detail
+    assert r.facts["unmerged_new"] is True, (
+        "cazul n-a mai trecut prin ramura care citește `.new`, deci nu probează "
+        "nimic despre comparația dintre cele două fișiere")
+    assert r.facts["unmerged_missing"] == []
+
+    # Celălalt sens, în același test, ca reparația să nu poată fi «nu mai compar
+    # deloc»: un cont cerut de `.new` și absent din cea încărcată rămâne roșu,
+    # chiar dacă încărcată numește alte conturi.
+    (tmp_path / "sentinel.yaml.new").write_text(
+        "history:\n  skip_command_accounts:\n    - sentinel-deploy\n"
+        "    - altcineva\n", encoding="utf-8")
+    r2 = run(checks.check_command_history_filter(
+        _HistDB(), _istoric(skip_command_accounts=["sentinel-deploy"])))[0]
+    assert r2.status == "degraded", r2.detail
+    assert r2.facts["unmerged_missing"] == ["altcineva"]
+    assert "altcineva" in r2.detail
+
+
+def test_a_new_file_that_cannot_be_read_is_unknown_not_ok(tmp_path, monkeypatch):
+    """„Nu pot citi" și „nu e nimic acolo" nu au voie să arate la fel.
+
+    Un `.new` cu drepturi greșite sau cu YAML stricat lasă întrebarea «filtrul
+    încărcat e cel scris de instalator?» fără răspuns. Raportat `ok`, ar fi exact
+    tiparul din `CLAUDE.md`: un mecanism care confirmă că n-a găsit nimic, când
+    de fapt n-a putut să se uite.
+    """
+    monkeypatch.setattr(checks, "CONFIG_PATH", tmp_path / "sentinel.yaml")
+    (tmp_path / "sentinel.yaml.new").write_text(
+        "history:\n  skip_command_accounts:\n   - a\n  - b\n", encoding="utf-8")
+
+    r = run(checks.check_command_history_filter(
+        _HistDB(), _istoric(skip_command_accounts=[])))[0]
+    assert r.status == "unknown", r.detail
+    assert "sentinel.yaml.new" in r.detail
+
+
+def test_a_storm_on_an_account_outside_the_filter_is_a_finding():
+    """Întrebarea pusă DATELOR, care nu depinde de ce a tastat cineva.
+
+    Măsurat pe gazdă: `scripts/deploy.sh` cerea `--user`, deci deploy-urile
+    rulau sub contul de logare al operatorului și scriau 174 839, 456 133 și
+    2 158 596 de comenzi fără terminal pe oră sub numele lui. Contul ăla NU e în
+    filtru și nici nu poate fi — sub el rulează și diagnosticele lui.
+
+    Nicio verificare pe configurație n-ar fi văzut asta: configurația era
+    perfect corectă, doar că deploy-ul nu rula sub contul pe care îl numea. Aici
+    se întreabă cine scrie, nu ce s-a configurat, deci se vede la fel de bine o
+    invocație cu contul vechi, un cont nou apărut sau o secțiune neîmbinată.
+    """
+    # O oră de deploy, sub cea mai săracă măsurată (174 839), plus o oră liniștită
+    # a aceluiași cont: rafala NU are voie să se dilueze în medie.
+    db = _HistDB(felie=[_felie("operator", 174_839, cu_terminal=200, ora=1),
+                        _felie("operator", 40, ora=0),
+                        _felie("root", 0, cu_terminal=30, ora=0)])
+    r = run(checks.check_command_history_filter(
+        db, _istoric(skip_command_accounts=[])))[0]
+
+    assert r.status == "degraded", r.detail
+    # Cu ghilimelele din mesaj: „operator" e și un cuvânt care apare prin
+    # texte, iar o căutare simplă ar putea trece fără ca numele contului să fie
+    # spus vreodată.
+    assert "„operator”" in r.detail, r.detail
+    assert r.facts["top_account"] == "operator"
+    assert r.facts["top_peak_hour"] == 174_839, (
+        "ora de vârf s-a pierdut într-o medie peste toată felia")
+    assert any("ORDER BY ts DESC" in s for s in db.sql), (
+        "verificarea n-a întrebat datele deloc")
+
+    # Contra-proba pentru chiar mecanismul de mai sus: aceleași 174 879 de
+    # comenzi, dar întinse peste 24 de ore de rutină, NU sunt o furtună. Fără
+    # cazul ăsta, un prag pus pe TOTAL în loc de pe oră ar trece neobservat.
+    intinse = run(checks.check_command_history_filter(
+        _HistDB(felie=[_felie("operator", 7_286, ora=h) for h in range(24)]),
+        _istoric(skip_command_accounts=[])))[0]
+    assert intinse.status == "ok", intinse.detail
+
+
+def test_a_slice_full_of_typed_commands_is_not_a_storm():
+    """Regula e despre comenzile FĂRĂ terminal, și numai despre ele.
+
+    Cineva care compilează la tastatură produce zeci de mii de `execve` într-o
+    oră, toate cu `pts0`. Numărate ca automatizare, ar da o constatare roșie
+    pentru munca omului — și, mai rău, ar cere ștergerea exact a istoricului care
+    are valoare de securitate. Filtrul viu le păstrează; verificarea trebuie să
+    se uite la aceleași rânduri ca el.
+    """
+    r = run(checks.check_command_history_filter(
+        _HistDB(felie=[_felie("om", 0, cu_terminal=60_000, ora=0)]),
+        _istoric(skip_command_accounts=[])))[0]
+    assert r.status == "ok", r.detail
+    assert r.facts["top_peak_hour"] == 0
+    assert "niciuna fără terminal" in r.detail
+
+
+def test_the_storm_is_attributed_to_the_burst_not_to_the_biggest_total():
+    """Contul cu cele mai multe rânduri nu e neapărat cel care face rău.
+
+    Pe gazdă, contul de logare al operatorului are 2,79 milioane de comenzi fără
+    terminal adunate în luni de zile, iar contul de automatizare are 1 365. Un
+    „cel mai activ" ales după TOTAL ar numi mereu primul cont și ar raporta
+    liniștit ritmul lui — adică o rafală de deploy pe alt cont ar trece
+    neobservată exact fiindcă victoria la total e deja luată.
+
+    Ce contează e ora de vârf: cine a scris cele mai multe într-o oră.
+    """
+    felie = [_felie("om", 3_000, cu_terminal=50, ora=h) for h in range(20)]
+    felie.append(_felie("automat", 25_000, ora=0))
+    r = run(checks.check_command_history_filter(
+        _HistDB(felie=felie), _istoric(skip_command_accounts=[])))[0]
+
+    assert r.facts["top_account"] == "automat", (
+        "contul numit e cel cu totalul cel mai mare, nu cel care a făcut rafala")
+    assert r.facts["top_peak_hour"] == 25_000
+    assert r.status == "degraded", r.detail
+
+
+def test_a_day_of_human_diagnostics_is_not_a_storm():
+    """Contra-cazul, și e cel care decide dacă alerta merită citită.
+
+    Măsurat pe gazdă după migrarea pe contul de deploy: operatorul a scris 2 438
+    de comenzi fără terminal într-o oră, apoi 355 — `ssh gazdă 'ceva'` n-are
+    terminal, deci diagnosticul de la distanță arată exact ca o automatizare, în
+    formă, și diferă doar în ritm. Un prag care ar semnala asta ar da o
+    constatare la fiecare zi de lucru, iar un canal care se plânge zilnic degeaba
+    nu mai e citit când se plânge de un deploy adevărat.
+    """
+    r = run(checks.check_command_history_filter(
+        _HistDB(felie=[_felie("operator", 2_438, cu_terminal=120, ora=1),
+                       _felie("operator", 355, cu_terminal=20, ora=0)]),
+        _istoric(skip_command_accounts=[])))[0]
+    assert r.status == "ok", r.detail
+    assert "2438" in r.detail.replace(" ", "") or "2 438" in r.detail
+
+
+def test_the_report_says_how_far_back_the_sample_could_see():
+    """O felie de 20 000 de comenzi nu e o fereastră de 48 de ore.
+
+    Interogarea e mărginită dinadins — rulează la 5 minute pe o tabelă de
+    milioane de rânduri —, deci pe o gazdă vorbăreață ea vede ultimele minute,
+    nu ultimele două zile. Spus «în ultimele 48 de ore n-am văzut nimic», ăsta ar
+    fi un raport mai tare decât măsurătoarea din spatele lui: exact felul în care
+    un instrument de monitorizare începe să mintă fără să greșească un număr.
+    """
+    plina = run(checks.check_command_history_filter(
+        _HistDB(felie=[_felie("cineva", 0, cu_terminal=checks.HISTORY_SAMPLE,
+                              ora=0)]),
+        _istoric(skip_command_accounts=[])))[0]
+    assert plina.facts["sample_capped"] is True
+    assert "cele mai recente" in plina.detail
+    assert f"{checks.HISTORY_WINDOW_H} de ore" not in plina.detail, (
+        "raportul pretinde fereastra întreagă peste o felie care n-a atins-o")
+
+    scurta = run(checks.check_command_history_filter(
+        _HistDB(felie=[_felie("cineva", 0, cu_terminal=12, ora=0)]),
+        _istoric(skip_command_accounts=[])))[0]
+    assert scurta.facts["sample_capped"] is False
+    assert f"{checks.HISTORY_WINDOW_H} de ore" in scurta.detail
+
+    # Și cazul care contează cel mai mult, fiindcă e cel de pe o gazdă vie: felia
+    # e plină ȘI are comenzi fără terminal, doar că într-un ritm de om. Aici se
+    # tipărește ritmul, iar odată cu el trebuie să se vadă pe ce interval a fost
+    # măsurat — altfel „~995/h" citit lângă „ultimele 48 de ore" descrie o gazdă
+    # care n-a fost măsurată.
+    plina_cu_comenzi = run(checks.check_command_history_filter(
+        _HistDB(felie=[_felie("cineva", (checks.HISTORY_SAMPLE - 100) // 24,
+                              cu_terminal=5, ora=h) for h in range(24)]),
+        _istoric(skip_command_accounts=[])))[0]
+    assert plina_cu_comenzi.status == "ok", plina_cu_comenzi.detail
+    assert plina_cu_comenzi.facts["sample_capped"] is True
+    assert "cele mai recente" in plina_cu_comenzi.detail
+    assert f"{checks.HISTORY_WINDOW_H} de ore" not in plina_cu_comenzi.detail
+
+
+def test_the_window_and_the_sample_are_what_the_query_receives():
+    """Cele două numere care decid dacă verificarea poate vedea ceva.
+
+    Schimbat tăcut din 48 în 1, `HISTORY_WINDOW_H` ar lăsa suita verde și ar face
+    ca starea cea mai importantă — un deploy care scrie sub contul greșit — să nu
+    mai fie prinsă aproape niciodată: un deploy nu rulează în fiecare oră. Nimic
+    nu-l lega de vreun test până acum.
+    """
+    db = _HistDB(felie=[])
+    run(checks.check_command_history_filter(
+        db, _istoric(skip_command_accounts=[])))
+
+    assert db.params, "interogarea de date n-a fost făcută deloc"
+    limita, ore, tipar = db.params[0]
+    assert limita == checks.HISTORY_SAMPLE
+    assert ore == checks.HISTORY_WINDOW_H
+    assert tipar == checks.REAL_TTY_SQL, (
+        "felia folosește alt tipar de terminal decât filtrul viu")
+
+    # Și valorile în sine, cu motivul lor: o fereastră de o oră n-ar prinde
+    # niciun deploy, iar o felie de câteva sute n-ar deosebi o furtună de zgomot.
+    assert checks.HISTORY_WINDOW_H >= 24, (
+        "fereastra a coborât sub o zi; un deploy nu rulează zilnic")
+    assert checks.HISTORY_SAMPLE >= 3 * checks.HISTORY_STORM_PER_H, (
+        "felia nu e mult mai mare decât pragul, iar ora se numără din chiar ea: "
+        "o furtună tăiată de granița dintre două ore ar sta sub prag în amândouă "
+        "gălețile, adică cea mai violentă ar fi cea mai ușor de ratat")
+    assert checks.HISTORY_STORM_PER_H > 2_438, (
+        "pragul ar semnala cea mai încărcată oră de muncă omenească măsurată")
+    assert checks.HISTORY_STORM_PER_H < 174_839, (
+        "pragul ar rata cea mai săracă oră de deploy măsurată")
+
+
+def test_the_storm_threshold_fires_exactly_at_the_boundary():
+    """`>=` sau `>` pe prag decide dacă ora care atinge fix pragul e o furtună.
+
+    Pragul e ales ca media geometrică între cea mai săracă oră de deploy și cea
+    mai bogată oră de om, tocmai ca granița să cadă între ele. O oră care e FIX
+    pe prag e ritm de automatizare, nu de om, deci comparația trebuie să fie
+    inclusivă (`>=`). Schimbată tăcut în `>`, ora de la fix prag ar trece drept
+    normală și un deploy care nimerește exact pragul n-ar mai fi raportat — iar
+    testele care doar fixează constanta n-ar prinde-o, fiindcă valoarea nu s-a
+    schimbat, doar comparația care o alimentează.
+    """
+    la_prag = run(checks.check_command_history_filter(
+        _HistDB(felie=[_felie("automat", checks.HISTORY_STORM_PER_H, ora=0)]),
+        _istoric(skip_command_accounts=[])))[0]
+    assert la_prag.status == "degraded", (
+        "ora care atinge fix pragul a trecut drept normală: `>` în loc de `>=` "
+        "ratează exact granița")
+    assert la_prag.facts["top_peak_hour"] == checks.HISTORY_STORM_PER_H
+
+    sub_prag = run(checks.check_command_history_filter(
+        _HistDB(felie=[_felie("automat", checks.HISTORY_STORM_PER_H - 1, ora=0)]),
+        _istoric(skip_command_accounts=[])))[0]
+    assert sub_prag.status == "ok", sub_prag.detail
+
+
+def test_a_configured_account_that_does_not_exist_is_degraded(monkeypatch):
+    """Un cont scris greșit dă un filtru care nu potrivește niciodată nimic.
+
+    `is_dropped_command` compară pe egalitate exactă. Secțiunea arată
+    configurată, tabela crește cu 405 777 de rânduri la fiecare deploy, și nimic
+    nu spune nimic. Exact starea pe care verificarea asta există s-o facă
+    vizibilă.
+    """
+    _cu_uid(monkeypatch, lambda _n: None)
+    r = run(checks.check_command_history_filter(
+        _HistDB(), _istoric(skip_command_accounts=["nu-exista"])))[0]
+    assert r.status == "degraded"
+    assert "nu-exista" in r.detail
+
+
+def test_an_unreadable_account_database_is_unknown_not_ok(monkeypatch):
+    """„Nu știu" și „e în regulă" nu au voie să arate la fel.
+
+    Fără baza de conturi nu se pot afla uid-urile, iar rândurile scrise cu `auid`
+    numeric — 87 935 pe gazdă — scapă filtrului. Raportat `ok`, reconcilierea din
+    runner ar șterge o constatare reală și i-ar arăta operatorului o revenire
+    care nu s-a întâmplat.
+    """
+    def orb(_n):
+        raise OSError("nu se poate citi /etc/passwd")
+
+    _cu_uid(monkeypatch, orb)
+    r = run(checks.check_command_history_filter(
+        _HistDB(), _istoric(skip_command_accounts=["sentinel-deploy"])))[0]
+    assert r.status == "unknown"
+    assert "nu știu" in r.detail.lower() or "nu pot" in r.detail.lower()
+
+
+def test_a_row_the_rule_forbids_means_the_filter_is_not_in_effect(monkeypatch):
+    """Faptul, nu intenția — dar numai un rând scris DUPĂ ce filtrul putea acționa.
+
+    `docs/ISTORIC-SESIUNI.md` propunea
+
+        journalctl -u sentinel-ingest | grep commands_skipped
+
+    care potrivea ÎNTOTDEAUNA: `commands_skipped` e mereu în `extra`, iar
+    `JSONFormatter` scrie și zerourile. Nu deosebea «am aruncat 405 777 de
+    rânduri» de «secțiunea n-a fost îmbinată niciodată».
+
+    Ce deosebește cele două e un rând pe care regula îl interzice, scris DUPĂ ce
+    filtrul putea acționa. Un `max(ts)` nefolosit făcea verificarea să acuze
+    filtrul și pentru rânduri vechi: reprodus pe gazdă (2026-08-26), 1 871 de
+    rânduri `sentinel-deploy` scrise ÎNAINTE ca filtrul să existe rămâneau în
+    fereastra de 48h; după ce operatorul adăuga contul și repornea, panoul
+    devenea roșu ~48h cu două cauze false și o acțiune care nu arăta nimic, și
+    îngropa sub aceeași cheie furtunile adevărate. Cel mai devreme moment în care
+    filtrul putea acționa e ultima pornire a serviciului de ingestie.
+    """
+    _cu_uid(monkeypatch, lambda _n: 998)
+
+    async def pornit_acum_2h(_unit):
+        return NOW - timedelta(hours=2)
+    monkeypatch.setattr(checks, "_service_started_at", pornit_acum_2h)
+
+    # Nou: cea mai recentă comandă interzisă e de acum 5 minute, DUPĂ pornire —
+    # filtrul rula deja când a fost scrisă, deci chiar nu e în vigoare.
+    db = _HistDB(total=405_777, interzise=405_777,
+                 newest=NOW - timedelta(minutes=5))
+    r = run(checks.check_command_history_filter(
+        db, _istoric(skip_command_accounts=["sentinel-deploy"])))[0]
+
+    assert r.status == "degraded", r.detail
+    assert "nu e în vigoare" in r.title
+    assert "405777" in r.detail.replace(" ", "") or "405 777" in r.detail
+    assert r.facts["rows_forbidden"] == 405_777
+    assert any("session_commands" in s for s in db.sql), (
+        "verificarea n-a întrebat tabela deloc: ar raporta despre configurație, "
+        "nu despre efect")
+
+    # Vechi: aceleași rânduri interzise, dar cea mai recentă e de acum 40 de ore —
+    # ÎNAINTE de ultima pornire a filtrului. Le-a scris procesul dinainte; a le
+    # numi „filtrul nu e în vigoare" e acuzația care aprindea panoul degeaba.
+    db_vechi = _HistDB(total=405_777, interzise=405_777,
+                       newest=NOW - timedelta(hours=40))
+    rv = run(checks.check_command_history_filter(
+        db_vechi, _istoric(skip_command_accounts=["sentinel-deploy"])))[0]
+
+    assert rv.status != "degraded", rv.detail
+    assert "nu e în vigoare" not in rv.title
+    assert "nu e în vigoare" not in rv.detail
+    # Faptul, dat operatorului: data celui mai recent rând interzis apare, ca s-o
+    # poată lega de momentul îmbinării.
+    assert checks._ceas(NOW - timedelta(hours=40)) in rv.detail
+    assert rv.facts["newest_forbidden"] == (NOW - timedelta(hours=40)).isoformat()
+
+
+def test_an_active_storm_outside_the_filter_is_not_swallowed_by_old_rows(monkeypatch):
+    """O furtună ACTIVĂ pe alt cont nu are voie să stea sub verdele dat rândurilor vechi.
+
+    B1 a stins un roșu fals: rânduri interzise VECHI ale contului configurat
+    (scrise înainte ca filtrul să existe) rămân în fereastra de 48h și, singure,
+    dau acum `ok`. Dar ramura aia întoarce `ok` ÎNAINTE de ramura de furtună de
+    dedesubt — deci în cele ~48h cât rândurile vechi zac, o furtună reală de
+    automatizare pe un cont din AFARA filtrului, sub aceeași cheie `history:filter`,
+    e înghițită și panoul rămâne verde. Exact cazul din
+    `test_a_storm_on_an_account_outside_the_filter_is_a_finding`, dar cu rânduri
+    interzise vechi prezente simultan: un deploy rulat pe contul de logare al
+    operatorului nu produce niciun semnal.
+    """
+    _cu_uid(monkeypatch, lambda _n: 998)
+
+    async def pornit_acum_2h(_unit):
+        return NOW - timedelta(hours=2)
+    monkeypatch.setattr(checks, "_service_started_at", pornit_acum_2h)
+
+    # Contul configurat: 1 871 de rânduri interzise, cea mai recentă de acum 40 de
+    # ore — ÎNAINTE de pornire, deci singure ar da `ok` (cazul B1). SIMULTAN,
+    # contul `operator`, din afara filtrului, scrie 174 839 de comenzi fără
+    # terminal într-o oră: furtună activă, peste prag.
+    db = _HistDB(total=1_871, interzise=1_871, newest=NOW - timedelta(hours=40),
+                 felie=[_felie("operator", 174_839, cu_terminal=200, ora=1),
+                        _felie("operator", 40, ora=0)])
+    r = run(checks.check_command_history_filter(
+        db, _istoric(skip_command_accounts=["sentinel-deploy"])))[0]
+
+    assert r.status == "degraded", r.detail
+    assert "„operator”" in r.detail, r.detail
+    assert r.facts["top_account"] == "operator"
+    assert r.facts["top_peak_hour"] == 174_839
+    assert "din afara filtrului" in r.title, (
+        "furtuna de pe contul neconfigurat a fost raportată ca altceva, sau "
+        "verdele rândurilor vechi a acoperit-o")
+
+
+def test_old_forbidden_rows_without_a_storm_stay_ok(monkeypatch):
+    """Non-regresie B1: rânduri interzise vechi rămân `ok`, cu sau fără furtună.
+
+    Garda adăugată deasupra n-are voie să reînvie roșul fals pe care B1 l-a
+    stins. Două sub-cazuri:
+
+    1. un cont din afara filtrului prezent dar SUB prag (nu e furtună), plus
+       rânduri interzise vechi ale contului configurat → `ok`;
+    2. mai tare: chiar o furtună VECHE pe CONTUL configurat însuși (toate
+       rândurile de dinaintea pornirii) trebuie să rămână `ok`. Contul filtrului
+       nu are voie să cadă prin la ramura de furtună, care l-ar acuza cu «n-ar fi
+       trebuit scrise» — exact roșul fals pentru rânduri vechi. Fără clauza
+       `top.username not in skip.matches` din gardă, sub-cazul ăsta devine roșu.
+    """
+    _cu_uid(monkeypatch, lambda _n: 998)
+
+    async def pornit_acum_2h(_unit):
+        return NOW - timedelta(hours=2)
+    monkeypatch.setattr(checks, "_service_started_at", pornit_acum_2h)
+
+    # Sub-cazul 1: cont din afara filtrului, sub prag.
+    db = _HistDB(total=1_871, interzise=1_871, newest=NOW - timedelta(hours=40),
+                 felie=[_felie("operator", checks.HISTORY_STORM_PER_H - 1, ora=1)])
+    r = run(checks.check_command_history_filter(
+        db, _istoric(skip_command_accounts=["sentinel-deploy"])))[0]
+
+    assert r.status == "ok", r.detail
+    assert "nu e în vigoare" not in r.title
+    assert "nu e în vigoare" not in r.detail
+
+    # Sub-cazul 2: furtună VECHE pe chiar contul configurat (toate rândurile
+    # dinaintea pornirii de acum 2h — ora 41 e cu mult înainte).
+    db2 = _HistDB(total=174_879, interzise=174_879, newest=NOW - timedelta(hours=40),
+                  felie=[_felie("sentinel-deploy", 174_839, ora=41)])
+    r2 = run(checks.check_command_history_filter(
+        db2, _istoric(skip_command_accounts=["sentinel-deploy"])))[0]
+
+    assert r2.facts["top_account"] == "sentinel-deploy"
+    assert r2.status == "ok", r2.detail
+    assert "n-ar fi trebuit scrise" not in r2.detail, (
+        "furtuna VECHE a contului configurat a căzut prin la ramura de furtună și "
+        "a reînviat roșul fals pentru rânduri de dinaintea filtrului")
+
+
+def test_the_numeric_spelling_is_part_of_what_the_check_looks_for(monkeypatch):
+    """Verificarea trebuie să caute AMBELE ortografii ale contului.
+
+    Dacă ar întreba doar despre nume, cele 87 935 de rânduri scrise cu `auid`
+    numeric n-ar apărea în numărătoare — iar verificarea ar raporta `ok` peste
+    exact golul pe care există s-o umple.
+    """
+    _cu_uid(monkeypatch, lambda _n: 998)
+    db = _HistDB()
+    r = run(checks.check_command_history_filter(
+        db, _istoric(skip_command_accounts=["sentinel-deploy"])))[0]
+
+    assert r.status == "ok"
+    assert sorted(r.facts["matches"]) == ["998", "sentinel-deploy"]
+
+
+def test_no_rows_at_all_is_not_reported_as_proof_that_the_filter_works(monkeypatch):
+    """Zero rânduri interzise într-o fereastră fără niciun deploy arată exact ca
+    zero rânduri interzise pe o gazdă care aruncă cum trebuie.
+
+    Verificarea nu are voie să spună «filtrul funcționează» despre asta. Spune ce
+    a văzut — nimic — și că nimic nu e o dovadă.
+    """
+    _cu_uid(monkeypatch, lambda _n: 998)
+    r = run(checks.check_command_history_filter(
+        _HistDB(total=0, interzise=0),
+        _istoric(skip_command_accounts=["sentinel-deploy"])))[0]
+
+    assert r.status == "ok"
+    assert "NU e o dovadă" in r.detail, (
+        "verificarea pretinde că filtrul aruncă, pe o fereastră în care n-a "
+        "văzut niciun rând")
+
+
+def test_the_history_check_is_registered_in_the_run():
+    """O verificare care nu e în `CHECKS` nu rulează niciodată.
+
+    E chiar felul de defect pe care fișierul ăsta îl păzește peste tot: cod
+    corect, testat, și niciodată chemat.
+    """
+    assert "history" in [nume for nume, _ in checks.CHECKS]
+
+
+# --- ship_lag: prag de vârstă pe flux + detector de înțepenire ---------------
+#
+# Două pene stau în spatele acestor teste. Prima: `session_commands`, fluxul cu
+# cel mai mare volum, rămâne normal în urmă mai mult decât restul, iar la 15
+# minute producea o constatare pe funcționarea sănătoasă — zgomot pe care
+# operatorul învață să-l ignore. A doua, cea care a durat ore: cursorul lui NU
+# avansa deloc (un WAF refuza loturile), iar a aștepta pragul de vârstă ridicat
+# înainte de a alarma ar fi lăsat oprirea nevăzută ore în șir. Cele două sunt
+# diagnostice diferite și au chei diferite.
+from sentinel.report.shipper import StreamLag
+
+
+class _StallDB:
+    """`collector_cursors` cât să se joace mai multe rulări ale detectorului.
+
+    Reimplementează în Python semantica upsertului pe cheia `ship:<flux>:stall`,
+    deci dovedește logica detectorului — starea ținută între rulări —, nu SQL-ul.
+    Un `_DB` care întoarce o singură valoare canonică pentru orice `fetchrow` nu
+    poate arăta ce vede detectorul: că VALOAREA cursorului e neschimbată de la
+    rularea trecută. Fără o stare care evoluează, testul de non-regresie (un flux
+    care se scurge normal) și cel de înțepenire ar arăta identic.
+    """
+
+    def __init__(self):
+        self.store: dict[str, dict] = {}
+
+    async def fetchrow(self, sql, *a):
+        return self.store.get(a[0])
+
+    async def execute(self, sql, *a):
+        name, cursor, events = a[0], a[1], a[2]
+        self.store[name] = {"cursor": cursor, "events_seen": events}
+
+    async def fetchval(self, sql, *a):
+        return None
+
+
+def _ship_cfg():
+    return _cfg(ship=SimpleNamespace(enabled=True, url="https://agg.invalid",
+                                     interval_s=60))
+
+
+def _patch_ship(monkeypatch, lags):
+    """Fă `check_ship_lag` să vadă exact `lags` și o cheie de expediere prezentă."""
+    from sentinel.report import shipper
+
+    async def fake_lag(db, streams=None):
+        return list(lags)
+
+    monkeypatch.setattr(shipper, "lag", fake_lag)
+    monkeypatch.setattr("sentinel.config.get_secrets",
+                        lambda: SimpleNamespace(has=lambda n: True))
+
+
+def _sc_lag(cursor, pending, oldest_min, stream="session_commands"):
+    """Un flux append-only (cursor pe `id`): `clock_ahead_s`/`trigger` = None."""
+    return StreamLag(stream=stream, cursor=cursor, floor=None, pending=pending,
+                     oldest_pending_min=oldest_min)
+
+
+def _key(results, key):
+    for r in results:
+        if r.key == key:
+            return r
+    return None
+
+
+def test_session_commands_thirty_minutes_behind_but_advancing_is_not_a_finding(monkeypatch):
+    """Zgomotul din care s-a cerut pragul de 6h.
+
+    `session_commands` are cel mai mare volum și rămâne legitim în urmă cu minute.
+    Sub pragul lui de 6h, cu un cursor care AVANSEAZĂ la fiecare rundă, nu e nici
+    înțepenit, nici „rămas în urmă" — la 15 minute ar fi produs o constatare pe
+    funcționarea normală, iar o alarmă pe normal e una peste care operatorul
+    învață să treacă și atunci nu mai vede nici restanța adevărată.
+    """
+    db = _StallDB()
+    cfg = _ship_cfg()
+    for cursor in (100, 130):
+        _patch_ship(monkeypatch, [_sc_lag(cursor, pending=5, oldest_min=30)])
+        results = run(checks.check_ship_lag(db, cfg))
+
+    assert not any(r.key.endswith(":stall") for r in results), (
+        "un flux care se scurge normal a fost numit înțepenit")
+    r = _key(results, "ship:lag:session_commands")
+    assert r is not None and r.status == "ok", (
+        "30 de minute a fost raportat ca restanță, deși pragul lui e de 6 ore")
+
+
+def test_session_commands_seven_hours_behind_is_an_age_finding(monkeypatch):
+    """Peste 6h, restanța lui `session_commands` E o constatare.
+
+    Ridicarea pragului la 6 ore nu are voie să însemne „niciodată": o copie
+    externă rămasă în urmă cu 7 ore e incompletă și trebuie spus. Cursorul
+    avansează — deci e vârstă, nu înțepenire.
+    """
+    db = _StallDB()
+    cfg = _ship_cfg()
+    for cursor in (100, 130):
+        _patch_ship(monkeypatch, [_sc_lag(cursor, pending=5, oldest_min=420)])
+        results = run(checks.check_ship_lag(db, cfg))
+
+    assert not any(r.key.endswith(":stall") for r in results)
+    r = _key(results, "ship:lag:session_commands")
+    assert r is not None and r.status == "degraded"
+    assert "rămas în urmă" in r.title
+
+
+def test_a_cursor_frozen_for_three_runs_with_pending_rows_is_a_stall(monkeypatch):
+    """Pana reală: cursorul nu mai înaintează DELOC, deși există rânduri.
+
+    A aștepta pragul de vârstă (6h) pentru asta e greșit — oprirea trebuie prinsă
+    în minute. Constatarea are cheie DISTINCTĂ de cea de vârstă, ca mesajul să
+    spună „nu mai înaintează", nu „a rămas în urmă": sunt diagnostice diferite,
+    cu acțiuni diferite. Restanța e sub pragul de 6h (30 min), deci ce prinde
+    aici e înțepenirea, nu vârsta.
+    """
+    db = _StallDB()
+    cfg = _ship_cfg()
+    results = []
+    for _ in range(3):
+        _patch_ship(monkeypatch, [_sc_lag(200, pending=5, oldest_min=30)])
+        results = run(checks.check_ship_lag(db, cfg))
+
+    stall = _key(results, "ship:lag:session_commands:stall")
+    assert stall is not None and stall.status == "degraded", (
+        "cursorul înghețat 3 rulări cu rânduri în așteptare nu a fost prins")
+    assert "nu mai înaintează" in stall.detail
+    assert _key(results, "ship:lag:session_commands") is None, (
+        "a raportat si constatarea de varsta pe un flux sub pragul de 6h")
+
+
+def test_a_cursor_that_advances_a_little_each_run_is_never_a_stall(monkeypatch):
+    """Non-regresia critică: o restanță care se scurge NU e o înțepenire.
+
+    Miezul reparației. `updated_at` e scris necondiționat de expeditor la fiecare
+    upsert, deci un detector clădit pe el ar numi înțepenit orice flux care e doar
+    în urmă. Semnalul e VALOAREA cursorului: dacă avansează — chiar și cu puțin,
+    chiar rămânând mereu în urmă — fluxul se mișcă și nu e blocat.
+    """
+    db = _StallDB()
+    cfg = _ship_cfg()
+    saw_stall = False
+    for cursor in (100, 101, 102, 103, 104):
+        _patch_ship(monkeypatch, [_sc_lag(cursor, pending=5, oldest_min=400)])
+        results = run(checks.check_ship_lag(db, cfg))
+        if any(r.key.endswith(":stall") for r in results):
+            saw_stall = True
+
+    assert not saw_stall, (
+        "un flux al cărui cursor avansează la fiecare rundă a fost numit înțepenit")
+    assert _key(results, "ship:lag:session_commands").status == "degraded"
+
+
+def test_another_stream_keeps_the_fifteen_minute_age_threshold(monkeypatch):
+    """Harta de excepții nu are voie să slăbească restul fluxurilor.
+
+    Pragul de 6h e DOAR pentru `session_commands`. Un alt flux în urmă cu 20 de
+    minute rămâne o constatare la 15 minute — altfel ridicarea pragului pentru
+    unul singur ar fi înmuiat tăcut sensibilitatea tuturor.
+    """
+    db = _StallDB()
+    cfg = _ship_cfg()
+    for cursor in (100, 130):
+        _patch_ship(monkeypatch,
+                    [_sc_lag(cursor, pending=5, oldest_min=20, stream="incidents")])
+        results = run(checks.check_ship_lag(db, cfg))
+
+    r = _key(results, "ship:lag:incidents")
+    assert r is not None and r.status == "degraded", (
+        "20 de minute pe un flux obișnuit nu a mai fost o constatare — harta de "
+        "excepții a slăbit pragul altui flux decât cel numit")
+    assert not any(x.key.endswith(":stall") for x in results)
+
+
+def test_the_stall_counter_resets_when_the_cursor_moves_again(monkeypatch):
+    """Un flux care se dezgheață nu rămâne marcat înțepenit.
+
+    Fără reset, un flux care s-a mișcat greu o rundă-două și apoi și-a revenit ar
+    fi ținut o constatare aprinsă pe o problemă care a trecut — exact felul de
+    alarmă care sună degeaba. Cursorul înghețat 2 rulări, apoi se mișcă: contorul
+    revine la zero, fără constatare.
+    """
+    db = _StallDB()
+    cfg = _ship_cfg()
+    for _ in range(2):
+        _patch_ship(monkeypatch, [_sc_lag(300, pending=5, oldest_min=30)])
+        run(checks.check_ship_lag(db, cfg))
+    assert db.store["ship:session_commands:stall"]["events_seen"] >= 1
+
+    _patch_ship(monkeypatch, [_sc_lag(305, pending=5, oldest_min=30)])
+    results = run(checks.check_ship_lag(db, cfg))
+
+    assert not any(r.key.endswith(":stall") for r in results), (
+        "un flux care a înaintat din nou e încă raportat înțepenit")
+    assert db.store["ship:session_commands:stall"]["events_seen"] == 0, (
+        "contorul de rulări-fără-mișcare nu a revenit la zero după ce cursorul s-a mișcat")

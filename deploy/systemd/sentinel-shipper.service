@@ -1,0 +1,78 @@
+[Unit]
+# Expeditorul de loturi catre agregatorul extern.
+#
+# Serviciu propriu, si NU acelasi cu sentinel-beacon. Beaconul e canalul prin
+# care gazda spune ca traieste: nu reincearca, nu blocheaza, nu scrie pe disc.
+# Expeditorul citeste loturi, tine conexiuni mai lungi si reincearca cu backoff.
+# In acelasi proces, o bucla de reincercare sau o scurgere de memorie din al
+# doilea ar opri primul — adica un bug in raportarea de date ar deveni o pana a
+# canalului prin care se anunta penele.
+Description=Sentinel shipper (loturi catre agregatorul extern)
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+PartOf=sentinel.target
+
+# In [Unit], nu in [Service] — acolo systemd le ignora tacut.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=exec
+User=sentinel
+Group=sentinel
+WorkingDirectory=/opt/sentinel
+ExecStart=/opt/sentinel/bin/sentinel ship
+# on-failure, nu always: cand expeditorul nu e configurat, serviciul spune o
+# data in jurnal si iese cu 0. Cu `always`, systemd l-ar reporni la nesfarsit
+# pentru o iesire care nu e o eroare, pana ar lovi limita si ar ramane `failed`.
+Restart=on-failure
+RestartSec=10
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONPATH=/opt/sentinel/lib
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=yes
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug @swap @reboot @raw-io @obsolete
+CapabilityBoundingSet=
+UMask=0077
+
+# Nu scrie nimic pe disc. Coada E baza de date locala: cursorul care n-a avansat
+# e restanta, si nu exista o a doua reprezentare a ei pe disc care sa nu fie de
+# acord cu prima.
+ReadOnlyPaths=/etc/sentinel
+# Doar iesire HTTPS si socketul bazei de date.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Peste cei 128M ai beaconului, si nu din generozitate: un lot de
+# ship.max_rows_per_batch randuri e citit din baza, codificat si semnat in
+# memorie. La 2000 de randuri de audit e ordinul megaoctetilor, dar plafonul
+# trebuie sa acopere si varful, nu media — un OOM aici opreste expedierea fara
+# ca nimic sa spuna de ce.
+MemoryMax=256M
+TasksMax=16
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-shipper
+
+[Install]
+WantedBy=multi-user.target

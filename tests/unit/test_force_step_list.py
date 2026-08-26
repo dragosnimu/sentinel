@@ -562,10 +562,28 @@ def test_the_rotation_proof_only_asks_for_what_the_public_panel_renders():
     operator is trying to confirm the beacon survived.
     """
     operare = (REPO / "docs" / "OPERARE.md").read_text(encoding="utf-8")
-    page = (REPO / "watcher" / "app" / "page.tsx").read_text(encoding="utf-8")
+    page = (REPO / "aggregator" / "lib" / "witness-page.ts").read_text(encoding="utf-8")
 
-    # What the page renders without a key: everything before the `detailed` gate.
-    public = page.split("{detailed &&", 1)[0]
+    # The page stopped being JSX when the witness moved into the aggregator (the
+    # panel CSP has no unsafe-inline; a server-rendered Next page emits six
+    # inline scripts). The gate is no longer `{detailed &&` but the body of
+    # `detailedRows` — so that is what gets cut out, and BOTH sides are asserted:
+    # a marker that matched nothing would make this test green forever, which is
+    # exactly how a verification step stops verifying.
+    marker = "function detailedRows("
+    assert marker in page, (
+        "witness-page.ts no longer has a `detailedRows` function, so this test "
+        "cannot tell the gated rows from the public ones"
+    )
+    gated = page.split(marker, 1)[1]
+    end = gated.find(chr(10) + "}")
+    assert end > 0, "cannot find the end of `detailedRows`"
+    gated = gated[:end]
+
+    assert "Semnal nr." in gated,         "`Semnal nr.` left the key-gated rows; the cut below proves nothing"
+    assert "Ultimul semnal" not in gated,         "the age row moved behind `?key=`, so the public panel shows no age at all"
+
+    public = page.replace(gated, "")
     assert "Ultimul semnal" in public, "the public panel no longer shows the age"
 
     section = operare.split("## 11.", 1)[1]

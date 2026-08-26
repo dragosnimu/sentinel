@@ -214,6 +214,7 @@ Rulează automat la 5 minute și la 90 de secunde după boot. Alertează pe Tele
 | `executor:socket` | Singura componentă privilegiată răspunde |
 | `code:current` | Serviciile rulează codul instalat, nu pe cel dinaintea ultimului deploy |
 | `alert:telegram` | Canalul care duce toate celelalte alerte chiar livrează |
+| `identity:instance` | Gazda mai are identitatea cu care a fost instalată — vezi §12 |
 | `db:*`, `res:*` | Fundațiile: bază accesibilă, schemă la zi, disc și memorie |
 
 ### O sursă tăcută nu e mereu un defect
@@ -429,8 +430,323 @@ pe o parte înseamnă că beaconul semnează fericit, iar martorul respinge fiec
 semnal ca semnătură greșită, ceea ce arată la fel ca o gazdă tăcută. Se rotește
 schimbând-o în **ambele** locuri, iar dovada e (d) de mai sus.
 
+De pe 19 august 2026, `SENTINEL_BEACON_SECRET` și `SENTINEL_SHIP_SECRET` pot fi
+puse **prin canalul de livrare**, nu doar de mână pe gazdă. Sunt în
+`OPERATOR_SECRET_KEYS`, nu în `GENERATED_SECRET_KEYS` — distincția contează și
+rămâne: instalatorul le acceptă, dar nu le inventează niciodată. O valoare
+născută aici ar fi jumătate dintr-o pereche a cărei cealaltă jumătate e la
+martor, respectiv la agregator.
+
+Înainte, prima punere a oricăreia cerea scris direct în `secrets.env` ca root,
+iar rulările următoare doar o purtau mai departe. Pentru o funcție livrată, asta
+însemna o procedură documentată care începea cu un pas nedocumentat.
+
 Pasul 27 duce mai departe orice cheie găsită deja în `secrets.env`, nu doar pe
 cele pe care le cunoaște. Nu a fost mereu așa: până în august 2026 rescria
 fișierul din două liste fixe și ștergea restul, iar cheia beaconului era exact
 „restul". Verificarea (a) e acolo pentru clasa asta de defect, nu pentru cazul
 ăla anume — el e reparat.
+
+---
+
+## 12. Identitatea instalării
+
+Un panou extern care adună mai multe instalări le deosebește după o singură
+valoare: **`instance_id`**, 32 de caractere hexa (`openssl rand -hex 16`), în
+`/etc/sentinel/instance_id`, mod `0640 root:sentinel`.
+
+**Se generează o dată și nu se regenerează niciodată.** Fiecare deploy verifică
+fișierul; dacă lipsește îl creează, iar dacă există doar îi reafirmă drepturile
+și îl lasă în pace. Regenerarea ar rupe istoria serverului în două pe agregator,
+iar ruptura nu produce nicio eroare nicăieri: cifrele doar încetează să însemne
+ce spun.
+
+Verificarea asta **nu** e legată de un pas al instalatorului, dinadins: pașii
+sunt marcați ca făcuți și sărite la re-rulare, deci o gazdă instalată înainte ca
+identitatea să existe n-ar fi căpătat-o niciodată dintr-un upgrade obișnuit — iar
+beaconul nou, repornit fără ea, ar fi amuțit.
+
+De ce nu hostname-ul: se schimbă (redenumire, migrare, un panou care recreează
+VPS-ul), iar identitatea schimbată e o istorie bifurcată; pe un panou partajat e
+și recunoaștere gratuită, fiindcă spune cui se uită cum se cheamă mașinile tale.
+De ce nu `/etc/machine-id`: o mașină clonată îl moștenește, iar identitatea
+duplicată e singurul eșec din familia asta care nu produce niciun raport de
+defecțiune nicăieri.
+
+**Nu e un secret și nu e o cheie.** Semnarea semnalului se face cu
+`SENTINEL_BEACON_SECRET`; identitatea doar spune cine trimite.
+
+### `instance_label` — numele pe care îl citești tu
+
+În `/etc/sentinel/sentinel.yaml`, la rădăcină:
+
+```yaml
+instance_label: "prod-web-1"
+```
+
+Pur cosmetic, exact ca `hostname` de deasupra lui: apare în alerta martorului ca
+`eticheta (id)`, ca să nu cauți după 32 de caractere hexa care server a tăcut.
+Gol e o valoare validă și e valoarea implicită — atunci alerta poartă doar
+identitatea. **Niciodată cheie:** nimic nu rutează, nu autentifică și nu
+deduplică după el. Dacă ar face-o, oricine poate edita `sentinel.yaml` ar putea
+muta un server în istoria altuia.
+
+### Cele două reprezentări, și de ce sunt două
+
+Fișierul e **autoritatea**. Rândul din tabela `instance_identity` e o
+**oglindă** a lui, scrisă de `sentinel migrate` — care rulează la fiecare
+instalare — și niciodată suprascrisă.
+
+Copia nu e redundanță, e martorul. Un backup al bazei luat pe serverul A și
+restaurat pe o clonă a lui B aduce datele lui A peste fișierul lui B. Fără o a
+doua reprezentare pe care s-o contrazică, asta bifurcă tăcut un server în două
+pe agregator.
+
+### Când `/selfcheck` spune ceva despre identitate
+
+| Ce vezi | Ce înseamnă | Ce faci |
+|---|---|---|
+| 🟡 **Identitatea instalării nu corespunde** | Fișierul spune una, baza alta. Aproape întotdeauna: bază restaurată pe altă mașină | Vezi mai jos — **nu** rescrie nimic până nu știi care e care |
+| ⚪ **Nu pot citi identitatea instalării** | Fișierul lipsește, e gol, are altă formă, sau procesul n-are drepturi pe el | `ls -l /etc/sentinel/instance_id`. Lipsă → un deploy obișnuit îl creează. Există dar nu e o identitate → `od -c`, îl ștergi, apoi deploy. Vezi DEPLOYMENT.md §7 |
+| 🟡 **Oglinda identității nu s-a scris** | Scriitorul a rulat și rândul tot nu e în bază | `sentinel migrate`, apoi `journalctl -u sentinel-selfcheck -n 50`; textul constatării poartă rezultatul înregistrat de ultima încercare |
+| 🟢 „oglinda nu e scrisă încă, iar scriitorul nu a rulat niciodată aici" | Starea normală între instalarea codului și `sentinel migrate` | Nimic. Se rezolvă la prima migrare |
+
+**Nepotrivirea nu e o pană.** Pe gazda asta nu s-a oprit nimic: se colectează,
+se detectează, se blochează. Ce e stricat e cui i se atribuie datele în afara
+ei — de aceea e 🟡 și nu 🔴.
+
+### Ce faci la o nepotrivire
+
+```bash
+# Ce spune fiecare capăt. `first_seen` e din viața gazdei DINAINTE, dacă baza
+# a venit de altundeva — jumătate din răspunsul la „de unde a apărut asta aici".
+cat /etc/sentinel/instance_id
+sudo -u postgres psql sentinel -c 'SELECT * FROM instance_identity'
+```
+
+Apoi decizi ce e adevărat, și doar tu poți:
+
+* **Ai restaurat o bază de pe alt server pe mașina asta** (cazul obișnuit).
+  Fișierul are dreptate; rândul e al altcuiva. Ștergi rândul și lași
+  `sentinel migrate` să-l rescrie:
+  `sudo -u postgres psql sentinel -c 'DELETE FROM instance_identity'` apoi
+  `sudo sentinel migrate`. Datele rămân, dar de acum sunt atribuite gazdei
+  ăsteia.
+* **Ai clonat mașina și vrei două servere distincte.** Clona trebuie să capete
+  identitate proprie: ștergi fișierul de pe ea și rulezi un deploy, care îl
+  recreează (DEPLOYMENT.md §7). Apoi tratezi cazul de mai sus.
+* **Nu știi ce s-a întâmplat.** Nu rescrie nimic. Atâta timp cât cele două se
+  contrazic, constatarea rămâne pe `/selfcheck`, și asta e tot ce faci pierzând
+  — o linie galbenă. O scriere greșită șterge dovada.
+
+Scriitorul oglinzii **nu rezolvă niciodată singur** o nepotrivire: dacă tabela
+ține alt identificator, `sentinel migrate` tipărește un avertisment, scrie o
+linie de ERROR în jurnal și lasă rândul neatins. A „repara" scriind ar șterge
+exact dovada pentru care există mecanismul.
+
+---
+
+## 13. Expedierea s-a oprit din cauza ceasului
+
+Ce vezi pe `/selfcheck` sau în alertă:
+
+> 🟡 **Expedierea fluxului „incidents" e oprită de ceasul serverului**
+> filigranul e cu 3600 s înaintea ceasului bazei — ceasul a mers înapoi.
+
+### Ce s-a întâmplat
+
+Fluxurile care duc **entități ce se schimbă** — incidente, blocări, findings,
+planuri de patch, active — nu pot folosi un cursor pe `id`: un incident închis
+nu-și schimbă `id`-ul, deci `WHERE id > cursor` nu-l vede niciodată. Cursorul lor
+e perechea `(updated_at, id)`, iar `updated_at` e ceasul bazei.
+
+Asta cumpără capacitatea de a expedia o schimbare și plătește cu o dependență:
+**dacă ceasul merge înapoi, expedierea fluxului se oprește.** Rândurile atinse de
+atunci încolo primesc un `updated_at` mai mic decât filigranul, deci nu mai sunt
+selectate niciodată. Interogarea rămâne validă și întoarce zero rânduri — exact
+ce întoarce o gazdă pe care nu s-a schimbat nimic.
+
+Constatarea asta există tocmai ca cele două să nu arate la fel. Fără ea ai fi
+citit „la zi", verde, în timp ce nimic nu mai pleacă.
+
+Cauzele obișnuite, în ordinea probabilității:
+
+* `chronyd` a pășit înapoi după ce a pierdut contactul cu sursele și l-a
+  recăpătat (`chronyc tracking`, câmpul `System time`);
+* mașina virtuală a fost restaurată dintr-un instantaneu mai vechi;
+* cineva a rulat `date -s` sau a oprit sincronizarea;
+* ceasul o luase **înainte** și tocmai a fost corectat. E același lucru: o
+  corecție în jos e un salt înapoi.
+
+### Ce faci
+
+```bash
+timedatectl status          # NTP activ? ceasul sistemului sincronizat?
+chronyc tracking            # System time, Last offset, Leap status
+journalctl -u chronyd -n 50
+```
+
+Repari sursa de timp. **Atât.** După ce ceasul e corect, expedierea repornește
+singură în momentul în care timpul real trece de filigran — nu e nevoie de nicio
+comandă. Constatarea de pe `/selfcheck` se stinge la următoarea rulare.
+
+Cât durează îți spune chiar constatarea: numărul de secunde din text e cât mai
+are de așteptat.
+
+### Ce s-a pierdut, și de ce agentul nu repară singur
+
+Tot ce s-a schimbat între saltul înapoi și clipa în care timpul real ajunge din
+urmă filigranul **nu va fi expediat niciodată**. Rândurile sunt intacte pe gazdă;
+copia din afara ei nu le are. Un incident închis în fereastra aia rămâne deschis
+pe agregator până la următoarea lui atingere.
+
+Se putea repara automat, retrăgând filigranul la ora curentă: rândurile din
+fereastră s-ar retrimite, iar retrimiterea e gratuită (ingestia e upsert). **Nu
+se face, dinadins.** Pe un ceas care oscilează — și un ceas care a sărit o dată
+e chiar ăla —, retragerea s-ar întâmpla la fiecare rundă, iar aceeași fereastră
+ar pleca la nesfârșit. Costul nu se vede nicăieri până când îl spune factura de
+trafic a agregatorului.
+
+Alegerea între o pierdere mărginită și un cost nemărginit e a ta, nu a agentului.
+Dacă vrei rândurile înapoi, după ce ceasul e reparat:
+
+```bash
+# Doar cu ceasul deja corect, și doar dacă înțelegi ce retrimiți.
+# <flux> e numele din constatare: incidents, blocklist, findings, ...
+sudo -u postgres psql sentinel -c   "UPDATE collector_cursors SET cursor_at = now() - interval '2 hours'    WHERE name = 'ship:<flux>'"
+```
+
+Intervalul trebuie să acopere fereastra pierdută. Cu cât e mai mare, cu atât se
+retrimit mai multe rânduri deja ajunse — inofensiv, dar plătit în trafic.
+
+### Ce NU e cazul ăsta
+
+* **„Expedierea fluxului … a rămas în urmă"** — altă constatare, altă cauză:
+  agregatorul nu confirmă. Acolo se caută în `journalctl -u sentinel-shipper`.
+* **`audit_log`** nu poate ajunge aici niciodată. E append-only, cursorul lui e
+  pe `id`, iar `id`-urile nu depind de ceas. Lanțul de audit pleacă de pe gazdă
+  și cu ceasul stricat.
+
+---
+
+## 14. Rânduri apărute sub filigran
+
+Ce vezi în jurnal (`journalctl -u sentinel-shipper`):
+
+> `rows appeared below the shipping cursor and will never be shipped`
+> `stream=incidents rows=3 total_lost=3`
+
+și, pe `/selfcheck`, o notă lipită de fluxul respectiv: *„3 rânduri au apărut sub
+filigran după ce a trecut peste ele … și nu vor pleca niciodată"*.
+
+### Ce s-a întâmplat
+
+`updated_at` primește `now()`, care în PostgreSQL e **ora de început a
+tranzacției**, nu a instrucțiunii. Ordinea commit-urilor nu e ordinea
+începuturilor: o tranzacție pornită la 10:00:00 și comisă la 10:00:40 face rândul
+vizibil *după* una pornită la 10:00:20 și comisă la 10:00:21. Dacă expeditorul a
+trecut între timp de 10:00:00, rândul apare sub filigran și nu mai e selectat
+niciodată.
+
+Împotriva asta, expeditorul nu trimite rândurile mai proaspete de
+`COMMIT_SAFETY_LAG_S` (30 de secunde, în `sentinel/report/shipper.py`). Fereastra
+mărginește problema; **nu o elimină.** O tranzacție de scriere mai lungă de atât
+o produce oricum.
+
+Mesajul de mai sus e măsurătoarea, nu o estimare: fereastra citită la runda
+precedentă e închisă — orice atingere nouă pune `updated_at = now()`, care e
+deasupra cursorului — deci fiecare rând găsit în plus acolo a fost comis cu
+întârziere.
+
+### Ce faci
+
+```bash
+# Cea mai lungă tranzacție deschisă acum. Rulează de câteva ori în timpul
+# vârfului de activitate, nu o dată la miezul nopții.
+sudo -u postgres psql sentinel -c   "SELECT pid, state, now() - xact_start AS durata, query
+   FROM pg_stat_activity WHERE xact_start IS NOT NULL
+   ORDER BY xact_start LIMIT 5"
+```
+
+Dacă vezi tranzacții care trec de 30 de secunde, **cauza e acolo**, nu în
+expeditor: o cale de cod care ține o tranzacție deschisă peste o cerere de rețea,
+un `psql` uitat deschis într-un `BEGIN`, un job de întreținere. Repar-o, sau
+ridică `COMMIT_SAFETY_LAG_S` peste durata măsurată — costul e că o schimbare
+apare pe agregator cu atâtea secunde mai târziu.
+
+### Cum recuperezi rândurile pierdute
+
+Ele sunt intacte pe gazdă; doar copia din afara ei nu le are. Se recuperează
+retrăgând filigranul, ceea ce retrimite o fereastră de rânduri deja ajunse —
+inofensiv (ingestia e upsert), plătit în trafic:
+
+```bash
+# Intervalul trebuie să acopere momentul tranzacției lungi.
+sudo -u postgres psql sentinel -c   "UPDATE collector_cursors SET cursor_at = now() - interval '1 hour'    WHERE name = 'ship:incidents'"
+```
+
+Contorul nu se resetează singur, dinadins: e istoria pierderilor instalării, nu
+o stare curentă. Dacă vrei să pornești de la zero după ce ai recuperat:
+`DELETE FROM collector_cursors WHERE name = 'ship:incidents:lost'`.
+
+---
+
+## 15. Filigranul nu e întreținut — trigger lipsă
+
+Ce vezi pe `/selfcheck`:
+
+> 🟡 **Expedierea fluxului „incidents" nu are filigran întreținut**
+
+### Ce s-a întâmplat
+
+Coloana `updated_at` a tabelei există, dar **niciun trigger activ nu o mai
+actualizează**. Rândul se schimbă, momentul lui rămâne cel de la INSERT. Cursorul
+trece o dată peste el și nu-l mai vede niciodată.
+
+Ăsta e cel mai tăcut mod de eșec din tot mecanismul, și de-aia e verificat la
+fiecare rulare în loc să fie presupus din migrație: fără el, interogarea întoarce
+zero rânduri, ceasul e bun, restanța e zero, unitatea e `active` — totul arată
+sănătos, la nesfârșit.
+
+Cauze: migrația `0023` n-a fost aplicată pe gazda asta; a fost aplicată și
+nucleul a respins ceva; sau cineva a rulat `ALTER TABLE … DISABLE TRIGGER`, ceea
+ce lasă rândul în catalog și oprește efectul.
+
+**Un fișier de migrație pe disc nu e dovadă că a fost încărcat**, iar
+`schema_version` spune doar că instrucțiunile au rulat fără eroare pe versiunea
+de-atunci a fișierului. Faptul e în `pg_trigger`.
+
+### Ce faci
+
+```bash
+sudo sentinel migrate
+
+# Apoi verifici EFECTUL, nu fișierul:
+sudo -u postgres psql sentinel -c   "SELECT tgrelid::regclass AS tabela, tgname, tgenabled
+   FROM pg_trigger WHERE NOT tgisinternal
+     AND tgfoid = to_regproc('set_updated_at') ORDER BY 1"
+```
+
+Trebuie să apară șapte rânduri — `actors`, `assets`, `blocklist`, `findings`,
+`incidents`, `patch_plans`, `selfcheck_state` — toate cu `tgenabled = 'O'`.
+
+`tgenabled` are patru valori, și doar două înseamnă „rulează":
+
+| Valoare | Ce înseamnă | Fluxul merge? |
+|---|---|---|
+| `'O'` | origine — normalul | da |
+| `'A'` | întotdeauna, inclusiv pe sesiuni de replicare | da |
+| `'D'` | dezactivat (`ALTER TABLE … DISABLE TRIGGER`) | **nu** |
+| `'R'` | doar pe o sesiune cu `session_replication_role = 'replica'` (`ENABLE REPLICA TRIGGER`) | **nu** |
+
+`'D'` și `'R'` sunt amândouă „prezent în catalog și fără efect pentru noi" — un
+trigger `'R'` nu se declanșează pe conexiunea obișnuită a expeditorului. De aceea
+verificarea enumeră ce acceptă (`'O'`, `'A'`), nu ce respinge.
+
+**`audit_log` nu trebuie să apară acolo, niciodată.** E append-only, cu un
+trigger care ridică excepție la UPDATE (`0002_response.sql`); fluxul lui merge pe
+`id` și nu depinde de niciun ceas.
+
+Cât timp constatarea e pe `/selfcheck`, fluxul e **oprit** — dinadins. Un flux
+care ar continua ar părea la zi și n-ar duce nicio modificare, ceea ce e mai rău
+decât o linie galbenă.

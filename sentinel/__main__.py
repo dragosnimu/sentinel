@@ -7,26 +7,33 @@ instead of a traceback in `journalctl`.
     sentinel ingest | detect | ai | telegram | web | scan | health | maintenance
     sentinel selfcheck [--print]
     sentinel reconcile [--reapply]
+    sentinel telegram --send-test [--message TEXT]
     sentinel migrate [--dry-run]
     sentinel config-check
     sentinel version
+
+Flags after the subcommand belong to the service and are handed to it. They are
+NOT discarded: a flag nobody parses used to mean "start the daemon", which is
+how `sentinel telegram --send-test` started a second bot poller on a host that
+was already running one. See `services.parse_service_args`.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 from sentinel import __version__
 from sentinel.errors import ConfigError, SentinelError
 from sentinel.logging_setup import setup_logging
 
 SERVICES = ("ingest", "detect", "ai", "telegram", "web", "scan", "health",
-            "maintenance", "selfcheck", "reconcile", "beacon")
+            "maintenance", "selfcheck", "reconcile", "beacon", "ship")
 
 
-def _run_service(name: str, args: argparse.Namespace) -> int:
+def _run_service(name: str, args: argparse.Namespace,
+                 extra: Sequence[str]) -> int:
     # Imported lazily so that `sentinel config-check` and `sentinel version` work
     # on a machine where the runtime dependencies of one daemon are missing.
     import importlib
@@ -47,8 +54,13 @@ def _run_service(name: str, args: argparse.Namespace) -> int:
     # The service's own main() decides whether it is starting a daemon or
     # running a one-shot admin command, and sets up logging accordingly — a
     # `--create-admin` invocation should not emit a "service starting" line.
-    entry: Callable[[], int] = module.main
-    return entry()
+    #
+    # It is handed the leftovers explicitly rather than re-reading sys.argv:
+    # every service that did read sys.argv had to guess where its own flags
+    # started, and `sentinel --log-level DEBUG web --list-users` is the
+    # invocation that guess gets wrong.
+    entry: Callable[[Sequence[str]], int] = module.main
+    return entry(list(extra))
 
 
 def _config_check(args: argparse.Namespace) -> int:
@@ -72,6 +84,12 @@ def _config_check(args: argparse.Namespace) -> int:
     # an evening spent wondering why the watcher never hears anything.
     if cfg.beacon.enabled:
         required += ["SENTINEL_BEACON_SECRET"]
+    # Same reasoning as the beacon, and its own key: a shared secret would let
+    # root on host A forge host A's rows into host B's history. Without it the
+    # shipper exits 0, which is indistinguishable from "not configured" unless
+    # something names the missing key.
+    if cfg.ship.enabled:
+        required += ["SENTINEL_SHIP_SECRET"]
     missing = [k for k in required if not secrets.has(k)]
 
     print(f"config:   OK  ({cfg.hostname or 'hostname unset'}, tz={cfg.timezone})")
@@ -109,7 +127,8 @@ def build_parser() -> argparse.ArgumentParser:
         # Service subcommands accept their own flags — `sentinel web
         # --create-admin`, `sentinel telegram --send-test`. The service module
         # parses them itself, so this level only needs to stop argparse
-        # rejecting them before they get there.
+        # rejecting them before they get there. It stops there: what this level
+        # does not recognise, the service must, or the service refuses.
         sub.add_parser(
             name,
             help=f"run the {name} service",
@@ -129,7 +148,20 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     # parse_known_args, not parse_args: a service's own flags are its business,
     # and this dispatcher should not need updating every time one gains an option.
-    args, _extra = build_parser().parse_known_args()
+    #
+    # `extra` is that business, and it is PASSED ON. It used to be assigned to a
+    # throwaway and dropped, which meant this dispatcher answered "I do not know
+    # what that flag is" by running the subcommand's default action anyway.
+    args, extra = build_parser().parse_known_args()
+
+    # The subcommands handled below define their own flags here, so a leftover
+    # is a flag nobody will act on — and the action they would fall through to
+    # is not harmless: `sentinel migrate --dry-runn` would apply migrations for
+    # real while its operator watched for a preview.
+    if extra and args.command not in SERVICES:
+        print(f"sentinel {args.command}: unrecognised argument(s): "
+              f"{' '.join(extra)}", file=sys.stderr)
+        return 64  # EX_USAGE
 
     try:
         if args.command == "version":
@@ -140,7 +172,7 @@ def main() -> int:
         if args.command == "migrate":
             return _migrate(args)
         if args.command in SERVICES:
-            return _run_service(args.command, args)
+            return _run_service(args.command, args, extra)
     except ConfigError as exc:
         print(f"configuration error: {exc}", file=sys.stderr)
         return 78

@@ -2,6 +2,11 @@ node_modules/
 .next/
 .env
 .env.local
+# Starea locală: fișierul de bază, câte unul per instanță, și intermediarele
+# scrierii atomice. Toate conțin stare reală, deci niciunul nu are ce căuta
+# într-un push.
 .sentinel-watcher.json
+.sentinel-watcher.*.json
+.sentinel-watcher*.tmp
 *.tsbuildinfo
 next-env.d.ts

@@ -58,6 +58,24 @@ SystemCallFilter=~@resources
 CapabilityBoundingSet=CAP_DAC_READ_SEARCH
 AmbientCapabilities=CAP_DAC_READ_SEARCH
 
+# Cache-ul propriu de metadate dnf.
+#
+# Masurat pe 21 august 2026, pe gazda reala: `dnf updateinfo list cves` ruleaza
+# in 7 secunde ca root, care foloseste cache-ul sistemului din /var/cache/dnf, si
+# in 82 ca utilizatorul `sentinel`, care NU-l poate citi si reparseaza de fiecare
+# data toate metadatele. Plafonul scanerului era 120 de secunde, deci in fiecare
+# noapte era o moneda aruncata: patru rulari din ultimele opt au durat intre 108
+# si 120 de secunde, iar doua au fost omorate la fix 120.
+#
+# Cu un cache al lui, scris o data si refolosit: 2,4 secunde. Masurat, de trei
+# ori la rand.
+#
+# `CacheDirectory=` il creeaza systemd, cu proprietarul serviciului, si il
+# pastreaza intre rulari — spre deosebire de `RuntimeDirectory=`, care l-ar
+# sterge la oprire si ar readuce exact problema. Ocupa in jur de 205 MB.
+CacheDirectory=sentinel-dnf
+CacheDirectoryMode=0750
+
 ReadWritePaths=/var/lib/sentinel
 ReadOnlyPaths=/etc/sentinel /var/www /opt /srv
 

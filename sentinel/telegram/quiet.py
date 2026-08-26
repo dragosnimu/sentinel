@@ -59,11 +59,37 @@ NEVER_MUTED_KINDS = frozenset({
     "patch_failed",      # a patch stopped partway
     "patch_rolled_back",  # the host changed and then changed back
     "lockout",           # you may be locked out right now
-    # Part of the security agent has stopped working. Holding this until 06:00
-    # would mean the hours you chose to stop watching your phone are exactly the
-    # hours nobody is watching the server either.
-    "selfcheck",
+    # Cineva tocmai a intrat pe server. Cerut de operator pe 24 august 2026, cu
+    # o condiție care e jumatate din cerinta: „nu se tace niciodata, dar atentie
+    # sa nu generezi fals pozitiv".
+    #
+    # A doua jumatate e ce face prima suportabila. O alerta care nu poate fi
+    # tacuta trebuie sa fie rara si sa fie adevarata, altfel scutirea de la
+    # liniste devine chiar mecanismul prin care canalul e abandonat. De-asta
+    # `detect/logins.py` alerteaza NUMAI pe sesiunile interactive: masurat pe
+    # gazda, 29 pe saptamana in loc de 586.
+    "login",
 })
+
+# `"selfcheck"` A STAT aici, cu motivul: „o parte din agentul de securitate s-a
+# oprit; ținut până la 06:00, orele în care ai ales să nu te uiți la telefon ar fi
+# exact orele în care nimeni nu se uită nici la server". Motivul rămâne valabil —
+# dar numai pentru jumătatea la care se referea.
+#
+# Autoverificarea emite DOUĂ feluri de veste, iar `runner._announce` le deosebea
+# deja: `critical` când ceva e `down`, `high` când e doar `degraded`. Iar
+# `degraded` înseamnă, prin definiția scrisă în `check_ship_lag`, „pe gazdă nu s-a
+# oprit nimic; ce e în urmă e o copie din afara ei". Aia nu e vestea pentru care a
+# fost făcută scutirea, și ținută sub ea a devenit exact ce scutirea voia să
+# prevină: un canal care sună degeaba și pe care operatorul îl închide.
+#
+# Scoasă din listă, jumătatea care conta trece în continuare — prin
+# `NEVER_MUTED_SEVERITIES`, fiindcă `down` produce `critical`. Cealaltă se ȚINE,
+# nu se pierde: rândul rămâne `queued` și pleacă la ridicarea ferestrei.
+#
+# Cerut de operator pe 24 august 2026, după câteva zile de „Sentinel funcționează
+# degradat" primite în perioada de mute, toate despre același flux în urmă cu o
+# oră prin construcție.
 
 _WINDOW_RE = re.compile(r"^\s*([0-2]?\d):([0-5]\d)\s*-\s*([0-2]?\d):([0-5]\d)\s*$")
 _DURATION_RE = re.compile(r"^\s*(\d{1,4})\s*(m|min|minute|h|o|ora|ore|d|zi|zile)\s*$", re.I)

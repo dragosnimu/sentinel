@@ -2,8 +2,25 @@
 #
 # Deploy Sentinel to the server over SSH. Run from Git Bash or WSL.
 #
-#   ./scripts/deploy.sh --host 203.0.113.10 --user deploy \
-#       --key ~/.ssh/sentinel_deploy --domain sentinel.exemplu.ro
+#   ./scripts/deploy.sh --host 203.0.113.10 --domain sentinel.exemplu.ro
+#
+#   --key K        private key. Defaults to ~/.ssh/sentinel_deploy, which is the
+#                  key authorized on the sentinel-deploy account --user also
+#                  defaults to. The two belong together: a key that opens the
+#                  operator's own login and a --user of sentinel-deploy is
+#                  "Permission denied (publickey)", and the older key some
+#                  documentation named is authorized on the human account only —
+#                  which is the account whose 405 777 terminal-less commands per
+#                  run this default exists to stop writing.
+#
+#   --user U       SSH account to deploy as. Defaults to sentinel-deploy, the
+#                  account deploy/install.sh creates with NOPASSWD sudo. It is
+#                  also the account named in history.skip_command_accounts, so
+#                  deploying as anything else puts a quarter of a million
+#                  terminal-less commands per run into session_commands under a
+#                  name the filter does not know. Override only if you have
+#                  installed with a different DEPLOY_ACCOUNT — and change the
+#                  config to match.
 #
 #   --nginx-mode M dedicated (own listener on --web-port) or shared (a vhost on
 #                  the nginx already serving 80/443). See docs/DEPLOYMENT.md §2.
@@ -33,7 +50,36 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SECRETS_FILE="${REPO_ROOT}/secrets/.env.local"
 
-HOST=""; USER=""; KEY=""; DOMAIN=""; EMAIL=""; ADMIN_IP=""
+HOST=""; KEY=""; DOMAIN=""; EMAIL=""; ADMIN_IP=""
+# The account this deploys AS, and the reason it has a default at all.
+#
+# Until 25 August 2026 this was empty and --user was required, so every
+# run named the operator's own login. auid survives sudo — it is the
+# LOGIN uid, not the effective one — so all 405 777 terminal-less commands
+# of a deploy landed in session_commands under the human account, which is
+# not in history.skip_command_accounts and must not be: the operator's
+# remote diagnostics run under the same name and are worth keeping.
+#
+# Hardcoded rather than read from the environment: $USER is set in every
+# shell, so a default of "${USER:-sentinel-deploy}" would silently be the
+# old behaviour on the exact machine it is meant to fix.
+DEPLOY_USER_DEFAULT="sentinel-deploy"
+USER="$DEPLOY_USER_DEFAULT"
+# The key that opens THAT account, because the two are one decision.
+#
+# The account default above shipped on its own, and on its own it is a way to
+# fail: sentinel-deploy authorizes ~/.ssh/sentinel_deploy and nothing else, so a
+# run that keeps the new --user and the old key gets "Permission denied
+# (publickey)" before the first step. The operator's remaining move would be to
+# put --user back, and then the filter is inert again — which is how the account
+# default came to be worth nothing.
+#
+# Only a DEFAULT. An explicit --key is used as given and must exist; a missing
+# default is a warning and ssh chooses an identity as it did before, because an
+# agent, an IdentityFile in ~/.ssh/config or a differently named key are all
+# legitimate here and this script cannot tell which. "I do not know" is not "you
+# are wrong".
+DEPLOY_KEY_DEFAULT="${HOME}/.ssh/sentinel_deploy"
 DRY_RUN=0; ROLLBACK=0; PURGE=0; FROM_STEP=""; FORCE_STEP=""; ASSUME_YES=0
 SSH_PORT=22
 # The dashboard's public HTTPS port. Not 443 — this host serves something else
@@ -48,7 +94,10 @@ info() { printf '\033[34m[.]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[32m[+]\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[!]\033[0m %s\n' "$*" >&2; }
 
-usage() { sed -n '2,25p' "$0"; exit 0; }
+# The whole header comment, however long it grows. A hardcoded line range was
+# here and it silently truncated --help the moment a flag was documented above
+# the end of it — the reader then believes the missing flags do not exist.
+usage() { sed -n '2,${/^#/!q;p;}' "$0"; exit 0; }
 
 # --force-step is passed through to install.sh, which stays the authority on
 # what the numbers mean. Two things still have to happen here:
@@ -99,7 +148,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$HOST" ]] || die "--host is required"
-[[ -n "$USER" ]] || die "--user is required"
+# --user may be given, but it may not be given EMPTY: `--user ""` would
+# otherwise deploy as whatever the ssh client falls back to, which is the
+# local username — the failure this default exists to remove.
+[[ -n "$USER" ]] || die "--user was given an empty value"
 
 # Refused here, before a tarball is built or an SSH session opened. The
 # installer checks it again on the server — it is the authority — but a typo
@@ -118,6 +170,18 @@ SSH_OPTS=(-o BatchMode=no -o StrictHostKeyChecking=accept-new
 SCP_OPTS=("${SSH_OPTS[@]}")
 SSH_OPTS+=(-p "$SSH_PORT")
 SCP_OPTS+=(-P "$SSH_PORT")
+
+# No --key: fall back to the key that belongs to the account default, but only
+# if it is really there. Substituting a path that does not exist would turn
+# "ssh, pick an identity" into a hard error on machines that were working.
+if [[ -z "$KEY" && -f "$DEPLOY_KEY_DEFAULT" ]]; then
+    KEY="$DEPLOY_KEY_DEFAULT"
+    info "using default key ${KEY} (pairs with --user ${DEPLOY_USER_DEFAULT})"
+elif [[ -z "$KEY" ]]; then
+    warn "no --key and ${DEPLOY_KEY_DEFAULT} does not exist; ssh will choose an identity."
+    warn "If it picks the one for your own login, ${USER}@${HOST} refuses it with"
+    warn "'Permission denied (publickey)' — that account authorizes sentinel_deploy."
+fi
 
 if [[ -n "$KEY" ]]; then
     KEY="${KEY/#\~/$HOME}"
@@ -277,11 +341,31 @@ info "packaging the repository"
 # witness, and its whole value is running somewhere the monitored host cannot
 # reach. Shipping a copy here would put the thing that reports Sentinel's death
 # on the machine whose death it reports.
+#
+# aggregator/ is excluded for the same reason and one more. It runs on the same
+# external hosting as the witness, and it is the archive of what left this
+# machine — "what left cannot be deleted from here" stops being true the moment
+# a copy of the archive's schema and credentials-handling code sits on the host
+# that is being archived. Nothing under deploy/ or sentinel/ reads it.
+#
+# scratchpad/ is where verification harnesses keep their working copies —
+# `.bak` snapshots of install.sh, config.py, signing.py, beacon.py. Three
+# reasons it must not ship, and the size ceiling below sees none of them: it is
+# source that nothing on the host runs, it is a second copy of files whose
+# single-copy-ness is the point, and a stale harness left there can be executed
+# against a newer tree. That last one is not hypothetical — it clobbered this
+# working tree twice during E2.2.
+#
+# The list is an intention. `tests/security/test_package_contents.py` builds a
+# real archive with a file planted under scratchpad/ and asserts `tar -tzf`
+# does not list it, because the archive is the effect.
 tar --exclude='./secrets' \
     --exclude='./.git' \
     --exclude='./tests' \
     --exclude='./docs' \
     --exclude='./watcher' \
+    --exclude='./aggregator' \
+    --exclude='./scratchpad' \
     --exclude='./dist' \
     --exclude='node_modules' \
     --exclude='.next' \
@@ -309,12 +393,23 @@ fi
 
 # A CRLF in a .sh or .service file fails on Linux as `bad interpreter:
 # /bin/bash^M`, which is a confusing twenty minutes if you have not seen it.
-# .gitattributes covers a git checkout; this catches everything else.
-if command -v file >/dev/null && \
-   grep -rlU $'\r' "${REPO_ROOT}/deploy" --include='*.sh' --include='*.service' 2>/dev/null | grep -q .; then
-    die "CRLF line endings found under deploy/. Fix with:
-    find deploy -type f \\( -name '*.sh' -o -name '*.service' -o -name '*.timer' \\) -exec sed -i 's/\\r\$//' {} +"
-fi
+# A CRLF in deploy/audit/sentinel.rules is worse, because it is quiet: the key
+# becomes `sentinel_ssh^M`, auditd accepts the rule, and the collector matches
+# nothing for as long as nobody notices.
+#
+# The check is on the PACKAGE, run after tar and before the transfer, so it
+# reads the exact bytes that are about to leave this machine rather than a
+# second guess at what tar included. .gitattributes normalises on commit; this
+# is what catches a file a tool rewrote between commit and deploy. The criterion
+# and the exemptions are argued in the script itself.
+#
+# Any non-zero exit stops the deploy, including exit 2 — "I could not inspect
+# the package" is not permission to send it.
+#
+# Invoked through `bash` rather than as an executable: the exec bit does not
+# survive every route this repository takes onto a Windows disk.
+bash "${REPO_ROOT}/scripts/lib/check-line-endings.sh" "$TARBALL" "$REPO_ROOT" \
+    || die "refusing to deploy this package — see above."
 
 info "transferring to ${HOST}:${REMOTE_DIR}"
 ssh_run "mkdir -p '${REMOTE_DIR}'"

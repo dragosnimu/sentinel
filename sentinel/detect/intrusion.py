@@ -36,6 +36,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from sentinel.collectors.auditd import SSH_PATH_LIKE
 from sentinel.db.engine import Database
 from sentinel.detect.spec import DetectionSpec
 from sentinel.logging_setup import get_logger
@@ -120,11 +121,23 @@ async def _grouped(db: Database, cursor: int, actions: tuple[str, ...], *,
 
 # Ce înseamnă de fapt „schimbare de cheie SSH", odată ce urmărirea de nucleu
 # acoperă tot /home. Un director `.ssh` oriunde, plus configurația demonului.
-SSH_PATHS = ("%/.ssh/%", "%/.ssh", "%sshd_config%", "%authorized_keys%")
+#
+# Definiția stă în colector, care aplică acum aceeași îngustare la clasificare —
+# o scriere în /home care nu are legătură cu SSH nici nu mai ajunge etichetată
+# `ssh_key_change`. Poarta de aici rămâne, cu aceeași listă, din două motive:
+# rândurile deja scrise în `raw_events` sub eticheta veche, și faptul că o
+# regresie în colector nu are voie să redeschidă alertele critice pe nimic.
+# Două liste separate ar fi divergat, iar divergența s-ar fi văzut ca un
+# fals-negativ tăcut.
+SSH_PATHS = SSH_PATH_LIKE
 
 
 def _spec(row: Any, *, rule_id: str, severity: str, title: str,
-          summary: str, extra: dict[str, Any] | None = None) -> DetectionSpec:
+          summary: str, extra: dict[str, Any] | None = None,
+          path_backed: bool = True) -> DetectionSpec:
+    """`path_backed` implicit adevărat: toate regulile de mai jos, în afară de
+    încărcarea de module, spun „fișierul X s-a modificat". Vezi
+    `spec.enforce_path_evidence` pentru ce se întâmplă când X lipsește."""
     users = (row["users"] or [])[:6]
     procs = (row["procs"] or [])[:6]
     return DetectionSpec(
@@ -148,6 +161,7 @@ def _spec(row: Any, *, rule_id: str, severity: str, title: str,
             **(extra or {}),
         },
         event_ids=list(row["event_ids"])[:200],
+        path_backed=path_backed,
     )
 
 
@@ -469,7 +483,11 @@ async def module_load(db: Database, cursor: int) -> list[DetectionSpec]:
     out: list[DetectionSpec] = []
     for row in await _grouped(db, cursor, ("module_load",)):
         out.append(_spec(
+            # Singura regulă din fișier care nu susține nimic despre un fișier:
+            # `init_module` nu are înregistrare PATH, iar textul alertei nu
+            # promite una. Garda pe evidență ar retrograda-o pe nedrept.
             row, rule_id="intrusion.module_load", severity="critical",
+            path_backed=False,
             title="Modul de kernel încărcat sau descărcat",
             summary=(f"{row['n']} operații în {WINDOW_MIN} min · "
                      f"proces: {', '.join((row['procs'] or [])[:3]) or '—'} · "

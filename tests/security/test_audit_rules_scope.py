@@ -70,21 +70,96 @@ def test_three_different_questions_use_three_different_keys(lines: list[str]) ->
         m = re.search(r"-(?:k|F key=)\s*([A-Za-z0-9_]+)", line)
         return m.group(1) if m else None
 
-    keys = {"exec": set(), "suid": set(), "module": set()}
+    keys = {"unealta": set(), "istoric": set(), "suid": set(), "module": set()}
     for line in lines:
         if not line.startswith("-a "):
             continue
         key = key_of(line)
         if re.search(r"-S execve", line):
-            keys["exec"].add(key)
+            # DOUĂ întrebări diferite trec prin același syscall, iar ce le
+            # deosebește e `-F path=`:
+            #
+            #   cu path  — «a rulat cineva `socat`?», un semnal de detecție;
+            #   fără     — «ce s-a rulat în sesiunea asta?», o arhivă.
+            #
+            # Cu o cheie comună, regula care alertează pe unelte de atacator ar
+            # primi FIECARE comandă rulată pe gazdă și ar declara fiecare `ls`
+            # drept unealtă de atacator. Testul ăsta a fost scris când exista o
+            # singură regulă `execve` și cerea egalitate cu numele ei; cerea
+            # atunci același lucru pe care îl cere acum, doar că faptul s-a
+            # schimbat, nu intenția.
+            (keys["unealta"] if "-F path=" in line else keys["istoric"]).add(key)
         elif re.search(r"-S [^ ]*chmod", line):
             keys["suid"].add(key)
         elif re.search(r"-S [^ ]*init_module|delete_module", line):
             keys["module"].add(key)
 
-    assert keys["exec"] == {"sentinel_exec"}
+    assert keys["unealta"] == {"sentinel_exec"}
+    assert keys["istoric"] == {"sentinel_cmd"}
     assert keys["suid"] == {"sentinel_suid"}
     assert keys["module"] == {"sentinel_module"}
+    assert not keys["unealta"] & keys["istoric"], (
+        "regula de unelte de atacator și istoricul de comenzi împart o cheie, "
+        "deci fiecare comandă rulată pe gazdă ar sosi la regula de detecție")
+
+
+def test_the_command_history_only_watches_login_sessions(lines: list[str]) -> None:
+    """Filtrul care ține istoricul de comenzi suportabil, și de ce e singurul.
+
+    Regula lui e cea mai largă din tot fișierul: FIECARE `execve`. Ce o face
+    posibilă pe o gazdă cu șase containere Docker e `-F auid!=unset` — procesele
+    fără sesiune de login în spate (daemoni, cron, tot ce rulează într-un
+    container) nu ajung niciodată la ea.
+
+    Scos, filtrul nu produce nicio eroare și niciun test roșu. Produce zeci de
+    mii de înregistrări pe oră, umple backlog-ul nucleului, iar de acolo încep să
+    se piardă înregistrări — inclusiv cele care contează. Antetul fișierului
+    numește exact asta: „aici mor seturile de reguli audit".
+
+    Măsurat pe 24 august 2026: cu filtrul, câteva mii de înregistrări pe zi.
+    """
+    istoric = [x for x in lines
+               if x.startswith("-a ") and "-S execve" in x and "sentinel_cmd" in x]
+    assert istoric, "regula de istoric a dispărut din fișier"
+
+    for regula in istoric:
+        assert "-F auid!=unset" in regula, (
+            f"regula de istoric nu mai cere o sesiune de login: {regula}\n"
+            f"Fără filtru, fiecare proces al celor șase containere și fiecare "
+            f"rulare de cron intră în istoric.")
+
+    # Amândouă arhitecturile. Un binar pe 32 de biți intră prin altă tabelă, iar
+    # un set de reguli care păzește numai b64 are o gaură exact de mărimea lui
+    # „compilează-l pe 32 de biți" — una dintre cele mai vechi evaziuni de audit.
+    arhitecturi = {x.split("-F arch=")[1].split()[0] for x in istoric}
+    assert arhitecturi == {"b64", "b32"}, (
+        f"istoricul acoperă doar {arhitecturi}; un binar de altă arhitectură "
+        f"rulează nevăzut")
+
+
+def test_the_kernel_backlog_is_sized_for_the_command_history(lines: list[str]) -> None:
+    """Un backlog rămas la valoarea implicită pierde tăcut înregistrări.
+
+    Peste plafon, nucleul ARUNCĂ, iar o înregistrare aruncată arată exact ca o
+    comandă care n-a fost rulată. Istoricul tace fix în minutul aglomerat în care
+    cineva lucrează repede — adică minutul care contează.
+
+    320 era dimensionat pentru cele 17 urmăriri de fișiere de dinainte. Un singur
+    deploy produce câteva mii de înregistrări într-o rafală.
+    """
+    backlog = [x for x in lines if x.startswith("-b ")]
+    assert len(backlog) == 1, f"plafonul de backlog e declarat de {len(backlog)} ori"
+    valoare = int(backlog[0].split()[1])
+    assert valoare >= 4096, (
+        f"backlog de {valoare}: prea mic pentru un `execve` pe fiecare comandă "
+        f"dintr-o sesiune, deci se vor pierde înregistrări în rafale")
+
+    astept = [x for x in lines if x.startswith("--backlog_wait_time")]
+    assert astept, (
+        "fără `--backlog_wait_time`, nucleul aruncă imediat ce backlog-ul se "
+        "umple, în loc să aștepte — iar un syscall care întârzie o clipă e o "
+        "mașină care pare lentă, pe când o înregistrare aruncată e un istoric "
+        "care minte")
 
 
 def test_every_key_used_is_known_to_the_collector(lines: list[str]) -> None:

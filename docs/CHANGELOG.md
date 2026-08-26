@@ -1,5 +1,366 @@
 # Changelog
 
+## 0.22.3 — Contul era corect, cheia era greșită; iar autodiagnosticul spunea „ok"
+
+Trei lucruri măsurate pe gazdă pe 25 august 2026, toate cu aceeași formă:
+mecanismul confirma ce s-a scris undeva, nu ce se întâmplă.
+
+* **Cheia de livrare are implicit, ca și contul.** `sentinel-deploy` (uid 1002)
+  autorizează exact o cheie — `~/.ssh/sentinel_deploy` —, iar cheia numită în
+  invocația folosită până acum are altă amprentă și primește `Permission denied
+  (publickey)`. Implicitul de cont livrat singur lăsa deci o singură ieșire la
+  îndemână: `--user` înapoi pe contul operatorului, adică filtrul inert la loc.
+  Cheia implicită LIPSĂ e doar un avertisment — un agent ssh sau un
+  `IdentityFile` din `~/.ssh/config` sunt tot atât de legitime;
+* **`history:filter` întreabă acum datele, nu configurația.** Pe listă goală
+  ieșea `ok` înainte de orice SQL. Citit pe gazdă: `sentinel.yaml` din 20 august
+  n-are secțiunea `history:`, iar `sentinel.yaml.new` din 25 august nu o are nici
+  el — filtrul n-a ajuns niciodată acolo —, în timp ce contul de deploy scrisese
+  **1 266 de comenzi fără terminal în 48 de ore**. Verificarea scrisă ca să
+  deosebească intenția de efect raporta `ok` peste exact starea pe care exista
+  s-o vadă.
+  Acum se întreabă *cine scrie comenzi fără terminal și cu ce ritm* — peste
+  **20 000 într-o oră** e automatizare (un deploy face 405 777 în 140 s; cea mai
+  încărcată oră de om măsurată are 2 438) — și, separat, dacă `sentinel.yaml.new`
+  cere un cont pe care configurația încărcată NU-l are. Comparația e orientată
+  dinadins: încărcată care aruncă mai mult decât cere `.new` e o alegere a
+  operatorului peste un `.new` rămas în urmă, iar pe egalitate constatarea ar fi
+  rămas roșie pentru totdeauna imediat ce cineva adaugă contul de mână — exact
+  reacția pe care mesajul o cere. Felia citită e mărginită la 60 000 de
+  comenzi (`EXPLAIN` pe gazdă: 4 239, față de 50 283 nemărginit) și raportul
+  spune ce interval a acoperit;
+* **`--list-sessions` nu mai costă 18,4 secunde.** Măsurat: `Execution Time:
+  18395.833 ms`, trei procese de fundal, 243 723 de citiri din heap, agregare
+  peste 2,85 milioane de rânduri — plătite exact înainte de curățare și pe o
+  gazdă care în aceeași zi a dat `504` pe panou, deci unealta de curățat putea
+  lua jos gazda pe care o curăță. Numărătoarea se oprește acum la 2000 pe
+  sesiune (`2000+` în coloană), cifra rămâne luată din TABELĂ, iar unde nici
+  atât nu încape coloana devine `?` — „n-am măsurat" nu e „zero".
+
+Mărunte, din aceeași rundă:
+
+* proba de colație a replicii citea `Number(null)` ca `0`, iar trei din cele
+  patru răspunsuri sunt așteptate `0`: pica închis din noroc, fiindcă al
+  patrulea așteaptă `1`. Acum ce nu e număr e refuzat pe față;
+* aceeași probă rulează și în modul uscat, unde **nu aruncă**: cifra pe care
+  operatorul o citește ca să decidă e validată, iar dacă serverul nu aplică
+  regula, raportul o spune în loc să oprească o numărătoare inofensivă;
+* **`0028_commands_purged.sql` se aplică ÎNAINTE de prima rulare** a scriptului,
+  altfel `--list-sessions` moare cu `column s.commands_purged does not exist`
+  (verificat pe gazdă). Scris acum acolo unde îl citește operatorul.
+
+## 0.22.2 — Filtrul era corect și se uita la contul greșit
+
+`0.22.1` a livrat filtrul de istoric și l-a probat comparând două nume din
+depozit. Măsurat pe gazdă pe 25 august 2026, filtrul ar fi șters **1 143 din
+2 978 485 de rânduri**: furtuna de 405 777 de comenzi nu era pe
+`sentinel-deploy`, era pe contul de logare al operatorului, fiindcă
+`scripts/deploy.sh` cerea `--user` iar `auid` e uid-ul de LOGARE și
+supraviețuiește lui `sudo`.
+
+* **Deploy-ul rulează implicit ca `sentinel-deploy`**, în `scripts/deploy.sh` și
+  `scripts/deploy.ps1`. Contul e cel pe care pasul 36 al instalatorului îl
+  creează cu `NOPASSWD: ALL` și cel numit în `history.skip_command_accounts`;
+* **filtrul prinde și ortografia numerică**. Același cont ajunge în tabelă și ca
+  `auid` numeric — **87 935 de rânduri** scrise ca `username = '1000'` — când
+  nici auditd, nici `pwd` nu rezolvă un nume. Conturile configurate se rezolvă
+  la uid la încărcarea configurației, iar un cont care nu se rezolvă e RAPORTAT,
+  nu înghițit;
+* **autodiagnostic `history:filter`**: citește cheia înapoi din configurația
+  încărcată și raportează conturile, dacă se rezolvă, și dacă s-au SCRIS rânduri
+  pe care regula le interzice. Lista goală e o stare validă și apare ca atare;
+* **mod pe sesiune** în amândouă scripturile de curățare, plus `--list-sessions`
+  ordonat după numărul de comenzi. Istoricul de dinaintea filtrului nu e pe
+  contul de automatizare și e amestecat cu diagnosticele operatorului: granița
+  se citește, nu se codifică;
+* **`commands_purged`** pe `login_sessions` și pe `login_session_entries`.
+
+### Verificarea care nu verifica nimic
+
+`docs/ISTORIC-SESIUNI.md` propunea
+
+    journalctl -u sentinel-ingest | grep commands_skipped
+
+și potrivea ÎNTOTDEAUNA: `commands_skipped` e mereu în `extra`, iar
+`JSONFormatter` scrie și zerourile. Nu deosebea «am aruncat 405 777 de rânduri»
+de «secțiunea n-a fost îmbinată niciodată» — adică exact întrebarea. Pe gazdă
+existau, din 20 august, ȘI `sentinel.yaml.new` ȘI `inventory.yaml.new`
+nefuzionate, deci avertismentul lui `install_config` e demonstrat că nu se
+citește.
+
+Și testul care păzea filtrul compara numele din `install.sh` cu numele din
+`sentinel.yaml.tmpl` — două fișiere din depozit, amândouă în dezacord cu gazda.
+A fost înlocuit cu unul care asertează pe DECIZIE: dându-se fluxul unui deploy
+adevărat, proiecția aruncă rândurile și le numără.
+
+### `command_count` nu mai pretinde rânduri care nu există
+
+`command_count` e un contor memorat al rândurilor din `session_commands`, iar
+panoul și rezumatul de închidere de pe Telegram îl citesc pe el. După prima
+curățare, sesiunea 2521 ar fi arătat **«558 079 comenzi» deasupra unui tabel
+gol** — fix eșecul pentru care există `_refresh_counters`.
+
+Ce s-a ales, și de ce amândouă: `command_count` se **renumără din tabelă**
+(invariantul rămâne cel de dinainte), iar cât a căzut intră în
+**`commands_purged`**. «Câte rânduri sunt» și «câte au fost» sunt două afirmații
+diferite, iar a doua e chiar faptul din care s-a născut filtrul — ștearsă,
+peste trei luni nimeni nu mai poate răspunde la «de ce e filtrul ăsta aici».
+
+Pe replică se scrie numai `commands_purged`: `command_count` de acolo e o
+afirmație a gazdei, adusă de expediere și rescrisă la fiecare lot.
+
+### Cele trei motoare dau acum același răspuns
+
+`is_interactive` făcea `.strip()`, niciun predicat SQL nu-l făcea, iar colația
+`utf8mb4_unicode_ci` a replicii făcea `IN` și `REGEXP` insensibile la majuscule.
+Măsurat pe cele trei implementări:
+
+| tty | filtrul viu | curățarea pe PG | replica |
+|---|---|---|---|
+| `' pts0'` | păstrat | **șters** | păstrat |
+| `'pts0\n'` | păstrat | **șters** | păstrat |
+| `'PTS0'` | aruncat | șters | **păstrat** |
+
+Marginile de spațiu sunt acum în chiar tipar — `^[ \t\n\r\f\v]*(pts[0-9]+|tty[0-9]+)[ \t\n\r\f\v]*$`,
+literalmente același șir în toate trei — iar predicatul replicii poartă `COLLATE
+utf8mb4_bin`. Colația nu e crezută pe cuvânt: înainte de prima ștergere,
+scriptul întreabă serverul cu chiar construcția din predicat și se oprește dacă
+răspunsul nu e cel al gazdei.
+
+## 0.22.1 — Un deploy nu mai scrie 405 777 de rânduri
+
+Măsurat pe gazdă: o singură livrare a produs **405 777 de comenzi în 140 de
+secunde** — `systemctl` de 320 591 de ori și `sleep` de 173 376, adică buclele
+de așteptare ale instalatorului —, iar replica de pe agregator a crescut de la
+83 MB la **909 MB în câteva ore**.
+
+* **`history.skip_command_accounts`** în `sentinel.yaml` (implicit
+  `sentinel-deploy`): comenzile conturilor de automatizare **rulate fără
+  terminal real** nu mai ajung în `session_commands`. Lista goală înseamnă „nu
+  se aruncă nimic", adică exact comportamentul de dinainte;
+* **rândurile aruncate se numără** și ajung în jurnal, ca `commands_skipped` —
+  fără contor, „n-a rulat nimeni nimic" și „am aruncat 405 777 de rânduri
+  conform politicii" ar arăta identic;
+* **două scripturi pentru istoricul deja strâns**, uscate implicit și în tranșe
+  de 5000: `scripts/purge-automation-commands.py` (gazdă, PostgreSQL) și
+  `npm run purge-automation` (replică, MariaDB). Raportează mărimea înainte și
+  după, și renumără ce a rămas în loc să creadă codul de retur al lui `DELETE`.
+
+### Filtrul e pe terminalul COMENZII, nu pe cont
+
+Asta e miezul, nu un detaliu de implementare. O sesiune devine `interactive`
+abia la prima comandă cu `tty` real, iar alerta de logare cere `interactive =
+true`. O regulă „tot ce rulează contul X" ar fi aruncat și comanda aia: sesiunea
+n-ar fi fost promovată niciodată, alerta n-ar fi plecat niciodată, iar contul de
+automatizare — care are `sudo NOPASSWD: ALL` — ar fi devenit **o cale de intrare
+tăcută**, exact acolo unde s-ar uita cineva care știe că există.
+
+Cu regula pe `tty`, `ssh sentinel-deploy@gazdă` cu shell adevărat capătă `pts0`:
+comenzile se păstrează, sesiunea se promovează, alerta pleacă.
+
+### Ce NU s-a schimbat
+
+**Regulile auditd.** Un `-F auid!=<uid>` ar fi oprit emisia din nucleu și ar fi
+făcut contul complet neînregistrat. Jurnalul de pe disc rămâne sursa completă —
+cu fereastra lui de rotație, care e scrisă acum în
+[ISTORIC-SESIUNI.md](ISTORIC-SESIUNI.md).
+
+**Rândurile de sesiune.** „S-a deschis o sesiune de deploy" e faptul cu valoare
+de securitate; cele ~161 de sesiuni nu ocupă nimic.
+
+### Ce trebuie făcut de mână pe o gazdă care rulează deja
+
+Instalatorul nu rescrie un `sentinel.yaml` existent — scrie `sentinel.yaml.new`
+și avertizează. Până când secțiunea `history:` e mutată de mână, lista e goală,
+iar goală înseamnă că **nu se aruncă nimic**.
+
+## 0.22.0 — Cine s-a logat, și ce a rulat
+
+Sentinel vedea cine BATE la ușă — 9200 de încercări eșuate la două zile — și nu
+vedea nimic din ce se întâmpla după ce cineva intra. Acum vede amândouă.
+
+* **alertă pe Telegram la fiecare sesiune interactivă**, cu rezumat la închidere
+  și butoane „am văzut" / „nu sunt eu". Netăcibilă, ca `panic` și `watchdog`;
+* **istoricul complet al comenzilor** — fiecare `execve` dintr-o sesiune cu
+  login, cu argumente, terminal și proces părinte. Nelimitat pe gazdă, 180 de
+  zile pe agregator;
+* **butonul „nu sunt eu"** blochează adresa ȘI închide sesiunea, refuzând să
+  blocheze o adresă din allowlist;
+* **pagina „Sesiuni"** în panoul extern;
+* **cont separat pentru automatizări** (`sentinel-deploy`), pasul 36 al
+  instalării;
+* **autodiagnostic pentru înregistrările pierdute de nucleu**.
+
+Totul e descris în [ISTORIC-SESIUNI.md](ISTORIC-SESIUNI.md), inclusiv ce NU se
+înregistrează.
+
+### Numărul care schimbă așteptările
+
+**O logare interactivă produce ~630 de comenzi.** Nu e o eroare: un shell de
+login sursează `/etc/profile.d/*`, iar `xargs`, `grep` și `tclsh` apar de câte 76
+de ori fiecare. Un deploy produce **~405 000**, în două minute — buclele de așteptare ale
+instalatorului: `systemctl is-active` de 320 591 de ori, `sleep` de 173 376.
+
+De-aia lista implicită din panou e de SESIUNI, nu de comenzi, iar alerta pleacă
+numai pentru sesiunile cu terminal: măsurat pe șapte zile, gazda a avut 557 de
+sesiuni fără terminal și 29 cu. Un mesaj pe fiecare ar fi fost ~80 pe zi, dintre
+care 75 despre propriile automatizări — iar un canal cu optzeci de mesaje pe zi
+se oprește într-o săptămână.
+
+### Trei defecte în cod care rula deja
+
+Găsite construind asta, nu căutându-le:
+
+* `username` era **gol la fiecare logare reușită** — câmpurile îmbogățite ale
+  lui auditd (`AUID="…"`) erau aruncate, fiindcă `_FIELD` cerea chei numai din
+  litere mici;
+* `(unknown)` — contul inventat de fiecare atac brute-force, 9200 la două zile —
+  ar fi devenit un nume de utilizator, primul în orice clasament;
+* `res` înghițea ghilimeaua de închidere: `success'UID="root"` în loc de
+  `success`. Verificarea de reușită **respingea fiecare logare prin sshd**.
+
+### Și trei pe care le-am făcut noi
+
+Scrise fiindcă `CLAUDE.md` cere ca tiparul să fie citibil:
+
+* `USER_END` citit ca ieșire din sesiune. E perechea lui `USER_START` — PAM
+  deschide un strat pentru fiecare `sudo`. **1534 de comenzi orfane din 14 157**,
+  plus un rând-fantomă la fiecare închidere în plus;
+* `terminal` din `USER_LOGIN` citit ca terminal. E numele SERVICIULUI: chiar cu
+  pty forțat scrie `ssh`. Fiecare sesiune ieșea neinteractivă, deci alerta n-ar
+  fi plecat niciodată — iar tăcerea aia arată exact ca „nu s-a logat nimeni";
+* `$2 - interval` fără cast. Postgres deduce `interval` pentru parametru, iar
+  comparația devine `timestamptz >= interval`. **Ingestia a fost picată douăzeci
+  de minute, pentru toate sursele.**
+
+Ultimul, plus un `json` neimportat care a oprit coada de notificări întreagă, au
+trecut de suita verde. Cauza comună: dublele de test primesc SQL-ul ca text și
+valorile ca obiecte Python — nimic din ele nu leagă tipuri, deci nimic nu poate
+observa că baza n-ar accepta perechea. De acolo a ieșit
+`tests/security/test_sql_parameters_are_typed.py`, care caută în sursă ce un
+dublu nu poate vedea.
+
+### Ce nu se înregistrează, spus pe față
+
+`docker exec -it <container> bash` dă un shell ale cărui comenzi NU apar:
+procesele din container n-au `auid`. Intrarea în container se înregistrează, cu
+tot cu argumente; ce urmează, nu. Închiderea găurii ar însemna auditarea
+fiecărui `execve` de pe gazdă — zeci de mii pe oră, adică exact ce refuză antetul
+fișierului de reguli cu „aici mor seturile de reguli audit".
+
+Iar redactarea secretelor din `argv` e o listă de tipare, nu o garanție: un token
+pus ca argument pozițional sau o parolă care arată ca un cuvânt obișnuit trec
+întregi. `docs/SECURITATE.md` §8b spune exact ce nu prinde.
+
+## 0.21.0 — Rezumatul care nu mai minte
+
+Panoul agregatorului avea două grafice: evenimente pe oră și un clasament de
+surse. Cifrele din ele erau **de zece până la douăzeci de ori mai mici decât
+realitatea**, iar asta nu se vedea nicăieri: barele erau proporționale între
+ele, axa pornea de la zero, orele lipsă erau marcate. Un raport care minte
+liniștit.
+
+    interval   server                 agregator
+    04:00      6 rânduri, 1385 ev     5 rânduri,   60 ev
+    05:00      6 rânduri,  977 ev     5 rânduri,   22 ev
+    07:00      6 rânduri, 1312 ev     6 rânduri,   17 ev
+
+### Cauza: un interval scris de două ori, expediat o dată
+
+`maintenance_service` scrie agregatul pentru fereastra SCURSĂ, nu pentru ora
+încheiată — raportul lui spune „12 rânduri pe 0,9h". Deci ora 04:00 e scrisă o
+dată la 04:56, cu cât se adunase, și COMPLETATĂ la 05:56.
+
+Cursorul expedierii mergea strict pe `bucket`: odată ce ora se încheia după ceas,
+rândurile plecau — versiunea parțială — iar cursorul trecea dincolo și nu se mai
+întorcea niciodată.
+
+Comentariul din `shipper.py` scria pe față presupunerea pe care se sprijinea:
+*„dacă serverul ar recalcula vreodată un interval DUPĂ ce a fost expediat,
+schimbarea aia n-ar mai pleca — mentenanța își încheie intervalele înainte de a
+trece mai departe, și pe asta se sprijină".* Presupunerea era falsă. Scrisă,
+măcar s-a putut găsi.
+
+Reparația e cea de la orice entitate care se schimbă după ce a fost scrisă:
+filigran pe `(updated_at, bucket)`, întreținut de trigger (migrațiile 0025 pe
+server, 0014 pe agregator). Un interval recalculat își mută momentul, trece din
+nou de cursor, și suprascrie prin upsert versiunea parțială.
+
+Fluxul a căpătat și **poarta de trigger** pe care o aveau deja fluxurile
+mutabile: fără trigger, interogarea întoarce zero rânduri, iar zero rânduri arată
+identic cu „nimic nu s-a schimbat". Un fișier de migrație pe disc nu e dovadă că
+nucleul l-a acceptat.
+
+### Perechea nu e unică, și asta pierdea surse
+
+Mentenanța scrie toate sursele unei ore în aceeași tranzacție, deci `nginx`,
+`sshd` și `auditd` împart și `updated_at`, și `bucket`. Tăiat la mijlocul unui
+asemenea grup, cursorul ar fi trecut dincolo iar sursele rămase n-ar mai fi
+plecat niciodată. Lotul cere acum un rând în plus decât plafonul, ca să vadă dacă
+grupul e tăiat, și se retrage la ultima graniță de grup. Când tot lotul e un
+singur grup, grupul pleacă întreg — peste plafon: plafonul mărginește un lot
+obișnuit, n-are voie să fie motivul pentru care nu mai pleacă nimic.
+
+### Aceeași linie, respinsă de două ori
+
+Perechea a fost scrisă întâi `($1::timestamptz, $2::text)` — Postgres a refuzat
+la compilare, fiindcă `bucket` e un moment. Apoi `($1::timestamptz,
+$2::timestamptz)` — asyncpg a refuzat la legare, fiindcă valoarea vine din
+`collector_cursors.cursor`, care e text. Răspunsul e lanțul
+`$2::text::timestamptz`: parametrul SOSEȘTE text, comparația se face pe momente.
+
+Amândouă au trecut de suita verde fiindcă dublul de test modela doar FORMA
+instrucțiunii și compara apoi valorile în Python, unde un `datetime` și un `str`
+se compară fără să se plângă. Dublul cere acum ambele capete ale fiecărui lanț de
+cast: tipul în care intră comparația, și tipul pe care îl cere driverul de la
+apelant.
+
+### Rezumatul, refăcut
+
+Pagina `/panel` are acum ce are panoul serverului, și în plus tendințe:
+
+* **șase cartonașe** — adrese distincte, detecții, evenimente, incidente
+  deschise, vulnerabilități neaplicate, blocări active — primele trei cu
+  tendința față de fereastra dinaintea lor. Sub `10` rânduri se scrie diferența
+  brută, nu procentul: `1 → 3` e „+200%" și nu înseamnă nimic;
+* **graficul orar STIVUIT pe sursă**, 48 de ore. Un total spune „a fost trafic";
+  stivuit spune cine l-a produs, iar `sshd` care ia locul lui `nginx` fără ca
+  totalul să se miște e chiar ce trebuie văzut. Peste cinci surse, restul se
+  ADUNĂ într-o bandă numită — nu se taie, ca înălțimea stivei să rămână totalul
+  orei;
+* **banda de severități** a incidentelor deschise. O felie cu măcar un incident
+  primește o lățime minimă: un `critical` singur, între o mie de `low`, ar fi
+  avut o lățime subpixel și AR FI DISPĂRUT;
+* **trei clasamente** — adrese, reguli, surse — fiecare cu a doua dimensiune
+  (câte reguli a atins o adresă, câte adrese a prins o regulă, din câte ore vine
+  o sursă);
+* **cronologia**, detecții și blocări într-o singură listă în ordinea timpului.
+  Separate, cititorul ar trebui să împerecheze singur „am fost atacat de X" cu
+  „am blocat X" — iar legătura dintre ele e chiar ce vrea să vadă.
+
+Tot SVG generat pe server, cu geometria în ATRIBUTE: politica paginii n-are
+`unsafe-inline`, deci un grafic dimensionat prin `style=` n-ar apărea deloc.
+
+### Ce nu se poate arăta, și se spune
+
+**Originea pe țară și pe operatorul de rețea** vine din fluxul `actors`, care nu
+se expediază la niciun capăt. **Istoricul de disponibilitate al serviciilor** ar
+veni din `availability_rollup`, la fel. Niciuna nu se aproximează din ce e la
+îndemână: un panou care desenează o hartă din altceva arată la fel de convingător
+ca unul care o desenează din date reale, iar cine se uită n-are cum să
+deosebească.
+
+Citirile paginii sunt mărginite la 5000 de rânduri fiecare — baza e partajată.
+Când plafonul e atins, **scrie pe pagină**: un plafon tăcut arată exact ca „atât
+a fost".
+
+### Fusul orar al unui moment scris ca text
+
+MariaDB întoarce `DATETIME(6)` ca `"2026-08-16 10:00:00.000"` — fără fus.
+`new Date(...)` pe forma asta îl citește ca oră LOCALĂ. Pe o gazdă pe fusul
+României, fiecare moment ar fi alunecat cu două-trei ore: cronologia ar fi rămas
+în ordine, doar cu ore greșite. Prins de dublul care formatează exact ca MariaDB.
+
 ## 0.20.0 — Ore de liniște
 
 Un canal care te trezește la 3 dimineața pentru o scanare de porturi e un canal

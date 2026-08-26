@@ -16,12 +16,16 @@ import argparse
 import asyncio
 import contextlib
 import signal
+from collections.abc import Sequence
 
 from sentinel.config import Config, get_config
 from sentinel.db.engine import Database
 from sentinel.detect import engine
+from sentinel.db.repo import logins as logins_repo
+from sentinel.detect import logins as detect_logins
 from sentinel.logging_setup import get_logger, setup_logging
 from sentinel.predict import baseline
+from sentinel.services import parse_service_args
 
 log = get_logger(__name__)
 
@@ -53,6 +57,25 @@ async def _main() -> int:
                 await engine.run_once(db, cfg)
             except Exception as exc:  # noqa: BLE001 - a bad pass must not kill the daemon
                 log.error("detect pass failed", extra={"detail": str(exc)})
+
+            # Alertele de logare, pe aceeasi bataie. Nu pe o cale proprie: un
+            # mecanism nou de alertare e si un mecanism nou care poate tacea
+            # fara sa se observe. Starea traieste in coloane (`alerted_at`,
+            # `summarised_at`), deci o trecere sarita nu pierde nimic — se
+            # recupereaza la urmatoarea.
+            try:
+                # Intai maturatoarea: o sesiune inchisa presupus trebuie sa-si
+                # primeasca rezumatul in aceeasi trecere, nu in urmatoarea.
+                inchise = await logins_repo.close_stale_sessions(db)
+                if inchise:
+                    log.info("stale sessions closed", extra={"count": inchise})
+                anuntate = await detect_logins.announce_new_sessions(db)
+                rezumate = await detect_logins.summarise_closed_sessions(db)
+                if anuntate or rezumate:
+                    log.info("login alerts queued",
+                             extra={"opened": anuntate, "closed": rezumate})
+            except Exception as exc:  # noqa: BLE001 - idem
+                log.error("login alerting failed", extra={"detail": str(exc)})
             if loop.time() >= next_baseline:
                 next_baseline = loop.time() + BASELINE_INTERVAL_S
                 try:
@@ -67,8 +90,9 @@ async def _main() -> int:
     return 0
 
 
-def main() -> int:
-    argparse.ArgumentParser(prog="sentinel detect", add_help=False).parse_known_args()
+def main(argv: Sequence[str] | None = None) -> int:
+    parse_service_args(
+        argparse.ArgumentParser(prog="sentinel detect", add_help=False), argv)
     setup_logging("sentinel-detect")
     try:
         return asyncio.run(_main())

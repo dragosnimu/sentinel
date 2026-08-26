@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Sequence
 
 from sentinel.config import get_config
 from sentinel.db.engine import Database
 from sentinel.logging_setup import get_logger, setup_logging
 from sentinel.selfcheck import run_all
 from sentinel.selfcheck.runner import run_and_alert
+from sentinel.services import parse_service_args
 
 log = get_logger(__name__)
 
@@ -64,14 +66,14 @@ async def _main(quiet: bool, print_all: bool) -> int:
         await db.close()
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="sentinel selfcheck", add_help=False)
     parser.add_argument("--quiet", action="store_true",
                         help="run and record, but send nothing")
     parser.add_argument("--print", dest="print_all", action="store_true",
                         help="print every check and exit; sends nothing")
     parser.add_argument("--log-level", default="INFO")
-    args, _ = parser.parse_known_args()
+    args = parse_service_args(parser, argv)
     setup_logging("sentinel-selfcheck", args.log_level)
     try:
         return asyncio.run(_main(args.quiet, args.print_all))

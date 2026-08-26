@@ -17,6 +17,8 @@
 #   sentinel_webroot   -> host.webroot_write
 #   sentinel_exec      -> host.suspicious_exec
 #   sentinel_priv      -> auth.sudo_failures
+#   sentinel_cmd       -> the command history (no detection rule; it is
+#                         an archive, and archives are read, not alerted on)
 
 # --- Accounts and credentials ----------------------------------------------
 # Adding a user or a key is a classic persistence step, and it is rare enough
@@ -33,11 +35,26 @@
 # anyone widening the way in.
 #
 # /home is watched whole because the kernel cannot glob: there is no way to say
-# "only /home/*/.ssh/". That makes this the broadest rule in the file — every
-# file any user writes anywhere in their home directory arrives here. The
-# narrowing happens downstream, in detect/intrusion.py, which alerts only on
-# paths under a .ssh directory. Without that filter the rule reported a shell
-# history write as an SSH key change, 62 times in one deployment.
+# "only /home/*/.ssh/". `-w` takes one path, and `-F dir=` takes one subtree;
+# neither can express a basename pattern. Generating one watch per existing home
+# at install time was considered and rejected: a home created afterwards would
+# be silently unwatched, which is the failure mode you never notice.
+#
+# That makes this the broadest rule in the file — every file any user writes
+# anywhere in their home directory arrives here. The narrowing happens
+# downstream, in two places:
+#
+#   collectors/auditd.py  classifies a write whose resolved path has nothing to
+#                         do with SSH as a plain `file_write`, so the event is
+#                         still stored but no longer claims to be a key change;
+#   detect/intrusion.py   filters the same paths again in SQL, for rows already
+#                         written under the old label and in case the collector
+#                         regresses.
+#
+# Both use one shared list of path patterns, so they cannot drift apart.
+# Without that filter the rule reported ordinary writes in a home directory as
+# an SSH key change: 62 critical detections in one deployment, on evidence that
+# named `=` and `rotateCount` as files.
 -w /etc/ssh/sshd_config -p wa -k sentinel_ssh
 -w /root/.ssh           -p wa -k sentinel_ssh
 -w /home                -p wa -k sentinel_ssh
@@ -92,6 +109,52 @@
 # context it can reach, and a module arriving with no login session behind it is
 # more alarming than one that has.
 -a always,exit -F arch=b64 -S init_module,finit_module,delete_module -k sentinel_module
+
+# --- Command history --------------------------------------------------------
+# Every command run inside a login session. This is the one rule in this file
+# that is NOT narrow, and the header above explains why that is normally how
+# audit rule sets die. It is here anyway, deliberately, and the thing that keeps
+# it survivable is the filter, not the volume:
+#
+#   auid!=unset excludes everything without a login session behind it — every
+#   daemon, every cron job, every process in the six Docker containers on this
+#   host. Measured on 24 August 2026, that is the difference between a few
+#   thousand records a day and tens of thousands an hour.
+#
+# The consequence, written down because it is a real gap and not an oversight:
+# `docker exec -it <container> sh` gives a shell whose commands are NOT recorded,
+# because processes inside the container carry no auid. The `docker exec` itself
+# IS recorded, with its arguments, so the moment of entry is visible even though
+# what follows is not. Closing that gap means auditing every execve on the host,
+# which is the thing this file refuses to do.
+#
+# Both architectures. A 32-bit binary on an x86_64 kernel enters through the b32
+# table, and a rule set that watches only b64 has a hole exactly the size of
+# "compile it as 32-bit" — one of the oldest audit evasions there is.
+-a always,exit -F arch=b64 -S execve -F auid!=unset -k sentinel_cmd
+-a always,exit -F arch=b32 -S execve -F auid!=unset -k sentinel_cmd
+
+# --- Backlog ----------------------------------------------------------------
+# How many records the kernel will hold while auditd falls behind. Past this,
+# records are DROPPED, and a dropped record looks exactly like a command that
+# was never run — the history goes quiet precisely during the busy minute when
+# someone is working fast, which is the minute that matters.
+#
+# The default of 320 was sized for the narrow rule set above it. With execve on
+# every login-session command, a single deploy can produce thousands of records
+# in a burst. 8192 costs about 8 MB of kernel memory on this host, which has
+# 7.6 GB.
+#
+# The counter is not left to be trusted: `sentinel/selfcheck` reads `lost` from
+# `auditctl -s` and alerts when it grows, because a wider buffer makes loss
+# rarer, never impossible.
+-b 8192
+
+# Wait rather than drop, when the backlog does fill. 60000 is measured in
+# 1/100 s of a jiffy — 600 ms — after which the kernel gives up waiting and
+# resumes dropping. A syscall that pauses briefly is a machine that feels slow;
+# a dropped record is a history that lies.
+--backlog_wait_time 60000
 
 # --- What is NOT watched, and why ------------------------------------------
 #
