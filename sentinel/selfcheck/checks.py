@@ -1907,6 +1907,14 @@ async def check_last_scan(db: Database, cfg: Config) -> list[CheckResult]:
         # Încheiată (completed/skipped): proaspătă sau veche? Vârsta se calculează
         # în baza de date, ca la `check_ingest_sources`: ceasul gazdei și cel al
         # bazei pot diferi, iar diferența ar apărea aici ca o vechime inventată.
+        #
+        # `finished_at` întâi, `started_at` doar ca rezervă. Întrebarea de aici e
+        # „cât de veche e cifra din panou", iar cifra se scrie când scanarea SE
+        # ÎNCHEIE. `sentinel-scan.service` are `TimeoutStartSec=14400`, deci o
+        # rulare poate ține ore: măsurată de la pornire, o listă scrisă acum zece
+        # minute ar putea fi raportată ca depășită. Rezerva pe `started_at`
+        # rămâne fiindcă un rând încheiat fără `finished_at` există — iar fără
+        # niciunul din două se cade în `unknown` mai jos, nu în `ok`.
         ts = r.get("finished_at") or r.get("started_at")
         age_s: float | None = None
         if ts is not None:
@@ -1985,15 +1993,21 @@ def _auditctl_status() -> dict[str, int] | None:
 
     try:
         result = ExecutorClient().audit_status()
-    except (ExecutorUnavailable, ExecutorRejected):
+    except (ExecutorUnavailable, ExecutorRejected, OSError):
         return None
     if not result.get("ok"):
         return None
     # Doar câmpurile întregi ale ieșirii lui `auditctl`, fără `ok`. `bool` e
     # subclasă de `int` în Python, dar `ok` a fost deja exclus, iar restul
     # câmpurilor sunt numere adevărate.
+    #
+    # `or None` la final NU e cosmetic: un răspuns care a trecut de garda `ok`
+    # dar din care n-a ieșit niciun câmp întreg e un răspuns pe care nu l-am
+    # înțeles. Returnat ca dicționar gol, apelantul l-ar citi prin `.get("lost",
+    # 0)` drept „zero pierderi" și ar raporta `ok` — adică exact schimbul pe care
+    # verificarea asta există ca să-l prevină. `None` îl duce în `unknown`.
     return {k: int(v) for k, v in result.items()
-            if k != "ok" and isinstance(v, int)}
+            if k != "ok" and isinstance(v, int)} or None
 
 
 async def check_audit_records(db: Database, cfg: Config) -> list[CheckResult]:
@@ -2009,12 +2023,16 @@ async def check_audit_records(db: Database, cfg: Config) -> list[CheckResult]:
     `degraded`, nu `down`: pe gazdă nu s-a oprit nimic. Se raportează EFECTUL —
     numărul real de înregistrări pierdute citit din nucleu —, nu un cod de ieșire.
     """
-    status = _auditctl_status()
+    # Apel BLOCANT (socket unix, `DEFAULT_TIMEOUT_S = 30`) — pe bucla de
+    # evenimente ar ține în loc toate celelalte verificări ale rundei exact
+    # când executorul nu răspunde, adică exact când sunt de citit. Ca toate
+    # celelalte apeluri blocante din fișierul ăsta, se împăchetează.
+    status = await asyncio.to_thread(_auditctl_status)
     if status is None:
         # „Nu știu dacă s-a pierdut ceva" nu e „nu s-a pierdut nimic". Se emite,
         # nu se tace: o tăcere ar șterge o constatare reală prin reconciliere.
         return [CheckResult(
-            "audit:lost", "Nu pot citi starea auditului", "unknown",
+            "audit:records", "Nu pot citi starea auditului", "unknown",
             detail="`auditctl -s` nu a răspuns prin executor — nu știu dacă "
                    "nucleul a aruncat înregistrări de audit",
             action="systemctl status sentinel-executor")]
@@ -2026,7 +2044,7 @@ async def check_audit_records(db: Database, cfg: Config) -> list[CheckResult]:
 
     if lost > AUDIT_LOST_MAX:
         return [CheckResult(
-            "audit:lost", "Nucleul a aruncat înregistrări de audit", "degraded",
+            "audit:records", "Nucleul a aruncat înregistrări de audit", "degraded",
             detail=f"{lost} înregistrări pierdute de la pornirea auditd — istoric "
                    f"de comenzi pierdut definitiv, chiar în minutele aglomerate. "
                    f"Un istoric cu goluri arată exact ca unul complet",
@@ -2038,7 +2056,7 @@ async def check_audit_records(db: Database, cfg: Config) -> list[CheckResult]:
     # de `auditctl`; comparat prin înmulțire, un `limit` zero nu declanșează.
     if limit > 0 and backlog * 100 >= limit * AUDIT_BACKLOG_WARN_PCT:
         return [CheckResult(
-            "audit:lost", "Tamponul de audit se apropie de plin", "degraded",
+            "audit:records", "Tamponul de audit se apropie de plin", "degraded",
             detail=f"{backlog} din {limit} în tampon — peste "
                    f"{AUDIT_BACKLOG_WARN_PCT}%, deci următoarea rafală (un deploy e "
                    f"~405 000 de înregistrări în două minute) le poate pierde",
@@ -2047,7 +2065,7 @@ async def check_audit_records(db: Database, cfg: Config) -> list[CheckResult]:
             facts=facts)]
 
     return [CheckResult(
-        "audit:lost", "Înregistrările de audit", "ok",
+        "audit:records", "Înregistrările de audit", "ok",
         detail=f"nicio înregistrare pierdută; {backlog} în tampon",
         facts=facts)]
 
