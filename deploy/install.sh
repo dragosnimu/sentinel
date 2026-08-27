@@ -395,6 +395,11 @@ container scanning; remove it and set scan.containers=false if you would rather 
 # reads cannot drift apart without somebody noticing.
 AUDITD_LOG_PATH=/var/log/audit/audit.log
 
+# Where step 37 drops the rules file. A variable for the same reason as the
+# path above: so the step that installs and verifies it can be run somewhere
+# that is not /etc.
+AUDITD_RULES_DEST=/etc/audit/rules.d/sentinel.rules
+
 # auditd installed is not auditd running, and only the running one produces
 # anything.
 #
@@ -1904,6 +1909,32 @@ reload_nginx() {
     fi
 }
 
+# Does anything in the EFFECTIVE nginx configuration still bind :80?
+#
+# `nginx -T` is the whole configuration as nginx itself assembles it, includes
+# resolved. It is the only place where "is this listener active" is a fact
+# rather than a guess about which file the block might be in — and guessing the
+# file is exactly how the :80 neutralisation came to report success on Ubuntu
+# without having edited anything.
+#
+# Three outcomes, and the third is why this returns a code instead of a boolean:
+#
+#   0  yes, something still listens on :80
+#   1  no
+#   2  could not tell (nginx absent, or it refused to dump its configuration)
+#
+# Collapsing 2 into 1 would print "port 80 released" over a host whose nginx
+# will not even parse its own configuration.
+nginx_listens_on_80() {
+    local dump
+    have nginx || return 2
+    dump="$(nginx -T 2>/dev/null)" || return 2
+    # `listen 80`, `listen 0.0.0.0:80`, `listen *:80`, `listen [::]:80`, with or
+    # without default_server / ssl after it. The trailing [^0-9] keeps :8080 and
+    # :8000 out of it.
+    grep -qE '^[[:space:]]*listen[[:space:]]+(\[::\]:|[0-9.]+:|\*:)?80([^0-9]|$)' <<< "$dump"
+}
+
 SENTINEL_NGINX_SNIPPET_DIR=/etc/nginx/sentinel
 
 install_sentinel_nginx_snippets() {
@@ -1946,18 +1977,46 @@ step_nginx() {
     # ourselves. If nginx was already here serving the operator's sites, its
     # config is theirs and editing it would be exactly the collateral damage the
     # rest of this installer works to avoid.
+    #
+    # NGINX_WAS_PREEXISTING is the whole distinction, and it is recorded at step
+    # 20, before the package install. It is also what settles the question the
+    # previous writer left open — whether sites-enabled/default is ours to
+    # remove. It is, on exactly the hosts where we are the ones who put it there.
     if ! port_free 80 && [[ "${NGINX_WAS_PREEXISTING:-0}" != "1" ]]; then
-        local owner80; owner80="$(port_owner 80)"
-        info "port 80 is held by ${owner80:-another service}; neutralising nginx.conf's :80 listener"
+        local owner80 default_site undo
+        owner80="$(port_owner 80)"
+        default_site="$(nginx_default_site)"
+        info "port 80 is held by ${owner80:-another service}; taking nginx's own :80 listener out of service"
 
         cp -a /etc/nginx/nginx.conf "${SNAPSHOT_DIR}/nginx.conf.orig" 2>/dev/null || true
-
-        # Idempotent: the marker means a re-run does not double-comment.
-        if ! grep -q 'SENTINEL-DISABLED' /etc/nginx/nginx.conf; then
-            sed -i -E 's|^([[:space:]]*)(listen[[:space:]]+(\[::\]:)?80;)|\1# SENTINEL-DISABLED \2|' \
-                /etc/nginx/nginx.conf
-            ok "nginx.conf :80 listener commented out (original in the snapshot)"
+        if [[ "$default_site" != /etc/nginx/nginx.conf ]]; then
+            # -L: the debian default site is a symlink, and a copy of the link
+            # is not a copy of what it pointed at.
+            cp -aL "$default_site" "${SNAPSHOT_DIR}/nginx-default-site.orig" 2>/dev/null || true
         fi
+
+        if undo="$(nginx_disable_default_listener)"; then
+            info "$undo"
+        else
+            info "${default_site} is not present, so there was nothing to disable there"
+        fi
+
+        # The EFFECT, not the edit. The previous version ran a sed against a
+        # file that on Ubuntu carries no active `listen 80` at all, matched
+        # nothing, exited 0, and printed ":80 listener commented out" — while
+        # the real block sat in sites-enabled/default saying
+        # `listen 80 default_server;`.
+        local port80_state=0
+        nginx_listens_on_80 || port80_state=$?
+        case $port80_state in
+            0) warn "nginx STILL has an active :80 listener after disabling \
+${default_site}. It will fail to bind while ${owner80:-the other service} holds \
+the port. Find the block with:
+    nginx -T | grep -nE 'listen[[:space:]]+([0-9.]+:|\\*:|\\[::\\]:)?80([^0-9]|\$)'" ;;
+            1) ok "no :80 listener left in nginx's effective configuration" ;;
+            2) warn "nginx would not dump its effective configuration, so whether \
+:80 was released is UNKNOWN — not 'fine'. Check by hand: nginx -T" ;;
+        esac
     elif ! port_free 80; then
         warn "port 80 is in use and nginx was already installed here. Not touching \
 nginx.conf — it is yours. If nginx fails to start, a server block in it is \
@@ -2402,6 +2461,198 @@ step_admin_user() {
 }
 
 # --- 35 -------------------------------------------------------------------
+# The two files step 35 has to look at by name. Constants, so the verification
+# below reads exactly the config the daemon was given and exactly the log the
+# daemon writes, rather than a second guess at either name.
+SURICATA_YAML=/etc/suricata/suricata.yaml
+SURICATA_EVE=/var/log/suricata/eve.json
+
+# How long step 35 waits for the first packet to reach eve.json.
+#
+# Not a politeness margin. Suricata daemonises immediately and then spends
+# minutes parsing the ET Open ruleset before a single capture thread starts;
+# eve.json is empty for all of it. Measured on the Ubuntu 24.04.4 test host
+# (suricata 7.0.3, 4 GB RAM, ~46k rules): about 2m20s from `systemctl restart`
+# to the capture threads coming up. A window shorter than that reports every
+# healthy install as unconfirmed, and a warning that appears on every deploy is
+# a warning nobody reads by the third one.
+SURICATA_CAPTURE_WAIT_S=210
+
+# /proc, as a variable purely so the checks below can be exercised against a
+# made-up process instead of only on a live host.
+SURICATA_PROC_DIR=/proc
+
+# The argv of the process systemd is actually tracking.
+#
+# NOT `systemctl show -p ExecStart`, which reports what the unit ASKS for. On a
+# host where the unit was rewritten and nothing restarted, the two disagree, and
+# the one that decides whether packets are captured is this one.
+suricata_running_argv() {
+    local pid
+    pid="$(systemctl show suricata -p MainPID --value 2>/dev/null || true)"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ -r "${SURICATA_PROC_DIR}/${pid}/cmdline" ]] || return 1
+    tr '\0' ' ' < "${SURICATA_PROC_DIR}/${pid}/cmdline"
+}
+
+# The drop-in that layers Sentinel's requirements onto the packaged unit.
+#
+# MemoryMax goes on both families: a NIDS on a small VPS must have a ceiling, or
+# a rule explosion OOM-kills whatever it was meant to protect.
+#
+# The EnvironmentFile/ExecStart pair goes only where the packaged unit does not
+# already read OPTIONS — see suricata_unit_reads_options in distro.sh for what
+# was measured on each family. `ExecStart=` on its own clears the packaged
+# command; the line after it re-issues the same command with $OPTIONS appended,
+# unquoted so that systemd word-splits it into arguments.
+#
+# The binary and the pid file are read off the unit that is installed rather
+# than written down here: a pid file that disagrees with the unit's PIDFile=
+# makes systemd abandon a Type=forking service that started perfectly well.
+suricata_dropin_body() {
+    printf '[Service]\nMemoryMax=1G\nRestart=on-failure\nRestartSec=5\n'
+    suricata_unit_reads_options && return 0
+
+    local bin pidfile
+    bin="$(command -v suricata 2>/dev/null || true)"
+    if [[ -z "$bin" ]]; then
+        # No override rather than a broken one. An ExecStart with an empty
+        # binary makes systemd refuse to start the unit at all, which is a worse
+        # outcome than a daemon watching the wrong interface.
+        return 1
+    fi
+    pidfile="$(systemctl show suricata -p PIDFile --value 2>/dev/null || true)"
+    printf 'EnvironmentFile=-%s\nExecStart=\nExecStart=%s -D -c %s --pidfile %s $OPTIONS\n' \
+        "$(suricata_defaults_file)" "$bin" "$SURICATA_YAML" "${pidfile:-/run/suricata.pid}"
+}
+
+# Why the running daemon has to be restarted, or nothing when it does not.
+#
+# `systemctl enable --now` on a service that is already up is a NO-OP, and the
+# process then keeps running the PREVIOUS deployment's argv while the step
+# reports success — one of the exact failures CLAUDE.md lists. So the question
+# asked here is about the argv that is up, not about the unit file, and "cannot
+# tell" is answered with a restart rather than with silence.
+suricata_needs_restart() {
+    local want="$1" argv
+    if ! argv="$(suricata_running_argv)"; then
+        printf 'no process is running under the unit yet'
+        return 0
+    fi
+    [[ "$argv" == *"$want"* ]] && return 1
+    printf 'its command line does not carry the options just written'
+    return 0
+}
+
+# The capture interface that argv actually selects, or nothing.
+#
+# `--af-packet=<dev>` names it. A BARE `--af-packet` does not: it means "take
+# the interface list out of suricata.yaml", and the packaged file says
+# `interface: eth0` on a host whose NIC is enp0s3. Returning nothing for that
+# case is the entire point of this function — it is the state step 35 used to
+# print as "IDS on enp0s3" while eve.json, fast.log and stats.log were all at
+# 0 bytes and the daemon was restarting every two and a half minutes.
+suricata_argv_iface() {
+    [[ "$1" =~ (^|[[:space:]])--af-packet=([^[:space:]]+) ]] || return 1
+    printf '%s' "${BASH_REMATCH[2]}"
+}
+
+# HOME_NET as the RUNNING process resolves it.
+#
+# Asked of Suricata's own config parser, with the `--set` overrides recovered
+# from the running argv, because the merge of yaml and command line is what
+# decides whether an EXTERNAL_NET -> HOME_NET rule can ever match. Reading
+# suricata.yaml directly would report the packaged RFC1918 default on a host
+# where the command line overrides it, and the command line on a host where it
+# does not reach the process at all.
+#
+# Empty output means "could not be read", which the caller reports as unknown.
+suricata_effective_home_net() {
+    local sets
+    # `|| true` on both pipelines, not to hide failure but because failure here
+    # is the "unknown" case and the caller reports it as such: an abort would
+    # end the install instead of saying what could not be read.
+    sets="$(grep -oE -- '--set[[:space:]]+[^[:space:]]+' <<< "$1" | tr '\n' ' ' || true)"
+    # shellcheck disable=SC2086
+    suricata --dump-config -c "$SURICATA_YAML" $sets 2>/dev/null \
+        | awk -F' = ' '$1 == "vars.address-groups.HOME_NET" { print $2; exit }' || true
+}
+
+# Bytes in eve.json right now; 0 when it is not there yet.
+suricata_eve_size() {
+    stat -c %s "$SURICATA_EVE" 2>/dev/null || printf '0'
+}
+
+# Step 35's verdict, assembled out of things this host can be observed doing.
+#
+# Nothing here trusts `systemctl is-active`. It said `active` on the Ubuntu host
+# that captured nothing: the daemon failed to open its socket, exited, and
+# systemd restarted it every 2m20s, so a single is-active lands in the `active`
+# phase nearly every time.
+suricata_report_effect() {
+    local want_iface="$1" want_ip="$2" bpf_file="$3" eve_before="$4"
+    local argv iface home_net problems=()
+
+    if ! argv="$(suricata_running_argv)"; then
+        warn "suricata is installed but no process is running under its unit, so \
+NOTHING is being captured. Look at:
+    systemctl status suricata ; journalctl -u suricata -n 50"
+        return 0
+    fi
+
+    if iface="$(suricata_argv_iface "$argv")"; then
+        if ! ip -o link show "$iface" >/dev/null 2>&1; then
+            problems+=("it was told to capture on ${iface}, which is not an interface on this host")
+        elif [[ "$iface" != "$want_iface" ]]; then
+            problems+=("it is capturing on ${iface}, not on ${want_iface} — the interface of the default route")
+        fi
+    else
+        iface="?"
+        problems+=("its command line names NO interface, so it is using the list in \
+${SURICATA_YAML}; on a packaged file that is an example device, not this host's NIC")
+    fi
+
+    home_net="$(suricata_effective_home_net "$argv")"
+    if [[ -z "$home_net" ]]; then
+        problems+=("HOME_NET could not be read back from the effective configuration, \
+so whether inbound-attack rules can match is UNKNOWN")
+    elif [[ -n "$want_ip" && "$home_net" != *"$want_ip"* ]]; then
+        problems+=("HOME_NET is ${home_net} and does not contain ${want_ip}; every \
+EXTERNAL_NET -> HOME_NET rule — which is most of the ruleset — can never match")
+    fi
+
+    if [[ -n "$bpf_file" && "$argv" != *"-F ${bpf_file}"* ]]; then
+        problems+=("the BPF exclusion file ${bpf_file} is not on its command line, so \
+the dominant flow preflight told us to drop is being inspected and written to disk")
+    fi
+
+    # And then the one fact that settles it: bytes arriving in eve.json.
+    # Growth, not existence — on a re-deploy the file already holds yesterday's
+    # bytes, and its presence proves nothing about today.
+    local waited=0 eve_now
+    eve_now="$(suricata_eve_size)"
+    while (( eve_now <= eve_before && waited < SURICATA_CAPTURE_WAIT_S )); do
+        sleep 5
+        waited=$((waited + 5))
+        eve_now="$(suricata_eve_size)"
+    done
+
+    if (( ${#problems[@]} )); then
+        warn "Suricata is running and is NOT watching this host correctly:
+    $(printf '%s\n    ' "${problems[@]}")
+    eve.json went ${eve_before} -> ${eve_now} bytes in ${waited}s.
+    Its command line is: ${argv}"
+    elif (( eve_now > eve_before )); then
+        ok "Suricata capturing on ${iface}, HOME_NET ${home_net}, eve.json growing \
+(${eve_before} -> ${eve_now} bytes in ${waited}s), MemoryMax=1G"
+    else
+        warn "Suricata was started with the right interface (${iface}) and HOME_NET \
+(${home_net}), but eve.json did not grow in ${waited}s — capture is NOT confirmed. \
+A freshly updated ruleset can still be loading. Confirm before trusting the IDS:
+    ls -l ${SURICATA_EVE} ; journalctl -u suricata -n 30"
+    fi
+}
+
 step_suricata() {
     if (( ! SURICATA_OK )); then
         info "Suricata skipped (RAM gate). Sentinel runs log-only."
@@ -2412,7 +2663,7 @@ step_suricata() {
     # We do NOT replace the distro suricata.yaml — it is complete and passes -T.
     # Everything site-specific is layered on top via OPTIONS, a BPF file, a
     # drop-in and an ACL, so an upgrade of the package never clobbers our config.
-    local iface bpf pubip options
+    local iface bpf bpf_file pubip options
     iface="$(ip route show default 2>/dev/null | awk '/default/{print $5; exit}')"
     iface="${iface:-eth0}"
     pubip="$(public_ips 2>/dev/null | head -1)"
@@ -2421,11 +2672,13 @@ step_suricata() {
     # disk. Preflight flags the dominant one; exclude it in the kernel BPF so
     # Suricata never even sees those packets.
     bpf=""
+    bpf_file=""
     [[ -n "${BPF_HINT:-}" ]] && bpf="not host ${BPF_HINT}"
     options="--af-packet=${iface}"
     if [[ -n "${bpf}" ]]; then
-        printf '%s\n' "${bpf}" > /etc/suricata/capture-filter.bpf
-        options+=" -F /etc/suricata/capture-filter.bpf"
+        bpf_file=/etc/suricata/capture-filter.bpf
+        printf '%s\n' "${bpf}" > "$bpf_file"
+        options+=" -F ${bpf_file}"
         info "Suricata BPF excludes: ${bpf}"
     fi
     # HOME_NET must include this host's public address or inbound-attack rules
@@ -2434,11 +2687,14 @@ step_suricata() {
 
     printf 'OPTIONS="%s"\n' "${options}" > "$(suricata_defaults_file)"
 
-    # A NIDS on a small VPS must have a ceiling, or a rule explosion OOM-kills
-    # whatever it was meant to protect.
+    # -- and then make sure the unit actually READS that file ------------------
+    local dropin=/etc/systemd/system/suricata.service.d/sentinel.conf
+    local dropin_body
+    dropin_body="$(suricata_dropin_body)" || \
+        warn "suricata is not on PATH, so the unit cannot be handed ${options}; the \
+daemon will capture on whatever ${SURICATA_YAML} names, which is not this host's NIC."
     install -d -m 0755 /etc/systemd/system/suricata.service.d
-    printf '[Service]\nMemoryMax=1G\nRestart=on-failure\nRestartSec=5\n' \
-        > /etc/systemd/system/suricata.service.d/sentinel.conf
+    printf '%s\n' "$dropin_body" > "$dropin"
     systemctl daemon-reload
 
     # The unprivileged ingest daemon reads eve.json. A per-user ACL grants
@@ -2451,10 +2707,21 @@ step_suricata() {
 
     suricata-update >/dev/null 2>&1 || warn "suricata-update failed; using shipped rules"
     # shellcheck disable=SC2086
-    suricata -T -c /etc/suricata/suricata.yaml ${options} || die "suricata config test failed"
+    suricata -T -c "$SURICATA_YAML" ${options} || die "suricata config test failed"
 
-    systemctl enable --now suricata
-    ok "Suricata running (IDS on ${iface}, MemoryMax=1G)"
+    systemctl enable suricata >/dev/null 2>&1 || true
+    local restart_reason=""
+    restart_reason="$(suricata_needs_restart "$options")" || restart_reason=""
+
+    if [[ -n "$restart_reason" ]]; then
+        info "restarting suricata: ${restart_reason}"
+        systemctl restart suricata || warn "systemctl restart suricata returned non-zero"
+    else
+        info "suricata already runs with these options; not restarting it"
+    fi
+
+    local eve_before; eve_before="$(suricata_eve_size)"
+    suricata_report_effect "$iface" "$pubip" "$bpf_file" "$eve_before"
 }
 
 # --- 36 -------------------------------------------------------------------
@@ -2590,41 +2857,157 @@ step_deploy_account() {
     fi
 }
 
-step_auxiliary() {
-    if [[ -f "${SCRIPT_DIR}/audit/sentinel.rules" ]]; then
-        install -D -m 0640 "${SCRIPT_DIR}/audit/sentinel.rules" /etc/audit/rules.d/sentinel.rules
+# One line of a rules file -> the identity that survives a round trip through
+# the kernel.
+#
+# Comparing rule TEXT is not possible, and that is why the previous version of
+# this compared keys instead. Measured on Ubuntu 24.04.4, `auditctl -l` hands
+# back what it was given, rewritten:
+#
+#   -F a1&07000                              as   -F a1&0xE00
+#   -F auid!=unset                           as   -F auid!=-1
+#   -S init_module,finit_module,delete_module     reordered
+#   a watch's key as  -k <key>  ,  a syscall rule's key as  -F key=<key>
+#
+# So each rule is identified by the one field that comes back intact: a watch by
+# its path, a keyed rule by its key, a suppression by its directory. A line that
+# matches none of those is reported as unchecked rather than counted as present
+# — "I cannot check this" and "this is loaded" are different answers, and only
+# one of them is true.
+audit_rule_signatures() {
+    awk '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { next }
+        /^-w[[:space:]]/                  { print "watch " $2; next }
+        match($0, /-F key=[^ ]+/)         { print "key " substr($0, RSTART + 7, RLENGTH - 7); next }
+        match($0, /(^| )-k +[^ ]+/)       { s = substr($0, RSTART, RLENGTH)
+                                            sub(/^ ?-k +/, "", s)
+                                            print "key " s; next }
+        match($0, /-F dir=[^ ]+/)         { print "dir " substr($0, RSTART + 7, RLENGTH - 7); next }
+        /^-b[[:space:]]/                  { print "option -b " $2; next }
+        /^--backlog_wait_time[[:space:]]/ { print "option --backlog_wait_time " $2; next }
+        { print "unchecked " $0 }
+    '
+}
 
-        # NOT `2>/dev/null`. The kernel validates each rule on load and rejects
-        # the ones it does not understand, one at a time, on stderr. Discarding
-        # that output means a rejected rule looks exactly like a loaded one:
-        # the file is on disk, the step says "installed", and the detection it
-        # feeds simply never fires. Silence is the failure mode this whole
-        # project keeps running into.
-        local load_err
-        if ! load_err="$(augenrules --load 2>&1)"; then
-            warn "augenrules failed: ${load_err}"
-        elif [[ -n "$load_err" ]]; then
-            warn "the kernel complained while loading audit rules: ${load_err}"
-        fi
+install_audit_rules() {
+    local src="${SCRIPT_DIR}/audit/sentinel.rules"
+    [[ -f "$src" ]] || return 0
+    install -D -m 0640 "$src" "$AUDITD_RULES_DEST"
 
-        # And then verify against the kernel rather than against our intent.
-        # Every key the rules file uses must actually be present in the loaded
-        # ruleset; a syntax the running kernel does not support is otherwise
-        # indistinguishable from one it does.
-        local want got missing=()
-        want="$(grep -oE 'sentinel_[a-z_]+' "${SCRIPT_DIR}/audit/sentinel.rules" | sort -u)"
-        got="$(auditctl -l 2>/dev/null || true)"
-        for key in $want; do
-            grep -q -- "$key" <<< "$got" || missing+=("$key")
-        done
-        if (( ${#missing[@]} )); then
-            warn "audit keys written but NOT loaded by the kernel: ${missing[*]}
-    The detections that read them will never fire. Inspect with:
-        auditctl -l | grep sentinel_"
-        else
-            ok "auditd rules installed and confirmed loaded"
-        fi
+    if ! have auditctl || ! have augenrules; then
+        warn "the audit rules are on disk at ${AUDITD_RULES_DEST} and \
+NOTHING loaded them — this host has no auditctl/augenrules. Every host.* detection, \
+plus auth.new_user and auth.new_ssh_key, has no source."
+        return 0
     fi
+
+    # NOT `2>/dev/null`. The kernel validates each rule on load and rejects the
+    # ones it does not understand, one at a time, on stderr. Discarding that
+    # output means a rejected rule looks exactly like a loaded one.
+    local raw
+    raw="$(augenrules --load 2>&1)" || true
+
+    # But not everything in there is an error, and the whole lot was being shown
+    # to the operator under the heading "augenrules failed". Measured on Ubuntu
+    # 24.04.4: a second deploy prints "/usr/sbin/augenrules: No change" — the
+    # generated audit.rules is byte-identical to the one already installed,
+    # which is the ordinary outcome of deploying twice — and then loads it
+    # anyway. auditctl additionally echoes a full status block for every -b /
+    # --backlog_wait_time line it is fed. Reporting a wall of that as a failure
+    # is how an operator learns to skip past the line where the real error is.
+    local errs
+    errs="$(printf '%s\n' "$raw" \
+        | grep -vE '^[^:]*augenrules: (No change|No rules)$' \
+        | grep -vE '^(enabled|failure|pid|rate_limit|backlog_limit|lost|backlog|backlog_wait_time|backlog_wait_time_actual|loginuid_immutable) [0-9]+$' \
+        | grep -vE '^[[:space:]]*$' || true)"
+
+    # And then count against the kernel, RULE by rule.
+    #
+    # Per key was not enough. A rejected rule that shares its key with a loaded
+    # one is invisible that way, and on this host that is not hypothetical:
+    # `auditctl -R` stops at the first rule it cannot add, so
+    # `-a never,exit -F dir=/var/lib/docker` failing on a host without docker
+    # takes the two suppression rules after it down with it — silently, because
+    # suppression rules carry no key at all.
+    local -A want_sig=() have_sig=()
+    local n sig
+    while read -r n sig; do
+        [[ -n "$sig" ]] && want_sig["$sig"]="$n"
+    done < <(audit_rule_signatures < "$src" | sort | uniq -c)
+    while read -r n sig; do
+        [[ -n "$sig" ]] && have_sig["$sig"]="$n"
+    done < <(auditctl -l 2>/dev/null | audit_rule_signatures | sort | uniq -c || true)
+
+    local total=0 present=0 got_n missing=() unchecked=()
+    for sig in "${!want_sig[@]}"; do
+        case "$sig" in
+            "option "*)    continue ;;   # not listed by auditctl -l; checked below
+            "unchecked "*) unchecked+=("${sig#unchecked }"); continue ;;
+        esac
+        total=$(( total + want_sig["$sig"] ))
+        got_n="${have_sig[$sig]:-0}"
+        if (( got_n >= want_sig["$sig"] )); then
+            present=$(( present + want_sig["$sig"] ))
+        else
+            present=$(( present + got_n ))
+            missing+=("${sig}: ${got_n} of ${want_sig[$sig]} in the kernel")
+        fi
+    done
+
+    # -b and --backlog_wait_time never appear in `auditctl -l` — they are
+    # settings, and `auditctl -s` is where the kernel says what it accepted.
+    # Passing over them silently would leave the one number that decides whether
+    # records are DROPPED unverified, and a dropped record looks exactly like a
+    # command that was never run.
+    local status kernel_key kernel_val optname optval
+    status="$(auditctl -s 2>/dev/null || true)"
+    for sig in "${!want_sig[@]}"; do
+        [[ "$sig" == "option "* ]] || continue
+        read -r _ optname optval <<< "$sig"
+        case "$optname" in
+            -b)                  kernel_key=backlog_limit ;;
+            --backlog_wait_time) kernel_key=backlog_wait_time ;;
+            *)                   unchecked+=("$sig"); continue ;;
+        esac
+        kernel_val="$(awk -v k="$kernel_key" '$1 == k { print $2; exit }' <<< "$status")"
+        [[ "$kernel_val" == "$optval" ]] || \
+            missing+=("${kernel_key} is ${kernel_val:-unreadable} in the kernel, not ${optval}")
+    done
+
+    # `auditctl -l` reads the KERNEL, and kernel rules outlive the daemon that
+    # asked for them. "confirmed loaded" was printed on a host where auditd was
+    # dead: the rules were in place, nothing was writing them to audit.log, and
+    # every host.* detection was reading an empty file.
+    local audit_pid audit_enabled dead=()
+    audit_pid="$(awk '$1 == "pid" { print $2; exit }' <<< "$status")"
+    audit_enabled="$(awk '$1 == "enabled" { print $2; exit }' <<< "$status")"
+    [[ "$audit_enabled" == "1" || "$audit_enabled" == "2" ]] || \
+        dead+=("kernel auditing is '${audit_enabled:-unreadable}', not enabled")
+    [[ "$audit_pid" =~ ^[1-9][0-9]*$ ]] || \
+        dead+=("no auditd daemon is running (pid '${audit_pid:-unreadable}'), so nothing \
+reaches ${AUDITD_LOG_PATH} however many rules the kernel holds")
+
+    # ONE verdict. The old block printed "augenrules failed" and then
+    # "rules installed and confirmed loaded" two lines apart, and an operator
+    # reading two opposite statements believes the second one.
+    local problems=("${missing[@]}" "${dead[@]}")
+    [[ -n "$errs" ]] && problems+=("augenrules did not load the whole file:
+${errs}")
+    (( ${#unchecked[@]} )) && problems+=("these lines could not be verified at all: ${unchecked[*]}")
+
+    if (( ${#problems[@]} )); then
+        warn "auditd: ${present}/${total} of Sentinel's rules are in the kernel, and:
+    $(printf '%s\n    ' "${problems[@]}")
+    Inspect with: auditctl -l ; auditctl -s ; augenrules --load"
+    else
+        ok "auditd: all ${total} rules from sentinel.rules counted one by one in the \
+kernel, and auditd (pid ${audit_pid}) is collecting"
+    fi
+}
+
+step_auxiliary() {
+    install_audit_rules
     if [[ -f "${SCRIPT_DIR}/fail2ban/sentinel-web.conf" ]] && have fail2ban-client; then
         install -D -m 0644 "${SCRIPT_DIR}/fail2ban/sentinel-web.conf" \
             /etc/fail2ban/jail.d/sentinel-web.conf

@@ -439,13 +439,16 @@ def test_the_per_scanner_ceilings_fit_inside_the_unit_budget() -> None:
     un trivy care se împotmolește lasă dnf-ul de a doua zi nerulat — și, mai rău,
     rândul `running` rămas în urmă umbrește ultimul rezultat real în panou.
     """
-    from sentinel.scan import os_packages
+    from sentinel.scan import os_packages, trivy_image
 
     valori = re.findall(r"^TimeoutStartSec=(\d+)\s*$",
                         UNIT.read_text(encoding="utf-8"), re.M)
     assert len(valori) == 1, valori
     buget = int(valori[0])
-    suma = os_packages.TIMEOUT_S + trivy_fs.TIMEOUT_S
+    # Fiecare scaner adăugat intră în sumă aici. Varianta care descoperă singură
+    # modulele — deci prinde și un al patrulea scaner scris fără să se atingă
+    # testul ăsta — e în `test_scan_trivy_image.py`.
+    suma = os_packages.TIMEOUT_S + trivy_fs.TIMEOUT_S + trivy_image.TIMEOUT_S
     assert suma < buget, (
         f"plafoanele scanerelor însumează {suma}s, iar unitatea e omorâtă la "
         f"{buget}s: ultimul scaner din listă poate să nu apuce să ruleze")

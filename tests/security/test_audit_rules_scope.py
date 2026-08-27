@@ -199,6 +199,13 @@ def test_execve_rules_still_only_name_network_tools(lines: list[str]) -> None:
 INSTALL_SH = RULES.parents[1] / "install.sh"
 
 
+def _shell_function(source: str, name: str) -> str:
+    """Corpul funcției livrate, ca aserțiunile să nu se potrivească din alt loc."""
+    match = re.search(rf"^{re.escape(name)}\(\)\s*\{{.*?^\}}", source, re.S | re.M)
+    assert match, f"funcția {name} nu mai există în install.sh"
+    return match.group(0)
+
+
 def test_rule_loading_does_not_discard_the_kernel_s_complaints() -> None:
     """`augenrules --load 2>/dev/null` face o regulă respinsă să arate ca una
     încărcată: fișierul e pe disc, pasul spune „installed", iar detecția care
@@ -210,10 +217,43 @@ def test_rule_loading_does_not_discard_the_kernel_s_complaints() -> None:
 
 def test_loaded_rules_are_verified_against_the_kernel() -> None:
     """Intenția noastră nu e o dovadă. O sintaxă pe care nucleul care rulează nu
-    o suportă e altfel imposibil de deosebit de una pe care o suportă."""
+    o suportă e altfel imposibil de deosebit de una pe care o suportă.
+
+    Aserțiunea de aici era pe TEXTUL avertismentului — exact partea care se
+    schimbă când se repară raportarea, deci exact partea care nu păzește nimic.
+    Ce nu are voie să se schimbe e ce se compară: fiecare REGULĂ față de ce
+    răspunde `auditctl -l`, cu NUMĂRUL ei. Verificarea pe cheie nu vedea o
+    regulă respinsă care împărțea cheia cu una încărcată, și nu vedea deloc una
+    fără cheie (`-a never,exit -F dir=…`) — măsurat pe Ubuntu 24.04.4, unde
+    `auditctl -R` s-a oprit la `-F dir=/var/lib/docker` pe o gazdă fără docker
+    și a lăsat neîncărcate exact regulile care opresc Sentinel din a-și audita
+    propriile scrieri.
+
+    Comportamentul e verificat prin rularea funcției livrate în
+    `tests/security/test_installer_capture_and_rules.py`; aici se păzește doar
+    decizia, ca o rescriere să nu se întoarcă tăcut la comparația pe chei.
+    """
     text = INSTALL_SH.read_text(encoding="utf-8")
     assert "auditctl -l" in text
-    assert "NOT loaded by the kernel" in text
+
+    # Aserțiunile de mai jos sunt pe CORPUL pasului, nu pe fișier. Căutate în
+    # tot install.sh, două din trei treceau degeaba: `audit_rule_signatures`
+    # apare și la definiție, iar `${#problems[@]}` apare și în pasul 35. O
+    # căutare care se potrivește din alt motiv nu păzește nimic — s-a văzut la
+    # falsificare, exact tiparul pe care CLAUDE.md îl numește.
+    body = _shell_function(text, "install_audit_rules")
+
+    # Nucleul rescrie ce i se dă (`a1&07000` -> `a1&0xE00`, `-k` -> `-F key=`),
+    # deci comparația pe text brut e imposibilă și semnăturile sunt mecanismul.
+    assert "audit_rule_signatures" in body, \
+        "pasul nu mai trece regulile prin semnături, deci nu le mai poate compara"
+    # Per regulă, cu numărul: prezența cheii nu mai e de ajuns.
+    assert 'got_n >= want_sig["$sig"]' in body, \
+        "pasul a revenit la o verificare care nu numără regulile"
+    # Iar linia de succes atârnă de lista de probleme găsite, nu de un cod de
+    # ieșire — altfel se întoarce „failed" urmat imediat de „confirmed loaded".
+    assert "(( ${#problems[@]} ))" in body, \
+        "verdictul nu mai atârnă de ce s-a găsit lipsă"
 
 
 def test_the_beacon_is_restarted_not_merely_enabled() -> None:

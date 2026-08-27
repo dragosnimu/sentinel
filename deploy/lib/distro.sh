@@ -301,6 +301,34 @@ suricata_defaults_file() {
     esac
 }
 
+# Does the PACKAGED unit actually read that file?
+#
+# Writing OPTIONS= somewhere is not the same as the daemon being started with
+# them, and the difference is the whole of B2.
+#
+#   rhel    yes. /usr/lib/systemd/system/suricata.service carries
+#           EnvironmentFile=/etc/sysconfig/suricata and ExecStart=... $OPTIONS.
+#           That is what production runs on, so nothing here touches it.
+#
+#   debian  NO. Measured on Ubuntu 24.04.4 with suricata 7.0.3:
+#           `systemctl show suricata -p EnvironmentFiles` prints NOTHING, and
+#           ExecStart is a fixed argv — `/usr/bin/suricata -D --af-packet -c
+#           /etc/suricata/suricata.yaml --pidfile /run/suricata.pid`. The bare
+#           `--af-packet` means "take the interface list out of suricata.yaml",
+#           and the packaged file says `interface: eth0` on a host whose NIC is
+#           enp0s3. So /etc/default/suricata was rewritten on every deploy and
+#           read by nobody: no interface, no HOME_NET, no BPF filter. The
+#           service was `active`, `suricata -T` passed, and eve.json, fast.log
+#           and stats.log were all 0 bytes.
+#
+# The caller supplies the missing EnvironmentFile with a drop-in when this is
+# false. It is a family answer rather than a probe of the live unit on purpose:
+# probing would mean the rhel path changes shape the first time a systemctl
+# output format shifts under it, on the one host that is production.
+suricata_unit_reads_options() {
+    [[ "$DISTRO_FAMILY" == "rhel" ]]
+}
+
 # ---------------------------------------------------------------- tls
 # Where the distribution keeps certs/ and private/.
 #
@@ -337,7 +365,61 @@ security_module_allow_nginx_proxy() {
 
 # ---------------------------------------------------------------- nginx
 # Both families read /etc/nginx/conf.d/*.conf from the shipped nginx.conf, so
-# the installer uses that path on both. Debian additionally has
-# sites-enabled/, which we deliberately do not touch: it belongs to whatever
-# the operator already runs there.
+# the installer puts Sentinel's own vhost there on both, and nowhere else.
 nginx_confdir() { printf '/etc/nginx/conf.d'; }
+
+# The DISTRIBUTION's own :80 server block — the one that has to get out of the
+# way when something else on this host already owns port 80.
+#
+# It lives in a different file on each family, which is why the previous
+# version of this never did anything on Ubuntu. Measured on 24.04.4:
+#
+#   rhel    the block is inside /etc/nginx/nginx.conf, written `listen 80;`
+#           and `listen [::]:80;`.
+#
+#   debian  /etc/nginx/nginx.conf has NO active listen directive at all — only
+#           two commented examples, at lines 73 and 79. The real one is the
+#           packaged default site, /etc/nginx/sites-enabled/default, and it
+#           says `listen 80 default_server;`, which the rhel pattern does not
+#           match either. The sed therefore ran against the wrong file looking
+#           for text that was not in it, changed nothing, and returned 0.
+#
+# sites-enabled/ used to be described here as belonging to the operator. That
+# is true only when nginx was already on the host. Ownership is not a property
+# of the directory, it is a property of who installed the package, and the
+# caller knows that (NGINX_WAS_PREEXISTING) and decides before calling.
+nginx_default_site() {
+    case "$DISTRO_FAMILY" in
+        rhel)   printf '/etc/nginx/nginx.conf' ;;
+        debian) printf '/etc/nginx/sites-enabled/default' ;;
+    esac
+}
+
+# Take the distribution's :80 listener out of service, and print how to undo it.
+#
+# Returns non-zero when there was nothing there to disable. It does NOT report
+# whether :80 was actually released — neither branch below is evidence of that,
+# and the caller checks the effect against `nginx -T` instead.
+nginx_disable_default_listener() {
+    local target; target="$(nginx_default_site)"
+    case "$DISTRO_FAMILY" in
+        rhel)
+            [[ -f "$target" ]] || return 1
+            # Idempotent: the marker means a re-run does not double-comment.
+            if ! grep -q 'SENTINEL-DISABLED' "$target"; then
+                sed -i -E 's|^([[:space:]]*)(listen[[:space:]]+(\[::\]:)?80;)|\1# SENTINEL-DISABLED \2|' \
+                    "$target"
+            fi
+            printf 'undo by removing the "# SENTINEL-DISABLED " prefixes in %s\n' "$target"
+            ;;
+        debian)
+            # A symlink into sites-available. Removing it disables the site and
+            # leaves the packaged file itself untouched, so putting it back is
+            # one symlink — considerably kinder than editing a conffile in place
+            # and hoping the next apt upgrade agrees with us about it.
+            [[ -e "$target" || -L "$target" ]] || return 1
+            rm -f "$target"
+            printf 'undo with: ln -s /etc/nginx/sites-available/default %s\n' "$target"
+            ;;
+    esac
+}

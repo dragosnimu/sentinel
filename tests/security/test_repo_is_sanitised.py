@@ -587,6 +587,19 @@ VALUE_EXEMPT: dict[str, tuple[dict[str, int], str]] = {
     # API public, scris identic în lista de permisiuni și în procedura de deploy.
     ".claude/settings.json": ({SHAPE_B64: 1}, "nume de unealtă MCP"),
     "watcher/INCARCARE-HOSTINGER.md": ({SHAPE_B64: 1}, "nume de unealtă MCP"),
+
+    # Aceeași clasă ca numele de unealtă MCP de deasupra: un identificator PUBLIC
+    # care nimerește regula de compoziție. Aici e URL-ul de avizare al unui GHSA
+    # din eșantionul de ieșire `trivy image` —
+    # `github.com/advisories/GHSA-…`, unde `com/advisories/GHSA-7788-qqqq-wwww`
+    # are exact 34 de caractere din alfabetul base64, fiindcă punctul din
+    # `github.com` rupe șirul și restul e numai litere, cifre, `/` și `-`.
+    # Forma trebuie să rămână cea reală: eșantionul există ca să dovedească
+    # exact că parserul potrivește ce scrie trivy, iar un URL scurtat ca să
+    # tacă garda ar face proba să nu mai probeze nimic. Nu deschide nimic — e
+    # o adresă publică, iar avizul din spatele ei e fabricat.
+    "tests/unit/test_scan_trivy_image.py":
+        ({SHAPE_B64: 1}, "URL public de avizare GitHub din eșantionul trivy"),
 }
 
 # Fișierele din care se EXTRAG formele de probă, cu podeaua măsurată azi. Podeaua

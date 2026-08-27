@@ -258,6 +258,40 @@ sunt și ele măsurate în loc să fie crezute:
   inclusiv `tgenabled`, fiindcă un trigger dezactivat rămâne în catalog — și
   lipsa **oprește** fluxul în loc să-l lase să pară la zi (`docs/OPERARE.md` §15).
 
+
+### 3.14 Scanarea containerelor costă un privilegiu, și el se scrie aici
+
+`sentinel` e **membru al grupului `docker`** și vorbește direct cu
+`/run/docker.sock`. Nu există niciun proxy între ele.
+
+**Pe gazda asta, grupul `docker` e echivalent cu root.** Cine ajunge la socket
+poate porni un container care montează `/` și scrie în el — fără exploit, doar
+cu API-ul documentat. Consecința, spusă fără menajamente: *o compromitere a
+agentului de securitate înseamnă acum root pe mașina pe care o păzește.*
+
+Operatorul a fost informat și a acceptat schimbul, deliberat, în august 2026.
+Alternativele — un proxy peste socket, sau o a doua componentă privilegiată care
+exportă imaginile — sunt fiecare mai mult cod care rulează mai aproape de root
+decât o apartenență la grup. Nu e o decizie ascunsă și nu e una la care se poate
+ajunge din greșeală: se dă în [`deploy/install.sh`](../deploy/install.sh) și se
+scoate împreună cu `scan.containers: false`. Lăsată pe loc cu scanerul oprit,
+păstrează tot costul și niciun beneficiu.
+
+Ce se scanează: **imaginile containerelor care rulează**, nu tot inventarul de
+imagini de pe disc. O vulnerabilitate într-o imagine pe care n-o execută nimeni
+nu e accesibilă nimănui, iar pusă în panou lângă una care rulează transformă
+panoul în ceva ce nu se mai citește. Cheia unei constatări e **referința
+imaginii** — `nginx:1.27` — fiindcă reparația e o reconstrucție de imagine, o
+dată, pentru toate containerele care o folosesc; ce se scanează e totuși id-ul
+imaginii care rulează cu adevărat, ca un tag reindreptat fără repornire să nu
+schimbe răspunsul.
+
+Absența lui docker **nu** e o eroare: e o gazdă fără containere, și nu scrie
+niciun rând în `scans`. Docker prezent dar inaccesibil **e** o eroare, cu rând
+`failed` și cheie roșie în `/selfcheck`: cineva a cerut scanarea și ea nu se
+face. Detaliile sunt în docstring-ul lui
+[`sentinel/scan/trivy_image.py`](../sentinel/scan/trivy_image.py).
+
 ---
 
 ## 4. Predicția — ce este de fapt
@@ -331,7 +365,7 @@ Ce obține un atacator:
 |---|---|
 | Dashboard-ul web | Acces de citire la datele de securitate. Nu poate acționa |
 | Tokenul botului Telegram | Poate *cere* acțiuni — limitat de allowlist-ul de chat_id, roluri, dubla confirmare și politica executorului |
-| Un daemon `sentinel` | Poate cere acțiuni executorului, care le validează independent |
+| Un daemon `sentinel` | Poate cere acțiuni executorului, care le validează independent — **dar** de la §3.14 încoace, `sentinel` e în grupul `docker`, iar grupul ăla e root pe gazda asta. Compromiterea unui daemon nu mai e ținută în frâu de politica executorului |
 | Executorul | Root. De asta are 400 de linii și o suită proprie de teste ostile |
 
 ### Injecție de prompt

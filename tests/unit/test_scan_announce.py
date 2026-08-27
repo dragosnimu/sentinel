@@ -207,12 +207,16 @@ def _wire(monkeypatch, results: dict) -> list[list[dict]]:
     async def fake_trivy(_db, _cfg, _triggered_by):
         return results.get("trivy_fs", {})
 
+    async def fake_image(_db, _triggered_by):
+        return results.get("trivy_image", {})
+
     async def fake_plans(_db, _cfg):
         return results.get("patch_plans", {})
 
     monkeypatch.setattr("sentinel.intel.kev.refresh", fake_kev)
     monkeypatch.setattr(orchestrator, "_run_os_packages", fake_dnf)
     monkeypatch.setattr(orchestrator, "_run_trivy_fs", fake_trivy)
+    monkeypatch.setattr(orchestrator, "_run_trivy_image", fake_image)
     monkeypatch.setattr(orchestrator, "_draft_plans", fake_plans)
     monkeypatch.setattr(orchestrator.announce, "announce", fake_announce)
     return sent
@@ -220,12 +224,12 @@ def _wire(monkeypatch, results: dict) -> list[list[dict]]:
 
 def _cfg(**over):
     base = SimpleNamespace(
-        # `filesystem` e scris explicit, chiar si cand e oprit: `run_all` il
-        # citeste, iar un ciot caruia ii lipseste un steag pe care codul il
-        # citeste nu esueaza pe „scanerul n-a rulat" — esueaza pe AttributeError,
-        # adica pe altceva decat ce masoara testul.
+        # `filesystem` si `containers` sunt scrise explicit, chiar si cand sunt
+        # oprite: `run_all` le citeste, iar un ciot caruia ii lipseste un steag pe
+        # care codul il citeste nu esueaza pe „scanerul n-a rulat" — esueaza pe
+        # AttributeError, adica pe altceva decat ce masoara testul.
         scan=SimpleNamespace(enabled=True, os_packages=True, filesystem=False,
-                             announce_new=True),
+                             containers=False, announce_new=True),
         telegram=SimpleNamespace(allowed_chat_ids=[1]), hostname="gazda")
     for k, v in over.items():
         setattr(base.scan, k, v)
@@ -281,6 +285,40 @@ def test_the_filesystem_scanner_reaches_the_same_single_announcement(
 
     assert len(sent) == 1, f"{len(sent)} mesaje pentru o singura rulare"
     assert sent[0] == [a, b], "constatarile lui trivy n-au ajuns in anunt"
+
+
+def test_the_container_scanner_reaches_the_same_single_announcement(
+        monkeypatch) -> None:
+    """Al treilea scaner real intra in acelasi mesaj, nu intr-al lui.
+
+    Esecul pe care il previne: `trivy_image` cablat in `run_all` fara sa fie cules
+    de bucla de anunt — o vulnerabilitate noua intr-o imagine care ruleaza ar
+    intra in baza si n-ar spune nimanui nimic pana cand cineva deschide panoul.
+    Sau, in cealalta directie, culeasa de un al doilea apel la `announce`: doua
+    mesaje pentru o rulare, si operatorul opreste canalul.
+    """
+    a, b = _finding(cve="CVE-DNF"), _finding(cve="CVE-IMAGINE")
+    sent = _wire(monkeypatch, {"dnf": {"new_items": [a]},
+                               "trivy_image": {"new_items": [b]}})
+    run(orchestrator.run_all(object(), _cfg(containers=True)))
+
+    assert len(sent) == 1, f"{len(sent)} mesaje pentru o singura rulare"
+    assert sent[0] == [a, b], "constatarile scanerului de containere n-au ajuns in anunt"
+
+
+def test_the_container_scanner_is_not_run_when_the_flag_is_off(monkeypatch) -> None:
+    """`scan.containers: false` chiar il opreste.
+
+    Esecul pe care il previne: operatorul refuza schimbul (apartenenta la grupul
+    `docker` e root pe gazda asta), pune steagul pe false — si scanerul ruleaza
+    mai departe in fiecare noapte, adica privilegiul e folosit dupa ce a fost
+    retras in configuratie.
+    """
+    sent = _wire(monkeypatch, {"trivy_image": {"new_items": [_finding()]}})
+    summary = run(orchestrator.run_all(object(), _cfg(containers=False)))
+
+    assert "trivy_image" not in summary, "scanerul a rulat cu steagul oprit"
+    assert sent == []
 
 
 def test_a_scanner_that_reports_no_new_items_does_not_break_the_scan(

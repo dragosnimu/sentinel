@@ -5,14 +5,16 @@ findings, enrich each with KEV, score it, upsert (dedup by finding_key), then
 mark anything the scanner used to report but no longer does as resolved. A single
 scanner failing is recorded on its own row and does not stop the others.
 
-Two scanners are wired here: `dnf` for OS packages and `trivy_fs` for the
-application dependencies dnf cannot see. Containers, nuclei and semgrep slot into
-the same loop; each is one more `_run_*` behind its config flag.
+Three scanners are wired here: `dnf` for OS packages, `trivy_fs` for the
+application dependencies dnf cannot see, and `trivy_image` for what the running
+containers carry. nuclei and semgrep slot into the same loop; each is one more
+`_run_*` behind its config flag.
 
-The two `_run_*` bodies below have the same shape on purpose and are NOT folded
-into one helper. They differ in what each scanner can prove — trivy also has to
-answer for the age of its vulnerability database — and the last time this loop
-was made generic, the special case was the one that mattered.
+The `_run_*` bodies below have the same shape on purpose and are NOT folded into
+one helper. They differ in what each scanner can prove — trivy also has to answer
+for the age of its vulnerability database, and `trivy_image` has to answer for
+whether there was a docker to talk to at all — and the last time this loop was
+made generic, the special case was the one that mattered.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ from sentinel.db.engine import Database
 from sentinel.db.repo import findings as fx
 from sentinel.intel import kev
 from sentinel.logging_setup import get_logger
-from sentinel.scan import announce, os_packages, prioritize, trivy_fs
+from sentinel.scan import announce, os_packages, prioritize, trivy_fs, trivy_image
 
 log = get_logger(__name__)
 
@@ -45,6 +47,8 @@ async def run_all(db: Database, cfg: Config, *, triggered_by: str = "schedule") 
         summary["dnf"] = await _run_os_packages(db, triggered_by)
     if cfg.scan.filesystem:
         summary[trivy_fs.SCANNER] = await _run_trivy_fs(db, cfg, triggered_by)
+    if cfg.scan.containers:
+        summary[trivy_image.SCANNER] = await _run_trivy_image(db, triggered_by)
 
     summary["patch_plans"] = await _draft_plans(db, cfg)
 
@@ -218,4 +222,84 @@ async def _run_trivy_fs(db: Database, cfg: Config, triggered_by: str) -> dict:
     except Exception as exc:  # noqa: BLE001 - record and surface, do not crash the pass
         await fx.finish_scan(db, scan_id, status="failed", error=str(exc)[:500])
         log.error("trivy fs scan crashed", extra={"detail": str(exc)})
+        return {"status": "failed", "error": str(exc)[:200]}
+
+
+async def _run_trivy_image(db: Database, triggered_by: str) -> dict:
+    """trivy peste imaginile containerelor care ruleaza.
+
+    Aceeasi forma ca `_run_trivy_fs`, cu o intrebare pusa INAINTE de orice
+    altceva: exista docker pe gazda asta?
+
+      * NU exista deloc — nici client, nici socket, nici `DOCKER_HOST`. Atunci nu
+        se deschide niciun rand in `scans`. Statusurile disponibile sunt
+        `running/completed/failed/timeout` (0029 a scos `skipped` dinadins), iar
+        un rand `completed` cu zero constatari despre o scanare care n-a rulat e
+        exact minciuna pe care migratia aia o previne. Nu se rezolva nimic: o
+        gazda fara docker n-a dovedit ca vulnerabilitatile de ieri au disparut.
+      * exista, dar nu raspunde — asta E o eroare, si primeste un rand `failed`
+        cu tot cu dovada (proprietarul socketului, modul, grupurile noastre).
+        Asa ajunge in `/selfcheck`, sub `scan:last:trivy_image`, ceea ce e tot
+        rostul: cineva a cerut scanarea containerelor si ea nu se face.
+    """
+    probe = await trivy_image.probe_docker()
+    if probe.state == trivy_image.DOCKER_ABSENT:
+        log.info("scanarea de containere nu se aplică",
+                 extra={"scanner": trivy_image.SCANNER, "detail": probe.detail})
+        return {"status": "not_applicable", "docker": probe.state,
+                "detail": probe.detail}
+
+    scan_id = await fx.start_scan(db, trivy_image.SCANNER,
+                                  "docker: imaginile containerelor în rulare",
+                                  triggered_by=triggered_by)
+    try:
+        raw, error, facts = await trivy_image.scan(probe)
+        db_version = facts.get("db_version")
+        if error:
+            await fx.finish_scan(db, scan_id, status="failed", error=error,
+                                 db_version=db_version)
+            log.error("trivy image scan failed",
+                      extra={"error": error, "docker": facts.get("docker")})
+            return {"status": "failed", "error": error, "db_version": db_version,
+                    "docker": facts.get("docker")}
+
+        cves = [f["cve"] for f in raw if f.get("cve")]
+        kev_map = await kev.lookup(db, cves)
+
+        seen: list[str] = []
+        new_items: list[dict] = []
+        new = 0
+        for f in raw:
+            if f.get("cve") in kev_map:
+                f["kev"] = True
+                f["kev_due_date"] = kev_map.get(f["cve"])
+            f["scan_id"] = scan_id
+            # Aceleasi implicite ca la celelalte doua scanere: containerele de
+            # aici publica porturi catre siturile operatorului, deci expuse, cu
+            # criticitate neutra. Legarea de un `asset` anume ar cere o potrivire
+            # imagine->activ, iar una gresita ar muta o vulnerabilitate pe alt
+            # sistem.
+            f["priority"] = prioritize.score(f, exposed=True, criticality=3)
+            if await fx.upsert_finding(db, f):
+                new += 1
+                new_items.append(dict(f))
+            seen.append(f["finding_key"])
+
+        resolved = await fx.mark_resolved_absent(db, trivy_image.SCANNER, None, seen)
+        await fx.finish_scan(
+            db, scan_id, status="completed", findings_count=len(raw),
+            new_findings=new, resolved_findings=resolved, db_version=db_version)
+        log.info("trivy image scan complete",
+                 extra={"findings": len(raw), "new": new, "resolved": resolved,
+                        "kev": len(kev_map), "images": facts.get("images"),
+                        "containers": facts.get("containers"),
+                        "db_version": db_version})
+        return {"status": "completed", "findings": len(raw), "new": new,
+                "resolved": resolved, "kev": len(kev_map),
+                "db_version": db_version, "images": facts.get("images"),
+                "containers": facts.get("containers"),
+                "references": facts.get("references"), "new_items": new_items}
+    except Exception as exc:  # noqa: BLE001 - record and surface, do not crash the pass
+        await fx.finish_scan(db, scan_id, status="failed", error=str(exc)[:500])
+        log.error("trivy image scan crashed", extra={"detail": str(exc)})
         return {"status": "failed", "error": str(exc)[:200]}
