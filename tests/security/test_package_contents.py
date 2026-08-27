@@ -78,6 +78,8 @@ FAKE_REPO: dict[str, bytes] = {
     "sentinel/__pycache__/config.cpython-310.pyc": b"\x00",
     "sentinel/config.pyc": b"\x00",
     ".git/config": b"[core]\n",
+    ".claude/settings.local.json": b"{}\n",
+    ".claude/worktrees/sesiune/deploy/install.sh": b"#!/usr/bin/env bash\n",
 }
 
 
@@ -171,7 +173,8 @@ def test_the_verification_scratch_never_reaches_the_server(packaged):
 @needs_bash
 @needs_tar
 @pytest.mark.parametrize("prefix",
-                         ["secrets", "tests", "docs", "watcher", "aggregator", ".git"])
+                         ["secrets", "tests", "docs", "watcher", "aggregator",
+                          ".git", ".claude"])
 def test_what_was_already_excluded_stays_excluded(packaged, prefix):
     """Adăugarea unei excluderi nu are voie să strice pe celelalte.
 
@@ -183,6 +186,12 @@ def test_what_was_already_excluded_stays_excluded(packaged, prefix):
     a ce a plecat de pe mașina asta. O copie a schemei lui pe gazda arhivată nu
     e o scurgere de secrete, dar e o hartă a arhivei pe chiar mașina de la care
     arhiva se apără — și nimic din `deploy/` sau `sentinel/` nu o citește.
+
+    `.claude/` e starea de lucru a agenților — setări, evidența worktree-urilor,
+    ce lasă în urmă o sesiune. Nu e o scurgere: un worktree de agent ar umfla
+    arhiva peste `PACKAGE_MAX_KB`, iar deploy-ul ar muri pe mărime în loc să
+    livreze tăcut. Exact de-aia e aici — o pană de deploy evitabilă cu o linie,
+    pe un director de care gazda n-are nicio nevoie.
     """
     leaked = [n for n in packaged if n.split("/")[0] == prefix]
     assert leaked == [], f"pachetul conține {prefix}/: {leaked}"

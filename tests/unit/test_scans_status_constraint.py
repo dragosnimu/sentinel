@@ -38,6 +38,74 @@ _ADD_CONSTRAINT = re.compile(
 _LITERAL = re.compile(r"'([a-z_]+)'")
 
 
+#: Familia de scrieri, nu o ortografie a ei. Postgres acceptă `ONLY`, un alias
+#: simplu și un alias cu `AS` între numele tabelei și restul instrucțiunii, iar
+#: PG 16 are `MERGE`. Toate astea trec pe lângă `UPDATE\s+scans\s+SET`:
+#:
+#:   UPDATE scans s SET status='completed'
+#:   UPDATE scans AS s SET status='completed'
+#:   UPDATE ONLY scans SET status='completed'
+#:   MERGE INTO scans USING ...
+#:   DELETE FROM ONLY scans WHERE status=...
+#:
+#: A doua oară când aceeași cauză e prinsă prea îngust, deci nu se mai adaugă o
+#: ortografie: se prinde tot ce poate ținti tabela `scans` cu o scriere, iar
+#: cuvântul de după numele tabelei nu mai contează. `\b` la sfârșit ca `scans`
+#: să nu potrivească `scans_history`.
+_SCRIE_IN_SCANS = re.compile(r"\b(UPDATE|MERGE\s+INTO)\s+(ONLY\s+)?scans\b", re.I)
+_STERGE_DIN_SCANS = re.compile(r"\bDELETE\s+FROM\s+(ONLY\s+)?scans\b", re.I)
+
+
+def _fara_comentarii(sql: str) -> str:
+    """SQL fără comentarii, cu literalii de șir neatinși.
+
+    Decuparea de dinainte lua doar liniile care ÎNCEP cu `--`, deci un
+    `RAISE NOTICE ...; -- comentariu care pomenește EXECUTE` la capătul unei
+    linii de cod rămânea în text și declanșa interdicția de SQL dinamic pe o
+    migrație perfect curată. Un test care pică din alt motiv decât cel scris în
+    el e la fel de nefolositor ca unul care trece degeaba — și, aici, ar fi
+    picat pe fiecare rulare până ce cineva l-ar fi „reparat" lărgind
+    interdicția. Se taie deci `--…` până la capătul liniei, oriunde pe linie, și
+    `/*…*/` pe oricâte linii.
+
+    Scanare caracter cu caracter, nu `re.sub`, și ăsta e tot rostul funcției: un
+    `--` din INTERIORUL unui literal (`'... -- ...'`) nu e comentariu. Un
+    `re.sub(r"--.*$", "", ...)` ar tăia acolo, ar lăsa literalul fără ghilimeaua
+    de închidere, iar decuparea literalilor de mai târziu ar înghiți apoi cod
+    adevărat — o aserțiune care nu mai vede scrierea pe care există s-o vadă, și
+    care tace despre asta.
+
+    Șirurile citate cu dolar (`$$ … $$`) rămân întregi și sunt tratate ca ce
+    sunt: corpul blocurilor `DO`, adică instrucțiuni care chiar se execută.
+    """
+    out: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        if sql[i] == "'":
+            j = i + 1
+            while j < n:
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            out.append(sql[i:j])
+            i = j
+        elif sql.startswith("--", i):
+            capat = sql.find("\n", i)
+            i = n if capat == -1 else capat
+        elif sql.startswith("/*", i):
+            capat = sql.find("*/", i + 2)
+            i = n if capat == -1 else capat + 2
+            out.append(" ")
+        else:
+            out.append(sql[i])
+            i += 1
+    return "".join(out)
+
+
 def _migrations_in_order() -> list[tuple[int, Path]]:
     found = [(int(re.match(r"^(\d+)_", f.name).group(1)), f)
              for f in MIGRATIONS.glob("*.sql")]
@@ -121,10 +189,25 @@ def test_the_migration_refuses_the_rows_instead_of_rewriting_them() -> None:
     strecurat înaintea lui `ALTER TABLE` e, pentru regexul de mai jos, un șir
     care dispare cu totul — conversia tăcută pe care întreaga migrație există
     s-o refuze trecea paza fără o vorbă, cu suita verde.
+
+    A treia, și a doua oară când aceeași cauză e prinsă prea îngust: garda era
+    scrisă pe DOUĂ ORTOGRAFII (`UPDATE\\s+scans\\s+SET`, `DELETE\\s+FROM\\s+
+    scans`), iar Postgres acceptă cel puțin cinci care nu seamănă cu ele —
+    `UPDATE scans s SET`, `UPDATE scans AS s SET`, `UPDATE ONLY scans SET`,
+    `MERGE INTO scans USING`, `DELETE FROM ONLY scans`. Toate cinci treceau,
+    verificat din nou pe 27 august 2026. Nu s-a mai adăugat o ortografie: garda
+    e acum pe FAMILIE (`_SCRIE_IN_SCANS`, `_STERGE_DIN_SCANS`) — orice
+    instrucțiune de scriere care țintește tabela, indiferent ce urmează după
+    numele ei.
+
+    Și decuparea comentariilor era greșită în cealaltă direcție: tăia doar
+    liniile care ÎNCEP cu `--`, deci un comentariu la capătul unei linii de cod
+    care pomenea `EXECUTE` rupea testul pe o migrație curată. Vezi
+    `_fara_comentarii`.
     """
     sql = (MIGRATIONS / "0029_scans_no_skipped.sql").read_text(encoding="utf-8")
     # Comentariile explică tocmai ce NU face migrația; scrieri se caută doar în cod.
-    cod = "\n".join(l for l in sql.splitlines() if not l.lstrip().startswith("--"))
+    cod = _fara_comentarii(sql)
 
     # Interdicția pe SQL dinamic se pune pe `cod`, ÎNAINTE de decuparea de mai
     # jos — altfel tocmai scrierea ascunsă într-un literal ar fi cea decupată.
@@ -140,10 +223,14 @@ def test_the_migration_refuses_the_rows_instead_of_rewriting_them() -> None:
     # face pe cod fără literali de șir, altfel sfatul ar fi confundat cu fapta.
     executabil = re.sub(r"'(?:[^']|'')*'", "''", cod)
 
-    assert not re.search(r"UPDATE\s+scans\s+SET", executabil, re.I), (
-        "migrația scrie în `scans` — o conversie tăcută rescrie istoric")
-    assert not re.search(r"DELETE\s+FROM\s+scans", executabil, re.I), (
-        "migrația șterge din `scans` — se pierde urma scriitorului necunoscut")
+    scriere = _SCRIE_IN_SCANS.search(executabil)
+    assert not scriere, (
+        f"migrația scrie în `scans` — {scriere.group(0)!r} — iar o conversie "
+        f"tăcută rescrie istoric")
+    stergere = _STERGE_DIN_SCANS.search(executabil)
+    assert not stergere, (
+        f"migrația șterge din `scans` — {stergere.group(0)!r} — și se pierde "
+        f"urma scriitorului necunoscut")
 
     assert re.search(r"count\(\*\)\s+INTO\s+n\s+FROM\s+scans\s+WHERE\s+status\s*=\s*'skipped'",
                      cod, re.I), (
@@ -172,7 +259,7 @@ def test_the_migration_proves_the_constraint_bites_instead_of_assuming_it() -> N
     verifică: că blocul chiar rulează așa — asta se vede numai pe un Postgres.
     """
     sql = (MIGRATIONS / "0029_scans_no_skipped.sql").read_text(encoding="utf-8")
-    cod = "\n".join(l for l in sql.splitlines() if not l.lstrip().startswith("--"))
+    cod = _fara_comentarii(sql)
 
     proba = re.search(r"INSERT\s+INTO\s+scans\s*\([^)]*status[^)]*\)\s*VALUES\s*\([^)]*'skipped'[^)]*\)",
                       cod, re.I | re.S)

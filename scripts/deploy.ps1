@@ -412,7 +412,14 @@ try {
     # sees none of that. This list must stay identical to the one in deploy.sh;
     # tests/security/test_package_contents.py compares them, because a Windows
     # deploy that ships what a Linux deploy excludes is the same hole.
-    & $tar --exclude='./secrets' --exclude='./.git' --exclude='./tests' `
+    #
+    # .claude/ is the agent's own working state — settings, worktree
+    # bookkeeping, whatever a session leaves behind. Nothing on the host reads
+    # it, and an agent worktree left in there would push the archive over
+    # $PackageMaxKb: a deploy that stops, not one that ships quietly. Excluded
+    # so that avoidable failure does not happen at all.
+    & $tar --exclude='./secrets' --exclude='./.git' --exclude='./.claude' `
+           --exclude='./tests' `
            --exclude='./docs' --exclude='./watcher' --exclude='./aggregator' `
            --exclude='./scratchpad' `
            --exclude='./dist' `

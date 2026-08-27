@@ -437,10 +437,19 @@ step_packages() {
 }
 
 # --- 21 -------------------------------------------------------------------
-# How long a freshly installed tool gets to answer a version query. There is a
+# How long a freshly installed tool gets to answer ONE version query. There is a
 # ceiling because `nuclei -version` also asks projectdiscovery whether a newer
 # release exists: on a host with no route out, an unbounded probe would hang the
 # installer here rather than report anything.
+#
+# The window per TOOL is three times this constant, not this constant:
+# tool_version_line tries --version, then -version, then version, and each
+# attempt carries its own `timeout`. A binary that hangs on all three therefore
+# costs 3 x 20 = 60 seconds, and the two-tool manifest can spend two minutes
+# here before the step says a word. Measured against a binary that sleeps, with
+# TOOL_PROBE_TIMEOUT_S=2: 6.6 seconds for one tool. The window is accepted as it
+# stands; what was wrong was this comment, which named 20 — the wrong number to
+# give an operator wondering how long a silent step is allowed to stay silent.
 TOOL_PROBE_TIMEOUT_S=20
 
 # Where external binaries land. A defaulted variable rather than a bare
@@ -553,7 +562,20 @@ tool_report_existing() {
 query — Sentinel cannot tell which build it is. Left alone; verify it by hand."
         return 1
     fi
-    if [[ -n "$pinned" && "$found" != *"$pinned"* ]]; then
+    # Equality, not `*"$pinned"*`. The substring test reported a host as being
+    # at the pinned version whenever the pin was a PREFIX of what is installed:
+    # nuclei is on 3.11.x today, so a host carrying 3.11.10 against a manifest
+    # pinning 3.11.1 was announced as "already installed" at the pinned build.
+    # An unreviewed scanner, reported as the reviewed one — the exact claim this
+    # function was added to stop making, and one patch release away from real.
+    #
+    # `found` is already a bare version token in every case that can be proved:
+    # tool_version_line greps `X.Y.Z...` out of the output and only falls back
+    # to a whole line when there is no version in it at all. In that fallback
+    # nothing can be proved, and equality correctly refuses to claim otherwise.
+    # A build answering `0.74.0-dev` against a pin of `0.74.0` is refused for
+    # the same reason: it is not the build whose checksum sits in the manifest.
+    if [[ -n "$pinned" && "$found" != "$pinned" ]]; then
         warn "${name} on PATH at ${path} reports ${found}, but the manifest pins \
 ${pinned}. Left alone — remove it and re-run step 21 to get the pinned build."
         return 1
@@ -680,7 +702,26 @@ Treat it as NOT installed; vulnerability scanning will not use it."
     # the pinned version. An unproven one counts against the verdict too: this
     # line is the last thing about step 21 the operator reads, and a green one
     # over a scanner nobody could identify is the whole failure mode again.
-    if (( n_bad > 0 || n_unproven > 0 )); then
+    #
+    # And "every tool" is vacuously true over no tools at all. A manifest that
+    # holds only comments, or zero bytes, walks the loop zero times, leaves all
+    # four counters at 0, and used to close with
+    # `[+] external tools: 0 installed, 0 already present` — after which
+    # run_step wrote the 21_external_tools marker, so every later run printed
+    # "already done" and the operator never saw the step again. That is the
+    # defect the manifest's own header records for 10 August 2026, one door
+    # further along: the MISSING file was handled, the empty one was not.
+    # Proving nothing is not proving everything.
+    local n_seen=$((n_ok + n_present + n_unproven + n_bad))
+    if (( n_seen == 0 )); then
+        warn "the tools manifest at ${manifest} pins no tools, so step 21 \
+installed nothing. Vulnerability scanning (P7) has no scanners until Trivy and \
+nuclei are listed there — the file is present but holds no entry."
+    # The third clause is implied by the two before it as the counters stand
+    # today. It is written out anyway because the rule is "green requires at
+    # least one tool proved present", and that must not have to be re-derived
+    # from the counters by whoever adds the fifth one.
+    elif (( n_bad > 0 || n_unproven > 0 || n_ok + n_present == 0 )); then
         warn "external tools: ${n_ok} installed, ${n_present} already present at the \
 pinned version, ${n_unproven} present but unverified, ${n_bad} NOT installed. \
 Vulnerability coverage is not proven for those — see the lines above."

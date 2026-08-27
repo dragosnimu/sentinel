@@ -356,11 +356,20 @@ info "packaging the repository"
 # against a newer tree. That last one is not hypothetical — it clobbered this
 # working tree twice during E2.2.
 #
+# .claude/ is the agent's own working state — settings, worktree bookkeeping,
+# whatever a session leaves behind. Nothing on the host reads it. Leaving it in
+# would not leak anything: the size ceiling below would `die` once an agent
+# worktree grew under it, so the failure mode is a deploy that stops, not one
+# that ships quietly. It is excluded because that failure is avoidable with one
+# line, and a deploy that dies on a directory the server has no use for is an
+# outage nobody learns anything from.
+#
 # The list is an intention. `tests/security/test_package_contents.py` builds a
 # real archive with a file planted under scratchpad/ and asserts `tar -tzf`
 # does not list it, because the archive is the effect.
 tar --exclude='./secrets' \
     --exclude='./.git' \
+    --exclude='./.claude' \
     --exclude='./tests' \
     --exclude='./docs' \
     --exclude='./watcher' \

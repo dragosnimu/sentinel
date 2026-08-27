@@ -620,6 +620,15 @@ def test_a_row_older_than_any_permitted_threshold_is_stuck_whatever_the_constant
     Vârsta de aici e derivată din UNITATE plus marja maximă admisă, nu din
     `STUCK_SCAN_HOURS`: un scenariu scris relativ la constantă se mută odată cu
     ea, și de-aia n-a prins nici constanta umflată, nici greșeala de unități.
+
+    CINE DEZARMEAZĂ TESTUL ĂSTA: `_MARJA_MAXIMA_S`, o singură linie mai sus.
+    Scenariul de aici e derivat din ea, deci urcarea ei mută și pragul pe care
+    invariantul îl admite, ȘI vârsta rândului din proba de purtare — cele două
+    gărzi se moaie împreună, tăcut, cu suita verde. Nu e un defect: o constantă
+    de test poate fi mereu mutată de cine o citește. E scris aici fiindcă
+    „mai lasă-i loc marjei" e o editare care arată nevinovată și le stinge pe
+    amândouă dintr-o dată, iar argumentul pentru cele două ore stă la constantă,
+    nu la editorul care o schimbă.
     """
     prea_vechi_ore = (_timeout_start_sec() + _MARJA_MAXIMA_S) / 3600 + 0.5
     (r,) = run(checks.check_last_scan(
