@@ -1,0 +1,138 @@
+-- 0030_dashboard_indexes: doi indecși parțiali care scot panourile paginii
+-- principale de sub volumul brut al tabelei.
+--
+-- ## Ce s-a măsurat, și de ce ăsta e defectul
+--
+-- Pe gazdă, `raw_events_20260824` are 5 600 000 de rânduri și 2932 MB —
+-- 87,7% `auditd`, iar 68,3% din toate rândurile au `action = 'command'`
+-- (pg_stats, 27 august 2026). Rândurile OSTILE, adică singurele pe care le
+-- vrea jumătate din pagină, sunt 5,8% din ele.
+--
+-- Panourile care întreabă „de unde vin atacurile" filtrează pe
+-- `action IN ('auth_fail','alert')` fără să numească vreo sursă. Niciun index
+-- existent nu e selectiv pe atât: `raw_events_source_idx` are `source` prima
+-- coloană, deci fără o valoare pentru ea planificatorul îl parcurge ÎNTREG și
+-- filtrează. `EXPLAIN` pe gazdă arată exact asta — `Index Scan using
+-- raw_events_20260824_source_action_ts_idx ... (cost=0.44..321465.69
+-- rows=58215)` pentru `by_country`, adică 5,6 milioane de intrări citite ca să
+-- se aleagă 58 de mii.
+--
+-- Consecința e cea care contează: costul panourilor ostile crește cu volumul
+-- BRUT, nu cu volumul ostil. O rafală de `auditd` — și 24 august a fost una —
+-- încetinește panouri care n-au cerut niciodată un rând de `auditd`.
+--
+-- ## Ce se adaugă
+--
+-- `raw_events_hostile_idx` — parțial pe `action IN ('auth_fail','alert')`,
+-- cheie `ts DESC`, cu `INCLUDE (src_ip, source, geo_country, geo_asn,
+-- geo_as_org)` ca citirea să fie `Index Only Scan` și să nu mai atingă heap-ul.
+-- Deservește `by_country`, `by_asn`, `top_attackers`, `hourly_activity`,
+-- `_concentrated_asn_insight`, `_trend_insight` și verdictul din `posture`.
+--
+-- `raw_events_notfound_idx` — parțial pe `http_status = 404`, cheie
+-- `(ts DESC, http_path)`, `INCLUDE (src_ip)`. Deservește `probed_paths` și
+-- `_probe_campaign_insights`. 404-urile sunt câteva mii pe săptămână, deci
+-- indexul e mic; planul de dinainte făcea `Bitmap Heap Scan` peste două
+-- bitmap-uri de ~420 000 de intrări fiecare ca să scoată 1298 de rânduri.
+--
+-- ## Ce s-a măsurat cu ei, și unde
+--
+-- Într-o replică locală a formei de pe gazdă (PostgreSQL 16, aceleași
+-- proporții din `pg_stats`, partiție de 5,6 M rânduri / 2992 MB), pe același
+-- set de interogări:
+--
+--     probed_paths        992 ms → 28 ms
+--     _probe_campaign     957 ms → 33 ms
+--     top_attackers       147 ms → 24 ms
+--     by_country          818 ms → 175 ms   (împreună cu rescrierea din aggregate.py)
+--     by_asn              824 ms → 100 ms
+--     _concentrated_asn   774 ms → 98 ms
+--
+-- Pe schema reală (toate migrațiile aplicate) și prin codul din depozit, o
+-- încărcare completă a paginii — `analytics.page.load` — a trecut de la 8114 ms
+-- (SQL-ul dinainte, fără indecșii ăștia) la 2480 ms. La 10 GB de `raw_events`,
+-- aceleași două măsurători sunt 15 890 ms și 4500 ms.
+--
+-- Și proprietatea care contează mai mult decât cifrele: adăugând 5,6 milioane
+-- de rânduri de `auditd/command` — creșterea REALĂ de pe gazdă, care n-a adus
+-- trafic ostil în plus — panourile ostile n-au crescut: `probed_paths` 63 ms →
+-- 63 ms, `by_asn` 172 ms → 172 ms. Înainte, aceleași rânduri de `auditd` erau
+-- citite de fiecare dintre ele.
+--
+-- Replica are alt disc decât gazda, deci CIFRELE ABSOLUTE nu se transferă;
+-- forma planului da — `Index Only Scan`, `Heap Fetches: 0`.
+--
+-- ## Ce NU se adaugă, și de ce
+--
+-- Un index pentru `ids_signatures` (`source = 'suricata'`, grupat pe
+-- `raw->>'signature'`). S-a construit și s-a măsurat: PostgreSQL 16 NU poate
+-- întoarce o coloană-EXPRESIE dintr-un index într-un `Index Only Scan`, deci
+-- indexul e folosit ca `Index Scan` obișnuit și tot heap-ul se citește la fel.
+-- Verificat pe replică forțând planul: aceleași ~253 000 de citiri de pagini
+-- cu index și fără. Un index care nu schimbă nimic dar se scrie la fiecare
+-- INSERT e cost curat, deci nu e aici. Ce ar rezolva panoul ăla e o coloană
+-- reală pentru semnătură sau o fereastră mai scurtă — amândouă sunt decizii,
+-- nu detalii de implementare.
+--
+-- Un index pe `(source, ts DESC)` pentru `sources` și `_gap_insights`.
+-- Interogările alea au fost rescrise (vezi `aggregate.sources`) ca să facă
+-- ~20 de căutări punctuale în `raw_events_source_idx`, câte una pe pereche
+-- (sursă, acțiune), în loc de o parcurgere a întregului index. Un index nou
+-- de ~200 MB pentru o problemă deja rezolvată prin interogare ar fi cost fără
+-- câștig.
+--
+-- ## De ce nu CONCURRENTLY, și ce costă asta
+--
+-- Runner-ul aplică fiecare fișier într-o tranzacție, iar `CREATE INDEX
+-- CONCURRENTLY` este interzis într-una — aceeași constrângere ca la 0019.
+--
+-- Diferența față de 0019 e că acolo tabela avea 978 de rânduri, iar aici are
+-- milioane, și 0019 spune explicit că la volumul ăsta indexul se face în afara
+-- unei migrații. Motivul pentru care se face totuși aici: pe o tabelă
+-- PARTIȚIONATĂ construcția e per partiție, iar partițiile vechi nu mai primesc
+-- inserări — ingestul de azi scrie doar în partiția de azi, care are zeci de
+-- mii de rânduri. Lacătul care doare e cel de pe părinte, cât ține construcția
+-- pe partiția mare.
+--
+-- **Cât ține nu s-a putut măsura pe gazdă** — ar fi însemnat să construiesc
+-- indexul acolo. Pe replica locală (NVMe, cache cald) au fost 847 ms pentru
+-- toate cele 37 de partiții; discul gazdei e mai lent, deci așteaptă-te la
+-- ordinul zecilor de secunde, nu la milisecunde. În intervalul ăla ingestul
+-- așteaptă; nu pierde evenimente (colectorii au propriile cursoare), dar
+-- migrația nu e una de rulat în mijlocul unui atac.
+
+CREATE INDEX raw_events_hostile_idx
+    ON raw_events (ts DESC)
+    INCLUDE (src_ip, source, geo_country, geo_asn, geo_as_org)
+    WHERE action IN ('auth_fail', 'alert');
+
+CREATE INDEX raw_events_notfound_idx
+    ON raw_events (ts DESC, http_path)
+    INCLUDE (src_ip)
+    WHERE http_status = 404;
+
+-- ## Unde e blocul care dovedește efectul, ca la 0029
+--
+-- Nu e aici, și motivul merită scris.
+--
+-- Prima variantă număra partițiile din `pg_inherits` și le compara cu numărul
+-- de indecși-copil, ca să prindă o partiție rămasă fără index. Blocul ăla a
+-- fost scris, pus în migrație, și apoi s-a încercat să fie făcut să PICE — pe o
+-- replică, desprinzând un index-copil. Nu se poate: `ALTER INDEX ... DETACH
+-- PARTITION` nu există, iar `DROP INDEX` pe copil e refuzat („cannot drop index
+-- ... because index ... requires it"). PostgreSQL 11+ creează indexul și la
+-- `CREATE TABLE ... PARTITION OF`, și la `ATTACH PARTITION`. Invariantul e
+-- ținut de motor, deci verificarea nu putea să iasă falsă NICIODATĂ — adică
+-- exact tiparul din CLAUDE.md, un grep după un tipar inexistent care raportează
+-- „nimic în neregulă" pe vecie.
+--
+-- Iar ce ar fi dovedit ceva — că planificatorul chiar ALEGE indexul — nu se
+-- poate cere într-o migrație: instalarea rulează migrațiile pe o bază goală,
+-- unde orice planificator sănătos alege `Seq Scan`, deci aserțiunea ar rupe
+-- fiecare instalare nouă.
+--
+-- Dovada de efect pentru schimbarea asta stă în altă parte, și rulează la 5
+-- minute, nu o dată: `selfcheck.checks.check_dashboard_latency` măsoară o
+-- încărcare reală a paginii și o compară cu `proxy_read_timeout`. Dacă indexul
+-- ăsta nu ajunge, sau încetează să ajungă, aia o spune — pe date reale, pe
+-- gazda reală, cu operatorul la capătul canalului.

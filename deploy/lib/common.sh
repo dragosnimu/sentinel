@@ -65,6 +65,45 @@ mark_done() {
 clear_step() { rm -f "${STATE_MARKERS}/$1"; }
 
 # --------------------------------------------------------------------------
+# Install facts: what was true BEFORE Sentinel touched this host
+# --------------------------------------------------------------------------
+# A marker answers "was this done"; a fact answers "what did we find". The
+# difference only matters for something observable once, and "is nginx
+# installed?" is exactly that: after the first deploy it is true because WE
+# installed it. An observation repeated on every run therefore converges on the
+# wrong answer and then stays there — step 20 appended NGINX_WAS_PREEXISTING=1
+# to preflight.env on each re-run, and step 33 spent every deploy afterwards
+# declining to touch "your" nginx.conf, which was ours.
+#
+# A fact is one value per file, next to the markers, and WRITE-ONCE: the first
+# observation wins and no later run can change it. Facts deliberately do NOT
+# live in preflight.env — step 1 rewrites that file with ">" whenever it runs,
+# and a record another step truncates is not a record.
+INSTALL_FACTS="${STATE_MARKERS}/facts"
+
+fact_recorded() { [[ -f "${INSTALL_FACTS}/$1" ]]; }
+
+fact_read() {
+    [[ -f "${INSTALL_FACTS}/$1" ]] || return 1
+    head -1 "${INSTALL_FACTS}/$1"
+}
+
+# Record NAME=VALUE unless it is already on record, and print what is on record
+# NOW — the FIRST value ever offered, which is not always the one passed in.
+# Callers use what comes back rather than their own argument, so that a later
+# re-observation cannot act on something the file does not say.
+fact_record_once() {
+    local name="$1" value="$2"
+    if [[ -f "${INSTALL_FACTS}/${name}" ]]; then
+        head -1 "${INSTALL_FACTS}/${name}"
+        return 0
+    fi
+    mkdir -p "$INSTALL_FACTS"
+    printf '%s\n' "$value" > "${INSTALL_FACTS}/${name}"
+    printf '%s\n' "$value"
+}
+
+# --------------------------------------------------------------------------
 # --force-step: a LIST, not one number
 # --------------------------------------------------------------------------
 # One number was enough while every step stood on its own. Rotating
@@ -280,8 +319,29 @@ erau deja marcați și NU au rulat:"
 # first snapshot ever taken; on 21 August 2026 a deploy printed one whose files
 # were dated 31 July. Cheap to redo (a few `nft list`, `rpm -qa` and a tar), and
 # worthless if stale, so it re-runs every time.
+#
+# `suricata` (35) is the one entry whose re-run is not cheap, and it is here by
+# the operator's decision of 26 August 2026. It qualifies under the rule above:
+# the OPTIONS line and the systemd drop-in are written by this installer, so
+# they carry repo content that changes between releases. Without it the
+# 25 August repair — which stopped the daemon capturing on a device that is not
+# this host's NIC — would never reach a host that is already installed,
+# production included, unless somebody remembered `--force-step 35`.
+#
+# The cost the operator accepted is `suricata-update` plus a `suricata -T` over
+# the whole ruleset on every deploy. MEASURED on the 24.04.4 test VM
+# (10.30.1.134) on 27 August 2026, same code, same host, back to back: a
+# change-nothing deploy took 332 s with this entry and 148 s without it. So the
+# entry costs about 3 minutes, and 132 s of that is `suricata -T` alone, timed
+# on its own. That is the figure the decision was taken on; if it grows much
+# past three minutes the ruleset has grown, not this list.
+#
+# The IDS itself is NOT bounced for it — `suricata_needs_restart` asks the
+# RUNNING argv whether it already carries the options just written, so a re-run
+# that changes nothing leaves the daemon up. Observed on the VM, twice:
+# "suricata already runs with these options; not restarting it".
 ALWAYS_STEPS="package claude_workspace configs migrate systemd start_services \
-nginx nginx_shared auxiliary snapshot"
+nginx nginx_shared suricata auxiliary snapshot"
 
 step_is_always() {
     case " ${ALWAYS_STEPS} " in *" $1 "*) return 0 ;; *) return 1 ;; esac

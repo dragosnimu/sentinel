@@ -40,6 +40,7 @@ import asyncio
 import os
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -2330,6 +2331,129 @@ async def check_instance_identity(db: Database) -> list[CheckResult]:
 
 
 # ---------------------------------------------------------------------------
+# Panoul web: cât durează o încărcare
+# ---------------------------------------------------------------------------
+#: `proxy_read_timeout` din vhostul Sentinel, în secunde.
+#:
+#: E singurul număr din sistem care decide dacă operatorul VEDE pagina. Peste
+#: el, nginx închide conexiunea către upstream și răspunde `504 Gateway
+#: Time-out`; ce mai face aplicația după aceea nu mai ajunge la nimeni. Pe 25
+#: august 2026 pagina a răspuns în 124 871 ms, iar operatorul a primit 504 —
+#: aplicația a terminat de randat, doar că vorbea singură.
+#:
+#: Copia de aici e legată de `deploy/nginx/*.conf.tmpl` printr-un test care
+#: pică dacă cele două se despart. Aceeași construcție ca `STUCK_SCAN_HOURS`
+#: față de `TimeoutStartSec`, și din același motiv: un prag scris de mână lângă
+#: o valoare care se poate schimba în altă parte încetează tăcut să însemne
+#: ceva.
+DASHBOARD_PROXY_TIMEOUT_S = 60
+
+#: Cât din bugetul ăla are voie să consume o încărcare înainte să fie numită
+#: „degradată".
+#:
+#: E o DECIZIE, nu un calcul, și e luată aici la jumătate. Argumentul: sub
+#: jumătate, o dublare a volumului de date lasă pagina tot în picioare; peste
+#: jumătate, următoarea dublare o trece de `proxy_read_timeout` și operatorul
+#: primește 504. Volumul ăsta chiar se dublează — 24 august a adus 5,6 milioane
+#: de rânduri într-o zi, față de ~28 000 într-una obișnuită — deci „o dublare
+#: distanță de eșec" e o descriere corectă a stării, nu o marjă inventată.
+#:
+#: O fracțiune mai mică ar fi un prag de confort, nu de funcționare, iar un prag
+#: de confort pe care nimeni nu l-a argumentat e primul care ajunge ignorat.
+_DASHBOARD_BUGET = 0.5
+
+#: Peste atâtea secunde încărcarea e „degradată". Derivat, nu ales.
+DASHBOARD_SLOW_S = DASHBOARD_PROXY_TIMEOUT_S * _DASHBOARD_BUGET
+
+
+async def check_dashboard_latency(db: Database) -> list[CheckResult]:
+    """Cât durează să se adune datele paginii principale.
+
+    Eșecul pe care îl repară, trăit pe 25 august 2026: pagina lua 45–126
+    secunde, operatorul primea `504`, iar `sentinel-watchdog` raporta `web=up`
+    fiindcă sondează `/healthz`, care răspunde în 13 ms pentru că nu atinge
+    nimic. Verificarea nu putea vedea defectul PRIN CONSTRUCȚIE: sonda măsura
+    altceva decât ce se stricase.
+
+    De ce nu s-a îngreunat `/healthz` în loc de asta. Watchdog-ul GOLEȘTE
+    blocklistul când `/healthz` e nesănătos cinci minute la rând (vezi
+    `respond/watchdog.py`). O sondă care ar atinge o interogare reprezentativă
+    ar transforma o bază de date încet într-o deblocare automată a tuturor
+    atacatorilor — adică fix scenariul pe care nu-l vrei într-o zi în care baza
+    de date e încet fiindcă cineva te atacă. `/healthz` rămâne terse și ieftin
+    tocmai ca să răspundă când restul nu poate.
+
+    Ce se măsoară e `analytics.page.load` — aceeași funcție pe care o apelează
+    routerul, nu o copie a listei ei. Costul: o încărcare la fiecare rulare de
+    selfcheck, adică la 5 minute. Când pagina e sănătoasă e sub o secundă și nu
+    se simte; când e stricată, sonda devine ea însăși scumpă — mărginit la
+    `DASHBOARD_PROXY_TIMEOUT_S`, și exact atunci când operatorul trebuie să afle.
+    Alternativa, o sondă ieftină care nu atinge datele, e chiar defectul de mai
+    sus.
+
+    Emite mereu exact o cheie. „N-am putut măsura" e `unknown`, nu tăcere și nu
+    `ok`: runner-ul reconciliază cheile lipsă ca pe constatări retrase, deci o
+    ramură tăcută ar șterge o constatare roșie și ar arăta o revenire care nu
+    s-a întâmplat.
+    """
+    from sentinel.analytics import page
+
+    key = "web:dashboard"
+    inceput = time.monotonic()
+    try:
+        # `wait_for`, nu `asyncio.timeout`: proiectul cere Python >= 3.10, iar
+        # managerul de context a apărut în 3.11.
+        await asyncio.wait_for(page.load(db), DASHBOARD_PROXY_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        return [CheckResult(
+            key, "Panoul web nu se mai încarcă", "down",
+            detail=f"datele paginii au trecut de {DASHBOARD_PROXY_TIMEOUT_S:.0f}s, "
+                   f"adică de `proxy_read_timeout` — nginx a răspuns deja 504 "
+                   f"oricui a deschis pagina",
+            action="sentinel migrate (indecșii din 0030) ; "
+                   "verifică volumul din raw_events pe ultima zi",
+            facts={"durata_s": None, "prag_s": DASHBOARD_PROXY_TIMEOUT_S,
+                   "peste_proxy_read_timeout": True})]
+    except Exception as exc:  # noqa: BLE001 - orice cădere e o măsurătoare ratată
+        durata = time.monotonic() - inceput
+        # `statement_timeout` e 30s pe pool, deci o interogare care îl atinge
+        # cade cu excepție în loc să se termine. Aia NU e „n-am putut măsura":
+        # aceeași excepție ar fi ieșit și pe cererea operatorului, ca pagină de
+        # eroare. Se raportează după cât a durat până a căzut, nu după faptul că
+        # a căzut.
+        if durata >= DASHBOARD_SLOW_S:
+            return [CheckResult(
+                key, "Panoul web a căzut la încărcare", "down",
+                detail=f"datele paginii au eșuat după {durata:.1f}s: "
+                       f"{str(exc)[:120]}",
+                action="journalctl -u sentinel-web -n 50",
+                facts={"durata_s": round(durata, 1),
+                       "prag_s": DASHBOARD_SLOW_S, "eroare": str(exc)[:200]})]
+        return [CheckResult(
+            key, "Durata panoului web", "unknown",
+            detail=f"nu s-a putut măsura după {durata:.1f}s: {str(exc)[:120]}",
+            action="journalctl -u sentinel-web -n 50",
+            facts={"durata_s": round(durata, 1), "eroare": str(exc)[:200]})]
+
+    durata = time.monotonic() - inceput
+    if durata >= DASHBOARD_SLOW_S:
+        return [CheckResult(
+            key, "Panoul web se încarcă greu", "degraded",
+            detail=f"datele paginii în {durata:.1f}s, peste jumătate din "
+                   f"`proxy_read_timeout` ({DASHBOARD_PROXY_TIMEOUT_S:.0f}s). "
+                   f"La următoarea dublare de volum operatorul primește 504.",
+            action="sentinel migrate (indecșii din 0030) ; "
+                   "verifică volumul din raw_events pe ultima zi",
+            facts={"durata_s": round(durata, 1), "prag_s": DASHBOARD_SLOW_S})]
+    return [CheckResult(
+        key, "Durata panoului web", "ok",
+        detail=f"datele paginii în {durata:.1f}s "
+               f"(prag {DASHBOARD_SLOW_S:.0f}s, `proxy_read_timeout` "
+               f"{DASHBOARD_PROXY_TIMEOUT_S:.0f}s)",
+        facts={"durata_s": round(durata, 1), "prag_s": DASHBOARD_SLOW_S})]
+
+
+# ---------------------------------------------------------------------------
 CHECKS: tuple[tuple[str, Callable], ...] = (
     ("units", check_units),
     ("timers", check_timers),
@@ -2348,6 +2472,7 @@ CHECKS: tuple[tuple[str, Callable], ...] = (
     ("beacon", check_beacon_delivery),
     ("alerting", check_alerting),
     ("autonomy", check_autonomy),
+    ("dashboard", check_dashboard_latency),
 )
 
 

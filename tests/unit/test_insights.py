@@ -72,6 +72,96 @@ def test_intermittent_source_gets_a_longer_leash():
     assert run(ins._gap_insights(db)) == []
 
 
+def test_a_source_with_no_events_at_all_is_the_loudest_silence():
+    """O sursă din inventar fără niciun eveniment în 30 de zile e cel mai mort colector.
+
+    Eșecul pe care îl previne: `float(r["hours_silent"] or 0)`. Când
+    `max(ts)` nu găsește nimic, `hours_silent` iese NULL, iar `or 0` îl citește
+    ca „văzută acum" — deci regula tace exact despre sursa care n-a mai scris
+    niciodată. E aceeași formă cu pana pe care regula o previne (tăcerea arată
+    identic cu liniștea), doar mutată în Python.
+    """
+    db = _StubDB(fetch_map={"hours_silent": [
+        {"source": "suricata", "last_seen": None, "hours_silent": None},
+    ]})
+    out = run(ins._gap_insights(db))
+    assert len(out) == 1, "o sursă fără niciun eveniment n-a produs nicio constatare"
+    assert out[0].level == "critical"
+    assert "suricata" in out[0].title
+
+
+def test_an_empty_inventory_says_it_cannot_know_instead_of_all_clear():
+    """Fără inventar de surse, „nimic tăcut" e o minciună, nu o constatare.
+
+    Eșecul pe care îl previne: inventarul de perechi (sursă, acțiune) vine din
+    `event_rollup_1m`. O sursă care a amuțit nu apare în date — de-aia e nevoie
+    de inventar ca să se știe că ar fi trebuit să apară. Dacă jobul de
+    întreținere moare, tabela rămâne pe loc, lista se golește, iar regula ar
+    întoarce zero constatări: operatorul citește „niciun colector oprit" fix
+    când nimeni nu mai poate spune dacă vreunul e oprit.
+    """
+    db = _StubDB(val_map={"max(bucket)": None}, fetch_map={"hours_silent": []})
+    out = run(ins._gap_insights(db))
+    assert len(out) == 1, "un inventar gol a produs tăcere, nu o constatare"
+    assert "amuțit" in out[0].title or "nu se poate" in out[0].title.lower()
+    assert out[0].evidence["rollup_lag_ore"] is None
+
+
+def test_a_stale_inventory_is_also_refused():
+    """Un inventar mai vechi decât cel mai scurt prag de tăcere nu poate fi crezut.
+
+    Eșecul pe care îl previne: rollup-ul rămâne în urmă cu o zi (jobul rulează,
+    dar cade). O sursă pornită și amuțită între timp nu intră niciodată în
+    inventar, deci regula raportează liniștită „nimic tăcut". Pragul nu e ales:
+    e cel mai scurt interval pe care regula însăși îl numește tăcere.
+    """
+    lag = ins._TACERE_MINIMA_H + 1
+    db = _StubDB(val_map={"max(bucket)": float(lag)}, fetch_map={"hours_silent": []})
+    out = run(ins._gap_insights(db))
+    assert len(out) == 1, f"un inventar vechi de {lag}h a fost crezut pe cuvânt"
+    assert out[0].evidence["rollup_lag_ore"] == lag
+
+
+def test_a_fresh_inventory_is_used_rather_than_refused():
+    """Cealaltă margine: un rollup normal nu are voie să blocheze regula.
+
+    Eșecul pe care îl previne: garda de mai sus scrisă cu `>=` sau cu pragul
+    greșit. Jobul de întreținere rulează din oră în oră, deci un lag de câteva
+    ore e starea OBIȘNUITĂ; o gardă prea strâmtă ar înlocui permanent
+    detectorul de colectori tăcuți cu un avertisment despre el însuși, iar
+    tăcerea unei surse n-ar mai fi raportată niciodată.
+    """
+    db = _StubDB(val_map={"max(bucket)": float(ins._TACERE_MINIMA_H - 0.5)},
+                 fetch_map={"hours_silent": [
+                     {"source": "sshd", "last_seen": NOW - timedelta(hours=30),
+                      "hours_silent": 30.0}]})
+    out = run(ins._gap_insights(db))
+    assert len(out) == 1
+    assert "sshd" in out[0].title, (
+        "garda de prospețime a înghițit constatarea reală: "
+        f"{out[0].title}")
+
+
+def test_the_inventory_guard_matches_the_shortest_silence_the_rule_reports():
+    """Garda inventarului și pragul de tăcere se mișcă împreună.
+
+    Eșecul pe care îl previne: cineva coboară pragul surselor mereu-active de la
+    6 ore la 2 („să aflăm mai repede"), garda rămâne la 6, iar între 2 și 6 ore
+    inventarul are voie să fie mai vechi decât tăcerea pe care regula o judecă —
+    fereastra în care o sursă poate apărea și amuți fără să fie văzută vreodată.
+    Se verifică pe PURTARE: o tăcere exact cât garda trebuie să fie raportată.
+    """
+    db = _StubDB(fetch_map={"hours_silent": [
+        {"source": "nginx", "last_seen": NOW - timedelta(hours=ins._TACERE_MINIMA_H),
+         "hours_silent": float(ins._TACERE_MINIMA_H)},
+    ]})
+    out = run(ins._gap_insights(db))
+    assert len(out) == 1, (
+        f"o tăcere de {ins._TACERE_MINIMA_H}h — exact cât e garda inventarului — "
+        f"n-a fost raportată, deci garda e mai largă decât regula pe care o "
+        f"apără")
+
+
 # --- multi-vector attackers -------------------------------------------------
 def test_multivector_requires_three_sources():
     db = _StubDB(fetch_map={"count(DISTINCT source) >= 3": [
@@ -87,7 +177,7 @@ def test_no_multivector_no_insight():
 
 # --- SSH targeting ----------------------------------------------------------
 def test_root_targeting_raises_a_hardening_action():
-    db = _StubDB(fetch_map={"action = 'auth_fail' AND username IS NOT NULL": [
+    db = _StubDB(fetch_map={"source = 'sshd' AND action = 'auth_fail'": [
         {"username": "root", "n": 919, "ips": 73},
         {"username": "admin", "n": 98, "ips": 16},
     ]})
@@ -98,7 +188,7 @@ def test_root_targeting_raises_a_hardening_action():
 
 
 def test_light_root_targeting_does_not_nag():
-    db = _StubDB(fetch_map={"action = 'auth_fail' AND username IS NOT NULL": [
+    db = _StubDB(fetch_map={"source = 'sshd' AND action = 'auth_fail'": [
         {"username": "root", "n": 4, "ips": 1},
     ]})
     out = run(ins._ssh_target_insights(db))

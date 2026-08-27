@@ -429,29 +429,10 @@ def test_trivy_gets_a_shorter_deadline_than_the_one_we_enforce() -> None:
     cerut = argv[argv.index("--timeout") + 1]
     assert cerut.endswith("s") and int(cerut[:-1]) == trivy_fs.TRIVY_TIMEOUT_S
     assert trivy_fs.TRIVY_TIMEOUT_S < trivy_fs.TIMEOUT_S
-
-
-def test_the_per_scanner_ceilings_fit_inside_the_unit_budget() -> None:
-    """Un scaner lent nu are voie să mănânce fereastra celorlalte.
-
-    Eșecul pe care îl previne: `sentinel-scan.service` are `TimeoutStartSec`, iar
-    systemd omoară TOATĂ unitatea la el. Fără plafoane proprii, sub al unității,
-    un trivy care se împotmolește lasă dnf-ul de a doua zi nerulat — și, mai rău,
-    rândul `running` rămas în urmă umbrește ultimul rezultat real în panou.
-    """
-    from sentinel.scan import os_packages, trivy_image
-
-    valori = re.findall(r"^TimeoutStartSec=(\d+)\s*$",
-                        UNIT.read_text(encoding="utf-8"), re.M)
-    assert len(valori) == 1, valori
-    buget = int(valori[0])
-    # Fiecare scaner adăugat intră în sumă aici. Varianta care descoperă singură
-    # modulele — deci prinde și un al patrulea scaner scris fără să se atingă
-    # testul ăsta — e în `test_scan_trivy_image.py`.
-    suma = os_packages.TIMEOUT_S + trivy_fs.TIMEOUT_S + trivy_image.TIMEOUT_S
-    assert suma < buget, (
-        f"plafoanele scanerelor însumează {suma}s, iar unitatea e omorâtă la "
-        f"{buget}s: ultimul scaner din listă poate să nu apuce să ruleze")
+    assert (trivy_fs.TRIVY_TIMEOUT_S + trivy_fs.TRIVY_GRACE_S
+            <= trivy_fs.TIMEOUT_S - trivy_fs.VERSION_TIMEOUT_S), (
+        "prima cale nu încape întreagă în termenul rulării, deși i se dă "
+        "plafonul întreg: o rulare cu o singură cale ar depăși bugetul")
 
 
 # --------------------------------------------------------------------------
@@ -713,6 +694,234 @@ def test_a_path_that_fails_stops_the_whole_run(monkeypatch, tmp_path) -> None:
     items, eroare, _ = run(trivy_fs.scan([str(a), str(b)]))
     assert items == [], "constatările primei căi au fost întoarse ca rezultat complet"
     assert eroare and "walk error" in eroare and str(b) in eroare
+
+
+# --------------------------------------------------------------------------
+# Bugetul de timp: UN termen peste toate căile, nu un plafon per cale
+# --------------------------------------------------------------------------
+class _Ceas:
+    """Ceas fals pentru `trivy_fs.time`, ca bugetul să fie măsurat, nu presupus.
+
+    Doar `monotonic`, și doar numele din `trivy_fs`: ceasul pe care îl citește
+    bucla de evenimente a lui asyncio rămâne cel real, altfel `asyncio.run` s-ar
+    trezi cu timpul mutat de sub picioare.
+    """
+
+    def __init__(self) -> None:
+        self.acum = 0.0
+
+    def monotonic(self) -> float:
+        return self.acum
+
+
+def _trivy_care_consuma(monkeypatch, ceas, *, payload=None, rc=0, err=""):
+    """trivy fals care CHELTUIE tot plafonul primit și notează când a pornit.
+
+    Cazul cel mai rău, dinadins: un trivy care își ignoră propriul `--timeout` și
+    atârnă până îl omorâm noi. Un buget probat pe un trivy cuminte n-ar fi probat
+    pe nimic — el există tocmai pentru cel care nu e.
+
+    `rc` poate fi o listă, câte un cod per cale, ca o cale să reușească și
+    următoarea să cadă.
+    """
+    apeluri: list[dict] = []
+    stare = {"i": 0}
+
+    async def fake_run(argv, timeout):
+        apeluri.append({"argv": list(argv), "timeout": timeout,
+                        "start": ceas.acum})
+        ceas.acum += timeout
+        if "version" in argv:
+            return 0, json.dumps({"Version": "0.74.0", "VulnerabilityDB": _meta(
+                NOW.strftime("%Y-%m-%dT%H:%M:%SZ"))}), ""
+        i = stare["i"]
+        stare["i"] += 1
+        with open(argv[argv.index("--output") + 1], "w", encoding="utf-8",
+                  newline="") as fh:
+            json.dump(payload if payload is not None
+                      else {"SchemaVersion": 2, "Results": None}, fh)
+        return (rc if isinstance(rc, int) else rc[min(i, len(rc) - 1)]), "", err
+
+    monkeypatch.setattr(trivy_fs, "_run", fake_run)
+    monkeypatch.setattr(trivy_fs, "time", ceas)
+    monkeypatch.setattr(trivy_fs, "BINARY", os.path.abspath(__file__))
+    return apeluri
+
+
+def _cai(tmp_path, cate):
+    """`cate` directoare care chiar există, ca `scan()` să nu iasă pe poarta lor."""
+    out = []
+    for i in range(cate):
+        d = tmp_path / f"cale-{i}"
+        d.mkdir(parents=True)
+        out.append(str(d))
+    return out
+
+
+def _fs(apeluri):
+    return [a for a in apeluri if "fs" in a["argv"]]
+
+
+@pytest.mark.parametrize("cate", [1, 2, 4, 8])
+def test_the_budget_is_one_deadline_over_all_paths_not_a_ceiling_per_path(
+        monkeypatch, tmp_path, cate) -> None:
+    """Plafonul nu are voie să se înmulțească cu numărul de căi din configurație.
+
+    Eșecul pe care îl previne, exact așa cum a fost livrat: `TIMEOUT_S` dat lui
+    `_run` ÎNĂUNTRUL buclei peste căi. Plafonul real era atunci `TIMEOUT_S` înmulțit
+    cu câte căi are `scan.discovery_paths` — 4 × 1800 cu implicitul, 8 × 1800 dacă
+    operatorul mai adaugă patru. `sentinel-scan.service` omoară TOATĂ unitatea la
+    `TimeoutStartSec`, deci `trivy_image` și ce vine după el n-ar mai rula deloc,
+    iar rândul lor `running` ar umbri ultimul rezultat real în panou.
+
+    Măsurat, nu presupus: ceasul lui `trivy_fs` e fals și fiecare rulare de trivy
+    cheltuie tot ce i s-a dat. Ce se asertează e cât a trecut, nu ce scrie într-o
+    constantă.
+    """
+    ceas = _Ceas()
+    apeluri = _trivy_care_consuma(monkeypatch, ceas)
+    run(trivy_fs.scan(_cai(tmp_path, cate)))
+
+    assert _fs(apeluri), (
+        "niciun trivy n-a fost chemat, deci măsurătoarea de mai jos ar trece "
+        "oricât ar fi bugetul")
+    assert ceas.acum <= trivy_fs.TIMEOUT_S, (
+        f"cu {cate} căi rularea a ținut {ceas.acum:.0f}s, iar plafonul pe care "
+        f"îl declară `TIMEOUT_S` e {trivy_fs.TIMEOUT_S}s")
+
+
+def test_the_measured_ceiling_fits_inside_the_unit_budget(monkeypatch, tmp_path) -> None:
+    """Suma constantelor nu e bugetul; cât ține scanarea pe ceas e.
+
+    Eșecul pe care îl previne: aserțiunea care aduna
+    `os_packages.TIMEOUT_S + trivy_fs.TIMEOUT_S + trivy_image.TIMEOUT_S`, dădea
+    5700 și trecea — în timp ce `trivy_fs` chiar ținea de patru ori constanta lui,
+    adică 11100. Testul păzea o sumă pe care nimeni n-o respecta. Când unitatea e
+    omorâtă la `TimeoutStartSec`, scanerul din coadă nu mai rulează și rândul lui
+    rămâne `running` peste ultimul rezultat real.
+
+    Numărul lui `trivy_fs` se MĂSOARĂ aici, pe cel mai rău caz pe care îl poate
+    produce configurația: destule căi cât să sature termenul, fiecare cu un trivy
+    care atârnă până îl omorâm.
+    """
+    from sentinel.scan import os_packages, trivy_image
+
+    # Atâtea căi câte trebuie ca termenul să fie CE MĂRGINEȘTE măsurătoarea, nu
+    # numărul de căi — altfel, la un `TIMEOUT_S` ridicat, opt căi s-ar termina
+    # înainte de termen și cifra măsurată ar fi mai mică decât cel mai rău caz.
+    # Cel puțin opt fiindcă atâtea îi ia operatorului două linii de configurație.
+    cate = max(8, trivy_fs.TIMEOUT_S
+               // (trivy_fs.TRIVY_TIMEOUT_S + trivy_fs.TRIVY_GRACE_S) + 2)
+    ceas = _Ceas()
+    apeluri = _trivy_care_consuma(monkeypatch, ceas)
+    _, eroare, _ = run(trivy_fs.scan(_cai(tmp_path, cate)))
+    masurat = ceas.acum
+    assert _fs(apeluri) and masurat > 0, (
+        "scanarea n-a consumat nimic, deci suma de mai jos n-ar măsura nimic")
+    assert eroare and "s-a epuizat" in eroare, (
+        f"cu {cate} căi care atârnă, rularea s-a terminat înainte de termen "
+        f"({masurat:.0f}s din {trivy_fs.TIMEOUT_S}s): măsurătoarea nu mai e cel mai "
+        f"rău caz, deci suma de mai jos ar trece fără să dovedească nimic")
+
+    valori = re.findall(r"^TimeoutStartSec=(\d+)\s*$",
+                        UNIT.read_text(encoding="utf-8"), re.M)
+    assert len(valori) == 1, valori
+    buget = int(valori[0])
+    # Celelalte două se iau ca declarate; a lui `trivy_image` e deja un termen de
+    # ceas peste toate imaginile, iar `os_packages` rulează o singură comandă.
+    suma = os_packages.TIMEOUT_S + masurat + trivy_image.TIMEOUT_S
+    assert suma < buget, (
+        f"pe {cate} căi `trivy_fs` ține {masurat:.0f}s, iar cu os_packages "
+        f"({os_packages.TIMEOUT_S}s) și trivy_image ({trivy_image.TIMEOUT_S}s) "
+        f"suma e {suma:.0f}s, peste cei {buget}s la care systemd omoară unitatea")
+
+
+def test_an_exhausted_budget_refuses_instead_of_ingesting_what_it_reached(
+        monkeypatch, tmp_path) -> None:
+    """Termenul epuizat oprește rularea; nu predă căile atinse ca listă întreagă.
+
+    Eșecul pe care îl previne: două căi din patru ingerate ca și cum ar fi toate,
+    urmate de `mark_resolved_absent`, care închide constatările celorlalte două.
+    Vulnerabilitățile de sub ele rămân pe disc, iar panoul spune că s-au reparat —
+    exact motivul pentru care o cale căzută oprește deja toată rularea.
+    """
+    ceas = _Ceas()
+    apeluri = _trivy_care_consuma(monkeypatch, ceas, payload=SAMPLE)
+    cai = _cai(tmp_path, 4)
+    items, eroare, fapte = run(trivy_fs.scan(cai))
+
+    assert items == [], (
+        "constatările căilor care au apucat să fie scanate au fost întoarse ca "
+        "rezultat complet")
+    assert eroare and "s-a epuizat după" in eroare and "2/4 căi" in eroare
+    assert cai[2] in eroare, "rândul `failed` nu spune de la ce cale s-a oprit"
+    assert len(_fs(apeluri)) == 2, (
+        f"trivy a fost chemat de {len(_fs(apeluri))} ori deși bugetul se dusese "
+        f"după două căi")
+    assert fapte["paths"] == cai, "rândul `failed` nu spune ce căi erau de scanat"
+
+
+def test_trivy_is_never_given_a_deadline_that_outlives_our_budget(
+        monkeypatch, tmp_path) -> None:
+    """Ultima cale nu are voie să treacă singură peste termenul rulării.
+
+    Eșecul pe care îl previne: `--timeout` fix la `TRIVY_TIMEOUT_S` pentru fiecare
+    cale, indiferent cât a mai rămas. O cale pornită cu o sută de secunde înainte
+    de termen ar primi tot 840, iar `sentinel-scan.service` ar fi omorâtă de
+    systemd cu trivy în ea — nu se pierde doar scanarea de fișiere, ci și tot ce
+    urma după ea, fără niciun rând care să spună de ce.
+    """
+    ceas = _Ceas()
+    apeluri = _trivy_care_consuma(monkeypatch, ceas)
+    run(trivy_fs.scan(_cai(tmp_path, 4)))
+
+    scanate = _fs(apeluri)
+    assert scanate, "niciun trivy chemat, deci bucla de mai jos n-ar verifica nimic"
+    for apel in scanate:
+        argv = apel["argv"]
+        cerut = int(argv[argv.index("--timeout") + 1][:-1])
+        assert 0 < cerut <= trivy_fs.TRIVY_TIMEOUT_S, cerut
+        assert apel["timeout"] == cerut + trivy_fs.TRIVY_GRACE_S, (
+            f"trivy primește {cerut}s, dar noi îl omorâm la {apel['timeout']}s: "
+            f"fie îl tăiem înainte să-și scrie mesajul, fie îl lăsăm peste buget")
+        capat = apel["start"] + cerut + trivy_fs.TRIVY_GRACE_S
+        assert capat <= trivy_fs.TIMEOUT_S, (
+            f"trivy pornit la {apel['start']:.0f}s cu {cerut}s ar fi ținut până la "
+            f"{capat:.0f}s, peste plafonul de {trivy_fs.TIMEOUT_S}s al rulării")
+
+
+def test_a_failure_on_a_shortened_deadline_names_the_budget_as_the_cause(
+        monkeypatch, tmp_path) -> None:
+    """„Repară calea" și „mărește bugetul" sunt două acțiuni diferite.
+
+    Eșecul pe care îl previne: ultima cale primește ce-a mai rămas din termen,
+    trivy scrie `context deadline exceeded`, iar rândul `failed` arată identic cu
+    al unei căi stricate. Operatorul se duce să caute ce e cu directorul, când de
+    fapt scanarea a rămas fără timp — și la noapte se întâmplă la fel.
+
+    Și invers: dacă pomenirea bugetului s-ar adăuga la ORICE eșec, n-ar mai deosebi
+    nimic, deci se verifică și că o cale căzută cu plafonul întreg nu-l pomenește.
+    """
+    ceas = _Ceas()
+    _trivy_care_consuma(monkeypatch, ceas, rc=[0, 1],
+                        err="FATAL\tscan error: context deadline exceeded")
+    cai = _cai(tmp_path, 3)
+    items, eroare, _ = run(trivy_fs.scan(cai))
+    assert items == []
+    assert eroare and cai[1] in eroare and "context deadline exceeded" in eroare, (
+        "mesajul lui trivy s-a pierdut din rândul `failed`")
+    assert "din bugetul de" in eroare, (
+        f"rândul `failed` nu spune că plafonul căii fusese tăiat de termenul "
+        f"rulării: {eroare}")
+
+    ceas2 = _Ceas()
+    _trivy_care_consuma(monkeypatch, ceas2, rc=1,
+                        err="FATAL\tscan error: walk error: permission denied")
+    _, eroare2, _ = run(trivy_fs.scan(_cai(tmp_path / "alta", 3)))
+    assert eroare2 and "permission denied" in eroare2
+    assert "din bugetul de" not in eroare2, (
+        f"prima cale a primit plafonul întreg, deci bugetul n-are ce căuta în "
+        f"explicație: {eroare2}")
 
 
 def test_a_clean_scan_returns_nothing_and_no_error(monkeypatch, tmp_path) -> None:

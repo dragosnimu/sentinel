@@ -499,6 +499,36 @@ def test_the_debian_default_site_is_disabled_by_removing_the_symlink(tmp_path):
     assert "ln -s" in proc.stdout, "nu s-a spus cum se pune la loc"
 
 
+def test_disabling_the_default_site_leaves_the_operators_own_vhosts_alone(tmp_path):
+    """Steagul `NGINX_WAS_PREEXISTING` rămâne 0 pe o gazdă unde nginx a fost pus
+    de noi — inclusiv dacă operatorul și-a adăugat între timp propriile situri.
+    Zero îi dă pasului 33 voie să dezactiveze situl implicit AL PACHETULUI, și
+    numai pe acela; dacă ar mătura `sites-enabled/`, deploy-ul următor i-ar
+    stinge operatorului siturile fără să spună nimic."""
+    etc = tmp_path / "etc" / "nginx"
+    (etc / "sites-available").mkdir(parents=True)
+    (etc / "sites-enabled").mkdir(parents=True)
+    default = etc / "sites-enabled" / "default"
+    default.write_text("server {\n\tlisten 80 default_server;\n}\n",
+                       encoding="utf-8", newline="\n")
+    mine = etc / "sites-enabled" / "magazinul-meu"
+    mine.write_text("server {\n\tlisten 80;\n\tserver_name magazin.example;\n}\n",
+                    encoding="utf-8", newline="\n")
+
+    proc = _run(
+        "set -euo pipefail\n"
+        "source ./lib/distro.sh\n"
+        'DISTRO_FAMILY="debian"\n'
+        + _func(DISTRO, "nginx_disable_default_listener").replace(
+            "$(nginx_default_site)", f'"{_p(default)}"') + "\n"
+        "nginx_disable_default_listener\n",
+        tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not default.exists(), "situl implicit al pachetului e încă activ"
+    assert mine.exists(), "s-a dezactivat un vhost al operatorului"
+    assert "magazin.example" in mine.read_text(encoding="utf-8")
+
+
 # Constanta istorică: rezultatul exact al `sed`-ului livrat pe un nginx.conf
 # de tip RHEL, așa cum arăta înainte de schimbare.
 RHEL_NGINX_CONF_BEFORE = """\
@@ -637,8 +667,8 @@ SYNTHETIC_RULES = """\
 -a always,exit -F arch=b64 -S execve -F path=/usr/bin/curl -F auid>=1000 -F auid!=unset -k sentinel_exec
 -b 8192
 --backlog_wait_time 60000
--a never,exit -F dir=/var/lib/docker
--a never,exit -F dir=/opt/sentinel
+-a never,exit -F dir=@@DIR_CHURN@@
+-a never,exit -F dir=@@DIR_SELF@@
 """
 
 ALL_LOADED = """\
@@ -646,9 +676,30 @@ ALL_LOADED = """\
 -w /etc/shadow -p wa -k sentinel_identity
 -a always,exit -F arch=b64 -S execve -F path=/usr/bin/nc -F auid>=1000 -F auid!=-1 -F key=sentinel_exec
 -a always,exit -F arch=b64 -S execve -F path=/usr/bin/curl -F auid>=1000 -F auid!=-1 -F key=sentinel_exec
--a never,exit -F dir=/var/lib/docker
--a never,exit -F dir=/opt/sentinel
+-a never,exit -F dir=@@DIR_CHURN@@
+-a never,exit -F dir=@@DIR_SELF@@
 """
+
+# Directoarele pe care le numesc regulile `never` din setul de mai sus.
+#
+# Nu `/var/lib/docker` și `/opt/sentinel`: pe mașina care rulează testele
+# niciunul nu există, iar de la reparația din 26 august o regulă `-F dir=` cu
+# calea absentă e ȚINUTĂ AFARĂ din fișierul instalat. Un test care ar depinde de
+# ce are din întâmplare mașina de test ar trece sau ar pica după gazdă — exact
+# felul de test care nu păzește nimic.
+DIR_CHURN = "@@DIR_CHURN@@"   # ține locul lui /var/lib/docker
+DIR_SELF = "@@DIR_SELF@@"     # ține locul lui /opt/sentinel
+
+
+def _dir_map(tmp_path: Path) -> dict[str, Path]:
+    return {DIR_CHURN: tmp_path / "churn", DIR_SELF: tmp_path / "self"}
+
+
+def _expand(text: str, tmp_path: Path) -> str:
+    for token, path in _dir_map(tmp_path).items():
+        text = text.replace(token, _p(path))
+    return text
+
 
 HEALTHY_STATUS = ("enabled 1\nfailure 1\npid 31813\nrate_limit 0\n"
                   "backlog_limit 8192\nlost 0\nbacklog 0\n"
@@ -658,18 +709,24 @@ HEALTHY_STATUS = ("enabled 1\nfailure 1\npid 31813\nrate_limit 0\n"
 def _audit_harness(tmp_path: Path, *, rules: str = SYNTHETIC_RULES,
                    loaded: str = ALL_LOADED, status: str = HEALTHY_STATUS,
                    augen_out: str = "", augen_rc: int = 0,
-                   tools_present: bool = True) -> subprocess.CompletedProcess:
+                   tools_present: bool = True,
+                   present: tuple[str, ...] = (DIR_CHURN, DIR_SELF),
+                   ) -> subprocess.CompletedProcess:
     """Rulează `install_audit_rules` LIVRATĂ, cu `augenrules` și `auditctl`
     momeală. `loaded` e exact ce răspunde `auditctl -l` — în forma în care o
     scrie NUCLEUL, cu `auid!=-1` și `-F key=`, nu în forma din fișier."""
     binpath = tmp_path / "bin"
     scriptdir = tmp_path / "deploy"
     (scriptdir / "audit").mkdir(parents=True)
+    # Doar directoarele din `present` există; celelalte sunt exact cazul măsurat
+    # pe VM — calea lipsă pentru care nucleul refuză regula.
+    for token in present:
+        _dir_map(tmp_path)[token].mkdir(parents=True, exist_ok=True)
     (scriptdir / "audit" / "sentinel.rules").write_text(
-        rules, encoding="utf-8", newline="\n")
+        _expand(rules, tmp_path), encoding="utf-8", newline="\n")
 
     loadedfile = tmp_path / "loaded.txt"
-    loadedfile.write_text(loaded, encoding="utf-8", newline="\n")
+    loadedfile.write_text(_expand(loaded, tmp_path), encoding="utf-8", newline="\n")
     statusfile = tmp_path / "status.txt"
     statusfile.write_text(status, encoding="utf-8", newline="\n")
 
@@ -693,6 +750,7 @@ exit 0
         f'AUDITD_RULES_DEST="{_p(tmp_path / "installed.rules")}"\n'
         "AUDITD_LOG_PATH=/var/log/audit/audit.log\n"
         + _func(INSTALL, "audit_rule_signatures") + "\n"
+        + _func(INSTALL, "audit_rules_for_this_host") + "\n"
         + _func(INSTALL, "install_audit_rules") + "\n"
         "install_audit_rules\n"
     )
@@ -732,11 +790,12 @@ def test_a_keyless_suppression_rule_that_did_not_load_is_reported(tmp_path):
     chei n-avea cum să le vadă — Sentinel ajunge să-și auditeze propriile
     scrieri, ceea ce e și zgomot, și buclă de reacție."""
     without = "\n".join(
-        l for l in ALL_LOADED.splitlines() if "/opt/sentinel" not in l) + "\n"
+        l for l in ALL_LOADED.splitlines() if DIR_SELF not in l) + "\n"
     proc = _audit_harness(tmp_path, loaded=without)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "[+]" not in proc.stdout
-    assert "dir /opt/sentinel: 0 of 1 in the kernel" in proc.stderr, proc.stderr
+    assert f"dir {_p(_dir_map(tmp_path)[DIR_SELF])}: 0 of 1 in the kernel" \
+        in proc.stderr, proc.stderr
 
 
 def test_no_change_on_its_own_is_not_reported_as_a_failure(tmp_path):
@@ -751,6 +810,40 @@ def test_no_change_on_its_own_is_not_reported_as_a_failure(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "[+]" in proc.stdout, proc.stdout + proc.stderr
     assert proc.stderr.strip() == "", proc.stderr
+
+
+def test_the_no_rules_line_auditctl_always_prints_is_not_a_failure(tmp_path):
+    """Măsurat pe VM pe 27 august 2026, în deploy-ul de verificare: `auditctl -D`
+    tipărește `No rules` pe stdout de FIECARE dată, inclusiv în rularea în care
+    tocmai ștersese 29 de reguli, iar `augenrules --load` îl rulează înainte de
+    `auditctl -R`. Cât timp mai exista și o eroare adevărată alături, linia asta
+    n-a fost observată. Singură, ea transformă gazda perfect sănătoasă într-un
+    `[!] augenrules did not load the whole file: No rules` la fiecare deploy —
+    adică exact roșul permanent pe care operatorul se învață să-l sară."""
+    proc = _audit_harness(
+        tmp_path,
+        augen_out="/usr/sbin/augenrules: No change\nNo rules\n" + HEALTHY_STATUS,
+        augen_rc=0)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "[+]" in proc.stdout, proc.stdout + proc.stderr
+    assert proc.stderr.strip() == "", proc.stderr
+
+
+def test_a_real_error_next_to_the_no_rules_line_still_gets_through(tmp_path):
+    """Cealaltă jumătate a filtrului de zgomot. Dacă tăierea ar înghiți și
+    eroarea, am fi înlocuit un roșu fals cu o tăcere falsă — iar tăcerea e mai
+    rea, fiindcă nimeni n-o observă niciodată."""
+    proc = _audit_harness(
+        tmp_path,
+        augen_out=("No rules\n"
+                   "Error sending add rule data request (No such file or directory)\n"
+                   "There was an error in line 34 of /etc/audit/audit.rules\n"),
+        augen_rc=1)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "[+]" not in proc.stdout
+    assert "Error sending add rule data request" in proc.stderr, proc.stderr
+    assert "No rules" not in proc.stderr, \
+        "zgomotul e încă prezentat ca parte din eroare"
 
 
 def test_a_real_rejection_from_augenrules_is_still_reported(tmp_path):
@@ -810,7 +903,7 @@ def test_the_step_never_prints_success_beside_failure(tmp_path):
     `[+] auditd rules installed and confirmed loaded`. Două afirmații opuse, una
     după alta, și operatorul o crede pe a doua."""
     partial = "\n".join(
-        l for l in ALL_LOADED.splitlines() if "/opt/sentinel" not in l) + "\n"
+        l for l in ALL_LOADED.splitlines() if DIR_SELF not in l) + "\n"
     proc = _audit_harness(
         tmp_path, loaded=partial,
         augen_out="Error sending add rule data request (No such file or directory)\n",
@@ -874,3 +967,268 @@ def test_the_shipped_rules_file_is_fully_recognised(tmp_path):
         [s for s in sigs if s.startswith("unchecked ")]
     # 30 de reguli + 2 opțiuni, măsurat pe fișierul livrat.
     assert len([s for s in sigs if not s.startswith("option ")]) == 30, sigs
+
+
+# ===========================================================================
+# Pasul 37 — o regulă `-F dir=` cu calea absentă nu mai ia cu ea restul
+# ===========================================================================
+# Măsurat pe VM (10.30.1.134) pe 26 august 2026, ÎNAINTE de reparație:
+#
+#   * `-a never,exit -F dir=/nonexistent` e refuzată de nucleu cu
+#     „Error sending add rule data request (No such file or directory)";
+#   * `auditctl -R` — pe care `augenrules --load` îl rulează — SE OPREȘTE acolo:
+#     cu regula rea pe linia 1, cea de pe linia 2 nu ajunge în nucleu; cu regula
+#     rea pe linia 2, cea de pe linia 1 ajunge. Se pierde tot ce e DUPĂ ea;
+#   * `-w /nonexistent -p wa -k x` se încarcă FĂRĂ probleme (rc=0, apare în
+#     `auditctl -l`). Doar `-F dir=` cere calea;
+#   * o regulă `-F dir=` deja încărcată DISPARE din `auditctl -l` în clipa în
+#     care directorul e șters, și nu revine când e recreat.
+def _installed(tmp_path: Path) -> str:
+    return (tmp_path / "installed.rules").read_text(encoding="utf-8")
+
+
+def test_a_missing_directory_no_longer_takes_the_rules_after_it_down(tmp_path):
+    """Defectul măsurat: pe o gazdă fără docker, `-F dir=/var/lib/docker` e
+    refuzată, `auditctl -R` se oprește la ea, și cele două suprimări de după ea
+    — /opt/sentinel și /var/lib/sentinel — nu mai ajung în nucleu. Sentinel își
+    auditează atunci propriile scrieri: și zgomot, și buclă de reacție."""
+    proc = _audit_harness(tmp_path, present=(DIR_SELF,))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    installed = _installed(tmp_path)
+    churn = _p(_dir_map(tmp_path)[DIR_CHURN])
+    selfd = _p(_dir_map(tmp_path)[DIR_SELF])
+    assert churn not in installed, \
+        "regula cu directorul absent a ajuns în fișierul instalat; nucleul o refuză"
+    assert f"-a never,exit -F dir={selfd}" in installed, \
+        "regula de DUPĂ cea refuzată lipsește — exact pierderea măsurată pe VM"
+
+
+def test_the_rule_left_out_is_named_not_silent(tmp_path):
+    """„Nu s-a putut" și „nu era nevoie" sunt stări diferite. O regulă tăiată
+    tăcut înseamnă un operator care crede că suprimarea e activă și se întreabă
+    de ce i se umple jurnalul."""
+    proc = _audit_harness(tmp_path, present=(DIR_SELF,))
+    churn = _p(_dir_map(tmp_path)[DIR_CHURN])
+    assert churn in proc.stdout, \
+        f"regula lăsată afară nu e numită nicăieri: {proc.stdout!r}"
+    assert "--force-step 37" in proc.stdout, "nu se spune cum se pune la loc"
+
+
+def test_the_count_is_taken_from_what_was_offered_to_the_kernel(tmp_path):
+    """Dacă numărătoarea ar rămâne pe fișierul LIVRAT, regula pe care gazda asta
+    n-o poate ține ar fi raportată la fiecare deploy ca „lipsă din nucleu" — un
+    roșu permanent pentru o stare corectă, adică fix genul de avertisment pe care
+    operatorul se învață să-l sară."""
+    without_churn = "\n".join(
+        l for l in ALL_LOADED.splitlines() if DIR_CHURN not in l) + "\n"
+    proc = _audit_harness(tmp_path, loaded=without_churn, present=(DIR_SELF,))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "all 5 rules" in proc.stdout, proc.stdout + proc.stderr
+    assert proc.stderr.strip() == "", proc.stderr
+
+
+def test_a_watch_on_a_path_that_does_not_exist_is_kept(tmp_path):
+    """Cealaltă jumătate, și ea măsurată: nucleul ACCEPTĂ `-w /cale/inexistentă`.
+    Dacă filtrul ar tăia și `-w`, un `/var/www` absent de pe o gazdă ar scoate
+    tăcut detecția `host.webroot_write` — o pierdere reală, în numele unei
+    probleme pe care watch-urile n-o au."""
+    rules = ("-w /nu-exista-nicaieri -p wa -k sentinel_webroot\n"
+             "-a never,exit -F dir=" + DIR_SELF + "\n")
+    proc = _audit_harness(tmp_path, rules=rules, loaded=rules,
+                          present=(DIR_SELF,))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "/nu-exista-nicaieri" in _installed(tmp_path), \
+        "un watch a fost tăiat degeaba; nucleul îl acceptă"
+    assert "all 2 rules" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_a_dropped_rule_that_is_not_a_suppression_is_in_the_verdict(tmp_path):
+    """O regulă `always` pentru un director absent e o DETECȚIE pe care gazda
+    n-o are, nu zgomot pe care nu-l are. Cele două nu au voie să se raporteze la
+    fel: una e o notă, cealaltă e o gaură."""
+    rules = ("-w /etc/passwd -p wa -k sentinel_identity\n"
+             "-a always,exit -F dir=" + DIR_CHURN + " -F perm=wa -k sentinel_webroot\n")
+    loaded = "-w /etc/passwd -p wa -k sentinel_identity\n"
+    proc = _audit_harness(tmp_path, rules=rules, loaded=loaded, present=())
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "[+]" not in proc.stdout, proc.stdout
+    assert "NOT installed, its directory does not exist here" in proc.stderr, proc.stderr
+
+
+def test_a_host_where_every_directory_exists_keeps_the_shipped_file_byte_for_byte(
+        tmp_path):
+    """Non-regresie pentru producție. AlmaLinux ARE docker (9 containere), deci
+    toate cele trei directoare există acolo, iar fișierul instalat trebuie să fie
+    identic cu cel livrat: filtrul n-are voie să schimbe nimic pe gazda unde nu e
+    nimic de schimbat."""
+    shipped = (REPO / "deploy" / "audit" / "sentinel.rules").read_text(
+        encoding="utf-8")
+    dirs = sorted(set(re.findall(r"-F dir=(\S+)", shipped)))
+    assert dirs, "fișierul livrat nu mai are reguli `-F dir=`; testul n-ar păzi nimic"
+
+    # Fiecare director din fișierul livrat primește o cale care CHIAR există pe
+    # mașina asta. Substituția e generată din fișier, deci o regulă `dir=` nouă
+    # nu poate scăpa neacoperită.
+    rewritten = shipped
+    for i, d in enumerate(dirs):
+        real = tmp_path / f"d{i}"
+        real.mkdir()
+        rewritten = rewritten.replace("-F dir=" + d, "-F dir=" + _p(real))
+
+    src = tmp_path / "in.rules"
+    dest = tmp_path / "kept.rules"
+    src.write_text(rewritten, encoding="utf-8", newline="\n")
+    proc = _run(
+        "set -euo pipefail\n"
+        + _func(INSTALL, "audit_rules_for_this_host") + "\n"
+        f'audit_rules_for_this_host "{_p(dest)}" < "{_p(src)}"\n',
+        tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout == "", f"s-a tăiat ceva deși toate căile există: {proc.stdout!r}"
+    assert dest.read_text(encoding="utf-8") == rewritten, \
+        "fișierul instalat diferă de cel livrat pe o gazdă unde nu e nimic de filtrat"
+
+
+# ===========================================================================
+# Pasul 35 — acum în ALWAYS_STEPS, deci rulează la FIECARE deploy
+# ===========================================================================
+def _suricata_step(tmp_path: Path, *, test_rc: int = 0,
+                   needs_restart: bool = True) -> subprocess.CompletedProcess:
+    """Rulează `step_suricata` LIVRATĂ, cu binare momeală și cu cele două căi din
+    /etc mutate în tmp. `systemctl` își scrie argumentele într-un fișier, ca
+    întrebarea „a fost repornit demonul?" să aibă un răspuns observat, nu unul
+    dedus din codul de ieșire."""
+    binpath = tmp_path / "bin"
+    calls = tmp_path / "systemctl-calls.txt"
+    defaults = tmp_path / "default-suricata"
+    dropin_dir = tmp_path / "dropin"
+    logdir = tmp_path / "log-suricata"
+
+    _stub(binpath, "systemctl", 'echo "$*" >> "' + _p(calls) + '"\nexit 0\n')
+    _stub(binpath, "suricata-update", "exit 0\n")
+    # `install -d -m 0750` nu poate pune modul pe mașina asta (același motiv
+    # pentru care testul din test_installer_external_tools.py e sărit). Momeala
+    # face partea care contează aici — creează directorul — și lasă modul în
+    # pace; testul ăsta se uită la repornirea demonului, nu la permisiuni.
+    _stub(binpath, "install", """
+dirs=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -d) shift ;;
+        -m|-o|-g) shift 2 ;;
+        *) dirs+=("$1"); shift ;;
+    esac
+done
+mkdir -p "${dirs[@]}"
+exit 0
+""")
+    _stub(binpath, "suricata", f"exit {test_rc}\n")
+    _stub(binpath, "ip", """
+case "$*" in
+    *"route show default"*) echo "default via 10.30.1.1 dev enp0s3 proto dhcp" ;;
+    *"addr show"*)          echo "2: enp0s3 inet 203.0.113.9/24 scope global enp0s3" ;;
+esac
+exit 0
+""")
+
+    body = _func(INSTALL, "step_suricata") \
+        .replace("/etc/systemd/system/suricata.service.d", _p(dropin_dir)) \
+        .replace("/var/log/suricata", _p(logdir))
+
+    restart_stub = ("suricata_needs_restart() { printf 'stubul cere repornire'; return 0; }"
+                    if needs_restart else
+                    "suricata_needs_restart() { return 1; }")
+
+    script = (
+        "set -euo pipefail\n"
+        "source ./lib/common.sh\n"
+        "SURICATA_OK=1\n"
+        "BPF_HINT=\n"
+        f'SURICATA_YAML="{_p(tmp_path / "suricata.yaml")}"\n'
+        + body + "\n"
+        # Momelile vin DUPĂ corpul livrat, ca să bată definițiile din distro.sh
+        # și install.sh pe care testul ăsta nu le are în vizor.
+        "pkg_install() { return 0; }\n"
+        "suricata_pkg() { echo suricata; }\n"
+        'suricata_defaults_file() { echo "' + _p(defaults) + '"; }\n'
+        "suricata_dropin_body() { echo '[Service]'; }\n"
+        + restart_stub + "\n"
+        "suricata_eve_size() { echo 0; }\n"
+        "suricata_report_effect() { echo REPORT-RAN; }\n"
+        "step_suricata\n"
+        'echo "STEP-RC=$?"\n'
+    )
+    proc = _run(script, tmp_path, extra_path=binpath)
+    proc.calls = calls.read_text(encoding="utf-8") if calls.exists() else ""  # type: ignore[attr-defined]
+    return proc
+
+
+def test_a_rejected_suricata_config_does_not_abort_the_rest_of_the_deploy(tmp_path):
+    """Pasul 35 e în ALWAYS_STEPS de pe 26 august, deci rulează la fiecare
+    deploy. Un `die` aici ar opri rularea ÎNAINTE de pasul 37 (regulile auditd),
+    înainte de proba de fum și înainte ca pasul 40 să-i spună ceva operatorului:
+    un set de reguli IDS stricat ar lua cu el toată livrarea."""
+    proc = _suricata_step(tmp_path, test_rc=1)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "STEP-RC=0" in proc.stdout, proc.stdout + proc.stderr
+    assert "rejected this configuration" in proc.stderr, proc.stderr
+
+
+def test_a_rejected_suricata_config_does_not_restart_the_running_daemon(tmp_path):
+    """Ce rulează acum a pornit dintr-o configurație care a trecut. Repornirea
+    peste una care tocmai a picat transformă un avertisment în pană de IDS."""
+    proc = _suricata_step(tmp_path, test_rc=1)
+    # Fără astea două, un pas care ar muri înainte de `suricata -T` ar lăsa
+    # fișierul de apeluri gol și testul ar trece fără să fi verificat nimic.
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "rejected this configuration" in proc.stderr, proc.stderr
+    assert "restart" not in proc.calls, \
+        f"demonul a fost repornit peste o configurație respinsă: {proc.calls!r}"
+    assert "REPORT-RAN" not in proc.stdout, \
+        "s-a raportat starea capturii lângă un avertisment de configurație respinsă"
+
+
+def test_a_repeated_deploy_does_not_bounce_the_ids_for_nothing(tmp_path):
+    """Cealaltă jumătate a intrării în ALWAYS_STEPS. Dacă pasul ar reporni
+    necondiționat, fiecare deploy ar lăsa gazda fără IDS cât se reîncarcă 46k de
+    reguli — inclusiv deploy-urile care nu schimbă nimic, care acum sunt
+    majoritatea."""
+    proc = _suricata_step(tmp_path, test_rc=0, needs_restart=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "restart" not in proc.calls, \
+        f"IDS-ul a fost repornit degeaba: {proc.calls!r}"
+    assert "already runs with these options" in proc.stdout, proc.stdout
+    assert "REPORT-RAN" in proc.stdout, "efectul nu mai e verificat deloc"
+
+
+def test_a_config_that_passes_still_reaches_the_restart(tmp_path):
+    """Dacă `suricata -T` ar fi devenit o poartă prin care nu trece nimic,
+    reparația din 25 august n-ar mai ajunge niciodată în procesul care rulează —
+    și ăsta e chiar motivul pentru care pasul a intrat în ALWAYS_STEPS."""
+    proc = _suricata_step(tmp_path, test_rc=0, needs_restart=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "restart suricata" in proc.calls, proc.calls
+    assert "REPORT-RAN" in proc.stdout, proc.stdout
+
+
+def test_sentinels_own_suppressions_come_before_any_third_party_one():
+    """Filtrul de la instalare se uită la gazdă o singură dată. Un director care
+    dispare ÎNTRE deploy-uri — docker dezinstalat — face nucleul să refuze regula
+    la următoarea pornire, iar `auditctl -R` se oprește acolo și duce cu el tot
+    ce urmează. Măsurat pe VM: o regulă `-F dir=` deja încărcată dispare din
+    `auditctl -l` în clipa în care directorul e șters. Cu suprimările proprii ale
+    Sentinelului puse întâi, un director străin care se evaporă costă doar el
+    însuși; puse după, ar costa exact ce a costat și prima oară — Sentinel își
+    auditează propriile scrieri până la deploy-ul următor."""
+    rules = (REPO / "deploy" / "audit" / "sentinel.rules").read_text(encoding="utf-8")
+    dirs = re.findall(r"^-a\s+never,exit\s+-F\s+dir=(\S+)\s*$", rules, re.M)
+    assert dirs, "nu mai există reguli `never` cu `dir=`; testul n-ar păzi nimic"
+
+    ours = [d for d in dirs if d in ("/opt/sentinel", "/var/lib/sentinel")]
+    assert len(ours) == 2, f"suprimările proprii ale Sentinelului lipsesc: {dirs}"
+
+    last_ours = max(dirs.index(d) for d in ours)
+    theirs = [d for d in dirs if d not in ours]
+    for d in theirs:
+        assert dirs.index(d) > last_ours, \
+            f"{d} e înaintea suprimărilor Sentinelului; dacă dispare, le ia cu el"

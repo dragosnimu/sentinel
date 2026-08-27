@@ -19,7 +19,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, Request, Response
 
 from sentinel import __version__
-from sentinel.analytics import aggregate, insights as insights_mod
+from sentinel.analytics import page
 from sentinel.config import Config
 from sentinel.db.engine import Database
 from sentinel.db.repo import audit as audit_repo
@@ -66,7 +66,9 @@ async def dashboard(
     templates = request.app.state.templates
     session = request.state.session
 
-    found = await insights_mod.collect(db)
+    # Panourile vin din `analytics.page`, nu de aici: autodiagnosticul măsoară
+    # aceeași funcție, deci nu poate rămâne verde peste un panou pe care pagina
+    # îl încarcă și sonda nu-l cunoaște. Vezi docstring-ul modulului.
     return templates.TemplateResponse(
         request=request,
         name="dashboard.html",
@@ -75,20 +77,7 @@ async def dashboard(
             "csrf_token": session.csrf_token,
             "status": await _self_status(db, cfg),
             "phase_notice": _phase_notice(cfg),
-            "posture": await insights_mod.posture(db, found),
-            "insights": found,
-            "kpi": await aggregate.kpis(db),
-            "deltas": await aggregate.deltas(db),
-            "countries": await aggregate.by_country(db),
-            "asns": await aggregate.by_asn(db),
-            "feed": await aggregate.activity_feed(db),
-            "sources": await aggregate.sources(db),
-            "attackers": await aggregate.top_attackers(db, limit=8),
-            "accounts": await aggregate.targeted_accounts(db),
-            "paths": await aggregate.probed_paths(db),
-            "signatures": await aggregate.ids_signatures(db),
-            "hourly": await aggregate.hourly_activity(db),
-            "health": await aggregate.service_health(db),
+            **await page.load(db),
         },
     )
 

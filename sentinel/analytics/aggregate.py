@@ -4,6 +4,27 @@ One module, one round of queries, so the page renders from a single snapshot
 rather than a dozen scattered calls that can disagree with each other by a few
 seconds. Everything here is a plain aggregate; the interpretation lives in
 insights.py.
+
+## Două tipare care se repetă mai jos, și de ce
+
+**Se numără perechile distincte, nu `count(DISTINCT)`.** PostgreSQL nu poate
+face `count(DISTINCT x)` prin hash: agregatul sortează rândurile fiecărui grup.
+Pe fereastra de 7 zile asta însemna, măsurat pe o replică a formei de pe gazdă,
+o sortare externă de 387 000 de rânduri care se vărsa pe disc (`external merge
+Disk: 12736kB`) — și care ajunsese să coste mai mult decât citirea datelor.
+Scrise ca un `GROUP BY dimensiune, ip` interior plus un `count(ip)` exterior,
+aceleași cifre ies dintr-un `HashAggregate` în memorie. Contează că e
+`count(ip)`, nu `count(*)`: rândurile fără `src_ip` formează un grup propriu,
+iar `count(*)` l-ar număra ca pe încă o adresă — exact rezultatul pe care
+`count(DISTINCT)` nu-l dădea, fiindcă sare peste NULL.
+
+**Întrebările „pe sursă" nu citesc toate rândurile.** `sources` — și
+`_gap_insights` din insights.py — întreabă *când s-a văzut ultima dată fiecare
+colector*. Scris ca `GROUP BY source` peste fereastră, răspunsul costă cât
+întreaga fereastră, deși are ~20 de rânduri. Scris ca o căutare punctuală pe
+fiecare pereche (sursă, acțiune), costă cât numărul de perechi. Vezi comentariul
+de la `_INVENTAR_SQL` pentru de unde vine lista de perechi și ce se întâmplă
+când ea lipsește.
 """
 
 from __future__ import annotations
@@ -11,6 +32,37 @@ from __future__ import annotations
 from typing import Any
 
 from sentinel.db.engine import Database
+
+#: Perechile (sursă, acțiune) care se știe că există.
+#:
+#: Vine în primul rând din `event_rollup_1m`, fiindcă acolo perechile sunt deja
+#: chei: tabela e mărginită de (minute × perechi), nu de volumul de evenimente,
+#: deci întrebarea rămâne ieftină oricât ar crește `raw_events`. Pe gazdă erau
+#: 24 de perechi și 138 000 de rânduri de rollup, față de milioane de rânduri
+#: brute.
+#:
+#: Reuniunea cu ultima oră din `raw_events` NU e o plasă de siguranță
+#: decorativă: jobul de întreținere rulează din oră în oră, deci un colector
+#: pornit acum n-a intrat încă în rollup, iar fără reuniune ar lipsi din panou
+#: exact în ora în care cineva se uită dacă a pornit. Ora e mărginită de volumul
+#: unei ore, nu de fereastră — măsurat pe replică: 28 ms într-o oră obișnuită,
+#: 315 ms într-o oră din ziua de vârf (233 000 de rânduri). E cel mai prost caz
+#: și e plătit de două ori pe pagină; un `LIMIT` l-ar face constant, cu prețul
+#: de a putea rata o sursă nouă și rară exact în timpul unei rafale, ceea ce e
+#: mai rău decât trei sutimi de secundă.
+#:
+#: Ce NU acoperă reuniunea: dacă rollup-ul e gol sau vechi, lista conține doar
+#: sursele care AU scris în ultima oră — adică fix cele care nu sunt tăcute.
+#: Cine judecă tăcerea (`_gap_insights`) trebuie să verifice separat vârsta
+#: rollup-ului și să spună că nu poate ști, în loc să raporteze „nimic tăcut"
+#: dintr-o listă din care tăcuții au dispărut.
+_INVENTAR_SQL = """
+    SELECT DISTINCT source, action FROM event_rollup_1m
+     WHERE bucket > now() - interval '30 days'
+    UNION
+    SELECT DISTINCT source, action FROM raw_events
+     WHERE ts > now() - interval '1 hour'
+"""
 
 
 async def kpis(db: Database) -> dict[str, Any]:
@@ -53,15 +105,34 @@ async def kpis(db: Database) -> dict[str, Any]:
 
 async def sources(db: Database) -> list[dict[str, Any]]:
     """Which collectors are actually producing. A zero row here is the fastest
-    way to spot a silent collector."""
+    way to spot a silent collector.
+
+    Costul e dat de numărul de perechi (sursă, acțiune), nu de fereastră: pentru
+    fiecare pereche, `max(ts)` e o singură coborâre în `raw_events_source_idx`,
+    iar numărătoarea pe 24h e o citire mărginită de ziua curentă. Varianta
+    dinainte grupa peste toate cele 7 zile ca să scoată ~20 de rânduri, deci
+    plătea întreaga tabelă pentru un tabel de ecran.
+
+    O sursă cu `ultim` NULL a fost cândva în inventar și n-a mai scris nimic în
+    30 de zile. Apare, cu zero — asta e chiar întrebarea panoului.
+    """
     rows = await db.fetch(
-        """
-        SELECT source,
-               count(*) FILTER (WHERE ts > now() - interval '24 hours') AS ev_24h,
-               max(ts) AS ultim
-        FROM raw_events WHERE ts > now() - interval '7 days'
-        GROUP BY source ORDER BY ev_24h DESC
-        """
+        f"""
+        WITH inventar AS ({_INVENTAR_SQL})
+        SELECT i.source,
+               COALESCE(sum(c.n), 0)::bigint AS ev_24h,
+               max(u.ultim) AS ultim
+          FROM inventar i
+          LEFT JOIN LATERAL (
+              SELECT max(e.ts) AS ultim FROM raw_events e
+               WHERE e.source = i.source AND e.action = i.action
+                 AND e.ts > now() - interval '30 days') u ON true
+          LEFT JOIN LATERAL (
+              SELECT count(*) AS n FROM raw_events e
+               WHERE e.source = i.source AND e.action = i.action
+                 AND e.ts > now() - interval '24 hours') c ON true
+         GROUP BY 1 ORDER BY ev_24h DESC
+        """  # noqa: S608 - _INVENTAR_SQL e o constantă de modul, nu date de la cineva
     )
     return [dict(r) for r in rows]
 
@@ -94,10 +165,13 @@ async def top_attackers(db: Database, limit: int = 10) -> list[dict[str, Any]]:
 async def targeted_accounts(db: Database, limit: int = 6) -> list[dict[str, Any]]:
     rows = await db.fetch(
         """
-        SELECT username, count(*) AS n, count(DISTINCT host(src_ip)) AS ips
-        FROM raw_events
-        WHERE source = 'sshd' AND action = 'auth_fail' AND username IS NOT NULL
-          AND ts > now() - interval '7 days'
+        SELECT username, sum(n)::bigint AS n, count(ip) AS ips
+        FROM (SELECT username, host(src_ip) AS ip, count(*) AS n
+                FROM raw_events
+               WHERE source = 'sshd' AND action = 'auth_fail'
+                 AND username IS NOT NULL
+                 AND ts > now() - interval '7 days'
+               GROUP BY 1, 2) pereche
         GROUP BY 1 ORDER BY n DESC LIMIT $1
         """,
         limit,
@@ -108,10 +182,13 @@ async def targeted_accounts(db: Database, limit: int = 6) -> list[dict[str, Any]
 async def probed_paths(db: Database, limit: int = 6) -> list[dict[str, Any]]:
     rows = await db.fetch(
         """
-        SELECT http_path, count(*) AS n, count(DISTINCT host(src_ip)) AS ips
-        FROM raw_events
-        WHERE source = 'nginx' AND http_status = 404 AND http_path IS NOT NULL
-          AND ts > now() - interval '7 days' AND http_path <> '/'
+        SELECT http_path, sum(n)::bigint AS n, count(ip) AS ips
+        FROM (SELECT http_path, host(src_ip) AS ip, count(*) AS n
+                FROM raw_events
+               WHERE source = 'nginx' AND http_status = 404
+                 AND http_path IS NOT NULL
+                 AND ts > now() - interval '7 days' AND http_path <> '/'
+               GROUP BY 1, 2) pereche
         GROUP BY 1 ORDER BY n DESC LIMIT $1
         """,
         limit,
@@ -121,14 +198,22 @@ async def probed_paths(db: Database, limit: int = 6) -> list[dict[str, Any]]:
 
 async def ids_signatures(db: Database, limit: int = 6) -> list[dict[str, Any]]:
     """Real threat signatures only — engine diagnostics are dropped at the
-    collector, but older rows predate that filter."""
+    collector, but older rows predate that filter.
+
+    Rămâne cea mai scumpă interogare a paginii, și niciun index n-o ieftinește:
+    `signature` stă în `raw`, deci fiecare rând de suricata din fereastră cere o
+    pagină de heap, iar rândurile sunt intercalate printre cele de auditd — pe
+    replica gazdei, 258 000 de rânduri împrăștiate pe 253 000 de pagini. Vezi
+    migrația 0030 pentru indexul care s-a construit, s-a măsurat și NU e acolo.
+    """
     rows = await db.fetch(
         """
-        SELECT raw->>'signature' AS sig, count(*) AS n,
-               count(DISTINCT host(src_ip)) AS ips
-        FROM raw_events
-        WHERE source = 'suricata' AND ts > now() - interval '7 days'
-          AND raw->>'signature' NOT LIKE 'SURICATA %'
+        SELECT sig, sum(n)::bigint AS n, count(ip) AS ips
+        FROM (SELECT raw->>'signature' AS sig, host(src_ip) AS ip, count(*) AS n
+                FROM raw_events
+               WHERE source = 'suricata' AND ts > now() - interval '7 days'
+                 AND raw->>'signature' NOT LIKE 'SURICATA %'
+               GROUP BY 1, 2) pereche
         GROUP BY 1 ORDER BY n DESC LIMIT $1
         """,
         limit,
@@ -159,11 +244,12 @@ async def by_country(db: Database, limit: int = 7) -> list[dict[str, Any]]:
     the bars are comparable at a glance rather than against an invisible total."""
     rows = await db.fetch(
         """
-        SELECT geo_country AS tara, count(*) AS ev,
-               count(DISTINCT host(src_ip)) AS ips
-        FROM raw_events
-        WHERE ts > now() - interval '7 days' AND geo_country IS NOT NULL
-          AND action IN ('auth_fail','alert')
+        SELECT tara, sum(ev)::bigint AS ev, count(ip) AS ips
+        FROM (SELECT geo_country AS tara, host(src_ip) AS ip, count(*) AS ev
+                FROM raw_events
+               WHERE ts > now() - interval '7 days' AND geo_country IS NOT NULL
+                 AND action IN ('auth_fail','alert')
+               GROUP BY 1, 2) pereche
         GROUP BY 1 ORDER BY ev DESC LIMIT $1
         """,
         limit,
@@ -181,11 +267,13 @@ async def by_asn(db: Database, limit: int = 6) -> list[dict[str, Any]]:
     more actionable than the country, which is usually just where a VPS sits."""
     rows = await db.fetch(
         """
-        SELECT geo_as_org AS operator, geo_asn AS asn, count(*) AS ev,
-               count(DISTINCT host(src_ip)) AS ips
-        FROM raw_events
-        WHERE ts > now() - interval '7 days' AND geo_as_org IS NOT NULL
-          AND action IN ('auth_fail','alert')
+        SELECT operator, asn, sum(ev)::bigint AS ev, count(ip) AS ips
+        FROM (SELECT geo_as_org AS operator, geo_asn AS asn,
+                     host(src_ip) AS ip, count(*) AS ev
+                FROM raw_events
+               WHERE ts > now() - interval '7 days' AND geo_as_org IS NOT NULL
+                 AND action IN ('auth_fail','alert')
+               GROUP BY 1, 2, 3) pereche
         GROUP BY 1, 2 ORDER BY ev DESC LIMIT $1
         """,
         limit,

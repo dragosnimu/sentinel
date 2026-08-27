@@ -162,6 +162,20 @@ def test_the_upgrade_steps_are_not_marker_gated():
     assert "! step_is_always" in COMMON
 
 
+def test_suricata_is_re_run_on_every_deploy():
+    """Pasul 35 scrie `/etc/default/suricata` și drop-in-ul systemd — conținut
+    generat de instalator, deci conținut care se schimbă între versiuni. Cât a
+    stat în afara listei, orice gazdă deja instalată îl sărea: reparația din
+    25 august, care a oprit demonul din a captura pe o placă inexistentă, n-ar
+    fi ajuns niciodată în producție fără un `--force-step 35` ținut minte de
+    cineva. Operatorul a cerut intrarea în listă pe 26 august 2026, acceptând
+    costul măsurat de ~3 minute pe deploy (332 s cu, 148 s fără,
+    pe VM-ul de test)."""
+    always = COMMON.split("ALWAYS_STEPS=", 1)[1].split('"', 2)[1]
+    assert "suricata" in always.split(), \
+        "pasul 35 e din nou sărit pe gazdele deja instalate"
+
+
 def test_nftables_is_never_re_run_automatically():
     """Re-creating the table empties the named sets, which silently unblocks
     every attacker currently blocked. Refreshing config is worth a re-run;

@@ -170,6 +170,24 @@
 #
 # If another product on this host writes continuously to its own directory, add
 # a matching `never,exit` line for it rather than letting it drown the log.
--a never,exit -F dir=/var/lib/docker
+#
+# A `-F dir=` rule is only accepted by the kernel if the path EXISTS at load
+# time, and `auditctl -R` stops at the first rule it cannot add — so one line
+# naming an absent directory silently costs every rule after it. The installer
+# therefore leaves such a line out of /etc/audit/rules.d/sentinel.rules on the
+# hosts where the directory is missing, and prints which one and why. That is
+# also why the directory is not simply created: a /var/lib/docker invented by
+# the installer would claim docker is here, and the rule would vanish from the
+# kernel again the moment anything removed it (measured, 26 August 2026).
+#
+# Order matters here for one narrow reason, and it is the reason /var/lib/docker
+# is last. The installer can only look at the host at install time. A directory
+# that disappears BETWEEN deploys — docker uninstalled, say — makes the kernel
+# refuse the rule at the next boot, and `auditctl -R` stops there, taking every
+# following rule with it. Sentinel's own two directories exist for as long as
+# Sentinel does, so putting them first means a third-party directory that goes
+# away costs only itself. These are `never` rules on disjoint subtrees, so their
+# relative order changes nothing else.
 -a never,exit -F dir=/opt/sentinel
 -a never,exit -F dir=/var/lib/sentinel
+-a never,exit -F dir=/var/lib/docker

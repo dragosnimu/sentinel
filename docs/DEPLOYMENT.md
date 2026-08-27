@@ -761,6 +761,16 @@ git pull
 Instalarea e idempotentă; pașii deja făcuți sunt sărite, codul se
 reinstalează, migrațiile noi se aplică.
 
+**De pe 26 august 2026 un re-deploy durează cu ~3 minute mai mult.** Pasul 35
+(Suricata) a intrat în `ALWAYS_STEPS`, deci rulează la fiecare trecere, nu doar
+la prima instalare: altfel o reparație a felului în care e pornit demonul nu
+ajunge niciodată pe o gazdă deja instalată. Costul e `suricata-update` plus
+`suricata -T` peste tot setul de reguli — măsurat pe VM-ul de test (Ubuntu
+24.04.4): 332 s cu pasul în listă, 148 s fără el, din care 132 s sunt
+`suricata -T` singur. **IDS-ul nu se repornește** dacă procesul care rulează
+poartă deja opțiunile scrise; în log apare `suricata already runs with these
+options; not restarting it`.
+
 **Migrațiile sunt forward-only.** Nu există down-migration — inversarea unei
 schimbări de schemă pe o bază de date de securitate live este o fantezie, iar
 pretinzând altceva încurajezi pe cineva să încerce în timpul unui incident.

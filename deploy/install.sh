@@ -91,9 +91,17 @@ CERT_MODE="auto"
 #              into a config directory shared with the operator's sites.
 NGINX_MODE="dedicated"
 
-# Set in step_packages: whether nginx was on this host before we touched it.
-# Decides whether editing nginx.conf is ours to do.
+# Whether nginx was on this host before we touched it. Decides whether editing
+# nginx.conf is ours to do. Observed once, in step_packages, and then read from
+# the write-once record — see nginx_preexisting_resolve.
 NGINX_WAS_PREEXISTING=0
+NGINX_PREEXISTING_FACT=nginx_preexisting
+
+# The marker run_step writes for step 20. Pinned as a constant because
+# nginx_preexisting_resolve reads it to tell a first install from a host that has
+# already been through step 20, and a silent mismatch there would put the
+# migration back where it started.
+STEP_PACKAGES_KEY=20_packages
 DEPLOY_TS="$(date -u +%Y%m%d-%H%M%S)"
 SNAPSHOT_DIR="${SENTINEL_BACKUP_DIR}/predeploy-${DEPLOY_TS}"
 
@@ -254,6 +262,62 @@ step_preflight() {
 # how a shared-mode resume regenerated sentinel.yaml with the dedicated default
 # port (8443) and failed validation: the PUBLIC_PORT=443 resolution lived in a
 # step that the resume skipped.
+# Was nginx on this host before Sentinel touched it? One answer, from the record.
+#
+# The observation is only valid the first time it is made — step 20, before the
+# package install. Every run after that reads what was written down. Three
+# sources, in this order, and the order is the design:
+#
+#   1. the write-once fact. Once written, nothing changes it.
+#   2. the legacy NGINX_WAS_PREEXISTING= line in preflight.env, promoted into the
+#      fact. A host installed before the fact file existed has its only record
+#      there — on production that record is 1, and defaulting to 0 instead would
+#      hand step 33 permission to edit the operator's own nginx.conf. Promoting
+#      it also makes it survive the next --force-step 1, which rewrites
+#      preflight.env from scratch and would otherwise drop it.
+#   3. no line at all, on a host that has ALREADY run step 20. The silence is
+#      itself the record: the old code appended that line only when it FOUND
+#      nginx, so its absence after step 20 means nginx was not here. Written down
+#      rather than re-derived every run, because otherwise the next
+#      --force-step 20 would observe our own nginx and record 1 — the same bug,
+#      back through the migration gap.
+#
+# Read from the FILE, not from the variable preflight.env sets: install.sh
+# initialises NGINX_WAS_PREEXISTING=0 at the top, so a variable test cannot tell
+# "preflight said 0" from "preflight said nothing" — and on a first install it
+# would freeze that 0 before step 20 has looked at the host at all.
+nginx_preexisting_resolve() {
+    local env_file="${1:-}" legacy=""
+
+    if fact_recorded "$NGINX_PREEXISTING_FACT"; then
+        fact_read "$NGINX_PREEXISTING_FACT"
+        return 0
+    fi
+
+    # grep and parameter expansion rather than a sed script: this line has been
+    # edited by hand more than once, and an escaping mistake here reads as "no
+    # legacy record" — which on production would mean "nginx is ours to edit".
+    if [[ -f "$env_file" ]]; then
+        legacy="$(grep -E '^NGINX_WAS_PREEXISTING=[01][[:space:]]*$' "$env_file" | tail -1)"
+        legacy="${legacy#NGINX_WAS_PREEXISTING=}"
+        legacy="${legacy//[[:space:]]/}"
+    fi
+    if [[ -n "$legacy" ]]; then
+        fact_record_once "$NGINX_PREEXISTING_FACT" "$legacy"
+        return 0
+    fi
+
+    if step_done "$STEP_PACKAGES_KEY"; then
+        fact_record_once "$NGINX_PREEXISTING_FACT" 0
+        return 0
+    fi
+
+    # Nothing recorded, and step 20 has not run: this is a first install and the
+    # real answer arrives in a few seconds. Deliberately NOT written down — that
+    # would be the record answering a question nobody has asked the host yet.
+    printf '0\n'
+}
+
 resolve_config() {
     # Command-line values, captured before `source` can clobber them: an explicit
     # flag must always beat whatever preflight persisted.
@@ -270,7 +334,7 @@ resolve_config() {
     SURICATA_OK="${SURICATA_OK:-0}"
     MEM_AVAIL="${MEM_AVAIL:-0}"
     BPF_HINT="${BPF_HINT:-}"
-    NGINX_WAS_PREEXISTING="${NGINX_WAS_PREEXISTING:-0}"
+    NGINX_WAS_PREEXISTING="$(nginx_preexisting_resolve "$env_file")"
 
     [[ -n "$cli_admin_ip" ]]    && ADMIN_IP="$cli_admin_ip"
     [[ -n "$cli_domain" ]]      && DOMAIN="$cli_domain"
@@ -502,11 +566,26 @@ step_packages() {
     # Recorded BEFORE the install, because it decides whether nginx.conf is ours
     # to edit later. If nginx was already serving the operator's sites, its
     # config belongs to them.
+    #
+    # Write-once, and that is the repair. The observation below is only
+    # meaningful the FIRST time it is made: from the second deploy on,
+    # `pkg_installed nginx` is true because WE installed it. A step 20 that ran
+    # again — --force-step 20, --from-step 20, or a reinstall — used to append
+    # NGINX_WAS_PREEXISTING=1 to preflight.env about our own package;
+    # resolve_config sourced that on every later run, and step 33 then spent
+    # every deploy printing "Not touching nginx.conf — it is yours" about a file
+    # this installer had written.
+    local observed=0
     if pkg_installed nginx || systemctl is-active --quiet nginx 2>/dev/null; then
-        NGINX_WAS_PREEXISTING=1
-        printf 'NGINX_WAS_PREEXISTING=1
-' >> "${STATE_MARKERS}/preflight.env"
-        info "nginx is already installed here — its configuration will not be modified"
+        observed=1
+    fi
+    NGINX_WAS_PREEXISTING="$(fact_record_once "$NGINX_PREEXISTING_FACT" "$observed")"
+    if [[ "$NGINX_WAS_PREEXISTING" == "1" ]]; then
+        info "nginx was on this host before Sentinel — its configuration will not be modified"
+    elif (( observed )); then
+        info "nginx is installed, but the first deploy recorded that it was NOT \
+here before us. The package is ours, so step 33 may take its :80 listener out \
+of service."
     fi
 
     info "installing base packages on ${DISTRO_PRETTY} (a few minutes on a fresh host)"
@@ -2706,8 +2785,26 @@ daemon will capture on whatever ${SURICATA_YAML} names, which is not this host's
     fi
 
     suricata-update >/dev/null 2>&1 || warn "suricata-update failed; using shipped rules"
+    # A rejected configuration stops the IDS work here and NOTHING else.
+    #
+    # This was a `die`, which was survivable while step 35 ran once on a fresh
+    # install. It is in ALWAYS_STEPS now, so it runs on every deploy — and a
+    # `die` would abort the run before step 37 installs the audit rules, before
+    # the smoke test, and before step 40 tells the operator anything at all. One
+    # bad ruleset would take the whole deployment down with it.
+    #
+    # The daemon is deliberately NOT restarted on this path either: what is
+    # running now started from a configuration that passed, and replacing it with
+    # one that has just failed turns a warning into an outage.
     # shellcheck disable=SC2086
-    suricata -T -c "$SURICATA_YAML" ${options} || die "suricata config test failed"
+    if ! suricata -T -c "$SURICATA_YAML" ${options}; then
+        warn "'suricata -T' rejected this configuration, so the daemon was NOT \
+restarted and is still running whatever it started with. $(suricata_defaults_file) and \
+the systemd drop-in have ALREADY been rewritten with the options that failed the test, \
+so a reboot would start suricata with them. The error is printed above. Fix it and \
+re-run this step:  --force-step 35"
+        return 0
+    fi
 
     systemctl enable suricata >/dev/null 2>&1 || true
     local restart_reason=""
@@ -2890,10 +2987,91 @@ audit_rule_signatures() {
     '
 }
 
+# The rules THIS host can load, and the `-F dir=` lines it cannot.
+#
+# MEASURED on the Ubuntu 24.04.4 VM (10.30.1.134) on 26 August 2026, before any
+# of this was written:
+#
+#   * `-a never,exit -F dir=/nonexistent` is REFUSED by the kernel with
+#     "Error sending add rule data request (No such file or directory)". The path
+#     has to resolve AT LOAD TIME. It does not even have to be a directory —
+#     `-F dir=/etc/passwd` loads.
+#   * `auditctl -R`, which is what `augenrules --load` runs, STOPS at the first
+#     refused line; everything after it is never offered to the kernel. With
+#     /var/lib/docker absent, 27 of the 30 shipped rules were loaded, and the two
+#     suppressions that FOLLOW it — /opt/sentinel and /var/lib/sentinel — were
+#     among the three lost, so Sentinel audited its own writes. That is the exact
+#     noise those lines exist to remove. Measured again with an empty
+#     /var/lib/docker created by hand: all 30 loaded.
+#   * `-w /nonexistent -p wa -k x` loads FINE. Only `-F dir=` needs its path, so
+#     only `-F dir=` is filtered here.
+#   * a loaded `-F dir=` rule DISAPPEARS from `auditctl -l` the moment the
+#     directory is removed, and does not come back when it is recreated. That is
+#     why this filters rather than creating the directory: a /var/lib/docker we
+#     invented would be a claim that docker is here, and would still be one
+#     `rmdir` away from silently dropping the suppression.
+#
+# So a `-F dir=` rule whose path is absent is left OUT of the file that goes to
+# /etc/audit/rules.d, and the caller NAMES it. Everything else passes through
+# byte for byte: on a host where every path is present — every RHEL host in
+# production, which has docker — the installed file is identical to the shipped
+# one, and so is what the kernel ends up holding.
+#
+# Writes the kept rules to $1; prints the dropped lines on stdout.
+audit_rules_for_this_host() {
+    local dest="$1" line dir
+    : > "$dest"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^[[:space:]]*-[aA][[:space:]] ]] &&
+           [[ "$line" =~ -F[[:space:]]+dir=([^[:space:]]+) ]]; then
+            dir="${BASH_REMATCH[1]}"
+            if [[ ! -e "$dir" ]]; then
+                printf '%s\n' "$line"
+                continue
+            fi
+        fi
+        printf '%s\n' "$line" >> "$dest"
+    done
+}
+
 install_audit_rules() {
     local src="${SCRIPT_DIR}/audit/sentinel.rules"
     [[ -f "$src" ]] || return 0
-    install -D -m 0640 "$src" "$AUDITD_RULES_DEST"
+
+    # What reaches /etc/audit/rules.d is what this host can load, not the whole
+    # shipped file — see audit_rules_for_this_host for what was measured and why.
+    # It has to be the FILE that is filtered, not just the load: augenrules also
+    # runs at boot, from the same directory, with nobody watching.
+    local staged line
+    local -a dropped=()
+    staged="$(mktemp)"
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && dropped+=("$line")
+    done < <(audit_rules_for_this_host "$staged" < "$src")
+    install -D -m 0640 "$staged" "$AUDITD_RULES_DEST"
+    rm -f "$staged"
+
+    # Named, not silent — but not a red line on every deploy either. A `never`
+    # suppression for a directory that does not exist suppresses nothing, so
+    # leaving it out changes no behaviour and this is an info. Anything else
+    # dropped IS a rule this host is missing, and joins the verdict below.
+    local -a dropped_never=() dropped_other=()
+    for line in ${dropped[@]+"${dropped[@]}"}; do
+        if [[ "$line" == *never,exit* ]]; then
+            dropped_never+=("$line")
+        else
+            dropped_other+=("$line")
+        fi
+    done
+    if (( ${#dropped_never[@]} )); then
+        info "auditd: ${#dropped_never[@]} suppression rule(s) left out of \
+${AUDITD_RULES_DEST}, because their directory does not exist on this host. The kernel \
+refuses '-F dir=' on a path that is not there, and auditctl -R stops at it, losing \
+every rule after it:
+    $(printf '%s\n    ' "${dropped_never[@]}")
+    They suppress nothing here. If that software is installed later, re-run this \
+step:  --force-step 37"
+    fi
 
     if ! have auditctl || ! have augenrules; then
         warn "the audit rules are on disk at ${AUDITD_RULES_DEST} and \
@@ -2916,9 +3094,20 @@ plus auth.new_user and auth.new_ssh_key, has no source."
     # anyway. auditctl additionally echoes a full status block for every -b /
     # --backlog_wait_time line it is fed. Reporting a wall of that as a failure
     # is how an operator learns to skip past the line where the real error is.
+    #
+    # The bare `No rules` line is the same kind of noise, and it cost an extra
+    # round to spot because until 27 August 2026 a real error was always printed
+    # beside it. MEASURED on the VM that day: `auditctl -D` prints `No rules` on
+    # stdout EVERY time, including the run where it had just deleted 29 rules,
+    # and `augenrules --load` runs `auditctl -D` before `auditctl -R`. Left in,
+    # it turns a perfectly healthy host into "augenrules did not load the whole
+    # file: No rules" on every deploy. Nothing is lost by dropping it: the
+    # question it looks like it answers is answered properly a few lines below,
+    # by counting every rule against `auditctl -l`.
     local errs
     errs="$(printf '%s\n' "$raw" \
         | grep -vE '^[^:]*augenrules: (No change|No rules)$' \
+        | grep -vE '^No rules$' \
         | grep -vE '^(enabled|failure|pid|rate_limit|backlog_limit|lost|backlog|backlog_wait_time|backlog_wait_time_actual|loginuid_immutable) [0-9]+$' \
         | grep -vE '^[[:space:]]*$' || true)"
 
@@ -2934,7 +3123,10 @@ plus auth.new_user and auth.new_ssh_key, has no source."
     local n sig
     while read -r n sig; do
         [[ -n "$sig" ]] && want_sig["$sig"]="$n"
-    done < <(audit_rule_signatures < "$src" | sort | uniq -c)
+    # The INSTALLED file, not the shipped one: that is what was offered to the
+    # kernel, and counting the shipped file here would report a rule this host
+    # deliberately does not have as one the kernel refused.
+    done < <(audit_rule_signatures < "$AUDITD_RULES_DEST" | sort | uniq -c)
     while read -r n sig; do
         [[ -n "$sig" ]] && have_sig["$sig"]="$n"
     done < <(auditctl -l 2>/dev/null | audit_rule_signatures | sort | uniq -c || true)
@@ -2992,6 +3184,9 @@ reaches ${AUDITD_LOG_PATH} however many rules the kernel holds")
     # "rules installed and confirmed loaded" two lines apart, and an operator
     # reading two opposite statements believes the second one.
     local problems=("${missing[@]}" "${dead[@]}")
+    for line in ${dropped_other[@]+"${dropped_other[@]}"}; do
+        problems+=("NOT installed, its directory does not exist here: ${line}")
+    done
     [[ -n "$errs" ]] && problems+=("augenrules did not load the whole file:
 ${errs}")
     (( ${#unchecked[@]} )) && problems+=("these lines could not be verified at all: ${unchecked[*]}")

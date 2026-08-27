@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from sentinel.analytics import aggregate
 from sentinel.db.engine import Database
 
 # Severity of the insight itself, not of the underlying events.
@@ -74,31 +75,78 @@ async def collect(db: Database) -> list[Insight]:
 
 
 # --- 1. silent collectors --------------------------------------------------
+#: Cea mai scurtă tăcere pe care regula de mai jos o numește defect, în ore.
+#: Inventarul de surse are voie să fie mai vechi de atât? Nu: o sursă putea să
+#: apară și să amuțească în intervalul ăla fără să intre vreodată în inventar,
+#: iar regula ar raporta „nimic tăcut" despre o listă din care lipsește exact
+#: cine tace. Pragul de aici nu e ales, e cel mai mic prag pe care regula îl
+#: folosește mai jos — dacă ăla se mișcă, se mișcă și ăsta.
+_TACERE_MINIMA_H = 6
+
+
 async def _gap_insights(db: Database) -> list[Insight]:
     """A source that stopped reporting. This is the most dangerous failure mode
     in the whole system: it is indistinguishable from "nothing happened" on
     every other screen, and it is exactly what happened when an OpenSSH upgrade
-    renamed the process that logs authentication."""
+    renamed the process that logs authentication.
+
+    Costul e dat de numărul de perechi (sursă, acțiune), nu de fereastră: vezi
+    `aggregate._INVENTAR_SQL`. Varianta dinainte grupa 30 de zile de
+    `raw_events` ca să scoată șase rânduri.
+    """
+    # Inventarul e ce face regula capabilă să vadă o sursă TĂCUTĂ: o sursă care
+    # nu mai scrie nu apare în date, deci trebuie să știm dinainte că ar fi
+    # trebuit să apară. Dacă inventarul lipsește sau e prea vechi, singurul
+    # răspuns onest e „nu pot ști" — nu tăcere, și nici „totul e bine".
+    lag_h = await db.fetchval(
+        "SELECT EXTRACT(EPOCH FROM (now() - max(bucket))) / 3600 "
+        "FROM event_rollup_1m")
+    if lag_h is None or float(lag_h) > _TACERE_MINIMA_H:
+        vechime = "gol" if lag_h is None else f"vechi de {float(lag_h):.0f} ore"
+        return [Insight(
+            level="warning",
+            title="Nu se poate spune dacă vreo sursă a amuțit",
+            detail=(f"Inventarul de surse vine din `event_rollup_1m`, care e "
+                    f"{vechime}. O sursă care tace nu apare în date, deci fără "
+                    f"un inventar proaspăt tăcerea ei arată identic cu "
+                    f"inexistența ei. Verificarea NU spune că totul e bine."),
+            action="systemctl status sentinel-maintenance.timer ; "
+                   "journalctl -u sentinel-maintenance -n 50",
+            evidence={"rollup_lag_ore": None if lag_h is None else round(float(lag_h), 1)},
+        )]
+
     rows = await db.fetch(
-        """
-        SELECT source, max(ts) AS last_seen,
-               EXTRACT(EPOCH FROM (now() - max(ts))) / 3600 AS hours_silent
-        FROM raw_events
-        WHERE ts > now() - interval '30 days'
-        GROUP BY source
-        """
+        f"""
+        WITH inventar AS ({aggregate._INVENTAR_SQL})
+        SELECT i.source, max(u.ultim) AS last_seen,
+               EXTRACT(EPOCH FROM (now() - max(u.ultim))) / 3600 AS hours_silent
+          FROM inventar i
+          LEFT JOIN LATERAL (
+              SELECT max(e.ts) AS ultim FROM raw_events e
+               WHERE e.source = i.source AND e.action = i.action
+                 AND e.ts > now() - interval '30 days') u ON true
+         GROUP BY 1
+        """  # noqa: S608 - _INVENTAR_SQL e o constantă de modul, nu date de la cineva
     )
     out: list[Insight] = []
     for r in rows:
-        hours = float(r["hours_silent"] or 0)
+        if r["last_seen"] is None:
+            # În inventar, dar niciun rând în 30 de zile. `or 0` ar fi citit asta
+            # ca „văzută acum" și ar fi tăcut exact despre colectorul cel mai
+            # mort din listă.
+            hours = 30 * 24.0
+        else:
+            hours = float(r["hours_silent"] or 0)
         # sudo/su are genuinely intermittent on a quiet host; the always-on
         # sources are the ones whose silence means a broken collector.
-        threshold = 6 if r["source"] in ("nginx", "suricata", "sshd") else 72
+        threshold = _TACERE_MINIMA_H if r["source"] in ("nginx", "suricata", "sshd") else 72
         if hours >= threshold:
+            ultim = (f"{r['last_seen']:%d.%m %H:%M}" if r["last_seen"] is not None
+                     else "niciunul în 30 de zile")
             out.append(Insight(
                 level="critical" if hours >= threshold * 4 else "warning",
                 title=f"Sursa „{r['source']}” a amuțit de {hours:.0f} ore",
-                detail=(f"Ultimul eveniment: {r['last_seen']:%d.%m %H:%M}. O sursă care "
+                detail=(f"Ultimul eveniment: {ultim}. O sursă care "
                         f"tace arată identic cu „nu s-a întâmplat nimic” — dar înseamnă "
                         f"că nu mai vezi ce se întâmplă acolo."),
                 action=f"Verifică colectorul: journalctl -u sentinel-ingest | grep {r['source']}",
@@ -142,10 +190,13 @@ async def _multivector_insights(db: Database) -> list[Insight]:
 async def _ssh_target_insights(db: Database) -> list[Insight]:
     rows = await db.fetch(
         """
-        SELECT username, count(*) AS n, count(DISTINCT host(src_ip)) AS ips
-        FROM raw_events
-        WHERE source = 'sshd' AND action = 'auth_fail' AND username IS NOT NULL
-          AND ts > now() - interval '7 days'
+        SELECT username, sum(n)::bigint AS n, count(ip) AS ips
+        FROM (SELECT username, host(src_ip) AS ip, count(*) AS n
+                FROM raw_events
+               WHERE source = 'sshd' AND action = 'auth_fail'
+                 AND username IS NOT NULL
+                 AND ts > now() - interval '7 days'
+               GROUP BY 1, 2) pereche
         GROUP BY 1 ORDER BY n DESC LIMIT 5
         """
     )
@@ -177,10 +228,13 @@ async def _ssh_target_insights(db: Database) -> list[Insight]:
 async def _probe_campaign_insights(db: Database) -> list[Insight]:
     rows = await db.fetch(
         """
-        SELECT http_path, count(*) AS n, count(DISTINCT host(src_ip)) AS ips
-        FROM raw_events
-        WHERE source = 'nginx' AND http_status = 404 AND http_path IS NOT NULL
-          AND ts > now() - interval '7 days'
+        SELECT http_path, sum(n)::bigint AS n, count(ip) AS ips
+        FROM (SELECT http_path, host(src_ip) AS ip, count(*) AS n
+                FROM raw_events
+               WHERE source = 'nginx' AND http_status = 404
+                 AND http_path IS NOT NULL
+                 AND ts > now() - interval '7 days'
+               GROUP BY 1, 2) pereche
         GROUP BY 1 ORDER BY n DESC LIMIT 40
         """
     )
@@ -478,12 +532,13 @@ async def _concentrated_asn_insight(db: Database) -> list[Insight]:
     the next address will come from the same place."""
     rows = await db.fetch(
         """
-        SELECT geo_as_org AS operator, count(*) AS ev,
-               count(DISTINCT host(src_ip)) AS ips
-        FROM raw_events
-        WHERE ts > now() - interval '7 days' AND geo_as_org IS NOT NULL
-          AND action IN ('auth_fail','alert')
-        GROUP BY 1 HAVING count(*) >= 150 AND count(DISTINCT host(src_ip)) <= 5
+        SELECT operator, sum(ev)::bigint AS ev, count(ip) AS ips
+        FROM (SELECT geo_as_org AS operator, host(src_ip) AS ip, count(*) AS ev
+                FROM raw_events
+               WHERE ts > now() - interval '7 days' AND geo_as_org IS NOT NULL
+                 AND action IN ('auth_fail','alert')
+               GROUP BY 1, 2) pereche
+        GROUP BY 1 HAVING sum(ev) >= 150 AND count(ip) <= 5
         ORDER BY ev DESC LIMIT 3
         """
     )

@@ -36,8 +36,9 @@ Three outcomes, and the caller records all three:
     [],       error="..."  trivy could NOT look — NOT the same as clean
 
 The binary missing, no configured path existing, trivy exiting non-zero on a
-path that does exist, output too large to parse, more findings than the cap, or
-a vulnerability database whose age cannot be proved: every one of them is the
+path that does exist, the time budget running out before every path was
+reached, output too large to parse, more findings than the cap, or a
+vulnerability database whose age cannot be proved: every one of them is the
 third case. The orchestrator writes a `failed` row and resolves nothing, so a
 run that could not look never closes a finding.
 
@@ -70,6 +71,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -100,19 +102,47 @@ BINARY = "/usr/local/bin/trivy"
 #: s-ar muta si cealalta ar scrie intr-un director pe care nu-l mai creeaza nimeni.
 CACHE_DIR = "/var/cache/sentinel-trivy"
 
-#: Plafonul nostru pentru o rulare intreaga (toate caile).
+#: Plafonul nostru pentru o rulare intreaga, masurat ca TERMEN de ceas peste
+#: toate caile — nu ca plafon per cale.
 #:
 #: `sentinel-scan.service` are `TimeoutStartSec=14400`. Bugetul unitatii se
 #: imparte intre scanere, iar unul lent nu are voie sa omoare fereastra
 #: celorlalti — de aceea fiecare scaner are plafonul lui, sub al unitatii, si
 #: suma lor e legata de unitate printr-un test.
+#:
+#: Per cale, suma aia n-ar fi legata de nimic: `scan.discovery_paths` e
+#: configuratie, iar nimic din cod nu-i marmureste lungimea. Cu implicitul de
+#: patru cai plafonul REAL ar fi 4 x 1800, cu opt ar fi 8 x 1800 — adica peste
+#: bugetul intregii unitati, iar `trivy_image` si ce vine dupa el n-ar mai apuca
+#: sa ruleze deloc. E acelasi rationament ca la `trivy_image.TIMEOUT_S` si din
+#: acelasi motiv: un plafon per element inmulteste bugetul cu numarul de
+#: elemente, iar numarul de elemente nu-l alege cine a calculat bugetul.
+#:
+#: Deosebirea fata de imagini e de unde vine numarul: containerele se descopera
+#: de pe gazda si au si un refuz explicit (`MAX_CONTAINERS`), pe cand caile le
+#: scrie operatorul in configuratie — deci un refuz peste N cai ar transforma o
+#: linie de configuratie legitima intr-o scanare care nu mai ruleaza. Termenul
+#: de ceas margineste rularea fara sa refuze vreo configuratie.
+#:
+#: Ce se pierde: o cale lenta poate manca termenul si lasa restul nescanate.
+#: Atunci rularea e o EROARE, nu un rezultat partial — exact ca o cale pe care
+#: trivy a esuat, si din acelasi motiv: `mark_resolved_absent` ar inchide tot ce
+#: statea sub caile la care nu s-a mai ajuns.
 TIMEOUT_S = 1800
 
 #: Plafonul pe care i-l dam LUI trivy, per cale. Sub al nostru dinadins: trivy
 #: care se opreste singur scrie un mesaj de eroare pe care il putem raporta;
 #: trivy omorat de noi lasa doar „timeout". Ordinea asta e diferenta dintre un
 #: rand `failed` care spune ce s-a intamplat si unul care nu spune nimic.
+#:
+#: E un MAXIM, nu valoarea data mereu: ce primeste efectiv o cale e
+#: `min(TRIVY_TIMEOUT_S, cat a mai ramas din termen)`, altfel ultima cale ar
+#: putea trece singura peste termenul intregii rulari.
 TRIVY_TIMEOUT_S = 840
+
+#: Cat ii mai dam lui trivy dupa termenul LUI, ca sa apuce sa scrie eroarea
+#: inainte sa-l omoram noi. Acelasi rol ca `trivy_image.TRIVY_GRACE_S`.
+TRIVY_GRACE_S = 60
 
 #: Cat asteptam dupa `trivy version` — o citire locala, nu o scanare.
 VERSION_TIMEOUT_S = 60
@@ -382,7 +412,14 @@ def parse(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return list(items.values())
 
 
-async def _run(argv: list[str], timeout: int = TIMEOUT_S) -> tuple[int, str, str]:
+async def _run(argv: list[str], timeout: int) -> tuple[int, str, str]:
+    """O comanda cu un plafon EXPLICIT de asteptare.
+
+    `timeout` n-are implicit dinadins. Cat asteptam depinde de ce rulam si de cat
+    a mai ramas din termenul rularii, iar un implicit egal cu bugetul intregii
+    rulari e chiar felul in care plafonul „pe rulare” ajunsese sa se aplice pe
+    fiecare cale in parte.
+    """
     proc = await asyncio.create_subprocess_exec(
         *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     try:
@@ -408,8 +445,13 @@ def resolve_binary() -> str | None:
     return shutil.which("trivy")
 
 
-def build_argv(path: str, output: str, binary: str = BINARY) -> list[str]:
-    """Comanda pentru o cale. Separata ca sa poata fi aserteata fara sa ruleze."""
+def build_argv(path: str, output: str, binary: str = BINARY,
+               timeout_s: int = TRIVY_TIMEOUT_S) -> list[str]:
+    """Comanda pentru o cale. Separata ca sa poata fi aserteata fara sa ruleze.
+
+    `timeout_s` e parametru fiindca ultimei cai i se da doar cat a mai ramas din
+    termenul rularii, nu plafonul intreg.
+    """
     return [
         binary,
         "--cache-dir", CACHE_DIR,
@@ -427,7 +469,7 @@ def build_argv(path: str, output: str, binary: str = BINARY) -> list[str]:
         # continuare; ce se opreste aici sunt interogarile per-artefact, care pe
         # o gazda fara iesire nu esueaza repede, ci atarna pana la plafon.
         "--offline-scan",
-        "--timeout", f"{TRIVY_TIMEOUT_S}s",
+        "--timeout", f"{timeout_s}s",
         # `--` inainte de cale: o cale de configuratie care incepe cu `-` ar fi
         # citita ca un steag, si atunci scanarea ar face altceva decat scrie aici.
         "--", path,
@@ -536,18 +578,44 @@ async def scan(paths: list[str]) -> tuple[list[dict[str, Any]], str | None, dict
 
     workdir = tempfile.mkdtemp(prefix="sentinel-trivy-")
     items: list[dict[str, Any]] = []
+    # Un singur termen peste toate caile (vezi `TIMEOUT_S`). `VERSION_TIMEOUT_S`
+    # se scade din el fiindca dupa bucla mai urmeaza o comanda — `db_status` —
+    # si fara rezerva asta o rulare care isi cheltuie bugetul in bucla ar depasi
+    # TIMEOUT_S cu exact cat ia interogarea aia: un plafon care spune un numar si
+    # tine altul.
+    deadline = time.monotonic() + TIMEOUT_S - VERSION_TIMEOUT_S
     try:
         for index, path in enumerate(present):
+            remaining = int(deadline - time.monotonic())
+            if remaining <= TRIVY_GRACE_S:
+                # Nu ingeram ce s-a apucat sa scaneze: `mark_resolved_absent` ar
+                # inchide constatarile cailor la care nu s-a mai ajuns, ca si cum
+                # s-ar fi reparat peste noapte. Acelasi refuz ca la o cale cazuta.
+                return [], (f"bugetul de {TIMEOUT_S}s s-a epuizat după "
+                            f"{index}/{len(present)} căi; nu ingerez o listă "
+                            f"parțială, fiindcă restul căilor ar fi marcate "
+                            f"rezolvate. Prima nescanată: {path}"), facts
+
             output = os.path.join(workdir, f"result-{index}.json")
-            rc, _out, err = await _run(build_argv(path, output, binary),
-                                       timeout=TIMEOUT_S)
+            per_path = min(TRIVY_TIMEOUT_S, remaining - TRIVY_GRACE_S)
+            rc, _out, err = await _run(
+                build_argv(path, output, binary, timeout_s=per_path),
+                timeout=per_path + TRIVY_GRACE_S)
             if rc != 0:
                 # O cale care EXISTA si pe care trivy a esuat opreste toata
                 # rularea. Alternativa — sa mergem mai departe cu restul — ar
                 # produce o lista partiala, iar `mark_resolved_absent` ar inchide
                 # tot ce era sub calea nescanata ca si cum ar fi fost reparat.
+                #
+                # Cand plafonul ei a fost taiat de termen, cauza se spune pe rand:
+                # „calea e stricata” si „n-a mai fost timp” cer de la operator doua
+                # lucruri diferite, iar mesajul lui trivy singur nu le deosebeste.
                 detail = (err.strip().splitlines() or ["fără mesaj"])[-1]
-                return [], f"trivy a eșuat pe {path} (cod {rc}): {detail[:300]}", facts
+                taiat = (f"; îi mai rămăseseră doar {per_path}s din bugetul de "
+                         f"{TIMEOUT_S}s al rulării"
+                         if per_path < TRIVY_TIMEOUT_S else "")
+                return [], (f"trivy a eșuat pe {path} (cod {rc}): "
+                            f"{detail[:300]}{taiat}"), facts
             try:
                 size = os.stat(output).st_size
             except OSError as exc:
