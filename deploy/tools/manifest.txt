@@ -1,25 +1,57 @@
 # Binare externe instalate de `step_external_tools` (pasul 21 din install.sh).
 #
-# Format: <nume> <url> <sha256>
+# Format: <nume> <url> <sha256>, un rand per unealta. Liniile goale si cele
+# care incep cu `#` sunt sarite. Numele e si numele fisierului din arhiva, si
+# numele sub care binarul ajunge in /usr/local/bin.
 #
-# Regula, scrisă în install.sh și repetată aici fiindcă e cea care contează:
-# niciodată `curl | bash`. Fiecare binar se descarcă, se verifică față de suma
-# fixată mai jos, și abia apoi se instalează. La nepotrivire, instalarea se
-# oprește cu `fail` — nu se ocolește, nu se reîncearcă fără verificare. O
-# unealtă de securitate care conduce internetul într-un shell n-are ce audita.
+# Versiuni fixate aici:
+#   trivy   0.74.0   trivy_0.74.0_Linux-64bit.tar.gz
+#   nuclei  3.11.1   nuclei_3.11.1_linux_amd64.zip
 #
-# Suma de control e citită din fișierul de checksums publicat de proiect,
-# alături de release, peste HTTPS. Asta dovedește că binarul descărcat e cel
-# pe care proiectul l-a publicat. Nu dovedește că proiectul n-a fost compromis
-# la sursă — pentru asta există semnăturile Sigstore, pe care instalatorul nu
-# le verifică încă.
+# Sumele au fost luate de operator pe 26 august 2026, de la sursa oficiala:
+# fisierele de checksums publicate alaturi de release, peste HTTPS
+#   https://github.com/aquasecurity/trivy/releases/tag/v0.74.0
+#   https://github.com/projectdiscovery/nuclei/releases/tag/v3.11.1
 #
-# Când actualizezi o versiune: schimbă URL-ul ȘI suma, în același commit.
-# O sumă rămasă în urmă face instalarea să eșueze — ceea ce e comportamentul
-# corect, nu un inconvenient.
+# Ce dovedeste fixarea, si ce NU dovedeste — spus explicit, fiindca diferenta
+# conteaza pentru cine se bazeaza pe ea:
 #
-# Fișierul lipsea până pe 10 august 2026. Pasul 21 avertiza și returna 0, deci
-# se marca „gata" fără să instaleze nimic, iar scanarea de vulnerabilități a
-# lipsit unsprezece zile fără ca ceva să raporteze un defect.
+#   NU dovedeste ca proiectul n-a fost compromis la sursa. Suma vine de la
+#   acelasi server care serveste binarul; cine poate schimba unul poate schimba
+#   si pe celalalt. Pentru asta ar trebui verificate semnaturile (Sigstore /
+#   cosign), pe care instalatorul nu le verifica inca.
+#
+#   DOVEDESTE ca binarul instalat maine e acelasi octet cu octet cu cel vazut
+#   azi, fiindca suma sta versionata si revizuita in depozit, nu se citeste de
+#   pe internet la fiecare rulare. Un release rescris in loc, un mirror otravit
+#   sau un CDN care serveste altceva se opresc aici, cu refuz — nu cu instalare.
+#   Acelasi motiv pentru care install.sh nu face niciodata `curl | bash`.
+#
+# Cand actualizezi o versiune: schimba URL-ul SI suma, in acelasi commit. O suma
+# ramasa in urma face instalarea sa refuze — comportamentul corect, nu un
+# inconvenient.
+#
+# LIMITA DE ARHITECTURA — citeste inainte de a instala pe altceva decat x86_64.
+#
+#   Formatul asta n-are notiune de arhitectura: e o singura linie per unealta,
+#   cu un singur URL si o singura suma. Ambele sume de mai jos sunt pentru
+#   x86_64 / amd64.
+#
+#   Pe arm64 (sau orice altceva) pasul 21 va descarca tot binarul de amd64,
+#   suma va potrivi, si binarul instalat nu va rula pe gazda — sau, daca
+#   operatorul schimba URL-ul catre arhiva de arm64 fara sa schimbe suma,
+#   verificarea va da nepotrivire si instalarea va REFUZA. Refuzul e
+#   comportamentul corect; ce nu e corect e sa fie o surpriza. De aceea pasul
+#   21 verifica dupa instalare ca binarul chiar raspunde la o interogare de
+#   versiune pe gazda asta — un binar de amd64 pe arm64 nu raspunde, si atunci
+#   pasul spune ca unealta nu e utilizabila in loc sa raporteze succes.
+#
+#   Daca Sentinel ajunge sa fie instalat pe arm64, formatul trebuie extins cu
+#   o coloana de arhitectura. Nu s-a facut acum: gazda de productie e x86_64,
+#   iar un format extins fara o gazda pe care sa fie rulat ar fi cod netestat.
+#
+# Istoric: fisierul a lipsit pana pe 10 august 2026. Pasul 21 avertiza si
+# returna 0, deci se marca „gata" fara sa instaleze nimic.
 
-trivy https://github.com/aquasecurity/trivy/releases/download/v0.73.0/trivy_0.73.0_Linux-64bit.tar.gz 2edd39da482bb4e9831962487b68f68e3928ec3137794757f54d00383d79547b
+trivy https://github.com/aquasecurity/trivy/releases/download/v0.74.0/trivy_0.74.0_Linux-64bit.tar.gz 2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a
+nuclei https://github.com/projectdiscovery/nuclei/releases/download/v3.11.1/nuclei_3.11.1_linux_amd64.zip ea63d4ae232808cd7c6bc00d0142428e231fab59dae01042246097d195835ab6

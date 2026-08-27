@@ -126,3 +126,8 @@ sentinel/web/static/vendor/*
 
 # Prezentarea generată local (binar, conține un instantaneu de producție)
 docs/Sentinel-prezentare.pdf
+
+# Worktree-uri temporare create de agenti; au propriul `.git` si nu sunt
+# continut de repository. Fara asta, `test_every_enumerated_file_can_be_read`
+# le enumereaza ca fisiere si pica fiindca nu poate citi un director.
+.claude/worktrees/

@@ -1825,12 +1825,119 @@ STALE_SCAN_HOURS = 30
 #: „necunoscut" sau ca reușită, exact cazul care a produs-o ar fi trecut.
 _FAILED_SCAN_STATUSES = frozenset({"failed", "timeout"})
 
+#: Peste câte ore un rând rămas `running` NU MAI POATE fi o scanare vie.
+#:
+#: Cifra e derivată din unitate, nu dintr-o părere despre cât durează o scanare:
+#: `deploy/systemd/sentinel-scan.service` are `TimeoutStartSec=14400`, deci
+#: systemd omoară unitatea la 4 ore. Peste atât nu mai există niciun proces care
+#: ar putea încheia rândul. Ora în plus e marja de oprire (SIGTERM, apoi SIGKILL)
+#: și diferența dintre ceasuri.
+#:
+#: Contează fiindcă `finish_scan` rulează DOAR în proces: un SIGKILL după
+#: timeout, un OOM sub `MemoryMax=1G` sau o repornire la mijlocul scanării lasă
+#: rândul `running` pentru totdeauna, și nimic nu-l curăță.
+#:
+#: Defectul a fost găsit CITIND CODUL, nu observat pe gazdă — și se spune așa, ca
+#: să nu treacă drept măsurătoare: ramura `running` întorcea `ok` fără să se uite
+#: vreodată la vârstă, deci un rând rămas acolo ar fi ieșit «rulează acum» oricât
+#: de vechi ar fi fost. Pe gazdă, pe 26 august 2026, nu exista niciun astfel de
+#: rând: 34 de rânduri în `scans`, 0 cu `running`, cel mai vechi `started_at` din
+#: 31 iulie, secvența la 34 (deci nimic n-a fost șters), iar `selfcheck_state`
+#: avea `scan:last:dnf | ok | ultima reușită acum 11 ore, 13 constatări`. Cifra
+#: de 2160 de ore din teste e scenariul lor sintetic, nu ceva ce s-a văzut acolo.
+#:
+#: Legat de unitate printr-un test care citește `TimeoutStartSec` din fișierul
+#: unității — dacă cineva urcă timeout-ul, constanta trebuie să urce cu el.
+STUCK_SCAN_HOURS = 5
+
+#: Ultima rulare a fiecărui scaner ȘI ultimul lui rezultat REAL.
+#:
+#: A doua jumătate nu e un lux. `DISTINCT ON (scanner) ... ORDER BY started_at
+#: DESC` alege ultimul rând, iar un rând rămas `running` de la un SIGKILL e
+#: pentru totdeauna ultimul rând: el UMBREȘTE ultima rulare încheiată, adică
+#: exact cifra pe care o arată pagina de vulnerabilități. Fără coloanele `ok_*`,
+#: constatarea despre rândul blocat ar putea spune că scanarea e blocată și n-ar
+#: putea spune din când e cifra din panou — ar repara o tăcere și ar lăsa alta.
+#:
+#: `LATERAL` peste mulțimea DEJA deduplicată, nu peste tabela întreagă: se
+#: execută o dată per scaner (2-3 azi), nu o dată per rând. Fiecare execuție e un
+#: `LIMIT 1` pe `scans_scanner_idx (scanner, started_at DESC)`, indexul din 0003.
+#:
+#: `LEFT JOIN`, nu `JOIN`: un scaner care n-a încheiat NICIODATĂ o rulare trebuie
+#: să iasă din interogare cu `ok_*` NULL, ca verificarea să poată spune „nu
+#: există niciun rezultat real" — nu să dispară din listă, fiindcă atunci nu s-ar
+#: mai spune nimic despre el, iar runner-ul ar citi tăcerea ca pe o revenire.
 _LAST_SCAN_SQL = """
-SELECT DISTINCT ON (scanner)
-       scanner, status, started_at, finished_at, error, findings_count
-  FROM scans
- ORDER BY scanner, started_at DESC
+SELECT last.id, last.scanner, last.status, last.started_at, last.finished_at,
+       last.error, last.findings_count,
+       ok.started_at     AS ok_started_at,
+       ok.finished_at    AS ok_finished_at,
+       ok.findings_count AS ok_findings_count
+  FROM (SELECT DISTINCT ON (scanner)
+               id, scanner, status, started_at, finished_at, error, findings_count
+          FROM scans
+         ORDER BY scanner, started_at DESC) last
+  LEFT JOIN LATERAL (
+        SELECT started_at, finished_at, findings_count
+          FROM scans c
+         WHERE c.scanner = last.scanner AND c.status = 'completed'
+         ORDER BY c.started_at DESC
+         LIMIT 1
+       ) ok ON true
+ ORDER BY last.scanner
 """
+
+
+async def _scan_age_s(db: Database, ts: Any) -> float | None:
+    """Vârsta unui moment din `scans`, în secunde, măsurată cu ceasul BAZEI.
+
+    `None` înseamnă „nu pot afla", niciodată „proaspăt": fie n-a fost niciun
+    moment de măsurat, fie interogarea a căzut. Apelanții îl duc în `unknown`.
+
+    Calculată în bază, ca la `check_ingest_sources`: ceasul gazdei și cel al
+    bazei pot diferi, iar diferența ar apărea aici ca o vechime inventată. Iar
+    `$1::timestamptz` e obligatoriu — fără el `now() - $1` are două citiri în
+    Postgres, tipul parametrului nu se poate deduce, și interogarea cade la
+    pregătire.
+    """
+    if ts is None:
+        return None
+    try:
+        return float(await db.fetchval(
+            "SELECT EXTRACT(EPOCH FROM (now() - $1::timestamptz))", ts) or 0.0)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _last_completed_phrase(db: Database, r: dict) -> tuple[str, dict[str, Any]]:
+    """Din când e ultimul rezultat REAL al scanerului, ca propoziție și ca fapte.
+
+    Trei răspunsuri, și niciunul nu are voie să fie tăcerea sau o cifră
+    inventată:
+
+      * există o rulare încheiată — se spune din când și cu câte constatări,
+        fiindcă aia e cifra pe care o arată panoul;
+      * n-a existat NICIODATĂ una — se spune asta pe față; „0 constatări" ar fi
+        chiar minciuna pe care o reparăm;
+      * există, dar nu i-am putut citi vârsta — nu e nici „nu există", nici
+        „proaspătă"; se spune că nu știu.
+    """
+    ts = r.get("ok_finished_at") or r.get("ok_started_at")
+    if ts is None:
+        return ("nu există nicio rulare încheiată a acestui scaner, deci panoul "
+                "n-are de la el nicio cifră — nici măcar una veche",
+                {"last_completed": None})
+
+    findings = int(r.get("ok_findings_count") or 0)
+    age_s = await _scan_age_s(db, ts)
+    if age_s is None:
+        return (f"există o rulare încheiată mai devreme, cu {findings} constatări, "
+                f"dar nu i-am putut citi vârsta",
+                {"last_completed_findings": findings})
+    return (f"ultimul rezultat real e de acum {_ago(age_s / 60)}, cu {findings} "
+            f"constatări — aia e cifra din panou",
+            {"last_completed_age_h": int(age_s / 3600),
+             "last_completed_findings": findings})
 
 
 async def check_last_scan(db: Database, cfg: Config) -> list[CheckResult]:
@@ -1842,6 +1949,18 @@ async def check_last_scan(db: Database, cfg: Config) -> list[CheckResult]:
     nicăieri: operatorul a văzut două surse care nu erau de acord și n-a avut de
     unde ști care minte. Verificarea de aici e drumul pe care eșecul intră în
     `selfcheck_state`, deci și în `/selfcheck` pe Telegram.
+
+    Al doilea eșec, găsit pe 26 august 2026 citind codul, nu văzut pe gazdă:
+    ramura `running` întorcea `ok` fără să se uite la vârstă, deci un rând rămas
+    acolo ar fi fost raportat «rulează acum» oricât de vechi. Pe gazdă erau atunci
+    0 rânduri `running`, deci nu s-a observat nimic — ceea ce nu-l face mai puțin
+    real: `finish_scan` rulează doar în proces, deci un SIGKILL după
+    `TimeoutStartSec`, un OOM sau o repornire la mijloc lasă rândul acolo și nimic
+    nu-l curăță. Peste
+    `STUCK_SCAN_HOURS` se raportează, cu AMÂNDOUĂ faptele: că rularea n-a mai
+    ajuns niciodată la capăt, ȘI din când e ultimul rezultat real — fiindcă
+    `_LAST_SCAN_SQL` alege rândul cel mai nou, deci cel blocat umbrește tocmai
+    cifra pe care operatorul o vede în panou.
 
     `degraded`, nu `down`: nimic de pe gazdă nu s-a oprit — colectarea și blocarea
     merg mai departe. Ce e stricat e prospețimea unei liste. Fiecare scanner își
@@ -1881,16 +2000,55 @@ async def check_last_scan(db: Database, cfg: Config) -> list[CheckResult]:
         status = str(r.get("status") or "")
         key = f"scan:last:{scanner}"
 
-        # O rulare în curs e purtarea normală în fereastra de scanare — și atât.
-        # Tratată ca măsurătoare reușită ar pretinde un rezultat care nu există
-        # încă („0 constatări" la o scanare abia pornită), deci nu se spune nimic
-        # despre constatări aici.
+        # O rulare în curs e purtarea normală în fereastra de scanare — dar numai
+        # cât timp POATE fi în curs. Vezi `STUCK_SCAN_HOURS`: peste pragul ăla
+        # procesul nu mai există, deci rândul e o rămășiță, nu o scanare.
         if status == "running":
+            age_s = await _scan_age_s(db, r.get("started_at"))
+            if age_s is None:
+                # Fără vârstă nu pot deosebi „rulează acum" de „a murit acum trei
+                # luni". „Nu știu" nu e „e bine", deci se emite `unknown` — sub
+                # cheia scanerului, ca să înlocuiască verdictul, nu să-l retragă.
+                results.append(CheckResult(
+                    key, f"Scanarea „{scanner}” — nu-i pot afla vârsta", "unknown",
+                    detail="rândul e „running”, dar nu am putut citi de când, deci "
+                           "nu știu dacă e o scanare în curs sau una moartă demult",
+                    action="journalctl -u sentinel-scan -n 50",
+                    facts={"scanner": scanner, "status": status}))
+                continue
+
+            if age_s <= STUCK_SCAN_HOURS * 3600:
+                # Tratată ca măsurătoare reușită ar pretinde un rezultat care nu
+                # există încă („0 constatări" la o scanare abia pornită), deci nu
+                # se spune nimic despre constatări aici.
+                results.append(CheckResult(
+                    key, f"Scanarea „{scanner}” rulează acum", "ok",
+                    detail=f"o scanare e în curs de {_ago(age_s / 60)} — starea "
+                           f"normală în fereastra de scanare; rezultatul se vede "
+                           f"când se încheie",
+                    facts={"scanner": scanner, "status": status,
+                           "age_h": int(age_s / 3600)}))
+                continue
+
+            # Peste prag. DOUĂ fapte, și amândouă trebuie spuse: rândul nu se va
+            # încheia niciodată, ȘI cât timp stă acolo el umbrește ultimul
+            # rezultat real (`DISTINCT ON` îl alege pe el), deci operatorul se
+            # uită la o cifră veche fără ca ceva să i-o spună.
+            ultima, fapte = await _last_completed_phrase(db, r)
+            scan_id = r.get("id")
             results.append(CheckResult(
-                key, f"Scanarea „{scanner}” rulează acum", "ok",
-                detail="o scanare e în curs — starea normală în fereastra de "
-                       "scanare; rezultatul se vede când se încheie",
-                facts={"scanner": scanner, "status": status}))
+                key, f"Scanarea „{scanner}” a rămas blocată în „running”", "degraded",
+                detail=f"a pornit acum {_ago(age_s / 60)} și nu s-a încheiat "
+                       f"niciodată — mai demult de {STUCK_SCAN_HOURS} ore, iar "
+                       f"systemd a omorât deja unitatea la `TimeoutStartSec`, deci "
+                       f"nu mai e nimic viu care s-o închidă (SIGKILL după timeout, "
+                       f"OOM, sau o repornire la mijloc). Cât rândul stă așa, el "
+                       f"ASCUNDE ultima rulare încheiată în panou: {ultima}",
+                action="journalctl -u sentinel-scan -n 100 ; rândul rămas se închide "
+                       f"cu: UPDATE scans SET status='failed', error='întrerupt' "
+                       f"WHERE id={scan_id};",
+                facts={"scanner": scanner, "status": status,
+                       "scan_id": scan_id, "age_h": int(age_s / 3600), **fapte}))
             continue
 
         if status in _FAILED_SCAN_STATUSES:
@@ -1904,9 +2062,11 @@ async def check_last_scan(db: Database, cfg: Config) -> list[CheckResult]:
                 facts={"scanner": scanner, "status": status, "error": eroare}))
             continue
 
-        # Încheiată (completed/skipped): proaspătă sau veche? Vârsta se calculează
-        # în baza de date, ca la `check_ingest_sources`: ceasul gazdei și cel al
-        # bazei pot diferi, iar diferența ar apărea aici ca o vechime inventată.
+        # Încheiată: proaspătă sau veche? (`skipped` a ieșit din constrângere în
+        # migrația 0029 — vezi acolo de ce nu se tratează, ci se face
+        # nereprezentabil.) Vârsta se calculează în baza de date, ca la
+        # `check_ingest_sources`: ceasul gazdei și cel al bazei pot diferi, iar
+        # diferența ar apărea aici ca o vechime inventată.
         #
         # `finished_at` întâi, `started_at` doar ca rezervă. Întrebarea de aici e
         # „cât de veche e cifra din panou", iar cifra se scrie când scanarea SE
@@ -1915,14 +2075,7 @@ async def check_last_scan(db: Database, cfg: Config) -> list[CheckResult]:
         # minute ar putea fi raportată ca depășită. Rezerva pe `started_at`
         # rămâne fiindcă un rând încheiat fără `finished_at` există — iar fără
         # niciunul din două se cade în `unknown` mai jos, nu în `ok`.
-        ts = r.get("finished_at") or r.get("started_at")
-        age_s: float | None = None
-        if ts is not None:
-            try:
-                age_s = float(await db.fetchval(
-                    "SELECT EXTRACT(EPOCH FROM (now() - $1::timestamptz))", ts) or 0.0)
-            except Exception:  # noqa: BLE001
-                age_s = None
+        age_s = await _scan_age_s(db, r.get("finished_at") or r.get("started_at"))
 
         if age_s is None:
             # Fără vârstă nu pot spune dacă lista e proaspătă. „Nu știu" nu e „e

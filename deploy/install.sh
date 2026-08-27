@@ -437,10 +437,150 @@ step_packages() {
 }
 
 # --- 21 -------------------------------------------------------------------
+# How long a freshly installed tool gets to answer a version query. There is a
+# ceiling because `nuclei -version` also asks projectdiscovery whether a newer
+# release exists: on a host with no route out, an unbounded probe would hang the
+# installer here rather than report anything.
+TOOL_PROBE_TIMEOUT_S=20
+
+# Where external binaries land. A defaulted variable rather than a bare
+# literal, in the same shape as SENTINEL_PREFIX and friends in lib/common.sh,
+# so tests/security/test_installer_external_tools.py can run the SHIPPED step
+# against a temporary directory instead of the machine's real /usr/local/bin.
+# Nothing in the installer or in deploy.sh ever sets it; a test pins the
+# default so it cannot drift.
+TOOLS_BIN_DIR="${TOOLS_BIN_DIR:-/usr/local/bin}"
+
+# Proof that the binary RUNS on this host — not that a file with that name
+# exists, which is a different and much weaker claim. An amd64 build on arm64
+# exits 126, a truncated file exits 126 or 2, and a directory left behind by a
+# failed unpack is not executable at all. None of those reach exit 0 with output.
+#
+# The flag differs per tool (cobra wants --version, goflags wants -version), so
+# each is tried in turn. Output is captured with 2>&1 on purpose: nuclei prints
+# its banner and its version line to stderr. With 2>/dev/null nuclei's probe
+# would look empty and a perfectly good install would be reported as unproven.
+tool_version_line() {
+    local bin="$1" flag out ver
+    for flag in --version -version version; do
+        out="$(timeout "$TOOL_PROBE_TIMEOUT_S" "$bin" "$flag" 2>&1)" || continue
+        [[ -n "$out" ]] || continue
+        # The version number wherever it sits in the output: trivy answers with
+        # one plain line, nuclei with an ASCII banner ahead of it.
+        ver="$(printf '%s\n' "$out" | tr -d '\r' | grep -m1 -oE '[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.+-]*' || true)"
+        [[ -n "$ver" ]] || ver="$(printf '%s\n' "$out" | tr -d '\r' | head -1)"
+        printf '%s' "$ver"
+        return 0
+    done
+    return 1
+}
+
+# The archive format is read from the first bytes of the file, not from the URL:
+# once the checksum has matched we know exactly which bytes we hold, and the
+# bytes are the truth about them. This matters because trivy publishes .tar.gz
+# while nuclei publishes ONLY .zip for Linux (linux_386, linux_amd64, linux_arm,
+# linux_arm64 — there is no tar.gz), so a step that only knows tar could never
+# install nuclei at all.
+tool_archive_kind() {
+    local f="$1" magic
+    magic="$(od -An -N4 -tx1 < "$f" 2>/dev/null | tr -d ' \n')"
+    case "$magic" in
+        1f8b*)                      printf 'gzip' ;;
+        504b0304|504b0506|504b0708) printf 'zip' ;;
+        *)                          return 1 ;;
+    esac
+}
+
+# Unpacks into a staging directory, never straight into /usr/local/bin: these
+# archives also carry LICENSE and README, and the old fallback
+# `tar -xzf -C /usr/local/bin` sprayed them there whenever the targeted
+# extraction missed.
+tool_extract() {
+    local archive="$1" dest="$2" kind
+    kind="$(tool_archive_kind "$archive")" || return 1
+    case "$kind" in
+        gzip)
+            tar -xzf "$archive" -C "$dest"
+            ;;
+        zip)
+            # `unzip` is NOT in pkg_names_core (deploy/lib/distro.sh), so on a
+            # minimal host it may simply not be there. It was not added to that
+            # list because pkg_install of the core set is a `die` path, and a
+            # package missing from one repository would then stop the whole
+            # install over a zip reader. Python is the guaranteed fallback
+            # instead: step 20 dies unless it can produce a Python >= 3.x, and
+            # records it in PYTHON_BIN. bsdtar was not used — it is guaranteed
+            # on neither family (own package on RHEL, libarchive-tools on Debian).
+            #
+            # `python -m zipfile` drops the executable bit. Harmless here,
+            # because `install -m 0755` below sets it — and, unlike the version
+            # this replaces, the result is then actually verified.
+            if have unzip; then
+                unzip -q -o "$archive" -d "$dest"
+            elif [[ -n "${PYTHON_BIN:-}" ]] && "$PYTHON_BIN" -c 'import zipfile' 2>/dev/null; then
+                "$PYTHON_BIN" -m zipfile -e "$archive" "$dest"
+            elif have python3 && python3 -c 'import zipfile' 2>/dev/null; then
+                python3 -m zipfile -e "$archive" "$dest"
+            else
+                return 1
+            fi
+            ;;
+    esac
+}
+
+# Skipping a tool that is already on PATH is right: one put there by the
+# operator or by the distribution is not ours to overwrite. What was wrong was
+# the old report of it — `ok "${name} already installed"` — which let the
+# operator believe the pinned version was the one on the host. It can be any
+# other, and an old scanner reports fewer findings without ever complaining.
+# So say what is actually there, and say when it differs from what is pinned.
+#
+# Returns 0 only when the tool on PATH was proved to BE the pinned version.
+# Anything else — a different version, or one that would not say — returns 1,
+# so the caller counts it as unproven and the step's closing line cannot go
+# green over it. "Present" and "the version we reviewed" are not the same claim.
+tool_report_existing() {
+    local name="$1" url="$2" path found pinned=""
+    path="$(command -v "$name")"
+    # The pinned version, read out of the URL: GitHub releases are
+    # .../download/vX.Y.Z/<asset>. If a URL ever stops looking like that we
+    # simply do not claim to know, rather than guessing.
+    if [[ "$url" == */download/*/* ]]; then
+        pinned="${url##*/download/}"; pinned="${pinned%%/*}"; pinned="${pinned#v}"
+    fi
+    if ! found="$(tool_version_line "$path")"; then
+        warn "${name} is already on PATH at ${path}, but it did not answer a version \
+query — Sentinel cannot tell which build it is. Left alone; verify it by hand."
+        return 1
+    fi
+    if [[ -n "$pinned" && "$found" != *"$pinned"* ]]; then
+        warn "${name} on PATH at ${path} reports ${found}, but the manifest pins \
+${pinned}. Left alone — remove it and re-run step 21 to get the pinned build."
+        return 1
+    fi
+    ok "${name} already installed at ${path}: ${found}"
+}
+
 step_external_tools() {
     # Never `curl | bash`. Every external binary is downloaded, checksummed
     # against a pinned value, and only then installed — a security tool that
     # pipes the internet into a shell has no business auditing anything.
+    #
+    # And, just as important: nothing is reported as installed because an unpack
+    # command returned 0. What shipped here wrote `ok "${name} installed"`
+    # unconditionally, after two tar attempts that could BOTH fail, with the
+    # chmod that would have caught it neutralised by `|| true`. Nothing in the
+    # step ever looked at /usr/local/bin. That is the CLAUDE.md pattern —
+    # confirming the intention instead of the effect — sitting inside the step
+    # that installs the security tooling. What is checked now: the file is at
+    # the destination, it is executable, and it answers a version query here.
+    #
+    # The step stays tolerant: a release that 404s, an unreadable archive or a
+    # binary for the wrong architecture must not stop an install that is mostly
+    # about auditd, nftables and the database. So none of these paths `die`.
+    # They print `[x]`/`[!]` per tool and close with a counted verdict line —
+    # a `warn`, because WARN_COUNT is what the end-of-run summary prints (see
+    # main()); FAIL_COUNT is incremented and read nowhere.
     local manifest="${SCRIPT_DIR}/tools/manifest.txt"
     if [[ ! -f "$manifest" ]]; then
         warn "no tools manifest at ${manifest}; skipping Trivy/nuclei. \
@@ -448,26 +588,105 @@ Vulnerability scanning (P7) will not be available until they are installed."
         return 0
     fi
 
-    local name url sha
-    while read -r name url sha; do
+    local name url sha work tmp src ver
+    local n_ok=0 n_present=0 n_unproven=0 n_bad=0
+    # `|| [[ -n "$name" ]]` picks up the last line of a manifest saved without a
+    # trailing newline: without it `read` returns 1 and that tool is skipped in
+    # complete silence, which is the same lie in a new place.
+    while read -r name url sha || [[ -n "$name" ]]; do
         [[ -z "$name" || "$name" == \#* ]] && continue
-        if have "$name"; then ok "${name} already installed"; continue; fi
+        if [[ -z "$url" || -z "$sha" ]]; then
+            fail "manifest entry '${name}' is incomplete (want: <name> <url> <sha256>); NOT installed"
+            n_bad=$((n_bad + 1)); continue
+        fi
 
-        local tmp="/tmp/sentinel-${name}.tar.gz"
-        info "downloading ${name}"
-        curl -fsSL --max-time 120 -o "$tmp" "$url" || { warn "download failed: ${name}"; continue; }
-        if ! echo "${sha}  ${tmp}" | sha256sum -c --status; then
-            rm -f "$tmp"
-            fail "checksum mismatch for ${name}. Refusing to install. This is either a \
-corrupted download or a compromised mirror — do not work around it."
+        if have "$name"; then
+            if tool_report_existing "$name" "$url"; then
+                n_present=$((n_present + 1))
+            else
+                n_unproven=$((n_unproven + 1))
+            fi
             continue
         fi
-        tar -xzf "$tmp" -C /usr/local/bin "$name" 2>/dev/null \
-            || tar -xzf "$tmp" -C /usr/local/bin
-        chmod 0755 "/usr/local/bin/${name}" 2>/dev/null || true
-        rm -f "$tmp"
-        ok "${name} installed"
+
+        # mktemp, not a fixed /tmp/sentinel-<name>.tar.gz: that path was
+        # predictable and written as root into a world-writable directory. The
+        # extension went with it — it described only one of the two formats.
+        work="$(mktemp -d "/tmp/sentinel-tool-${name}.XXXXXX")" || {
+            fail "cannot create a staging directory for ${name}; NOT installed"
+            n_bad=$((n_bad + 1)); continue
+        }
+        tmp="${work}/archive"
+
+        info "downloading ${name}"
+        if ! curl -fsSL --max-time 120 -o "$tmp" "$url"; then
+            rm -rf "$work"
+            warn "download failed: ${name}; NOT installed"
+            n_bad=$((n_bad + 1)); continue
+        fi
+        if ! printf '%s  %s\n' "$sha" "$tmp" | sha256sum -c --status; then
+            rm -rf "$work"
+            fail "checksum mismatch for ${name}. Refusing to install. This is either a \
+corrupted download or a compromised mirror — do not work around it."
+            n_bad=$((n_bad + 1)); continue
+        fi
+
+        if ! tool_extract "$tmp" "$work"; then
+            rm -rf "$work"
+            fail "could not unpack the ${name} archive — unrecognised format, or no \
+extractor for it (a .zip needs unzip or python3). ${name} is NOT installed."
+            n_bad=$((n_bad + 1)); continue
+        fi
+
+        # The binary wherever the archive put it: at the root for trivy and
+        # nuclei, possibly a level down for something else. If it is nowhere,
+        # the unpack succeeded and there is still nothing to install — exactly
+        # the case the old code reported as `ok`.
+        src="$(find "$work" -mindepth 1 -type f -name "$name" -print -quit 2>/dev/null || true)"
+        if [[ -z "$src" ]]; then
+            rm -rf "$work"
+            fail "the ${name} archive unpacked but holds no file named '${name}'; NOT installed"
+            n_bad=$((n_bad + 1)); continue
+        fi
+        # -D so a host without /usr/local/bin gets it rather than a failure that
+        # would read like a broken archive.
+        if ! install -D -m 0755 "$src" "${TOOLS_BIN_DIR}/${name}"; then
+            rm -rf "$work"
+            fail "could not write ${TOOLS_BIN_DIR}/${name}; NOT installed"
+            n_bad=$((n_bad + 1)); continue
+        fi
+        rm -rf "$work"
+
+        # Everything from here down is the effect, not the intention.
+        if [[ ! -x "${TOOLS_BIN_DIR}/${name}" ]]; then
+            fail "${TOOLS_BIN_DIR}/${name} is not executable after install; ${name} is NOT usable"
+            n_bad=$((n_bad + 1)); continue
+        fi
+        if ver="$(tool_version_line "${TOOLS_BIN_DIR}/${name}")"; then
+            ok "${name} installed: ${ver} (${TOOLS_BIN_DIR}/${name})"
+            n_ok=$((n_ok + 1))
+        else
+            # Left on disk deliberately. Deleting on an ambiguous probe would be
+            # destructive on doubt, and a re-run reports the same thing again
+            # through tool_report_existing rather than pretending it is fine.
+            warn "${name} was written to ${TOOLS_BIN_DIR}/${name} but does not run here \
+— no answer to a version query. Wrong architecture, or a missing shared library. \
+Treat it as NOT installed; vulnerability scanning will not use it."
+            n_bad=$((n_bad + 1))
+        fi
     done < "$manifest"
+
+    # Green only when every tool in the manifest was proved to be on the host at
+    # the pinned version. An unproven one counts against the verdict too: this
+    # line is the last thing about step 21 the operator reads, and a green one
+    # over a scanner nobody could identify is the whole failure mode again.
+    if (( n_bad > 0 || n_unproven > 0 )); then
+        warn "external tools: ${n_ok} installed, ${n_present} already present at the \
+pinned version, ${n_unproven} present but unverified, ${n_bad} NOT installed. \
+Vulnerability coverage is not proven for those — see the lines above."
+    else
+        ok "external tools: ${n_ok} installed, ${n_present} already present"
+    fi
 }
 
 # --- 22 -------------------------------------------------------------------

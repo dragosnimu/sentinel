@@ -566,10 +566,21 @@ VALUE_EXEMPT: dict[str, tuple[dict[str, int], str]] = {
     "tests/unit/test_exposed.py": ({SHAPE_HEX: 1}, "adresă IPv6 în forma din /proc/net"),
     "tests/unit/test_auditd_watch.py": ({SHAPE_HEX: 1}, "proctitle auditd, hexa prin format"),
 
-    # Suma sha256 a unui binar public, fixată dinadins: e chiar mecanismul care
-    # face `curl | bash` inutil. Nu e un secret, e opusul lui — o valoare publică
-    # a cărei schimbare tăcută e ce trebuie observat.
-    "deploy/tools/manifest.txt": ({SHAPE_HEX: 1}, "sumă sha256 fixată a unui binar public"),
+    # Sumele sha256 ale unor binare publice, fixate dinadins: e chiar mecanismul
+    # care face `curl | bash` inutil. Nu sunt secrete, sunt opusul lor — valori
+    # publice a căror schimbare tăcută e ce trebuie observat.
+    #
+    # Erau 1 până pe 26 august 2026 (doar trivy). Sunt 2 de atunci: nuclei a fost
+    # adăugat în manifest, cu suma lui. Numărul e o măsurătoare, deci crește
+    # odată cu manifestul, nu înainte.
+    "deploy/tools/manifest.txt": ({SHAPE_HEX: 2}, "sume sha256 fixate ale unor binare publice"),
+    # Aceleași două sume, scrise a doua oară ca aserțiune de conținut: testul
+    # cere ca manifestul să fixeze EXACT valorile verificate de operator la
+    # sursă, ca o editare accidentală să pice aici, nu pe gazdă. Ca să dovedească
+    # asta trebuie să le conțină literal; o comparație cu ce e în manifest s-ar
+    # potrivi cu orice ar scrie manifestul.
+    "tests/security/test_installer_external_tools.py":
+        ({SHAPE_HEX: 2}, "sumele fixate, repetate ca aserțiune de conținut"),
 
     # Numele unei unelte MCP, `mcp__…_restartNode_jsApplicationV1`. Are literă
     # mică, literă mare și cifră, deci trece de regula de compoziție; e un nume de
