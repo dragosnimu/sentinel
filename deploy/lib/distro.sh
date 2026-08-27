@@ -86,6 +86,22 @@ pkg_installed() {
     esac
 }
 
+# The full package inventory, one line per package, for the pre-deploy
+# snapshot that rollback reads.
+#
+# It used to be a bare `rpm -qa | sort ... 2>/dev/null || true` in
+# lib/common.sh. On Ubuntu that wrote an EMPTY file and said nothing: the
+# snapshot which is supposed to answer "what did this host have before
+# Sentinel touched it" answered "no packages". Writes to stdout so the caller
+# can see it fail; a caller that discards the exit code gets an empty file
+# either way, which is why snapshot_create now checks the result.
+pkg_list() {
+    case "$DISTRO_FAMILY" in
+        rhel)   rpm -qa | sort ;;
+        debian) dpkg-query -W -f '${Package} ${Version} ${Architecture}\n' | sort ;;
+    esac
+}
+
 # Extra repositories needed before the core packages resolve.
 pkg_enable_extra_repos() {
     case "$DISTRO_FAMILY" in
@@ -141,10 +157,57 @@ python_pkg_names() {
     esac
 }
 
+# What an interpreter that is ALREADY on the host still needs: the venv module
+# and the C headers.
+#
+# A different question from python_pkg_names, which answers "what do I install
+# when there is no usable interpreter at all". On Ubuntu that list is never
+# reached — 24.04 ships python3 = 3.12.3, which clears PYTHON_MIN_MINOR — and
+# yet `python3.12 -m venv` still dies with "ensurepip is not available" and
+# systemd-python==235 will not compile, because python3.12-venv and
+# python3.12-dev are separate packages that nothing installed. Measured on
+# Ubuntu 24.04.4: `dpkg -l` showed both as `un`, i.e. never installed.
+#
+# The names follow the INTERPRETER, not the family default. `python3-dev` and
+# `python3-venv` are metapackages pointing at whatever Debian currently calls
+# the default python3; on a host where the chosen interpreter is python3.13
+# they would install headers for 3.12 and the build would fail against the
+# wrong Python.h without ever saying so.
+#
+# Takes the interpreter, echoes one package per line. Refuses (non-zero, no
+# output) when the interpreter will not say which version it is — better no
+# names than names for a version we guessed.
+python_support_pkgs() {
+    local py="$1" xy
+    xy="$("$py" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)" || return 1
+    [[ "$xy" =~ ^[0-9]+\.[0-9]+$ ]] || return 1
+    case "$DISTRO_FAMILY" in
+        # RHEL keeps ensurepip inside the interpreter package, so only the
+        # headers are ever a separate install here.
+        rhel)   printf '%s\n' "python${xy}-devel" ;;
+        debian) printf '%s\n' "python${xy}-venv" "python${xy}-dev" ;;
+    esac
+}
+
 # ---------------------------------------------------------------- core packages
 #
 # Same roles, different names. Kept as one function rather than a lookup table
 # so the reason for each package is visible next to it.
+#
+# `auditd` is in the debian list and NOT in the rhel one, and that asymmetry is
+# deliberate: RHEL ships auditd in its minimal install, Ubuntu ships none of it.
+# Measured on Ubuntu 24.04.4 — `auditctl` did not exist, so `augenrules --load`
+# was "command not found", step 37 warned once, and the install went on to
+# report success. What is lost with it is every host.* detection plus
+# auth.new_user and auth.new_ssh_key: sentinel_identity, sentinel_ssh,
+# sentinel_cron, sentinel_systemd, sentinel_webroot, sentinel_exec,
+# sentinel_priv and sentinel_cmd have nothing to load them.
+#
+# `audispd-plugins` is deliberately NOT here. It carries the remote/syslog
+# dispatcher plugins, and Sentinel's collector reads /var/log/audit/audit.log
+# directly (ingest.auditd_log_path) — it dispatches nowhere. This list is a
+# `die` path, so a package that buys nothing is a way for the install to stop
+# over something it does not need.
 pkg_names_core() {
     case "$DISTRO_FAMILY" in
         rhel)
@@ -159,6 +222,7 @@ pkg_names_core() {
                 gcc \
                 libsystemd-dev pkg-config \
                 nginx nftables \
+                auditd \
                 acl ca-certificates curl tar zstd jq
             ;;
     esac
@@ -234,6 +298,22 @@ suricata_defaults_file() {
     case "$DISTRO_FAMILY" in
         rhel)   printf '/etc/sysconfig/suricata' ;;
         debian) printf '/etc/default/suricata' ;;
+    esac
+}
+
+# ---------------------------------------------------------------- tls
+# Where the distribution keeps certs/ and private/.
+#
+# /etc/pki/tls is an RPM convention. Debian and Ubuntu have no /etc/pki at all —
+# confirmed on Ubuntu 24.04.4, where the directory simply does not exist — so
+# the hardcoded path meant `openssl req -out /etc/pki/tls/certs/...` failed, the
+# placeholder certificate was never written, and the vhost pointed at a file
+# that would never be there. nginx then refuses to start on the missing
+# certificate, at step 33, with an error about TLS rather than about the path.
+tls_dir() {
+    case "$DISTRO_FAMILY" in
+        rhel)   printf '/etc/pki/tls' ;;
+        debian) printf '/etc/ssl' ;;
     esac
 }
 

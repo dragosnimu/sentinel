@@ -257,6 +257,67 @@ else
     ok "firewalld inactive (as expected)"
 fi
 
+# ufw — the Debian-family front-end to the SAME netfilter hooks.
+#
+# Measured on a fresh Ubuntu 24.04.4: ufw is active out of the box, allowing
+# 22/tcp and nothing else, and this section printed "firewalld inactive (as
+# expected)" followed by "nftables available" and declared the firewall fine.
+# ufw was not mentioned anywhere in this file.
+#
+# Sentinel's `accept` cannot undo ufw's drop. netfilter evaluates EVERY chain
+# registered on a hook, and one drop ends the packet — so the allowlist would be
+# populated, every step would report success, the dashboard would answer
+# nothing, and no log on the host would say why.
+#
+# This is `fail` and not `warn`, for four reasons worth writing down because the
+# opposite choice is defensible until you look at them together:
+#
+#   * preflight's contract is go/no-go. A host on which the dashboard cannot
+#     answer is a no-go; that is the whole question this script exists to ask.
+#   * firewalld, the same problem on the other family, is already `fail` above.
+#     Warning about ufw while failing on firewalld teaches the operator that ufw
+#     is the milder of the two. It is the same hook.
+#   * the remedy is one non-destructive command, printed below verbatim.
+#   * a SCOPED rule satisfies this check — `ufw allow from <your-ip> to any port
+#     N` shows up as an ALLOW line just like a global one — so an operator who
+#     does not want the port open to the internet is not blocked by it.
+#
+# The escape hatch is --allow-ufw, which mirrors --allow-firewalld. Note that
+# scripts/deploy.sh forwards NEITHER flag: through that path the way past this
+# check is to open the port, which is also the right thing to do.
+if have ufw; then
+    ufw_state="$(ufw status verbose 2>/dev/null || true)"
+    if [[ -z "$ufw_state" ]]; then
+        # Not "fine": unreadable. `ufw status` needs root, and preflight is not
+        # always run as root when invoked by hand.
+        warn "ufw is installed but its status could not be read (it needs root). \
+Whether port ${SENTINEL_PUBLIC_PORT} is open is UNKNOWN — not verified, not fine. \
+Check by hand with:  sudo ufw status verbose"
+    elif ! grep -qi '^Status: active' <<< "$ufw_state"; then
+        ok "ufw installed but inactive"
+    elif [[ "$NGINX_MODE" == "shared" ]]; then
+        # In shared mode Sentinel binds no public port of its own: it answers on
+        # the 80/443 the operator's nginx already serves, which ufw must already
+        # be allowing or those sites would be down.
+        info "ufw is active. In shared mode Sentinel opens no port of its own."
+    elif grep -qE '^Default:[^,]*allow \(incoming\)' <<< "$ufw_state"; then
+        ok "ufw active, but its default incoming policy is allow — it does not block ${SENTINEL_PUBLIC_PORT}"
+    elif grep -qE "^${SENTINEL_PUBLIC_PORT}(/tcp)?([[:space:]]+\(v6\))?[[:space:]]+ALLOW" <<< "$ufw_state"; then
+        ok "ufw active and port ${SENTINEL_PUBLIC_PORT} is allowed in it"
+    elif [[ "${ALLOW_UFW:-0}" == "1" ]]; then
+        warn "ufw is ACTIVE with no rule for ${SENTINEL_PUBLIC_PORT}/tcp, and --allow-ufw was \
+passed. The install will finish and the dashboard will still answer nothing until you run: \
+sudo ufw allow ${SENTINEL_PUBLIC_PORT}/tcp"
+    else
+        fail "ufw is ACTIVE and no rule in it allows ${SENTINEL_PUBLIC_PORT}/tcp. Sentinel's own \
+nftables table cannot undo that — netfilter runs every chain on the hook and a single drop wins — \
+so the install would report success at every step and the dashboard would answer nothing."
+        fail "Open it first:            sudo ufw allow ${SENTINEL_PUBLIC_PORT}/tcp"
+        fail "Or, only for your address: sudo ufw allow from <your-ip> to any port ${SENTINEL_PUBLIC_PORT} proto tcp"
+        fail "Or re-run with --allow-ufw if you will open it yourself afterwards."
+    fi
+fi
+
 if have nft; then
     ok "nftables available"
     if nft list table inet sentinel >/dev/null 2>&1; then

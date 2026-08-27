@@ -74,6 +74,23 @@ AmbientCapabilities=CAP_DAC_READ_SEARCH
 # pastreaza intre rulari — spre deosebire de `RuntimeDirectory=`, care l-ar
 # sterge la oprire si ar readuce exact problema. Ocupa in jur de 205 MB.
 CacheDirectory=sentinel-dnf
+
+# Cache-ul lui trivy: baza de vulnerabilitati, nu un fisier temporar.
+#
+# Fara el trivy scrie in $HOME/.cache/trivy, iar sub `ProtectSystem=strict`
+# acolo nu se poate scrie: fiecare rulare ar reincerca descarcarea si ar
+# esua. Cu el, baza se descarca o data si se reimprospateaza incremental --
+# altfel ar fi cateva sute de MB de la ghcr.io in fiecare noapte, si o
+# scanare care depinde de iesirea la internet la FIECARE rulare, nu doar
+# cand baza s-a invechit.
+#
+# `CacheDirectory=`, nu `RuntimeDirectory=`: al doilea l-ar sterge la
+# oprirea unitatii, adica exact la fiecare rulare (`Type=oneshot`).
+#
+# Calea rezultata, /var/cache/sentinel-trivy, e `trivy_fs.CACHE_DIR`, si
+# `tests/unit/test_scan_trivy_fs.py` cere ca cele doua sa fie aceeasi.
+CacheDirectory=sentinel-trivy
+
 CacheDirectoryMode=0750
 
 ReadWritePaths=/var/lib/sentinel

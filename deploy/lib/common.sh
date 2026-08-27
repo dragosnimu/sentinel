@@ -591,7 +591,25 @@ snapshot_create() {
     ss -tlnp                    > "${dir}/listening.txt"      2>/dev/null || true
     systemctl list-units --type=service --state=running --no-legend \
                                 > "${dir}/services.txt"       2>/dev/null || true
-    rpm -qa | sort              > "${dir}/rpm.txt"            2>/dev/null || true
+    # The package inventory, through the distro abstraction.
+    #
+    # It was `rpm -qa | sort > rpm.txt 2>/dev/null || true`. On a Debian host
+    # that wrote an EMPTY file and said nothing at all: the snapshot whose job
+    # is to answer "what did this host have before Sentinel touched it" answered
+    # "no packages", and the rollback notes then pointed the operator at it.
+    # Both halves of that line hid the failure — the redirect and the `|| true`.
+    #
+    # Now the result is checked, and an inventory that could not be taken is
+    # reported as unknown rather than written out as none.
+    if declare -F pkg_list >/dev/null 2>&1 \
+       && pkg_list > "${dir}/packages.txt" 2>/dev/null \
+       && [[ -s "${dir}/packages.txt" ]]; then
+        info "snapshot: $(wc -l < "${dir}/packages.txt") packages recorded"
+    else
+        rm -f "${dir}/packages.txt"
+        warn "could not list the installed packages, so ${dir}/packages.txt was \
+NOT written. The rollback notes will have no 'before' list to compare against."
+    fi
     [[ -d /etc/nginx ]] && tar -cf "${dir}/nginx.tar" -C / etc/nginx 2>/dev/null || true
     [[ -d "$SENTINEL_CONFIG_DIR" ]] && \
         tar -cf "${dir}/sentinel-config.tar" -C / "etc/sentinel" 2>/dev/null || true

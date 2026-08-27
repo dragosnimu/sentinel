@@ -5,8 +5,14 @@ findings, enrich each with KEV, score it, upsert (dedup by finding_key), then
 mark anything the scanner used to report but no longer does as resolved. A single
 scanner failing is recorded on its own row and does not stop the others.
 
-Only the OS-package scanner is wired here (P7.1). trivy, web checks, nuclei and
-semgrep slot into the same loop; each is one more `_run_*` behind its config flag.
+Two scanners are wired here: `dnf` for OS packages and `trivy_fs` for the
+application dependencies dnf cannot see. Containers, nuclei and semgrep slot into
+the same loop; each is one more `_run_*` behind its config flag.
+
+The two `_run_*` bodies below have the same shape on purpose and are NOT folded
+into one helper. They differ in what each scanner can prove — trivy also has to
+answer for the age of its vulnerability database — and the last time this loop
+was made generic, the special case was the one that mattered.
 """
 
 from __future__ import annotations
@@ -16,7 +22,7 @@ from sentinel.db.engine import Database
 from sentinel.db.repo import findings as fx
 from sentinel.intel import kev
 from sentinel.logging_setup import get_logger
-from sentinel.scan import announce, os_packages, prioritize
+from sentinel.scan import announce, os_packages, prioritize, trivy_fs
 
 log = get_logger(__name__)
 
@@ -37,6 +43,8 @@ async def run_all(db: Database, cfg: Config, *, triggered_by: str = "schedule") 
     summary: dict[str, dict] = {}
     if cfg.scan.os_packages:
         summary["dnf"] = await _run_os_packages(db, triggered_by)
+    if cfg.scan.filesystem:
+        summary[trivy_fs.SCANNER] = await _run_trivy_fs(db, cfg, triggered_by)
 
     summary["patch_plans"] = await _draft_plans(db, cfg)
 
@@ -148,4 +156,66 @@ async def _run_os_packages(db: Database, triggered_by: str) -> dict:
     except Exception as exc:  # noqa: BLE001 - record and surface, do not crash the pass
         await fx.finish_scan(db, scan_id, status="failed", error=str(exc)[:500])
         log.error("dnf scan crashed", extra={"detail": str(exc)})
+        return {"status": "failed", "error": str(exc)[:200]}
+
+
+async def _run_trivy_fs(db: Database, cfg: Config, triggered_by: str) -> dict:
+    """trivy peste caile din `scan.discovery_paths`.
+
+    Aceeasi forma ca `_run_os_packages`, cu doua lucruri in plus, si amandoua
+    exista fiindca trivy poate raspunde cu incredere si totusi gresit:
+
+      * `db_version` se scrie pe rand la FIECARE incheiere, si pe cele esuate:
+        „ce a vazut scanarea" fara „cu ce baza de date s-a uitat" e o cifra
+        careia nu i se poate afla valabilitatea nici a doua zi;
+      * cand scanerul intoarce o eroare nu se rezolva NIMIC. O rulare care n-a
+        putut sa se uite n-are voie sa inchida o constatare — lipsa unui rezultat
+        nu e un zero.
+    """
+    target = ",".join(cfg.scan.discovery_paths or []) or "(nicio cale configurată)"
+    scan_id = await fx.start_scan(db, trivy_fs.SCANNER, target[:400],
+                                  triggered_by=triggered_by)
+    try:
+        raw, error, facts = await trivy_fs.scan(list(cfg.scan.discovery_paths or []))
+        db_version = facts.get("db_version")
+        if error:
+            await fx.finish_scan(db, scan_id, status="failed", error=error,
+                                 db_version=db_version)
+            log.error("trivy fs scan failed", extra={"error": error})
+            return {"status": "failed", "error": error, "db_version": db_version}
+
+        cves = [f["cve"] for f in raw if f.get("cve")]
+        kev_map = await kev.lookup(db, cves)
+
+        seen: list[str] = []
+        new_items: list[dict] = []
+        new = 0
+        for f in raw:
+            if f.get("cve") in kev_map:
+                f["kev"] = True
+                f["kev_due_date"] = kev_map.get(f["cve"])
+            f["scan_id"] = scan_id
+            # Aceleasi implicite ca la dnf: constatarile astea sunt pe gazda care
+            # serveste siturile operatorului, deci expuse, cu criticitate neutra.
+            # Legarea lor de un `asset` anume ar cere o potrivire cale->activ, si
+            # una gresita ar muta o vulnerabilitate pe alt sistem.
+            f["priority"] = prioritize.score(f, exposed=True, criticality=3)
+            if await fx.upsert_finding(db, f):
+                new += 1
+                new_items.append(dict(f))
+            seen.append(f["finding_key"])
+
+        resolved = await fx.mark_resolved_absent(db, trivy_fs.SCANNER, None, seen)
+        await fx.finish_scan(
+            db, scan_id, status="completed", findings_count=len(raw),
+            new_findings=new, resolved_findings=resolved, db_version=db_version)
+        log.info("trivy fs scan complete",
+                 extra={"findings": len(raw), "new": new, "resolved": resolved,
+                        "kev": len(kev_map), "db_version": db_version})
+        return {"status": "completed", "findings": len(raw), "new": new,
+                "resolved": resolved, "kev": len(kev_map),
+                "db_version": db_version, "new_items": new_items}
+    except Exception as exc:  # noqa: BLE001 - record and surface, do not crash the pass
+        await fx.finish_scan(db, scan_id, status="failed", error=str(exc)[:500])
+        log.error("trivy fs scan crashed", extra={"detail": str(exc)})
         return {"status": "failed", "error": str(exc)[:200]}

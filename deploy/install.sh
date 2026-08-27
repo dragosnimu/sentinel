@@ -109,6 +109,7 @@ while [[ $# -gt 0 ]]; do
         --force-step)     FORCE_STEP="${2:-}"; shift 2 ;;
         --skip-preflight) SKIP_PREFLIGHT=1; shift ;;
         --allow-firewalld) export ALLOW_FIREWALLD=1; shift ;;
+        --allow-ufw)      export ALLOW_UFW=1; shift ;;
         --yes|-y)         export SENTINEL_ASSUME_YES=1; shift ;;
         # The range covers the header block down to the end of the nginx-mode
         # description. It is a line count, so it moves when the header does —
@@ -389,6 +390,109 @@ container scanning; remove it and set scan.containers=false if you would rather 
 }
 
 # --- 20 -------------------------------------------------------------------
+# The path the collector opens, and the one named in sentinel.yaml.tmpl. One
+# constant, so the check that decides `ingest.auditd` and the file the collector
+# reads cannot drift apart without somebody noticing.
+AUDITD_LOG_PATH=/var/log/audit/audit.log
+
+# auditd installed is not auditd running, and only the running one produces
+# anything.
+#
+# Measured on Ubuntu 24.04.4 right after the package went in: systemd reported
+# auditd.service as `enabled`, `systemctl is-active auditd` said `inactive`, and
+# /var/log/audit was EMPTY. Debian's postinst enables the unit without starting
+# it. Left like that, the host has the package, gets the rules written at step
+# 37, and collects nothing at all until somebody reboots it — which is the same
+# outcome as not installing auditd, reached by a longer route.
+#
+# `enable --now`, not `restart`: on every host where auditd is already up — all
+# the RHEL ones — a restart would be a change to a service that was fine, and
+# auditd is not a service one bounces for no reason. And then the EFFECT is what
+# is checked: the daemon is active AND the log file has appeared. The file does
+# not exist the instant the unit starts, so it is waited for rather than
+# assumed; an instant check would report a working auditd as broken.
+AUDITD_LOG_WAIT_S=10
+
+ensure_auditd_running() {
+    have auditctl || return 1
+    if ! systemctl is-active --quiet auditd 2>/dev/null; then
+        systemctl enable --now auditd >/dev/null 2>&1 || true
+    fi
+    systemctl is-active --quiet auditd 2>/dev/null || return 1
+
+    local waited=0
+    while (( waited < AUDITD_LOG_WAIT_S )); do
+        [[ -f "$AUDITD_LOG_PATH" ]] && return 0
+        sleep 1; waited=$((waited + 1))
+    done
+    return 1
+}
+
+# Can this interpreter build Sentinel's venv, and compile against its headers?
+#
+# Two facts, asked of the interpreter itself rather than of dpkg or rpm:
+#
+#   ensurepip importable   `python -m venv` fails without it, with
+#                          "ensurepip is not available" — step 23
+#   Python.h readable      systemd-python==235 is a C extension built at pip
+#                          time; without headers step 23 dies in a compiler
+#
+# Neither is a claim about a package name, which is what makes this survive the
+# next distribution to split its Python differently.
+python_can_venv() { "$1" -c 'import ensurepip' >/dev/null 2>&1; }
+
+python_has_headers() {
+    local inc
+    inc="$("$1" -c 'import sysconfig; print(sysconfig.get_paths()["include"])' 2>/dev/null)" || return 1
+    [[ -n "$inc" && -r "${inc}/Python.h" ]]
+}
+
+# Install what is missing, then ASK AGAIN.
+#
+# The old code installed the Python group only when python_find failed. On
+# Ubuntu 24.04 python3 is 3.12.3, which clears the 3.10 floor, so the block was
+# skipped entirely and python3.12-venv / python3.12-dev were never installed —
+# measured: `dpkg -l` reported both as `un`. The install then died 200 lines
+# later at step 23 with an error about the venv, which is the symptom, not the
+# cause. RHEL never saw it because AlmaLinux's python3 is 3.9, below the floor,
+# so the block always ran there.
+#
+# Driven by the two facts and not by the family: on a host where both already
+# hold — every RHEL host that installs today — nothing is installed and nothing
+# changes. The package install itself is best-effort on purpose; whether it
+# worked is decided by re-asking the interpreter, not by apt's exit code.
+ensure_python_build_deps() {
+    local py="$1" missing=() pkgs=() p
+    python_can_venv "$py"    || missing+=("venv")
+    python_has_headers "$py" || missing+=("headers")
+    if (( ${#missing[@]} == 0 )); then
+        ok "${py} already has venv and headers"
+        return 0
+    fi
+
+    while read -r p; do pkgs+=("$p"); done < <(python_support_pkgs "$py")
+    if (( ${#pkgs[@]} )); then
+        local what
+        what="$(printf '%s and ' "${missing[@]}")"; what="${what% and }"
+        info "${py} is missing ${what}; installing ${pkgs[*]}"
+        pkg_install "${pkgs[@]}" >/dev/null 2>&1 || \
+            warn "installing ${pkgs[*]} reported a failure; checking what is on the host anyway"
+    else
+        warn "${py} would not say which version it is, so there are no package \
+names to install for it"
+    fi
+
+    missing=()
+    python_can_venv "$py"    || missing+=("ensurepip — '${py} -m venv' will fail")
+    python_has_headers "$py" || missing+=("Python.h — systemd-python will not compile")
+    if (( ${#missing[@]} )); then
+        die "${py} still cannot build Sentinel's venv:
+    $(printf '%s\n    ' "${missing[@]}")
+    Install ${pkgs[*]-the venv and development packages for ${py}} by hand and re-run."
+    fi
+    ok "${py} can build a venv and has its headers"
+}
+
 step_packages() {
     # Recorded BEFORE the install, because it decides whether nginx.conf is ours
     # to edit later. If nginx was already serving the operator's sites, its
@@ -418,12 +522,31 @@ step_packages() {
     printf 'PYTHON_BIN=%q\n' "$PYTHON_BIN" >> "${STATE_MARKERS}/preflight.env"
     info "using ${PYTHON_BIN} ($("$PYTHON_BIN" -V 2>&1))"
 
+    # An interpreter that exists is not an interpreter that can build the venv.
+    ensure_python_build_deps "$PYTHON_BIN"
+
     # Shared roles, per-family names. `systemd-devel` / `libsystemd-dev` matter
     # most: systemd-python is a C extension built at pip time, and without the
     # headers the venv step dies with "Package 'libsystemd' ... not found".
     local pkgs=()
     while read -r p; do pkgs+=("$p"); done < <(pkg_names_core)
     pkg_install "${pkgs[@]}" || die "package installation failed"
+
+    # auditd is where every host.* detection comes from. Not fatal — Sentinel
+    # still watches journald, nginx and Suricata without it — but never silent:
+    # a host with no auditd is a host with a whole class of detection missing,
+    # and step 26 writes that fact into the configuration instead of pretending.
+    if ! have auditctl; then
+        warn "auditd is not installed on this host. Every host.* detection, plus \
+auth.new_user and auth.new_ssh_key, comes from it and will not fire."
+    elif ensure_auditd_running; then
+        ok "auditd running and writing ${AUDITD_LOG_PATH}"
+    else
+        warn "auditd is installed but ${AUDITD_LOG_PATH} is not being written \
+(service state: $(systemctl is-active auditd 2>/dev/null || echo unknown)). The rules \
+installed at step 37 will load into the kernel and nothing will collect their records. \
+Inspect with:  systemctl status auditd"
+    fi
 
     # Optional extras: a missing one degrades a feature, it does not stop setup.
     pkg_install git certbot >/dev/null 2>&1 || \
@@ -902,6 +1025,31 @@ API-based triage, correlation and reports do not. Install it later if you want t
 }
 
 # --- 26 -------------------------------------------------------------------
+# Will there be an auditd feeding the collector on this host?
+#
+# `ingest.auditd: true` used to be hardcoded in the template. On Ubuntu 24.04.4
+# auditd is not installed at all — `auditctl` did not exist — so the shipped
+# configuration told the collector to read a file that would never be created.
+# Nothing failed; the host.* detections and auth.new_user / auth.new_ssh_key
+# simply never fired, on a dashboard that reported itself healthy. A
+# configuration that lies is worse than a missing package: the missing package
+# is at least visible.
+#
+# Two facts, both about this host and neither about our intent: the control
+# binary exists, and the log the template names is actually there. The DAEMON
+# being up right now is deliberately NOT one of them — step 26 re-runs on every
+# deploy, and an auditd restarted at the wrong second would otherwise flip the
+# configuration to false and leave it there. A stopped auditd still has its log
+# file, and is warned about separately below.
+#
+# An auditd configured to write somewhere other than AUDITD_LOG_PATH also
+# answers no, and that is correct rather than pedantic: the collector opens that
+# exact path, so a log kept elsewhere is a log it cannot read.
+auditd_feeds_the_collector() {
+    have auditctl || return 1
+    [[ -f "$AUDITD_LOG_PATH" ]]
+}
+
 step_configs() {
     # NOT a `trap ... RETURN`: without `set -o functrace` a RETURN trap set in a
     # function is not cleared when that function returns, so it fires again on the
@@ -927,6 +1075,23 @@ step_configs() {
     bpf=""
     [[ -n "${BPF_HINT:-}" ]] && bpf="not host ${BPF_HINT}"
 
+    local auditd_enabled=false
+    if auditd_feeds_the_collector; then
+        auditd_enabled=true
+        if ! systemctl is-active --quiet auditd 2>/dev/null; then
+            warn "auditd is installed but its service is not running. ingest.auditd stays \
+true — ${AUDITD_LOG_PATH} is there — but nothing new is being written to it. Start it with: \
+systemctl enable --now auditd"
+        fi
+    else
+        warn "no auditd on this host (auditctl missing, or ${AUDITD_LOG_PATH} absent), so \
+ingest.auditd is written as FALSE rather than pointed at a file that will not exist.
+    What that costs: every host.* detection, plus auth.new_user and auth.new_ssh_key.
+    The rules sentinel_identity, sentinel_ssh, sentinel_cron, sentinel_systemd,
+    sentinel_webroot, sentinel_exec, sentinel_priv and sentinel_cmd have nothing to load them.
+    Install auditd and re-run this step:  --force-step 26"
+    fi
+
     sed -e "s|@@DOMAIN@@|${DOMAIN}|g" \
         -e "s|@@HOSTNAME@@|${hostname_fqdn}|g" \
         -e "s|@@NGINX_MODE@@|${NGINX_MODE}|g" \
@@ -934,6 +1099,7 @@ step_configs() {
         -e "s|@@IFACE@@|${iface}|g" \
         -e "s|@@BPF_FILTER@@|${bpf}|g" \
         -e "s|@@SURICATA_ENABLED@@|$( (( SURICATA_OK )) && echo true || echo false )|g" \
+        -e "s|@@AUDITD_ENABLED@@|${auditd_enabled}|g" \
         -e "s|@@TELEGRAM_CHAT_ID@@|${SECRETS[TELEGRAM_CHAT_ID]:-0}|g" \
         -e "s|@@EXTRA_ALLOWLIST@@|${extra_allow}|g" \
         "${SCRIPT_DIR}/config/sentinel.yaml.tmpl" > "${tmp}/sentinel.yaml"
@@ -1802,6 +1968,7 @@ competing for :80."
     sed -e "s|@@DOMAIN@@|${DOMAIN:-_}|g" \
         -e "s|@@PORT@@|8787|g" \
         -e "s|@@PUBLIC_PORT@@|${PUBLIC_PORT}|g" \
+        -e "s|@@TLS_DIR@@|$(tls_dir)|g" \
         "${SCRIPT_DIR}/nginx/sentinel.conf.tmpl" > "$conf"
 
     # Catch-all deny for requests that reach Sentinel's port without naming its
@@ -1819,6 +1986,7 @@ competing for :80."
 
     if [[ -z "$existing_default" ]]; then
         sed -e "s|@@PUBLIC_PORT@@|${PUBLIC_PORT}|g" \
+            -e "s|@@TLS_DIR@@|$(tls_dir)|g" \
             "${SCRIPT_DIR}/nginx/sentinel-default-deny.conf.tmpl" > "$deny_conf"
         chmod 0644 "$deny_conf"
         ok "catch-all deny on :${PUBLIC_PORT} — only https://${DOMAIN:-<domain>}:${PUBLIC_PORT} reaches the dashboard"
@@ -1893,6 +2061,7 @@ configuration first — Sentinel will not add a vhost to a broken nginx."
 
     sed -e "s|@@DOMAIN@@|${DOMAIN}|g" \
         -e "s|@@PORT@@|8787|g" \
+        -e "s|@@TLS_DIR@@|$(tls_dir)|g" \
         "${SCRIPT_DIR}/nginx/sentinel-shared.conf.tmpl" \
         > /etc/nginx/conf.d/sentinel-shared.conf
     chmod 0644 /etc/nginx/conf.d/sentinel-shared.conf
@@ -1954,9 +2123,18 @@ nginx picked Sentinel's. A bare-IP scan would find the login page."
 }
 
 ensure_placeholder_certificate() {
-    local cert=/etc/pki/tls/certs/sentinel-selfsigned.crt
-    local key=/etc/pki/tls/private/sentinel-selfsigned.key
+    # /etc/pki is an RPM convention; Debian and Ubuntu keep this under /etc/ssl
+    # and have no /etc/pki at all. See tls_dir in lib/distro.sh.
+    local dir; dir="$(tls_dir)"
+    local cert="${dir}/certs/sentinel-selfsigned.crt"
+    local key="${dir}/private/sentinel-selfsigned.key"
     [[ -f "$cert" ]] && return 0
+
+    # Created only when absent. Debian ships /etc/ssl/private as 0710
+    # root:ssl-cert, and an `install -d -m` over an existing directory would
+    # change a mode that is not ours to change.
+    [[ -d "${dir}/certs" ]]   || install -d -m 0755 "${dir}/certs"
+    [[ -d "${dir}/private" ]] || install -d -m 0700 "${dir}/private"
 
     openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
         -keyout "$key" -out "$cert" \

@@ -256,7 +256,9 @@ cat <<EOF
 
   Rămase în urmă, deliberat:
     - pachete instalate (nginx, postgresql, nftables, certbot, python3.12)
-      Lista dinainte de deploy: ${SNAPSHOT}/rpm.txt
+      Lista dinainte de deploy: $( [[ -s "${SNAPSHOT}/packages.txt" ]] \
+        && printf '%s' "${SNAPSHOT}/packages.txt" \
+        || printf '%s' 'NU s-a putut lua (vezi avertismentul de la pasul 18)' )
     - ${SENTINEL_STATE_DIR} și ${SENTINEL_BACKUP_DIR}
     - certificatul Let's Encrypt
 $( (( PURGE )) || echo "    - baza de date 'sentinel' (folosește --purge pentru a o șterge)" )

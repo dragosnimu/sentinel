@@ -71,7 +71,13 @@ ingest:
   # auditd: doar tipurile de înregistrări relevante pentru securitate
   # (autentificări, USER_CMD, modificări de conturi, AVC, crash-uri). Restul e
   # filtrat în colector — auditd poate produce zeci de mii de linii pe zi.
-  auditd: true
+  #
+  # Scris de instalator, nu fix pe `true`. Era `true` întotdeauna, iar pe o
+  # gazdă Ubuntu unde auditd nici măcar nu e instalat asta însemna un colector
+  # care deschide la nesfârșit un fișier ce nu va exista niciodată — adică o
+  # configurație care minte, ceea ce e mai rău decât un pachet lipsă. Pasul 26
+  # se uită dacă există `auditctl` ȘI fișierul de mai jos, și scrie ce a găsit.
+  auditd: @@AUDITD_ENABLED@@
   suricata: @@SURICATA_ENABLED@@
   # NEIMPLEMENTATE încă: nu există colector pentru ele. Lăsate false ca să nu
   # pretindă o acoperire pe care Sentinel nu o are.

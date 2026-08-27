@@ -204,11 +204,15 @@ def _wire(monkeypatch, results: dict) -> list[list[dict]]:
     async def fake_dnf(_db, _triggered_by):
         return results.get("dnf", {})
 
+    async def fake_trivy(_db, _cfg, _triggered_by):
+        return results.get("trivy_fs", {})
+
     async def fake_plans(_db, _cfg):
         return results.get("patch_plans", {})
 
     monkeypatch.setattr("sentinel.intel.kev.refresh", fake_kev)
     monkeypatch.setattr(orchestrator, "_run_os_packages", fake_dnf)
+    monkeypatch.setattr(orchestrator, "_run_trivy_fs", fake_trivy)
     monkeypatch.setattr(orchestrator, "_draft_plans", fake_plans)
     monkeypatch.setattr(orchestrator.announce, "announce", fake_announce)
     return sent
@@ -216,7 +220,12 @@ def _wire(monkeypatch, results: dict) -> list[list[dict]]:
 
 def _cfg(**over):
     base = SimpleNamespace(
-        scan=SimpleNamespace(enabled=True, os_packages=True, announce_new=True),
+        # `filesystem` e scris explicit, chiar si cand e oprit: `run_all` il
+        # citeste, iar un ciot caruia ii lipseste un steag pe care codul il
+        # citeste nu esueaza pe „scanerul n-a rulat" — esueaza pe AttributeError,
+        # adica pe altceva decat ce masoara testul.
+        scan=SimpleNamespace(enabled=True, os_packages=True, filesystem=False,
+                             announce_new=True),
         telegram=SimpleNamespace(allowed_chat_ids=[1]), hostname="gazda")
     for k, v in over.items():
         setattr(base.scan, k, v)
@@ -253,6 +262,25 @@ def test_two_scanners_produce_one_message_not_two(monkeypatch) -> None:
 
     assert len(sent) == 1, f"{len(sent)} mesaje pentru o singura rulare"
     assert sent[0] == [a, b], "constatarile n-au fost adunate din ambele scanere"
+
+
+def test_the_filesystem_scanner_reaches_the_same_single_announcement(
+        monkeypatch) -> None:
+    """Al doilea scaner real intra in acelasi mesaj, nu intr-al lui.
+
+    Esecul pe care il previne: `trivy_fs` cablat in `run_all` fara sa fie cules
+    de bucla de anunt — constatarile lui ar intra in baza si n-ar spune nimanui
+    nimic, exact pana cand cineva deschide panoul. Sau, in cealalta directie,
+    culese de un al doilea apel la `announce`: doua mesaje pentru o rulare, si
+    operatorul opreste canalul.
+    """
+    a, b = _finding(cve="CVE-DNF"), _finding(cve="CVE-TRIVY")
+    sent = _wire(monkeypatch, {"dnf": {"new_items": [a]},
+                               "trivy_fs": {"new_items": [b]}})
+    run(orchestrator.run_all(object(), _cfg(filesystem=True)))
+
+    assert len(sent) == 1, f"{len(sent)} mesaje pentru o singura rulare"
+    assert sent[0] == [a, b], "constatarile lui trivy n-au ajuns in anunt"
 
 
 def test_a_scanner_that_reports_no_new_items_does_not_break_the_scan(

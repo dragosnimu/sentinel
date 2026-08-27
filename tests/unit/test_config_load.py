@@ -84,6 +84,7 @@ def _render_shipped_template() -> str:
         "@@IFACE@@": "eth0",
         "@@BPF_FILTER@@": "",
         "@@SURICATA_ENABLED@@": "true",
+        "@@AUDITD_ENABLED@@": "true",
         "@@TELEGRAM_CHAT_ID@@": "1",
         "@@EXTRA_ALLOWLIST@@": '"192.0.2.10"',
     }.items():

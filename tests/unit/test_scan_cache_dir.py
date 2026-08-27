@@ -34,14 +34,22 @@ def _unit() -> str:
 
 
 def test_the_unit_creates_the_directory_the_scanner_writes_to() -> None:
-    """`CacheDirectory=X` face `/var/cache/X`. Trebuie să fie exact `CACHE_DIR`."""
-    found = re.search(r"^CacheDirectory=(\S+)$", _unit(), re.M)
-    assert found, (
+    """`CacheDirectory=X` face `/var/cache/X`. Trebuie să fie exact `CACHE_DIR`.
+
+    Citite TOATE liniile, nu prima: unitatea are mai multe `CacheDirectory=` de
+    când trivy și-a primit cache-ul lui, iar o aserțiune pe prima potrivire ar
+    fi devenit un test despre ordinea liniilor din fișier. Reordonate mâine de
+    cineva care aranjează secțiunea, ar fi picat fără ca nimic să se strice —
+    sau, mai rău, ar fi trecut comparând calea lui dnf cu a altui scaner.
+    """
+    valori = re.findall(r"^CacheDirectory=(\S+)$", _unit(), re.M)
+    assert valori, (
         "unitatea nu declară `CacheDirectory=`, deci dnf ar scrie într-un "
         "director pe care nimeni nu-l creează — și fiecare scanare ar "
         "reconstrui metadatele, ca înainte de reparație")
-    assert f"/var/cache/{found.group(1)}" == os_packages.CACHE_DIR, (
-        f"unitatea creează /var/cache/{found.group(1)}, iar scanerul scrie în "
+    create = {f"/var/cache/{v}" for v in valori}
+    assert os_packages.CACHE_DIR in create, (
+        f"unitatea creează {sorted(create)}, iar scanerul de pachete scrie în "
         f"{os_packages.CACHE_DIR}")
 
 
