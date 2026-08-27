@@ -356,20 +356,28 @@ info "packaging the repository"
 # against a newer tree. That last one is not hypothetical — it clobbered this
 # working tree twice during E2.2.
 #
-# .claude/ is the agent's own working state — settings, worktree bookkeeping,
-# whatever a session leaves behind. Nothing on the host reads it. Leaving it in
-# would not leak anything: the size ceiling below would `die` once an agent
-# worktree grew under it, so the failure mode is a deploy that stops, not one
-# that ships quietly. It is excluded because that failure is avoidable with one
-# line, and a deploy that dies on a directory the server has no use for is an
-# outage nobody learns anything from.
+# .claude/worktrees/ is excluded; the REST of .claude/ must ship, and that
+# distinction is load-bearing. `deploy/install.sh` step 25 does
+# `cp -r "${SRC_ROOT}/.claude/skills"` and the same for `.claude/agents`, where
+# SRC_ROOT is this archive unpacked on the host. An exclude on all of .claude/
+# deletes the source of that cp; with `set -euo pipefail` the installer dies at
+# step 25. Making the cp tolerant instead would be worse: the headless CLI on
+# the server would lose the skill and the six agent definitions without a word,
+# so patch-plan generation, /ask and incident dossiers stop existing and
+# nothing reports a fault.
+#
+# worktrees/ is the part that actually grows — 228 KB of skills and 52 KB of
+# agents against 6.6 MB of worktrees, under a 20 MB ceiling. It is a second
+# checkout this repository leaves behind between agent sessions; nothing on the
+# host reads it, and it is the only thing under .claude/ that would push the
+# archive past PACKAGE_MAX_KB.
 #
 # The list is an intention. `tests/security/test_package_contents.py` builds a
 # real archive with a file planted under scratchpad/ and asserts `tar -tzf`
 # does not list it, because the archive is the effect.
 tar --exclude='./secrets' \
     --exclude='./.git' \
-    --exclude='./.claude' \
+    --exclude='./.claude/worktrees' \
     --exclude='./tests' \
     --exclude='./docs' \
     --exclude='./watcher' \

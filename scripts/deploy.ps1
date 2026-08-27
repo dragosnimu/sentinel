@@ -413,12 +413,16 @@ try {
     # tests/security/test_package_contents.py compares them, because a Windows
     # deploy that ships what a Linux deploy excludes is the same hole.
     #
-    # .claude/ is the agent's own working state — settings, worktree
-    # bookkeeping, whatever a session leaves behind. Nothing on the host reads
-    # it, and an agent worktree left in there would push the archive over
-    # $PackageMaxKb: a deploy that stops, not one that ships quietly. Excluded
-    # so that avoidable failure does not happen at all.
-    & $tar --exclude='./secrets' --exclude='./.git' --exclude='./.claude' `
+    # .claude/worktrees/ is excluded; the REST of .claude/ must ship.
+    # `deploy/install.sh` step 25 copies ${SRC_ROOT}/.claude/skills and
+    # ${SRC_ROOT}/.claude/agents out of this archive into the workspace the
+    # headless CLI runs in. Excluding all of .claude/ deletes the source of
+    # that cp and kills the install at step 25; making the cp tolerant would be
+    # worse, because the CLI would then lose the skill and the agents silently.
+    # worktrees/ is the part that grows — 6.6 MB against 228 KB of skills — and
+    # the only part that would push the archive over $PackageMaxKb.
+    & $tar --exclude='./secrets' --exclude='./.git' `
+           --exclude='./.claude/worktrees' `
            --exclude='./tests' `
            --exclude='./docs' --exclude='./watcher' --exclude='./aggregator' `
            --exclude='./scratchpad' `

@@ -29,6 +29,12 @@ Un test care verifică doar excluderile e un test pe care îl treci excluzând t
 Aceleași arhive se verifică și pentru prezența fișierelor fără de care
 instalarea nu are ce rula — inclusiv `deploy/tools/`, care e sub `deploy/` și
 NU are voie să fie prins de vreo excludere lăsată prea largă.
+
+Și `.claude/skills` cu `.claude/agents`, care sunt cazul trăit: un
+`--exclude='./.claude'` cerut din grabă a tăiat sursa lui
+`cp -r "${SRC_ROOT}/.claude/skills"` din pasul 25 al instalării. Nimic de aici
+nu acoperea dependența aia, deci excluderea a trecut de suită și a murit pe
+gazdă, la instalare.
 """
 from __future__ import annotations
 
@@ -44,6 +50,10 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 DEPLOY_SH = REPO / "scripts" / "deploy.sh"
 DEPLOY_PS1 = REPO / "scripts" / "deploy.ps1"
+INSTALL_SH = REPO / "deploy" / "install.sh"
+
+#: Sursa fiecărui `cp -r` din pasul 25, adică ce trebuie să fie în arhivă.
+_CP_DIN_ARHIVA = re.compile(r'cp\s+-r\s+"\$\{SRC_ROOT\}/([^"]+)"')
 
 BASH = shutil.which("bash")
 TAR = shutil.which("tar")
@@ -66,6 +76,12 @@ FAKE_REPO: dict[str, bytes] = {
     "scripts/smoke-test.sh": b"#!/usr/bin/env bash\n",
     "requirements.txt": b"httpx\n",
     "VERSION": b"1.0.0\n",
+    # Pasul 25 al instalării le copiază DIN arhivă în spațiul de lucru al
+    # CLI-ului headless de pe gazdă.
+    ".claude/skills/sentinel-soc/SKILL.md": b"# skill\n",
+    ".claude/skills/sentinel-soc/scripts/health_snapshot.py":
+        b"#!/usr/bin/env python3\n",
+    ".claude/agents/code-writer.md": b"# scriitorul\n",
     # Nu are voie să plece.
     "scratchpad/e22-shipper/falsify.py": b"# harness\n",
     "scratchpad/e22-shipper/backup/sentinel__config.py": b"# copie de lucru\n",
@@ -78,9 +94,19 @@ FAKE_REPO: dict[str, bytes] = {
     "sentinel/__pycache__/config.cpython-310.pyc": b"\x00",
     "sentinel/config.pyc": b"\x00",
     ".git/config": b"[core]\n",
-    ".claude/settings.local.json": b"{}\n",
     ".claude/worktrees/sesiune/deploy/install.sh": b"#!/usr/bin/env bash\n",
 }
+
+
+def _sub_calea(names: list[str], prefix: str) -> list[str]:
+    """Numele din arhivă aflate sub `prefix`, unde `prefix` poate fi o CALE.
+
+    `n.split("/")[0] == prefix` mergea cât timp fiecare excludere era un
+    director de la rădăcină. `.claude/worktrees` nu e, iar o comparație pe
+    primul segment n-ar fi găsit niciodată nimic acolo — adică ar fi raportat
+    „nimic scurs" despre o excludere ștearsă cu totul.
+    """
+    return [n for n in names if n == prefix or n.startswith(prefix + "/")]
 
 
 def _posix(path: Path) -> str:
@@ -166,7 +192,7 @@ def test_the_verification_scratch_never_reaches_the_server(packaged):
     Verificat pe ARHIVĂ. O aserțiune pe lista de excluderi ar trece și peste un
     `--exclude` pus după `-czf`, care nu exclude nimic și iese cu 0.
     """
-    leaked = [n for n in packaged if n.split("/")[0] == "scratchpad"]
+    leaked = _sub_calea(packaged, "scratchpad")
     assert leaked == [], f"pachetul conține scratchpad/: {leaked}"
 
 
@@ -174,7 +200,7 @@ def test_the_verification_scratch_never_reaches_the_server(packaged):
 @needs_tar
 @pytest.mark.parametrize("prefix",
                          ["secrets", "tests", "docs", "watcher", "aggregator",
-                          ".git", ".claude"])
+                          ".git", ".claude/worktrees"])
 def test_what_was_already_excluded_stays_excluded(packaged, prefix):
     """Adăugarea unei excluderi nu are voie să strice pe celelalte.
 
@@ -187,13 +213,17 @@ def test_what_was_already_excluded_stays_excluded(packaged, prefix):
     e o scurgere de secrete, dar e o hartă a arhivei pe chiar mașina de la care
     arhiva se apără — și nimic din `deploy/` sau `sentinel/` nu o citește.
 
-    `.claude/` e starea de lucru a agenților — setări, evidența worktree-urilor,
-    ce lasă în urmă o sesiune. Nu e o scurgere: un worktree de agent ar umfla
-    arhiva peste `PACKAGE_MAX_KB`, iar deploy-ul ar muri pe mărime în loc să
-    livreze tăcut. Exact de-aia e aici — o pană de deploy evitabilă cu o linie,
-    pe un director de care gazda n-are nicio nevoie.
+    `.claude/worktrees` e singura parte din `.claude/` care nu pleacă, și
+    îngustimea aia e tot rostul liniei. Un worktree de agent e un al doilea
+    checkout al depozitului — 6,6 MB față de 228 KB de skills — deci el e ce ar
+    împinge arhiva peste `PACKAGE_MAX_KB`. Restul lui `.claude/` TREBUIE să
+    plece, fiindcă pasul 25 al instalării copiază din arhivă `.claude/skills` și
+    `.claude/agents`; `--exclude='./.claude'` a fost cerut o dată și a omorât
+    instalarea acolo (`cp: cannot stat`, ieșire 1). Vezi
+    `test_the_package_carries_what_step_25_copies_out_of_it`, care păzește
+    direcția cealaltă.
     """
-    leaked = [n for n in packaged if n.split("/")[0] == prefix]
+    leaked = _sub_calea(packaged, prefix)
     assert leaked == [], f"pachetul conține {prefix}/: {leaked}"
 
 
@@ -232,6 +262,52 @@ def test_what_the_installer_needs_is_still_in_the_package(packaged, member):
     scris mai lax decât `./scratchpad` l-ar putea prinde.
     """
     assert member in packaged, f"{member} nu mai e în pachet"
+
+
+def _ce_scoate_pasul_25_din_arhiva() -> list[str]:
+    """Căile pe care pasul 25 le copiază DIN arhivă, citite din `install.sh`.
+
+    Citite, nu scrise a doua oară aici: o listă copiată într-un test e încă o
+    listă care poate să nu fie de acord cu instalatorul livrat — exact clasa de
+    defect pe care fișierul ăsta o închide pentru excluderi.
+    """
+    text = INSTALL_SH.read_text(encoding="utf-8")
+    corp = text[text.index("step_claude_workspace() {"):]
+    corp = corp[:corp.index("\n}\n")]
+    cai = _CP_DIN_ARHIVA.findall(corp)
+    assert cai, (
+        "n-am găsit niciun `cp -r \"${SRC_ROOT}/…\"` în `step_claude_workspace` "
+        "din deploy/install.sh; dacă pasul 25 a fost rescris, testul de mai jos "
+        "nu mai verifică nimic și trebuie rescris odată cu el")
+    return cai
+
+
+@needs_bash
+@needs_tar
+def test_the_package_carries_what_step_25_copies_out_of_it(packaged):
+    """Ce copiază instalarea din arhivă trebuie să fie ÎN arhivă.
+
+    Eșecul pe care îl previne, trăit pe 26 august 2026: s-a cerut
+    `--exclude='./.claude'` „ca să nu plece starea de lucru a agenților".
+    `step_claude_workspace` face `cp -r "${SRC_ROOT}/.claude/skills"` și la fel
+    pentru `agents`, unde `SRC_ROOT` e chiar arhiva asta dezarhivată. Excluderea
+    a tăiat sursa acelui `cp`, iar cu `set -euo pipefail` instalarea a murit la
+    pasul 25 cu `cp: cannot stat`, ieșire 1. Nicio aserțiune din depozit nu
+    atingea dependența, deci schimbarea a trecut verde și a picat pe gazdă.
+
+    Și previne reparația greșită a aceluiași lucru: dacă cineva face `cp`-ul
+    tolerant, instalarea trece, iar CLI-ul Claude de pe server rămâne fără skill
+    și fără cele șase definiții de agenți — generarea planurilor de patch,
+    `/ask` și dosarele de incident dispar fără ca nimic să raporteze un defect.
+    Aici se verifică arhiva, adică sursa acelui `cp`, nu toleranța lui.
+    """
+    for cale in _ce_scoate_pasul_25_din_arhiva():
+        continut = _sub_calea(packaged, cale)
+        assert continut, (
+            f"pasul 25 din deploy/install.sh copiază `${{SRC_ROOT}}/{cale}` din "
+            f"arhivă, iar arhiva nu conține nimic sub `{cale}`. Ori o excludere "
+            f"l-a tăiat, ori depozitul fabricat de aici nu mai plantează nimic "
+            f"acolo — în ambele cazuri instalarea moare la pasul 25.")
 
 
 # ---------------------------------------------------------------------------

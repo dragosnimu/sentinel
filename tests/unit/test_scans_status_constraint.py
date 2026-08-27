@@ -38,26 +38,58 @@ _ADD_CONSTRAINT = re.compile(
 _LITERAL = re.compile(r"'([a-z_]+)'")
 
 
-#: Familia de scrieri, nu o ortografie a ei. Postgres acceptă `ONLY`, un alias
-#: simplu și un alias cu `AS` între numele tabelei și restul instrucțiunii, iar
-#: PG 16 are `MERGE`. Toate astea trec pe lângă `UPDATE\s+scans\s+SET`:
+#: Ce ARE VOIE să conțină 0029, nu ce n-are voie. A treia oară că aceeași cauză
+#: e prinsă prea îngust, deci nu se mai adaugă o alternanță — se schimbă
+#: întrebarea. Vezi docstring-ul testului pentru de ce.
 #:
-#:   UPDATE scans s SET status='completed'
-#:   UPDATE scans AS s SET status='completed'
-#:   UPDATE ONLY scans SET status='completed'
-#:   MERGE INTO scans USING ...
-#:   DELETE FROM ONLY scans WHERE status=...
+#: Lista e a ACESTEI migrații, nu un cadru. Alta care are nevoie de alte
+#: instrucțiuni își declară propria listă, lângă propriile ei motive.
 #:
-#: A doua oară când aceeași cauză e prinsă prea îngust, deci nu se mai adaugă o
-#: ortografie: se prinde tot ce poate ținti tabela `scans` cu o scriere, iar
-#: cuvântul de după numele tabelei nu mai contează. `\b` la sfârșit ca `scans`
-#: să nu potrivească `scans_history`.
-_SCRIE_IN_SCANS = re.compile(r"\b(UPDATE|MERGE\s+INTO)\s+(ONLY\s+)?scans\b", re.I)
-_STERGE_DIN_SCANS = re.compile(r"\bDELETE\s+FROM\s+(ONLY\s+)?scans\b", re.I)
+#: `ALTER TABLE` merge un pas mai departe de primul cuvânt fiindcă e singurul
+#: verb care e și unealta legitimă de aici, și una dintre cele care remodelează
+#: tabela: constrângeri da, coloane și tipuri nu.
+_INSTRUCTIUNI_PERMISE: tuple[re.Pattern[str], ...] = (
+    re.compile(r"DO\s*\$", re.I),
+    re.compile(r"ALTER\s+TABLE\s+scans\s+(?:ADD|DROP)\s+CONSTRAINT\b", re.I),
+    re.compile(r"COMMENT\s+ON\s+COLUMN\s+scans\.\w+\b", re.I),
+)
+
+#: Și a doua listă albă: locurile în care are voie să apară NUMELE tabelei,
+#: oriunde în cod. Asta e ce ajunge în corpul blocurilor `DO`, unde despărțirea
+#: în instrucțiuni se oprește — PL/pgSQL nu se poate despărți după `;`, fiindcă
+#: `BEGIN`, `THEN` și `EXCEPTION WHEN` deschid instrucțiuni fără unul, iar o
+#: despărțire aproximativă ar da fragmente care încep cu `BEGIN` și ar înghiți
+#: orice ar urma. Acolo nu se judecă instrucțiuni, ci fiecare pomenire: o
+#: scriere trebuie să numească tabela, iar o pomenire care nu e una dintre
+#: astea patru pică — inclusiv `public.scans` și `"scans"`.
+#:
+#: Se potrivesc pe codul din care literalii de șir au fost înlocuiți cu `''`.
+_REFERINTE_PERMISE: tuple[re.Pattern[str], ...] = (
+    # pasul 1: numărătoarea rândurilor de care migrația se împiedică
+    re.compile(r"SELECT\s+count\(\*\)\s+INTO\s+n\s+FROM\s+(scans)"
+               r"\s+WHERE\s+status\s*=\s*''", re.I),
+    # pasul 2: constrângerile. Forma, nu numele — o altă constrângere adăugată
+    # deliberat mâine e legitimă; o coloană sau un tip nu.
+    re.compile(r"ALTER\s+TABLE\s+(scans)\s+(?:ADD|DROP)\s+CONSTRAINT\b", re.I),
+    re.compile(r"COMMENT\s+ON\s+COLUMN\s+(scans)\.\w+\b", re.I),
+    # pasul 3: inserarea de probă, ÎNTREAGĂ și până la `;`. O coadă în plus
+    # (`... ON CONFLICT DO UPDATE SET ...`) nu se mai potrivește, deci nu trece.
+    re.compile(r"INSERT\s+INTO\s+(scans)\s*\(\s*scanner\s*,\s*target\s*,"
+               r"\s*status\s*\)\s*VALUES\s*\(\s*''\s*,\s*''\s*,\s*''\s*\)\s*;",
+               re.I),
+)
+
+#: `\b` la capăt ca `scans_status_check` să NU fie o pomenire a tabelei, dar
+#: `public.scans`, `"scans"` și `sentinel.scans` să fie.
+_NUMELE_TABELEI = re.compile(r"\bscans\b", re.I)
+
+#: `$$` sau `$eticheta$`. Cifra nu poate deschide o etichetă, deci `$1` dintr-un
+#: parametru nu e confundat cu un citat cu dolar.
+_ETICHETA_DOLAR = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
 
 
-def _fara_comentarii(sql: str) -> str:
-    """SQL fără comentarii, cu literalii de șir neatinși.
+def _scaneaza(sql: str) -> tuple[str, list[str]]:
+    """SQL fără comentarii, ȘI instrucțiunile lui de nivel superior.
 
     Decuparea de dinainte lua doar liniile care ÎNCEP cu `--`, deci un
     `RAISE NOTICE ...; -- comentariu care pomenește EXECUTE` la capătul unei
@@ -77,10 +109,48 @@ def _fara_comentarii(sql: str) -> str:
 
     Șirurile citate cu dolar (`$$ … $$`) rămân întregi și sunt tratate ca ce
     sunt: corpul blocurilor `DO`, adică instrucțiuni care chiar se execută.
+    Comentariile și literalii dinăuntrul lor se taie la fel ca afară, fiindcă
+    acolo chiar sunt comentarii și literali PL/pgSQL.
+
+    A doua treabă, adăugată în aceeași trecere în loc să fie scrisă a doua oară:
+    despărțirea în instrucțiuni de nivel superior. Se despart la `;`, dar NUMAI
+    la un `;` care e cu adevărat separator — nu unul dintr-un literal, și nu
+    unul din corpul unui `$$ … $$`, unde există câte unul după fiecare linie de
+    PL/pgSQL. Fără eticheta de dolar, singurul `DO` din migrație s-ar sparge în
+    zece cioburi care încep cu `DECLARE`, `BEGIN`, `SELECT`, `END`; cu ea, e o
+    instrucțiune. Un scaner al doilea, scris separat, ar fi însemnat două
+    păreri despre unde se termină un literal.
     """
-    out: list[str] = []
+    tot: list[str] = []
+    curent: list[str] = []
+    instructiuni: list[str] = []
+
+    def emite(txt: str) -> None:
+        tot.append(txt)
+        curent.append(txt)
+
+    def incheie() -> None:
+        text = "".join(curent).strip()
+        if text:
+            instructiuni.append(text)
+        curent.clear()
+
     i, n = 0, len(sql)
+    eticheta: str | None = None
     while i < n:
+        if eticheta is None:
+            deschide = _ETICHETA_DOLAR.match(sql, i)
+            if deschide:
+                eticheta = deschide.group(0)
+                emite(eticheta)
+                i = deschide.end()
+                continue
+        elif sql.startswith(eticheta, i):
+            emite(eticheta)
+            i += len(eticheta)
+            eticheta = None
+            continue
+
         if sql[i] == "'":
             j = i + 1
             while j < n:
@@ -91,7 +161,7 @@ def _fara_comentarii(sql: str) -> str:
                     j += 1
                     break
                 j += 1
-            out.append(sql[i:j])
+            emite(sql[i:j])
             i = j
         elif sql.startswith("--", i):
             capat = sql.find("\n", i)
@@ -99,11 +169,21 @@ def _fara_comentarii(sql: str) -> str:
         elif sql.startswith("/*", i):
             capat = sql.find("*/", i + 2)
             i = n if capat == -1 else capat + 2
-            out.append(" ")
-        else:
-            out.append(sql[i])
+            emite(" ")
+        elif sql[i] == ";" and eticheta is None:
+            tot.append(";")
             i += 1
-    return "".join(out)
+            incheie()
+        else:
+            emite(sql[i])
+            i += 1
+    incheie()
+    return "".join(tot), instructiuni
+
+
+def _fara_comentarii(sql: str) -> str:
+    """Doar textul, pentru cine n-are nevoie și de despărțire."""
+    return _scaneaza(sql)[0]
 
 
 def _migrations_in_order() -> list[tuple[int, Path]]:
@@ -184,30 +264,56 @@ def test_the_migration_refuses_the_rows_instead_of_rewriting_them() -> None:
     Dacă se declanșează pe altă instanță, aia e informație, nu obstacol — și
     atunci mesajul trebuie să-i spună operatorului ce are de făcut.
 
-    A doua gaură, astupată aici: decuparea literalilor de șir e OARBĂ la SQL
-    dinamic. Un `DO $$ BEGIN EXECUTE 'UPDATE scans SET status = ...'; END $$;`
-    strecurat înaintea lui `ALTER TABLE` e, pentru regexul de mai jos, un șir
-    care dispare cu totul — conversia tăcută pe care întreaga migrație există
-    s-o refuze trecea paza fără o vorbă, cu suita verde.
+    ## De ce listă albă, și nu încă o alternanță
 
-    A treia, și a doua oară când aceeași cauză e prinsă prea îngust: garda era
-    scrisă pe DOUĂ ORTOGRAFII (`UPDATE\\s+scans\\s+SET`, `DELETE\\s+FROM\\s+
-    scans`), iar Postgres acceptă cel puțin cinci care nu seamănă cu ele —
-    `UPDATE scans s SET`, `UPDATE scans AS s SET`, `UPDATE ONLY scans SET`,
-    `MERGE INTO scans USING`, `DELETE FROM ONLY scans`. Toate cinci treceau,
-    verificat din nou pe 27 august 2026. Nu s-a mai adăugat o ortografie: garda
-    e acum pe FAMILIE (`_SCRIE_IN_SCANS`, `_STERGE_DIN_SCANS`) — orice
-    instrucțiune de scriere care țintește tabela, indiferent ce urmează după
-    numele ei.
+    Garda asta a fost respinsă de trei ori, de fiecare dată fiindcă era o listă
+    NEAGRĂ: oarbă întâi la SQL dinamic (`DO $$ BEGIN EXECUTE 'UPDATE scans SET
+    ...'; END $$;`, un șir care dispărea cu totul la decuparea literalilor),
+    apoi la două ortografii, apoi la treisprezece. Cea care a dărâmat-o ultima
+    oară e banală: `UPDATE public.scans SET status='completed' WHERE status=
+    'skipped'` — calificarea cu schemă e stil obișnuit într-o migrație. Rulată
+    în migrația reală, suita întreagă a rămas 2663 passed, identică cu
+    baseline-ul.
 
-    Și decuparea comentariilor era greșită în cealaltă direcție: tăia doar
-    liniile care ÎNCEP cu `--`, deci un comentariu la capătul unei linii de cod
-    care pomenea `EXECUTE` rupea testul pe o migrație curată. Vezi
-    `_fara_comentarii`.
+    Fiecare rundă a adăugat alternanțele la care se gândise verificatorul de
+    dinainte, și fiecare rundă următoare a găsit alta în câteva minute:
+    `UPDATE "scans"`, `UPDATE sentinel.scans`, `DELETE FROM public.scans`,
+    `TRUNCATE scans`, `TRUNCATE TABLE scans`, `DROP TABLE scans`, `DROP TABLE IF
+    EXISTS scans CASCADE`, `INSERT ... ON CONFLICT DO UPDATE`, `COPY scans FROM
+    PROGRAM ...`, `ALTER TABLE scans DROP COLUMN findings_count`, `ALTER TABLE
+    scans ALTER COLUMN status TYPE ...`. Mulțimea instrucțiunilor care scriu,
+    distrug sau remodelează o tabelă în PG 16 nu e enumerabilă, deci o listă
+    neagră completă nu se poate scrie — iar una incompletă tace exact acolo unde
+    contează, cu suita verde.
+
+    Deci întrebarea e alta: nu „conține vreo scriere?", ci „conține ALTCEVA
+    decât instrucțiunile așteptate?". 0029 e cinci instrucțiuni și cinci
+    pomeniri ale tabelei, toate cunoscute și scrise în `_INSTRUCTIUNI_PERMISE`
+    și `_REFERINTE_PERMISE`. Orice în plus pică, fără să fie numit nicăieri.
+
+    ## De ce blocul de probă din migrație NU acoperă asta
+
+    Migrația își pune singură efectul la încercare (pasul 3, păzit de testul
+    următor), și e ușor de crezut că proba aia prinde și o conversie tăcută.
+    Nu o prinde: ea dovedește că baza refuză `skipped` DUPĂ rescrierea
+    constrângerii. Un `UPDATE` strecurat rulează ÎNAINTE, golește tabela de
+    rânduri `skipped`, deci numărătoarea de la pasul 1 găsește zero, refuzul nu
+    se mai declanșează, proba trece ca de obicei, iar migrația raportează
+    succes. Rândurile rescrise nu mai există ca să se plângă. Singurul loc unde
+    asta se oprește e citirea fișierului, aici.
+
+    ## Ce NU acoperă
+
+    Despărțirea în instrucțiuni e a nivelului superior; corpul unui bloc `DO` nu
+    se poate despărți la fel, iar acolo ajunge a doua listă albă, cea pe
+    pomenirile tabelei. Rămâne neacoperit ce nu numește tabela și nu e o
+    instrucțiune de nivel superior: o scriere printr-un view sau printr-un
+    trigger. `EXECUTE` e interzis cu totul mai jos, iar view-uri și triggere
+    0029 nu creează — s-ar vedea ca instrucțiuni în afara listei albe.
     """
     sql = (MIGRATIONS / "0029_scans_no_skipped.sql").read_text(encoding="utf-8")
-    # Comentariile explică tocmai ce NU face migrația; scrieri se caută doar în cod.
-    cod = _fara_comentarii(sql)
+    # Comentariile explică tocmai ce NU face migrația; se judecă doar codul.
+    cod, instructiuni = _scaneaza(sql)
 
     # Interdicția pe SQL dinamic se pune pe `cod`, ÎNAINTE de decuparea de mai
     # jos — altfel tocmai scrierea ascunsă într-un literal ar fi cea decupată.
@@ -218,19 +324,48 @@ def test_the_migration_refuses_the_rows_instead_of_rewriting_them() -> None:
         "migrația conține SQL dinamic; orice scriere de acolo e invizibilă "
         "pentru aserțiunile de mai jos, care caută în codul fără literali de șir")
 
+    # Despărțirea se dovedește ÎNAINTE să fie folosită. Dacă `$$ … $$` n-ar mai
+    # fi opac la `;`, blocurile `DO` s-ar sparge în cioburi care încep cu
+    # `DECLARE`, `BEGIN`, `SELECT`, și lista albă ar judeca cioburi. Dacă `;`
+    # n-ar mai despărți deloc, tot fișierul ar fi o singură instrucțiune care
+    # începe cu `DO` — și ar trece întreagă, orice ar conține.
+    assert len(instructiuni) >= 5, (
+        f"despărțirea a găsit {len(instructiuni)} instrucțiuni în 0029, care "
+        f"are cinci; dacă `;` nu mai desparte nimic, tot fișierul e o singură "
+        f"instrucțiune care începe cu `DO` și trece întreagă")
+    # Cele două blocuri `DO`, recunoscute după ce e ÎN ele, nu după cum încep:
+    # dacă citatele cu dolar n-ar mai fi opace, cioburile care poartă marcajele
+    # astea ar începe cu `BEGIN`, nu cu `DO`.
+    intregi = [x for x in instructiuni
+               if "count(*)" in x or "INSERT INTO scans" in x]
+    assert len(intregi) == 2 and all(re.match(r"DO\b", x, re.I) for x in intregi), (
+        "cele două blocuri `DO` nu mai ies din despărțire ca instrucțiuni "
+        "întregi, deci lista albă de mai jos judecă cioburi de PL/pgSQL")
+
+    for instructiune in instructiuni:
+        assert any(p.match(instructiune) for p in _INSTRUCTIUNI_PERMISE), (
+            f"instrucțiune din afara listei albe a lui 0029: "
+            f"{' '.join(instructiune.split())[:140]!r}. Migrația are voie doar "
+            f"cu `DO $…$`, `ALTER TABLE scans ADD/DROP CONSTRAINT` și "
+            f"`COMMENT ON COLUMN scans.…`")
+
     # …iar mesajul de refuz îi ARATĂ operatorului un `UPDATE` pe care să-l ruleze
-    # el, cu ochii pe rând. Ăla e text, nu instrucțiune. Căutarea de scrieri se
-    # face pe cod fără literali de șir, altfel sfatul ar fi confundat cu fapta.
+    # el, cu ochii pe rând. Ăla e text, nu instrucțiune, deci literalii se taie
+    # înainte de căutarea de mai jos: altfel sfatul ar fi confundat cu fapta.
     executabil = re.sub(r"'(?:[^']|'')*'", "''", cod)
 
-    scriere = _SCRIE_IN_SCANS.search(executabil)
-    assert not scriere, (
-        f"migrația scrie în `scans` — {scriere.group(0)!r} — iar o conversie "
-        f"tăcută rescrie istoric")
-    stergere = _STERGE_DIN_SCANS.search(executabil)
-    assert not stergere, (
-        f"migrația șterge din `scans` — {stergere.group(0)!r} — și se pierde "
-        f"urma scriitorului necunoscut")
+    pomeniri = list(_NUMELE_TABELEI.finditer(executabil))
+    assert len(pomeniri) >= 5, (
+        f"doar {len(pomeniri)} pomeniri ale tabelei în codul lui 0029; sunt "
+        f"cinci. O căutare care nu găsește nimic trece liniștită pentru "
+        f"totdeauna, și exact așa au trecut aici teste care nu verificau nimic")
+    permise = {m.start(1) for p in _REFERINTE_PERMISE for m in p.finditer(executabil)}
+    straine = [" ".join(executabil[max(0, m.start() - 45):m.end() + 25].split())
+               for m in pomeniri if m.start() not in permise]
+    assert not straine, (
+        f"`scans` e pomenit în codul lui 0029 în afara celor patru locuri pe "
+        f"care migrația le are — o scriere trebuie să numească tabela, deci "
+        f"aici se oprește și cea din corpul unui bloc `DO`: {straine}")
 
     assert re.search(r"count\(\*\)\s+INTO\s+n\s+FROM\s+scans\s+WHERE\s+status\s*=\s*'skipped'",
                      cod, re.I), (

@@ -717,10 +717,26 @@ Treat it as NOT installed; vulnerability scanning will not use it."
         warn "the tools manifest at ${manifest} pins no tools, so step 21 \
 installed nothing. Vulnerability scanning (P7) has no scanners until Trivy and \
 nuclei are listed there — the file is present but holds no entry."
-    # The third clause is implied by the two before it as the counters stand
-    # today. It is written out anyway because the rule is "green requires at
-    # least one tool proved present", and that must not have to be re-derived
-    # from the counters by whoever adds the fifth one.
+    # `n_ok + n_present == 0` cannot be true here as the counters stand today.
+    # n_seen is those two plus n_unproven and n_bad, so once n_seen is non-zero
+    # and neither of the other two is, the first two cannot both be zero. The
+    # clause is unfalsifiable: no test can make it decide anything, and none
+    # does. That is a real objection and it is not being waved away.
+    #
+    # It stays, and this comment is the whole of why. The scenario it is
+    # written for is a FIFTH counter added to n_seen but not to the warn below
+    # — a tool the loop skipped, say. In that world the `n_seen == 0` branch
+    # stops firing for a manifest that proved nothing, and this clause is the
+    # only thing left between that manifest and a green line. It fires with the
+    # wrong words when it does: all four numbers read 0 and "see the lines
+    # above" points at nothing. But a warn with an incomplete message is a
+    # thing the operator goes and looks at, while
+    # `ok: 0 installed, 0 already present` over a step that proved nothing is
+    # the exact lie step 21 was rewritten to stop telling — the same shape as
+    # loading audit rules with the kernel's complaint sent to /dev/null.
+    #
+    # So, to whoever adds the fifth counter: add it to the warn below too, not
+    # only to n_seen. Carrying that sentence to you is what this clause is for.
     elif (( n_bad > 0 || n_unproven > 0 || n_ok + n_present == 0 )); then
         warn "external tools: ${n_ok} installed, ${n_present} already present at the \
 pinned version, ${n_unproven} present but unverified, ${n_bad} NOT installed. \

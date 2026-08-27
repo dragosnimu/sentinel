@@ -24,8 +24,11 @@
 # about being blind.
 #
 # The tree. The package is `tar -C "$REPO_ROOT" .` minus an exclude list, so
-# sentinel/, scripts/, executor/ and .claude/ ship too. A CR does not break a
-# .py module, but it does break a shebang, and executor/ runs as root.
+# sentinel/, scripts/, executor/ and .claude/ ship too — all of .claude/ except
+# worktrees/, because install.sh step 25 copies .claude/skills and
+# .claude/agents out of the package. A CR does not break a .py module, but it
+# does break a shebang, and both executor/ (root) and the skill scripts under
+# .claude/skills/sentinel-soc/scripts/ (chmod 0755 by step 25) start with one.
 #
 # So the criterion is not a list of extensions — that is the thing that failed.
 # It is: *does this byte sequence reach the server, and is it text?* Everything
