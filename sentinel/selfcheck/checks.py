@@ -2868,6 +2868,72 @@ _DASHBOARD_BUGET = 0.5
 #: Peste atâtea secunde încărcarea e „degradată". Derivat, nu ales.
 DASHBOARD_SLOW_S = DASHBOARD_PROXY_TIMEOUT_S * _DASHBOARD_BUGET
 
+#: Sub atâtea secunde o încărcare care A FOST degradată e declarată revenită.
+#: Histerezis, și e nevoie de el pentru un motiv care nu ține de panou.
+#:
+#: `runner.run_and_alert` raportează pe SCHIMBARE de stare: o cheie care și-a
+#: schimbat starea intră în `changed_bad`, iar o revenire produce la rândul ei
+#: un mesaj. Un semnal continuu care oscilează în jurul unui prag produce deci
+#: câte un mesaj la fiecare trecere — pe 28 august 2026 o singură cauză
+#: neîntreruptă a produs 6 mesaje în 7 ore. Durata încărcării e exact un astfel
+#: de semnal: aceleași șase interogări ale paginii au fost măsurate, în aceeași
+#: seară, între 2,2 și 15,2 secunde de la o rulare la alta.
+#:
+#: De ce jumătate din prag, și nu o marjă de zgomot aleasă din burtă: pragul de
+#: intrare e, cu argumentul de la `_DASHBOARD_BUGET`, „la o dublare de volum
+#: distanță de 504". Pragul de ieșire e, în aceeași unitate de măsură, „la două
+#: dublări distanță" — adică pagina chiar a coborât, nu doar a nimerit de
+#: partea cealaltă a liniei la o rulare.
+#:
+#: Costul, spus pe față: o pagină care a trecut o dată pragul și se așază între
+#: cele două praguri rămâne „degradată" cât timp stă acolo, deși una care n-a
+#: trecut niciodată pragul, la aceeași durată, iese `ok`. Aia e chiar definiția
+#: histerezisului, nu un efect secundar de care n-am știut. E acceptabil aici
+#: fiindcă greșeala se face într-o singură direcție: histerezisul poate DOAR să
+#: țină un galben mai mult, niciodată să ascundă unul nou. O valoare prost
+#: aleasă costă o linie galbenă în plus, nu o constatare pierdută.
+DASHBOARD_RECOVER_S = DASHBOARD_SLOW_S / 2
+
+#: O singură cheie pentru toate verdictele panoului — și la scris, și la
+#: recitirea stării de dinainte. Vezi `test_every_branch_emits_exactly_one_key`.
+_DASHBOARD_KEY = "web:dashboard"
+
+#: Vocabularul lui `facts["mod"]`. De când niciun verdict de aici nu mai e
+#: `down` (motivul e în docstring-ul verificării), severitatea nu mai deosebește
+#: „a fost lent" de „n-a mai venit deloc". Câmpul ăsta o face, și e ținut
+#: într-un singur loc ca o ramură nouă să nu-și inventeze o valoare pe care
+#: panoul n-o cunoaște.
+DASHBOARD_MODES = ("rapid", "revine", "lent", "expirat", "eroare", "nemasurat")
+
+#: Modurile în care operatorul NU a primit pagina: `expirat` e 504 de la nginx,
+#: `eroare` e pagina de eroare a aplicației. „Lent" înseamnă că a primit-o,
+#: târziu — altă întrebare, alt răspuns dimineața.
+DASHBOARD_MODES_FAILED = ("expirat", "eroare")
+
+
+async def _dashboard_was_degraded(db: Database) -> bool:
+    """Ce a raportat verificarea asta la rularea trecută.
+
+    Citit din `selfcheck_state`, fiindcă `sentinel-selfcheck.service` e
+    `Type=oneshot`: fiecare rulare e un proces nou, deci nu există memorie între
+    rulări în afara bazei.
+
+    O citire eșuată întoarce `False`, adică histerezisul se stinge și rămâne
+    pragul scris. E singura rezervă care nu poate minți: histerezisul nu produce
+    constatări, doar le ține pe cele deja produse, deci pierderea lui costă un
+    mesaj în plus — nu o constatare ascunsă. „Nu știu" ar fi fost răspunsul
+    corect dacă din citirea asta ar fi ieșit un verdict; nu iese unul, verdictul
+    e durata măsurată.
+    """
+    try:
+        rand = await db.fetchrow(
+            "SELECT status FROM selfcheck_state WHERE key = $1", _DASHBOARD_KEY)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("selfcheck: starea anterioară a panoului nu s-a putut citi (%s); "
+                  "histerezisul nu se aplică la rularea asta", exc)
+        return False
+    return rand is not None and dict(rand).get("status") == "degraded"
+
 
 async def check_dashboard_latency(db: Database) -> list[CheckResult]:
     """Cât durează să se adune datele paginii principale.
@@ -2898,10 +2964,49 @@ async def check_dashboard_latency(db: Database) -> list[CheckResult]:
     `ok`: runner-ul reconciliază cheile lipsă ca pe constatări retrase, deci o
     ramură tăcută ar șterge o constatare roșie și ar arăta o revenire care nu
     s-a întâmplat.
+
+    ## De ce niciun verdict de aici nu mai e `down`
+
+    `down` nu e o culoare, e un apel telefonic. `runner._announce` ridică
+    mesajul la `critical` dacă ORICE constatare a rulării e `down`, iar
+    `telegram/quiet.NEVER_MUTED_SEVERITIES` lasă `critical` să treacă peste
+    orice fereastră de liniște și peste orice `/mute`. `down` aici înseamnă
+    literal „trezește-l pe operator la 3 dimineața".
+
+    Pe 28 august 2026, la 21:24, exact asta s-a întâmplat, cu textul „SENTINEL
+    NU FUNCȚIONEAZĂ COMPLET". Măsurat pe gazdă în aceleași minute în care pagina
+    murea la 60s: `/healthz` răspundea în 7 ms; `sentinel-ingest`, `-detect`,
+    `-web`, `-telegram` și `-shipper` erau toate active cu `NRestarts=0`;
+    cititorul Suricata avansa; `selfcheck_state` nu avea nicio altă intrare
+    diferită de `ok`. Detecția, ingestia, blocarea și alertarea funcționau —
+    cauza era că pagina are șase interogări lente, fiecare independent lentă, cu
+    sortări care se revarsă pe disc (`work_mem = 8MB`, sortări de ~10 MB).
+
+    `down` trebuie să însemne „gazda nu mai e apărată". O pagină care se încarcă
+    greu, sau chiar deloc, nu e asta, și un roșu care nu e adevărat e exact cum
+    ajunge operatorul să nu mai citească roșul următor. `degraded` produce
+    `high`, care se ȚINE în fereastra de liniște și pleacă la ridicarea ei —
+    vestea nu se pierde, doar nu mai sună noaptea.
+
+    Contra-argumentul, fiindcă există unul real: un panou care nu se încarcă
+    CHIAR e critic dacă operatorul e în mijlocul unui incident și are nevoie de
+    el atunci. Nu schimbă concluzia, din două motive. Canalul de comandă e
+    Telegram, nu panoul — `/status`, `/selfcheck`, `/blocheaza` merg toate fără
+    el, iar panoul e citire. Și disponibilitatea HTTP a web-ului e supravegheată
+    separat, de `respond/watchdog.py` pe `/healthz`, care NU e atins de
+    schimbarea asta: un `sentinel-web` care chiar a căzut rămâne prins acolo,
+    unde a fost mereu prins.
+
+    Ce nu se pierde: „pagina a fost lentă" și „pagina n-a mai venit deloc" rămân
+    stări distincte — titlu, `detail` și `facts["mod"]` diferite —, doar
+    severitatea e aceeași. Ținute pe ACEEAȘI cheie și pe același `status`
+    dinadins: runner-ul anunță pe schimbare de stare, deci alunecarea între
+    „lent" și „a eșuat" costă zero mesaje, în timp ce chei separate ar fi produs
+    la fiecare alunecare un mesaj ȘI o retragere de constatare.
     """
     from sentinel.analytics import page
 
-    key = "web:dashboard"
+    key = _DASHBOARD_KEY
     inceput = time.monotonic()
     try:
         # `wait_for`, nu `asyncio.timeout`: proiectul cere Python >= 3.10, iar
@@ -2909,34 +3014,37 @@ async def check_dashboard_latency(db: Database) -> list[CheckResult]:
         await asyncio.wait_for(page.load(db), DASHBOARD_PROXY_TIMEOUT_S)
     except asyncio.TimeoutError:
         return [CheckResult(
-            key, "Panoul web nu se mai încarcă", "down",
+            key, "Panoul web nu se mai încarcă", "degraded",
             detail=f"datele paginii au trecut de {DASHBOARD_PROXY_TIMEOUT_S:.0f}s, "
                    f"adică de `proxy_read_timeout` — nginx a răspuns deja 504 "
-                   f"oricui a deschis pagina",
+                   f"oricui a deschis pagina. Restul agentului nu e afectat: "
+                   f"detecția, blocarea și alertarea nu trec prin panou",
             action="sentinel migrate (indecșii din 0030) ; "
                    "verifică volumul din raw_events pe ultima zi",
             facts={"durata_s": None, "prag_s": DASHBOARD_PROXY_TIMEOUT_S,
-                   "peste_proxy_read_timeout": True})]
+                   "peste_proxy_read_timeout": True, "mod": "expirat"})]
     except Exception as exc:  # noqa: BLE001 - orice cădere e o măsurătoare ratată
         durata = time.monotonic() - inceput
-        # `statement_timeout` e 30s pe pool, deci o interogare care îl atinge
-        # cade cu excepție în loc să se termine. Aia NU e „n-am putut măsura":
+        # `statement_timeout` oprește o interogare care îl atinge, deci ea cade
+        # cu excepție în loc să se termine. Aia NU e „n-am putut măsura":
         # aceeași excepție ar fi ieșit și pe cererea operatorului, ca pagină de
         # eroare. Se raportează după cât a durat până a căzut, nu după faptul că
         # a căzut.
         if durata >= DASHBOARD_SLOW_S:
             return [CheckResult(
-                key, "Panoul web a căzut la încărcare", "down",
+                key, "Panoul web a căzut la încărcare", "degraded",
                 detail=f"datele paginii au eșuat după {durata:.1f}s: "
                        f"{str(exc)[:120]}",
                 action="journalctl -u sentinel-web -n 50",
                 facts={"durata_s": round(durata, 1),
-                       "prag_s": DASHBOARD_SLOW_S, "eroare": str(exc)[:200]})]
+                       "prag_s": DASHBOARD_SLOW_S, "eroare": str(exc)[:200],
+                       "mod": "eroare"})]
         return [CheckResult(
             key, "Durata panoului web", "unknown",
             detail=f"nu s-a putut măsura după {durata:.1f}s: {str(exc)[:120]}",
             action="journalctl -u sentinel-web -n 50",
-            facts={"durata_s": round(durata, 1), "eroare": str(exc)[:200]})]
+            facts={"durata_s": round(durata, 1), "eroare": str(exc)[:200],
+                   "mod": "nemasurat"})]
 
     durata = time.monotonic() - inceput
     if durata >= DASHBOARD_SLOW_S:
@@ -2947,13 +3055,30 @@ async def check_dashboard_latency(db: Database) -> list[CheckResult]:
                    f"La următoarea dublare de volum operatorul primește 504.",
             action="sentinel migrate (indecșii din 0030) ; "
                    "verifică volumul din raw_events pe ultima zi",
-            facts={"durata_s": round(durata, 1), "prag_s": DASHBOARD_SLOW_S})]
+            facts={"durata_s": round(durata, 1), "prag_s": DASHBOARD_SLOW_S,
+                   "mod": "lent"})]
+    # Sub prag, dar nu destul de jos ca să numim revenire o singură măsurătoare.
+    # Interogarea în plus se face NUMAI în banda asta, deci pe o gazdă sănătoasă
+    # nu se face niciodată.
+    if durata >= DASHBOARD_RECOVER_S and await _dashboard_was_degraded(db):
+        return [CheckResult(
+            key, "Panoul web încă nu a revenit", "degraded",
+            detail=f"datele paginii în {durata:.1f}s — sub pragul de "
+                   f"{DASHBOARD_SLOW_S:.0f}s, dar peste pragul de revenire de "
+                   f"{DASHBOARD_RECOVER_S:.0f}s. Se ține „degradat” până coboară "
+                   f"sub el, ca o oscilație în jurul pragului să nu producă un "
+                   f"mesaj la fiecare trecere",
+            action="sentinel migrate (indecșii din 0030) ; "
+                   "verifică volumul din raw_events pe ultima zi",
+            facts={"durata_s": round(durata, 1), "prag_s": DASHBOARD_SLOW_S,
+                   "prag_revenire_s": DASHBOARD_RECOVER_S, "mod": "revine"})]
     return [CheckResult(
         key, "Durata panoului web", "ok",
         detail=f"datele paginii în {durata:.1f}s "
                f"(prag {DASHBOARD_SLOW_S:.0f}s, `proxy_read_timeout` "
                f"{DASHBOARD_PROXY_TIMEOUT_S:.0f}s)",
-        facts={"durata_s": round(durata, 1), "prag_s": DASHBOARD_SLOW_S})]
+        facts={"durata_s": round(durata, 1), "prag_s": DASHBOARD_SLOW_S,
+               "mod": "rapid"})]
 
 
 # ---------------------------------------------------------------------------

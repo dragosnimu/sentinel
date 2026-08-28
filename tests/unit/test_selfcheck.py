@@ -1145,6 +1145,12 @@ class _StateDB:
         self.sql.append((sql, a))
         if "FROM selfcheck_runs" in sql:
             return self.runs[-1] if self.runs else None
+        if "FROM selfcheck_state" in sql:
+            # `check_dashboard_latency` își recitește starea de dinainte, ca o
+            # oscilație în jurul pragului să nu producă un mesaj la fiecare
+            # trecere. Un dublu care ar întoarce mereu None ar face testul de
+            # histerezis să treacă fără să atingă histerezisul.
+            return self.state.get(a[0]) if a else None
         return None
 
     async def fetchval(self, sql, *a):
@@ -2910,3 +2916,261 @@ def test_the_backlog_messages_agree_with_their_own_numbers(monkeypatch):
     results = run(checks.check_ship_lag(db, cfg))
     r = _key(results, "ship:lag:session_commands")
     assert "21 de rânduri neexpediate," in r.detail, r.detail
+
+
+# --- panoul web: cât de tare are voie să strige o pagină lentă --------------
+#
+# Pe 28 august 2026, la 21:24, autoverificarea a trimis „SENTINEL NU
+# FUNCȚIONEAZĂ COMPLET" fiindcă pagina principală trecuse de
+# `proxy_read_timeout`. În aceleași minute, măsurat pe gazdă: `/healthz` în 7 ms,
+# toate unitățile active cu `NRestarts=0`, cititorul Suricata în avans, nicio
+# altă intrare din `selfcheck_state` diferită de `ok`. Cauza era că pagina are
+# șase interogări lente — reală, dar nu „gazda nu mai e apărată".
+#
+# Lanțul care face din `down` un telefon la 3 dimineața: `runner._announce`
+# ridică mesajul la `critical` dacă ORICE constatare e `down`, iar
+# `quiet.NEVER_MUTED_SEVERITIES` lasă `critical` să treacă peste orice mute.
+# Testele de aici păzesc capătul lanțului, nu o constantă dintr-un fișier: dacă
+# verdictul urcă înapoi la `down`, primul dintre ele pică.
+
+#: Cele trei feluri în care panoul e o constatare. Numărul e verificat în test:
+#: o listă golită prin editare ar face buclele să treacă uitându-se la nimic —
+#: chiar tiparul „listă parametrizată ieșită goală și sărită tăcut".
+_SCENARII_PANOU = ("lent", "eroare", "expirat")
+
+#: `proxy_read_timeout` așa cum e în cod, capturat înainte ca vreun test să-l
+#: coboare pentru scenariul „expirat". Fără el, ordinea scenariilor din buclă ar
+#: decide rezultatul celorlalte.
+_PROXY_NORMAL = checks.DASHBOARD_PROXY_TIMEOUT_S
+
+
+class _Ceas:
+    """`time.monotonic` scriptat, ca durata măsurată să nu ceară așteptare reală."""
+
+    def __init__(self, *valori: float) -> None:
+        self.valori = list(valori)
+
+    def __call__(self) -> float:
+        return self.valori.pop(0) if len(self.valori) > 1 else self.valori[0]
+
+
+def _sonda_paginii(monkeypatch, *, secunde: float, boom: Exception | None = None):
+    """Înlocuiește `page.load` și ceasul, ca sonda să „măsoare" `secunde`."""
+    from sentinel.analytics import page
+
+    async def fals(db):  # noqa: ANN001, ANN202
+        if boom is not None:
+            raise boom
+        return {}
+
+    monkeypatch.setattr(page, "load", fals)
+    monkeypatch.setattr(checks, "DASHBOARD_PROXY_TIMEOUT_S", _PROXY_NORMAL)
+    # Se înlocuiește NUMELE `time` din `checks`, nu funcția din modulul `time`:
+    # `asyncio.wait_for` își ia ceasul tot de acolo, iar un ceas scriptat sub
+    # bucla de evenimente face testul să măsoare altceva decât crede.
+    monkeypatch.setattr(checks, "time", SimpleNamespace(monotonic=_Ceas(0.0, secunde)))
+
+
+def _constatarea_panoului(monkeypatch, scenariu: str, db=None):
+    """Rulează sonda panoului în scenariul numit și întoarce constatarea."""
+    from sentinel.analytics import page
+
+    tinta = _StateDB() if db is None else db
+    if scenariu == "expirat":
+        async def atarna(_db):  # noqa: ANN001, ANN202
+            await asyncio.sleep(5)
+
+        monkeypatch.setattr(page, "load", atarna)
+        monkeypatch.setattr(checks, "DASHBOARD_PROXY_TIMEOUT_S", 0.05)
+    elif scenariu == "eroare":
+        _sonda_paginii(monkeypatch, secunde=checks.DASHBOARD_SLOW_S + 1,
+                       boom=RuntimeError("canceling statement due to statement timeout"))
+    elif scenariu == "lent":
+        _sonda_paginii(monkeypatch, secunde=checks.DASHBOARD_SLOW_S + 1)
+    else:  # pragma: no cover - o greșeală de scriere în test, nu o stare a gazdei
+        raise AssertionError(f"scenariu necunoscut: {scenariu}")
+    rezultate = run(checks.check_dashboard_latency(tinta))
+    assert len(rezultate) == 1, f"scenariul „{scenariu}” nu a emis exact o cheie"
+    return rezultate[0]
+
+
+def _notificarea(db):
+    """(severitate, text) din ultimul rând scris în `notifications`."""
+    for sql, a in reversed(db.sql):
+        if "INSERT INTO notifications" in sql:
+            return a[0], a[-1]
+    raise AssertionError("runner-ul n-a scris nicio notificare")
+
+
+def test_a_slow_dashboard_never_pierces_the_operators_quiet_hours(monkeypatch):
+    """O pagină lentă nu are voie să sune noaptea la operator.
+
+    Eșecul pe care îl previne, trăit pe 28 august 2026 la 21:24, în fereastra de
+    liniște 21:00-09:00: panoul era lent, iar operatorul a primit „SENTINEL NU
+    FUNCȚIONEAZĂ COMPLET" — despre un agent care detecta, ingera, bloca și
+    alerta perfect. Un roșu care nu e adevărat e cum ajunge operatorul să nu mai
+    citească roșul următor, iar următorul poate fi chiar cel în care gazda nu mai
+    e apărată.
+
+    Se verifică LANȚUL, nu o constantă: verdictul verificării intră în
+    `runner._announce`, severitatea pe care ACELA o scrie în `notifications`
+    intră în `quiet.passes_anyway`. Dacă vreun verdict al panoului urcă înapoi la
+    `down`, severitatea devine `critical`, `critical` e în
+    `NEVER_MUTED_SEVERITIES`, și testul pică aici — nu peste trei luni, în chat.
+    """
+    from sentinel.selfcheck import runner
+    from sentinel.telegram.quiet import NEVER_MUTED_SEVERITIES, passes_anyway
+
+    assert len(_SCENARII_PANOU) == 3, "bucla de mai jos s-a golit prin editare"
+    for scenariu in _SCENARII_PANOU:
+        db = _StateDB()
+        r = _constatarea_panoului(monkeypatch, scenariu, db)
+        assert r.bad, (
+            f"scenariul „{scenariu}” nu mai e o constatare deloc; operatorul nu "
+            f"mai află nici dimineața că panoul e stricat")
+
+        run(runner._announce(db, _cfg(), [r], []))
+        severitate, text = _notificarea(db)
+
+        assert severitate not in NEVER_MUTED_SEVERITIES, (
+            f"scenariul „{scenariu}” produce severitatea „{severitate}”, care e "
+            f"în `NEVER_MUTED_SEVERITIES` — deci trece peste fereastra de "
+            f"liniște și îl trezește pe operator pentru o pagină web")
+        assert not passes_anyway(severitate, "selfcheck"), (
+            f"scenariul „{scenariu}” trece prin mute pe altă cale decât "
+            f"severitatea")
+        assert text.splitlines()[0].startswith(runner._EMOJI["degraded"]), (
+            f"scenariul „{scenariu}” încă deschide mesajul cu titlul de pană "
+            f"totală: {text.splitlines()[0]!r}")
+
+
+def test_a_slow_page_and_a_page_that_never_arrived_stay_two_states(monkeypatch):
+    """Dimineața, operatorul trebuie să poată deosebi „lent" de „n-a venit deloc".
+
+    Eșecul pe care îl previne: coborârea severității topește cele trei ramuri
+    într-un singur galben. Operatorul care citește la 09:00 nu mai poate spune
+    dacă pagina a fost greoaie sau dacă nginx a răspuns 504 tuturor — adică nu
+    mai poate spune dacă panoul a fost folosibil în timpul nopții, care e chiar
+    întrebarea pe care și-o pune.
+
+    Se verifică pe DECIZIE, nu pe prezența unui câmp: `facts["mod"]` trebuie să
+    fie din vocabularul declarat, diferit pentru fiecare ramură, iar cele două
+    ramuri în care operatorul n-a primit nimic trebuie să fie exact cele din
+    `DASHBOARD_MODES_FAILED`.
+    """
+    assert len(_SCENARII_PANOU) == 3, "bucla de mai jos s-a golit prin editare"
+    assert set(checks.DASHBOARD_MODES_FAILED) < set(checks.DASHBOARD_MODES), (
+        "`DASHBOARD_MODES_FAILED` nu mai e o submulțime strictă a vocabularului")
+
+    moduri: dict[str, str] = {}
+    titluri: dict[str, str] = {}
+    for scenariu in _SCENARII_PANOU:
+        r = _constatarea_panoului(monkeypatch, scenariu)
+        moduri[scenariu] = r.facts["mod"]
+        titluri[scenariu] = r.title
+
+    assert set(moduri.values()) <= set(checks.DASHBOARD_MODES), (
+        f"o ramură și-a inventat un mod pe care panoul nu-l cunoaște: {moduri}")
+    assert len(set(moduri.values())) == 3, (
+        f"două ramuri raportează același mod, deci distincția s-a pierdut: {moduri}")
+    assert len(set(titluri.values())) == 3, (
+        f"două ramuri au același titlu, deci mesajul din chat nu le mai "
+        f"deosebește: {titluri}")
+
+    assert moduri["lent"] not in checks.DASHBOARD_MODES_FAILED, (
+        "o pagină care s-a încărcat târziu e numărată drept pagină nelivrată")
+    for scenariu in ("eroare", "expirat"):
+        assert moduri[scenariu] in checks.DASHBOARD_MODES_FAILED, (
+            f"scenariul „{scenariu}” nu mai e numărat drept pagină nelivrată, "
+            f"deci dimineața arată la fel ca una doar lentă")
+
+
+def test_a_dashboard_oscillating_around_the_threshold_speaks_once(monkeypatch):
+    """O singură cauză neîntreruptă are voie la un singur mesaj.
+
+    Eșecul pe care îl previne, măsurat pe 28 august 2026: `runner.run_and_alert`
+    raportează pe SCHIMBARE de stare, iar durata încărcării e un semnal continuu
+    care oscilează. Aceeași cauză nereparată a produs 6 mesaje în 7 ore. Un canal
+    care repetă aceeași veste la fiecare cinci minute e un canal pe care
+    operatorul îl închide, și atunci nu mai ajunge la el nici vestea următoare.
+
+    Cealaltă jumătate, în același test: histerezisul nu are voie să înțepenească
+    galbenul. O pagină care chiar și-a revenit trebuie să producă revenirea.
+    """
+    from sentinel.selfcheck import runner
+
+    db = _StateDB()
+    intre_praguri = (checks.DASHBOARD_RECOVER_S + checks.DASHBOARD_SLOW_S) / 2
+    for durata in (checks.DASHBOARD_SLOW_S + 1, intre_praguri,
+                   checks.DASHBOARD_SLOW_S + 1, intre_praguri,
+                   checks.DASHBOARD_SLOW_S + 1, intre_praguri):
+        _sonda_paginii(monkeypatch, secunde=durata)
+        (r,) = run(checks.check_dashboard_latency(db))
+        monkeypatch.setattr(runner, "run_groups", _outcome([r]))
+        run(runner.run_and_alert(db, _cfg()))
+
+    assert len(db.notifications) == 1, (
+        f"șase rulări cu aceeași cauză au produs {len(db.notifications)} mesaje; "
+        f"pragul n-are histerezis, deci oscilația în jurul lui devine zgomot")
+
+    _sonda_paginii(monkeypatch, secunde=checks.DASHBOARD_RECOVER_S - 1)
+    (r,) = run(checks.check_dashboard_latency(db))
+    assert r.status == "ok", (
+        f"pagina a coborât sub pragul de revenire și tot „{r.status}” rămâne; "
+        f"histerezisul a înțepenit galbenul")
+    monkeypatch.setattr(runner, "run_groups", _outcome([r]))
+    run(runner.run_and_alert(db, _cfg()))
+    assert len(db.notifications) == 2, "revenirea reală nu i-a fost spusă nimănui"
+
+
+def test_the_hysteresis_holds_a_finding_but_never_invents_or_hides_one(monkeypatch):
+    """Histerezisul are voie să întârzie o revenire, nimic mai mult.
+
+    Eșecul pe care îl previne: un histerezis care se aplică pe partea greșită.
+    Dacă ar ține și în lipsa unei constatări de dinainte, ar aprinde galben pe o
+    gazdă sănătoasă; dacă ar muta pragul de intrare, o pagină chiar lentă ar
+    trece drept bună și operatorul ar afla abia la 504 — adică pana din 25
+    august, cu o verificare verde lângă ea.
+
+    Și cazul „nu pot citi ce am raportat data trecută": recitirea stării poate
+    eșua. Atunci se aplică pragul scris, care e verdictul măsurat — se pierde
+    doar amortizarea, nu constatarea.
+    """
+    intre_praguri = (checks.DASHBOARD_RECOVER_S + checks.DASHBOARD_SLOW_S) / 2
+
+    # Fără o constatare de dinainte, banda de sub prag e `ok`.
+    db = _StateDB()
+    _sonda_paginii(monkeypatch, secunde=intre_praguri)
+    (r,) = run(checks.check_dashboard_latency(db))
+    assert r.status == "ok", (
+        f"o gazdă care n-a fost niciodată degradată a ieșit „{r.status}” la "
+        f"{intre_praguri}s; histerezisul inventează constatări")
+
+    # Cu una, aceeași durată se ține — și spune că se ține, nu se dă drept nouă.
+    db.state["web:dashboard"] = {
+        "key": "web:dashboard", "status": "degraded", "title": "x", "detail": "",
+        "since": NOW, "last_alert_at": None, "stale": False}
+    _sonda_paginii(monkeypatch, secunde=intre_praguri)
+    (r,) = run(checks.check_dashboard_latency(db))
+    assert r.status == "degraded" and r.facts["mod"] == "revine", (
+        f"constatarea de dinainte nu se mai ține: {r.status}/{r.facts.get('mod')}")
+
+    class _Oarba:
+        """O bază din care starea de dinainte nu se poate citi."""
+
+        async def fetchrow(self, sql, *a):  # noqa: ANN001, ANN002, ANN202
+            raise RuntimeError("pool epuizat")
+
+    # Citire imposibilă: rămâne pragul scris. Nici ținut, nici ascuns.
+    _sonda_paginii(monkeypatch, secunde=intre_praguri)
+    (r,) = run(checks.check_dashboard_latency(_Oarba()))
+    assert r.status == "ok", (
+        f"o citire de stare eșuată a produs „{r.status}”; verdictul nu mai e "
+        f"durata măsurată, ci o presupunere")
+
+    # Peste prag rămâne peste prag, oricât de necitibilă e starea de dinainte.
+    _sonda_paginii(monkeypatch, secunde=checks.DASHBOARD_SLOW_S + 1)
+    (r,) = run(checks.check_dashboard_latency(_Oarba()))
+    assert r.status == "degraded" and r.facts["mod"] == "lent", (
+        f"pragul de intrare s-a mutat: {checks.DASHBOARD_SLOW_S + 1}s a ieșit "
+        f"„{r.status}”")

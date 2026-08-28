@@ -185,14 +185,21 @@ def test_a_load_just_under_the_band_is_still_ok(monkeypatch) -> None:
     assert r.status == "ok"
 
 
-def test_a_load_that_never_finishes_is_down_and_says_why(monkeypatch) -> None:
-    """Când sonda depășește bugetul nginx, verdictul e `down`, nu „nu știu".
+def test_a_load_that_never_finishes_is_a_finding_and_says_why(monkeypatch) -> None:
+    """Când sonda depășește bugetul nginx, verdictul e o constatare, nu „nu știu".
 
     Eșecul pe care îl previne: o sondă care atârnă la nesfârșit blochează rularea
     de autodiagnostic, deci nici celelalte verificări nu mai ajung la operator —
     o pagină lentă ar amuți întregul canal. Și ramura asta e cea în care se ȘTIE
     cel mai sigur că operatorul primește 504, deci ar fi cel mai rău loc pentru
     un `unknown`.
+
+    De ce `degraded` și nu `down`, din 28 august 2026: `down` e singura stare
+    care trece de fereastra de liniște a operatorului, iar un panou care nu se
+    încarcă nu înseamnă că gazda nu mai e apărată. Argumentul întreg, cu
+    contra-argumentul lui, e în docstring-ul verificării; lanțul până la
+    `NEVER_MUTED_SEVERITIES` e păzit în `test_selfcheck.py`. Ce rămâne păzit
+    aici e că ramura RĂMÂNE o constatare și spune care dintre ele e.
     """
     from sentinel.analytics import page
 
@@ -202,8 +209,11 @@ def test_a_load_that_never_finishes_is_down_and_says_why(monkeypatch) -> None:
     monkeypatch.setattr(page, "load", atarna)
     monkeypatch.setattr(checks, "DASHBOARD_PROXY_TIMEOUT_S", 0.05)
     (r,) = run(checks.check_dashboard_latency(object()))
-    assert r.status == "down", f"o sondă care nu se termină a ieșit {r.status}"
+    assert r.bad and r.status == "degraded", (
+        f"o sondă care nu se termină a ieșit {r.status}")
     assert r.facts["peste_proxy_read_timeout"] is True
+    assert r.facts["mod"] == "expirat", (
+        f"ramura de 504 nu se mai deosebește de una doar lentă: {r.facts}")
 
 
 def test_a_probe_that_cannot_measure_is_unknown_not_ok(monkeypatch) -> None:
@@ -222,7 +232,7 @@ def test_a_probe_that_cannot_measure_is_unknown_not_ok(monkeypatch) -> None:
     assert "pool epuizat" in r.detail
 
 
-def test_a_probe_that_fails_slowly_is_down_not_unknown(monkeypatch) -> None:
+def test_a_probe_that_fails_slowly_is_a_finding_not_unknown(monkeypatch) -> None:
     """O interogare oprită de `statement_timeout` NU e „n-am putut măsura".
 
     Eșecul pe care îl previne, și e cel mai subtil de aici: pool-ul are
@@ -234,9 +244,12 @@ def test_a_probe_that_fails_slowly_is_down_not_unknown(monkeypatch) -> None:
     _incarcare(monkeypatch, secunde=checks.DASHBOARD_SLOW_S + 1,
                boom=RuntimeError("canceling statement due to statement timeout"))
     (r,) = run(checks.check_dashboard_latency(object()))
-    assert r.status == "down", (
+    assert r.bad and r.status == "degraded", (
         f"o încărcare care a căzut după {checks.DASHBOARD_SLOW_S + 1}s a ieșit "
         f"{r.status}; operatorul primise deja pagina de eroare")
+    assert r.facts["mod"] == "eroare", (
+        f"ramura de pagină de eroare nu se mai deosebește de una doar lentă: "
+        f"{r.facts}")
 
 
 @pytest.mark.parametrize("scenariu", ["ok", "degradat", "eroare_rapida", "eroare_lenta"])
