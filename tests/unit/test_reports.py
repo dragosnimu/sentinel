@@ -882,6 +882,39 @@ def test_a_twenty_five_hour_day_is_one_bucket_not_two():
     assert start.astimezone(z).hour == 0 and end.astimezone(z).hour == 0
 
 
+def test_a_day_with_two_midnights_starts_at_the_first_one():
+    """`fold=0` din `_instant`, si ce se pierde fara el.
+
+    Sunt fusuri in care ceasul da inapoi CHIAR la miezul noptii, deci „00:00"
+    local se intampla de doua ori. Eticheta zilei are atunci doua instante, la o
+    ora distanta, si `truncate` mosteneste `fold` din momentul din care taie:
+    fara `fold=0` aceeasi zi ar incepe in doua locuri diferite, dupa ce moment
+    s-a nimerit sa fie cerut. Fixat pe al DOILEA, ora repetata cade in afara lui
+    `WHERE ts >= $3` — o ora de evenimente disparuta din zi, o data pe an, cu un
+    total care nu se plange.
+    """
+    from zoneinfo import ZoneInfo
+
+    HAVANA = "America/Havana"
+    z = ZoneInfo(HAVANA)
+    prima = datetime(2026, 11, 1, 0, 0, tzinfo=z, fold=0).astimezone(timezone.utc)
+    a_doua = datetime(2026, 11, 1, 0, 0, tzinfo=z, fold=1).astimezone(timezone.utc)
+    assert a_doua - prima == timedelta(hours=1), (
+        "fixtura nu mai demonstreaza miezul de noapte ambiguu; alt tzdata, alta zi")
+    assert reports.align_zone("day", HAVANA) == HAVANA, "ziua nu se mai taie in fusul cerut"
+
+    din_ora_repetata = reports.truncate(a_doua + timedelta(minutes=30), "day",
+                                        tz_name=HAVANA)
+    din_dupa_amiaza = reports.truncate(prima + timedelta(hours=12), "day",
+                                       tz_name=HAVANA)
+    assert din_ora_repetata == prima, din_ora_repetata.isoformat()
+    assert din_dupa_amiaza == prima, din_dupa_amiaza.isoformat()
+
+    # Si marginea urmatoare ramane cea a zilei urmatoare, nu una mutata cu o ora:
+    # altfel ziua desenata ar fi de 23 sau de 25 de ore fara ca ceasul sa se dea.
+    assert reports.advance(prima, "day", 1, tz_name=HAVANA) - prima == timedelta(hours=25)
+
+
 def test_the_bucket_list_stays_contiguous_across_the_clock_change():
     """Lista de margini trebuie să rămână lipită și fără duplicate.
 

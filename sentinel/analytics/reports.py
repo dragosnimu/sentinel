@@ -110,6 +110,22 @@ def align_zone(unit: str, tz_name: str = STORAGE_TZ) -> str:
     de 23 sau de 25 de ore, deci suma pe acea zi va arăta o anomalie o dată pe
     an. Nu e un bug de vânat: e chiar ziua pe care a trăit-o operatorul.
 
+    **Într-un fus decalat cu jumătate de oră, ziua se rupe în interiorul unei
+    găleți, și asta e o limită cunoscută, nu o proprietate.** Evenimentele nu
+    se numără din `raw_events`, ci din `event_rollup_1h`, care ține ore UTC
+    ÎNTREGI; `events_rows` taie ziua pe `bucket AT TIME ZONE $2`, adică pe
+    începutul găleții. Pentru `Europe/Bucharest` ziua începe la 21:00:00+00 —
+    exact pe o margine de găleată, deci nu se pierde nimic. Pentru
+    `Asia/Kolkata` (+05:30) începe la 18:30:00+00 și pentru `Asia/Kathmandu`
+    (+05:45) la 18:15:00+00, adică ÎN MIJLOCUL găleții care începe la 18:00:
+    toată găleata pleacă în ziua în care începe, deci până la o jumătate de oră
+    (respectiv trei sferturi) de evenimente sunt numărate în ziua locală vecină,
+    fără ca nimic de pe pagină s-o spună. Incidentele și patch-urile nu sunt
+    atinse — acolo se taie direct o coloană `timestamptz`, nu o găleată gata
+    agregată. Reparat, ar cere o găleată mai mică decât ora în rollup; până
+    atunci, un fus cu decalaj fracționar e o configurație pe care raportul de
+    evenimente o servește aproximativ.
+
     **ORA rămâne tăiată în UTC**, și asta e o alegere, nu o scăpare. `date_trunc`
     într-un fus numit lucrează pe ceasul de perete, iar în noaptea în care ceasul
     dă înapoi există DOUĂ ore locale „03:00": `GROUP BY` le-ar aduna într-o
@@ -194,11 +210,21 @@ SOURCE_ROWS_MAX = 25
 def _instant(local_naive: datetime, z: Any) -> datetime:
     """Un ceas de perete dintr-o zonă, ca moment absolut.
 
-    `fold=0` e scris pe față. Fără el, o margine căzută într-o oră locală care
-    se repetă ar putea moșteni `fold=1` din momentul din care a fost tăiată, iar
-    Python ar alege alt instant decât cel pe care îl întoarce PostgreSQL pentru
-    aceeași etichetă — două mecanisme de acord până în noaptea în care nu mai
-    sunt.
+    `fold=0` e scris pe față, și motivul NU e un dezacord cu PostgreSQL:
+    instrucțiunile de aici nu fac niciodată conversia naiv→instant.
+    `date_trunc($1, ts AT TIME ZONE $2)` merge doar în sensul celălalt,
+    instant→naiv, iar amândouă marginile ferestrei sunt calculate în Python,
+    prin funcția asta. Ce ține `fold` e altceva, și e local.
+
+    Într-un fus în care MIEZUL NOPȚII e ambiguu — `America/Havana`, 1 noiembrie
+    2026: 00:00 local se întâmplă de două ori, la 04:00 și la 05:00 UTC —
+    eticheta „începutul zilei" are două instante. `truncate` taie pe ceasul de
+    perete cu `replace(tzinfo=None)`, care DUCE `fold` mai departe din momentul
+    din care s-a tăiat. Fără `fold=0`, aceeași zi ar începe la 04:00 când e
+    cerută dintr-un moment obișnuit și la 05:00 când e cerută dintr-unul din ora
+    repetată — două margini pentru o singură coloană. Cu `fold=1` ar începe mereu
+    la 05:00, iar ora repetată ar cădea în afara lui `WHERE ts >= $3`: o oră de
+    evenimente ar dispărea din zi, o dată pe an, fără ca totalul să se plângă.
     """
     return local_naive.replace(tzinfo=z, fold=0).astimezone(timezone.utc)
 

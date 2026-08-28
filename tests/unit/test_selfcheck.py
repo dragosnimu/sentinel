@@ -305,7 +305,23 @@ class _QueueDB:
     două citiri diferite — coada și preferințele de liniște. Un dublu care le
     confundă ar fi răspuns la a doua cu rânduri de notificări, adică ar fi picat
     dintr-un motiv care n-are nicio legătură cu ce se testează.
+
+    Dublul APLICĂ predicatele din `WHERE`, nu le ignoră. Fără asta, instrucțiunea
+    nu se execută nicăieri în suită: `AND channel = 'telegram'` și
+    `AND enqueued_at < now() - interval '10 minutes'` puteau fi șterse amândouă
+    cu suita verde, deși pe prima se sprijină explicit motivarea scrisă în
+    `check_alerting` („`channel` filtrează exact rândurile pe care le golește
+    `_push_notifications`"). Cheile din `_WHERE` sunt chiar TEXTUL căutat în
+    SQL-ul trimis: o clauză scoasă din `checks.py` face dublul să nu mai
+    filtreze, rândul nepotrivit intră în număr, iar testele care îl exclud pică.
+    Scrisă altfel, într-o clauză rescrisă de mână aici, ar fi fost a doua copie a
+    aceleiași reguli — și tot verde.
     """
+
+    _WHERE = {
+        "channel = 'telegram'": lambda g: g["channel"] == "telegram",
+        "enqueued_at < now() - interval '10 minutes'": lambda g: g["age_min"] > 10,
+    }
 
     def __init__(self, groups=None, prefs=None, prefs_error=None, queue_error=None):
         self._groups = groups or []
@@ -319,7 +335,13 @@ class _QueueDB:
         if "FROM notifications" in sql:
             if self._queue_error:
                 raise self._queue_error
-            return self._groups
+            trecute = [g for g in self._groups
+                       if all(pred(g) for text, pred in self._WHERE.items()
+                              if text in sql)]
+            # Numai coloanele pe care le proiectează `SELECT`: `channel` și
+            # vechimea sunt intrări ale filtrului, nu răspuns pentru verificare.
+            return [{k: g[k] for k in ("severity", "kind", "tried", "n")}
+                    for g in trecute]
         if "telegram_chats" in sql:
             if self._prefs_error:
                 raise self._prefs_error
@@ -327,8 +349,15 @@ class _QueueDB:
         return []
 
 
-def _grp(n=1, severity="high", kind="selfcheck", tried=False):
-    return {"severity": severity, "kind": kind, "tried": tried, "n": n}
+def _grp(n=1, severity="high", kind="selfcheck", tried=False,
+         channel="telegram", age_min=30):
+    """Un grup din coadă, plus cele două câmpuri pe care le citește `WHERE`-ul.
+
+    Valorile implicite sunt cele care TREC filtrul, ca toate testele scrise
+    înaintea lui să însemne exact ce însemnau.
+    """
+    return {"severity": severity, "kind": kind, "tried": tried, "n": n,
+            "channel": channel, "age_min": age_min}
 
 
 def _chat(chat_id=1, quiet_hours=None, muted_until=None, timezone_name=None):
@@ -368,6 +397,38 @@ def test_a_running_bot_that_delivers_nothing_is_degraded(monkeypatch):
     result = run(checks.check_alerting(db, _cfg()))[0]
     assert result.status == "degraded"
     assert result.facts["blocked"] == 12
+
+
+def test_a_queued_row_on_another_channel_is_not_the_telegram_channel_s_fault(monkeypatch):
+    """`AND channel = 'telegram'` — verificarea răspunde despre UN canal.
+
+    `notifications` e coada tuturor canalelor. Azi fiecare rând de pe gazdă e
+    `telegram`, deci clauza nu schimbă nimic observabil — dar în ziua în care se
+    adaugă al doilea canal, fără ea o coadă de e-mail nelivrată ar fi raportată
+    ca „Telegram nu mai livrează", cu `journalctl -u sentinel-telegram` ca
+    acțiune sugerată. Operatorul ar căuta ore întregi în serviciul sănătos.
+    """
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "active")
+    db = _QueueDB(groups=[_grp(n=12, tried=True, channel="email")])
+    result = run(checks.check_alerting(db, _cfg()))[0]
+    assert result.status == "ok", result.detail
+    assert result.facts == {"blocked": 0, "held": 0}
+
+
+def test_a_row_enqueued_a_minute_ago_is_not_a_stuck_queue(monkeypatch):
+    """`AND enqueued_at < now() - interval '10 minutes'` — pragul, nu decorul.
+
+    Expeditorul golește coada la interval; un rând pus acolo acum o clipă e
+    normalul, nu o defecțiune. Fără prag, fiecare rulare care prinde coada în
+    lucru ar raporta „mesaje care trebuiau trimise stau de peste 10 minute" —
+    un canal care se plânge de propria funcționare, adică exact alarma falsă
+    repetată care duce la oprirea lui.
+    """
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "active")
+    db = _QueueDB(groups=[_grp(n=12, tried=True, age_min=1)])
+    result = run(checks.check_alerting(db, _cfg()))[0]
+    assert result.status == "ok", result.detail
+    assert result.facts == {"blocked": 0, "held": 0}
 
 
 def test_a_message_held_by_quiet_hours_is_not_reported_as_blocked(monkeypatch):

@@ -261,6 +261,38 @@ def test_a_chat_without_a_row_uses_the_deployment_window():
                               default_tz=BUCHAREST) == frozenset({7})
 
 
+def test_a_chat_with_its_own_zone_is_judged_in_that_zone():
+    """Al treilea camp per chat, si singurul pe care nu-l tinea nimic.
+
+    `telegram_chats` are trei coloane pe care `silent_chats` le duce mai
+    departe: `muted_until`, `quiet_hours` si `timezone`. Primele doua sunt
+    tinute de testele de mai sus; a treia se putea inlocui cu fusul instalarii
+    fara ca vreun test din suita sa se plimbe.
+
+    Ce se strica: un chat care si-a scris `22:00-06:00` in fusul LUI ar avea
+    fereastra evaluata in fusul gazdei — cu trei ore de decalat, exact
+    „a three-hour error here silences the wrong three hours" din capul
+    modulului. Si ar fi invizibil, fiindca expeditorul si autoverificarea citesc
+    aceeasi functie: ar gresi la fel, deci nimic de pe panou n-ar contrazice
+    nimic din chat.
+    """
+    LISABONA = "Europe/Lisbon"                       # UTC+1 in august
+    now = datetime(2026, 8, 9, 21, 30, tzinfo=UTC)   # 00:30 la Bucuresti, 22:30 la Lisabona
+    fereastra = "23:00-06:00"
+    assert now.astimezone(quiet.zone(BUCHAREST)).hour == 0, "fixtura nu mai separa fusurile"
+    assert now.astimezone(quiet.zone(LISABONA)).hour == 22, "fixtura nu mai separa fusurile"
+
+    # Fusul chatului spune „inca nu e liniste", desi fusul instalarii ar spune ca e.
+    prefs = {7: _Prefs(quiet_hours=fereastra, timezone=LISABONA)}
+    assert quiet.silent_chats(now=now, chat_ids=[7], prefs=prefs,
+                              default_tz=BUCHAREST) == frozenset()
+
+    # Si in cealalta directie, ca reparatia sa nu poata fi „ignora fereastra".
+    prefs = {7: _Prefs(quiet_hours=fereastra, timezone=BUCHAREST)}
+    assert quiet.silent_chats(now=now, chat_ids=[7], prefs=prefs,
+                              default_tz=LISABONA) == frozenset({7})
+
+
 def test_holding_needs_every_chat_to_be_silent():
     """Daca macar un chat asculta, mesajul pleaca la el.
 

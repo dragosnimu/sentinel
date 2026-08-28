@@ -296,6 +296,7 @@ def test_the_application_binds_the_filter_to_its_own_config():
     """
     from sentinel.config import Config
     from sentinel.web.app import create_app
+    from sentinel.web.jinja import build_env
 
     app = create_app(config=Config(timezone=TZ),
                      secrets_store=SimpleNamespace(get=lambda k, d=None: None,
@@ -304,6 +305,45 @@ def test_the_application_binds_the_filter_to_its_own_config():
     env = app.state.templates.env
     assert "ora" in env.filters, "panoul nu are filtrul; fiecare pagină cu o oră ar da 500"
     assert env.from_string("{{ m | ora }}").render(m=VARA) == "24.08 08:54 EEST"
+
+    # Și tot ce leagă `build_env` e legat și aici, fiindcă vin din ACELAȘI apel.
+    # Cât timp erau două liste asamblate de mână, o globală adăugată într-una
+    # rămânea verde peste tot în teste și dădea `UndefinedError` — 500 — pe
+    # fiecare pagină cu chenar din proces. Aserțiunea e „cel puțin": starlette
+    # mai adaugă `url_for` peste ce punem noi.
+    referinta = build_env(TZ)
+    lipsa = set(referinta.globals) - set(env.globals)
+    assert not lipsa, f"globale legate în teste, dar nu în aplicație: {sorted(lipsa)}"
+    lipsa = set(referinta.filters) - set(env.filters)
+    assert not lipsa, f"filtre legate în teste, dar nu în aplicație: {sorted(lipsa)}"
+
+
+def test_the_footer_names_the_zone_the_page_is_actually_written_in():
+    """Subsolul scria „ora serverului: UTC" pe fiecare pagină cu chenar.
+
+    Era adevărat cât timp fiecare șablon formata singur, în UTC. Din clipa în
+    care orele au trecut prin `| ora`, aceeași propoziție contrazicea fiecare
+    oră de deasupra ei — iar subsolul e SINGURUL loc de pe pagină care numește
+    fusul. Un operator care citește „21:15" și „ora serverului: UTC" caută în
+    `journalctl` cu trei ore alături și crede că are motiv.
+    """
+    from sentinel.web.jinja import build_env
+
+    # `Asia/Kolkata` e `IST` tot anul: marcajul din pagină nu depinde de ziua în
+    # care rulează testul, deci aserțiunea e pe un șir, nu pe o recalculare cu
+    # aceeași funcție — care ar fi trecut și cu fusul greșit legat în mediu.
+    pagina = build_env("Asia/Kolkata").get_template("base.html").render(
+        user=SimpleNamespace(username="operator", role="owner"),
+        csrf_token="t", active="dashboard")
+    assert "ore afișate în IST" in pagina, pagina[-400:]
+    assert "ora serverului: UTC" not in pagina
+
+    # Și marcajul urmează MOMENTUL, nu numele zonei: fixat o dată la pornirea
+    # procesului ar fi greșit jumătate de an, tăcut, fiindcă orele de deasupra
+    # ar rămâne corecte.
+    fus = build_env(TZ).globals["fus_orar"]
+    assert fus(VARA) == "EEST"
+    assert fus(IARNA) == "EET"
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +362,18 @@ def test_the_application_binds_the_filter_to_its_own_config():
 # aici motivul, nu doar numele.
 
 
+def _self_formatting_templates(director: Path) -> list[str]:
+    """Numele șabloanelor din `director` care își scriu singure un moment.
+
+    Expresia gărzii stă AICI, într-o funcție, și nu inline în test. Testul de
+    anti-vacuitate de mai jos o cheamă pe un director al lui, cu un ofensator
+    fabricat, deci proba trece prin chiar codul care caută — nu prin un literal
+    retastat lângă el, care ar fi rămas adevărat oricât s-ar fi stricat garda.
+    """
+    return sorted(p.name for p in director.glob("*.html")
+                  if "strftime" in p.read_text(encoding="utf-8"))
+
+
 def test_no_template_formats_a_moment_by_itself():
     """Douăzeci de locuri care chemau `strftime`, toate în UTC, dintre care
     patru scriau „UTC" în text și restul nu scriau nimic.
@@ -329,15 +381,14 @@ def test_no_template_formats_a_moment_by_itself():
     Un loc nou care formatează singur ar reintroduce exact asta, și ar face-o
     tăcut: pagina se randează, ora e greșită cu trei ore, nimic nu se plânge.
     """
-    vinovate = sorted(p.name for p in TEMPLATES.glob("*.html")
-                      if "strftime" in p.read_text(encoding="utf-8"))
+    vinovate = _self_formatting_templates(TEMPLATES)
     assert not vinovate, (
         f"șabloane care formatează singure un moment: {vinovate}. "
         "Folosește filtrul `| ora`, care scrie în fusul configurat și pune "
         "marcajul de fus.")
 
 
-def test_the_guard_is_not_looking_at_an_empty_set():
+def test_the_guard_is_not_looking_at_an_empty_set(tmp_path):
     """Fără asta, testul de mai sus trece și dacă directorul de șabloane s-a
     mutat sau tiparul căutat nu mai există nicăieri — o listă parametrizată
     ieșită goală și sărită tăcut a costat deja o pană aici."""
@@ -346,9 +397,18 @@ def test_the_guard_is_not_looking_at_an_empty_set():
     assert any("| ora" in p.read_text(encoding="utf-8") for p in sabloane), (
         "niciun șablon nu folosește filtrul; ori s-a redenumit, ori nu e "
         "folosit nicăieri — în ambele cazuri garda de mai sus nu păzește nimic")
-    # Și proba că expresia chiar VEDE tiparul: fără ea, un `strftime` scris
-    # altfel (sau un director mutat) ar face lista de vinovați să iasă goală, iar
-    # garda ar trece verde uitându-se la nimic. Lista de scutiri care a stat aici
-    # până pe 28 august 2026 era exact gaura asta, cu nume.
-    fals = "{{ m.strftime('%H:%M') }}"
-    assert "strftime" in fals, "tiparul căutat de gardă nu mai potrivește forma"
+
+    # Și proba că garda MUȘCĂ: un ofensator fabricat, dat aceleiași funcții pe
+    # un director de unică folosință. Aici se prinde un tipar scris altfel, un
+    # glob care nu mai potrivește extensia și o condiție întoarsă pe dos — adică
+    # fix cazurile în care lista de vinovați iese goală fiindcă nu se uită
+    # nimeni, nu fiindcă nu e nimeni. Aserțiunea care a stat aici până pe 28
+    # august 2026 verifica un literal definit cu un rând mai sus, deci era
+    # adevărată și cu garda oarbă.
+    (tmp_path / "curat.html").write_text(
+        "<p>{{ m | ora }}</p>\n", encoding="utf-8")
+    (tmp_path / "ofensator.html").write_text(
+        "<p>{{ m.strftime('%H:%M') }}</p>\n", encoding="utf-8")
+    assert _self_formatting_templates(tmp_path) == ["ofensator.html"], (
+        "garda nu vede un șablon care cheamă `strftime`, sau îl vede și pe cel "
+        "curat — în ambele cazuri verdele de mai sus nu înseamnă nimic")

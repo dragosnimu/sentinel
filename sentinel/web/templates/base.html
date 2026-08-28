@@ -76,7 +76,11 @@
   <main class="{% block main_class %}content{% endblock %}">
     {% block content %}{% endblock %}
     <footer class="footer">
-      <span>Sentinel {{ version }}</span><span>·</span><span>ora serverului: UTC</span>
+      {# Fusul REAL în care sunt scrise orele de pe pagină, nu „UTC" scris de
+         mână: de când formatarea trece prin `| ora`, orele de deasupra sunt în
+         `cfg.timezone`, iar un subsol rămas pe UTC ar trimite operatorul să
+         caute în `journalctl` cu trei ore alături. Vezi `web/jinja.py:zone_label`. #}
+      <span>Sentinel {{ version }}</span><span>·</span><span>ore afișate în {{ fus_orar() }}</span>
     </footer>
   </main>
 

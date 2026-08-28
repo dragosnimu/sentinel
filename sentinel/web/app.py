@@ -303,13 +303,15 @@ def create_app(
     # From the shared factory, so a template that renders here renders in the
     # tests too. `_vuln.html` calls these globals directly; an environment
     # without them raises UndefinedError at render time, not at import.
-    from sentinel.web.jinja import ora_filter, template_globals
+    # Chiar din fabrica aceea, acum printr-un singur apel. Globalele și filtrul
+    # erau legate în două locuri, cu aceleași linii scrise de două ori, iar
+    # prima globală adăugată numai în `build_env` a randat verde în toate
+    # testele de șabloane și a dat 500 pe fiecare pagină din proces.
+    # `cfg.timezone` e fusul în care se scrie fiecare moment de pe pagină și pe
+    # care îl numește subsolul. Vezi `sentinel/util/tz.py`.
+    from sentinel.web.jinja import configure_env
 
-    templates.env.globals.update(template_globals())
-    # Fiecare moment afișat în panou, în fusul configurat și cu marcajul lui.
-    # Legat aici, o dată, din `Config`: un șablon nu poate uita fusul și nu
-    # poate folosi altul. Vezi `sentinel/util/tz.py`.
-    templates.env.filters["ora"] = ora_filter(cfg.timezone)
+    configure_env(templates.env, cfg.timezone)
     app.state.templates = templates
 
     from sentinel.web.routers import (

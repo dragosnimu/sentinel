@@ -629,10 +629,10 @@ async def check_alerting(db: Database, cfg: Config) -> list[CheckResult]:
     # Delivery, not just liveness: a bot that is running but failing to send is
     # the same outcome as one that is stopped.
     #
-    # Grupat în S'L, nu listat rând cu rând: felurile și severitățile sunt
+    # Grupat în SQL, nu listat rând cu rând: felurile și severitățile sunt
     # câteva, deci răspunsul are câteva rânduri oricât de mare ar fi coada. Așa
     # nu e nevoie nici de un LIMIT — care ar face cifra raportată o minciună —
-    # nici de reguli de liniște scrise a doua oară, în S'L. `channel` filtrează
+    # nici de reguli de liniște scrise a doua oară, în SQL. `channel` filtrează
     # exact rândurile pe care le golește `_push_notifications`.
     try:
         groups = await db.fetch(

@@ -13,6 +13,7 @@ So there is one factory, and both the app and the tests use it.
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -110,6 +111,31 @@ def ora_filter(tz_name: str | None):
     return ora
 
 
+def zone_label(tz_name: str | None):
+    """Globalul `fus_orar`: marcajul fusului în care sunt scrise orele paginii.
+
+    Subsolul din `base.html` a scris „ora serverului: UTC" până pe 28 august
+    2026, și era adevărat cât timp fiecare șablon își formata singur momentele,
+    în UTC. De când trec toate prin `| ora`, propoziția aia contrazicea fiecare
+    oră de deasupra ei — iar un subsol care contrazice pagina e mai rău decât
+    niciun subsol: operatorul care compară panoul cu `journalctl` caută în
+    fereastra greșită și crede că are motiv.
+
+    Funcție chemată la randare, nu șir calculat la construirea mediului:
+    aceeași zonă e `EET` iarna și `EEST` vara, iar un marcaj fixat la pornirea
+    procesului ar fi greșit jumătate de an — și greșit TĂCUT, fiindcă orele de
+    deasupra lui ar rămâne corecte. Marcajul iese din `util.tz.label`, adică din
+    aceeași funcție care îl pune pe fiecare oră de pe pagină; două surse s-ar
+    despărți exact în ziua schimbării ceasului.
+    """
+    from sentinel.util import tz
+
+    def fus_orar(moment: datetime | None = None) -> str:
+        return tz.label(moment or datetime.now(timezone.utc), tz_name)
+
+    return fus_orar
+
+
 def template_globals() -> dict[str, Any]:
     from sentinel import __version__
     from sentinel.intel import links
@@ -127,6 +153,26 @@ def template_globals() -> dict[str, Any]:
     }
 
 
+def configure_env(env: Any, tz_name: str | None = None) -> Any:
+    """Tot ce face dintr-un mediu Jinja gol mediul pe care îl randează Sentinel.
+
+    UN SINGUR loc, chemat și de `build_env`, și de `web/app.create_app`. Până pe
+    28 august 2026 cele două își legau globalele și filtrul fiecare pe cont
+    propriu, cu aceleași linii scrise de două ori — deși capul fișierului ăstuia
+    promitea deja o singură fabrică. Prima globală adăugată după promisiune a
+    ajuns numai în mediul de teste: toate șabloanele randau verde local și
+    fiecare pagină cu chenar dădea `UndefinedError`, adică 500, în proces.
+
+    `tz_name` e fusul în care se scrie fiecare moment de pe pagină, și tot el e
+    cel pe care îl numește subsolul. Legat aici, o dată, din `Config`: un șablon
+    nu poate uita fusul și nu poate folosi altul.
+    """
+    env.globals.update(template_globals())
+    env.filters["ora"] = ora_filter(tz_name)
+    env.globals["fus_orar"] = zone_label(tz_name)
+    return env
+
+
 def build_env(tz_name: str | None = None) -> Any:
     """A bare Jinja environment with the same configuration the app uses.
 
@@ -140,6 +186,4 @@ def build_env(tz_name: str | None = None) -> Any:
         loader=jinja2.FileSystemLoader(str(TEMPLATES_DIR)),
         autoescape=True,
     )
-    env.globals.update(template_globals())
-    env.filters["ora"] = ora_filter(tz_name)
-    return env
+    return configure_env(env, tz_name)
