@@ -2992,10 +2992,17 @@ async def check_dashboard_latency(db: Database) -> list[CheckResult]:
     CHIAR e critic dacă operatorul e în mijlocul unui incident și are nevoie de
     el atunci. Nu schimbă concluzia, din două motive. Canalul de comandă e
     Telegram, nu panoul — `/status`, `/selfcheck`, `/blocheaza` merg toate fără
-    el, iar panoul e citire. Și disponibilitatea HTTP a web-ului e supravegheată
-    separat, de `respond/watchdog.py` pe `/healthz`, care NU e atins de
-    schimbarea asta: un `sentinel-web` care chiar a căzut rămâne prins acolo,
-    unde a fost mereu prins.
+    el, iar panoul e citire. Și un `sentinel-web` care chiar a CĂZUT e prins de
+    `check_units`, care îl dă `down` pe starea unității, deci `critical`, deci
+    străpunge liniștea — neatins de schimbarea asta. Verificarea de aici nu e
+    ultima plasă pentru „web-ul a murit"; e singura pentru „web-ul răspunde,
+    dar încet".
+
+    (Paragraful ăsta spunea până pe 28 august 2026 că plasa e `respond/watchdog.py`
+    pe `/healthz`. E greșit: watchdog-ul golește blocklistul și scrie în jurnal,
+    dar NU trimite nicio notificare. Proprietatea ține, și e chiar mai tare decât
+    scria — doar mecanismul era numit greșit, într-un argument care se sprijină
+    pe el.)
 
     Ce nu se pierde: „pagina a fost lentă" și „pagina n-a mai venit deloc" rămân
     stări distincte — titlu, `detail` și `facts["mod"]` diferite —, doar
