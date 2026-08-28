@@ -51,6 +51,20 @@ RESERVED_PORTS: Final[frozenset[int]] = RESERVED_BIND_PORTS
 
 NGINX_MODES: Final[tuple[str, ...]] = ("dedicated", "shared")
 
+# ---------------------------------------------------------------------------
+# Platform family
+# ---------------------------------------------------------------------------
+# The two families `deploy/lib/distro.sh` detects, spelled identically. The
+# runtime does NOT detect this for itself: a second detection is a second source
+# of truth, and two of those disagree exactly once, in production, at 3 a.m.
+# `distro_detect` decides at install time, install.sh writes the answer into
+# sentinel.yaml as `platform.family`, and Python reads it from there.
+#
+# Here rather than in config.py because an unrecognised family selects no
+# scanner at all. Silently falling back to the RHEL scanner on a host that is
+# not RHEL is how a dead scanner becomes a green panel.
+PLATFORM_FAMILIES: Final[tuple[str, ...]] = ("rhel", "debian")
+
 # Ports belonging to OTHER services on the host are not enumerated anywhere.
 # They vary per machine, so the installer discovers them: preflight snapshots
 # what is listening and refuses to take a port already in use. A hard-coded list

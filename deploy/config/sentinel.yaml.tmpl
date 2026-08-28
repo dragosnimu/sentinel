@@ -23,6 +23,22 @@ instance_label: ""
 
 log_level: INFO
 
+platform:
+  # Familia de distribuție, decisă O SINGURĂ DATĂ, la instalare, de
+  # `distro_detect` din deploy/lib/distro.sh. Runtime-ul Python nu se uită în
+  # /etc/os-release: două detecții sunt două surse de adevăr, iar cele două se
+  # contrazic exact pe gazda unde contează.
+  #
+  # De ea depinde ce scaner de pachete de sistem rulează:
+  #   rhel    -> dnf updateinfo   (CVE, metadate de la furnizor)
+  #   debian  -> apt-get -s       (pachete cu actualizare de securitate, FĂRĂ CVE)
+  #
+  # Nu o edita ca să „adaugi suport" pentru o distribuție. O valoare
+  # necunoscută e refuzată la pornire, dinadins: dacă ar fi tolerată, gazda ar
+  # rula scanerul greșit, n-ar găsi comanda, iar panoul ar arăta zero
+  # vulnerabilități — adică exact ce arată o gazdă sănătoasă.
+  family: "@@PLATFORM_FAMILY@@"
+
 database:
   host: 127.0.0.1
   port: 5432

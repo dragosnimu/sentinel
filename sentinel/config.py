@@ -34,6 +34,30 @@ T = TypeVar("T")
 # Sections
 # ---------------------------------------------------------------------------
 @dataclass
+class PlatformConfig:
+    """Which distribution family this host is, decided once at install time.
+
+    `deploy/lib/distro.sh:distro_detect` decides it, install.sh renders it into
+    sentinel.yaml, and everything in the runtime that has to differ per family
+    reads it from here. Nothing in Python looks at /etc/os-release: a second
+    detector is a second source of truth, and the two only ever disagree on the
+    host where it matters.
+
+    The default is `rhel`, and it is deliberate rather than incidental. Every
+    installation that predates this key runs on AlmaLinux, and `install_config`
+    refuses to overwrite a live sentinel.yaml — it writes sentinel.yaml.new and
+    warns — so those hosts will never gain the key on their own. Defaulting to
+    `rhel` is what keeps their behaviour byte-for-byte what it is today.
+
+    A value outside PLATFORM_FAMILIES is refused at load. It must not be
+    tolerated by falling back to the default: a Debian host whose family was
+    mistyped would then run the dnf scanner, find no dnf, and report a failed
+    scan for a reason nobody could see in the config.
+    """
+    family: str = "rhel"
+
+
+@dataclass
 class DatabaseConfig:
     host: str = "127.0.0.1"
     port: int = 5432
@@ -555,6 +579,7 @@ class Config:
     # Empty by default and empty is fine: the aggregator falls back to the id.
     instance_label: str = ""
     log_level: str = "INFO"
+    platform: PlatformConfig = field(default_factory=PlatformConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     retention: RetentionConfig = field(default_factory=RetentionConfig)
     ingest: IngestConfig = field(default_factory=IngestConfig)
@@ -748,7 +773,17 @@ def load_config(path: Path = CONFIG_PATH) -> Config:
 def _validate(cfg: Config) -> None:
     from sentinel.constants import RESERVED_PORTS, SEVERITIES
 
-    from sentinel.constants import NGINX_MODES
+    from sentinel.constants import NGINX_MODES, PLATFORM_FAMILIES
+
+    if cfg.platform.family not in PLATFORM_FAMILIES:
+        raise ConfigError(
+            f"platform.family must be one of {list(PLATFORM_FAMILIES)}, got "
+            f"{cfg.platform.family!r}. It is written by the installer from the "
+            "family deploy/lib/distro.sh detected; do not hand-edit it to a "
+            "distribution name. An unrecognised family selects no OS-package "
+            "scanner, and a scanner that never runs looks exactly like a host "
+            "with no vulnerabilities."
+        )
 
     if cfg.web.nginx_mode not in NGINX_MODES:
         raise ConfigError(f"web.nginx_mode must be one of {NGINX_MODES}")

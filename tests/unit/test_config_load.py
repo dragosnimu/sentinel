@@ -79,6 +79,7 @@ def _render_shipped_template() -> str:
     for placeholder, value in {
         "@@HOSTNAME@@": "host.example.test",
         "@@DOMAIN@@": "panel.example.test",
+        "@@PLATFORM_FAMILY@@": "rhel",
         "@@NGINX_MODE@@": "dedicated",
         "@@PUBLIC_PORT@@": "8443",
         "@@IFACE@@": "eth0",
@@ -118,6 +119,81 @@ def test_the_shipped_template_still_loads(tmp_path):
 # `tests/unit/test_login_projection.py::test_the_shipped_configuration_actually_drops_a_real_deploy_burst`,
 # which asserts on the DECISION rather than on the presence of a name: given a
 # real deploy's event stream, the projection drops the rows and counts them.
+
+
+# --- platform family -------------------------------------------------------
+def test_a_config_without_a_platform_section_is_still_rhel(tmp_path):
+    """The production host runs AlmaLinux and will never gain this key.
+
+    `install_config` refuses to overwrite a live sentinel.yaml — it writes
+    sentinel.yaml.new and warns — so every installation that predates
+    platform.family keeps a file without it. If the default were anything but
+    `rhel`, the next scan pass on that host would run the wrong package manager,
+    the scan would fail, and the vulnerability page would stop being refreshed.
+    """
+    from sentinel.config import PlatformConfig
+
+    cfg = load_config(_write(tmp_path, """
+telegram:
+  enabled: false
+"""))
+    assert isinstance(cfg.platform, PlatformConfig)
+    assert cfg.platform.family == "rhel"
+
+
+def test_the_default_family_still_selects_the_scanner_production_reports_under(tmp_path):
+    """The continuity this default exists for, checked as an effect.
+
+    `check_last_scan` reports under `scan:last:{scanner}`, and `selfcheck_state`
+    on the production host carries `scan:last:dnf` with history from 21 August
+    2026. A default that loaded fine but selected any other scanner name would
+    have that key reconciled away and a fresh one inserted with `since = now()`,
+    throwing away the history the operator reads.
+    """
+    from sentinel.scan.os_packages import scanner_for
+
+    cfg = load_config(_write(tmp_path, """
+telegram:
+  enabled: false
+"""))
+    assert scanner_for(cfg.platform.family) == "dnf"
+
+
+def test_platform_family_from_the_file_is_what_reaches_the_runtime(tmp_path):
+    """The installer writes the family into the file; if the load path dropped
+    it, an Ubuntu host would silently keep the rhel default and run dnf."""
+    cfg = load_config(_write(tmp_path, """
+platform:
+  family: debian
+telegram:
+  enabled: false
+"""))
+    assert cfg.platform.family == "debian"
+
+
+def test_an_unrecognised_platform_family_is_refused(tmp_path):
+    """`family: ubuntu` looks right and selects no scanner. Tolerating it — by
+    falling back to the default — would run dnf on an Ubuntu host and produce a
+    page of zero vulnerabilities that nobody could explain."""
+    with pytest.raises(ConfigError, match="platform.family"):
+        load_config(_write(tmp_path, """
+platform:
+  family: ubuntu
+telegram:
+  enabled: false
+"""))
+
+
+def test_an_unsubstituted_placeholder_is_refused(tmp_path):
+    """If install.sh ever stops substituting @@PLATFORM_FAMILY@@, the literal
+    token must stop the service at load rather than be quietly ignored."""
+    with pytest.raises(ConfigError, match="platform.family"):
+        load_config(_write(tmp_path, """
+platform:
+  family: "@@PLATFORM_FAMILY@@"
+telegram:
+  enabled: false
+"""))
 
 
 def test_a_config_without_a_history_section_drops_nothing(tmp_path):

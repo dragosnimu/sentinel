@@ -897,6 +897,7 @@ def _conturi_din_sablon() -> list[str]:
     for tinta, valoare in {
         "@@HOSTNAME@@": "host.example.test",
         "@@DOMAIN@@": "panel.example.test",
+        "@@PLATFORM_FAMILY@@": "rhel",
         "@@NGINX_MODE@@": "dedicated",
         "@@PUBLIC_PORT@@": "8443",
         "@@IFACE@@": "eth0",

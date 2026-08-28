@@ -91,15 +91,37 @@ def test_the_timeout_has_room_for_the_worst_case_that_remains() -> None:
         f"măsurată la 87s — marginea trebuie să fie peste dublu")
 
 
-def test_the_default_timeout_of_run_is_the_declared_one() -> None:
-    """Un implicit rămas în urmă e un plafon care nu se vede în constantă."""
+def test_run_has_no_default_timeout_at_all() -> None:
+    """Un implicit e felul în care plafonul lui dnf ajunge pe altă comandă.
+
+    Testul de aici cerea până pe 28 august 2026 ca implicitul lui `_run` să fie
+    egal cu `TIMEOUT_S`. De când modulul are două backend-uri — dnf pe rhel,
+    apt pe debian —, un implicit e mai rău decât unul rămas în urmă: e plafonul
+    unui backend moștenit tăcut de celălalt, adică exact defectul pe care
+    `trivy_fs._run` l-a scos ieri, unde bugetul unei rulări devenise unul per
+    apel. Fiecare apel își spune plafonul.
+    """
     import inspect
 
-    default = inspect.signature(os_packages._run).parameters["timeout"].default
-    assert default == os_packages.TIMEOUT_S, (
-        f"`_run` are implicitul {default}, iar constanta spune "
-        f"{os_packages.TIMEOUT_S}: cine citește constanta află altceva decât "
-        f"ce se întâmplă")
+    param = inspect.signature(os_packages._run).parameters["timeout"]
+    assert param.default is inspect.Parameter.empty, (
+        f"`_run` are implicitul {param.default!r}: un al doilea backend adăugat "
+        f"mâine îl moștenește fără să scrie nicăieri cât așteaptă")
+
+
+def test_the_dnf_call_asks_for_the_declared_timeout() -> None:
+    """Plafonul obligatoriu trebuie să fie ȘI cel declarat, nu doar prezent.
+
+    Verificat pe SURSĂ, nu pe constantă: `_run` fără implicit nu spune nimic
+    despre ce număr primește chiar apelul lui dnf, iar un `timeout=120` scris de
+    mână acolo ar readuce moneda aruncată din 21 august 2026 cu o constantă care
+    spune altceva alături.
+    """
+    source = (ROOT / "sentinel" / "scan" / "os_packages.py").read_text(encoding="utf-8")
+    dnf_call = re.search(r"await _run\(\[\s*\n?\s*\"dnf\".*?\)\n", source, re.S)
+    assert dnf_call, "nu mai găsesc apelul `_run` care rulează dnf în os_packages.py"
+    assert "timeout=TIMEOUT_S" in dnf_call.group(0), (
+        f"apelul dnf nu primește `timeout=TIMEOUT_S`, ci:\n{dnf_call.group(0)}")
 
 
 @pytest.mark.parametrize("cale", ["/var/cache/dnf", "/tmp", "/var/tmp"])

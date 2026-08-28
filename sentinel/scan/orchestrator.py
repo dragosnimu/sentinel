@@ -5,10 +5,17 @@ findings, enrich each with KEV, score it, upsert (dedup by finding_key), then
 mark anything the scanner used to report but no longer does as resolved. A single
 scanner failing is recorded on its own row and does not stop the others.
 
-Three scanners are wired here: `dnf` for OS packages, `trivy_fs` for the
-application dependencies dnf cannot see, and `trivy_image` for what the running
+Three scanners are wired here: the OS package scanner, `trivy_fs` for the
+application dependencies it cannot see, and `trivy_image` for what the running
 containers carry. nuclei and semgrep slot into the same loop; each is one more
 `_run_*` behind its config flag.
+
+The OS package scanner is the one whose NAME depends on the host: `dnf` on rhel,
+`apt` on debian, chosen from `platform.family`. The name is resolved here from
+the family — not read back out of the scanner's answer — because the `scans` row
+is opened BEFORE the scanner is asked to do anything, so that a scanner which is
+missing, crashes or never returns leaves a row behind instead of nothing at all.
+Nothing is the state that gets read as "no vulnerabilities".
 
 The `_run_*` bodies below have the same shape on purpose and are NOT folded into
 one helper. They differ in what each scanner can prove — trivy also has to answer
@@ -44,7 +51,11 @@ async def run_all(db: Database, cfg: Config, *, triggered_by: str = "schedule") 
 
     summary: dict[str, dict] = {}
     if cfg.scan.os_packages:
-        summary["dnf"] = await _run_os_packages(db, triggered_by)
+        # Keyed by the scanner that actually ran, so the summary line in the
+        # journal names it. On rhel this is still "dnf", unchanged.
+        family = cfg.platform.family
+        summary[os_packages.scanner_for(family)] = await _run_os_packages(
+            db, family, triggered_by)
     if cfg.scan.filesystem:
         summary[trivy_fs.SCANNER] = await _run_trivy_fs(db, cfg, triggered_by)
     if cfg.scan.containers:
@@ -112,14 +123,31 @@ async def _draft_plans(db: Database, cfg: Config) -> dict:
             "validated": len(validated), "plan_ids": validated}
 
 
-async def _run_os_packages(db: Database, triggered_by: str) -> dict:
-    scan_id = await fx.start_scan(db, "dnf", "localhost", triggered_by=triggered_by)
+async def _run_os_packages(db: Database, family: str, triggered_by: str) -> dict:
+    """Scanerul de pachete de sistem al familiei: `dnf` pe rhel, `apt` pe debian.
+
+    Aceeasi forma ca `_run_trivy_fs`, cu doua lucruri proprii:
+
+      * numele scanerului se afla din FAMILIE, inainte de orice apel. Randul din
+        `scans` se deschide primul, ca un scaner care nu exista pe gazda sa lase
+        un rand `failed` in urma, nu tacere;
+      * cand scanerul intoarce o eroare nu se rezolva NIMIC. Aici a fost bug-ul:
+        pe Ubuntu se rula `dnf`, comanda nu exista, eroarea intra in jurnal si
+        rularea mergea mai departe — iar panoul arata zero vulnerabilitati pe o
+        gazda pe care nu se scanase niciodata nimic.
+    """
+    scanner = os_packages.scanner_for(family)
+    scan_id = await fx.start_scan(db, scanner, "localhost", triggered_by=triggered_by)
     try:
-        raw, error = await os_packages.scan()
+        raw, error, facts = await os_packages.scan(family)
+        db_version = facts.get("db_version")
         if error:
-            await fx.finish_scan(db, scan_id, status="failed", error=error)
-            log.error("dnf scan failed", extra={"error": error})
-            return {"status": "failed", "error": error}
+            await fx.finish_scan(db, scan_id, status="failed", error=error,
+                                 db_version=db_version)
+            log.error("os package scan failed",
+                      extra={"scanner": scanner, "family": family, "error": error})
+            return {"status": "failed", "scanner": scanner, "error": error,
+                    "db_version": db_version}
 
         cves = [f["cve"] for f in raw if f.get("cve")]
         kev_map = await kev.lookup(db, cves)
@@ -137,30 +165,35 @@ async def _run_os_packages(db: Database, triggered_by: str) -> dict:
                 f["kev"] = True
                 f["kev_due_date"] = due
             f["scan_id"] = scan_id
-            # dnf findings are host-level; exposure/criticality use host defaults.
+            # OS package findings are host-level; exposure/criticality use host
+            # defaults.
             f["priority"] = prioritize.score(f, exposed=True, criticality=3)
             if await fx.upsert_finding(db, f):
                 new += 1
                 new_items.append(dict(f))
             seen.append(f["finding_key"])
 
-        resolved = await fx.mark_resolved_absent(db, "dnf", None, seen)
+        resolved = await fx.mark_resolved_absent(db, scanner, None, seen)
         await fx.finish_scan(
             db, scan_id, status="completed", findings_count=len(raw),
-            new_findings=new, resolved_findings=resolved)
-        log.info("dnf scan complete",
-                 extra={"findings": len(raw), "new": new, "resolved": resolved,
-                        "kev": len(kev_map)})
-        return {"status": "completed", "findings": len(raw), "new": new,
+            new_findings=new, resolved_findings=resolved, db_version=db_version)
+        log.info("os package scan complete",
+                 extra={"scanner": scanner, "findings": len(raw), "new": new,
+                        "resolved": resolved, "kev": len(kev_map),
+                        "db_version": db_version})
+        return {"status": "completed", "scanner": scanner,
+                "findings": len(raw), "new": new,
                 "resolved": resolved, "kev": len(kev_map),
+                "db_version": db_version,
                 # Lista, nu doar numarul: `run_all` o duce la anunt. Ramane in
                 # sumar si cand e goala, ca apelantul sa nu trebuiasca sa
                 # deosebeasca „n-a fost nimic nou" de „scanarea asta nu spune".
                 "new_items": new_items}
     except Exception as exc:  # noqa: BLE001 - record and surface, do not crash the pass
         await fx.finish_scan(db, scan_id, status="failed", error=str(exc)[:500])
-        log.error("dnf scan crashed", extra={"detail": str(exc)})
-        return {"status": "failed", "error": str(exc)[:200]}
+        log.error("os package scan crashed",
+                  extra={"scanner": scanner, "family": family, "detail": str(exc)})
+        return {"status": "failed", "scanner": scanner, "error": str(exc)[:200]}
 
 
 async def _run_trivy_fs(db: Database, cfg: Config, triggered_by: str) -> dict:

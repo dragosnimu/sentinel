@@ -326,6 +326,112 @@ niciun rând în `scans`. Docker prezent dar inaccesibil **e** o eroare, cu rân
 face. Detaliile sunt în docstring-ul lui
 [`sentinel/scan/trivy_image.py`](../sentinel/scan/trivy_image.py).
 
+### 3.15 Familia se detectează o dată, la instalare
+
+Runtime-ul Python **nu se uită în `/etc/os-release`**. `distro_detect` din
+[`deploy/lib/distro.sh`](../deploy/lib/distro.sh) decide familia la instalare,
+`install.sh` o scrie în `sentinel.yaml` ca `platform.family`, iar codul o citește
+de acolo.
+
+Motivul e tiparul din `CLAUDE.md`: două detecții sunt două surse de adevăr, iar
+două surse de adevăr se contrazic exact pe gazda unde contează. Valoarea nu
+trece nici prin `preflight.env` — fișierul acela e citit de `resolve_config`
+*după* detecția pe care install.sh o face oricum la pornire, deci un fișier
+rămas de la o rulare anterioară pe altă gazdă ar fi putut suprascrie răspunsul
+viu.
+
+O valoare necunoscută e refuzată la încărcarea configurației, nu tolerată prin
+revenirea la implicit. `family: ubuntu` arată corect și nu selectează niciun
+scaner; dacă ar fi tolerat, gazda ar rula `dnf`, n-ar găsi comanda, iar pagina
+de vulnerabilități ar arăta zero.
+
+**Implicitul e `rhel`, și e explicit.** Instalările care preced cheia rulează
+toate pe AlmaLinux, iar `install_config` refuză să suprascrie un `sentinel.yaml`
+viu — scrie `.new` și avertizează. Deci gazdele existente nu primesc cheia
+niciodată, iar implicitul e singurul lucru care le păstrează comportamentul.
+
+Numele scanerului de pe familia `rhel` **rămâne `dnf`**, și nu din inerție:
+`check_last_scan` raportează sub `scan:last:{scanner}`, iar `selfcheck_state` de
+pe gazda de producție are cheia `scan:last:dnf` cu istoric din 21 august 2026.
+Redenumită, cheia veche ar fi reconciliată afară și în locul ei ar apărea una cu
+`since = now()` — aceeași pierdere de istoric prinsă pe 25 august la
+`audit:records`.
+
+### 3.16 Scanarea de pachete pe Debian nu e la fel de bună, și o spune
+
+| Familie | Scaner | Ce dă |
+|---|---|---|
+| rhel | `dnf updateinfo list cves --security` | CVE, severitatea din aviz, versiunea care repară |
+| debian | `apt-get -s dist-upgrade` | pachetul și versiunea, **fără CVE, fără severitate** |
+
+Pe RHEL metadatele furnizorului sunt adevărul: știu despre remedieri
+*backportate*, adică un CVE reparat într-un șir de versiune vechi. Scanerele
+generice le raportează ca vulnerabile și produc un zid de fals-pozitive — de
+aceea `trivy_fs` e îndreptat spre dependențele aplicațiilor, nu spre pachetele
+sistemului.
+
+Pe Debian și Ubuntu nu există echivalent local. Metadatele de securitate stau în
+fluxul OVAL al Canonical și în trackerul de securitate Debian — amândouă
+servicii de rețea, niciunul pe gazdă. Ce poate răspunde `apt`, offline și
+corect, e o întrebare mai îngustă: **ce pachete instalate au o actualizare care
+așteaptă în depozitul de securitate** al distribuției (`noble-security`,
+`bookworm-security`, buzunarele Ubuntu Pro).
+
+Deci o constatare pe Debian spune „există o actualizare de securitate pentru
+openssl". Nu spune „openssl are CVE-2026-1234". `cve` e null, severitatea e
+`medium` cu `raw.severity_known = False` — aceeași pereche pe care
+`trivy_fs.map_severity` o dă pentru `UNKNOWN`, și din același motiv: `info` e o
+afirmație, iar absența unei note nu e — și descrierea constatării **își scrie
+singură** că severitatea nu e o evaluare.
+
+Calea de patch **eșuează închis**, fără o regulă scrisă pentru ea:
+`generate_for_kev` alege pe `findings.kev`, iar `kev` se pune doar când CVE-ul
+constatării e în oglinda KEV. Fără CVE nu există potrivire, deci nu există plan.
+
+Ce s-a evaluat și de ce nu s-a ales, acum:
+
+| Opțiune | De ce nu (încă) |
+|---|---|
+| `trivy rootfs /` | Trivy **e** pe gazdă acum (pasul 21) și baza lui poartă avize `deb`, deci ar da CVE-uri pe Debian. Dar ar fi **un al doilea scaner de pachete de sistem**, cu alt spațiu de chei și alt profil de fals-pozitive, iar `trivy_fs` evită dinadins `rootfs` tocmai fiindcă acolo reaprinde baza de pachete a sistemului. Care dintre cele două e sursa pe Debian e o decizie de proiectare, nu o reconciliere |
+| `debsecan` | Nu e instalat implicit, interoghează trackerul Debian prin rețea, iar pe Ubuntu acoperirea diferă de realitate |
+| `apt list --upgradable` | Îți spune singur, în stderr, că nu are o interfață stabilă. `apt-get -s` are aceeași informație plus depozitul de origine |
+| `ubuntu-security-status` / `pro` | Doar Ubuntu, nu Debian, și dă numere agregate, nu pachete |
+
+**Un scaner care raportează mai puțin decât știe e mai bun decât unul care pare
+complet.**
+
+### 3.17 Absența unui rezultat nu e zero
+
+Bug-ul care a produs secțiunile de mai sus: pe Ubuntu, runtime-ul rula `dnf`,
+comanda nu exista, eroarea se scria în jurnal și pasul continua. Panoul arăta
+zero vulnerabilități pe o gazdă pe care nu se scanase niciodată nimic.
+
+Patru lucruri împiedică repetarea:
+
+1. Rândul din `scans` se deschide **înainte** ca scanerul să fie întrebat ceva,
+   sub numele pe care îl dă FAMILIA — deci un scaner lipsă lasă un rând `failed`,
+   nu tăcere. Tăcerea e starea care se citește ca „nicio vulnerabilitate".
+2. Un scaner care a eșuat **nu rezolvă nimic**. `mark_resolved_absent` rulează
+   doar după o scanare încheiată; altfel o comandă lipsă ar marca fiecare
+   constatare deschisă drept reparată, iar operatorului i s-ar arăta o gazdă
+   care s-a vindecat singură peste noapte. Același refuz ca la `trivy_fs`.
+3. Backend-ul apt refuză să raporteze „curat" când nu poate dovedi că s-a uitat:
+   fără indexuri de pachete (`apt-get update` n-a rulat niciodată), fără niciun
+   index de securitate (depozitul de securitate nu e configurat, deci gazda nu
+   primește actualizări deloc), sau cu linii `Inst` pe care nu le înțelege —
+   toate sunt erori, nu zero. O linie `Inst` sărită în tăcere n-ar fi doar una
+   neraportată: `mark_resolved_absent` i-ar închide constatarea.
+4. Vechimea indexurilor pleacă în `scans.db_version`, și pe rândurile `failed`,
+   fiindcă un raport curat dintr-un index de trei săptămâni e o imagine parțială
+   — iar „ce a văzut scanarea" fără „cu ce s-a uitat" e o cifră căreia nu i se
+   mai poate afla valabilitatea nici a doua zi.
+
+Ce **nu** e verificat pe o gazdă reală: formatul exact al liniei `Inst`, numele
+buzunarelor de securitate și conținutul lui `/var/lib/apt/lists`. Nimic din
+mediul de test nu rulează apt. Forma e fixată din sursa lui apt, iar punctul 3
+de mai sus e ce transformă o presupunere greșită într-un eșec zgomotos în loc de
+o listă mai scurtă.
+
 ---
 
 ## 4. Predicția — ce este de fapt

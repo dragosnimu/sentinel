@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.22.4 — Scanerul de pachete știe pe ce distribuție e, iar eșecul lui nu mai e un zero
+
+Instalatorul trece pe Ubuntu de pe 27 august, dovedit pe un VM real. Runtime-ul
+nu trecea: `dnf updateinfo` era singurul scaner de pachete de sistem, iar
+orchestratorul îi logha eroarea și mergea mai departe. Pe Ubuntu, scanarea de
+vulnerabilități de sistem era deci **moartă**, iar panoul arăta verde cu zero
+vulnerabilități — absența unei constatări citită ca sănătate, la scara
+produsului.
+
+* **Familia vine din configurație, nu dintr-o a doua detecție.** `distro_detect`
+  decide la instalare, `install.sh` scrie `platform.family` în `sentinel.yaml`,
+  Python citește de acolo. Nimic din runtime nu se uită în `/etc/os-release`:
+  două detecții sunt două surse de adevăr, iar cele două se contrazic exact pe
+  gazda unde contează. O valoare necunoscută e **refuzată la încărcare**, nu
+  tolerată prin revenirea la implicit;
+* **O configurație fără secțiunea `platform` rămâne `rhel`, explicit.**
+  `install_config` nu suprascrie o configurație vie, deci gazda de producție nu
+  primește cheia de la sine — implicitul e singurul lucru care îi păstrează
+  comportamentul. Iar numele scanerului de pe `rhel` rămâne **`dnf`**: cheia
+  `scan:last:dnf` din `selfcheck_state` are istoric din 21 august, și o
+  redenumire l-ar fi aruncat, exact cum era să se întâmple la `audit:records`;
+* **Pe debian rulează `apt-get -s dist-upgrade`, filtrat pe depozitul de
+  securitate.** Ce se pierde față de RHEL, spus pe față: `apt` nu poartă CVE și
+  nu poartă severitate, deci constatările ies cu `cve: null` și cu severitatea
+  `medium` marcată `severity_known: False` — aceeași convenție pe care
+  `trivy_fs` o folosește pentru `UNKNOWN`. Calea de patch eșuează închis fără o
+  regulă scrisă pentru ea: fără CVE nu există potrivire KEV, deci nu există plan;
+* **Un scaner care nu poate rula scrie un rând `failed` și nu rezolvă nimic.**
+  Rândul din `scans` se deschide înainte de orice apel, sub numele pe care îl dă
+  familia. Backend-ul apt refuză să raporteze „curat" fără indexuri de pachete,
+  fără index de securitate, sau când nu înțelege o linie `Inst` — o linie sărită
+  în tăcere nu e doar una neraportată, `mark_resolved_absent` i-ar închide
+  constatarea;
+* **`_run` a rămas fără implicit pentru `timeout`.** Cu două backend-uri, un
+  implicit e plafonul unuia moștenit tăcut de celălalt — același defect scos din
+  `trivy_fs._run`, unde bugetul unei rulări devenise unul per apel.
+
+Neverificat, și rămâne așa până există o gazdă Debian de probă: formatul liniei
+`Inst`, prezența câmpului de origine, numele buzunarelor de securitate și
+conținutul lui `/var/lib/apt/lists`.
+
 ## 0.22.3 — Contul era corect, cheia era greșită; iar autodiagnosticul spunea „ok"
 
 Trei lucruri măsurate pe gazdă pe 25 august 2026, toate cu aceeași formă:

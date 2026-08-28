@@ -1176,8 +1176,14 @@ ingest.auditd is written as FALSE rather than pointed at a file that will not ex
     Install auditd and re-run this step:  --force-step 26"
     fi
 
+    # PLATFORM_FAMILY comes straight from the `distro_detect` this process ran at
+    # startup — NOT from preflight.env. preflight.env is sourced by
+    # resolve_config, which runs AFTER that detection, so routing the family
+    # through it would let a stale file from an earlier run on another host
+    # override the live answer. One detection, one value, no second opinion.
     sed -e "s|@@DOMAIN@@|${DOMAIN}|g" \
         -e "s|@@HOSTNAME@@|${hostname_fqdn}|g" \
+        -e "s|@@PLATFORM_FAMILY@@|${DISTRO_FAMILY}|g" \
         -e "s|@@NGINX_MODE@@|${NGINX_MODE}|g" \
         -e "s|@@PUBLIC_PORT@@|${PUBLIC_PORT}|g" \
         -e "s|@@IFACE@@|${iface}|g" \

@@ -828,12 +828,18 @@ def test_the_measured_ceiling_fits_inside_the_unit_budget(monkeypatch, tmp_path)
     assert len(valori) == 1, valori
     buget = int(valori[0])
     # Celelalte două se iau ca declarate; a lui `trivy_image` e deja un termen de
-    # ceas peste toate imaginile, iar `os_packages` rulează o singură comandă.
-    suma = os_packages.TIMEOUT_S + masurat + trivy_image.TIMEOUT_S
+    # ceas peste toate imaginile, iar `os_packages` rulează o singură comandă —
+    # una singură pe gazdă, fiindcă familia alege un singur backend, deci ce
+    # trebuie să încapă aici e MAXIMUL plafoanelor lui, nu suma lor. Citit din
+    # `WORST_CASE_TIMEOUT_S` și nu din plafonul lui dnf: cu al doilea backend,
+    # `TIMEOUT_S` singur ar fi ținut suma legată de gazda RHEL și ar fi lăsat-o
+    # dezlegată exact pe cea Debian.
+    suma = os_packages.WORST_CASE_TIMEOUT_S + masurat + trivy_image.TIMEOUT_S
     assert suma < buget, (
         f"pe {cate} căi `trivy_fs` ține {masurat:.0f}s, iar cu os_packages "
-        f"({os_packages.TIMEOUT_S}s) și trivy_image ({trivy_image.TIMEOUT_S}s) "
-        f"suma e {suma:.0f}s, peste cei {buget}s la care systemd omoară unitatea")
+        f"({os_packages.WORST_CASE_TIMEOUT_S}s) și trivy_image "
+        f"({trivy_image.TIMEOUT_S}s) suma e {suma:.0f}s, peste cei {buget}s la "
+        f"care systemd omoară unitatea")
 
 
 def test_an_exhausted_budget_refuses_instead_of_ingesting_what_it_reached(

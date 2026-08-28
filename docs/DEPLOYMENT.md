@@ -153,6 +153,27 @@ Suricatei, SELinux față de AppArmor — stă într-un singur loc,
 [`deploy/lib/distro.sh`](../deploy/lib/distro.sh), iar un test verifică mecanic
 că nu a rămas niciun `dnf` sau `apt-get` direct în installer.
 
+**Scanarea de vulnerabilități de sistem nu e la fel de bogată pe cele două
+familii, și trebuie să știi asta înainte de deploy.** Pe RHEL, `dnf updateinfo`
+dă CVE, severitate și versiunea care repară, direct din avizele furnizorului. Pe
+Debian și Ubuntu, `apt` nu poartă aceste metadate: Sentinel raportează
+**pachetele cu o actualizare care așteaptă în depozitul de securitate**, fără CVE
+și fără severitate. E o listă acționabilă, dar e mai puțin decât pe RHEL, fiecare
+constatare o spune în propria descriere, și niciun plan de patch nu se generează
+din ele. Detaliile și ce ar fi nevoie ca să se închidă golul:
+[ARHITECTURA.md §3.16](ARHITECTURA.md).
+
+Familia se scrie în `sentinel.yaml` ca `platform.family`, o singură dată, de
+installer. **Pe o gazdă instalată înainte de cheia asta nu apare de la sine** —
+`install_config` nu suprascrie o configurație vie, scrie `sentinel.yaml.new` —
+iar implicitul e `rhel`, deci comportamentul rămâne neschimbat. Dacă gazda aia e
+Debian sau Ubuntu, secțiunea trebuie adăugată de mână, altfel rulează `dnf`:
+
+```yaml
+platform:
+  family: rhel      # sau: debian
+```
+
 **Python 3.10 e pragul** fiindcă îl are deja fiecare țintă suportată, fără
 depozit terț: Ubuntu 22.04 are 3.10, Debian 12 are 3.11, AlmaLinux 9 are
 3.11/3.12 în AppStream, Ubuntu 24.04 are 3.12.
@@ -939,7 +960,7 @@ ceva periculos este *refuzat*, nu că ceva funcționează.
 | P4 | Reguli de detecție, incidente, alertare Telegram |
 | P5 | Răspuns: blocklist nftables, blocare dintr-un tap, `/panic`, audit cu lanț de hash |
 | P6 | Decizia de auto-block (observă/armat), baseline sezonier, Suricata IDS |
-| P7 | Scanare de vulnerabilități: `dnf updateinfo`, oglindă CISA KEV, prioritizare |
+| P7 | Scanare de vulnerabilități: `dnf updateinfo` (RHEL) sau `apt-get -s` pe depozitul de securitate (Debian/Ubuntu, fără CVE), trivy pe fișiere și imagini, oglindă CISA KEV, prioritizare |
 | P8 | Triaj AI cu plafon dur de tokeni și izolare anti prompt-injection |
 | P9 | Patching: generare de planuri, aprobare în doi pași, backup verificat, rollback automat |
 | P10 | Analytics extins, hardening final, documentație completă — **în curs** |

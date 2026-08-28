@@ -201,7 +201,7 @@ def _wire(monkeypatch, results: dict) -> list[list[dict]]:
     async def fake_kev(_db):
         return None
 
-    async def fake_dnf(_db, _triggered_by):
+    async def fake_dnf(_db, _family, _triggered_by):
         return results.get("dnf", {})
 
     async def fake_trivy(_db, _cfg, _triggered_by):
@@ -230,6 +230,10 @@ def _cfg(**over):
         # AttributeError, adica pe altceva decat ce masoara testul.
         scan=SimpleNamespace(enabled=True, os_packages=True, filesystem=False,
                              containers=False, announce_new=True),
+        # Din acelasi motiv: `run_all` citeste `platform.family` ca sa afle
+        # sub ce nume ruleaza scanerul de pachete. `rhel` fiindca asta e
+        # gazda de productie, si fiindca sub ea cheia ramane "dnf".
+        platform=SimpleNamespace(family="rhel"),
         telegram=SimpleNamespace(allowed_chat_ids=[1]), hostname="gazda")
     for k, v in over.items():
         setattr(base.scan, k, v)
