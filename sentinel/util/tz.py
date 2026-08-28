@@ -118,6 +118,32 @@ def zone(name: str | None) -> ZoneInfo | timezone:
     return local if local is not None else timezone.utc
 
 
+def zone_key(name: str | None) -> str:
+    """Numele zonei rezolvate, într-o formă pe care o înțelege și PostgreSQL.
+
+    `zone()` întoarce un obiect de fus; aici e nevoie de NUMELE lui, fiindcă
+    agregarea din `analytics/reports.py` îl trimite bazei ca PARAMETRU într-un
+    `date_trunc($1, ts AT TIME ZONE $2)`. Numele trebuie deci să fie unul pe care
+    Python l-a acceptat deja — altfel Python ar coborî tăcut la fusul gazdei, iar
+    PostgreSQL ar ridica o eroare pe același șir, și cele două ar fi de acord
+    numai atâta vreme cât nimeni nu greșește configurația.
+
+    Ultima instanță din `zone()` e un DECALAJ FIX, care nu are nume IANA. Un
+    decalaj n-are reguli de oră de vară și n-are un scris pe care ambele motoare
+    să-l citească la fel, deci aici se coboară la `UTC` — zgomotos, fiindcă
+    „intervalele sunt aliniate în UTC" și „intervalele sunt aliniate în fusul
+    tău" sunt lucruri diferite, iar cel de-al doilea nu are voie să fie
+    presupus.
+    """
+    z = zone(name)
+    key = getattr(z, "key", None)
+    if key:
+        return key
+    log.error("no IANA zone name resolved; aligning intervals in UTC",
+              extra={"timezone": name})
+    return "UTC"
+
+
 def to_local(moment: datetime, tz_name: str | None = None) -> datetime:
     """`moment` in the configured zone. Never raises, never returns naive.
 

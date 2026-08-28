@@ -217,6 +217,62 @@ def test_the_never_muted_list_lives_in_code_not_config():
     assert "never_muted" not in cfg.lower()
 
 
+# --- cine tace acum, pentru expeditor SI pentru autoverificare -------------
+# `silent_chats` si `all_silent` au fost mutate aici din `bot._quiet_chats` cand
+# autoverificarea a inceput sa puna aceeasi intrebare. O regula citita din doua
+# locuri trebuie sa aiba un singur raspuns; testele de mai jos sunt ce tine
+# raspunsul acela pe loc.
+class _Prefs:
+    """Un rand din `telegram_chats`, citit prin atribute ca `ChatPrefs`."""
+
+    def __init__(self, quiet_hours=None, muted_until=None, timezone=None):
+        self.quiet_hours = quiet_hours
+        self.muted_until = muted_until
+        self.timezone = timezone
+
+
+def test_an_adhoc_mute_silences_the_chat_for_everyone_who_asks():
+    """`/mute 2h` trebuie sa taca si pentru expeditor, si pentru verificare.
+
+    Doua mecanisme tac un chat: fereastra recurenta si pauza temporara. Daca
+    rezolutia comuna ar citi doar fereastra, `/mute 2h` ar deveni un buton care
+    minte — alertele ar pleca in timpul pauzei — iar autoverificarea ar numara
+    ca „blocate" chiar mesajele pe care operatorul a cerut sa fie tinute.
+    """
+    now = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
+    prefs = {7: _Prefs(muted_until=now + timedelta(hours=1))}
+    assert quiet.silent_chats(now=now, chat_ids=[7], prefs=prefs) == frozenset({7})
+
+    # Expirata, nu mai tace nimic: o pauza pe care trebuie s-o desfaci de mana
+    # e o pauza pe care nimeni n-o desface.
+    prefs = {7: _Prefs(muted_until=now - timedelta(minutes=1))}
+    assert quiet.silent_chats(now=now, chat_ids=[7], prefs=prefs) == frozenset()
+
+
+def test_a_chat_without_a_row_uses_the_deployment_window():
+    """`telegram_chats` primeste un rand abia la prima preferinta.
+
+    Citit ca „fara liniste", un chat care n-a folosit niciodata `/mute` ar fi
+    sunat toata noaptea, desi `sentinel.yaml` cere liniste.
+    """
+    now = datetime(2026, 8, 9, 23, 30, tzinfo=UTC)      # 02:30 la Bucuresti
+    assert quiet.silent_chats(now=now, chat_ids=[7], prefs={},
+                              default_schedule="22:00-06:00",
+                              default_tz=BUCHAREST) == frozenset({7})
+
+
+def test_holding_needs_every_chat_to_be_silent():
+    """Daca macar un chat asculta, mesajul pleaca la el.
+
+    `_push_notifications` tine un mesaj care se poate amuta numai cand TOATE
+    chat-urile permise tac. Cu „macar unul", un al doilea operator treaz n-ar
+    mai primi nimic.
+    """
+    assert quiet.all_silent({1}, [1])
+    assert not quiet.all_silent({1}, [1, 2])
+    assert quiet.all_silent({1, 2}, [1, 2])
+
+
 # --- the push loop ----------------------------------------------------------
 def test_quiet_hours_hold_alerts_rather_than_dropping_them():
     """`notified_at` stays NULL, so the batch goes out when the window lifts.

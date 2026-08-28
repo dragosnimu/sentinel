@@ -771,11 +771,19 @@ def _sql_literals(path: Path) -> list[str]:
     return out
 
 
-def test_every_bucketed_query_truncates_in_utc_explicitly():
-    """`date_trunc` on a `timestamptz` truncates in the SESSION time zone, and
-    nothing in engine.py pins one. On a host whose PostgreSQL defaults to a
-    local zone, "days" would silently begin at 03:00 and the page would never
-    say so. Converting with `AT TIME ZONE 'UTC'` first removes the question."""
+def test_every_bucketed_query_pins_the_zone_and_pins_it_as_a_parameter():
+    """Două eșecuri diferite, ținute de aceeași linie.
+
+    Unul: `date_trunc` pe un `timestamptz` taie în fusul SESIUNII, iar nimic din
+    `engine.py` nu-l fixează. Pe o gazdă a cărei baze e configurată local,
+    „zilele" ar începe la 03:00 și pagina n-ar spune-o niciodată.
+
+    Celălalt, apărut pe 28 august 2026 odată cu mutarea în fusul configurat:
+    numele zonei vine dintr-un câmp de configurare, iar scris în textul
+    instrucțiunii — `f"AT TIME ZONE '{tz}'"` — ar fi o cale de injecție deschisă
+    de acel câmp. Ajunge acolo ca PARAMETRU sau nu ajunge deloc, la fel ca
+    dimensiunea de grupare din `EVENT_DIMS`.
+    """
     calls = [c for sql in _sql_literals(REPO / "sentinel" / "analytics" / "reports.py")
              for c in re.findall(r"date_trunc\([^)]*\)", sql)]
     # Prose is excluded on purpose: the module docstring and the comments talk
@@ -783,14 +791,186 @@ def test_every_bucketed_query_truncates_in_utc_explicitly():
     # wording rather than on the SQL.
     assert len(calls) >= 3, f"only {len(calls)} date_trunc calls found in SQL — the scan is broken"
     for call in calls:
-        assert "AT TIME ZONE 'UTC'" in call, f"untruncated session-zone call: {call}"
+        assert re.search(r"AT TIME ZONE \$\d", call), (
+            f"zona nu e legată ca parametru: {call}")
+        assert "'" not in call.split("AT TIME ZONE", 1)[1], (
+            f"nume de zonă scris în textul instrucțiunii: {call}")
 
 
-def test_the_utc_lint_would_catch_the_bug_it_is_guarding():
-    """Guard the guard: feed it the shape that would ship without the cast."""
-    bad = "date_trunc($1::text, bucket) AS b"
-    assert re.findall(r"date_trunc\([^)]*\)", bad)
-    assert "AT TIME ZONE 'UTC'" not in re.findall(r"date_trunc\([^)]*\)", bad)[0]
+def test_the_zone_lint_would_catch_both_bugs_it_is_guarding():
+    """Guard the guard: dă-i exact cele două forme care ar fi livrat.
+
+    Fără proba asta, o expresie stricată n-ar mai găsi niciun apel, bucla de mai
+    sus s-ar sări, iar testul ar trece verde uitându-se la nimic — tiparul „listă
+    parametrizată ieșită goală" din CLAUDE.md.
+    """
+    fara_zona = "date_trunc($1::text, bucket) AS b"
+    interpolata = "date_trunc($1::text, bucket AT TIME ZONE 'Europe/Bucharest') AS b"
+    for bad in (fara_zona, interpolata):
+        gasit = re.findall(r"date_trunc\([^)]*\)", bad)
+        assert gasit, "expresia nu mai vede forma unui apel `date_trunc`"
+        call = gasit[0]
+        rau = (not re.search(r"AT TIME ZONE \$\d", call)
+               or "'" in call.split("AT TIME ZONE", 1)[-1])
+        assert rau, f"lintul ar fi lăsat să treacă {call}"
+
+
+# ---------------------------------------------------------------------------
+# Marginile de interval, în fusul configurat
+# ---------------------------------------------------------------------------
+BUCHAREST = "Europe/Bucharest"
+
+
+def test_a_day_starts_at_local_midnight_not_at_three_in_the_morning():
+    """Ziua de pe pagină trebuie să fie ziua pe care a trăit-o operatorul.
+
+    Aliniate în UTC, „27.08" începea la 03:00 ora lui și se termina la 03:00 a
+    doua zi: cifra citită de pe grafic și ce scria în jurnal erau despre două
+    intervale diferite, iar nimic de pe pagină nu spunea asta. Trei ore de atac
+    dinaintea miezului nopții cădeau în ziua următoare.
+    """
+    from zoneinfo import ZoneInfo
+
+    # 9 august 2026, 01:30 la Bucuresti — deci inca 8 august in UTC (22:30).
+    moment = datetime(2026, 8, 9, 1, 30, tzinfo=ZoneInfo(BUCHAREST))
+    assert moment.astimezone(timezone.utc).day == 8
+
+    start = reports.truncate(moment, "day", tz_name=BUCHAREST)
+    assert start.astimezone(ZoneInfo(BUCHAREST)) == datetime(
+        2026, 8, 9, 0, 0, tzinfo=ZoneInfo(BUCHAREST))
+    # Si NU miezul noptii UTC, care e ce se desena inainte.
+    assert start != datetime(2026, 8, 9, tzinfo=timezone.utc)
+
+
+def test_the_zone_name_cannot_be_injected_through_the_configuration():
+    """Numele zonei vine din `sentinel.yaml`, deci e o intrare.
+
+    Ajunge în SQL ca parametru, dar `align_zone` e cel care decide ce șir pleacă
+    într-acolo: trece prin `tz.zone_key`, deci prin `ZoneInfo`. Un șir care nu e
+    o zonă nu devine text de instrucțiune, devine `UTC` — și se spune în jurnal,
+    fiindcă „aliniat în fusul tău" și „aliniat în UTC" sunt lucruri diferite.
+    """
+    otrava = "UTC'; DROP TABLE raw_events; --"
+    assert reports.align_zone("day", otrava) == "UTC"
+    assert reports.align_zone("day", "Nu/Exista") == "UTC"
+    # Iar una reala trece intreaga, ca sa nu „treaca" testul prin a nu face nimic.
+    assert reports.align_zone("day", BUCHAREST) == BUCHAREST
+
+
+def test_a_twenty_five_hour_day_is_one_bucket_not_two():
+    """Ziua în care se dă ceasul înapoi are 25 de ore, și e o singură zi.
+
+    `+ timedelta(days=1)` ar muta marginea la 23:00, deci ziua desenată ar fi
+    umplută cu ultima oră a zilei vecine, iar coloana vecină ar pierde-o. O dată
+    pe an, pe întuneric, fără nimic care s-o spună.
+    """
+    from zoneinfo import ZoneInfo
+
+    z = ZoneInfo(BUCHAREST)
+    # 25 octombrie 2026: ceasul da inapoi la 04:00 EEST -> 03:00 EET.
+    start = reports.truncate(datetime(2026, 10, 25, 12, 0, tzinfo=z), "day",
+                             tz_name=BUCHAREST)
+    end = reports.advance(start, "day", 1, tz_name=BUCHAREST)
+    assert (end - start) == timedelta(hours=25)
+    assert start.astimezone(z).hour == 0 and end.astimezone(z).hour == 0
+
+    # Si primavara, in cealalta directie: 29 martie 2026, 23 de ore.
+    start = reports.truncate(datetime(2026, 3, 29, 12, 0, tzinfo=z), "day",
+                             tz_name=BUCHAREST)
+    end = reports.advance(start, "day", 1, tz_name=BUCHAREST)
+    assert (end - start) == timedelta(hours=23)
+    assert start.astimezone(z).hour == 0 and end.astimezone(z).hour == 0
+
+
+def test_the_bucket_list_stays_contiguous_across_the_clock_change():
+    """Lista de margini trebuie să rămână lipită și fără duplicate.
+
+    O galeata sarita ar desena o zi lipsa ca zero — „nu s-a intamplat nimic" —
+    iar o galeata dublata ar imparti aceeasi zi in doua coloane pe jumatate.
+    """
+    from zoneinfo import ZoneInfo
+
+    z = ZoneInfo(BUCHAREST)
+    starts = reports.bucket_starts("day", now=datetime(2026, 10, 27, 9, 0, tzinfo=z),
+                                   count=7, tz_name=BUCHAREST)
+    assert len(set(starts)) == 7
+    assert starts == sorted(starts)
+    assert all(s.astimezone(z).hour == 0 for s in starts), \
+        [s.astimezone(z).isoformat() for s in starts]
+    for a, b in zip(starts, starts[1:]):
+        assert reports.advance(a, "day", 1, tz_name=BUCHAREST) == b
+
+
+def test_hour_buckets_stay_absolute_so_the_repeated_hour_is_not_merged():
+    """Ora rămâne aliniată absolut, și asta e o decizie.
+
+    `date_trunc('hour', ts AT TIME ZONE 'Europe/Bucharest')` produce DOUA ore
+    locale „03:00" in noaptea in care ceasul da inapoi; `GROUP BY` le-ar aduna
+    intr-o singura coloana, iar vecina ei ar ramane un zero care nu e zero —
+    exact minciuna pe care modulul o combate. Pentru un fus decalat cu ore
+    intregi marginile ies oricum aceleasi, deci nu se pierde nimic.
+    """
+    from zoneinfo import ZoneInfo
+
+    z = ZoneInfo(BUCHAREST)
+    assert reports.align_zone("hour", BUCHAREST) == "UTC"
+    for unit in ("day", "week", "month", "year"):
+        assert reports.align_zone(unit, BUCHAREST) == BUCHAREST
+
+    # Cele doua „03:00" locale raman doua galeti diferite.
+    starts = reports.bucket_starts("hour", now=datetime(2026, 10, 25, 5, 30, tzinfo=z),
+                                   count=6, tz_name=BUCHAREST)
+    assert len(set(starts)) == 6
+    etichete = [s.astimezone(z).strftime("%H:%M") for s in starts]
+    assert etichete.count("03:00") == 2, etichete
+
+
+def test_a_bucket_read_back_from_sql_lands_on_the_column_it_was_drawn_for():
+    """Drumul intors: ce intoarce `date_trunc` trebuie sa cada pe aceeasi margine.
+
+    SQL-ul intoarce un `timestamp` FARA fus — ceasul de perete al zonei de
+    aliniere. Citit ca UTC, fiecare bara ar cadea cu trei ore mai devreme, adica
+    pe coloana vecina sau in afara graficului: totalul din antet ar ramane acelasi
+    si nimic nu s-ar plange.
+    """
+    starts = reports.bucket_starts("day", now=NOW, count=5, tz_name=BUCHAREST)
+    # Exact forma pe care o intoarce asyncpg pentru `AT TIME ZONE`: naiv, local.
+    from sentinel.util import tz as tzutil
+    rows = [{"b": tzutil.to_local(s, BUCHAREST).replace(tzinfo=None),
+             "k": "nginx", "n": 3} for s in starts]
+
+    series = reports.build_series(
+        rows, unit="day", starts=starts, tz_name=BUCHAREST,
+        known_from=starts[0], complete_to=NOW,
+        known_to=reports.advance(starts[-1], "day", 1, tz_name=BUCHAREST),
+        fallbacks=reports.NO_FALLBACK)
+    assert series.per_bucket == [3] * 5, series.per_bucket
+    assert series.grand_total == 15
+
+
+def test_the_chart_labels_carry_the_zone_they_are_written_in():
+    """O ora fara marcaj e o afirmatie pe care cititorul trebuie s-o ghiceasca.
+
+    Intre UTC si EEST sunt trei ore — destul cat sa te uiti in jurnal in
+    fereastra gresita. Marcajul e AL MOMENTULUI, nu al zonei: aceeasi zona e
+    `EET` iarna si `EEST` vara, iar un marcaj fix ar fi gresit jumatate de an.
+    """
+    starts = reports.bucket_starts("day", now=NOW, count=3, tz_name=BUCHAREST)
+    from sentinel.util import tz as tzutil
+    rows = [{"b": tzutil.to_local(s, BUCHAREST).replace(tzinfo=None),
+             "k": "nginx", "n": 5} for s in starts]
+    series = reports.build_series(
+        rows, unit="day", starts=starts, tz_name=BUCHAREST,
+        known_from=starts[0], complete_to=NOW,
+        known_to=reports.advance(starts[-1], "day", 1, tz_name=BUCHAREST),
+        fallbacks=reports.NO_FALLBACK)
+    chart = reports.build_chart(series, tick_fmt="%d.%m")
+
+    assert chart.segments, "graficul a iesit gol; testul nu s-ar uita la nimic"
+    for seg in chart.segments:
+        assert " EEST" in seg.title or " EET" in seg.title, seg.title
+    # Si eticheta e cea LOCALA: 09.08 local, nu 08.08 cum ar iesi din UTC.
+    assert any(t.label == "09.08" for t in chart.ticks), [t.label for t in chart.ticks]
 
 
 def test_breakdown_columns_are_whitelisted_not_taken_from_the_request():

@@ -96,7 +96,7 @@
 <span class="kpi-note kpi-note-warn">nu se știe ce interval acoperă — magazia nu poate fi citită</span>
 {%- elif cov.partial %}
 <span class="kpi-note kpi-note-warn">acoperă doar {{ cov_span(cov) }} ·
-  datele încep la {{ cov.covered_from.strftime('%d.%m %H:%M') }}</span>
+  datele încep la {{ cov.covered_from | ora('%d.%m %H:%M') }}</span>
 {%- endif %}
 {% endmacro %}
 
@@ -109,7 +109,16 @@
 {% block content %}
 <h1>Rapoarte</h1>
 <p class="page-sub">
-  Agregări pe interval, cu detaliu la click pe orice bară. Toate orele sunt UTC.
+  Agregări pe interval, cu detaliu la click pe orice bară.
+  {# Numele zonei, nu marcajul: `EEST` e adevărat doar jumătate de an, iar un
+     grafic pe 30 de zile poate trece peste schimbarea ceasului. Marcajul îl
+     poartă fiecare moment în parte, prin filtrul `ora`. #}
+  Zilele, săptămânile, lunile și anii încep la miezul nopții în fusul
+  <strong>{{ tz_name or 'gazdei' }}</strong> — nu în UTC, cum era până pe 28
+  august 2026. Cifrele citite înainte de asta se referă la alte intervale și nu
+  se pot compara direct cu cele de aici. Ziua în care se schimbă ceasul are 23
+  sau 25 de ore, deci o singură zi pe an va părea mai mică sau mai mare; aia e
+  ziua pe care ai trăit-o, nu o eroare de numărare.
 </p>
 
 {# ── ONESTITATEA DATELOR ────────────────────────────────────────────────────
@@ -132,7 +141,7 @@
   <strong>Agregatul orar are întârziere de {{ coverage.lag_hours }} ore.</strong>
   <p>
     Ultimul interval agregat este
-    {{ coverage.latest.strftime('%d.%m.%Y %H:%M') }} UTC. Timerul de mentenanță
+    {{ coverage.latest | ora('%d.%m.%Y %H:%M') }}. Timerul de mentenanță
     e orar, deci o întârziere mai mare de câteva ore înseamnă că rulările
     eșuează. Până se repară, coada graficelor de evenimente lipsește — nu e
     liniște, e lipsă de date.
@@ -141,18 +150,18 @@
 {% endif %}
 
 <p class="muted small">
-  Interval afișat: <strong>{{ range_from.strftime('%d.%m.%Y %H:%M') }}</strong> →
-  <strong>{{ range_to.strftime('%d.%m.%Y %H:%M') }}</strong> UTC.
+  Interval afișat: <strong>{{ range_from | ora('%d.%m.%Y %H:%M', with_zone=False) }}</strong> →
+  <strong>{{ range_to | ora('%d.%m.%Y %H:%M') }}</strong>.
   {% if coverage.latest %}
-  Evenimentele sunt agregate până la {{ coverage.latest.strftime('%d.%m %H:%M') }};
+  Evenimentele sunt agregate până la {{ coverage.latest | ora('%d.%m %H:%M') }};
   {% endif %}
   {% if coverage.earliest %}
   cel mai vechi interval păstrat în agregat este
-  {{ coverage.earliest.strftime('%d.%m.%Y') }}.
+  {{ coverage.earliest | ora('%d.%m.%Y', with_zone=False) }}.
   {% endif %}
   {% if raw_from %}
   Detaliul brut (evenimente individuale) există de la
-  {{ raw_from.strftime('%d.%m.%Y') }}.
+  {{ raw_from | ora('%d.%m.%Y', with_zone=False) }}.
   {% else %}
   <span class="pill pill-off">detaliul brut: necunoscut</span>
   {% endif %}
@@ -178,7 +187,7 @@
   <button type="submit" class="btn btn-quiet">Aplică</button>
   <span class="muted small">
     {{ spec.span }} intervale {{ spec.label }} · cifrele de mai jos acoperă
-    {{ overview.since.strftime('%d.%m %H:%M') }} → acum
+    {{ overview.since | ora('%d.%m %H:%M') }} → acum
     {#- Fereastra e rotunjită în jos la oră fiindcă agregatul e orar. Rotunjirea
         e spre exterior: „24h" acoperă cel puțin 24 de ore, niciodată 23. -#}
   </span>

@@ -309,17 +309,17 @@ def test_the_application_binds_the_filter_to_its_own_config():
 # ---------------------------------------------------------------------------
 # Garda
 # ---------------------------------------------------------------------------
-#: Șabloanele care încă își formatează singure momentele, și de ce.
-#:
-#: Paginile de rapoarte etichetează CAPETE DE GĂLEATĂ, nu momente: gălețile sunt
-#: aliniate în UTC de `date_trunc(..., bucket AT TIME ZONE 'UTC')` din
-#: `analytics/reports.py`. O galeată zilnică scrisă în ora locală ar spune
-#: „27.08" despre un interval care începe la 03:00 și se termină la 03:00 —
-#: adică ar face graficul să mintă mai rău decât o face acum, când scrie „UTC"
-#: pe față. Mutarea granițelor gălaților e o schimbare de analitică, cu
-#: corectitudinea ei proprie, și e o decizie a operatorului, nu una luată în
-#: trecere aici.
-SABLOANE_CU_FORMATARE_PROPRIE = {"reports.html", "report_drill.html"}
+# Scutirea pentru `reports.html` și `report_drill.html` A STAT aici, cu motivul:
+# gălețile erau aliniate în UTC, deci o etichetă locală ar fi numit „27.08" un
+# interval care începe la 03:00, iar graficul ar fi mințit mai rău decât o face
+# scriind „UTC" pe față.
+#
+# Motivul s-a stins pe 28 august 2026, când operatorul a mutat alinierea în fusul
+# configurat: `date_trunc($1, ts AT TIME ZONE $2)` cu zona din `cfg.timezone`.
+# Ziua începe acum la miezul nopții local, deci eticheta locală e chiar
+# adevărată, iar scutirea ar fi fost singurul loc din care ora putea ieși din nou
+# fără marcaj. Nu mai există niciun șablon scutit — dacă apare unul, se scrie
+# aici motivul, nu doar numele.
 
 
 def test_no_template_formats_a_moment_by_itself():
@@ -330,8 +330,7 @@ def test_no_template_formats_a_moment_by_itself():
     tăcut: pagina se randează, ora e greșită cu trei ore, nimic nu se plânge.
     """
     vinovate = sorted(p.name for p in TEMPLATES.glob("*.html")
-                      if "strftime" in p.read_text(encoding="utf-8")
-                      and p.name not in SABLOANE_CU_FORMATARE_PROPRIE)
+                      if "strftime" in p.read_text(encoding="utf-8"))
     assert not vinovate, (
         f"șabloane care formatează singure un moment: {vinovate}. "
         "Folosește filtrul `| ora`, care scrie în fusul configurat și pune "
@@ -347,7 +346,9 @@ def test_the_guard_is_not_looking_at_an_empty_set():
     assert any("| ora" in p.read_text(encoding="utf-8") for p in sabloane), (
         "niciun șablon nu folosește filtrul; ori s-a redenumit, ori nu e "
         "folosit nicăieri — în ambele cazuri garda de mai sus nu păzește nimic")
-    for name in SABLOANE_CU_FORMATARE_PROPRIE:
-        assert (TEMPLATES / name).exists(), (
-            f"{name} e scutit de gardă și nu mai există; scutirea e acum o "
-            "gaură fără motiv")
+    # Și proba că expresia chiar VEDE tiparul: fără ea, un `strftime` scris
+    # altfel (sau un director mutat) ar face lista de vinovați să iasă goală, iar
+    # garda ar trece verde uitându-se la nimic. Lista de scutiri care a stat aici
+    # până pe 28 august 2026 era exact gaura asta, cu nume.
+    fals = "{{ m.strftime('%H:%M') }}"
+    assert "strftime" in fals, "tiparul căutat de gardă nu mai potrivește forma"

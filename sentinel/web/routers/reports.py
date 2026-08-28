@@ -31,12 +31,13 @@ from fastapi import APIRouter, Depends, Query, Request, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from sentinel.analytics import reports
+from sentinel.config import Config
 from sentinel.db.engine import Database
 from sentinel.db.repo import incidents as inc_repo
 from sentinel.db.repo import users as users_repo
 from sentinel.logging_setup import get_logger
 from sentinel.model.event import ACTIONS, SOURCES
-from sentinel.web.deps import current_user, get_db, now_utc
+from sentinel.web.deps import current_user, get_config, get_db, now_utc
 
 log = get_logger(__name__)
 router = APIRouter()
@@ -97,6 +98,7 @@ async def reports_page(
     request: Request,
     user: Annotated[users_repo.User, Depends(current_user)],
     db: Annotated[Database, Depends(get_db)],
+    cfg: Annotated[Config, Depends(get_config)],
     now: Annotated[datetime, Depends(now_utc)],
     window: str = Query(reports.DEFAULT_WINDOW),
     bucket: str = Query(reports.DEFAULT_BUCKET),
@@ -105,8 +107,15 @@ async def reports_page(
     bucket = bucket if bucket in reports.BUCKETS else reports.DEFAULT_BUCKET
     spec = reports.BUCKETS[bucket]
 
-    starts = reports.bucket_starts(spec.unit, now=now, count=spec.span)
-    start, end = starts[0], reports.advance(starts[-1], spec.unit, 1)
+    # Fusul configurat, dat pe față fiecărei funcții care taie sau scrie o
+    # margine. `analytics/reports.py` are implicit UTC — depozitarea — tocmai ca
+    # o funcție chemată fără fus să dea același răspuns oriunde; deci pagina, care
+    # desenează pentru un om, trebuie să-l treacă de fiecare dată. Că îl trece
+    # chiar peste tot e ținut de `test_the_reports_page_aligns_in_the_configured_zone`.
+    tz_name = cfg.timezone
+
+    starts = reports.bucket_starts(spec.unit, now=now, count=spec.span, tz_name=tz_name)
+    start, end = starts[0], reports.advance(starts[-1], spec.unit, 1, tz_name=tz_name)
 
     # What the store actually holds, read before anything is charted. Every
     # series is annotated with it, so a gap is drawn as a gap.
@@ -125,13 +134,14 @@ async def reports_page(
     # bucket ended up drawn as "no data kept" while holding a hundred events.
     ev_from, ev_complete, ev_to = reports.event_edges(coverage, now=now)
     live_from, live_complete, live_to = reports.live_edges(
-        since_install, now=now, unit=spec.unit)
+        since_install, now=now, unit=spec.unit, tz_name=tz_name)
 
     charts = []
 
     ev_source = reports.build_series(
-        await reports.events_rows(db, unit=spec.unit, start=start, end=end, dim="source"),
-        unit=spec.unit, starts=starts,
+        await reports.events_rows(db, unit=spec.unit, start=start, end=end,
+                                  dim="source", tz_name=tz_name),
+        unit=spec.unit, tz_name=tz_name, starts=starts,
         known_from=ev_from, complete_to=ev_complete, known_to=ev_to,
         fallbacks=fallbacks, top=7,
     )
@@ -147,8 +157,9 @@ async def reports_page(
     })
 
     ev_action = reports.build_series(
-        await reports.events_rows(db, unit=spec.unit, start=start, end=end, dim="action"),
-        unit=spec.unit, starts=starts,
+        await reports.events_rows(db, unit=spec.unit, start=start, end=end,
+                                  dim="action", tz_name=tz_name),
+        unit=spec.unit, tz_name=tz_name, starts=starts,
         known_from=ev_from, complete_to=ev_complete, known_to=ev_to,
         fallbacks=fallbacks, top=7,
     )
@@ -162,8 +173,9 @@ async def reports_page(
     })
 
     inc_sev = reports.build_series(
-        await reports.incidents_rows(db, unit=spec.unit, start=start, end=end, dim="severity"),
-        unit=spec.unit, starts=starts,
+        await reports.incidents_rows(db, unit=spec.unit, start=start, end=end,
+                                     dim="severity", tz_name=tz_name),
+        unit=spec.unit, tz_name=tz_name, starts=starts,
         known_from=live_from, complete_to=live_complete, known_to=live_to,
         # Nothing sits below `incidents`: no hourly aggregate to be behind, no
         # raw table to fall back to. `live_edges` puts `known_to` at the end of
@@ -187,8 +199,8 @@ async def reports_page(
 
     inc_fam = reports.build_series(
         await reports.incidents_rows(db, unit=spec.unit, start=start, end=end,
-                                     dim="rule_family"),
-        unit=spec.unit, starts=starts,
+                                     dim="rule_family", tz_name=tz_name),
+        unit=spec.unit, tz_name=tz_name, starts=starts,
         known_from=live_from, complete_to=live_complete, known_to=live_to,
         fallbacks=reports.NO_FALLBACK, top=7,
     )
@@ -205,8 +217,9 @@ async def reports_page(
     })
 
     patch_status = reports.build_series(
-        await reports.patches_rows(db, unit=spec.unit, start=start, end=end),
-        unit=spec.unit, starts=starts,
+        await reports.patches_rows(db, unit=spec.unit, start=start, end=end,
+                                   tz_name=tz_name),
+        unit=spec.unit, tz_name=tz_name, starts=starts,
         known_from=live_from, complete_to=live_complete, known_to=live_to,
         fallbacks=reports.NO_FALLBACK,
     )
@@ -240,6 +253,11 @@ async def reports_page(
             "bucket": bucket,
             "buckets": reports.BUCKETS,
             "spec": spec,
+            # Numele zonei, nu marcajul: `EEST` e adevărat jumătate de an, iar
+            # un grafic pe 30 de zile poate trece peste schimbare. Numele e
+            # adevărat mereu, iar marcajul îl pune filtrul `ora` pe fiecare
+            # moment în parte.
+            "tz_name": tz_name,
             "range_from": start,
             "range_to": end,
             "coverage": coverage,
@@ -261,6 +279,7 @@ async def reports_drill(
     request: Request,
     user: Annotated[users_repo.User, Depends(current_user)],
     db: Annotated[Database, Depends(get_db)],
+    cfg: Annotated[Config, Depends(get_config)],
     now: Annotated[datetime, Depends(now_utc)],
     kind: str = Query(...),
     bucket: str = Query(...),
@@ -298,7 +317,9 @@ async def reports_drill(
             raise StarletteHTTPException(status_code=400, detail="Categorie necunoscută")
 
     spec = reports.BUCKETS[bucket]
-    valid = set(reports.bucket_starts(spec.unit, now=now, count=spec.span))
+    tz_name = cfg.timezone
+    valid = set(reports.bucket_starts(spec.unit, now=now, count=spec.span,
+                                      tz_name=tz_name))
     try:
         parsed = datetime.fromisoformat(start)
     except ValueError:
@@ -314,7 +335,7 @@ async def reports_drill(
             status_code=400,
             detail="Intervalul cerut nu mai este în raportul curent. Reia din grafic.")
 
-    bucket_from, bucket_to = reports.drill_bounds(spec.unit, parsed)
+    bucket_from, bucket_to = reports.drill_bounds(spec.unit, parsed, tz_name=tz_name)
 
     rows: list[dict[str, Any]] = []
     window = reports.RawWindow(start=bucket_from, end=bucket_to,
@@ -360,6 +381,7 @@ async def reports_drill(
             "all_categories": all_categories,
             "bucket": bucket,
             "spec": spec,
+            "tz_name": tz_name,
             "bucket_from": bucket_from,
             "bucket_to": bucket_to,
             "window": window,

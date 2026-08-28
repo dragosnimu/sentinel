@@ -39,8 +39,10 @@ silence exactly the evening hours the operator wanted covered.
 from __future__ import annotations
 
 import re
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
+from typing import Any
 
 from sentinel.logging_setup import get_logger
 from sentinel.util.tz import host_zone_name, zone  # noqa: F401
@@ -453,6 +455,67 @@ def evaluate(*, now: datetime, muted_until: datetime | None,
             return MuteState(True, f"ore de liniște ({rule})", ends)
 
     return MuteState(False, "activ")
+
+
+# ---------------------------------------------------------------------------
+# Cine tace ACUM — o singură dată, pentru toți cei care întreabă
+# ---------------------------------------------------------------------------
+# Funcțiile de mai jos au trăit în `telegram/bot.py`, ca `_quiet_chats` și ca
+# expresia `quiet_chats >= set(cfg.telegram.allowed_chat_ids)` scrisă în
+# `_push_notifications`. Câtă vreme le citea numai expeditorul, un singur loc
+# era de ajuns.
+#
+# Nu mai e: autoverificarea trebuie să răspundă la „ar fi plecat mesajul ăsta?",
+# iar dacă și-ar fi scris propria regulă de liniște ar fi existat două mecanisme
+# de aceeași formă care se pot despărți tăcut — exact ce spune nota din
+# `aggregator/lib/prune.ts`. Deci regula stă aici, în modulul care o DEȚINE, iar
+# expeditorul și verificarea o cheamă amândoi.
+#
+# Citirea din bază rămâne la apelant: modulul ăsta e pur și trebuie să rămână
+# așa, ca să poată fi testat fără PostgreSQL.
+
+
+def silent_chats(*, now: datetime, chat_ids: Iterable[int],
+                 prefs: Mapping[int, Any] | None = None,
+                 default_schedule: str | None = None,
+                 default_tz: str | None = None) -> frozenset[int]:
+    """Chat-urile care sunt ACUM într-o fereastră de liniște sau pe pauză.
+
+    `prefs` e ce a scris fiecare chat pentru el (`db.repo.chats.all_prefs`);
+    lipsa unui rând înseamnă „ia din configurația livrată", nu „fără liniște".
+    Tipul preferințelor e citit prin atribute, nu importat: `quiet.py` nu are
+    voie să depindă de stratul de bază de date, altfel n-ar mai putea fi testat
+    fără PostgreSQL.
+    """
+    prefs = prefs or {}
+    out: set[int] = set()
+    for chat_id in chat_ids:
+        p = prefs.get(chat_id)
+        sched = parse_schedule((getattr(p, "quiet_hours", None) if p else None)
+                               or default_schedule or "")
+        state = evaluate(now=now, schedule=sched,
+                         muted_until=getattr(p, "muted_until", None) if p else None,
+                         tz_name=(getattr(p, "timezone", None) if p else None)
+                         or default_tz)
+        if state.muted:
+            out.add(chat_id)
+    return frozenset(out)
+
+
+def all_silent(silent: Collection[int], chat_ids: Iterable[int]) -> bool:
+    """Tac TOATE chat-urile cărora li s-ar trimite?
+
+    Numai atunci se ține un mesaj care se poate amuta: dacă măcar unul ascultă,
+    mesajul pleacă la el, iar coada nu are de ce să-l mai țină.
+
+    O listă goală de chat-uri iese ADEVĂRAT, și asta e o alegere, nu o scăpare:
+    pentru expeditor „nu e nimeni de anunțat" trebuie să însemne „ține rândul",
+    fiindcă alternativa e `_broadcast` care întoarce 0 și un rând marcat
+    `failed` — adică o alertă pierdută. Cine citește liniștea ca să judece
+    SĂNĂTATEA canalului are nevoie de răspunsul celălalt și trebuie să ceară
+    separat că există măcar un destinatar; vezi `selfcheck/checks.check_alerting`.
+    """
+    return set(chat_ids) <= set(silent)
 
 
 def _rule_end(local: datetime, window: Window) -> datetime:

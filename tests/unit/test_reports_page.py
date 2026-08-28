@@ -19,6 +19,7 @@ developer's screen and fatal on the server:
 from __future__ import annotations
 
 import contextlib
+import pathlib
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -26,6 +27,7 @@ from fastapi.testclient import TestClient
 
 from sentinel.analytics import reports
 from sentinel.config import Config, Secrets
+from sentinel.util import tz
 from sentinel.web.security import COOKIE_NAME
 
 SESSION_SECRET = "e" * 64
@@ -43,6 +45,13 @@ TOKEN = "test-session-token"
 # 06:37 is deliberately mid-hour: the newest hour bucket is then genuinely
 # partial, which is the interesting case.
 NOW = datetime(2026, 8, 9, 6, 37, 12, tzinfo=timezone.utc)
+
+# Fusul in care pagina ALINIAZA marginile de interval, citit din `Config`, nu
+# scris a doua oara aici: un literal s-ar desparti tacut de configuratia pe care
+# o foloseste aplicatia, iar testele ar verifica alta aliniere decat cea
+# desenata. Din 28 august 2026 zilele/saptamanile/lunile/anii incep la miezul
+# noptii LOCAL; ora ramane aliniata absolut (vezi `reports.align_zone`).
+TZ = Config().timezone
 
 # Midnight-ish, where the daily chart's newest column starts at the same instant
 # as `max(bucket)` — the exact shape that made the daily chart hatch today.
@@ -124,6 +133,10 @@ class StubDB:
             "min(bucket) FROM event_rollup_1m": None,
         }
         self.sql: list[str] = []
+        # Si argumentele legate. Textul singur nu poate arata CE fus a ajuns in
+        # `AT TIME ZONE $2`, iar diferenta dintre `Europe/Bucharest` si `UTC`
+        # acolo e chiar subiectul paginii.
+        self.calls: list[tuple[str, tuple]] = []
 
     async def connect(self):
         return None
@@ -143,6 +156,7 @@ class StubDB:
 
     async def fetch(self, sql, *a):
         self.sql.append(sql)
+        self.calls.append((sql, a))
         # Checked first: a drill-down statement shares most of its WHERE clause
         # with the series query it came from, so matching on the breakdown
         # column would hand the drill-down the chart's rows.
@@ -207,7 +221,20 @@ def _client(db: StubDB, *, authenticated: bool = True, now: datetime = NOW):
         app_module.Database = original            # type: ignore[assignment]
 
 
-def _event_rows(earliest: datetime, now: datetime = NOW) -> list[dict]:
+def _naive_bucket(start: datetime, unit: str) -> datetime:
+    """Marginea, in forma in care o intoarce chiar `date_trunc`.
+
+    `date_trunc($1, ts AT TIME ZONE $2)` intoarce un `timestamp` FARA fus: ceasul
+    de perete al zonei de aliniere. Un stub care ar intoarce ceasul UTC pentru o
+    galeata aliniata local ar ascunde exact greseala de citire pe care o poate
+    face pagina — barele ar cadea pe alte coloane decat cele desenate, si nimic
+    nu s-ar plange.
+    """
+    return tz.to_local(start, reports.align_zone(unit, TZ)).replace(tzinfo=None)
+
+
+def _event_rows(earliest: datetime, now: datetime = NOW,
+                latest: datetime | None = None) -> list[dict]:
     """Rollup rows for every day and hour bucket the coverage actually claims.
 
     Only inside the coverage: a stub that hands back rows for a period it also
@@ -216,9 +243,16 @@ def _event_rows(earliest: datetime, now: datetime = NOW) -> list[dict]:
     """
     rows = []
     for unit, count in (("day", 30), ("hour", 48)):
-        for i, s in enumerate(reports.bucket_starts(unit, now=now, count=count)):
-            if s >= earliest:
-                rows.append({"b": s.replace(tzinfo=None), "k": "nginx", "n": 40 + i})
+        for i, s in enumerate(reports.bucket_starts(unit, now=now, count=count, tz_name=TZ)):
+            if s < earliest:
+                continue
+            # Taierea de sus se face pe INSTANTE, nu pe ceasul de perete: lista
+            # amesteca galeti aliniate local cu galeti aliniate absolut, iar o
+            # comparatie intre doua ceasuri de perete din zone diferite ar taia
+            # cu decalajul in plus sau in minus.
+            if latest is not None and s >= latest + timedelta(hours=1):
+                continue
+            rows.append({"b": _naive_bucket(s, unit), "k": "nginx", "n": 40 + i})
     return rows
 
 
@@ -228,8 +262,7 @@ def _set_rollup(stub: StubDB, *, earliest: datetime | None, latest: datetime | N
     stub.rows["AS earliest"] = {"earliest": earliest, "latest": latest}
     stub.lists["COALESCE(source, '')"] = (
         [] if earliest is None or latest is None
-        else [r for r in _event_rows(earliest)
-              if r["b"] < latest.replace(tzinfo=None) + timedelta(hours=1)])
+        else _event_rows(earliest, latest=latest))
 
 
 @pytest.fixture
@@ -242,17 +275,17 @@ def stub() -> StubDB:
     produce, and that convenience is precisely why the page tests stayed green
     while the newest column of every hourly chart was rendered as "no data".
     """
-    starts = reports.bucket_starts("day", now=NOW, count=30)
+    starts = reports.bucket_starts("day", now=NOW, count=30, tz_name=TZ)
     earliest = NOW - timedelta(days=40)
     return StubDB(
         rollup_earliest=earliest,
-        rollup_latest=reports.truncate(NOW, "hour"),
+        rollup_latest=reports.truncate(NOW, "hour", tz_name=TZ),
         raw_from=(NOW - timedelta(days=25)).date(),
         installed=NOW - timedelta(days=60),
         event_rows=_event_rows(earliest),
-        incident_rows=[{"b": starts[-2].replace(tzinfo=None), "k": "high", "n": 3},
-                       {"b": starts[-1].replace(tzinfo=None), "k": "critical", "n": 1}],
-        patch_rows=[{"b": starts[-1].replace(tzinfo=None), "k": "succeeded", "n": 2}],
+        incident_rows=[{"b": _naive_bucket(starts[-2], "day"), "k": "high", "n": 3},
+                       {"b": _naive_bucket(starts[-1], "day"), "k": "critical", "n": 1}],
+        patch_rows=[{"b": _naive_bucket(starts[-1], "day"), "k": "succeeded", "n": 2}],
     )
 
 
@@ -354,7 +387,7 @@ def test_a_stale_aggregate_reports_its_lag(stub):
     calendar day as the sandbox — the same coincidence that let the W2 guard
     pass in round 2.
     """
-    latest = reports.truncate(NOW, "hour") - timedelta(hours=9)
+    latest = reports.truncate(NOW, "hour", tz_name=TZ) - timedelta(hours=9)
     _set_rollup(stub, earliest=NOW - timedelta(days=40), latest=latest)
     with _client(stub) as c:
         body = c.get("/reports").text
@@ -362,7 +395,10 @@ def test_a_stale_aggregate_reports_its_lag(stub):
     assert expected == 9.6                       # 06:37:12 against 21:00
     assert f"întârziere de {expected} ore" in body
     assert "lipsă de date" in body
-    assert latest.strftime("%d.%m.%Y %H:%M") in body
+    # Scris in fusul configurat, cu marcaj: pagina nu mai afirma „UTC" peste o
+    # ora pe care operatorul o citeste pe alt ceas.
+    assert tz.fmt(latest, "%d.%m.%Y %H:%M", tz_name=TZ) in body
+    assert latest.strftime("%d.%m.%Y %H:%M") + " UTC" not in body
 
 
 def test_a_current_aggregate_raises_no_alarm(stub):
@@ -375,7 +411,7 @@ def test_a_current_aggregate_raises_no_alarm(stub):
 def test_uncovered_buckets_are_hatched_rather_than_flat(stub):
     """Retention dropped those months. The bar must not be a zero-height bar."""
     _set_rollup(stub, earliest=NOW - timedelta(days=3),
-                latest=reports.truncate(NOW, "hour"))
+                latest=reports.truncate(NOW, "hour", tz_name=TZ))
     with _client(stub) as c:
         body = c.get("/reports").text
     assert "url(#hatch-" in body
@@ -427,7 +463,7 @@ def test_the_newest_bucket_with_no_events_is_a_covered_zero_not_a_gap(bucket, no
     written for."""
     earliest = now - timedelta(days=40)
     db = StubDB(rollup_earliest=earliest,
-                rollup_latest=reports.truncate(now, "hour"),
+                rollup_latest=reports.truncate(now, "hour", tz_name=TZ),
                 installed=now - timedelta(days=60))
     with _client(db, now=now) as c:
         body = c.get(f"/reports?bucket={bucket}").text
@@ -466,7 +502,7 @@ def test_the_newest_bucket_with_data_is_drawn_as_a_bar_with_its_own_drill_link(
     earliest = now - timedelta(days=40)
     db = StubDB(
         rollup_earliest=earliest,
-        rollup_latest=reports.truncate(now, "hour"),
+        rollup_latest=reports.truncate(now, "hour", tz_name=TZ),
         raw_from=(now - timedelta(days=25)).date(),
         installed=now - timedelta(days=60),
         event_rows=_event_rows(earliest, now),
@@ -474,7 +510,7 @@ def test_the_newest_bucket_with_data_is_drawn_as_a_bar_with_its_own_drill_link(
     with _client(db, now=now) as c:
         body = c.get(f"/reports?bucket={bucket}").text
 
-    newest = reports.truncate(now, reports.BUCKETS[bucket].unit)
+    newest = reports.truncate(now, reports.BUCKETS[bucket].unit, tz_name=TZ)
     anchor = f'<a href="{_events_drill_href(bucket, newest, "nginx")}">'
     rect = _rect_after(body, anchor)
 
@@ -515,7 +551,7 @@ def test_the_page_renders_against_the_injected_clock_not_the_wall_clock():
     """
     earliest = FAR_FUTURE - timedelta(days=40)
     db = StubDB(rollup_earliest=earliest,
-                rollup_latest=reports.truncate(FAR_FUTURE, "hour"),
+                rollup_latest=reports.truncate(FAR_FUTURE, "hour", tz_name=TZ),
                 installed=FAR_FUTURE - timedelta(days=60),
                 event_rows=_event_rows(earliest, FAR_FUTURE))
     with _client(db, now=FAR_FUTURE) as c:
@@ -524,8 +560,10 @@ def test_the_page_renders_against_the_injected_clock_not_the_wall_clock():
     # Rows landed in the charted span: the handler used the injected moment.
     assert "/reports/drill?" in body
     assert "2031" in body
-    window_start = reports.truncate(FAR_FUTURE - timedelta(hours=24), "hour")
-    assert f"{window_start.strftime('%d.%m %H:%M')} → acum" in body
+    window_start = reports.truncate(FAR_FUTURE - timedelta(hours=24), "hour", tz_name=TZ)
+    # Scrisa in fusul paginii, cu marcaj: fereastra numarata si ora citita de
+    # operator trebuie sa fie acelasi lucru.
+    assert f"{tz.fmt(window_start, '%d.%m %H:%M', tz_name=TZ)} → acum" in body
 
 
 def test_a_bucket_the_rollup_has_not_reached_is_pending_not_deleted(stub):
@@ -538,7 +576,7 @@ def test_a_bucket_the_rollup_has_not_reached_is_pending_not_deleted(stub):
     operator learns to skip, and it is the only mark that says a month really
     was dropped."""
     _set_rollup(stub, earliest=NOW - timedelta(days=40),
-                latest=reports.truncate(NOW, "hour") - timedelta(hours=1))
+                latest=reports.truncate(NOW, "hour", tz_name=TZ) - timedelta(hours=1))
     with _client(stub) as c:
         body = c.get("/reports?bucket=hour").text
     assert "încă neagregat" in body
@@ -550,7 +588,7 @@ def test_a_bucket_the_rollup_has_not_reached_is_pending_not_deleted(stub):
 def test_a_deleted_month_still_gets_the_loud_hatch(stub):
     """The other side: the hatch has to keep firing where it means something."""
     _set_rollup(stub, earliest=NOW - timedelta(days=3),
-                latest=reports.truncate(NOW, "hour"))
+                latest=reports.truncate(NOW, "hour", tz_name=TZ))
     with _client(stub) as c:
         body = c.get("/reports?bucket=day").text
     assert "fără date păstrate" in body
@@ -599,7 +637,7 @@ def test_a_window_wider_than_the_data_is_flagged_on_the_card_itself(stub):
     5.8 days of rollup exist. The caveat has to sit next to the figure: a
     paragraph elsewhere on the page is not read at the same moment."""
     _set_rollup(stub, earliest=NOW - timedelta(days=5, hours=19),
-                latest=reports.truncate(NOW, "hour"))
+                latest=reports.truncate(NOW, "hour", tz_name=TZ))
     with _client(stub) as c:
         wide = c.get("/reports?window=30z").text
         narrow = c.get("/reports?window=24h").text
@@ -621,8 +659,8 @@ def test_the_page_prints_the_exact_window_it_counted(stub):
     difference between the label and the number."""
     with _client(stub) as c:
         body = c.get("/reports?window=24h").text
-    expected = reports.truncate(NOW - timedelta(hours=24), "hour")
-    assert f"{expected.strftime('%d.%m %H:%M')} → acum" in body
+    expected = reports.truncate(NOW - timedelta(hours=24), "hour", tz_name=TZ)
+    assert f"{tz.fmt(expected, '%d.%m %H:%M', tz_name=TZ)} → acum" in body
 
 
 def test_the_stylesheet_link_is_versioned_by_content(stub):
@@ -705,7 +743,7 @@ def test_a_pending_column_is_never_described_as_full_coverage(stub):
     other. The round-2 fix branched on `unknown_buckets`; the fourth state
     reopened the same hole one branch further along."""
     _set_rollup(stub, earliest=NOW - timedelta(days=40),
-                latest=reports.truncate(NOW, "hour") - timedelta(hours=1))
+                latest=reports.truncate(NOW, "hour", tz_name=TZ) - timedelta(hours=1))
     stub.lists["COALESCE(source, '')"] = []
     with _client(stub) as c:
         body = c.get("/reports?bucket=hour").text
@@ -724,7 +762,7 @@ def test_the_empty_chart_sentence_accounts_for_every_column_drawn(stub):
     exactly the number of pending columns, on a page whose subject is honest
     counting."""
     _set_rollup(stub, earliest=NOW - timedelta(hours=20),
-                latest=reports.truncate(NOW, "hour") - timedelta(hours=5))
+                latest=reports.truncate(NOW, "hour", tz_name=TZ) - timedelta(hours=5))
     stub.lists["COALESCE(source, '')"] = []
     with _client(stub) as c:
         body = c.get("/reports?bucket=hour").text
@@ -748,21 +786,21 @@ def test_columns_past_the_minute_table_are_the_only_ones_called_final(stub):
     left" about them points at writing the period off instead of at restarting
     the timer.
     """
-    minute_from = reports.truncate(NOW - timedelta(days=90), "day")
-    raw_from = reports.truncate(NOW - timedelta(days=25), "day")
+    minute_from = reports.truncate(NOW - timedelta(days=90), "day", tz_name=TZ)
+    raw_from = reports.truncate(NOW - timedelta(days=25), "day", tz_name=TZ)
     _set_rollup(stub, earliest=NOW - timedelta(days=400),
-                latest=reports.truncate(NOW - timedelta(days=200), "hour"))
+                latest=reports.truncate(NOW - timedelta(days=200), "hour", tz_name=TZ))
     stub.vals["pg_inherits"] = raw_from.date()
     stub.vals["min(bucket) FROM event_rollup_1m"] = minute_from
 
     with _client(stub) as c:
         body = c.get("/reports?bucket=month").text
 
-    starts = reports.bucket_starts("month", now=NOW, count=reports.BUCKETS["month"].span)
-    covered_to = reports.truncate(NOW - timedelta(days=200), "hour") + timedelta(hours=1)
+    starts = reports.bucket_starts("month", now=NOW, count=reports.BUCKETS["month"].span, tz_name=TZ)
+    covered_to = reports.truncate(NOW - timedelta(days=200), "hour", tz_name=TZ) + timedelta(hours=1)
     blank = [s for s in starts if s >= covered_to]
     expect_missed = [s for s in blank
-                     if reports.advance(s, "month", 1) <= minute_from]
+                     if reports.advance(s, "month", 1, tz_name=TZ) <= minute_from]
     expect_pending = [s for s in blank if s not in expect_missed]
     assert expect_missed and expect_pending, "the scenario produced only one kind"
 
@@ -780,7 +818,7 @@ def test_columns_past_the_minute_table_are_the_only_ones_called_final(stub):
 
     # No column older than the raw edge offers a list of events.
     for s in blank:
-        if reports.advance(s, "month", 1) > raw_from:
+        if reports.advance(s, "month", 1, tz_name=TZ) > raw_from:
             continue
         href = reports.drill_href(
             {"kind": "events", "dim": "source", "bucket": "month", "scope": "all"},
@@ -796,7 +834,7 @@ def test_a_pending_column_offers_the_drill_down_it_promises(stub):
     """Its tooltip says the raw rows exist. `raw_events` can be read for exactly
     that bucket, so telling the operator the data is there and giving them no
     route to it is a worse answer than saying nothing."""
-    pending_start = reports.truncate(NOW, "hour")
+    pending_start = reports.truncate(NOW, "hour", tz_name=TZ)
     _set_rollup(stub, earliest=NOW - timedelta(days=40),
                 latest=pending_start - timedelta(hours=1))
     stub.lists["COALESCE(source, '')"] = []
@@ -831,7 +869,7 @@ def test_the_all_categories_scope_is_refused_where_there_is_no_raw_table(stub):
     refusing it."""
     from urllib.parse import urlencode
 
-    start = reports.bucket_starts("day", now=NOW, count=30)[-1]
+    start = reports.bucket_starts("day", now=NOW, count=30, tz_name=TZ)[-1]
     for kind, dim in (("incidents", "severity"), ("patches", "status")):
         url = "/reports/drill?" + urlencode(
             {"kind": kind, "dim": dim, "bucket": "day", "scope": "all",
@@ -843,7 +881,7 @@ def test_the_all_categories_scope_is_refused_where_there_is_no_raw_table(stub):
 def test_an_unknown_scope_is_refused(stub):
     from urllib.parse import urlencode
 
-    start = reports.bucket_starts("day", now=NOW, count=30)[-1]
+    start = reports.bucket_starts("day", now=NOW, count=30, tz_name=TZ)[-1]
     url = "/reports/drill?" + urlencode(
         {"kind": "events", "dim": "source", "bucket": "day", "scope": "everything",
          "value": "nginx", "start": start.isoformat()})
@@ -858,7 +896,7 @@ def test_a_windowed_caveat_never_lands_under_an_as_of_now_figure(stub):
     A block-level "acoperă doar 9.8 z din 30 z" under it reads as "58 is an
     undercount". It is not."""
     _set_rollup(stub, earliest=NOW - timedelta(days=9, hours=19),
-                latest=reports.truncate(NOW, "hour"))
+                latest=reports.truncate(NOW, "hour", tz_name=TZ))
     stub.vals["schema_version"] = NOW - timedelta(days=9, hours=19)
     with _client(stub) as c:
         body = c.get("/reports?window=30z").text
@@ -901,7 +939,7 @@ def test_a_nonsense_selector_falls_back_instead_of_erroring(stub):
 # ---------------------------------------------------------------------------
 def _drill_url(kind: str, dim: str, value: str, bucket: str = "day", offset: int = -1) -> str:
     from urllib.parse import urlencode
-    start = reports.bucket_starts(bucket, now=NOW, count=reports.BUCKETS[bucket].span)[offset]
+    start = reports.bucket_starts(bucket, now=NOW, count=reports.BUCKETS[bucket].span, tz_name=TZ)[offset]
     return "/reports/drill?" + urlencode(
         {"kind": kind, "dim": dim, "bucket": bucket, "value": value,
          "start": start.isoformat()})
@@ -973,7 +1011,7 @@ def test_a_start_that_is_not_a_bucket_boundary_is_refused(stub):
     five-year window over `raw_events` becomes a scan competing with detection
     for the same database."""
     from urllib.parse import urlencode
-    odd = (reports.truncate(NOW, "day") + timedelta(minutes=7)).isoformat()
+    odd = (reports.truncate(NOW, "day", tz_name=TZ) + timedelta(minutes=7)).isoformat()
     url = "/reports/drill?" + urlencode(
         {"kind": "events", "dim": "source", "bucket": "day", "value": "nginx",
          "start": odd})
@@ -985,7 +1023,7 @@ def test_a_start_outside_the_charted_span_is_refused(stub):
     """A link from a chart that has since scrolled past that bucket. Refusing is
     what keeps the span, and therefore the query cost, bounded."""
     from urllib.parse import urlencode
-    old = reports.truncate(NOW - timedelta(days=400), "day").isoformat()
+    old = reports.truncate(NOW - timedelta(days=400), "day", tz_name=TZ).isoformat()
     url = "/reports/drill?" + urlencode(
         {"kind": "events", "dim": "source", "bucket": "day", "value": "nginx",
          "start": old})
@@ -1018,6 +1056,7 @@ def _render_drill(**over):
     ctx = {
         "user": type("U", (), {"username": "operator", "role": "owner"})(),
         "csrf_token": "t", "active": "reports", "kind": "events", "dim": "source",
+        "tz_name": TZ,
         "value": "nginx", "value_label": "nginx", "bucket": "month",
         "spec": reports.BUCKETS["month"],
         "bucket_from": datetime(2026, 8, 1, tzinfo=timezone.utc),
@@ -1027,7 +1066,7 @@ def _render_drill(**over):
         "severity_ro": {}, "exec_status_ro": {}, "back": "/reports?bucket=month",
     }
     ctx.update(over)
-    return build_env().get_template("report_drill.html").render(**ctx)
+    return build_env(TZ).get_template("report_drill.html").render(**ctx)
 
 
 def test_a_window_narrowed_by_retention_does_not_blame_the_cap():
@@ -1047,7 +1086,11 @@ def test_a_window_narrowed_by_retention_does_not_blame_the_cap():
     assert "ștearsă de retenție" in html
     assert "fereastra maximă de detaliu" not in html
     assert "alege un bucket mai mic" not in html
-    assert "25.08.2026 00:00" in html                 # the window it really read
+    # Momentul e absolut; scris in fusul paginii, 00:00 UTC e 03:00 la Bucuresti.
+    # Asertiunea trece prin aceeasi functie ca sablonul, ca sa nu ramana un sir
+    # care mai spune „00:00" dupa ce pagina a inceput sa scrie altceva.
+    assert tz.fmt(datetime(2026, 8, 25, tzinfo=timezone.utc), "%d.%m.%Y %H:%M",
+                  tz_name=TZ, with_zone=False) in html
 
 
 def test_a_window_narrowed_only_by_the_cap_says_so_and_offers_the_remedy():
@@ -1107,3 +1150,95 @@ def test_the_drill_down_offers_no_way_to_change_anything(stub):
         '<form method="post" action="/logout" class="inline">']
     assert "<button" not in body.replace(
         '<button type="submit" class="btn btn-quiet btn-sm btn-block">Ieșire</button>', "")
+
+
+# ---------------------------------------------------------------------------
+# Fusul: ajunge in SQL, si ajunge ca parametru
+# ---------------------------------------------------------------------------
+def test_the_page_binds_the_configured_zone_as_a_query_parameter(stub):
+    """Fusul configurat trebuie sa ajunga chiar la baza, nu doar in etichete.
+
+    Doua feluri de a livra o pagina care minte, amandoua verzi la un test de
+    text: alinierea ramasa in UTC in timp ce etichetele sunt scrise local (bare
+    decalate cu trei ore fata de propriile lor nume), sau numele zonei scris in
+    textul instructiunii in loc sa fie legat. Aici se citeste valoarea legata.
+    """
+    with _client(stub) as c:
+        assert c.get("/reports?bucket=day").status_code == 200
+    bucketed = [(sql, a) for sql, a in stub.calls if "date_trunc(" in sql]
+    assert len(bucketed) >= 3, f"doar {len(bucketed)} interogari cu date_trunc"
+    for sql, a in bucketed:
+        assert "AT TIME ZONE $2::text" in sql, f"zona nu e legata: {sql}"
+        assert a[0] == "day" and a[1] == TZ, f"unitatea/zona legate gresit: {a[:2]}"
+
+
+def test_the_hourly_chart_stays_aligned_in_utc(stub):
+    """Decizia din `align_zone`, verificata pe drumul real.
+
+    Ora nu se aliniaza in fusul configurat: in noaptea in care ceasul da inapoi
+    exista doua ore locale „03:00", iar `GROUP BY` le-ar uni intr-o coloana si ar
+    lasa vecina un zero care nu e zero.
+    """
+    with _client(stub) as c:
+        assert c.get("/reports?bucket=hour").status_code == 200
+    bucketed = [a for sql, a in stub.calls if "date_trunc(" in sql]
+    assert bucketed, "nicio interogare cu date_trunc"
+    for a in bucketed:
+        assert a[0] == "hour" and a[1] == "UTC", f"ora aliniata in {a[1]!r}"
+
+
+def test_the_page_says_which_zone_its_intervals_are_aligned_in(stub):
+    """Cifra citita azi nu are voie sa fie comparata tacut cu una de ieri.
+
+    Intervalele s-au mutat din UTC in fusul configurat, deci fiecare interval
+    istoric s-a deplasat o data. Fara ca pagina sa spuna in ce fus e, operatorul
+    ar pune „evenimente pe 27.08" de azi langa cifra notata saptamana trecuta si
+    ar cauta o cauza pentru o diferenta care vine din alta margine de zi.
+
+    Numele zonei, nu marcajul: `EEST` e adevarat doar jumatate de an, iar un
+    grafic pe 30 de zile poate trece peste schimbarea ceasului.
+    """
+    with _client(stub) as c:
+        body = c.get("/reports").text
+    assert TZ in body, (
+        f"pagina nu numeste fusul ({TZ}) in care isi aliniaza intervalele")
+    # Si spune ca s-a mutat, o data, ca cifrele vechi sa nu fie comparate orbeste.
+    assert "nu în UTC" in body
+
+
+def test_the_reports_page_never_leaves_the_zone_to_the_default():
+    """`analytics/reports.py` are fus IMPLICIT — depozitarea, UTC.
+
+    Implicitul exista ca o functie chemata fara fus sa dea acelasi raspuns pe
+    orice masina, nu ca sa fie folosit de pagina. Un apel din router care il
+    uita ar desena o coloana aliniata in UTC langa una aliniata local, fara nimic
+    care s-o spuna. Lista functiilor e DERIVATA din semnaturi, nu scrisa de mana:
+    una noua cu `tz_name` intra automat sub garda.
+    """
+    import ast
+    import inspect
+
+    cu_fus = {name for name, fn in vars(reports).items()
+              if inspect.isfunction(fn)
+              and "tz_name" in inspect.signature(fn).parameters}
+    assert len(cu_fus) >= 8, f"doar {sorted(cu_fus)} functii cu `tz_name` — scanarea e rupta"
+
+    ruta = pathlib.Path(reports.__file__).parents[1] / "web" / "routers" / "reports.py"
+    arbore = ast.parse(ruta.read_text(encoding="utf-8"))
+
+    vazute = 0
+    for nod in ast.walk(arbore):
+        if not isinstance(nod, ast.Call) or not isinstance(nod.func, ast.Attribute):
+            continue
+        tinta = nod.func
+        if not (isinstance(tinta.value, ast.Name) and tinta.value.id == "reports"):
+            continue
+        if tinta.attr not in cu_fus:
+            continue
+        vazute += 1
+        assert any(k.arg == "tz_name" for k in nod.keywords), (
+            f"`reports.{tinta.attr}` chemata din pagina fara `tz_name`, la linia "
+            f"{nod.lineno} — ar alinia in UTC in timp ce restul paginii e local")
+    assert vazute >= 6, (
+        f"doar {vazute} apeluri gasite in {ruta.name}; expresia de cautare e "
+        "rupta si garda s-ar sari in tacere")

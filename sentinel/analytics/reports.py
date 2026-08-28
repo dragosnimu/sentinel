@@ -51,6 +51,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from sentinel.db.engine import Database
+from sentinel.util import tz
 
 # ---------------------------------------------------------------------------
 # Vocabularies
@@ -83,6 +84,49 @@ BUCKETS: dict[str, BucketSpec] = {
     "year":  BucketSpec("year", 3, "pe an", "%Y"),
 }
 DEFAULT_BUCKET = "day"
+
+# ---------------------------------------------------------------------------
+# În ce fus se taie marginile intervalului
+# ---------------------------------------------------------------------------
+#: Fusul implicit al modulului. NU înseamnă „fusul gazdei": înseamnă depozitarea,
+#: care rămâne UTC. O funcție de aici chemată fără fus trebuie să dea același
+#: răspuns pe orice mașină, iar `None`-ul lui `util.tz` (= fusul gazdei) ar face
+#: rezultatul să depindă de unde rulează testul.
+STORAGE_TZ = "UTC"
+
+
+def align_zone(unit: str, tz_name: str = STORAGE_TZ) -> str:
+    """Fusul în care se taie marginile pentru unitatea asta, ca NUME de zonă.
+
+    Zilele, săptămânile, lunile și anii se taie în fusul configurat. Până pe 28
+    august 2026 se tăiau în UTC, deci „ziua de 27.08" începea la 03:00 ora
+    operatorului: cifra de pe pagină și ce scria în jurnal erau despre două zile
+    diferite, fără nimic care s-o spună. Costul mutării, acceptat la decizie:
+    fiecare interval istoric se deplasează o dată, iar comparația cu cifrele
+    citite înainte se rupe o dată.
+
+    **Ora de vară rămâne vizibilă, și așa trebuie.** În ziua în care se schimbă
+    ceasul, `date_trunc('day', ts AT TIME ZONE 'Europe/Bucharest')` produce o zi
+    de 23 sau de 25 de ore, deci suma pe acea zi va arăta o anomalie o dată pe
+    an. Nu e un bug de vânat: e chiar ziua pe care a trăit-o operatorul.
+
+    **ORA rămâne tăiată în UTC**, și asta e o alegere, nu o scăpare. `date_trunc`
+    într-un fus numit lucrează pe ceasul de perete, iar în noaptea în care ceasul
+    dă înapoi există DOUĂ ore locale „03:00": `GROUP BY` le-ar aduna într-o
+    singură coloană, iar vecina ei ar rămâne un zero care nu e zero — exact
+    minciuna împotriva căreia e scris tot modulul („Missing data is not zero",
+    în capul fișierului). Pentru un fus decalat cu un număr ÎNTREG de ore, cum e
+    `Europe/Bucharest`, marginile orare ies oricum aceleași, deci nu se pierde
+    nimic; pentru unul decalat cu jumătate de oră, eticheta orară poartă minutele
+    și spune adevărul. Același argument, scris pentru sparkline-ul orar de pe
+    panou, e în `dashboard.html`.
+
+    Numele iese prin `tz.zone_key`, deci e unul pe care Python l-a rezolvat deja
+    — fiindcă de aici pleacă drept PARAMETRU în `date_trunc($1, ts AT TIME ZONE
+    $2)`, niciodată interpolat în textul instrucțiunii. Aceeași disciplină ca la
+    `EVENT_DIMS` / `INCIDENT_DIMS` mai jos, din același motiv.
+    """
+    return STORAGE_TZ if unit == "hour" else tz.zone_key(tz_name)
 
 # Overview windows, in hours.
 WINDOWS: dict[str, int] = {"24h": 24, "7z": 24 * 7, "30z": 24 * 30}
@@ -147,57 +191,89 @@ SOURCE_ROWS_MAX = 25
 # ---------------------------------------------------------------------------
 # Bucket arithmetic
 # ---------------------------------------------------------------------------
-def truncate(moment: datetime, unit: str) -> datetime:
-    """Start of the bucket containing `moment`, in UTC.
+def _instant(local_naive: datetime, z: Any) -> datetime:
+    """Un ceas de perete dintr-o zonă, ca moment absolut.
+
+    `fold=0` e scris pe față. Fără el, o margine căzută într-o oră locală care
+    se repetă ar putea moșteni `fold=1` din momentul din care a fost tăiată, iar
+    Python ar alege alt instant decât cel pe care îl întoarce PostgreSQL pentru
+    aceeași etichetă — două mecanisme de acord până în noaptea în care nu mai
+    sunt.
+    """
+    return local_naive.replace(tzinfo=z, fold=0).astimezone(timezone.utc)
+
+
+def truncate(moment: datetime, unit: str, *, tz_name: str = STORAGE_TZ) -> datetime:
+    """Start of the bucket containing `moment`, as an absolute instant.
 
     Weeks start on Monday, matching PostgreSQL's `date_trunc('week', …)`. If the
     two disagreed, a bar drawn for one week would be filled with another week's
     rows and nothing would say so.
+
+    Tăierea se face pe CEASUL DE PERETE al zonei date de `align_zone` și se
+    întoarce ca moment absolut, fiindcă instantul e ce ajunge în `WHERE ts >= $1`.
     """
-    m = moment.astimezone(timezone.utc)
     if unit == "hour":
-        return m.replace(minute=0, second=0, microsecond=0)
-    day = m.replace(hour=0, minute=0, second=0, microsecond=0)
+        # Aliniere absolută; motivul e scris la `align_zone`.
+        return moment.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    z = tz.zone(align_zone(unit, tz_name))
+    local = moment.astimezone(z).replace(tzinfo=None)
+    day = local.replace(hour=0, minute=0, second=0, microsecond=0)
     if unit == "day":
-        return day
-    if unit == "week":
-        return day - timedelta(days=day.weekday())
-    if unit == "month":
-        return day.replace(day=1)
-    if unit == "year":
-        return day.replace(month=1, day=1)
-    raise ValueError(f"unknown bucket unit {unit!r}")
+        start = day
+    elif unit == "week":
+        start = day - timedelta(days=day.weekday())
+    elif unit == "month":
+        start = day.replace(day=1)
+    elif unit == "year":
+        start = day.replace(month=1, day=1)
+    else:
+        raise ValueError(f"unknown bucket unit {unit!r}")
+    return _instant(start, z)
 
 
-def advance(moment: datetime, unit: str, steps: int = 1) -> datetime:
-    """Move `steps` buckets forward (or back, for a negative count)."""
+def advance(moment: datetime, unit: str, steps: int = 1, *,
+            tz_name: str = STORAGE_TZ) -> datetime:
+    """Move `steps` buckets forward (or back, for a negative count).
+
+    Pasul se face pe ceasul de perete, nu pe durată. O zi nu are 24 de ore în
+    noaptea schimbării ceasului, iar `+ timedelta(days=1)` ar muta marginea la
+    23:00 sau la 01:00 locale — adică pe altă margine decât cea pe care o taie
+    `date_trunc`, cu bare umplute cu rândurile intervalului vecin.
+    """
     if unit == "hour":
         return moment + timedelta(hours=steps)
+    z = tz.zone(align_zone(unit, tz_name))
+    local = moment.astimezone(z).replace(tzinfo=None)
     if unit == "day":
-        return moment + timedelta(days=steps)
-    if unit == "week":
-        return moment + timedelta(weeks=steps)
-    if unit == "month":
-        total = (moment.year * 12 + moment.month - 1) + steps
-        return moment.replace(year=total // 12, month=total % 12 + 1, day=1)
-    if unit == "year":
-        return moment.replace(year=moment.year + steps, month=1, day=1)
-    raise ValueError(f"unknown bucket unit {unit!r}")
+        local += timedelta(days=steps)
+    elif unit == "week":
+        local += timedelta(weeks=steps)
+    elif unit == "month":
+        total = (local.year * 12 + local.month - 1) + steps
+        local = local.replace(year=total // 12, month=total % 12 + 1, day=1)
+    elif unit == "year":
+        local = local.replace(year=local.year + steps, month=1, day=1)
+    else:
+        raise ValueError(f"unknown bucket unit {unit!r}")
+    return _instant(local, z)
 
 
-def bucket_starts(unit: str, *, now: datetime, count: int) -> list[datetime]:
+def bucket_starts(unit: str, *, now: datetime, count: int,
+                  tz_name: str = STORAGE_TZ) -> list[datetime]:
     """The `count` bucket starts ending with the bucket containing `now`."""
-    last = truncate(now, unit)
+    last = truncate(now, unit, tz_name=tz_name)
     starts = [last]
     for _ in range(count - 1):
-        starts.append(advance(starts[-1], unit, -1))
+        starts.append(advance(starts[-1], unit, -1, tz_name=tz_name))
     return list(reversed(starts))
 
 
-def window_bounds(unit: str, *, now: datetime, count: int) -> tuple[datetime, datetime]:
+def window_bounds(unit: str, *, now: datetime, count: int,
+                  tz_name: str = STORAGE_TZ) -> tuple[datetime, datetime]:
     """Half-open [start, end) covering `count` buckets up to and including now."""
-    starts = bucket_starts(unit, now=now, count=count)
-    return starts[0], advance(starts[-1], unit, 1)
+    starts = bucket_starts(unit, now=now, count=count, tz_name=tz_name)
+    return starts[0], advance(starts[-1], unit, 1, tz_name=tz_name)
 
 
 # ---------------------------------------------------------------------------
@@ -278,8 +354,13 @@ class Series:
     """A stacked time series: one row per category, one column per bucket."""
 
     unit: str
-    starts: list[datetime]
-    keys: list[str]
+    # Fusul în care au fost TĂIATE marginile și în care se scriu etichetele.
+    # Călătorește pe serie, nu se dă separat lui `build_chart`: altfel o serie
+    # aliniată într-un fus ar putea fi etichetată în altul, iar diferența — trei
+    # ore — nu s-ar vedea nicăieri pe pagină.
+    tz_name: str = STORAGE_TZ
+    starts: list[datetime] = field(default_factory=list)
+    keys: list[str] = field(default_factory=list)
     counts: dict[str, list[int]] = field(default_factory=dict)
     totals: dict[str, int] = field(default_factory=dict)
     per_bucket: list[int] = field(default_factory=list)
@@ -340,6 +421,26 @@ def _as_utc(value: Any) -> datetime | None:
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
     if isinstance(value, date):
         return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+    return None
+
+
+def _bucket_instant(value: Any, zone_name: str) -> datetime | None:
+    """Marginea de interval întoarsă de SQL, ca moment absolut.
+
+    `date_trunc($1, ts AT TIME ZONE $2)` întoarce un `timestamp` FĂRĂ fus: ceasul
+    de perete al zonei în care s-a aliniat. Citit ca UTC — corect cât timp
+    alinierea chiar era în UTC — ar deplasa fiecare coloană cu tot decalajul,
+    barele s-ar potrivi peste alte intervale decât cele desenate, iar totalul din
+    antet ar rămâne același. Adică o pagină care se contrazice fără să spună.
+    """
+    if value is None:
+        return None
+    z = tz.zone(zone_name)
+    if isinstance(value, datetime):
+        return (value.astimezone(timezone.utc) if value.tzinfo
+                else _instant(value, z))
+    if isinstance(value, date):
+        return _instant(datetime(value.year, value.month, value.day), z)
     return None
 
 
@@ -417,7 +518,8 @@ def event_edges(
 
 
 def live_edges(
-    known_from: datetime | None, *, now: datetime, unit: str
+    known_from: datetime | None, *, now: datetime, unit: str,
+    tz_name: str = STORAGE_TZ
 ) -> tuple[datetime | None, datetime | None, datetime | None]:
     """The same three edges for a table written continuously and never pruned —
     `incidents`, `patch_executions`. Everything up to now exists; the bucket
@@ -440,7 +542,8 @@ def live_edges(
     It needs `unit` for the same reason the bug existed: "the end of the current
     bucket" is not a property of the clock alone.
     """
-    return known_from, now, advance(truncate(now, unit), unit, 1)
+    return known_from, now, advance(truncate(now, unit, tz_name=tz_name), unit, 1,
+                                    tz_name=tz_name)
 
 
 def build_series(
@@ -454,6 +557,7 @@ def build_series(
     fallbacks: Fallbacks,
     key_order: tuple[str, ...] | None = None,
     top: int | None = None,
+    tz_name: str = STORAGE_TZ,
 ) -> Series:
     """Fold `(b, k, n)` rows into a dense matrix.
 
@@ -464,9 +568,10 @@ def build_series(
     index = {start: i for i, start in enumerate(starts)}
     counts: dict[str, list[int]] = {}
     totals: dict[str, int] = {}
+    zone_name = align_zone(unit, tz_name)
 
     for row in rows:
-        bucket = _as_utc(row["b"])
+        bucket = _bucket_instant(row["b"], zone_name)
         if bucket is None:
             continue
         pos = index.get(bucket)
@@ -502,8 +607,8 @@ def build_series(
 
     per_bucket = [sum(counts[k][i] for k in keys) for i in range(len(starts))]
     state = [
-        _bucket_state(s, advance(s, unit, 1), known_from, complete_to, known_to,
-                      fallbacks)
+        _bucket_state(s, advance(s, unit, 1, tz_name=tz_name),
+                      known_from, complete_to, known_to, fallbacks)
         for s in starts
     ]
 
@@ -520,6 +625,7 @@ def build_series(
 
     return Series(
         unit=unit,
+        tz_name=tz_name,
         starts=starts,
         keys=keys,
         counts=counts,
@@ -637,6 +743,15 @@ def build_chart(
 ) -> Chart:
     """Lay a stacked bar chart out in SVG user units."""
     n = len(series.starts)
+    # Etichetele se scriu în fusul seriei, cu marcajul lui. Marcajul e AL
+    # MOMENTULUI, nu al zonei: aceeași zonă e `EET` iarna și `EEST` vara, iar un
+    # grafic pe 30 de zile poate trece peste schimbare. Fără el, ora citită de pe
+    # pagină ar fi o afirmație pe care cititorul trebuie s-o ghicească — între
+    # UTC și EEST sunt trei ore, destul cât să te uiți în jurnal în fereastra
+    # greșită.
+    def eticheta(moment: datetime, *, marcaj: bool = True) -> str:
+        return tz.fmt(moment, tick_fmt, tz_name=series.tz_name, with_zone=marcaj)
+
     plot_w = CHART_W - PAD_L - PAD_R
     plot_h = CHART_H - PAD_T - PAD_B
     baseline = PAD_T + plot_h
@@ -653,7 +768,7 @@ def build_chart(
             kind = series.state[i]
             href = None
             fb = series.fallbacks
-            bucket_end = advance(start, series.unit, 1)
+            bucket_end = advance(start, series.unit, 1, tz_name=series.tz_name)
             if kind == UNKNOWN:
                 note = "fără date păstrate pentru acest interval (nu înseamnă zero)"
             elif kind == MISSED:
@@ -695,7 +810,7 @@ def build_chart(
                         if drill is not None and drill.get("kind") == "events" else None)
             gaps.append(GapMark(
                 x=round(x, 1), y=round(PAD_T, 1), w=round(bar_w, 1), h=round(plot_h, 1),
-                kind=kind, title=f"{start.strftime(tick_fmt)} — {note}", href=href,
+                kind=kind, title=f"{eticheta(start)} — {note}", href=href,
             ))
             continue
         top = baseline
@@ -715,13 +830,16 @@ def build_chart(
                 # single filter that reproduces it. No link rather than a wrong one.
                 href=(drill_href(drill, start=start, value=key)
                       if drill is not None and key not in ("", "altele") else None),
-                title=f"{start.strftime(tick_fmt)} · {shown}: {value}{note}",
+                title=f"{eticheta(start)} · {shown}: {value}{note}",
             ))
 
     # Roughly a dozen ticks whatever the bucket count, always including the last.
     every = max(1, -(-n // 12))
+    # Axa rămâne fără marcaj — s-ar repeta de douăsprezece ori pe același grafic
+    # și ar face eticheta ilizibilă. Fusul e spus o dată, în capul paginii, și
+    # pe fiecare tooltip, adică exact acolo unde se citește un moment anume.
     ticks = [
-        Tick(x=round(PAD_L + i * slot + slot / 2, 1), label=s.strftime(tick_fmt))
+        Tick(x=round(PAD_L + i * slot + slot / 2, 1), label=eticheta(s, marcaj=False))
         for i, s in enumerate(series.starts)
         if (n - 1 - i) % every == 0
     ]
@@ -844,32 +962,41 @@ def earliest(*moments: datetime | None) -> datetime | None:
 # Time series queries
 # ---------------------------------------------------------------------------
 async def events_rows(
-    db: Database, *, unit: str, start: datetime, end: datetime, dim: str
+    db: Database, *, unit: str, start: datetime, end: datetime, dim: str,
+    tz_name: str = STORAGE_TZ
 ) -> list[Any]:
     """Event counts per bucket per category, straight out of the hourly rollup.
 
-    `bucket AT TIME ZONE 'UTC'` before truncating is not decoration: `date_trunc`
-    on a `timestamptz` truncates in the *session* time zone, which asyncpg does
-    not pin. On a host whose PostgreSQL defaults to a local zone, days would
-    silently start at 21:00 or 03:00 and never say so. Converting to a naive UTC
-    timestamp first makes the answer the same on every host.
+    `AT TIME ZONE` before truncating is not decoration: `date_trunc` on a
+    `timestamptz` truncates in the *session* time zone, which asyncpg does not
+    pin. On a host whose PostgreSQL defaults to a local zone, days would silently
+    start at 21:00 or 03:00 and never say so. Converting to a naive timestamp in
+    a NAMED zone first makes the answer the same on every host.
+
+    Zona ajunge acolo ca PARAMETRU, `$2`, niciodată interpolată în textul
+    instrucțiunii — și e una dintre cele pe care `align_zone` le poate întoarce,
+    adică una pe care Python a rezolvat-o deja. Aceeași disciplină ca la coloana
+    de dimensiune, din același motiv: valoarea vine din configurație, iar un
+    `f"AT TIME ZONE '{tz}'"` ar fi o cale de injecție deschisă de un câmp de
+    configurare.
     """
     column = EVENT_DIMS[dim]
     return list(await db.fetch(
         f"""
-        SELECT date_trunc($1::text, bucket AT TIME ZONE 'UTC') AS b,
+        SELECT date_trunc($1::text, bucket AT TIME ZONE $2::text) AS b,
                COALESCE({column}, '') AS k,
                sum(n)::bigint AS n
         FROM event_rollup_1h
-        WHERE bucket >= $2 AND bucket < $3
+        WHERE bucket >= $3 AND bucket < $4
         GROUP BY 1, 2
         """,  # noqa: S608 - {column} comes from EVENT_DIMS, never from a request
-        unit, start, end,
+        unit, align_zone(unit, tz_name), start, end,
     ))
 
 
 async def incidents_rows(
-    db: Database, *, unit: str, start: datetime, end: datetime, dim: str
+    db: Database, *, unit: str, start: datetime, end: datetime, dim: str,
+    tz_name: str = STORAGE_TZ
 ) -> list[Any]:
     """Incidents per bucket, placed by when they were OPENED.
 
@@ -881,32 +1008,33 @@ async def incidents_rows(
     column = INCIDENT_DIMS[dim]
     return list(await db.fetch(
         f"""
-        SELECT date_trunc($1::text, first_detection_at AT TIME ZONE 'UTC') AS b,
+        SELECT date_trunc($1::text, first_detection_at AT TIME ZONE $2::text) AS b,
                COALESCE({column}, '') AS k,
                count(*) AS n
         FROM incidents
-        WHERE first_detection_at >= $2 AND first_detection_at < $3
+        WHERE first_detection_at >= $3 AND first_detection_at < $4
         GROUP BY 1, 2
         """,  # noqa: S608 - {column} comes from INCIDENT_DIMS, never from a request
-        unit, start, end,
+        unit, align_zone(unit, tz_name), start, end,
     ))
 
 
 async def patches_rows(
-    db: Database, *, unit: str, start: datetime, end: datetime
+    db: Database, *, unit: str, start: datetime, end: datetime,
+    tz_name: str = STORAGE_TZ
 ) -> list[Any]:
     """Real applies only. A dry run touches nothing, and counting one as a patch
     would let a page report work that never happened."""
     return list(await db.fetch(
         """
-        SELECT date_trunc($1::text, started_at AT TIME ZONE 'UTC') AS b,
+        SELECT date_trunc($1::text, started_at AT TIME ZONE $2::text) AS b,
                COALESCE(status, '') AS k,
                count(*) AS n
         FROM patch_executions
-        WHERE started_at >= $2 AND started_at < $3 AND mode = 'apply'
+        WHERE started_at >= $3 AND started_at < $4 AND mode = 'apply'
         GROUP BY 1, 2
         """,
-        unit, start, end,
+        unit, align_zone(unit, tz_name), start, end,
     ))
 
 
@@ -1105,8 +1233,9 @@ async def overview(
 # ---------------------------------------------------------------------------
 # Drill-down
 # ---------------------------------------------------------------------------
-def drill_bounds(unit: str, start: datetime) -> tuple[datetime, datetime]:
-    return start, advance(start, unit, 1)
+def drill_bounds(unit: str, start: datetime, *,
+                 tz_name: str = STORAGE_TZ) -> tuple[datetime, datetime]:
+    return start, advance(start, unit, 1, tz_name=tz_name)
 
 
 @dataclass(frozen=True)

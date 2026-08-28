@@ -16,8 +16,11 @@
 {% block content %}
 <h1>Detaliu · {{ value_label }}</h1>
 <p class="page-sub">
-  {{ bucket_from.strftime('%d.%m.%Y %H:%M') }} →
-  {{ bucket_to.strftime('%d.%m.%Y %H:%M') }} UTC ({{ spec.label }})
+  {# Marginea e cea din grafic, deci se scrie în același fus ca graficul —
+     altfel „intervalul" din titlu ar fi altul decât bara pe care s-a dat click.
+  #}
+  {{ bucket_from | ora('%d.%m.%Y %H:%M', with_zone=False) }} →
+  {{ bucket_to | ora('%d.%m.%Y %H:%M') }} ({{ spec.label }})
 </p>
 
 <p class="statline">
@@ -44,7 +47,7 @@
   <p>
     Partițiile <code>raw_events</code> se elimină la expirarea retenției, iar
     intervalul cerut e integral mai vechi decât cea mai veche partiție rămasă
-    ({% if raw_from %}{{ raw_from.strftime('%d.%m.%Y') }}{% else %}necunoscut{% endif %}).
+    ({% if raw_from %}{{ raw_from | ora('%d.%m.%Y', with_zone=False) }}{% else %}necunoscut{% endif %}).
     Agregatul din grafic rămâne corect — doar evenimentele individuale au fost
     aruncate. Tabelul de mai jos e gol pentru că nu s-a putut citi nimic, nu
     pentru că nu s-a întâmplat nimic.
@@ -65,12 +68,12 @@
     {% if window.trimmed %}
       Începutul intervalului e mai vechi decât cea mai veche partiție
       <code>raw_events</code> rămasă
-      ({% if raw_from %}{{ raw_from.strftime('%d.%m.%Y') }}{% else %}necunoscut{% endif %}),
+      ({% if raw_from %}{{ raw_from | ora('%d.%m.%Y', with_zone=False) }}{% else %}necunoscut{% endif %}),
       deci partea aceea a fost ștearsă de retenție, nu sărită.
     {% endif %}
     Fereastra citită efectiv:
-    <strong>{{ window.start.strftime('%d.%m.%Y %H:%M') }} →
-    {{ window.end.strftime('%d.%m.%Y %H:%M') }}</strong> UTC.
+    <strong>{{ window.start | ora('%d.%m.%Y %H:%M', with_zone=False) }} →
+    {{ window.end | ora('%d.%m.%Y %H:%M') }}</strong>.
     {% if window.capped and not window.trimmed %}
     Pentru detaliu pe tot intervalul, alege un bucket mai mic în grafic.
     {% endif %}
@@ -83,13 +86,16 @@
 <div class="table-scroll">
   <table>
     <thead>
-      <tr><th>Deschis (UTC)</th><th>Severitate</th><th>Stare</th><th>Titlu</th>
+      {# Marcajul de fus stă în capul coloanei, o dată, nu pe fiecare rând:
+         200 de rânduri cu „EEST" e zgomot, iar o coloană fără niciun marcaj e
+         o oră pe care cititorul trebuie s-o ghicească. #}
+      <tr><th>Deschis ({{ tz_name or 'ora gazdei' }})</th><th>Severitate</th><th>Stare</th><th>Titlu</th>
           <th>Actor</th><th class="num">Detecții</th></tr>
     </thead>
     <tbody>
       {% for r in rows %}
       <tr class="{{ 'row-bad' if r.severity in ('high', 'critical') }}">
-        <td class="mono nowrap small">{{ r.first_detection_at.strftime('%d.%m %H:%M') }}</td>
+        <td class="mono nowrap small">{{ r.first_detection_at | ora('%d.%m %H:%M', with_zone=False) }}</td>
         <td>{{ severity_ro.get(r.severity, r.severity) }}</td>
         <td class="muted">{{ r.status }}</td>
         <td><a href="/incidents/{{ r.id }}">{{ r.title }}</a></td>
@@ -108,13 +114,13 @@
 <div class="table-scroll">
   <table>
     <thead>
-      <tr><th>Pornit (UTC)</th><th>Stare</th><th>Asset</th><th>Risc</th>
+      <tr><th>Pornit ({{ tz_name or 'ora gazdei' }})</th><th>Stare</th><th>Asset</th><th>Risc</th>
           <th class="num">Durată</th><th>Verificare finală</th><th>Motiv</th></tr>
     </thead>
     <tbody>
       {% for r in rows %}
       <tr class="{{ 'row-bad' if r.status in ('failed', 'rollback_failed', 'aborted') }}">
-        <td class="mono nowrap small">{{ r.started_at.strftime('%d.%m %H:%M') }}</td>
+        <td class="mono nowrap small">{{ r.started_at | ora('%d.%m %H:%M', with_zone=False) }}</td>
         <td><a href="/patches/{{ r.plan_id }}">{{ exec_status_ro.get(r.status, r.status) }}</a></td>
         <td>{{ r.asset_name or '—' }}</td>
         <td class="muted">{{ r.risk_level or '—' }}</td>
@@ -138,13 +144,13 @@
 <div class="table-scroll">
   <table class="events">
     <thead>
-      <tr><th>Când (UTC)</th><th>Sursă</th><th>Acțiune</th><th>Sursă IP</th>
+      <tr><th>Când ({{ tz_name or 'ora gazdei' }})</th><th>Sursă</th><th>Acțiune</th><th>Sursă IP</th>
           <th>Detaliu</th><th class="num">Stare</th></tr>
     </thead>
     <tbody>
       {% for r in rows %}
       <tr>
-        <td class="mono nowrap">{{ r.ts.strftime('%m-%d %H:%M:%S') }}</td>
+        <td class="mono nowrap">{{ r.ts | ora('%m-%d %H:%M:%S', with_zone=False) }}</td>
         <td class="muted">{{ r.source }}</td>
         <td>{{ r.action }}</td>
         <td class="mono">

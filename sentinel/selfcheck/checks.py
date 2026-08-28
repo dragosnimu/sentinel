@@ -557,7 +557,64 @@ async def check_alerting(db: Database, cfg: Config) -> list[CheckResult]:
     Checked last and reported loudest: if this is broken, nothing else in this
     file can reach anyone, and the operator's impression of "no news is good
     news" becomes exactly wrong.
+
+    ## Ce se numără, și de ce nu „rândurile vechi din coadă"
+
+    Verificarea asta a numărat, până pe 28 august 2026, ORICE rând `queued` mai
+    vechi de zece minute. Măsurat pe gazdă: chat-ul avea `21:00-09:00`, iar în
+    fiecare noapte șase mesaje cu `attempts = 0` stăteau în coadă între 22:53 și
+    07:04 — ținute de fereastra de liniște, exact cum spune `_push_notifications`
+    că trebuie ținute. Constatarea era falsă în fiecare noapte.
+
+    Și se hrănea singură: trei din cele șase aveau `dedup_key` =
+    `selfcheck:alert:telegram`, adică erau chiar alerta despre coada blocată.
+    Fereastra ținea mesaje, verificarea le număra, raportul intra în coadă,
+    numărul creștea.
+
+    Întrebarea corectă nu e „sunt mesaje vechi în coadă?", ci **„poate o alertă
+    să ajungă la operator?"**. Deci se numără rândurile pe care expeditorul
+    **le-ar fi trimis și nu le-a trimis**:
+
+      * `attempts > 0` — expeditorul a încercat, iar rândul e tot acolo. Blocat,
+        la orice oră. Azi nimic nu re-pune în coadă un rând eșuat, deci starea
+        asta înseamnă că altceva s-a stricat; o condiție în plus
+        (`error IS NOT NULL`) ar fi doar încă un fel de a nu vedea.
+      * `attempts = 0`, fereastră de liniște activă pe TOATE chat-urile, fel
+        care se poate amuta — **ținut prin proiectare**. Nu se numără.
+      * `attempts = 0` în orice altă situație — trebuia trimis și n-a plecat în
+        zece minute. Blocat. Aici intră și `NEVER_MUTED_KINDS`: un mesaj scutit
+        de liniște rămas în coadă e chiar defecțiunea.
+
+    Regula de liniște NU e rescrisă aici. `telegram/quiet.py` o deține —
+    `silent_chats`, `all_silent`, `passes_anyway` — și e chemată, nu copiată.
+
+    ## De ce `alert:telegram` NU intră în `NEVER_MUTED_KINDS`
+
+    Întrebarea e legitimă: o alertă care spune „alertele nu ajung la tine" și
+    care e ea însăși amuțită pare inutilă prin construcție.
+
+    Nu intră, din motivul care decide: **scutirea de la liniște nu poate face
+    mesajul ăsta să ajungă.** Vestea despre coadă călătorește PRIN coadă, iar
+    fiecare cauză care o produce oprește și livrarea ei — `attempts > 0`
+    înseamnă că trimiterea eșuează, `attempts = 0` în afara ferestrei înseamnă
+    că bucla de golire nu mai rulează. În amândouă, un rând scutit stă exact
+    unde stătea. S-ar câștiga un singur lucru: trezirea operatorului noaptea
+    pentru o defecțiune despre care oricum nu i se poate spune.
+
+    Cazul în care canalul chiar e orb — botul oprit — nu depinde de listă: e
+    `down`, deci `critical`, deci trece deja prin `NEVER_MUTED_SEVERITIES`, iar
+    `runner._announce` îl scoate pe lângă bot cu `_send_direct`. Garanția că
+    tăcerea se vede vine din afara gazdei, de la martorul extern, nu dintr-o
+    scutire în plus.
+
+    Și e exact motivul pentru care `"selfcheck"` a fost SCOS din listă pe 24
+    august: lista e o proprietate de siguranță ținută deliberat scurtă, iar
+    fiecare adăugare o diluează. O adăugare care nu schimbă nimic observabil ar
+    fi cel mai prost fel de diluare.
     """
+    from sentinel.db.repo import chats as chats_repo
+    from sentinel.telegram import quiet
+
     if not cfg.telegram.enabled:
         return [CheckResult("alert:telegram", "Telegram", "unknown",
                             detail="dezactivat în configurație")]
@@ -571,16 +628,74 @@ async def check_alerting(db: Database, cfg: Config) -> list[CheckResult]:
 
     # Delivery, not just liveness: a bot that is running but failing to send is
     # the same outcome as one that is stopped.
-    stuck = int(await db.fetchval(
-        "SELECT count(*) FROM notifications WHERE state = 'queued' "
-        "AND enqueued_at < now() - interval '10 minutes'") or 0)
-    if stuck:
+    #
+    # Grupat în S'L, nu listat rând cu rând: felurile și severitățile sunt
+    # câteva, deci răspunsul are câteva rânduri oricât de mare ar fi coada. Așa
+    # nu e nevoie nici de un LIMIT — care ar face cifra raportată o minciună —
+    # nici de reguli de liniște scrise a doua oară, în S'L. `channel` filtrează
+    # exact rândurile pe care le golește `_push_notifications`.
+    try:
+        groups = await db.fetch(
+            "SELECT severity, kind, attempts > 0 AS tried, count(*)::bigint AS n "
+            "FROM notifications "
+            "WHERE state = 'queued' AND channel = 'telegram' "
+            "AND enqueued_at < now() - interval '10 minutes' "
+            "GROUP BY 1, 2, 3")
+    except Exception as exc:  # noqa: BLE001
+        return [CheckResult("alert:telegram", "Coada de notificări", "unknown",
+                            detail=f"coada nu a putut fi citită: {str(exc)[:100]}",
+                            action="journalctl -u sentinel-telegram -n 50")]
+
+    if not groups:
+        return [CheckResult("alert:telegram", "Canalul Telegram", "ok",
+                            detail="activ", facts={"blocked": 0, "held": 0})]
+
+    # Liniștea se citește numai dacă există un rând neîncercat de judecat.
+    holding = False
+    if any(not g["tried"] for g in groups):
+        chat_ids = list(cfg.telegram.allowed_chat_ids)
+        try:
+            prefs = await chats_repo.all_prefs(db)
+        except Exception as exc:  # noqa: BLE001
+            # „Nu știu dacă e liniște" nu e „e în regulă": fără răspunsul ăsta
+            # nu se poate spune despre niciun rând dacă e ținut sau blocat.
+            return [CheckResult(
+                "alert:telegram", "Coada de notificări", "unknown",
+                detail=f"preferințele de liniște nu s-au putut citi: {str(exc)[:80]}",
+                action="journalctl -u sentinel-telegram -n 50")]
+        silent = quiet.silent_chats(
+            now=datetime.now(timezone.utc), chat_ids=chat_ids, prefs=prefs,
+            default_schedule=cfg.telegram.quiet_hours,
+            default_tz=cfg.telegram.timezone)
+        # `bool(chat_ids)` nu e de prisos. Fără niciun chat permis, `all_silent`
+        # întoarce adevărat — pentru EXPEDITOR e alegerea bună, ține rândul în
+        # loc să-l piardă. Pentru verificare ar însemna „liniște" acolo unde
+        # adevărul e „nu există destinatar": nimic nu ajunge la nimeni, iar un
+        # „ok" ar fi chiar minciuna pe care verificarea există s-o prevină.
+        holding = bool(chat_ids) and quiet.all_silent(silent, chat_ids)
+
+    blocked = held = 0
+    for g in groups:
+        n = int(g["n"] or 0)
+        if not g["tried"] and holding and not quiet.passes_anyway(g["severity"], g["kind"]):
+            held += n
+        else:
+            blocked += n
+
+    if blocked:
         return [CheckResult(
             "alert:telegram", "Notificări blocate în coadă", "degraded",
-            detail=f"{stuck} mesaje în așteptare de peste 10 minute",
+            detail=f"{blocked} mesaje care trebuiau trimise stau de peste 10 minute",
             action="journalctl -u sentinel-telegram -n 50",
-            facts={"stuck": stuck})]
-    return [CheckResult("alert:telegram", "Canalul Telegram", "ok", detail="activ")]
+            facts={"blocked": blocked, "held": held})]
+    return [CheckResult(
+        "alert:telegram", "Canalul Telegram", "ok",
+        # Coada nu e goală, și se spune. „Activ" singur ar acoperi și cazul în
+        # care fereastra ține ceva, iar operatorul care se uită dimineața la
+        # coadă n-ar avea de unde ști că verificarea a văzut-o și a ales.
+        detail=(f"activ; {held} mesaje ținute de fereastra de liniște"
+                if held else "activ"),
+        facts={"blocked": 0, "held": held})]
 
 
 async def check_running_code_is_current() -> list[CheckResult]:

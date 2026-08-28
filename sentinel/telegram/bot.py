@@ -914,20 +914,15 @@ async def _quiet_chats(cfg: Config, db: Database) -> set[int]:
     from sentinel.db.repo import chats as chats_repo
     from sentinel.telegram import quiet
 
-    now = datetime.now(_tz.utc)
-    prefs = await chats_repo.all_prefs(db)
-    default = cfg.telegram.quiet_hours
-    out: set[int] = set()
-    for chat_id in cfg.telegram.allowed_chat_ids:
-        p = prefs.get(chat_id)
-        sched = quiet.parse_schedule((p.quiet_hours if p else None) or default or "")
-        state = quiet.evaluate(now=now, schedule=sched,
-                               muted_until=p.muted_until if p else None,
-                               tz_name=(p.timezone if p else None)
-                               or getattr(cfg.telegram, "timezone", None))
-        if state.muted:
-            out.add(chat_id)
-    return out
+    # Regula însăși stă în `quiet.silent_chats`, nu aici: de când o citește și
+    # autoverificarea, o a doua copie ar fi însemnat două răspunsuri la aceeași
+    # întrebare, iar cel care se desparte primul e mereu cel netestat.
+    return set(quiet.silent_chats(
+        now=datetime.now(_tz.utc),
+        chat_ids=cfg.telegram.allowed_chat_ids,
+        prefs=await chats_repo.all_prefs(db),
+        default_schedule=cfg.telegram.quiet_hours,
+        default_tz=getattr(cfg.telegram, "timezone", None)))
 
 
 async def _broadcast(app: Application, cfg: Config, text: str,
@@ -1093,9 +1088,9 @@ async def _push_notifications(app: Application, cfg: Config, db: Database,
         "SELECT id, severity, title, body, kind, buttons FROM notifications "
         "WHERE state = 'queued' AND channel = 'telegram' "
         "ORDER BY enqueued_at LIMIT 5")
-    from sentinel.telegram.quiet import passes_anyway
+    from sentinel.telegram.quiet import all_silent, passes_anyway
 
-    all_quiet = quiet_chats >= set(cfg.telegram.allowed_chat_ids)
+    all_quiet = all_silent(quiet_chats, cfg.telegram.allowed_chat_ids)
 
     for row in rows:
         # ȚINUT, nu marcat eșuat. Distincția asta lipsea, iar consecința era că

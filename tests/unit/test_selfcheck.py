@@ -12,6 +12,7 @@ matter here are about the checks that do not ask systemd.
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import re
 from datetime import datetime, timedelta, timezone
@@ -60,7 +61,12 @@ def _cfg(**over):
         # in fusul configurat, si il citesc de aici — un dublu fara campul asta
         # ar fi facut verificarea sa pice pe altceva decat pe ce testeaza.
         timezone="Europe/Bucharest",
-        telegram=SimpleNamespace(enabled=True, allowed_chat_ids=[1]),
+        # `quiet_hours` și `timezone` sunt pe `TelegramConfig`-ul real și le
+        # citește `check_alerting` DIRECT, nu printr-un getattr cu rezervă —
+        # vezi `test_no_check_reads_a_config_field_that_does_not_exist`. Fără
+        # ele aici, verificarea ar pica pe altceva decât pe ce se testează.
+        telegram=SimpleNamespace(enabled=True, allowed_chat_ids=[1],
+                                 quiet_hours=None, timezone="Europe/Bucharest"),
         response=SimpleNamespace(auto_block=SimpleNamespace(enabled=False), admin_ip=""),
         # Ca pe `Config`-ul real: `check_ship_lag` citește `cfg.ship.enabled`
         # direct, nu printr-un `getattr` cu valoare de rezervă — vezi
@@ -292,11 +298,308 @@ def test_a_stopped_bot_is_down(monkeypatch):
     assert "nicio alertă nu poate ajunge" in result.detail
 
 
+class _QueueDB:
+    """O bază care răspunde separat la cele două întrebări ale lui `check_alerting`.
+
+    `_DB` întoarce aceleași rânduri la orice `fetch`, iar verificarea face acum
+    două citiri diferite — coada și preferințele de liniște. Un dublu care le
+    confundă ar fi răspuns la a doua cu rânduri de notificări, adică ar fi picat
+    dintr-un motiv care n-are nicio legătură cu ce se testează.
+    """
+
+    def __init__(self, groups=None, prefs=None, prefs_error=None, queue_error=None):
+        self._groups = groups or []
+        self._prefs = prefs or []
+        self._prefs_error = prefs_error
+        self._queue_error = queue_error
+        self.sql: list[str] = []
+
+    async def fetch(self, sql, *a):
+        self.sql.append(sql)
+        if "FROM notifications" in sql:
+            if self._queue_error:
+                raise self._queue_error
+            return self._groups
+        if "telegram_chats" in sql:
+            if self._prefs_error:
+                raise self._prefs_error
+            return self._prefs
+        return []
+
+
+def _grp(n=1, severity="high", kind="selfcheck", tried=False):
+    return {"severity": severity, "kind": kind, "tried": tried, "n": n}
+
+
+def _chat(chat_id=1, quiet_hours=None, muted_until=None, timezone_name=None):
+    """Un rând din `telegram_chats`, în forma pe care o citește `all_prefs`."""
+    return {"chat_id": chat_id, "quiet_hours": quiet_hours,
+            "muted_until": muted_until, "timezone": timezone_name,
+            "quiet_set_at": None}
+
+
+# Fereastra măsurată pe gazdă pe 28 august 2026: `21:00-09:00`, fusul chat-ului.
+NIGHT = "21:00-09:00"
+
+
+def _at(local_hhmm: str, monkeypatch):
+    """Fixează ceasul verificării la o oră LOCALĂ din fusul chat-ului."""
+    from zoneinfo import ZoneInfo
+
+    h, m = (int(x) for x in local_hhmm.split(":"))
+    moment = datetime(2026, 8, 27, h, m, tzinfo=ZoneInfo("Europe/Bucharest"))
+
+    class _Clock(datetime):
+        @classmethod
+        def now(cls, tz_=None):
+            return moment.astimezone(tz_) if tz_ else moment
+
+    monkeypatch.setattr(checks, "datetime", _Clock)
+
+
 def test_a_running_bot_that_delivers_nothing_is_degraded(monkeypatch):
-    """Running and failing to send is the same outcome as stopped."""
+    """Running and failing to send is the same outcome as stopped.
+
+    `attempts > 0` înseamnă că expeditorul a încercat și rândul e tot în coadă.
+    Nicio fereastră de liniște nu explică asta.
+    """
     monkeypatch.setattr(checks, "_systemctl", lambda *a: "active")
-    result = run(checks.check_alerting(_DB(val=12), _cfg()))[0]
+    db = _QueueDB(groups=[_grp(n=12, tried=True)])
+    result = run(checks.check_alerting(db, _cfg()))[0]
     assert result.status == "degraded"
+    assert result.facts["blocked"] == 12
+
+
+def test_a_message_held_by_quiet_hours_is_not_reported_as_blocked(monkeypatch):
+    """Constatarea falsă din fiecare noapte, și bucla care se hrănea singură.
+
+    Pe gazdă, chat-ul avea `21:00-09:00`. Șase mesaje `selfcheck` cu
+    `attempts = 0` stăteau în coadă între 22:53 și 07:04, ținute de fereastră
+    exact cum spune `_push_notifications` că trebuie ținute — iar trei dintre
+    ele erau chiar alerta „notificări blocate în coadă". Numărate, verificarea
+    raporta în fiecare noapte că nu mai ajunge nimic la operator, apoi punea
+    raportul ăla în aceeași coadă și îl număra data viitoare.
+
+    Un operator care primește asta 200 de nopți la rând oprește canalul.
+    """
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "active")
+    _at("23:30", monkeypatch)
+    db = _QueueDB(groups=[_grp(n=6, severity="high", kind="selfcheck")],
+                  prefs=[_chat(1, quiet_hours=NIGHT, timezone_name="Europe/Bucharest")])
+    result = run(checks.check_alerting(db, _cfg()))[0]
+    assert result.status == "ok", result.detail
+    assert result.facts == {"blocked": 0, "held": 6}
+    # Și se SPUNE, ca „activ" să nu acopere o coadă care chiar are ceva în ea.
+    assert "6 mesaje ținute" in result.detail
+
+
+def test_a_never_muted_message_still_in_the_queue_IS_blocked(monkeypatch):
+    """Scutirea de la liniște nu e o scuză de a rămâne în coadă.
+
+    Un `login` — „cineva tocmai a intrat pe server" — trece prin orice fereastră
+    prin construcție. Dacă unul e tot `queued` după zece minute, nu-l ține
+    liniștea: îl ține o defecțiune, iar aia e chiar vestea pe care operatorul
+    trebuie s-o primească.
+    """
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "active")
+    _at("23:30", monkeypatch)
+    db = _QueueDB(groups=[_grp(n=1, severity="high", kind="login")],
+                  prefs=[_chat(1, quiet_hours=NIGHT, timezone_name="Europe/Bucharest")])
+    result = run(checks.check_alerting(db, _cfg()))[0]
+    assert result.status == "degraded"
+    assert result.facts["blocked"] == 1
+
+
+def test_a_critical_message_still_in_the_queue_IS_blocked(monkeypatch):
+    """A doua jumătate a scutirii: severitatea, nu felul.
+
+    `NEVER_MUTED_SEVERITIES` e ce duce mai departe „o parte din Sentinel s-a
+    oprit" în timpul ferestrei. Ținut acolo, ar fi exact vestea care nu are voie
+    să aștepte până la 09:00.
+    """
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "active")
+    _at("23:30", monkeypatch)
+    db = _QueueDB(groups=[_grp(n=2, severity="critical", kind="selfcheck")],
+                  prefs=[_chat(1, quiet_hours=NIGHT, timezone_name="Europe/Bucharest")])
+    result = run(checks.check_alerting(db, _cfg()))[0]
+    assert result.status == "degraded"
+    assert result.facts["blocked"] == 2
+
+
+def test_outside_the_quiet_window_everything_old_still_counts(monkeypatch):
+    """Reparația nu are voie să orbească verificarea ziua.
+
+    La 10:00, cu fereastra `21:00-09:00` încheiată, un mesaj de zece minute în
+    coadă înseamnă că bucla de golire nu mai rulează. Aia e defecțiunea pentru
+    care există verificarea, și trebuie să se vadă exact ca înainte.
+    """
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "active")
+    _at("10:00", monkeypatch)
+    db = _QueueDB(groups=[_grp(n=6, severity="high", kind="selfcheck")],
+                  prefs=[_chat(1, quiet_hours=NIGHT, timezone_name="Europe/Bucharest")])
+    result = run(checks.check_alerting(db, _cfg()))[0]
+    assert result.status == "degraded"
+    assert result.facts == {"blocked": 6, "held": 0}
+
+
+def test_quiet_hours_do_not_excuse_a_message_the_sender_already_tried(monkeypatch):
+    """Noaptea, un rând cu `attempts > 0` e tot blocat.
+
+    Ținerea nu atinge `attempts` — asta scrie `_push_notifications`, și pe asta
+    se sprijină deosebirea. Dacă fereastra ar acoperi și rândurile încercate, o
+    livrare care eșuează toată noaptea ar fi raportată ca liniște.
+    """
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "active")
+    _at("23:30", monkeypatch)
+    db = _QueueDB(groups=[_grp(n=3, kind="selfcheck", tried=True),
+                          _grp(n=6, kind="selfcheck", tried=False)],
+                  prefs=[_chat(1, quiet_hours=NIGHT, timezone_name="Europe/Bucharest")])
+    result = run(checks.check_alerting(db, _cfg()))[0]
+    assert result.status == "degraded"
+    assert result.facts == {"blocked": 3, "held": 6}
+
+
+def test_a_quiet_window_on_only_one_of_two_chats_holds_nothing(monkeypatch):
+    """Dacă măcar un chat ascultă, mesajul pleacă la el.
+
+    `_push_notifications` ține numai când TOATE chat-urile permise tac. O
+    verificare care s-ar mulțumi cu „unul e pe mute" ar ierta o coadă care chiar
+    nu se golește către cineva care aștepta.
+    """
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "active")
+    _at("23:30", monkeypatch)
+    db = _QueueDB(groups=[_grp(n=4, kind="selfcheck")],
+                  prefs=[_chat(1, quiet_hours=NIGHT, timezone_name="Europe/Bucharest")])
+    result = run(checks.check_alerting(db, _cfg(
+        telegram=SimpleNamespace(enabled=True, allowed_chat_ids=[1, 2],
+                                 quiet_hours=None, timezone="Europe/Bucharest"))))[0]
+    assert result.status == "degraded"
+    assert result.facts["blocked"] == 4
+
+
+def test_with_no_allowed_chat_a_full_queue_is_not_called_quiet(monkeypatch):
+    """„Nu e nimeni de anunțat" nu e „e liniște".
+
+    Fără niciun chat permis, expeditorul ține fiecare rând la nesfârșit — pentru
+    el e alegerea bună, nu pierde alerta. Citit ca liniște de verificare, ar
+    însemna un „canalul e activ" veșnic peste o coadă din care nu pleacă nimic
+    către nimeni.
+    """
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "active")
+    _at("23:30", monkeypatch)
+    db = _QueueDB(groups=[_grp(n=9, kind="selfcheck")], prefs=[])
+    result = run(checks.check_alerting(db, _cfg(
+        telegram=SimpleNamespace(enabled=True, allowed_chat_ids=[],
+                                 quiet_hours=NIGHT, timezone="Europe/Bucharest"))))[0]
+    assert result.status == "degraded"
+    assert result.facts["blocked"] == 9
+
+
+def test_a_chat_without_a_row_of_its_own_falls_back_to_the_deployment_window(monkeypatch):
+    """Un chat care n-a folosit niciodată `/mute` tace tot după fereastra livrată.
+
+    `telegram_chats` primește un rând abia la prima preferință. Dacă verificarea
+    ar citi „fără rând" ca „fără liniște", mesajele ținute de fereastra din
+    `sentinel.yaml` ar fi numărate ca blocate — aceeași alarmă falsă în fiecare
+    noapte, doar pe altă cale.
+    """
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "active")
+    _at("23:30", monkeypatch)
+    db = _QueueDB(groups=[_grp(n=6, kind="selfcheck")], prefs=[])
+    result = run(checks.check_alerting(db, _cfg(
+        telegram=SimpleNamespace(enabled=True, allowed_chat_ids=[1],
+                                 quiet_hours=NIGHT, timezone="Europe/Bucharest"))))[0]
+    assert result.status == "ok", result.detail
+    assert result.facts == {"blocked": 0, "held": 6}
+
+
+def test_a_message_held_by_an_adhoc_mute_is_not_reported_as_blocked(monkeypatch):
+    """`/mute 2h` ține la fel de legitim ca fereastra recurentă.
+
+    Operatorul care cere liniște pentru o oră de mentenanță nu trebuie să
+    primească, la sfârșitul ei, o alertă care spune că mesajele lui erau
+    blocate. Ar fi un canal care se plânge de exact ce i s-a cerut să facă.
+    """
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "active")
+    _at("12:00", monkeypatch)
+    pana = datetime(2026, 8, 27, 13, 0, tzinfo=timezone.utc)
+    db = _QueueDB(groups=[_grp(n=5, kind="selfcheck")],
+                  prefs=[_chat(1, muted_until=pana)])
+    result = run(checks.check_alerting(db, _cfg()))[0]
+    assert result.status == "ok", result.detail
+    assert result.facts == {"blocked": 0, "held": 5}
+
+
+def test_unreadable_quiet_preferences_are_unknown_not_ok(monkeypatch):
+    """Dacă nu se poate citi liniștea, nu se poate ști dacă e ținut sau blocat.
+
+    „Nu știu" și „e în regulă" sunt stări diferite. Colapsate, o eroare de bază
+    ar produce un canal raportat sănătos exact când nimeni nu mai poate spune
+    dacă e.
+    """
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "active")
+    db = _QueueDB(groups=[_grp(n=6, kind="selfcheck")],
+                  prefs_error=RuntimeError("relation telegram_chats does not exist"))
+    result = run(checks.check_alerting(db, _cfg()))[0]
+    assert result.status == "unknown"
+    assert "liniște" in result.detail
+
+
+def test_an_unreadable_queue_is_unknown_not_ok(monkeypatch):
+    """Aceeași regulă pentru coada însăși: o citire care crapă nu e „activ"."""
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "active")
+    db = _QueueDB(queue_error=RuntimeError("connection reset"))
+    result = run(checks.check_alerting(db, _cfg()))[0]
+    assert result.status == "unknown"
+
+
+def test_the_check_does_not_write_its_own_quiet_hours_rule():
+    """Două mecanisme de aceeași formă se despart tăcut.
+
+    Regula de liniște e a lui `telegram/quiet.py`. Dacă verificarea ar începe
+    să parseze singură ferestre sau să-și scrie propria listă de feluri scutite,
+    cele două ar putea da răspunsuri diferite despre același mesaj, iar cel
+    greșit ar fi mereu cel pe care nu-l testează nimeni.
+    """
+    import inspect
+    import textwrap
+
+    # Numai CODUL, fără docstring și fără comentarii: `ast.unparse` le lasă pe
+    # amândouă afară. Altfel testul ar fi căzut pe propria explicație a deciziei
+    # — o aserțiune despre proză, nu despre ce execută funcția, adică exact
+    # felul de test care trece sau pică din motive greșite.
+    fn = ast.parse(textwrap.dedent(inspect.getsource(checks.check_alerting))).body[0]
+    corp = fn.body[1:] if isinstance(fn.body[0], ast.Expr) else fn.body
+    cod = "\n".join(ast.unparse(n) for n in corp)
+
+    assert "quiet" in cod, "proba a ieșit goală: nu s-a extras corpul funcției"
+    for interzis in ("NEVER_MUTED", "parse_window", "parse_schedule", "Window("):
+        assert interzis not in cod, (
+            f"`check_alerting` conține `{interzis}` — liniștea e rescrisă aici, "
+            f"deci există două reguli care se pot contrazice")
+    for chemat in ("quiet.silent_chats", "quiet.all_silent", "quiet.passes_anyway"):
+        assert chemat in cod, f"`{chemat}` nu mai e chemat; regula a fost copiată?"
+
+
+def test_alert_telegram_is_deliberately_not_exempt_from_quiet_hours():
+    """Decizia, ținută de un test ca să nu se schimbe din reflex.
+
+    O alertă despre coadă călătorește PRIN coadă: fiecare cauză care o produce
+    oprește și livrarea ei, deci scutirea de la liniște n-ar face-o să ajungă —
+    ar trezi operatorul pentru o veste care tot nu pleacă. Cazul în care canalul
+    chiar e orb e `down`, deci `critical`, deci trece prin
+    `NEVER_MUTED_SEVERITIES`, iar `runner._announce` îl scoate pe lângă bot.
+
+    Dacă cineva decide altfel, decizia se ia aici, nu prin adăugarea tăcută a
+    unui șir într-o listă de siguranță ținută deliberat scurtă.
+    """
+    from sentinel.telegram import quiet
+
+    assert "selfcheck" not in quiet.NEVER_MUTED_KINDS
+    assert "alert:telegram" not in quiet.NEVER_MUTED_KINDS
+    assert not quiet.passes_anyway("high", "selfcheck")
+    # Jumătatea care TREBUIE să treacă trece în continuare.
+    assert quiet.passes_anyway("critical", "selfcheck")
 
 
 # --- isolation --------------------------------------------------------------
