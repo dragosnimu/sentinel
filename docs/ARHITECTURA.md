@@ -162,6 +162,40 @@ funcționează chiar dacă nginx sau TLS e stricat — ceea ce contează, pentru
 Telegram este canalul de urgență, iar momentul în care ai cea mai mare nevoie de
 el este momentul în care dashboard-ul e inaccesibil.
 
+**Fiecare mesaj spune de pe ce instanță vine.** Un rând în față, `Instanță:
+eticheta (id scurt)` — aceeași convenție ca panoul (`nameOf` din ruta de check a
+agregatorului), cu id-ul tăiat la 8 caractere. Eticheta vine din
+`instance_label` din `sentinel.yaml` și e opțională; fără ea rămâne id-ul scurt,
+care e un prefix al lui `/etc/sentinel/instance_id`. Nu e configurabil pornit/
+oprit: pe 27 august 2026 două instanțe au alertat în același chat nouăsprezece
+ore, iar ziua în care apare a doua instanță e exact ziua în care nimeni nu se
+gândește să pornească lucrul care le deosebește. Dacă identitatea nu se poate
+citi, mesajul pleacă și spune că nu știe. Vezi `sentinel/telegram/identity.py`.
+
+### 3.10b Ora afișată e ora ta, și spune care e
+
+Baza scrie și păstrează UTC — asta nu se schimbă. Ce se citește, se citește în
+`timezone` din `sentinel.yaml`, cu marcajul fusului în text: `24.08 08:54
+EEST`. Un singur mecanism, `sentinel/util/tz.py`, folosit de Telegram, de panou
+(filtrul Jinja `| ora`), de autoverificare și de detecție; `telegram/quiet.py`
+îl reexportă, ca ferestrele de liniște și orele afișate să nu poată fi de acord
+pe jumătate.
+
+Nu e doar afișare. Fereastra „ore nefirești" din `detect/logins.py` se compara
+cu ora **UTC**, iar cu Bucureștiul la UTC+3 asta însemna 04:00–08:59 local: o
+logare la 08:54 era semnalată, iar una la 03:00 — 00:00 UTC — nu era semnalată
+deloc. Se evaluează acum în fusul configurat.
+
+`ZoneInfo`, niciodată un decalaj fix: un decalaj n-are reguli de oră de vară,
+deci în noaptea în care se schimbă ceasurile totul se calculează cu o oră
+greșit. Un fus necunoscut coboară zgomotos și **nu** face ora să dispară din
+mesaj — marcajul spune în ce fus a ieșit până la urmă.
+
+**Excepție, deliberată:** graficele din pagina de rapoarte etichetează capete de
+găleată aliniate în UTC (`date_trunc(..., AT TIME ZONE 'UTC')`). O galeată
+zilnică scrisă în ora locală ar numi „27.08" un interval care începe la 03:00,
+deci acolo etichetele rămân UTC până când se decide mutarea granițelor.
+
 ### 3.11 Suricata, gated pe RAM
 
 Dacă `MemAvailable` era sub 2,5 GB la instalare, Suricata nu se instalează, iar

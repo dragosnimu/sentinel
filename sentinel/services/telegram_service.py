@@ -75,6 +75,15 @@ def _send_test(cfg: Config, sec: Secrets, message: str | None) -> int:
     text = message or (
         f"Sentinel {__version__}: test de canal. Dacă vezi acest mesaj, "
         "alertele ajung la tine.")
+    # Named, like everything else this agent sends. This message is the one the
+    # operator gets at the END OF AN INSTALL, which is exactly the moment a
+    # second instance starts sharing a chat with the first — on 27 August 2026
+    # it did, for nineteen hours, and nothing said which was which. Plain text,
+    # not HTML: `parse_mode` is None here on purpose (see the docstring of
+    # `telegram/direct.py`), so markup would arrive as four literal characters.
+    from sentinel.telegram.identity import stamp, tag_for
+
+    text = stamp(text, tag_for(cfg), html=False)
     outcomes = asyncio.run(send_to_chats(token, cfg.telegram.allowed_chat_ids, text))
 
     for outcome in outcomes:

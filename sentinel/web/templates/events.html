@@ -73,7 +73,7 @@
     <tbody>
     {% for r in rows %}
       <tr class="{{ 'row-bad' if r.action_class == 'bad' }}">
-        <td class="mono nowrap">{{ r.ts.strftime('%m-%d %H:%M:%S') }}</td>
+        <td class="mono nowrap">{{ r.ts | ora('%m-%d %H:%M:%S') }}</td>
         <td class="muted">{{ r.source }}</td>
         <td><span class="pill pill-{{ r.action_class or 'off' }}">{{ r.action }}</span></td>
         <td class="mono">

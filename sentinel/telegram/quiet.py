@@ -41,9 +41,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sentinel.logging_setup import get_logger
+from sentinel.util.tz import host_zone_name, zone  # noqa: F401
 
 log = get_logger(__name__)
 
@@ -405,55 +405,15 @@ def parse_duration(text: str) -> timedelta | None:
     return min(delta, MAX_ADHOC)
 
 
-def host_zone_name() -> str | None:
-    """The host's IANA zone name, or None if it cannot be determined.
-
-    Worth the effort over `datetime.now().astimezone()`, which yields a FIXED
-    offset captured at that instant — "+03:00", not "Europe/Bucharest". A fixed
-    offset has no DST rules, so on the night the clocks change, the end of a
-    22:00-06:00 window is computed an hour wrong. Once a year, in the dark,
-    is exactly when nobody is watching.
-
-    Both supported families are covered: Debian writes the name to
-    /etc/timezone, RHEL symlinks /etc/localtime into the zoneinfo tree.
-    """
-    from pathlib import Path
-
-    try:
-        text = Path("/etc/timezone").read_text(encoding="utf-8").strip()
-        if text:
-            return text
-    except OSError:
-        pass
-    try:
-        target = Path("/etc/localtime").resolve()
-        parts = target.parts
-        if "zoneinfo" in parts:
-            return "/".join(parts[parts.index("zoneinfo") + 1:]) or None
-    except OSError:
-        pass
-    return None
-
-
-def zone(name: str | None) -> ZoneInfo | timezone:
-    """The zone the window is read in. Falls back loudly, never silently to UTC.
-
-    A three-hour error here silences the wrong three hours — the evening the
-    operator wanted covered stays loud and the morning goes quiet.
-    """
-    for candidate, explicit in ((name, True), (host_zone_name(), False)):
-        if not candidate:
-            continue
-        try:
-            return ZoneInfo(candidate)
-        except (ZoneInfoNotFoundError, ValueError):
-            if explicit:
-                log.error("unknown timezone, falling back to host local",
-                          extra={"timezone": candidate})
-    # Last resort: a fixed offset from the running process. Correct right now,
-    # and wrong for one night per year at the DST boundary.
-    local = datetime.now().astimezone().tzinfo
-    return local if local is not None else timezone.utc
+# `host_zone_name` și `zone` AU STAT aici și acum vin din `sentinel/util/tz.py`.
+# Mutate, nu copiate: de când ora afișată din Telegram, detecția de logări,
+# panoul web și autoverificarea folosesc aceeași regulă de fus, o a doua copie
+# ar fi însemnat două reguli care se despart tăcut — iar cea care se desparte
+# prima e mereu cea pe care n-o testează nimeni.
+#
+# Reexportate sub aceleași nume fiindcă `telegram/bot.py` cheamă `quiet.zone(...)`
+# în `_fmt_local`, iar textul care anunță fusul în confirmarea lui `/mute` și ora
+# pe care o tipărește nu au voie să vină din două funcții diferite.
 
 
 @dataclass(frozen=True)

@@ -69,7 +69,12 @@ async def _main() -> int:
                 inchise = await logins_repo.close_stale_sessions(db)
                 if inchise:
                     log.info("stale sessions closed", extra={"count": inchise})
-                anuntate = await detect_logins.announce_new_sessions(db)
+                # Fusul CONFIGURAT, nu cel al gazdei: fereastra de „ore
+                # nefirești" se evaluează în el, iar o diferență între cele
+                # două ar muta fereastra cu tot decalajul fără ca nimic s-o
+                # spună. Vezi `ODD_HOURS` în `detect/logins.py`.
+                anuntate = await detect_logins.announce_new_sessions(
+                    db, tz_name=cfg.timezone)
                 rezumate = await detect_logins.summarise_closed_sessions(db)
                 if anuntate or rezumate:
                     log.info("login alerts queued",

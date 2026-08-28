@@ -63,7 +63,7 @@
           {{ status_ro.get(r.status, r.status) }}
           {%- if r.notified_at %} <span class="tag" title="Trimis pe Telegram">📨</span>{% endif -%}
         </td>
-        <td class="mono nowrap small">{{ r.last_detection_at.strftime('%d.%m %H:%M') }}</td>
+        <td class="mono nowrap small">{{ r.last_detection_at | ora }}</td>
         {% if can_act %}
         <td class="nowrap">
           {% if r.status in ('open', 'acknowledged') %}

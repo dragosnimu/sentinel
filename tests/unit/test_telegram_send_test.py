@@ -48,6 +48,7 @@ import pytest
 
 from sentinel.config import Config, Secrets, TelegramConfig
 from sentinel.services import telegram_service
+from sentinel.telegram.identity import PREFIX as INSTANCE_PREFIX
 
 # Short and obviously fake, on purpose. `tests/security/test_repo_is_sanitised.py`
 # greps every tracked file for token-shaped strings, and a fixture that trips
@@ -155,7 +156,13 @@ def test_send_test_sends_once_and_never_starts_a_poller(
     for req in telegram_api.requests:
         assert req["method"] == "POST"
         assert req["url"] == f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        assert req["body"]["text"] == "instalat"
+        # The operator's message arrives whole, under one line saying which
+        # installation sent it. That line was added after 27 August 2026, when
+        # two Sentinels shared one chat for nineteen hours and no message said
+        # which was which — and the end of an install is exactly the moment the
+        # second one appears. See sentinel/telegram/identity.py.
+        assert req["body"]["text"].startswith(INSTANCE_PREFIX)
+        assert req["body"]["text"].endswith("\ninstalat")
     out = capsys.readouterr().out
     assert "chat 111: delivered (message_id=7)" in out
 
@@ -172,7 +179,13 @@ def test_the_installer_message_is_not_parsed_as_markup(
     assert telegram_service.main(["--send-test", "--message", text]) == 0
     for req in telegram_api.requests:
         assert "parse_mode" not in req["body"]
-        assert req["body"]["text"] == text
+        assert req["body"]["text"].endswith("\n" + text)
+        # The instance line obeys the same rule as the body it precedes: with
+        # no parse_mode, an `<i>` would be four literal characters in front of
+        # the proof that alerting works.
+        antet = req["body"]["text"].split("\n")[0]
+        assert antet.startswith(INSTANCE_PREFIX)
+        assert "<i>" not in antet
 
 
 def test_a_refusal_from_telegram_is_never_reported_as_delivered(

@@ -39,6 +39,7 @@ from typing import Any
 
 from sentinel.db.engine import Database
 from sentinel.logging_setup import get_logger
+from sentinel.util import tz
 
 log = get_logger(__name__)
 
@@ -59,6 +60,16 @@ KIND = "login"
 #: o logare la 4 dimineața rămâne o surpriză chiar dacă s-a mai întâmplat de
 #: două ori. Fereastra e largă dinadins — cine lucrează seara nu are de ce să
 #: primească o alertă în fiecare seară.
+#:
+#: **01:00–05:59 ÎN FUSUL CONFIGURAT**, nu în UTC. Până pe 28 august 2026 se
+#: compara cu `opened_at.astimezone(timezone.utc).hour`, iar cu
+#: `Europe/Bucharest` la UTC+3 fereastra însemna de fapt 04:00–08:59 ora locală.
+#: Amândouă capetele erau greșite, și amândouă s-au întâmplat:
+#:
+#:   * o logare la 08:54 local (05:54 UTC) era semnalată drept „oră nefirească";
+#:   * o logare la 03:00 local e 00:00 UTC, care NU e în `range(1, 6)`, deci
+#:     trecea complet neremarcată — exact ora la care ar intra cineva pe furiș
+#:     era singura care tăcea.
 ODD_HOURS = frozenset(range(1, 6))
 
 #: De câte ori trebuie văzut un fapt ca să nu mai fie o surpriză.
@@ -104,13 +115,21 @@ async def _seen_before(db: Database, kind: str, value: str) -> bool:
     return not row["inserted"] and row["seen_count"] > FAMILIAR_AFTER
 
 
-async def classify(db: Database, session: dict[str, Any]) -> list[str]:
+async def classify(db: Database, session: dict[str, Any], *,
+                   tz_name: str | None) -> list[str]:
     """Ce e neașteptat la sesiunea asta. Lista goală înseamnă „nimic".
 
     Fiecare fapt se înregistrează în linia de referință chiar dacă e nou — de
     asta a doua logare de pe aceeași adresă nu mai surprinde. Consecința, spusă
     pe față: o adresă de atacator devine „obișnuită" după prima ei logare. Ce
     face asta suportabil e că PRIMA a produs și mesaj, și incident.
+
+    `tz_name` e obligatoriu și nu are valoare implicită. O valoare implicită
+    aici ar fi fost fusul gazdei, care e de obicei același cu cel configurat și
+    uneori nu — iar când nu e, fereastra de ore se mută cu tot decalajul și
+    nimic nu spune asta. Apelantul are configurația; e ținut să o dea.
+    `None` rămâne o valoare validă și înseamnă „nu s-a configurat niciunul",
+    caz în care `tz.zone` coboară pe fusul gazdei.
     """
     surprize: list[str] = []
 
@@ -123,10 +142,15 @@ async def classify(db: Database, session: dict[str, Any]) -> list[str]:
         surprize.append(f"adresă nemaivăzută: {ip}")
 
     opened = session.get("opened_at")
-    if isinstance(opened, datetime) and opened.astimezone(timezone.utc).hour in ODD_HOURS:
+    if isinstance(opened, datetime) and tz.hour(opened, tz_name) in ODD_HOURS:
         # Ora NU trece prin linia de referință: e o margine, nu un obicei. Cine
         # se loghează la 4 dimineața de trei ori nu face ora aia obișnuită.
-        surprize.append(f"oră nefirească: {opened.astimezone(timezone.utc):%H:%M} UTC")
+        #
+        # Ora se citește ȘI se scrie în același fus. Scrise în fusuri diferite,
+        # mesajul ar fi spus „oră nefirească: 05:54" despre o decizie luată pe
+        # 08:54 — adică operatorul n-ar fi putut nici măcar să constate că
+        # regula e greșită.
+        surprize.append(f"oră nefirească: {tz.fmt(opened, '%H:%M', tz_name=tz_name)}")
 
     return surprize
 
@@ -134,16 +158,19 @@ async def classify(db: Database, session: dict[str, Any]) -> list[str]:
 # ---------------------------------------------------------------------------
 # Mesajele
 # ---------------------------------------------------------------------------
-def open_text(session: dict[str, Any], surprize: list[str]) -> str:
+def open_text(session: dict[str, Any], surprize: list[str], *,
+              tz_name: str | None) -> str:
     cine = session.get("username") or "cont necunoscut"
     de_unde = session.get("src_ip") or "local"
-    cand = session["opened_at"].astimezone(timezone.utc)
     linii = [
         "🔐 <b>Logare pe server</b>",
         f"Cont: <code>{cine}</code>",
         f"De la: <code>{de_unde}</code>",
         f"Terminal: <code>{session.get('terminal') or '—'}</code>",
-        f"Când: {cand:%Y-%m-%d %H:%M} UTC",
+        # În fusul configurat, cu marcajul lui. „21:15 UTC" despre ceva
+        # întâmplat la miezul nopții îl pune pe operator să adune trei ore în
+        # cap, la ora la care e cel mai puțin capabil s-o facă.
+        f"Când: {tz.fmt(session['opened_at'], tz.LONG, tz_name=tz_name)}",
     ]
     if surprize:
         linii.append("")
@@ -212,7 +239,7 @@ VALUES ('telegram', $1::text, $2::text, $3::text, $4::text, $5::text, $6::jsonb)
 """
 
 
-async def announce_new_sessions(db: Database) -> int:
+async def announce_new_sessions(db: Database, *, tz_name: str | None) -> int:
     """Pune în coadă un mesaj pentru fiecare sesiune interactivă neanunțată.
 
     Starea trăiește în COLOANĂ (`alerted_at`), nu în memoria procesului: un bot
@@ -230,14 +257,14 @@ async def announce_new_sessions(db: Database) -> int:
     trimise = 0
     for row in rows:
         session = dict(row)
-        surprize = await classify(db, session)
+        surprize = await classify(db, session, tz_name=tz_name)
         # Severitatea vine din SURPRIZĂ, nu din faptul logării. O logare
         # obișnuită e o informație; una de pe o adresă nemaivăzută e altceva.
         severitate = "high" if surprize else "info"
         await db.execute(
             _ENQUEUE, severitate, KIND,
             f"login:{session['session_key']}:{session['opened_at'].isoformat()}",
-            "Logare pe server", open_text(session, surprize),
+            "Logare pe server", open_text(session, surprize, tz_name=tz_name),
             json.dumps(_buttons(session["id"], session.get("src_ip"))))
         await db.execute(
             "UPDATE login_sessions SET alerted_at = now(), unexpected = $2::text[] "

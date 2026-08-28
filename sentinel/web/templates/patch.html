@@ -143,7 +143,7 @@
         <td>{{ 'dry-run' if e.mode == 'dry_run' else 'aplicare' }}</td>
         <td>{{ e.status }}</td>
         <td class="num">{{ ((e.duration_ms or 0) / 1000) | round(1) }}s</td>
-        <td class="mono nowrap small">{{ e.started_at.strftime('%d.%m %H:%M') }}</td>
+        <td class="mono nowrap small">{{ e.started_at | ora }}</td>
         <td class="muted small">{{ (e.error or '')[:80] }}</td>
       </tr>
       {% endfor %}

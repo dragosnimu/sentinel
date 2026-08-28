@@ -133,6 +133,7 @@ async def announce(cfg: Any, findings: Iterable[dict[str, Any]]) -> int:
     try:
         from sentinel.config import get_secrets
         from sentinel.telegram.direct import send_to_chats
+        from sentinel.telegram.identity import stamp, tag_for
 
         token = get_secrets().get("TELEGRAM_BOT_TOKEN")
         chats = list(cfg.telegram.allowed_chat_ids or [])
@@ -141,9 +142,15 @@ async def announce(cfg: Any, findings: Iterable[dict[str, Any]]) -> int:
             return 0
 
         host = getattr(cfg, "hostname", None) or "serverul monitorizat"
+        # Numele instanței se pune AICI, nu în `build_message`: calea asta
+        # ocolește botul, deci și `StampingBot`, care marchează tot ce pleacă
+        # prin proces. `host` de mai sus e o etichetă din configurație și nu
+        # deosebește două instalări — pe 27 august 2026 două Sentinel-uri au
+        # alertat în același chat și niciun mesaj nu spunea de pe care mașină
+        # venea. Vezi `sentinel/telegram/identity.py`.
+        text = stamp(build_message(items, host=str(host)), tag_for(cfg))
         outcomes = await send_to_chats(
-            token, chats, build_message(items, host=str(host)),
-            parse_mode="HTML", timeout_s=TIMEOUT_S)
+            token, chats, text, parse_mode="HTML", timeout_s=TIMEOUT_S)
 
         delivered = [o.chat_id for o in outcomes if o.ok]
         failed = [o.describe() for o in outcomes if not o.ok]

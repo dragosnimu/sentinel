@@ -927,17 +927,24 @@ def test_the_status_reply_shows_an_active_pause_and_when_it_lifts(monkeypatch):
 def test_a_naive_datetime_is_not_read_silently_as_process_local_time(caplog):
     """Baza intoarce `timestamptz`, deci un moment naiv inseamna ca altceva e
     stricat. `.astimezone()` l-ar citi tacut in ora procesului — corect pe gazda,
-    gresit oriunde altundeva, si fara nimic care sa spuna ca s-a ghicit."""
+    gresit oriunde altundeva, si fara nimic care sa spuna ca s-a ghicit.
+
+    Avertismentul vine acum din `sentinel.util.tz`, unde s-a mutat corpul lui
+    `_fmt_local` odata cu restul afisarilor de ora. Testul urmareste logger-ul
+    ala, nu pe cel al botului: lasat pe cel vechi, ar fi trecut verde peste o
+    ghicire tacuta — adica fix bifa falsa impotriva careia e scris.
+    """
     import logging
 
     pytest.importorskip("telegram")
     from sentinel.telegram import bot
 
     naive = datetime(2026, 12, 24, 20, 30)
-    with caplog.at_level(logging.WARNING, logger="sentinel.telegram.bot"):
+    with caplog.at_level(logging.WARNING, logger="sentinel.util.tz"):
         shown = bot._fmt_local(naive, BUCHAREST_ZONE)
 
-    assert shown == "24.12 22:30", shown       # citit ca UTC, afisat la Bucuresti
+    # Citit ca UTC, afisat la Bucuresti — in decembrie, deci EET (UTC+2).
+    assert shown == "24.12 22:30 EET", shown
     assert any("naive datetime" in r.getMessage() for r in caplog.records)
 
 
@@ -949,4 +956,21 @@ def test_the_format_is_the_one_the_rest_of_the_bot_already_uses():
     from sentinel.telegram import bot
 
     moment = datetime(2026, 8, 9, 21, 5, tzinfo=UTC)
-    assert bot._fmt_local(moment, "UTC") == "09.08 21:05"
+    assert bot._fmt_local(moment, "UTC") == "09.08 21:05 UTC"
+
+
+def test_every_shown_moment_carries_its_zone():
+    """O ora fara marcaj e o afirmatie pe care cititorul trebuie s-o ghiceasca.
+
+    Intre UTC si EEST sunt trei ore: destul cat operatorul sa creada ca liniste
+    se ridica la 06:00 cand se ridica la 09:00. Si marcajul e AL MOMENTULUI, nu
+    al zonei — aceeasi zona e EET iarna si EEST vara, iar un marcaj fix ar fi
+    gresit jumatate de an.
+    """
+    pytest.importorskip("telegram")
+    from sentinel.telegram import bot
+
+    iarna = datetime(2026, 12, 24, 20, 30, tzinfo=UTC)
+    vara = datetime(2026, 8, 9, 18, 5, tzinfo=UTC)
+    assert bot._fmt_local(iarna, BUCHAREST_ZONE).endswith(" EET")
+    assert bot._fmt_local(vara, BUCHAREST_ZONE).endswith(" EEST")

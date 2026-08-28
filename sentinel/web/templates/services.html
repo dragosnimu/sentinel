@@ -54,7 +54,7 @@
         <td class="muted">{{ r.asset.kind }}{% if r.asset.port %} :{{ r.asset.port }}{% endif %}</td>
         <td>
           <span class="dot dot-{{ r.dot }}"></span> {{ r.status_ro }}
-          {% if r.open_since %}<div class="muted small">din {{ r.open_since.strftime('%H:%M') }} UTC</div>{% endif %}
+          {% if r.open_since %}<div class="muted small">din {{ r.open_since | ora('%H:%M') }}</div>{% endif %}
         </td>
         <td class="num mono">{{ r.latency_ms ~ ' ms' if r.latency_ms is not none else '—' }}</td>
         <td class="num mono">

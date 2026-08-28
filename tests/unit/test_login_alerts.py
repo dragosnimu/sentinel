@@ -25,6 +25,15 @@ from sentinel.telegram.quiet import NEVER_MUTED_KINDS, passes_anyway
 
 NOW = datetime(2026, 8, 24, 14, 0, tzinfo=timezone.utc)
 
+#: Fusul CONFIGURAT, dat explicit la fiecare apel.
+#:
+#: Nu e decor. Pana pe 28 august 2026 fereastra de ore nefiresti se evalua pe ora
+#: UTC, iar cu `Europe/Bucharest` la UTC+3 asta insemna 04:00-08:59 local: o
+#: logare la 08:54 era semnalata, iar una la 03:00 nu era. O fixtura fara fus
+#: explicit ar lua fusul GAZDEI, deci acelasi test ar da alt rezultat pe masina
+#: de dezvoltare si in CI — adica n-ar mai pazi nimic.
+TZ = "Europe/Bucharest"
+
 
 def run(coro):
     return asyncio.run(coro)
@@ -118,7 +127,7 @@ def _sesiune(**over) -> dict:
 # ---------------------------------------------------------------------------
 def test_an_interactive_session_is_announced() -> None:
     db = _DB([_sesiune()])
-    assert run(detect_logins.announce_new_sessions(db)) == 1
+    assert run(detect_logins.announce_new_sessions(db, tz_name=TZ)) == 1
     assert len(db.queued) == 1
     corp = db.queued[0]["body"]
     assert "operator" in corp
@@ -134,7 +143,7 @@ def test_a_session_without_a_terminal_is_NOT_announced() -> None:
     acoperire și nu e.
     """
     db = _DB([_sesiune(interactive=False, terminal="ssh")])
-    assert run(detect_logins.announce_new_sessions(db)) == 0
+    assert run(detect_logins.announce_new_sessions(db, tz_name=TZ)) == 0
     assert db.queued == []
 
 
@@ -145,8 +154,8 @@ def test_a_session_is_announced_exactly_once() -> None:
     repornit invers n-ar anunța deloc.
     """
     db = _DB([_sesiune()])
-    run(detect_logins.announce_new_sessions(db))
-    run(detect_logins.announce_new_sessions(db))
+    run(detect_logins.announce_new_sessions(db, tz_name=TZ))
+    run(detect_logins.announce_new_sessions(db, tz_name=TZ))
     assert len(db.queued) == 1
 
 
@@ -157,50 +166,116 @@ def test_a_known_account_from_a_known_address_is_not_a_surprise() -> None:
     db = _DB([_sesiune()], baseline={("account", "operator"),
                                      ("src_ip", "198.51.100.7")})
     # A doua vedere: prima intrare le-a înregistrat, a doua le găsește.
-    run(detect_logins.classify(db, _sesiune()))
-    surprize = run(detect_logins.classify(db, _sesiune()))
+    run(detect_logins.classify(db, _sesiune(), tz_name=TZ))
+    surprize = run(detect_logins.classify(db, _sesiune(), tz_name=TZ))
     assert surprize == []
 
 
 def test_a_new_account_is_a_surprise() -> None:
     db = _DB([])
-    surprize = run(detect_logins.classify(db, _sesiune(username="intrus")))
+    surprize = run(detect_logins.classify(db, _sesiune(username="intrus"), tz_name=TZ))
     assert any("cont" in s for s in surprize)
 
 
 def test_a_new_address_is_a_surprise() -> None:
     db = _DB([])
-    surprize = run(detect_logins.classify(db, _sesiune(src_ip="203.0.113.9")))
+    surprize = run(detect_logins.classify(db, _sesiune(src_ip="203.0.113.9"), tz_name=TZ))
     assert any("adres" in s for s in surprize)
 
 
-@pytest.mark.parametrize("ora,surprinde", [(3, True), (4, True), (14, False),
-                                           (22, False), (6, False)])
-def test_an_odd_hour_is_a_surprise_even_when_it_repeats(ora: int, surprinde: bool) -> None:
-    """Ora e o MARGINE, nu un obicei.
+def _la_ora_locala(ora: int, minut: int = 0) -> datetime:
+    """Momentul UTC al unei ore de PERETE din fusul configurat.
+
+    Construit prin `ZoneInfo`, nu prin scăderea a trei ore: în august
+    Bucureștiul e UTC+3 și în decembrie UTC+2, iar un decalaj fix scris în test
+    ar face testul să spună altceva decât spune codul exact în noaptea în care
+    se schimbă ceasurile.
+    """
+    from zoneinfo import ZoneInfo
+
+    local = datetime(2026, 8, 24, ora, minut, tzinfo=ZoneInfo(TZ))
+    return local.astimezone(timezone.utc)
+
+
+@pytest.mark.parametrize("ora_locala,surprinde", [
+    (0, False), (1, True), (3, True), (5, True), (6, False),
+    (9, False), (14, False), (22, False),
+])
+def test_an_odd_hour_is_a_surprise_even_when_it_repeats(
+        ora_locala: int, surprinde: bool) -> None:
+    """Ora e o MARGINE, nu un obicei — și e ora LOCALĂ.
 
     Cine se loghează la 4 dimineața de trei ori nu face ora aia obișnuită — spre
     deosebire de cont și de adresă, care se învață. Trecută prin linia de
     referință, a doua logare de noapte ar fi tăcută, adică exact cazul pe care îl
     caută cineva.
+
+    Parametrii sunt ore de PERETE în fusul configurat. Erau ore UTC, și de aia
+    testul trecea verde peste o fereastră deplasată cu trei ore: `range(1, 6)`
+    comparat cu ora UTC însemna 04:00-08:59 la București.
     """
     db = _DB([])
-    moment = NOW.replace(hour=ora)
-    run(detect_logins.classify(db, _sesiune(opened_at=moment)))
-    surprize = run(detect_logins.classify(db, _sesiune(opened_at=moment)))
+    moment = _la_ora_locala(ora_locala)
+    run(detect_logins.classify(db, _sesiune(opened_at=moment), tz_name=TZ))
+    surprize = run(detect_logins.classify(db, _sesiune(opened_at=moment), tz_name=TZ))
     assert any("oră" in s for s in surprize) is surprinde
+
+
+def test_a_login_at_0854_local_is_not_an_odd_hour() -> None:
+    """Falsul pozitiv măsurat pe gazdă: operatorul s-a logat la 08:54 și a
+    primit „oră nefirească: 05:54 UTC".
+
+    Opt fără cinci dimineața nu e o oră nefirească. O alertă care se înșală în
+    mod evident e o alertă pe care operatorul învață să o ignore — iar asta e
+    una dintre cele care nu se pot tăcea niciodată.
+    """
+    db = _DB([])
+    surprize = run(detect_logins.classify(
+        db, _sesiune(opened_at=_la_ora_locala(8, 54)), tz_name=TZ))
+    assert not any("oră" in s for s in surprize), surprize
+
+
+def test_a_login_at_three_in_the_morning_is_an_odd_hour() -> None:
+    """Falsul negativ, care e cel grav: 03:00 la București e 00:00 UTC, care NU
+    e în `range(1, 6)`.
+
+    Adică exact ora la care ar intra cineva pe furiș era singura care tăcea.
+    Sesiunea are cont și adresă cunoscute dinadins, ca singurul motiv posibil de
+    surpriză să fie ora.
+    """
+    db = _DB([], baseline={("account", "operator"),
+                           ("src_ip", "198.51.100.7")})
+    surprize = run(detect_logins.classify(
+        db, _sesiune(opened_at=_la_ora_locala(3)), tz_name=TZ))
+    assert any("oră" in s for s in surprize), surprize
+
+
+def test_the_hour_is_written_in_the_same_zone_it_was_judged_in() -> None:
+    """Citită într-un fus și scrisă în altul, alerta ar fi spus „oră nefirească:
+    05:54" despre o decizie luată pe 08:54 — iar operatorul n-ar fi avut cum să
+    constate că regula e greșită.
+
+    Marcajul de fus e în text din același motiv: o oră fără el e o afirmație pe
+    care cititorul trebuie s-o ghicească.
+    """
+    db = _DB([])
+    surprize = run(detect_logins.classify(
+        db, _sesiune(opened_at=_la_ora_locala(3, 17)), tz_name=TZ))
+    ora = next(s for s in surprize if "oră" in s)
+    assert "03:17" in ora, ora
+    assert "EEST" in ora, ora
 
 
 def test_a_surprise_raises_the_severity() -> None:
     """O logare obișnuită e o informație; una de pe o adresă nemaivăzută nu."""
     db = _DB([_sesiune()])
-    run(detect_logins.announce_new_sessions(db))
+    run(detect_logins.announce_new_sessions(db, tz_name=TZ))
     assert db.queued[0]["severity"] == "high"
 
     db2 = _DB([_sesiune()], baseline={("account", "operator"),
                                       ("src_ip", "198.51.100.7")})
-    run(detect_logins.classify(db2, _sesiune()))
-    run(detect_logins.announce_new_sessions(db2))
+    run(detect_logins.classify(db2, _sesiune(), tz_name=TZ))
+    run(detect_logins.announce_new_sessions(db2, tz_name=TZ))
     assert db2.queued[0]["severity"] == "info"
 
 
@@ -226,7 +301,7 @@ def test_an_ordinary_alert_is_still_mutable() -> None:
 # ---------------------------------------------------------------------------
 def test_the_alert_carries_the_two_buttons() -> None:
     db = _DB([_sesiune()])
-    run(detect_logins.announce_new_sessions(db))
+    run(detect_logins.announce_new_sessions(db, tz_name=TZ))
     butoane = json.loads(db.queued[0]["buttons"])
     date = [b["data"] for b in butoane]
     assert "cancel" in date
@@ -237,7 +312,7 @@ def test_the_button_carries_the_SESSION_not_the_address() -> None:
     """Un buton care ar purta adresa poate fi apăsat peste trei ore, când de pe
     ea e conectat altcineva. Sesiunea e ce trebuie închis."""
     db = _DB([_sesiune(id=77)])
-    run(detect_logins.announce_new_sessions(db))
+    run(detect_logins.announce_new_sessions(db, tz_name=TZ))
     butoane = json.loads(db.queued[0]["buttons"])
     nteu = [b for b in butoane if b["data"].startswith("nteu:")][0]
     assert nteu["data"] == "nteu:77"
@@ -248,7 +323,7 @@ def test_a_session_without_an_address_gets_no_kill_button() -> None:
     """O logare pe consola locală n-are ce bloca, iar un buton care nu poate
     face ce promite e mai rău decât lipsa lui."""
     db = _DB([_sesiune(src_ip=None, terminal="tty1")])
-    run(detect_logins.announce_new_sessions(db))
+    run(detect_logins.announce_new_sessions(db, tz_name=TZ))
     butoane = json.loads(db.queued[0]["buttons"])
     assert not any(b["data"].startswith("nteu:") for b in butoane)
 

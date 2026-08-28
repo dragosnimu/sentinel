@@ -56,6 +56,10 @@ class _DB:
 def _cfg(**over):
     base = SimpleNamespace(
         ai=SimpleNamespace(enabled=True),
+        # Ca pe `Config`-ul real. Constatarile care tiparesc un moment il scriu
+        # in fusul configurat, si il citesc de aici — un dublu fara campul asta
+        # ar fi facut verificarea sa pice pe altceva decat pe ce testeaza.
+        timezone="Europe/Bucharest",
         telegram=SimpleNamespace(enabled=True, allowed_chat_ids=[1]),
         response=SimpleNamespace(auto_block=SimpleNamespace(enabled=False), admin_ip=""),
         # Ca pe `Config`-ul real: `check_ship_lag` citește `cfg.ship.enabled`
@@ -1662,7 +1666,10 @@ def test_a_row_the_rule_forbids_means_the_filter_is_not_in_effect(monkeypatch):
     assert "nu e în vigoare" not in rv.detail
     # Faptul, dat operatorului: data celui mai recent rând interzis apare, ca s-o
     # poată lega de momentul îmbinării.
-    assert checks._ceas(NOW - timedelta(hours=40)) in rv.detail
+    # În fusul CONFIGURAT, cu marcajul lui: operatorul verifică momentul ăsta în
+    # `journalctl`, care îi arată ora locală. Dat în UTC, l-ar trimite să caute
+    # cu trei ore alături.
+    assert checks._ceas(NOW - timedelta(hours=40), "Europe/Bucharest") in rv.detail
     assert rv.facts["newest_forbidden"] == (NOW - timedelta(hours=40)).isoformat()
 
 

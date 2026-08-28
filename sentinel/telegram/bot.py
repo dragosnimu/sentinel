@@ -22,6 +22,11 @@ see `_publish_commands`), and is read back before anything says it worked. It
 was missing entirely until August 2026: twenty-three working commands, an empty
 `getMyCommands`, and an operator reporting a command as broken because nothing
 in the interface admitted it existed.
+
+Every message this process sends names the installation it came from. That is
+done once, in `StampingBot` at the foot of this file, because two Sentinels
+sharing one token is a thing that happens and the messages are otherwise
+indistinguishable — see `sentinel/telegram/identity.py`.
 """
 
 from __future__ import annotations
@@ -43,7 +48,14 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ExtBot,
+)
+from telegram.request import HTTPXRequest
 
 from sentinel import __version__
 from sentinel.config import Config, Secrets
@@ -58,6 +70,8 @@ from sentinel.errors import ExecutorRejected, ExecutorUnavailable
 from sentinel.logging_setup import get_logger
 from sentinel.respond import actions
 from sentinel.telegram import views
+from sentinel.util import tz
+from sentinel.telegram.identity import current_tag, stamp
 
 log = get_logger(__name__)
 
@@ -527,11 +541,13 @@ async def cmd_incident(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if inc is None:
         await update.message.reply_text("Incident inexistent.")
         return
+    cfg: Config = context.bot_data["cfg"]
     dets = await inc_repo.incident_detections(db, inc.id, limit=5)
     text = format_incident(inc)
     if dets:
         det_lines = "\n".join(
-            f"• {_esc(d['ts'].strftime('%H:%M:%S'))} {_esc(d['rule_id'])} [{_esc(d['severity'])}]"
+            f"• {_esc(tz.fmt(d['ts'], '%H:%M:%S', tz_name=cfg.timezone))} "
+            f"{_esc(d['rule_id'])} [{_esc(d['severity'])}]"
             for d in dets
         )
         text += f"\n\n<b>Detecții recente</b>\n{det_lines}"
@@ -729,23 +745,20 @@ def _fmt_local(moment: datetime, tz_name: str | None) -> str:
     in the blocklist listing. Nothing here is ever more than 24 hours away (an
     ad-hoc mute is capped, and a quiet window ends within the day), so the year
     would be noise.
-    """
-    if moment.tzinfo is None:
-        # Un `datetime` naiv nu e un moment, e o ghicitoare. `.astimezone()` l-ar
-        # citi tăcut în ora procesului, care pe gazdă e UTC și pe altă mașină nu
-        # e — adică o oră afișată greșit fără nimic care să spună asta. Baza
-        # întoarce `timestamptz`, deci dacă ajunge aici unul naiv, altceva e
-        # stricat și trebuie să se vadă.
-        log.warning("naive datetime in a chat reply, reading it as UTC",
-                    extra={"moment": moment.isoformat()})
-        moment = moment.replace(tzinfo=timezone.utc)
-    # `quiet.zone` decide ce înseamnă `tz_name=None` — fusul gazdei, după nume, cu
-    # eroare în jurnal dacă un fus cerut explicit nu există. Aceeași funcție e cea
-    # al cărei nume îl tipărește confirmarea lui `/mute`, deci ora afișată și
-    # fusul anunțat nu pot să nu fie de acord.
-    from sentinel.telegram import quiet
 
-    return moment.astimezone(quiet.zone(tz_name)).strftime("%d.%m %H:%M")
+    Poartă și marcajul de fus — `28.08 06:00 EEST`. Fără el, ora la care se
+    ridică liniștea e o afirmație pe care operatorul trebuie s-o ghicească, iar
+    între UTC și EEST sunt trei ore: destul cât să creadă că e liniște când nu e.
+
+    Corpul a fost mutat în `sentinel/util/tz.py`, care face aceleași două
+    lucruri și pentru restul afișărilor: tratează un `datetime` naiv cu o linie
+    de avertisment (baza întoarce `timestamptz`, deci unul naiv înseamnă că
+    altceva e stricat, iar `.astimezone()` l-ar citi tăcut în ora procesului) și
+    rezolvă `tz_name=None` la fusul gazdei. E aceeași funcție pe care o
+    reexportă `quiet.zone` și al cărei nume îl tipărește confirmarea lui
+    `/mute`, deci ora afișată și fusul anunțat nu pot să nu fie de acord.
+    """
+    return tz.fmt(moment, tz.SHORT, tz_name=tz_name)
 
 
 async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -926,6 +939,12 @@ async def _broadcast(app: Application, cfg: Config, text: str,
     A chat inside its quiet window is skipped — unless the message is one that
     is never muted, in which case the window is ignored entirely. See
     `telegram/quiet.py` for what qualifies and why.
+
+    `text` is NOT stamped with the instance name here, and that is deliberate:
+    `app.bot` is a `StampingBot`, which does it for every message leaving this
+    process, including the ones that never come through this function. Doing it
+    here as well would name the instance twice on this path and not at all on
+    the others.
     """
     from sentinel.telegram.quiet import passes_anyway
 
@@ -1313,9 +1332,105 @@ async def _publish_commands(app: Application, cfg: Config) -> None:
         log.warning("command menu reached no chat", extra={"chats": len(chat_ids)})
 
 
+# --- who is speaking --------------------------------------------------------
+# A sentinel of our own for "the caller passed nothing". PTB has one
+# (`telegram._utils.defaultvalue.DEFAULT_NONE`) and it is private; what matters
+# here is only the difference between forwarding an argument and not forwarding
+# it, so a local object does the job without reaching into the library.
+_KEEP: Any = object()
+
+
+class StampingBot(ExtBot):
+    """Puts the instance name on every message this process sends.
+
+    **Why here and not in each formatter.** On 27 August 2026 two Sentinels
+    alerted into the same chat for nineteen hours and no message said which
+    machine it came from; see `sentinel/telegram/identity.py` for the incident.
+    The fix has to hold for messages nobody has written yet, so it sits at the
+    transport rather than at the forty places that build text. Every route out
+    of this process funnels through exactly two Bot methods:
+
+      * `_broadcast`, `patch_flow.send_plan_for_approval` and every
+        `reply_text`/`reply_html` end at `Bot.send_message` — PTB's
+        `Message.reply_text` is a call to `self.get_bot().send_message`;
+      * every confirmation that replaces its own message — `query.
+        edit_message_text` in `on_callback`, `on_flush_callback` and
+        `patch_flow` — ends at `Bot.edit_message_text`, through
+        `Message.edit_text`.
+
+    That routing is a claim about the library, so it is checked rather than
+    assumed: `tests/unit/test_telegram_instance_tag.py` drives a real
+    `Message.reply_text` and a real `CallbackQuery.edit_message_text` through
+    this class and reads back the text PTB was handed.
+
+    The paths that do NOT come through here are the ones that do not use PTB at
+    all — `telegram/direct.py`, used by the self-check when the bot is the thing
+    that is down, by the vulnerability announcement and by
+    `sentinel telegram --send-test`. Those three stamp their own text, and
+    `tests/security/test_telegram_names_its_instance.py` is what refuses to let
+    a fourth appear unstamped.
+
+    `parse_mode` decides the markup of the header, not whether there is one: a
+    `<i>` in a message sent without `parse_mode` would be four literal
+    characters in front of the alert.
+    """
+
+    def __init__(self, token: str, *, label: Any = "", **kwargs: Any) -> None:
+        super().__init__(token, **kwargs)
+        # The label, not the finished tag: the tag is rebuilt per message so
+        # that an identity which becomes unreadable is admitted in the next
+        # message rather than in the next restart. See the module docstring of
+        # `telegram/identity.py`.
+        self._instance_label = label
+
+    def _stamp(self, text: str, parse_mode: Any) -> str:
+        return stamp(text, current_tag(self._instance_label),
+                     html=(parse_mode == ParseMode.HTML))
+
+    async def send_message(self, chat_id: Any, text: str,
+                           parse_mode: Any = _KEEP, **kwargs: Any) -> Any:
+        stamped = self._stamp(text, None if parse_mode is _KEEP else parse_mode)
+        if parse_mode is _KEEP:
+            return await super().send_message(chat_id, stamped, **kwargs)
+        return await super().send_message(chat_id, stamped, parse_mode, **kwargs)
+
+    async def edit_message_text(self, text: str, chat_id: Any = None,
+                                message_id: Any = None,
+                                inline_message_id: Any = None,
+                                parse_mode: Any = _KEEP, **kwargs: Any) -> Any:
+        stamped = self._stamp(text, None if parse_mode is _KEEP else parse_mode)
+        if parse_mode is _KEEP:
+            return await super().edit_message_text(
+                stamped, chat_id, message_id, inline_message_id, **kwargs)
+        return await super().edit_message_text(
+            stamped, chat_id, message_id, inline_message_id, parse_mode, **kwargs)
+
+
 def build_application(cfg: Config, secrets: Secrets) -> Application:
     token = secrets.require("TELEGRAM_BOT_TOKEN")
-    app = Application.builder().token(token).build()
+    # `.bot(...)` rather than `.token(...)`: the builder would otherwise
+    # construct a plain `ExtBot`, and nothing this process sent would say which
+    # installation sent it.
+    #
+    # The two request objects are NOT decoration and must not be dropped.
+    # `.token()` does not just pass the token along — it builds the bot through
+    # `ApplicationBuilder._build_ext_bot`, which hands it two `HTTPXRequest`s
+    # with connection pools of 256 (everything the bot sends) and 1 (long
+    # polling). `ExtBot(token)` on its own takes `HTTPXRequest`'s own default
+    # for both, which is 1. Handing the builder a bot without them would have
+    # quietly cut the outbound pool from 256 to one connection with a 1-second
+    # pool timeout — a change to how the alerting channel behaves under load,
+    # shipped as a side effect of adding a line of text to a message.
+    #
+    # The numbers are PTB's, written here because it does not expose them.
+    # `test_the_bot_is_configured_exactly_as_the_builder_would_have` compares
+    # this bot against one the builder really made, so a change on their side
+    # is a red test rather than a slower host.
+    app = Application.builder().bot(StampingBot(
+        token, label=cfg.instance_label,
+        request=HTTPXRequest(connection_pool_size=256),
+        get_updates_request=HTTPXRequest(connection_pool_size=1),
+    )).build()
 
     async def post_init(application: Application) -> None:
         db = Database(cfg)

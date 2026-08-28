@@ -37,7 +37,11 @@ def _update():
 
 
 def _ctx(db, args=None):
-    return SimpleNamespace(bot_data={"db": db, "cfg": SimpleNamespace()}, args=args or [])
+    # `timezone` e in configuratia reala si e citita de fiecare afisare de
+    # ora; o fixtura fara ea ar fi testat un obiect pe care procesul nu-l are.
+    return SimpleNamespace(
+        bot_data={"db": db, "cfg": SimpleNamespace(timezone="Europe/Bucharest")},
+        args=args or [])
 
 
 def run(c):
@@ -51,7 +55,7 @@ def test_an_http_path_cannot_inject_markup():
         {"ts": NOW, "source": "nginx", "action": "http",
          "src_ip": "203.0.113.9", "http_method": "GET",
          "http_path": "/<img src=x onerror=alert(1)>", "http_status": 404},
-        with_ip=True)
+        with_ip=True, tz_name="UTC")
     assert "<img" not in line
     assert "&lt;img" in line
 
@@ -60,7 +64,7 @@ def test_a_username_cannot_inject_markup():
     line = views._format_event(
         {"ts": NOW, "source": "sshd", "action": "auth_fail",
          "src_ip": "203.0.113.9", "username": "<b>root</b>"},
-        with_ip=True)
+        with_ip=True, tz_name="UTC")
     assert "<b>root</b>" not in line
     assert "&lt;b&gt;root" in line
 
@@ -72,7 +76,7 @@ def test_a_long_path_is_truncated_before_escaping():
     line = views._format_event(
         {"ts": NOW, "source": "nginx", "action": "http", "src_ip": "203.0.113.9",
          "http_method": "GET", "http_path": "<" * 200},
-        with_ip=True)
+        with_ip=True, tz_name="UTC")
     assert "&l;" not in line and "&" not in line.replace("&lt;", "")
 
 

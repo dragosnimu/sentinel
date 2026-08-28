@@ -153,7 +153,7 @@
             {%- else -%}{{ f.txt }}{%- endif -%}
           </p>
           <p class="feed-meta">
-            {{ f.at.strftime('%d.%m %H:%M') }}
+            {{ f.at | ora }}
             {%- if f.meta %} · <span class="mono">{{ f.meta }}</span>{% endif -%}
           </p>
         </div>
@@ -198,15 +198,21 @@
 <h2>Când te atacă</h2>
 <div class="card">
   <h2>Evenimente ostile pe oră (24 h)</h2>
+  {# Gălețile sunt aliniate în UTC, dar sunt ORARE, iar fusul configurat aici e
+     decalat cu un număr întreg de ore — deci capătul unei găleți scris în ora
+     locală e tot un început de oră, și eticheta rămâne adevărată. Nu e la fel
+     pentru gălețile zilnice și săptămânale din pagina de rapoarte: acolo o
+     etichetă locală ar numi „27.08" un interval care începe la 03:00, de aceea
+     acelea sunt lăsate marcate UTC. #}
   <div class="spark-hours" role="img"
        aria-label="Activitatea ostilă pe fiecare din ultimele 24 de ore">
     {% for h in hourly %}
       <span class="{{ 'peak' if h.pct >= 90 }}" style="height: {{ [h.pct, 3] | max }}%"
-            title="{{ h.ora.strftime('%H:%M') }} — {{ h.n }} evenimente"></span>
+            title="{{ h.ora | ora('%H:%M') }} — {{ h.n }} evenimente"></span>
     {% endfor %}
   </div>
   <p class="muted small">
-    {{ hourly[0].ora.strftime('%d.%m %H:%M') }} → {{ hourly[-1].ora.strftime('%d.%m %H:%M') }} UTC.
+    {{ hourly[0].ora | ora(with_zone=False) }} → {{ hourly[-1].ora | ora }}.
     Bara portocalie este vârful.
   </p>
 </div>
@@ -228,7 +234,7 @@
         <td class="num">{{ a.surse }}</td>
         <td class="muted small">{{ a.care }}</td>
         <td class="num">{{ a.ev }}</td>
-        <td class="mono nowrap small">{{ a.ultim.strftime('%d.%m %H:%M') }}</td>
+        <td class="mono nowrap small">{{ a.ultim | ora }}</td>
         <td>
           {%- if a.blocat %}<span class="pill pill-bad">blocat</span>
           {%- elif a.surse >= 3 %}<span class="pill pill-warn">multi-vector</span>

@@ -33,12 +33,22 @@ from sentinel.db.repo import events as events_repo
 from sentinel.db.repo import findings as findings_repo
 from sentinel.intel.links import cve_html, cve_links
 from sentinel.logging_setup import get_logger
+from sentinel.util import tz
 
 log = get_logger(__name__)
 
 # Telegram's hard limit is 4096. Stopping short leaves room for the "cut" note
 # and for the closing hint line, which are the two things worth keeping when a
 # message is too long.
+#
+# That headroom now has a third consumer, and it is worth the arithmetic:
+# `telegram/identity.py` puts one line naming the instance in front of every
+# message on its way out. That line is a 64-character label at most
+# (`MAX_LABEL`), an 8-character id, the prefix and the italics — 93 characters
+# with the newline, or 349 in the absurd case where every character of the
+# label is an `&` and escapes to five. Even then 3600 + 349 is under 4096, so
+# nothing clamped here can be pushed over the limit by it and `stamp` never has
+# to trim a message this function produced.
 MAX_MESSAGE = 3600
 
 _SEV_EMOJI = {"info": "⚪", "low": "🔵", "medium": "🟡", "high": "🟠", "critical": "🔴"}
@@ -247,6 +257,7 @@ async def cmd_events(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     happened".
     """
     db: Database = context.bot_data["db"]
+    cfg = context.bot_data["cfg"]
     arg = context.args[0] if context.args else ""
     src_ip = arg if _looks_like_ip(arg) else None
     minutes = 60
@@ -278,16 +289,20 @@ async def cmd_events(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     lines += ["", f"<b>Ultimele {len(rows)}</b>"]
     for e in rows:
-        lines.append(_format_event(e, with_ip=src_ip is None))
+        lines.append(_format_event(e, with_ip=src_ip is None,
+                                   tz_name=cfg.timezone))
 
     tail = ("\n<i>/evenimente &lt;ip&gt; pentru o singură sursă</i>"
             if not src_ip else f"\n<code>/block {esc(src_ip)}</code> pentru a bloca")
     await _reply(update, clamp(lines, tail=tail))
 
 
-def _format_event(e: dict, *, with_ip: bool) -> str:
+def _format_event(e: dict, *, with_ip: bool, tz_name: str | None) -> str:
     """One event, one line. Every field here is attacker-influenced."""
-    when = e["ts"].strftime("%H:%M:%S")
+    # Marcajul de fus stă pe FIECARE rând, nu o dată în antet. Cinci caractere
+    # pe rând sunt mai ieftine decât un antet care devine mincinos în noaptea
+    # schimbării ceasurilor, când aceeași listă conține și EET, și EEST.
+    when = tz.fmt(e["ts"], "%H:%M:%S", tz_name=tz_name)
     who = f" <code>{esc(e['src_ip'])}</code>" if with_ip and e.get("src_ip") else ""
     what = esc(e.get("action"))
     detail = ""
@@ -370,6 +385,7 @@ async def cmd_blocklist_full(update: Update, context: ContextTypes.DEFAULT_TYPE)
     from sentinel.respond import actions
 
     db: Database = context.bot_data["db"]
+    cfg = context.bot_data["cfg"]
     blocks = await blocklist_repo.list_active(db, limit=60)
     live = await actions.live_count()
 
@@ -381,7 +397,7 @@ async def cmd_blocklist_full(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lines = [f"🚫 <b>Blocklist</b> — {len(blocks)} în bază · "
              f"{live if live >= 0 else '?'} în nftables", ""]
     for b in blocks:
-        exp = b.expires_at.strftime("%d.%m %H:%M") if b.expires_at else "permanent"
+        exp = tz.fmt(b.expires_at, tz_name=cfg.timezone, missing="permanent")
         lines.append(f"<code>{esc(b.ip)}</code> · până la {exp}")
         lines.append(f"   {esc(b.reason or '—')} · {esc(b.created_by)}")
 
@@ -526,6 +542,7 @@ async def cmd_behaviour(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     from sentinel.predict import behaviour as bh
 
     db: Database = context.bot_data["db"]
+    cfg = context.bot_data["cfg"]
     rows = await bh.status(db)
 
     warm = [r for r in rows if r["warm"]]
@@ -557,6 +574,6 @@ async def cmd_behaviour(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             for r in recent:
                 lines.append(f"  <code>{esc(r['key'])}</code> · "
                              f"{esc(r['dimension'])} · "
-                             f"{r['first_seen'].strftime('%d.%m %H:%M')}")
+                             f"{tz.fmt(r['first_seen'], tz_name=cfg.timezone)}")
 
     await update.effective_message.reply_html(clamp("\n".join(lines)))

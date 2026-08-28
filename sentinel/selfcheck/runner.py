@@ -306,13 +306,21 @@ async def _send_direct(cfg: Config, text: str) -> None:
     try:
         from sentinel.config import get_secrets
         from sentinel.telegram.direct import send_to_chats
+        from sentinel.telegram.identity import stamp, tag_for
 
         token = get_secrets().get("TELEGRAM_BOT_TOKEN")
         if not token or not cfg.telegram.allowed_chat_ids:
             return
-        outcomes = await send_to_chats(
-            token, cfg.telegram.allowed_chat_ids,
+        # Stamped here because this path exists precisely to skip the bot, and
+        # `StampingBot` — which names the instance on everything the bot sends
+        # — is skipped with it. This is the one message that arrives when
+        # everything else is broken; "which machine" is the first thing it has
+        # to answer. See `sentinel/telegram/identity.py`.
+        body = stamp(
             "⚠️ <i>trimis direct de autoverificare — botul nu răspunde</i>\n\n" + text,
+            tag_for(cfg))
+        outcomes = await send_to_chats(
+            token, cfg.telegram.allowed_chat_ids, body,
             parse_mode="HTML", timeout_s=15)
         delivered = [o.chat_id for o in outcomes if o.ok]
         failed = [o.describe() for o in outcomes if not o.ok]

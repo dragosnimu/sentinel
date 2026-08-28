@@ -27,7 +27,7 @@
         <td class="mono">{{ b.ip }}</td>
         <td class="muted truncate" title="{{ b.reason }}">{{ b.reason }}</td>
         <td class="muted">{{ b.created_by }}</td>
-        <td class="mono nowrap">{{ b.expires_at.strftime('%m-%d %H:%M') if b.expires_at else 'permanent' }}</td>
+        <td class="mono nowrap">{{ b.expires_at | ora('%m-%d %H:%M', missing='permanent') }}</td>
         {% if can_unblock %}
         <td>
           <form method="post" action="/blocklist/unblock" class="inline">
@@ -53,7 +53,7 @@
     {% for b in history %}
       <tr class="{{ '' if b.active else 'muted' }}">
         <td class="mono">{{ b.ip }}</td>
-        <td class="mono nowrap">{{ b.blocked_at.strftime('%m-%d %H:%M') }}</td>
+        <td class="mono nowrap">{{ b.blocked_at | ora('%m-%d %H:%M') }}</td>
         <td class="muted">{{ b.created_by }}</td>
         <td>{{ 'activ' if b.active else 'deblocat' }}</td>
       </tr>

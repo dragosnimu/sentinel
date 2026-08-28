@@ -86,6 +86,30 @@ def asset_url(relative: str) -> str:
     return f"/static/{rel}?v={asset_digest(candidate) or __version__}"
 
 
+def ora_filter(tz_name: str | None):
+    """Filtrul `ora`: un moment scris în fusul configurat, cu marcajul lui.
+
+    Un filtru, și nu `strftime` scris în fiecare șablon, fiindcă exact aia era
+    situația până acum: treizeci de locuri care formatau singure, toate în UTC,
+    dintre care patru scriau „UTC" în text și restul nu scriau nimic. Un panou
+    care arată `21:15` fără să spună în ce fus e un panou pe care operatorul îl
+    compară greșit cu `journalctl`.
+
+    Fusul se leagă la construirea mediului, din `Config`, deci un șablon nu
+    poate uita să-l dea și nu poate da altul.
+    """
+    from sentinel.util import tz
+
+    def ora(moment: Any, pattern: str = tz.SHORT, with_zone: bool = True,
+            missing: str = "—") -> str:
+        if moment is None:
+            return missing
+        return tz.fmt(moment, pattern, tz_name=tz_name,
+                      with_zone=with_zone, missing=missing)
+
+    return ora
+
+
 def template_globals() -> dict[str, Any]:
     from sentinel import __version__
     from sentinel.intel import links
@@ -103,8 +127,13 @@ def template_globals() -> dict[str, Any]:
     }
 
 
-def build_env() -> Any:
-    """A bare Jinja environment with the same configuration the app uses."""
+def build_env(tz_name: str | None = None) -> Any:
+    """A bare Jinja environment with the same configuration the app uses.
+
+    `tz_name` is what every rendered timestamp is written in. It defaults to
+    None, which `sentinel.util.tz.zone` reads as "the host's own zone" — the
+    same meaning it has for the quiet hours. The app passes `cfg.timezone`.
+    """
     import jinja2
 
     env = jinja2.Environment(
@@ -112,4 +141,5 @@ def build_env() -> Any:
         autoescape=True,
     )
     env.globals.update(template_globals())
+    env.filters["ora"] = ora_filter(tz_name)
     return env

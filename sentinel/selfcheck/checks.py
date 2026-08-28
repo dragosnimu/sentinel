@@ -53,6 +53,7 @@ from sentinel.constants import SYSTEMD_UNITS
 from sentinel.db.engine import Database
 from sentinel.db.repo.logins import REAL_TTY_SQL
 from sentinel.logging_setup import get_logger
+from sentinel.util import tz
 
 log = get_logger(__name__)
 
@@ -1355,11 +1356,21 @@ def _mii(value: float) -> str:
     return f"{value:,.0f}".replace(",", " ")
 
 
-def _ceas(ts: datetime | None) -> str:
-    """Un moment, citit de un om. `None` când nu se cunoaște."""
+def _ceas(ts: datetime | None, tz_name: str | None) -> str:
+    """Un moment, citit de un om, în fusul configurat și cu marcajul lui.
+
+    `None` întoarce „necunoscut", nu ora curentă și nu un șir gol: textul ăsta
+    ajunge în Telegram, iar „nu știu când" și „acum" sunt stări diferite.
+
+    Scria `%Y-%m-%d %H:%M UTC`. Constatarea în care apare compară două momente —
+    ultima comandă scrisă și ultima pornire a serviciului de ingestie — iar
+    operatorul le verifică în `journalctl`, care îi arată ora LOCALĂ. Două ore
+    citite în fusuri diferite, în aceeași propoziție, e felul cel mai sigur de
+    a-l trimite să caute în fereastra greșită.
+    """
     if ts is None:
         return "necunoscut"
-    return ts.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return tz.fmt(ts, tz.LONG, tz_name=tz_name)
 
 
 @dataclass(frozen=True)
@@ -1678,8 +1689,8 @@ async def check_command_history_filter(db: Database, cfg: Config) -> list[CheckR
                 "unknown",
                 f"{interzise} comenzi fără terminal ale conturilor {ortografii} "
                 f"sunt în ultimele {HISTORY_WINDOW_H} de ore, cea mai recentă la "
-                f"{_ceas(newest)}. Nu pot citi când a pornit ultima oară "
-                f"`{INGEST_UNIT}` ({_ceas(started)}), deci nu pot spune dacă au "
+                f"{_ceas(newest, cfg.timezone)}. Nu pot citi când a pornit ultima oară "
+                f"`{INGEST_UNIT}` ({_ceas(started, cfg.timezone)}), deci nu pot spune dacă au "
                 f"fost scrise înainte sau după ce filtrul putea acționa. Din "
                 f"date: {vazut}",
                 facts=facts,
@@ -1692,8 +1703,8 @@ async def check_command_history_filter(db: Database, cfg: Config) -> list[CheckR
                 "Filtrul de istoric e configurat, dar nu e în vigoare", "degraded",
                 f"{interzise} comenzi fără terminal ale conturilor {ortografii} au "
                 f"fost SCRISE în ultimele {HISTORY_WINDOW_H} de ore, cea mai "
-                f"recentă la {_ceas(newest)} — DUPĂ ultima pornire a serviciului "
-                f"de ingestie ({_ceas(started)}), deci filtrul rula deja când au "
+                f"recentă la {_ceas(newest, cfg.timezone)} — DUPĂ ultima pornire a serviciului "
+                f"de ingestie ({_ceas(started, cfg.timezone)}), deci filtrul rula deja când au "
                 f"fost scrise. Ori secțiunea `history:` din `sentinel.yaml` nu e "
                 f"cea pe care o citește serviciul, ori procesul rulează încă codul "
                 f"dinaintea livrării. Din date: {vazut}",
@@ -1722,8 +1733,8 @@ async def check_command_history_filter(db: Database, cfg: Config) -> list[CheckR
                 "history:filter", "Filtrul de istoric", "ok",
                 f"conturi {ortografii}; {interzise} comenzi fără terminal ale lor "
                 f"sunt încă în fereastra de {HISTORY_WINDOW_H} de ore, dar cea mai "
-                f"recentă e la {_ceas(newest)}, ÎNAINTE de ultima pornire a "
-                f"serviciului de ingestie ({_ceas(started)}) — le-a scris procesul "
+                f"recentă e la {_ceas(newest, cfg.timezone)}, ÎNAINTE de ultima pornire a "
+                f"serviciului de ingestie ({_ceas(started, cfg.timezone)}) — le-a scris procesul "
                 f"dinaintea filtrului, nu filtrul de acum, și niciun rând interzis "
                 f"n-a mai fost scris de când rulează. Din date: {vazut}",
                 facts=facts)]

@@ -35,9 +35,9 @@
         {% if s.id == current_session_id %}<span class="badge">aceasta</span>{% endif %}
         <br>
         <span class="muted small">
-          creată {{ s.created_at.strftime('%Y-%m-%d %H:%M') }} ·
-          activă {{ s.last_seen_at.strftime('%H:%M') }} ·
-          expiră {{ s.expires_at.strftime('%Y-%m-%d %H:%M') }}
+          creată {{ s.created_at | ora('%Y-%m-%d %H:%M') }} ·
+          activă {{ s.last_seen_at | ora('%H:%M') }} ·
+          expiră {{ s.expires_at | ora('%Y-%m-%d %H:%M') }}
         </span>
         {% if s.user_agent %}
         <br><span class="muted small truncate">{{ s.user_agent }}</span>
@@ -71,7 +71,7 @@
     <tbody>
     {% for a in audit %}
       <tr class="{{ 'row-bad' if a.result != 'ok' }}">
-        <td class="mono nowrap">{{ a.at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+        <td class="mono nowrap">{{ a.at | ora('%Y-%m-%d %H:%M:%S') }}</td>
         <td class="mono">{{ a.actor }}</td>
         <td>{{ a.operation }}</td>
         <td class="mono muted">{{ a.target or '—' }}</td>

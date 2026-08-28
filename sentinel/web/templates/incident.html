@@ -53,9 +53,9 @@
       <dt>Stare</dt><dd>{{ status_ro.get(inc.status, inc.status) }}</dd>
       <dt>Sursă</dt><dd class="mono">{{ inc.actor_key or '—' }}</dd>
       <dt>Detecții</dt><dd>{{ inc.detection_count }}</dd>
-      <dt>Prima</dt><dd class="mono">{{ inc.first_detection_at.strftime('%Y-%m-%d %H:%M:%S') }} UTC</dd>
-      <dt>Ultima</dt><dd class="mono">{{ inc.last_detection_at.strftime('%Y-%m-%d %H:%M:%S') }} UTC</dd>
-      <dt>Telegram</dt><dd>{{ 'trimis ' + inc.notified_at.strftime('%H:%M') if inc.notified_at else 'nu' }}</dd>
+      <dt>Prima</dt><dd class="mono">{{ inc.first_detection_at | ora('%Y-%m-%d %H:%M:%S') }}</dd>
+      <dt>Ultima</dt><dd class="mono">{{ inc.last_detection_at | ora('%Y-%m-%d %H:%M:%S') }}</dd>
+      <dt>Telegram</dt><dd>{{ 'trimis ' + (inc.notified_at | ora('%H:%M')) if inc.notified_at else 'nu' }}</dd>
     </dl>
     {% if inc.summary %}<p>{{ inc.summary }}</p>{% endif %}
   </section>
@@ -84,7 +84,7 @@
         <tbody>
         {% for d in detections %}
           <tr>
-            <td class="mono nowrap">{{ d.ts.strftime('%m-%d %H:%M:%S') }}</td>
+            <td class="mono nowrap">{{ d.ts | ora('%m-%d %H:%M:%S') }}</td>
             <td class="mono">{{ d.rule_id }}</td>
             <td>{{ d.severity }}</td>
             <td class="muted small">

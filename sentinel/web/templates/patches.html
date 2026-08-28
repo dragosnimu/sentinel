@@ -38,7 +38,7 @@
           {%- if r.requires_reboot %} <span class="tag tag-exposed">reboot</span>{% endif -%}
         </td>
         <td><span class="pill pill-{{ r.pill }}">{{ r.status_ro }}</span></td>
-        <td class="mono nowrap small">{{ r.created_at.strftime('%d.%m %H:%M') }}</td>
+        <td class="mono nowrap small">{{ r.created_at | ora }}</td>
       </tr>
       {% endfor %}
     </tbody>
@@ -66,7 +66,7 @@
           {%- elif rp.verified_at %}<span class="pill pill-ok">da</span>
           {%- else %}<span class="pill pill-warn">neverificat</span>{% endif -%}
         </td>
-        <td class="mono nowrap small">{{ rp.created_at.strftime('%d.%m %H:%M') }}</td>
+        <td class="mono nowrap small">{{ rp.created_at | ora }}</td>
       </tr>
       {% endfor %}
     </tbody>

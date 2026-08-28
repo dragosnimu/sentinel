@@ -21,6 +21,7 @@ from sentinel.db.engine import Database
 from sentinel.db.repo import audit, sessions, users
 from sentinel.logging_setup import get_logger, setup_logging
 from sentinel.services import parse_service_args
+from sentinel.util import tz
 from sentinel.web.security import (
     Authenticator,
     generate_totp_secret,
@@ -374,10 +375,12 @@ async def _list_users(cfg: Config) -> int:
                 state = "blocat"
             else:
                 state = "activ"
-            last = (
-                r["last_login_at"].strftime("%Y-%m-%d %H:%M")
-                if r["last_login_at"] else "niciodată"
-            )
+            # În fusul configurat, cu marcajul lui. Coloana e citită de un om
+            # care compară cu ce vede în `journalctl` sau în panou, iar ambele
+            # arată ora locală; scrisă aici în UTC, aceeași autentificare ar
+            # apărea la trei ore distanță în două locuri.
+            last = tz.fmt(r["last_login_at"], tz.LONG, tz_name=cfg.timezone,
+                          missing="niciodată")
             print(
                 f"{r['username']:<20} {r['role']:<10} "
                 f"{'da' if r['totp_confirmed'] else 'NU':<5} {state:<12} "
