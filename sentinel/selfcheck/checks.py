@@ -1217,9 +1217,10 @@ async def check_ship_lag(db: Database, cfg: Config) -> list[CheckResult]:
       the whole check to a single `ship:lag` key, so the append-only stream —
       which needs neither the trigger nor `cursor_at` — vanished from the panel
       because the mutable one could not be read. Measured on the production host
-      (schema_version=22, migration 0023 not applied): the only key emitted was
-      `ship:lag`, and `ship:lag:audit_log` was reconciled away. A guard hiding
-      another guard.
+      while it was still at schema_version=22, before 0023 was applied: the only
+      key emitted was `ship:lag`, and `ship:lag:audit_log` was reconciled away.
+      A guard hiding another guard. The host is past that schema now — the fix
+      stands on its own, not on the schema that exposed it.
 
     A fifth case sits inside "behind" and is the one that catches a shipper
     nobody started: configured, but no cursor has ever been written. That is not
@@ -1325,9 +1326,9 @@ async def check_ship_lag(db: Database, cfg: Config) -> list[CheckResult]:
 
         # ÎNAINTEA tuturor, fiindcă e singura care spune „nu m-am putut uita".
         # Un flux ilizibil e o stare a FLUXULUI, nu a verificării: cât timp
-        # `shipper.lag` ridica, un `incidents` necitibil — pe gazda de producție,
-        # cu 0023 neaplicată, chiar asta se întâmplă — ducea tot `check_ship_lag`
-        # în ramura de mai sus, care întoarce O SINGURĂ cheie. Runner-ul șterge
+        # `shipper.lag` ridica, un `incidents` necitibil — starea în care era
+        # gazda de producție cât timp 0023 nu fusese încă aplicată — ducea tot
+        # `check_ship_lag` în ramura de mai sus, care întoarce O SINGURĂ cheie. Runner-ul șterge
         # ce o rulare completă n-a emis, deci `ship:lag:audit_log` dispărea din
         # panou: fluxul append-only devenea invizibil fiindcă vecinul mutabil nu
         # s-a putut citi. Aici fiecare flux răspunde numai pentru el.
@@ -1430,9 +1431,10 @@ async def check_ship_lag(db: Database, cfg: Config) -> list[CheckResult]:
         # `collector_cursors`, sub cheia `ship:<flux>:stall`: `cursor` ține
         # semnătura poziției plus restanța de la înghețare (`_stall_mark`),
         # `events_seen` numărul de priviri anterioare consecutive în aceeași
-        # poziție. Ambele coloane există din 0010, deci detectorul merge și pe
-        # schema veche (0023 neaplicată), acolo unde un flux mutabil oricum iese
-        # pe ramura `error` de mai sus și nu ajunge aici.
+        # poziție. Ambele coloane există din 0010, deci detectorul merge și pe o
+        # schemă fără 0023 — acolo un flux mutabil iese oricum pe ramura `error`
+        # de mai sus și nu ajunge aici. Pe gazdă 0023 E aplicată (verificat pe 28
+        # august 2026), deci fluxurile mutabile chiar trec pe aici.
         #
         # NU e de ajuns ca poziția să stea pe loc, și asta e reparația din 28
         # august 2026. Un cursor nemișcat răspunde la „a plecat ceva?", nu la
