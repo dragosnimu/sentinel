@@ -68,6 +68,15 @@ def _cfg(**over):
         telegram=SimpleNamespace(enabled=True, allowed_chat_ids=[1],
                                  quiet_hours=None, timezone="Europe/Bucharest"),
         response=SimpleNamespace(auto_block=SimpleNamespace(enabled=False), admin_ip=""),
+        # Aceleași valori ca pe `Config()`-ul real: colectorul Suricata e pornit
+        # în `ingest`, dar senzorul e oprit până când instalatorul îl aprinde.
+        # `check_ingest_sources` le citește DIRECT — vezi
+        # `test_no_check_reads_a_config_field_that_does_not_exist` —, iar un dublu
+        # rămas în urmă ar face grupul „ingest” să pice pe altceva decât pe ce se
+        # testează.
+        ingest=SimpleNamespace(suricata=True),
+        suricata=SimpleNamespace(enabled=False,
+                                 eve_path="/var/log/suricata/eve.json"),
         # Ca pe `Config`-ul real: `check_ship_lag` citește `cfg.ship.enabled`
         # direct, nu printr-un `getattr` cu valoare de rezervă — vezi
         # `test_no_check_reads_a_config_field_that_does_not_exist` mai jos, care
@@ -157,10 +166,252 @@ def test_the_shared_journald_reader_still_has_a_watched_source():
     assert "sshd" in JOURNALD_COMMS, "sshd nu mai vine din același cititor"
 
 
+# --- suricata: cititorul se măsoară pe offset, nu pe rânduri ---------------
+#
+# Faptele din spatele testelor de mai jos sunt măsurate pe gazda de producție
+# pe 28 august 2026, în ziua în care pragul de 30 de minute a
+# produs 6 alerte `critical` — care trec de `/mute`, deci sună noaptea — pe un
+# colector care citea corect: `eve.json` creștea cu ~333 MB/zi, cursorul
+# colectorului avansa cu 164 156 de octeți în 35 de secunde peste același inod,
+# iar ultimele 200 de linii ale fișierului conțineau ZERO `event_type: alert`.
+# În 24 de ore, sursa avusese 7 goluri de peste 30 de minute, cel mai mare de
+# 1h00m11s, în timp ce nginx și auditd scriau continuu.
+
+
+def _eve(tmp_path, size: int):
+    """Un `eve.json` adevărat de `size` octeți. Întoarce (cale, inod, mărime).
+
+    Fișier real, nu un `os.stat` păcălit: mărimea și inodul sunt tocmai faptele
+    pe care verificarea le compară cu offsetul, iar un dublu ar fi lăsat
+    netestat exact `_stat_size_inode`.
+    """
+    import os as _os
+
+    p = tmp_path / "eve.json"
+    p.write_bytes(b"x" * size)
+    st = _os.stat(p)
+    return str(p), st.st_ino, st.st_size
+
+
+def _suricata_cfg(path: str, **over):
+    cfg = _cfg(**over)
+    cfg.suricata = SimpleNamespace(enabled=True, eve_path=path)
+    return cfg
+
+
+def _cursor_row(cursor: str, idle_min: float):
+    return {"cursor": cursor, "minute": idle_min}
+
+
+def test_an_hour_without_a_suricata_alert_is_not_a_broken_collector(tmp_path):
+    """Falsul pozitiv măsurat pe 28 august: 6 alerte `critical` într-o zi.
+
+    Suricata scrie în `raw_events` doar ce se potrivește cu o semnătură, deci o
+    oră fără nicio alertă e purtarea normală a unei gazde pe care nu s-a
+    declanșat nimic. Judecată prin comparație cu nginx și auditd — care scriu un
+    rând pe conexiune — tăcerea aia arăta ca o pană, iar `critical` trece peste
+    `/mute`: operatorul era trezit de un colector care citea.
+
+    Faptul care spune că citește e OFFSETUL care avansează, și el avansa.
+    """
+    path, inode, size = _eve(tmp_path, 4096)
+    db = _DB(rows=[_source("suricata", 60), _source("nginx", 1), _source("auditd", 1)],
+             row=_cursor_row(f"{inode}:{size}", 0.2))
+    results = run(checks.check_ingest_sources(db, _suricata_cfg(path)))
+
+    sur = [r for r in results if r.key == "ingest:suricata"]
+    assert len(sur) == 1, f"un singur verdict pentru suricata, nu {len(sur)}"
+    assert sur[0].status == "ok", (
+        "un colector al cărui offset avansează a fost raportat ca defect fiindcă "
+        "n-a avut ce raporta")
+    assert not any(r.bad for r in results if r.key.startswith("ingest:suricata"))
+
+
+def test_a_frozen_suricata_cursor_over_a_growing_file_is_down(tmp_path):
+    """Pana pe care verificarea veche n-o putea vedea deloc.
+
+    Cititorul moare peste un `eve.json` care continuă să crească: IDS-ul scrie,
+    nimic nu ia. Vechea verificare ar fi tăcut oricât — pe gazdă suricata are
+    goluri de peste o oră în purtare normală, deci pragul ei nu deosebea cazul
+    ăsta de o noapte fără semnături. Aici se vede din singurul fapt care-l
+    dovedește: offsetul stă, fișierul a crescut peste el.
+    """
+    path, inode, size = _eve(tmp_path, 400_000)
+    db = _DB(rows=[_source("suricata", 90), _source("nginx", 1)],
+             row=_cursor_row(f"{inode}:0", 34.0))
+    results = run(checks.check_ingest_sources(db, _suricata_cfg(path)))
+
+    sur = next(r for r in results if r.key == "ingest:suricata")
+    assert sur.status == "down", "cititorul mort peste un fișier viu nu a fost prins"
+    assert "sentinel-ingest" in sur.action
+    assert sur.facts["unread_bytes"] == size
+
+
+def test_a_frozen_cursor_over_a_file_that_stopped_growing_blames_the_sensor(tmp_path):
+    """Cauza e alta, deci remediul trebuie să fie altul.
+
+    Dacă `eve.json` nu mai crește, colectorul a citit tot ce există: nu el s-a
+    oprit, ci Suricata. Un „systemctl restart sentinel-ingest" aici n-ar schimba
+    nimic, iar operatorul ar reporni serviciul greșit la 3 dimineața. Cheie
+    separată, mesaj separat.
+    """
+    path, inode, size = _eve(tmp_path, 4096)
+    db = _DB(rows=[_source("suricata", 200), _source("nginx", 1)],
+             row=_cursor_row(f"{inode}:{size}", 40.0))
+    results = run(checks.check_ingest_sources(db, _suricata_cfg(path)))
+
+    sur = next(r for r in results if r.key == "ingest:suricata")
+    assert sur.status == "ok", "colectorul a fost acuzat pentru tăcerea senzorului"
+    sensor = next(r for r in results if r.key == "ingest:suricata:sensor")
+    assert sensor.status == "degraded"
+    assert "suricata" in sensor.action and "sentinel-ingest" not in sensor.action
+
+
+def test_a_rotated_eve_json_the_reader_never_picked_up_is_down(tmp_path):
+    """Rotația pe care cititorul n-a urmat-o e tot o pată oarbă.
+
+    Un cititor viu trece pe inodul nou în cel mult o citire, deci un cursor rămas
+    pe inodul vechi după 34 de minute înseamnă că nimeni nu citește — chiar dacă
+    fișierul nou e mic. Fără cazul ăsta, comparația mărime-offset ar fi dat un
+    număr negativ și verificarea ar fi raportat „senzorul tace", adică serviciul
+    greșit.
+    """
+    path, inode, size = _eve(tmp_path, 8192)
+    db = _DB(rows=[_source("suricata", 120), _source("nginx", 1)],
+             row=_cursor_row(f"{inode + 1}:900000", 34.0))
+    results = run(checks.check_ingest_sources(db, _suricata_cfg(path)))
+
+    sur = next(r for r in results if r.key == "ingest:suricata")
+    assert sur.status == "down"
+    assert sur.facts["rotated"] is True
+    assert sur.facts["unread_bytes"] == size
+
+
+def test_a_truncated_eve_json_the_reader_never_rewound_is_down(tmp_path):
+    """`logrotate` cu `copytruncate` taie fișierul sub cursor, la același inod.
+
+    Un cititor viu o vede și reia de la zero (`read_new_lines`: `if start > size:
+    start = 0`), deci cursorul lui s-ar fi mișcat. Rămas pe loc, tot ce a scris
+    Suricata de atunci e necitit. Scăderea `mărime - offset` iese aici NEGATIVĂ,
+    deci nu trece niciun prag: fără ramura asta, un cititor mort era raportat ca
+    „senzorul tace", iar operatorul repornea serviciul greșit.
+    """
+    path, inode, size = _eve(tmp_path, 300_000)
+    db = _DB(rows=[_source("suricata", 120), _source("nginx", 1)],
+             row=_cursor_row(f"{inode}:154153955", 34.0))
+    results = run(checks.check_ingest_sources(db, _suricata_cfg(path)))
+
+    sur = next(r for r in results if r.key == "ingest:suricata")
+    assert sur.status == "down"
+    assert sur.facts["truncated"] is True and sur.facts["unread_bytes"] == size
+    assert not any(r.key == "ingest:suricata:sensor" for r in results)
+
+
+def test_a_missing_suricata_cursor_is_unknown_not_ok(tmp_path):
+    """„Nu știu" și „e bine" nu au voie să arate la fel.
+
+    Runner-ul șterge din `selfcheck_state` cheile pe care o rulare completă nu
+    le-a emis, și socotește „revenit la normal" orice cheie care nu mai e `bad`.
+    Un `ok` inventat aici ar stinge o constatare adevărată și i-ar trimite
+    operatorului o revenire care nu s-a întâmplat.
+    """
+    path, _inode, _size = _eve(tmp_path, 4096)
+    db = _DB(rows=[_source("nginx", 1)], row=None)
+    results = run(checks.check_ingest_sources(db, _suricata_cfg(path)))
+
+    sur = next(r for r in results if r.key == "ingest:suricata")
+    assert sur.status == "unknown", "lipsa cursorului a fost citită ca sănătate"
+
+
+def test_an_unreadable_eve_json_is_unknown_not_a_verdict(tmp_path):
+    """Cu fișierul necitibil, cele două cauze nu se pot deosebi — deci nu se aleg.
+
+    Un `down` aici ar trimite operatorul să repornească un colector care poate
+    citea; un `ok` ar ascunde o pată oarbă. Singurul răspuns adevărat e că
+    întrebarea n-a primit răspuns.
+    """
+    path = str(tmp_path / "nu-exista" / "eve.json")
+    db = _DB(rows=[_source("suricata", 120), _source("nginx", 1)],
+             row=_cursor_row("123:456", 40.0))
+    results = run(checks.check_ingest_sources(db, _suricata_cfg(path)))
+
+    sur = next(r for r in results if r.key == "ingest:suricata")
+    assert sur.status == "unknown"
+    assert not any(r.key == "ingest:suricata:sensor" for r in results)
+
+
+def test_suricata_keeps_a_verdict_when_it_has_no_rows_at_all(tmp_path):
+    """O sursă fără niciun rând iese din interogarea pe 30 de zile — și tocmai
+    atunci întrebarea „mai citește cineva?" e cea care contează.
+
+    Cât timp verdictul venea din rânduri, o gazdă pe care Suricata n-a potrivit
+    nimic o lună întreagă nu mai avea NICIO cheie `ingest:suricata`, deci nici
+    acoperire. Verdictul pe cursor se produce indiferent de rânduri.
+    """
+    path, inode, size = _eve(tmp_path, 4096)
+    db = _DB(rows=[_source("nginx", 1), _source("auditd", 2)],
+             row=_cursor_row(f"{inode}:{size}", 1.0))
+    results = run(checks.check_ingest_sources(db, _suricata_cfg(path)))
+
+    sur = next(r for r in results if r.key == "ingest:suricata")
+    assert sur.status == "ok"
+    assert "nicio alertă în fereastra de 30 de zile" in sur.detail
+
+
+def test_suricata_is_not_judged_against_its_neighbours_any_more():
+    """Premisa scrisă în cod era falsă, iar un prag rămas în hartă o reînvie.
+
+    nginx și auditd scriu un rând pe conexiune; suricata scrie un rând pe
+    potrivire de semnătură. Comparația dintre ele nu poate răspunde la „e stricat
+    colectorul?", și exact ea a produs alertele `critical` din 28 august.
+    """
+    assert "suricata" not in checks.SOURCE_MAX_SILENCE_MIN, (
+        "suricata a revenit în harta de praguri pe tăcere, deci e judecată din nou "
+        "prin comparație cu vecini cu care nu e comparabilă")
+    assert "suricata" in checks.CURSOR_BACKED_SOURCES
+    assert not (checks.CURSOR_BACKED_SOURCES & set(checks.SOURCE_MAX_SILENCE_MIN))
+
+
+def test_the_neighbour_comparison_still_covers_the_row_driven_collectors():
+    """Reparația nu are voie să însemne „taci peste tot".
+
+    auditd, sshd și nginx AU prins pana reală de 21 de ore, și rândul lor chiar e
+    proporțional cu traficul. Pragurile lor rămân.
+    """
+    for source in ("auditd", "sshd", "nginx"):
+        assert source in checks.SOURCE_MAX_SILENCE_MIN, (
+            f"{source} și-a pierdut pragul de tăcere — verificarea care a prins "
+            f"pata oarbă de 21 de ore nu-l mai acoperă")
+
+
+def test_suricata_turned_off_in_config_says_so_instead_of_vanishing(tmp_path):
+    """O cheie absentă îl lasă pe operator să ghicească de ce.
+
+    Aceeași alegere ca la `ship:lag` cu `ship.enabled: false`: dezactivarea se
+    spune, nu se arată printr-un spațiu gol în panou.
+    """
+    path, inode, size = _eve(tmp_path, 4096)
+    cfg = _suricata_cfg(path)
+    cfg.suricata = SimpleNamespace(enabled=False, eve_path=path)
+    db = _DB(rows=[_source("nginx", 1)], row=_cursor_row(f"{inode}:{size}", 0.5))
+    results = run(checks.check_ingest_sources(db, cfg))
+
+    sur = next(r for r in results if r.key == "ingest:suricata")
+    assert sur.status == "ok" and sur.facts["configured"] is False
+
+
 def test_no_events_at_all_is_reported():
+    """Zero rânduri în 30 de zile e o pană totală de colectare, și trebuie spusă.
+
+    Căutat pe CHEIE, nu pe poziția din listă: verdictele judecate pe cursor sunt
+    produse înaintea acestei ramuri (ca să supraviețuiască ei), deci `results[0]`
+    nu mai e `ingest:any`. O aserțiune pe poziție ar fi trecut verde peste
+    dispariția ramurii.
+    """
     db = _DB(rows=[])
     results = run(checks.check_ingest_sources(db, _cfg()))
-    assert results[0].status == "down"
+    any_key = next(r for r in results if r.key == "ingest:any")
+    assert any_key.status == "down"
 
 
 # --- the firewall table has to actually exist ------------------------------
@@ -2270,8 +2521,8 @@ def test_session_commands_seven_hours_behind_is_an_age_finding(monkeypatch):
     assert "rămas în urmă" in r.title
 
 
-def test_a_cursor_frozen_for_three_runs_with_pending_rows_is_a_stall(monkeypatch):
-    """Pana reală: cursorul nu mai înaintează DELOC, deși există rânduri.
+def test_a_cursor_frozen_while_the_backlog_grows_is_a_stall(monkeypatch):
+    """Pana reală: cursorul nu mai înaintează DELOC în timp ce sosește muncă.
 
     A aștepta pragul de vârstă (6h) pentru asta e greșit — oprirea trebuie prinsă
     în minute. Constatarea are cheie DISTINCTĂ de cea de vârstă, ca mesajul să
@@ -2282,16 +2533,147 @@ def test_a_cursor_frozen_for_three_runs_with_pending_rows_is_a_stall(monkeypatch
     db = _StallDB()
     cfg = _ship_cfg()
     results = []
-    for _ in range(3):
-        _patch_ship(monkeypatch, [_sc_lag(200, pending=5, oldest_min=30)])
+    for pending in (5, 40, 120):
+        _patch_ship(monkeypatch, [_sc_lag(200, pending=pending, oldest_min=30)])
         results = run(checks.check_ship_lag(db, cfg))
 
     stall = _key(results, "ship:lag:session_commands:stall")
     assert stall is not None and stall.status == "degraded", (
-        "cursorul înghețat 3 rulări cu rânduri în așteptare nu a fost prins")
+        "cursorul înghețat 3 rulări cu restanța în creștere nu a fost prins")
     assert "nu mai înaintează" in stall.detail
+    assert stall.facts["pending_at_freeze"] == 5 and stall.facts["pending"] == 120
     assert _key(results, "ship:lag:session_commands") is None, (
         "a raportat si constatarea de varsta pe un flux sub pragul de 6h")
+
+
+def test_a_frozen_cursor_with_a_backlog_that_does_not_grow_is_not_a_stall(monkeypatch):
+    """Falsul pozitiv măsurat pe 28 august, verbatim: „deși 1 randuri asteapta".
+
+    Un cursor care nu se mișcă răspunde la „a plecat ceva?", nu la „mai merge
+    expeditorul?". Cu un singur rând restant care nu se înmulțește, răspunsul
+    corect la prima e „n-avea mare lucru de trimis", iar textul „nu mai
+    înaintează deloc" e fals. Alerta a plecat de două ori într-o zi și, fiindcă
+    își revenea singură, a costat de fiecare dată încă un mesaj de revenire.
+
+    Ce ține în picioare acoperirea: un rând care chiar nu pleacă îmbătrânește, și
+    de asta răspunde pragul de VÂRSTĂ, cu întrebarea potrivită.
+    """
+    db = _StallDB()
+    cfg = _ship_cfg()
+    results = []
+    for _ in range(4):
+        _patch_ship(monkeypatch,
+                    [_sc_lag(56882, pending=1, oldest_min=5, stream="incidents")])
+        results = run(checks.check_ship_lag(db, cfg))
+
+    assert not any(r.key.endswith(":stall") for r in results), (
+        "un flux cu un singur rând restant, care nu se înmulțește, a fost numit "
+        "înțepenit")
+    r = _key(results, "ship:lag:incidents")
+    assert r is not None and r.status == "ok"
+
+
+def test_a_mutable_stream_whose_watermark_advances_is_not_a_stall(monkeypatch):
+    """Cauza celor 7 alerte `incidents:stall` din 28 august.
+
+    Pe un flux mutabil cursorul e PERECHEA `(cursor_at, cheie)`. Jumătatea-cheie
+    repornește la fiecare filigran nou de la ultimul rând al lotului, deci un
+    incident deschis care se actualizează des o ține pe aceeași valoare rundă
+    după rundă — în timp ce poziția reală înaintează. Măsurat pe gazdă: alerta
+    spunea „a rămas la valoarea 56882" în timp ce `collector_cursors` avea
+    `ship:incidents` cu `cursor = 54661`, scris cu cinci minute mai târziu.
+
+    Comparată pe pereche, poziția asta e în mișcare și nu e o înțepenire.
+    """
+    db = _StallDB()
+    cfg = _ship_cfg()
+    results = []
+    for minute in (10, 15, 20, 25):
+        item = StreamLag(
+            stream="incidents", cursor=56882, floor=None, pending=3 + minute,
+            oldest_pending_min=8.0, clock_ahead_s=0.0,
+            cursor_at=datetime(2026, 8, 28, 12, minute, tzinfo=timezone.utc),
+            updated_at_trigger=True)
+        _patch_ship(monkeypatch, [item])
+        results = run(checks.check_ship_lag(db, cfg))
+
+    assert not any(r.key.endswith(":stall") for r in results), (
+        "un flux mutabil al cărui filigran înaintează a fost numit înțepenit "
+        "fiindcă doar jumătatea-cheie a cursorului arăta la fel")
+
+
+def test_a_mutable_stream_whose_whole_position_is_frozen_is_still_caught(monkeypatch):
+    """Reparația de mai sus nu are voie să lase fluxurile mutabile neacoperite.
+
+    Dacă stă și `cursor_at`, și cheia, fluxul chiar e oprit — și trebuie spus,
+    altfel copia din afara gazdei încetează să crească fără ca nimeni să afle.
+    """
+    db = _StallDB()
+    cfg = _ship_cfg()
+    results = []
+    for pending in (4, 30, 90):
+        item = StreamLag(
+            stream="incidents", cursor=56882, floor=None, pending=pending,
+            oldest_pending_min=25.0, clock_ahead_s=0.0,
+            cursor_at=datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc),
+            updated_at_trigger=True)
+        _patch_ship(monkeypatch, [item])
+        results = run(checks.check_ship_lag(db, cfg))
+
+    stall = _key(results, "ship:lag:incidents:stall")
+    assert stall is not None and stall.status == "degraded", (
+        "un flux mutabil cu poziția întreagă înghețată și restanța în creștere "
+        "nu a mai fost prins")
+
+
+def test_a_stall_is_not_declared_inside_one_shipping_round(monkeypatch):
+    """Pragul numără PRIVIRI, iar o privire nu e o rundă de expediere.
+
+    Temporizatorul autodiagnosticului e la 5 minute, deci trei priviri înseamnă
+    ~15 minute — pe orice gazdă, oricât de rar ar expedia expeditorul. Cu un
+    `interval_s` de 10 minute pus de operator, pragul cade SUB o singură rundă
+    normală, iar constatarea s-ar aprinde pe purtarea corectă a mecanismului.
+    Aceeași podea o are deja pragul de vârstă.
+    """
+    db = _StallDB()
+    cfg = _cfg(ship=SimpleNamespace(enabled=True, url="https://agg.invalid",
+                                    interval_s=600))
+    results = []
+    for pending in (5, 40, 120):
+        _patch_ship(monkeypatch, [_sc_lag(200, pending=pending, oldest_min=12)])
+        results = run(checks.check_ship_lag(db, cfg))
+
+    assert not any(r.key.endswith(":stall") for r in results), (
+        "constatarea de înțepenire s-a aprins înainte să fi trecut trei runde de "
+        "expediere — pe un interval lung, asta e funcționarea normală")
+
+
+def test_the_stall_message_agrees_with_its_own_numbers(monkeypatch):
+    """Textul trimis operatorului spunea „deși 1 randuri asteapta".
+
+    Canalul ăsta e singurul prin care agentul poate spune ceva. Un mesaj care nu
+    se acordă cu propriul lui număr se citește ca un mesaj pe care nu-l verifică
+    nimeni, iar încrederea în canal e o proprietate de funcționare.
+    """
+    assert checks._numar(1, "rând", "rânduri") == "1 rând"
+    assert checks._numar(3, "rând", "rânduri") == "3 rânduri"
+    assert checks._numar(19, "rând", "rânduri") == "19 rânduri"
+    assert checks._numar(20, "rând", "rânduri") == "20 de rânduri"
+    assert checks._numar(101, "rând", "rânduri") == "101 rânduri"
+    assert checks._numar(120, "rând", "rânduri") == "120 de rânduri"
+    assert checks._numar(0, "rând", "rânduri") == "0 rânduri"
+
+    db = _StallDB()
+    cfg = _ship_cfg()
+    results = []
+    for pending in (1, 21, 21):
+        _patch_ship(monkeypatch, [_sc_lag(200, pending=pending, oldest_min=30)])
+        results = run(checks.check_ship_lag(db, cfg))
+
+    stall = _key(results, "ship:lag:session_commands:stall")
+    assert stall is not None, "cazul de acord nu a mai produs constatarea testată"
+    assert "de la 1 rând la 21 de rânduri" in stall.detail, stall.detail
+    assert "1 rânduri" not in stall.detail
 
 
 def test_a_cursor_that_advances_a_little_each_run_is_never_a_stall(monkeypatch):

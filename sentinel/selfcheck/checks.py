@@ -29,9 +29,11 @@ mean *the check looked and had nothing to report* — never *the check could not
 look*. A check that returns nothing because a probe failed would have its own
 previous finding deleted, and the operator would be shown a recovery that never
 happened. When a check cannot read what it needs, it emits `unknown`; it does
-not fall silent. (`ingest:{source}` has one honest gap left: a source that goes
-quiet for more than the 30-day window drops out of the query altogether. Worth
-knowing about before extending that window's use.)
+not fall silent. (`ingest:{source}` has one honest gap left: a ROW-judged source
+that goes quiet for more than the 30-day window drops out of the query
+altogether. Worth knowing about before extending that window's use. It no longer
+applies to `CURSOR_BACKED_SOURCES`, whose verdict comes from the reader's own
+cursor and is therefore produced whether or not a row exists.)
 """
 
 from __future__ import annotations
@@ -205,12 +207,42 @@ async def check_timers(cfg: Config) -> list[CheckResult]:
 # comparison against neighbours is what makes the check sharp, so these only
 # have to be long enough to survive a lull.
 SOURCE_MAX_SILENCE_MIN: dict[str, int] = {
-    "suricata": 30,    # an internet-facing host is scanned constantly
     "auditd": 60,      # cron, logins, privilege use
     "nginx": 180,      # a low-traffic site can genuinely be quiet
     "sshd": 180,       # ditto, though in practice never is
 }
 DEFAULT_MAX_SILENCE_MIN = 180
+
+# Sources whose rows are NOT proportional to traffic, so the arrival of rows
+# cannot be read as proof that their collector is alive. They are judged on the
+# reader's own cursor instead; see `_suricata_reader` below.
+#
+# `suricata` was in the table above at 30 minutes, and the premise written into
+# the comment beneath it — "an exposed host is scanned continuously, so a silent
+# suricata beside a busy nginx is a genuine fault" — is false. Measured on the
+# production host on 28 August 2026:
+#
+#   * `eve.json` grew by 76 982 bytes in 20 s (~333 MB/day) and the collector's
+#     cursor advanced by 164 156 bytes in 35 s over the same inode — the reader
+#     was demonstrably working;
+#   * of the last 200 lines of `eve.json`: 175 flow, 8 dns, 7 ssh, 5 stats,
+#     2 tls, 2 fileinfo, 1 http, and ZERO `alert`;
+#   * `raw_events` over three hours: auditd 1721, sshd 772, nginx 687, sudo 36,
+#     suricata 5;
+#   * over 24 hours, suricata had 7 gaps longer than 30 minutes, the largest
+#     1h00m11s, while nginx and auditd wrote continuously.
+#
+# nginx and auditd write a row per connection; suricata contributes a row only
+# when something crosses a signature threshold. They are not comparable
+# quantities, so comparing them cannot answer "is this collector broken?" — and
+# the 30-minute threshold turned an ordinary hour without a signature match into
+# six `critical` alerts in one day, which pass `/mute` by design.
+#
+# What replaces it separates the two facts the old check conflated: "is the
+# mechanism working?" is the cursor's offset moving, and "did it find anything?"
+# is the row count. Zero rows is a legitimate answer to the second and says
+# nothing about the first.
+CURSOR_BACKED_SOURCES = frozenset({"suricata"})
 
 # Sources whose events exist only when a HUMAN acts. Silence here is not
 # evidence of anything: a server nobody logged into for a day produces zero
@@ -223,10 +255,12 @@ DEFAULT_MAX_SILENCE_MIN = 180
 # the channel that carries the real ones.
 #
 # The `others_are_live` discriminator below cannot rescue them. It answers "is
-# the host quiet, or is this collector broken?" by comparing against neighbours
-# — which works for traffic-driven sources, because an exposed host is scanned
-# continuously and a silent suricata beside a busy nginx is a genuine fault. It
-# says nothing about whether a person happened to type `sudo`.
+# the host quiet, or is this collector broken?" by comparing against neighbours,
+# and that only works where one row means one unit of the same kind of work —
+# nginx, auditd and sshd all write a row per connection, so the comparison is
+# between comparable quantities. It says nothing about whether a person happened
+# to type `sudo`, and — see `CURSOR_BACKED_SOURCES` above — nothing about a
+# source whose rows are produced by a signature match rather than by traffic.
 #
 # They are not left unmonitored. sshd, sudo and su come from the SAME journald
 # reader — one `_COMM` match set, one loop, classified into sources after the
@@ -251,12 +285,230 @@ def _ago(minutes: float) -> str:
     return f"{m // (24 * 60)}z {(m % (24 * 60)) // 60}h"
 
 
+def _numar(n: int, singular: str, plural: str) -> str:
+    """„1 rând", „3 rânduri", „21 de rânduri" — acordul numeralului în română.
+
+    Cerut de un mesaj trimis operatorului pe 28 august 2026, verbatim: „deși 1
+    randuri așteaptă". Un text care nu se acordă cu propriul lui număr se citește
+    ca un text pe care nu-l verifică nimeni, iar canalul ăsta e singurul prin
+    care agentul poate spune ceva: cât încredere are în el operatorul e o
+    proprietate de funcționare, nu de stil.
+
+    Regula: `1` e singular; ultimele două cifre între `01` și `19` iau pluralul
+    simplu; `00` și `20`–`99` cer „de".
+    """
+    if n == 1:
+        return f"1 {singular}"
+    if n == 0:
+        return f"0 {plural}"
+    rest = abs(n) % 100
+    if rest == 0 or rest >= 20:
+        return f"{n} de {plural}"
+    return f"{n} {plural}"
+
+
+# How long the eve.json reader's own offset may sit still before the question
+# "is it still reading?" is worth asking of the FILE.
+#
+# The reader polls every `ingest.flush_interval_ms` (1 s by default) and writes
+# `collector_cursors[suricata]` only when the offset actually changed — see the
+# `if eve_new:` guard in services/ingest_service.py — so `updated_at` on that row
+# is the moment the reader last advanced, not the moment it last ran. Fifteen
+# minutes is three runs of the self-check timer (`OnUnitActiveSec=5min`), the
+# same convention as everywhere else here, and 900 missed polls.
+#
+# It is NOT a finding on its own, and that is the point of the split: a frozen
+# offset has two causes with two different remedies, and which one it is comes
+# from the file, not from the clock.
+SURICATA_CURSOR_IDLE_MIN = 15
+
+# How many bytes may sit unread behind a LIVE reader. `nginx_tail.read_new_lines`
+# stops at the last `\n`, so what a healthy reader leaves behind is one line that
+# has been started and not yet terminated. An `eve.json` line is on the order of
+# a kilobyte; 64 KiB is far above that and far below any real growth (~231 KB/min
+# measured on the host, so ~3.4 MB accumulates over one idle window).
+SURICATA_PARTIAL_LINE_BYTES = 64 * 1024
+
+
+def _stat_size_inode(path: str) -> tuple[int, int] | None:
+    """(size, inode) of `path`, or `None` if it cannot be read.
+
+    `None` is "I could not look", never "it is empty": the caller turns it into
+    `unknown`, because an unreadable eve.json cannot tell the dead reader apart
+    from the stopped sensor and reporting either would be an invention.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return st.st_size, st.st_ino
+
+
+def _tail_cursor(cursor: str) -> tuple[int, int] | None:
+    """"<inode>:<offset>" → (inode, offset), or `None` if it is not that.
+
+    Same format as `collectors/nginx_tail.read_new_lines` writes. Anything else
+    is a cursor this check cannot interpret, and it says so rather than guessing
+    a zero — an offset of 0 would make every growing file look unread.
+    """
+    inode_s, _, offset_s = (cursor or "").partition(":")
+    try:
+        return int(inode_s), int(offset_s)
+    except ValueError:
+        return None
+
+
+async def _suricata_reader(db: Database, cfg: Config,
+                           alert_minutes: float | None) -> list[CheckResult]:
+    """Is the eve.json reader still reading? — asked of the offset, not the rows.
+
+    Four states, and the old check collapsed all four into "no rows for 30
+    minutes, so the collector is broken":
+
+    * **the offset advances** — the reader works. Whether it produced rows is a
+      separate question and not this one's business: on the production host
+      `eve.json` is ~99% flow/dns/stats records, so hours pass with no `alert`
+      to write, and that is Suricata finding nothing rather than Sentinel
+      failing to look.
+    * **the offset is frozen and the file has grown past it** — the reader died
+      over a live file. This is the fault the check exists for, it is the one the
+      neighbour comparison could never see, and it is `down`.
+    * **the offset is frozen and the file has not grown** — the collector has
+      read everything there is. Suricata itself stopped writing, which is a
+      different fault with a different remedy: restarting `sentinel-ingest`
+      would change nothing. Its own key, so it cannot be mistaken for the one
+      above.
+    * **the cursor or the file cannot be read** — `unknown`, said out loud. Not
+      `ok`: the runner reconciles state against the keys a run emits, so
+      answering "fine" to a question that was never answered would clear a real
+      finding and show the operator a recovery that never happened.
+
+    `alert_minutes` is how long ago the last suricata ROW landed, or `None` if
+    the source has never appeared in the 30-day window. It is reported, never
+    judged.
+    """
+    if not (cfg.ingest.suricata and cfg.suricata.enabled):
+        # Said rather than omitted, like `ship:lag` says shipping is off: a key
+        # missing from the panel leaves the operator to infer why.
+        return [CheckResult(
+            "ingest:suricata", "Colector „suricata”", "ok",
+            detail="oprit în configurație — pe gazda asta nu se citește eve.json",
+            facts={"configured": False})]
+
+    note = ""
+    if alert_minutes is None:
+        note = " · nicio alertă în fereastra de 30 de zile"
+    else:
+        note = f" · ultima alertă acum {_ago(alert_minutes)}"
+    note += (". Rândurile apar doar când se potrivește o semnătură, deci "
+             "tăcerea lor nu e o măsurătoare a colectorului")
+
+    row = await db.fetchrow(
+        "SELECT cursor, EXTRACT(EPOCH FROM (now() - updated_at))/60 AS minute "
+        "FROM collector_cursors WHERE name = 'suricata'")
+    if row is None:
+        return [CheckResult(
+            "ingest:suricata", "Nu pot spune dacă „suricata” mai e citit", "unknown",
+            detail="colectorul e pornit în configurație, dar nu există cursorul "
+                   "`suricata` în collector_cursors — nu s-a citit niciodată, ori "
+                   "rândul a fost șters. Nu înseamnă „citește” și nu înseamnă "
+                   "„s-a oprit”",
+            action="journalctl -u sentinel-ingest -n 100",
+            facts={"configured": True, "cursor": None})]
+
+    cursor = str(row["cursor"] or "")
+    idle_min = float(row["minute"] or 0)
+    if idle_min <= SURICATA_CURSOR_IDLE_MIN:
+        return [CheckResult(
+            "ingest:suricata", "Colector „suricata”", "ok",
+            detail=f"cititorul avansează — offsetul din eve.json s-a mișcat acum "
+                   f"{_ago(idle_min)}{note}",
+            facts={"cursor": cursor, "cursor_idle_min": int(idle_min),
+                   "alert_min": None if alert_minutes is None else int(alert_minutes)})]
+
+    path = cfg.suricata.eve_path
+    stat = await asyncio.to_thread(_stat_size_inode, path)
+    parsed = _tail_cursor(cursor)
+    if stat is None or parsed is None:
+        why = (f"{path} nu s-a putut citi" if stat is None
+               else f"cursorul „{cursor}” nu are forma <inod>:<offset>")
+        return [CheckResult(
+            "ingest:suricata", "Nu pot spune dacă „suricata” mai e citit", "unknown",
+            detail=f"offsetul colectorului stă pe loc de {_ago(idle_min)}, iar "
+                   f"{why} — deci nu se poate spune dacă a murit cititorul sau "
+                   f"dacă s-a oprit Suricata",
+            action=f"ls -l {path} ; journalctl -u sentinel-ingest -n 100",
+            facts={"cursor": cursor, "cursor_idle_min": int(idle_min)})]
+
+    size, inode = stat
+    c_inode, c_offset = parsed
+    rotated = c_inode != inode
+    # Offsetul dincolo de capătul fișierului înseamnă că fișierul a fost tăiat
+    # sub același inod — `logrotate` cu `copytruncate`. Un cititor viu o vede
+    # (`read_new_lines`: `if start > size: start = 0`) și reia de la zero, deci
+    # cursorul lui s-ar fi mișcat. Rămas pe loc, întreg fișierul e necitit. Fără
+    # ramura asta, `size - c_offset` ieșea negativ, nu trecea de prag, și un
+    # cititor mort era raportat drept „senzorul tace" — serviciul greșit.
+    truncated = not rotated and c_offset > size
+    unread = size if (rotated or truncated) else size - c_offset
+    if rotated or truncated or unread > SURICATA_PARTIAL_LINE_BYTES:
+        # Fișierul a crescut (ori s-a rotit, ori a fost tăiat) sub un offset care
+        # nu s-a mișcat. Asta e o pată oarbă: Suricata scrie, nimeni nu citește.
+        # `down`, deci `critical` la runner — e aceeași clasă cu pana de 21 de ore.
+        if rotated:
+            what = (f"fișierul s-a rotit (inod {inode}, cursorul e pe {c_inode}) "
+                    f"și cei {unread} de octeți ai lui n-au fost citiți")
+        elif truncated:
+            what = (f"fișierul a fost tăiat sub cursor (offset {c_offset}, mărime "
+                    f"{size}) și cei {unread} de octeți de acum n-au fost citiți")
+        else:
+            what = f"au rămas {unread} de octeți necitiți în eve.json"
+        return [CheckResult(
+            "ingest:suricata", "Colectorul „suricata” nu mai citește eve.json", "down",
+            detail=f"offsetul colectorului stă pe loc de {_ago(idle_min)}, iar "
+                   f"{what} — Suricata scrie, colectorul nu ia nimic{note}",
+            action="systemctl restart sentinel-ingest ; "
+                   "journalctl -u sentinel-ingest -n 100",
+            facts={"cursor": cursor, "cursor_idle_min": int(idle_min),
+                   "unread_bytes": unread, "eve_size": size, "rotated": rotated,
+                   "truncated": truncated})]
+
+    # Offset oprit, fișier care nu crește: colectorul a citit tot ce există.
+    # Cheie separată, fiindcă remediul e altul — o repornire a lui
+    # `sentinel-ingest` n-ar schimba nimic. `degraded`, nu `down`: pe gazdă
+    # colectarea funcționează, iar `down` ar deveni `critical`, adică ar trece
+    # peste `/mute` și ar spune „SENTINEL NU FUNCȚIONEAZĂ COMPLET" pentru un
+    # senzor din afara lui Sentinel.
+    return [
+        CheckResult(
+            "ingest:suricata", "Colector „suricata”", "ok",
+            detail=f"cititorul e la zi cu eve.json (offset {c_offset} din {size} "
+                   f"octeți), dar fișierul nu a mai crescut de {_ago(idle_min)}"
+                   f"{note}",
+            facts={"cursor": cursor, "cursor_idle_min": int(idle_min),
+                   "unread_bytes": unread}),
+        CheckResult(
+            "ingest:suricata:sensor", "Suricata nu mai scrie în eve.json", "degraded",
+            detail=f"{path} nu a mai crescut de {_ago(idle_min)}, iar colectorul "
+                   f"a citit tot ce era acolo — nu lipsește citirea, lipsește "
+                   f"senzorul. Cât ține, gazda nu e inspectată de IDS",
+            action=f"systemctl status suricata ; journalctl -u suricata -n 50 ; "
+                   f"ls -l {path}",
+            facts={"eve_size": size, "quiet_min": int(idle_min)}),
+    ]
+
+
 async def check_ingest_sources(db: Database, cfg: Config) -> list[CheckResult]:
     """Each collector that has ever produced data is still producing it.
 
     This is the check that would have caught the 21-hour blind spot: the ingest
     service was `active`, had never restarted, and had logged no error, while
     its journald reader returned nothing poll after poll. Only the data said so.
+
+    That argument holds for every source whose rows are proportional to traffic,
+    and only for those. The sources listed in `CURSOR_BACKED_SOURCES` are judged
+    on their reader's cursor instead, and their verdict is produced here — not
+    skipped — so the `ingest:*` namespace still has exactly one author.
     """
     rows = await db.fetch(
         """
@@ -267,20 +519,31 @@ async def check_ingest_sources(db: Database, cfg: Config) -> list[CheckResult]:
         WHERE ts > now() - interval '30 days'
         GROUP BY source
         """)
+    ages = {r["source"]: float(r["minute_tacere"] or 0) for r in rows}
+    # Judged on the cursor, so it is asked BEFORE the "no rows at all" branch and
+    # survives it: a host where Suricata has matched nothing for a month has no
+    # suricata row to group by, and dropping out of the query is exactly the case
+    # where "is the reader alive" still needs an answer.
+    cursor_backed = await _suricata_reader(db, cfg, ages.get("suricata"))
+
     if not rows:
-        return [CheckResult("ingest:any", "Colectare de evenimente", "down",
+        return [*cursor_backed,
+                CheckResult("ingest:any", "Colectare de evenimente", "down",
                             detail="niciun eveniment în 30 de zile",
                             action="journalctl -u sentinel-ingest -n 100")]
 
-    ages = {r["source"]: float(r["minute_tacere"] or 0) for r in rows}
     # The discriminator: is ANY source still writing? If none is, the host is
     # quiet (or the whole daemon is down, which check_units reports) — and
     # blaming each collector individually would be six alerts for one fault.
     freshest = min(ages.values())
     others_are_live = freshest <= 5
 
-    results: list[CheckResult] = []
+    results: list[CheckResult] = list(cursor_backed)
     for source, minutes in sorted(ages.items()):
+        if source in CURSOR_BACKED_SOURCES:
+            # Already answered, from the fact that measures it. A second verdict
+            # from the row clock would be the falsified one, under the same key.
+            continue
         if source in HUMAN_DRIVEN:
             # Reported, never alerted on. The operator still sees the source and
             # when it last spoke; what changes is that quiet is not a fault.
@@ -795,25 +1058,83 @@ SHIP_LAG_GRACE_MIN_BY_STREAM: dict[str, int] = {
     "session_commands": 360,  # 6 ore
 }
 
-# Câte rulări consecutive ale autodiagnosticului văd VALOAREA cursorului
-# neschimbată — deși există rânduri în așteptare — înainte ca fluxul să fie numit
-# înțepenit. Trei, adică se raportează „la a treia privire", exact aceeași
-# convenție ca `BEACON_REFUSALS_BEFORE_FINDING`: temporizatorul e la 5 minute
-# (`OnUnitActiveSec=5min`), deci ~15 minute, prins pe scala minutelor, nu a orelor
-# pragului de vârstă de mai sus. O restanță reală care se recuperează nu s-a
-# oprit — cursorul ei înaintează la fiecare rundă, deci resetează contorul; numai
-# un cursor înghețat trece pragul.
+# Câte rulări consecutive ale autodiagnosticului văd POZIȚIA cursorului
+# neschimbată înainte ca fluxul să poată fi numit înțepenit. Trei, adică „la a
+# treia privire", aceeași convenție ca `BEACON_REFUSALS_BEFORE_FINDING`.
 #
-# Semnalul e VALOAREA cursorului comparată între rulări, NU ora vreunei scrieri,
-# și asta e miezul reparației. Măsurat în `report/shipper.py`: `_advance` (fluxul
-# pe `id`) și `_advance_mutable` (fluxul pe `(updated_at, cheie)`) scriu amândouă
-# `updated_at = now()` NECONDIȚIONAT la fiecare upsert, în timp ce `cursor` și
-# `cursor_at` se mișcă doar când chiar avansează (`GREATEST`, respectiv
-# `CASE WHEN moved`). Un detector clădit pe `updated_at` n-ar vedea deci niciodată
-# o înțepenire — ar arăta identic cu munca normală. Comparăm `item.cursor`:
-# `cursor` (int) pentru fluxul pe `id`, `cursor_at` (isoformat) pentru cel mutabil
-# — ambele se schimbă numai când expedierea înaintează cu adevărat.
+# Semnalul e POZIȚIA cursorului comparată între rulări, NU ora vreunei scrieri.
+# Măsurat în `report/shipper.py`: `_advance` (fluxul pe `id`) și `_advance_mutable`
+# (fluxul pe `(updated_at, cheie)`) scriu amândouă `updated_at = now()`
+# NECONDIȚIONAT la fiecare upsert, în timp ce cursorul propriu-zis se mișcă doar
+# când chiar avansează (`GREATEST`, respectiv `CASE WHEN moved`). Un detector
+# clădit pe `updated_at` n-ar vedea deci niciodată o înțepenire.
 STALL_RUNS_BEFORE_FINDING = 3
+
+# Câte runde ale EXPEDITORULUI trebuie să fi trecut peste cel mai vechi rând în
+# așteptare înainte ca „cursorul n-a mișcat" să însemne ceva.
+#
+# Asta e reparația din 28 august 2026, și e despre ce se măsoară. Pragul de mai
+# sus numără PRIVIRI, nu timp: temporizatorul e la 5 minute, deci trei priviri
+# înseamnă un cursor nemișcat de ~15 minute — pe orice gazdă, indiferent cât de
+# des expediază expeditorul. Cu `ship.interval_s` implicit de 60 s asta e mult;
+# cu un interval pus de operator la 10 minute e SUB o singură rundă normală, și
+# atunci constatarea se aprinde pe purtarea corectă a mecanismului. Aceeași
+# podea o are deja pragul de vârstă (`3 * cfg.ship.interval_s`), din același
+# motiv, iar detectorul de înțepenire nu avea niciuna.
+STALL_MIN_ROUNDS_WAITED = 3
+
+# Cel mai vechi rând în așteptare trebuie să fi așteptat cel puțin atât, oricât
+# de des ar expedia expeditorul. O rundă poate fi de o secundă (`DRAIN_PAUSE_S`),
+# iar „trei runde" ar fi atunci trei secunde — adică nimic.
+STALL_MIN_WAIT_MIN = 3.0
+
+
+def _stall_position(item: Any) -> str:
+    """Semnătura POZIȚIEI cursorului unui flux, comparabilă între rulări.
+
+    `item.cursor` singur NU e poziția pe un flux mutabil, iar ăsta e defectul
+    măsurat pe gazda de producție pe 28 august 2026. Acolo cursorul e PERECHEA
+    `(cursor_at, cheie)` — `_advance_mutable` le mută pe amândouă odată —, iar
+    jumătatea-cheie nu e nici monotonă, nici unică: la fiecare filigran nou ea
+    repornește de la ultimul rând al lotului. Un incident deschis care se
+    actualizează des e ultimul din lot rundă după rundă, deci jumătatea-cheie
+    rămâne aceeași valoare în timp ce poziția reală înaintează.
+
+    Ce s-a văzut din asta: alerta de la 12:53 spunea „a rămas la valoarea 56882",
+    în timp ce `collector_cursors` avea `ship:incidents` cu `cursor = 54661`,
+    scris la 12:58:39 — deci un cursor viu, și două valori diferite pentru
+    „cursorul". Cea comparată nu era poziția.
+
+    `cursor_at is None` înseamnă flux pe `id`, unde `cursor` CHIAR e poziția
+    întreagă și e monoton crescător.
+    """
+    if item.cursor_at is not None:
+        return f"{item.cursor_at.isoformat()}|{item.cursor}"
+    return str(item.cursor)
+
+
+def _stall_mark(raw: str) -> tuple[str, int]:
+    """„<restanță la înghețare>#<poziție>" → (poziție, restanță).
+
+    Cele două stau într-o singură coloană fiindcă `collector_cursors` are, pe
+    schema pe care rulează gazda (0023 neaplicată), exact două câmpuri libere —
+    `cursor` (text) și `events_seen` (bigint) —, iar contorul de priviri îl
+    ocupă pe al doilea. Rândul `ship:<flux>:stall` nu e citit de nimeni altcineva
+    (nici de expeditor, nici de agregator), deci formatul e privat detectorului.
+
+    O valoare care nu are forma asta — rândul scris de versiunea dinainte — se
+    citește ca poziția ei, cu restanța de referință 0. Consecința e ținută
+    dinadins în partea sigură: prima rulare după instalare vede o poziție care nu
+    se potrivește, resetează contorul, și detectorul repornește curat în loc să
+    moștenească o măsurătoare pe care n-a făcut-o.
+    """
+    baseline, sep, position = (raw or "").partition("#")
+    if not sep:
+        return raw or "", 0
+    try:
+        return position, int(baseline)
+    except ValueError:
+        return position, 0
 
 # How long the last ACCEPTED beat may sit before `beacon:delivery` calls it a
 # finding, and how many refused rounds in a row make a never-accepted beacon one.
@@ -1086,31 +1407,48 @@ async def check_ship_lag(db: Database, cfg: Config) -> list[CheckResult]:
         # (6h pentru `session_commands`) ar fi greșit: înțepenirea se prinde în
         # câteva minute.
         #
-        # Semnalul e VALOAREA cursorului între rulări (vezi
+        # Semnalul e POZIȚIA cursorului între rulări (vezi
         # `STALL_RUNS_BEFORE_FINDING`), nu ora vreunei scrieri: `updated_at` e pus
         # necondiționat la fiecare upsert al expeditorului, deci un detector pe el
         # n-ar deosebi o înțepenire de munca normală. Starea între rulări stă în
-        # `collector_cursors`, sub cheia `ship:<flux>:stall`, cu aceeași disciplină
-        # ca celelalte cursoare: `cursor` ține ultima valoare văzută, `events_seen`
-        # numărul de priviri anterioare consecutive la aceeași valoare. Ambele
-        # coloane există din 0010, deci detectorul merge și pe schema veche (0023
-        # neaplicată), acolo unde un flux mutabil oricum iese pe ramura `error` de
-        # mai sus și nu ajunge aici.
+        # `collector_cursors`, sub cheia `ship:<flux>:stall`: `cursor` ține
+        # semnătura poziției plus restanța de la înghețare (`_stall_mark`),
+        # `events_seen` numărul de priviri anterioare consecutive în aceeași
+        # poziție. Ambele coloane există din 0010, deci detectorul merge și pe
+        # schema veche (0023 neaplicată), acolo unde un flux mutabil oricum iese
+        # pe ramura `error` de mai sus și nu ajunge aici.
+        #
+        # NU e de ajuns ca poziția să stea pe loc, și asta e reparația din 28
+        # august 2026. Un cursor nemișcat răspunde la „a plecat ceva?", nu la
+        # „mai merge expeditorul?" — iar pe un flux fără trafic răspunsul corect
+        # la prima e „n-avea ce". Ce deosebește mecanismul oprit de mecanismul
+        # care n-are de lucru e că restanța CREȘTE: sosește muncă și nu pleacă
+        # nimic. Măsurat pe gazdă pe 28 august: două alerte de „nu mai înaintează
+        # deloc" cu 3, respectiv 1 rând în așteptare, pe fluxuri ale căror
+        # cursoare erau vii.
+        #
+        # Ce rămâne acoperit fără condiția asta: un flux cu o restanță care nu
+        # crește, dar care nu pleacă, e prins de pragul de VÂRSTĂ mai jos — acolo
+        # întrebarea e „de cât timp așteaptă rândul", și e cea potrivită.
         stall_key = f"ship:{item.stream}:stall"
         prev_stall = await db.fetchrow(
             "SELECT cursor, events_seen FROM collector_cursors WHERE name = $1",
             stall_key)
-        cursor_repr = str(item.cursor)
-        if (prev_stall is None or str(prev_stall["cursor"]) != cursor_repr
-                or not item.pending):
-            # Cursorul a înaintat (valoare nouă sau prima privire), ori nu mai e
+        position = _stall_position(item)
+        prev_position, pending_at_freeze = _stall_mark(
+            str(prev_stall["cursor"]) if prev_stall is not None else "")
+        if prev_stall is None or prev_position != position or not item.pending:
+            # Cursorul a înaintat (poziție nouă sau prima privire), ori nu mai e
             # nimic în așteptare — în ambele cazuri fluxul NU e înțepenit, deci
-            # contorul revine la zero. Un flux fără rânduri în așteptare e la zi,
-            # nu blocat: cursorul e la cap, n-are ce înainta.
+            # contorul revine la zero și restanța de referință e cea de acum. Un
+            # flux fără rânduri în așteptare e la zi, nu blocat: cursorul e la
+            # cap, n-are ce înainta.
             prior_frozen_looks = 0
+            pending_at_freeze = item.pending
         else:
-            # Aceeași valoare, cu rânduri în așteptare: încă o privire consecutivă
-            # în care nu s-a mișcat.
+            # Aceeași poziție, cu rânduri în așteptare: încă o privire consecutivă
+            # în care nu s-a mișcat. Restanța de referință rămâne cea de la
+            # înghețare, ca tendința să se măsoare de acolo, nu de la ultima privire.
             prior_frozen_looks = int(prev_stall["events_seen"] or 0) + 1
         await db.execute(
             """
@@ -1121,26 +1459,40 @@ async def check_ship_lag(db: Database, cfg: Config) -> list[CheckResult]:
                     events_seen = $3::bigint,
                     updated_at = now()
             """,
-            stall_key, cursor_repr, prior_frozen_looks)
+            stall_key, f"{pending_at_freeze}#{position}", prior_frozen_looks)
 
-        # Privirea curentă e a `prior_frozen_looks + 1`-a la aceeași valoare. La a
-        # treia (prag), fluxul e înțepenit. `degraded`, NU `down`, dinadins și în
-        # ciuda faptului că e mai grav decât o restanță: `runner._announce` ridică
-        # la `critical` — care trece de mute — exact când un rezultat e `down`, iar
-        # regula întregii verificări (vezi docstring) e că „🔴 SENTINEL NU
-        # FUNCȚIONEAZĂ COMPLET" înseamnă „nimeni nu se uită la gazdă". O expediere
-        # înțepenită nu e asta: pe gazdă totul funcționează, doar copia din afară
-        # nu mai crește. Gravitatea suplimentară o poartă cheia și titlul distinct
-        # („s-a înțepenit" vs „a rămas în urmă") și prinderea în minute, nu status-ul.
-        if item.pending and prior_frozen_looks + 1 >= STALL_RUNS_BEFORE_FINDING:
+        # Podeaua de timp. `STALL_RUNS_BEFORE_FINDING` numără PRIVIRI, iar o
+        # privire e a temporizatorului de autodiagnostic, nu a expeditorului: pe
+        # o gazdă cu `interval_s` mare, trei priviri pot cădea între două runde
+        # normale de expediere, și atunci constatarea s-ar aprinde pe purtarea
+        # corectă a mecanismului. Aceeași podea o are pragul de vârstă de mai jos.
+        waited_min = item.oldest_pending_min or 0.0
+        min_wait_min = max(STALL_MIN_WAIT_MIN,
+                           STALL_MIN_ROUNDS_WAITED * cfg.ship.interval_s / 60)
+        grew_by = item.pending - pending_at_freeze
+
+        # Privirea curentă e a `prior_frozen_looks + 1`-a în aceeași poziție.
+        # `degraded`, NU `down`, dinadins și în ciuda faptului că e mai grav decât
+        # o restanță: `runner._announce` ridică la `critical` — care trece de mute
+        # — exact când un rezultat e `down`, iar regula întregii verificări (vezi
+        # docstring) e că „🔴 SENTINEL NU FUNCȚIONEAZĂ COMPLET" înseamnă „nimeni
+        # nu se uită la gazdă". O expediere înțepenită nu e asta: pe gazdă totul
+        # funcționează, doar copia din afară nu mai crește. Gravitatea suplimentară
+        # o poartă cheia și titlul distinct („s-a înțepenit" vs „a rămas în urmă")
+        # și prinderea în minute, nu status-ul.
+        if (item.pending and prior_frozen_looks + 1 >= STALL_RUNS_BEFORE_FINDING
+                and grew_by > 0 and waited_min >= min_wait_min):
             results.append(CheckResult(
                 f"ship:lag:{item.stream}:stall",
                 f"{title} s-a înțepenit", "degraded",
-                detail=f"cursorul fluxului „{item.stream}” a rămas la valoarea "
-                       f"{item.cursor} în {prior_frozen_looks + 1} rulări la rând, "
-                       f"deși {item.pending} rânduri așteaptă — nu rămâne în urmă, "
-                       f"nu mai înaintează deloc. Copia din afara gazdei e oprită "
-                       f"pe loc, iar restanța nu se va recupera singură{floor_note}",
+                detail=f"cursorul fluxului „{item.stream}” a rămas pe loc în "
+                       f"{_numar(prior_frozen_looks + 1, 'rulare', 'rulări')} la "
+                       f"rând, iar restanța a crescut în tot acest timp de la "
+                       f"{_numar(pending_at_freeze, 'rând', 'rânduri')} la "
+                       f"{_numar(item.pending, 'rând', 'rânduri')}, cel mai vechi "
+                       f"de {_ago(waited_min)} — nu rămâne în urmă, nu mai "
+                       f"înaintează deloc. Copia din afara gazdei e oprită pe loc, "
+                       f"iar restanța nu se va recupera singură{floor_note}",
                 action="journalctl -u sentinel-shipper -n 50  (un cursor blocat "
                        "înseamnă că fiecare lot e refuzat sau că un singur rând nu "
                        "poate pleca: caută „HTTP 413” — lot peste plafonul "
@@ -1148,8 +1500,11 @@ async def check_ship_lag(db: Database, cfg: Config) -> list[CheckResult]:
                        "fără ecou” — cerere care nu ajunge la agregator, ori „cannot "
                        "encode a row” — un rând pe care expeditorul nu-l poate "
                        "codifica îi blochează fluxul pe loc)",
-                facts={"cursor": item.cursor, "pending": item.pending,
+                facts={"cursor": item.cursor, "position": position,
+                       "pending": item.pending,
+                       "pending_at_freeze": pending_at_freeze,
                        "stall_runs": prior_frozen_looks + 1,
+                       "oldest_min": int(waited_min),
                        "lost_below_cursor": item.lost_below_cursor}))
             continue
 
