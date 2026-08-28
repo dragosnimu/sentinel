@@ -400,6 +400,52 @@ def test_suricata_turned_off_in_config_says_so_instead_of_vanishing(tmp_path):
     assert sur.status == "ok" and sur.facts["configured"] is False
 
 
+def test_the_toggle_in_ingest_decides_whether_the_cursor_is_read_at_all(tmp_path):
+    """Colectorul se oprește din DOUĂ chei, iar una singură era fixată de un test.
+
+    `cfg.ingest.suricata` e cea care spune dacă `sentinel-ingest` mai citește
+    `eve.json`; `cfg.suricata.enabled` spune dacă senzorul e pornit. Dacă prima
+    nu mai e citită, pe o gazdă care a oprit colectorul dinadins verificarea ar
+    judeca un cursor pe care nimeni nu-l mai scrie și l-ar raporta înghețat —
+    adică `down`, adică `critical`, adică o alertă care trece de `/mute` despre
+    ceva ce a cerut chiar operatorul.
+    """
+    path, inode, size = _eve(tmp_path, 4096)
+    cfg = _suricata_cfg(path)
+    cfg.ingest = SimpleNamespace(suricata=False)
+    db = _DB(rows=[_source("nginx", 1)], row=_cursor_row(f"{inode}:{size}", 90.0))
+    results = run(checks.check_ingest_sources(db, cfg))
+
+    sur = next(r for r in results if r.key == "ingest:suricata")
+    assert sur.status == "ok" and sur.facts["configured"] is False, (
+        "`ingest.suricata: false` nu mai oprește verdictul pe cursor")
+    assert not any("collector_cursors" in s for s in db.sql), (
+        "a citit cursorul „suricata” deși colectorul e oprit din `ingest` — "
+        "verdictul ar veni dintr-un rând pe care nimeni nu-l mai scrie")
+
+
+def test_the_cursor_verdict_survives_the_no_rows_at_all_branch(tmp_path):
+    """O gazdă fără niciun eveniment nu are voie să piardă verdictul pe cursor.
+
+    Ramura „niciun rând în 30 de zile" iese devreme și întoarce singură lista de
+    rezultate. Runner-ul reconciliază `selfcheck_state` cu cheile pe care le emite
+    o rulare, deci un `ingest:suricata` absent din ea e citit ca o constatare pe
+    care verificarea a retras-o: operatorului i s-ar arăta o revenire care nu s-a
+    întâmplat, pe cititorul de `eve.json`, exact pe gazda unde nu scrie nimeni
+    altcineva ca să se observe.
+    """
+    path, inode, size = _eve(tmp_path, 4096)
+    db = _DB(rows=[], row=_cursor_row(f"{inode}:{size}", 0.5))
+    results = run(checks.check_ingest_sources(db, _suricata_cfg(path)))
+
+    sur = next((r for r in results if r.key == "ingest:suricata"), None)
+    assert sur is not None and sur.status == "ok", (
+        "verdictul pe cursor a dispărut pe ramura «niciun eveniment în 30 de "
+        "zile», deci runner-ul retrage constatarea despre cititorul eve.json")
+    assert any(r.key == "ingest:any" and r.status == "down" for r in results), (
+        "ramura de pană totală de colectare nu mai raportează nimic")
+
+
 def test_no_events_at_all_is_reported():
     """Zero rânduri în 30 de zile e o pană totală de colectare, și trebuie spusă.
 
@@ -2741,3 +2787,126 @@ def test_the_stall_counter_resets_when_the_cursor_moves_again(monkeypatch):
         "un flux care a înaintat din nou e încă raportat înțepenit")
     assert db.store["ship:session_commands:stall"]["events_seen"] == 0, (
         "contorul de rulări-fără-mișcare nu a revenit la zero după ce cursorul s-a mișcat")
+
+
+def test_a_registry_row_written_before_the_baseline_existed_forces_a_reset(monkeypatch):
+    """Prima rulare după deploy alarma pe o creștere pe care n-o măsurase nimeni.
+
+    Rândurile `ship:<flux>:stall` lăsate de versiunea dinainte țin doar poziția,
+    fără restanța de referință. Pe un flux append-only poziția E `str(cursor)`,
+    deci un asemenea rând se potrivea cu poziția de acum: contorul de priviri se
+    moștenea, restanța de referință ieșea 0, iar „a crescut de la 0" e adevărat
+    pentru orice restanță nenulă. Rezultatul e chiar falsul pozitiv pe care
+    restanța de referință îl repară, aprins permanent pe fluxurile append-only.
+
+    Datele sunt cele citite pe gazdă pe 28 august 2026: toate cele 12 rânduri erau
+    în formatul vechi, `ship:session_commands:stall` avea `cursor = 2984543` fără
+    `#`, iar prima rulare după deploy trimitea „a rămas pe loc în 6 rulări la rând,
+    iar restanța a crescut în tot acest timp de la 0 rânduri la 1 rând".
+    """
+    db = _StallDB()
+    db.store["ship:session_commands:stall"] = {"cursor": "2984543", "events_seen": 5}
+    cfg = _ship_cfg()
+    _patch_ship(monkeypatch, [_sc_lag(2984543, pending=1, oldest_min=30)])
+
+    results = run(checks.check_ship_lag(db, cfg))
+
+    assert not any(r.key.endswith(":stall") for r in results), (
+        "rândul lăsat de versiunea dinainte a fost citit ca o măsurătoare proprie, "
+        "iar prima rulare după deploy a alarmat pe o creștere de la un zero fabricat")
+    mark = db.store["ship:session_commands:stall"]
+    assert mark["events_seen"] == 0, (
+        "contorul de priviri din rândul vechi a fost moștenit, deci o măsurătoare "
+        "pe care detectorul n-a făcut-o rămâne în rând")
+    assert mark["cursor"] == "1#2984543", (
+        "restanța de referință nu a fost scrisă la reset, deci rulările următoare "
+        "ar porni iar de la zero")
+
+    # Direct pe citirea rândului, fiindcă asta e proprietatea: o valoare din care
+    # nu se poate scoate restanța de referință nu e o măsurătoare, deci nu are voie
+    # să se potrivească cu nimic. „Poziția ei, cu restanța 0" e o măsurătoare
+    # inventată, iar pe un flux append-only e chiar poziția de acum.
+    assert checks._stall_mark("2984543") is None
+    assert checks._stall_mark("nu-i-numar#2984543") is None
+    assert checks._stall_mark(None) is None
+    assert checks._stall_mark("1#2984543") == ("2984543", 1)
+
+
+def test_after_that_reset_a_backlog_that_really_grows_is_still_caught(monkeypatch):
+    """Perechea: resetul nu are voie să însemne „nu mai alarmează niciodată".
+
+    Un rând vechi îmbătrânit într-o gazdă chiar înțepenită trebuie să producă
+    constatarea — doar că măsurată de la restanța pe care detectorul a văzut-o el,
+    nu de la una presupusă. Aceeași poziție de pe gazdă, trei priviri, restanță
+    care chiar crește.
+    """
+    db = _StallDB()
+    db.store["ship:session_commands:stall"] = {"cursor": "2984543", "events_seen": 5}
+    cfg = _ship_cfg()
+    results = []
+    for pending in (1, 4, 9):
+        _patch_ship(monkeypatch, [_sc_lag(2984543, pending=pending, oldest_min=30)])
+        results = run(checks.check_ship_lag(db, cfg))
+
+    stall = _key(results, "ship:lag:session_commands:stall")
+    assert stall is not None and stall.status == "degraded", (
+        "după resetul forțat de rândul vechi, o înțepenire adevărată nu mai e prinsă")
+    assert stall.facts["stall_runs"] == 3 and stall.facts["pending_at_freeze"] == 1, (
+        f"numărat greșit după reset: {stall.facts}")
+    assert "de la 1 rând la 9 rânduri" in stall.detail, stall.detail
+
+
+def test_the_second_consecutive_look_is_not_yet_a_stall(monkeypatch):
+    """Pragul de trei priviri trebuie ținut și de dedesubt, nu doar de deasupra.
+
+    O privire e a temporizatorului de autodiagnostic, care e la 5 minute: trei
+    priviri înseamnă un cursor nemișcat de ~15 minute. Aprinsă la a doua, aceeași
+    alertă ar pleca după ~5 minute — adică peste o singură rundă de expediere care
+    poate fi doar înceată, și atunci constatarea se aprinde pe funcționarea normală.
+    """
+    db = _StallDB()
+    cfg = _ship_cfg()
+    results = []
+    for pending in (5, 40):
+        _patch_ship(monkeypatch, [_sc_lag(200, pending=pending, oldest_min=30)])
+        results = run(checks.check_ship_lag(db, cfg))
+
+    assert not any(r.key.endswith(":stall") for r in results), (
+        "constatarea de înțepenire s-a aprins la a doua privire — alerta pleacă "
+        "după ~5 minute în loc de ~15")
+
+    _patch_ship(monkeypatch, [_sc_lag(200, pending=120, oldest_min=30)])
+    results = run(checks.check_ship_lag(db, cfg))
+    stall = _key(results, "ship:lag:session_commands:stall")
+    assert stall is not None and stall.facts["stall_runs"] == 3, (
+        "a treia privire nu mai e constatarea de înțepenire — pragul s-a mutat")
+
+
+def test_the_backlog_messages_agree_with_their_own_numbers(monkeypatch):
+    """Acordul a fost aplicat doar în mesajul de înțepenire, nu și în restanță.
+
+    Mesajele de restanță sunt cele pe care operatorul le primește de departe cel
+    mai des, iar cu un singur rând spuneau „1 rânduri neexpediate". Un text care
+    nu se acordă cu propriul lui număr se citește ca un text pe care nu-l verifică
+    nimeni, iar canalul ăsta e singurul prin care agentul poate spune ceva.
+    """
+    db = _StallDB()
+    cfg = _ship_cfg()
+
+    _patch_ship(monkeypatch, [_sc_lag(100, pending=1, oldest_min=1)])
+    results = run(checks.check_ship_lag(db, cfg))
+    r = _key(results, "ship:lag:session_commands")
+    assert r is not None and r.status == "ok", "cazul de sub prag nu mai e cel testat"
+    assert "1 rând în curs de expediere" in r.detail, r.detail
+
+    _patch_ship(monkeypatch, [_sc_lag(110, pending=1, oldest_min=420)])
+    results = run(checks.check_ship_lag(db, cfg))
+    r = _key(results, "ship:lag:session_commands")
+    assert r is not None and r.status == "degraded", "cazul de peste prag nu mai e cel testat"
+    assert "1 rând neexpediat," in r.detail, r.detail
+    assert "1 rânduri" not in r.detail
+
+    _patch_ship(monkeypatch, [_sc_lag(120, pending=21, oldest_min=420)])
+    results = run(checks.check_ship_lag(db, cfg))
+    r = _key(results, "ship:lag:session_commands")
+    assert "21 de rânduri neexpediate," in r.detail, r.detail

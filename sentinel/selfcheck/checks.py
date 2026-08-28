@@ -1113,8 +1113,8 @@ def _stall_position(item: Any) -> str:
     return str(item.cursor)
 
 
-def _stall_mark(raw: str) -> tuple[str, int]:
-    """„<restanță la înghețare>#<poziție>" → (poziție, restanță).
+def _stall_mark(raw: Any) -> tuple[str, int] | None:
+    """„<restanță la înghețare>#<poziție>" → (poziție, restanță), ori `None`.
 
     Cele două stau într-o singură coloană fiindcă `collector_cursors` are, pe
     schema pe care rulează gazda (0023 neaplicată), exact două câmpuri libere —
@@ -1122,19 +1122,32 @@ def _stall_mark(raw: str) -> tuple[str, int]:
     ocupă pe al doilea. Rândul `ship:<flux>:stall` nu e citit de nimeni altcineva
     (nici de expeditor, nici de agregator), deci formatul e privat detectorului.
 
-    O valoare care nu are forma asta — rândul scris de versiunea dinainte — se
-    citește ca poziția ei, cu restanța de referință 0. Consecința e ținută
-    dinadins în partea sigură: prima rulare după instalare vede o poziție care nu
-    se potrivește, resetează contorul, și detectorul repornește curat în loc să
-    moștenească o măsurătoare pe care n-a făcut-o.
+    `None` înseamnă „nu există o măsurătoare făcută de detectorul ăsta": lipsește
+    rândul, ori are forma scrisă de versiunea dinainte, ori restanța din el nu e
+    un număr. E singurul răspuns onest, iar prima variantă — a citi un rând fără
+    `#` ca „poziția lui, cu restanța de referință 0" — reintroducea PERMANENT
+    chiar falsul pozitiv pe care restanța de referință îl repară. Pe un flux
+    append-only poziția e `str(cursor)`, adică exact ce scria versiunea veche:
+    rândul vechi se potrivea cu poziția de acum, contorul de priviri se moștenea,
+    iar `restanță - 0 > 0` e adevărat pentru orice restanță nenulă. Măsurat pe
+    gazdă pe 28 august 2026: toate cele 12 rânduri `ship:*:stall` erau în formatul
+    vechi, iar prima rulare după instalare producea `session_commands:stall` cu
+    textul „restanța a crescut de la 0 rânduri la 1 rând" — o creștere pe care
+    nimeni n-o măsurase.
+
+    `None` cade la apelant pe aceeași ramură cu „poziție nouă": contorul revine la
+    zero, se scrie formatul nou, și detectorul repornește curat de la restanța de
+    acum. Nu e o stare în plus, e aceeași stare — „n-am de unde compara".
     """
-    baseline, sep, position = (raw or "").partition("#")
+    if raw is None:
+        return None
+    baseline, sep, position = str(raw).partition("#")
     if not sep:
-        return raw or "", 0
+        return None
     try:
         return position, int(baseline)
     except ValueError:
-        return position, 0
+        return None
 
 # How long the last ACCEPTED beat may sit before `beacon:delivery` calls it a
 # finding, and how many refused rounds in a row make a never-accepted beacon one.
@@ -1435,20 +1448,22 @@ async def check_ship_lag(db: Database, cfg: Config) -> list[CheckResult]:
             "SELECT cursor, events_seen FROM collector_cursors WHERE name = $1",
             stall_key)
         position = _stall_position(item)
-        prev_position, pending_at_freeze = _stall_mark(
-            str(prev_stall["cursor"]) if prev_stall is not None else "")
-        if prev_stall is None or prev_position != position or not item.pending:
-            # Cursorul a înaintat (poziție nouă sau prima privire), ori nu mai e
-            # nimic în așteptare — în ambele cazuri fluxul NU e înțepenit, deci
-            # contorul revine la zero și restanța de referință e cea de acum. Un
-            # flux fără rânduri în așteptare e la zi, nu blocat: cursorul e la
-            # cap, n-are ce înainta.
+        prev_mark = _stall_mark(
+            prev_stall["cursor"] if prev_stall is not None else None)
+        if prev_mark is None or prev_mark[0] != position or not item.pending:
+            # Cursorul a înaintat (poziție nouă), ori nu există o măsurătoare de
+            # la care să pornim (prima privire, ori rândul lăsat de versiunea
+            # dinainte — vezi `_stall_mark`), ori nu mai e nimic în așteptare. În
+            # toate cazurile fluxul NU e înțepenit, deci contorul revine la zero
+            # și restanța de referință e cea de acum. Un flux fără rânduri în
+            # așteptare e la zi, nu blocat: cursorul e la cap, n-are ce înainta.
             prior_frozen_looks = 0
             pending_at_freeze = item.pending
         else:
             # Aceeași poziție, cu rânduri în așteptare: încă o privire consecutivă
             # în care nu s-a mișcat. Restanța de referință rămâne cea de la
             # înghețare, ca tendința să se măsoare de acolo, nu de la ultima privire.
+            pending_at_freeze = prev_mark[1]
             prior_frozen_looks = int(prev_stall["events_seen"] or 0) + 1
         await db.execute(
             """
@@ -1532,17 +1547,19 @@ async def check_ship_lag(db: Database, cfg: Config) -> list[CheckResult]:
             # every busy minute and train the operator to ignore the key.
             results.append(CheckResult(
                 f"ship:lag:{item.stream}", title, "ok",
-                detail=f"{item.pending} rânduri în curs de expediere, cel mai "
-                       f"vechi de {_ago(minutes)}{floor_note}",
+                detail=f"{_numar(item.pending, 'rând', 'rânduri')} în curs de "
+                       f"expediere, cel mai vechi de {_ago(minutes)}{floor_note}",
                 facts={"cursor": item.cursor, "pending": item.pending,
                        "lost_below_cursor": item.lost_below_cursor}))
             continue
 
         results.append(CheckResult(
             f"ship:lag:{item.stream}", f"{title} a rămas în urmă", "degraded",
-            detail=f"{item.pending} rânduri neexpediate, cel mai vechi de "
-                   f"{_ago(minutes)} — pe gazdă nu s-a oprit nimic, dar copia "
-                   f"din afara ei nu mai e completă{floor_note}",
+            # Fraza se acordă cu numărul ei, adjectivul inclusiv: „1 rând
+            # neexpediat", nu „1 rânduri neexpediate". Vezi `_numar`.
+            detail=f"{_numar(item.pending, 'rând neexpediat', 'rânduri neexpediate')}, "
+                   f"cel mai vechi de {_ago(minutes)} — pe gazdă nu s-a oprit "
+                   f"nimic, dar copia din afara ei nu mai e completă{floor_note}",
             # `batch_streams` e numit AICI fiindcă întrebarea operatorului e „al
             # cui rând a produs asta", iar cheia roșie e a fluxului rămas în urmă
             # — adică a efectului. Fluxurile scadente pleacă într-un lot comun,
