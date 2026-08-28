@@ -1116,11 +1116,14 @@ def _stall_position(item: Any) -> str:
 def _stall_mark(raw: Any) -> tuple[str, int] | None:
     """„<restanță la înghețare>#<poziție>" → (poziție, restanță), ori `None`.
 
-    Cele două stau într-o singură coloană fiindcă `collector_cursors` are, pe
-    schema pe care rulează gazda (0023 neaplicată), exact două câmpuri libere —
-    `cursor` (text) și `events_seen` (bigint) —, iar contorul de priviri îl
-    ocupă pe al doilea. Rândul `ship:<flux>:stall` nu e citit de nimeni altcineva
-    (nici de expeditor, nici de agregator), deci formatul e privat detectorului.
+    Cele două stau într-o singură coloană fiindcă detectorul are exact două
+    câmpuri pe care le poate folosi: `cursor` (text) și `events_seen` (bigint),
+    iar contorul de priviri îl ocupă pe al doilea. `collector_cursors` mai are
+    un al treilea, `cursor_at`, adăugat de 0023 și aplicat pe gazdă (verificat
+    pe 28 august 2026), dar el e filigranul fluxurilor MUTABILE și e citit de
+    expeditor, deci nu e liber pentru detectorul ăsta. Rândul
+    `ship:<flux>:stall` nu e citit de nimeni altcineva (nici de expeditor, nici
+    de agregator), deci formatul e privat detectorului.
 
     `None` înseamnă „nu există o măsurătoare făcută de detectorul ăsta": lipsește
     rândul, ori are forma scrisă de versiunea dinainte, ori restanța din el nu e
