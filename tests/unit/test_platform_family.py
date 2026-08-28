@@ -81,6 +81,7 @@ _RENDER_VALUES = {
     "@@BPF_FILTER@@": "",
     "@@SURICATA_ENABLED@@": "true",
     "@@AUDITD_ENABLED@@": "true",
+    "@@SCAN_CONTAINERS@@": "true",
     "@@TELEGRAM_CHAT_ID@@": "123456",
     "@@EXTRA_ALLOWLIST@@": "",
 }

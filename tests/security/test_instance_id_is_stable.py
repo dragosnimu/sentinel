@@ -190,6 +190,11 @@ section() {{ :; }}
 # ca „a rulat" să fie un fapt de pe disc și nu o linie de jurnal.
 ensure_instance_id() {{ printf 'ENSURED\\n' >> "$CALLS"; : > "$CFG/instance_id"; }}
 
+# Cealaltă funcție necondiționată din secvență. Aici doar se înregistrează, ca
+# secvența livrată să ruleze; poziția ei e probată în
+# tests/security/test_installer_docker_access.py.
+ensure_docker_access() {{ printf 'DOCKER_ACCESS\\n' >> "$CALLS"; }}
+
 mkdir -p "$STATE_MARKERS"
 {markers}
 

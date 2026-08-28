@@ -314,7 +314,16 @@ scan:
   # alert that mattered is lost with it.
   announce_new: true
   os_packages: true
-  containers: true
+
+  # Written by the installer, not pinned to true. Scanning container images
+  # needs the `sentinel` user to reach the docker socket, and `true` on a host
+  # where it cannot writes a `failed` scan row every night and turns
+  # `scan:last:trivy_image` red — a configuration that claims a capability
+  # nobody has, which is worse than the missing capability itself.
+  # `ensure_docker_access` in deploy/install.sh measures what is actually
+  # reachable and writes the answer here. What the membership costs is in
+  # docs/ARHITECTURA.md §3.14.
+  containers: @@SCAN_CONTAINERS@@
   filesystem: true
   source_sca: true
   secrets: true

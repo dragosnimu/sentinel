@@ -445,11 +445,312 @@ step_user_and_dirs() {
     for grp in systemd-journal adm; do
         getent group "$grp" >/dev/null && usermod -aG "$grp" "$SENTINEL_USER"
     done
-    if getent group docker >/dev/null; then
-        info "adding ${SENTINEL_USER} to the docker group for container inventory."
-        warn "docker group membership is effectively root. It is required for \
-container scanning; remove it and set scan.containers=false if you would rather not."
-        usermod -aG docker "$SENTINEL_USER"
+    # The docker group is deliberately NOT granted here — see
+    # `ensure_docker_access` below. This step is marker-gated, and docker can
+    # appear on a host long after the day it was installed.
+}
+
+# ---------------------------------------------------------------------------
+# Accesul lui `sentinel` la socketul docker.
+#
+# NU e un pas numerotat, exact ca `resolve_config` și `ensure_instance_id`:
+# se cheamă necondiționat din `main`, între 19 și 20. Trei motive, în ordinea
+# importanței:
+#
+#   * pasul 26 (`configs`, ÎN ALWAYS_STEPS) scrie `scan.containers` din
+#     măsurătoarea de aici. O sursă supusă marcajelor n-ar putea răspunde la
+#     fiecare deploy întrebării pe care pasul 26 o pune la fiecare deploy;
+#   * aici a stat până acum, în pasul 19, și 19 e marcat din ziua instalării.
+#     Docker poate apărea pe gazdă ORICÂND după aceea, iar atunci apartenența
+#     n-ar mai fi acordată niciodată, în tăcere;
+#   * un pas NOU ar muta numerele tuturor pașilor de după el, adică ar invalida
+#     fiecare `--force-step N` din docs/OPERARE.md, din DEPANARE.md și din
+#     istoricul de comenzi al operatorului. Motivul e scris pe larg la
+#     `ensure_instance_id`, care a fost mutată din același fel de loc.
+#
+# Ce se măsoară și ce ajunge în configurație:
+#
+#   fapt observat                                          stare      containers
+#   ─────────────────────────────────────────────────────  ─────────  ──────────
+#   niciun client, niciun socket, niciun DOCKER_HOST        absent        false
+#   configurația VIE cere deja `scan.containers: false`     oprit         false
+#   daemonul răspunde ca `sentinel` cu versiunea LUI        gata          true
+#   apartenența e în /etc/group, dar daemonul e mut și
+#     pentru root (ori n-avem cum să rulăm ca alt user)     nedovedit     true
+#   orice altceva — grupul lipsește, `usermod` n-a prins,
+#     sau root e servit și `sentinel` nu                    refuzat       false
+#
+# Regula din spatele tabelului: `true` se scrie doar când există o DOVADĂ a căii
+# de acces. Fără ea se scrie `false`, fiindcă un `scan.containers: true` fără
+# acces produce un rând `failed` în `scans` în fiecare noapte și o cheie roșie la
+# `scan:last:trivy_image`, pe care nimeni nu le poate curăța de pe gazdă:
+# scanerul nu poate să-și acorde singur apartenența.
+#
+# „Nedovedit" nu e „în regulă", și de asta are stare proprie și mesaj propriu:
+# acolo `true` se sprijină pe intrarea din /etc/group, iar operatorul e anunțat
+# explicit că EFECTUL nu a fost văzut.
+#
+# Ce costă apartenența — pe gazda asta grupul `docker` e echivalent cu root, deci
+# o compromitere a agentului de securitate devine root pe mașina pe care o
+# păzește — e scris în docs/ARHITECTURA.md §3.14 și în docstring-ul lui
+# sentinel/scan/trivy_image.py. Operatorul a acceptat schimbul deliberat. Nu se
+# repetă aici.
+# ---------------------------------------------------------------------------
+
+# Aceleași trei semne pe care le citește `probe_docker` din
+# sentinel/scan/trivy_image.py, și în aceeași ordine. Un singur semn ar fi ori
+# încredere în filesystem, ori încredere în configurație, iar fiecare dintre ele
+# s-a dovedit deja greșită aici, în direcții opuse.
+#
+# Variabile, nu litere în cod, ca funcțiile să poată fi rulate și în altă parte
+# decât pe /run — același motiv ca la AUDITD_RULES_DEST.
+DOCKER_SOCKET_PATHS=(/run/docker.sock /var/run/docker.sock)
+DOCKER_CLIENT_PATH=/usr/bin/docker
+DOCKER_GROUP=docker
+
+# Starea măsurată, și valoarea pe care o scrie pasul 26. GOALE până rulează
+# `ensure_docker_access`: pasul 26 refuză să scrie o valoare pe care n-a
+# măsurat-o nimeni, în loc să presupună una.
+DOCKER_ACCESS_STATE=""
+SCAN_CONTAINERS=""
+
+# Ce a răspuns ultima interogare: versiunea serverului, și ultima linie de
+# eroare.
+#
+# Amândouă ies prin variabile, nu pe stdout, iar asta e o reparație, nu un stil.
+# Prima versiune a funcției de mai jos întorcea versiunea pe stdout, deci
+# apelantul o citea cu `$(…)` — iar atribuirea lui DOCKER_PROBE_ERR se făcea
+# atunci ÎNĂUNTRUL substituției de comandă și murea cu subshell-ul. Efectul
+# măsurat pe VM-ul de test: daemon oprit, stderr cu explicația, instalatorul
+# tipărea „fără mesaj" — exact linia de care operatorul are nevoie ca să știe ce
+# să repare, pierdută în tăcere.
+#
+# Același tipar ca la `read_instance_id_file`/`INSTANCE_ID_READ`: rezultatul
+# într-o variabilă, codul de ieșire doar pentru „a mers sau nu".
+DOCKER_SERVER_VERSION=""
+DOCKER_PROBE_ERR=""
+
+docker_is_present() {
+    if have docker || [[ -x "$DOCKER_CLIENT_PATH" ]]; then
+        return 0
+    fi
+    local sock
+    for sock in "${DOCKER_SOCKET_PATHS[@]}"; do
+        if [[ -e "$sock" ]]; then
+            return 0
+        fi
+    done
+    [[ -n "${DOCKER_HOST:-}" ]]
+}
+
+# Versiunea SERVERULUI, cerută de un anume utilizator, cu grupurile lui.
+#
+# `--format '{{.Server.Version}}'` nu e cosmetică, e miezul verificării:
+# `docker version` FĂRĂ format iese cu 0 și tipărește blocul clientului chiar și
+# când daemonul nu răspunde. Codul de ieșire singur e trapa — MĂSURAT, vezi
+# tests/security/test_installer_docker_access.py. Deci se cere ȘI cod 0, ȘI o
+# versiune nevidă.
+#
+#   0  daemonul a răspuns; versiunea e în DOCKER_SERVER_VERSION
+#   1  am întrebat și n-am primit o versiune de server; motivul e în DOCKER_PROBE_ERR
+#   2  n-am avut CUM să întreb ca utilizatorul acela — altceva decât un refuz
+docker_server_version_as() {
+    local user="$1" out="" rc=0 errfile
+    DOCKER_SERVER_VERSION=""
+    DOCKER_PROBE_ERR=""
+    errfile="$(mktemp)"
+
+    if [[ "$user" == "root" ]]; then
+        out="$(docker version --format '{{.Server.Version}}' 2>"$errfile")" || rc=$?
+    elif have runuser; then
+        # `runuser -u` execută comanda DIRECT, fără shell, și reface lista de
+        # grupuri din /etc/group. Contează: `sentinel` are /sbin/nologin, deci
+        # `su - sentinel -c …` n-ar rula nimic și ar raporta un eșec care n-are
+        # nicio legătură cu docker.
+        out="$(runuser -u "$user" -- docker version --format '{{.Server.Version}}' 2>"$errfile")" || rc=$?
+    elif have sudo; then
+        out="$(sudo -n -u "$user" -- docker version --format '{{.Server.Version}}' 2>"$errfile")" || rc=$?
+    else
+        rm -f "$errfile"
+        DOCKER_PROBE_ERR="nu există nici runuser, nici sudo pe gazda asta"
+        return 2
+    fi
+
+    # `|| true`: `pipefail` e activ, iar un stderr GOL face `grep` să iasă 1.
+    # Fără el, o interogare REUȘITĂ ar opri instalatorul întreg.
+    DOCKER_PROBE_ERR="$(tr -d '\r' < "$errfile" \
+                        | grep -v '^[[:space:]]*$' | tail -n1)" || true
+    rm -f "$errfile"
+
+    out="$(printf '%s' "$out" | tr -d '[:space:]')"
+    if (( rc != 0 )) || [[ -z "$out" ]]; then
+        return 1
+    fi
+    DOCKER_SERVER_VERSION="$out"
+    return 0
+}
+
+# Apartenența așa cum o vede sistemul, nu așa cum am cerut-o. Dovedește intrarea
+# din /etc/group și ATÂT — nu că daemonul răspunde. De asta e doar sprijinul
+# ramurii „nedovedit", niciodată dovada principală.
+sentinel_in_docker_group() {
+    id -nG "$SENTINEL_USER" 2>/dev/null | tr ' ' '\n' | grep -qx "$DOCKER_GROUP"
+}
+
+# Ce cere configurația VIE de pe gazdă. Trei răspunsuri, fiindcă „nu pot citi
+# fișierul" și „scrie false" nu sunt același lucru: primul e o gazdă pe care
+# operatorul nu s-a pronunțat (instalare nouă), al doilea e un refuz explicit.
+#
+# `awk` delimitat la blocul `scan:`, nu un `grep containers:` peste tot fișierul:
+# `containers` e un cuvânt destul de generic încât o cheie cu același nume din
+# altă secțiune să fie citită drept răspunsul operatorului. O cheie de nivel zero
+# începe linia în coloana 0, deci blocul se delimitează exact.
+config_containers_setting() {
+    local cfg="${SENTINEL_CONFIG_DIR}/sentinel.yaml" value=""
+    [[ -r "$cfg" ]] || { printf 'unknown'; return 0; }
+    value="$(awk '
+        /^[^[:space:]#]/ { in_scan = ($0 ~ /^scan:[[:space:]]*(#.*)?$/); next }
+        in_scan && $1 == "containers:" { print $2; exit }
+    ' "$cfg" 2>/dev/null)" || value=""
+    case "$value" in
+        true)  printf 'true' ;;
+        false) printf 'false' ;;
+        *)     printf 'unknown' ;;
+    esac
+}
+
+ensure_docker_access() {
+    DOCKER_ACCESS_STATE=""
+    SCAN_CONTAINERS=""
+
+    if ! docker_is_present; then
+        DOCKER_ACCESS_STATE=absent
+        SCAN_CONTAINERS=false
+        info "docker nu e pe gazda asta: nici clientul, nici ${DOCKER_SOCKET_PATHS[*]}, \
+nici DOCKER_HOST. Nu e o eroare — e o gazdă fără containere."
+        info "scan.containers se scrie false, ca să nu se ceară o scanare care n-are ce scana."
+        return 0
+    fi
+
+    # Alegerea operatorului, dacă a făcut-o, se citește ÎNAINTE de orice
+    # acordare. §3.14 spune că ieșirea din schimb e `scan.containers: false`
+    # ÎMPREUNĂ cu scoaterea din grup; un instalator care re-acordă apartenența la
+    # fiecare deploy pe o gazdă unde scanarea e oprită păstrează tot costul și
+    # niciun beneficiu — și, fiindcă funcția asta rulează necondiționat, ar face-o
+    # de fiecare dată.
+    local wanted; wanted="$(config_containers_setting)"
+    if [[ "$wanted" == "false" ]]; then
+        DOCKER_ACCESS_STATE=disabled
+        SCAN_CONTAINERS=false
+        info "docker e pe gazda asta, dar ${SENTINEL_CONFIG_DIR}/sentinel.yaml are \
+scan.containers: false, deci apartenența la grupul ${DOCKER_GROUP} NU se acordă."
+        # Fără linia asta ramura e o fundătură tăcută: pe o gazdă unde docker a
+        # apărut DUPĂ instalare, `false` a fost scris chiar de instalator (docker
+        # lipsea atunci), iar `install_config` nu rescrie un sentinel.yaml viu.
+        # Nimic de pe gazdă nu i-ar mai spune operatorului că scanarea
+        # containerelor e la un cuvânt distanță.
+        info "Ca s-o pornești: pune scan.containers: true în \
+${SENTINEL_CONFIG_DIR}/sentinel.yaml și re-rulează deploy-ul. Abia atunci se acordă \
+apartenența — și citește întâi docs/ARHITECTURA.md §3.14."
+        if sentinel_in_docker_group; then
+            warn "${SENTINEL_USER} e totuși în grupul ${DOCKER_GROUP}, iar grupul ăla e \
+echivalent cu root aici (docs/ARHITECTURA.md §3.14). Cu scanarea oprită, asta e tot costul \
+și niciun beneficiu. Scoate-l:  gpasswd -d ${SENTINEL_USER} ${DOCKER_GROUP}"
+        fi
+        return 0
+    fi
+
+    # Întâi efectul, apoi acordarea. Pe a doua rulare — și pe fiecare deploy de
+    # după — asta face funcția o operație nulă DOVEDITĂ: daemonul a răspuns, deci
+    # nu se atinge nimic. Un `usermod` „oricum idempotent" ar fi tot o presupunere.
+    local rc=0
+    docker_server_version_as "$SENTINEL_USER" || rc=$?
+    if (( rc == 0 )); then
+        DOCKER_ACCESS_STATE=ready
+        SCAN_CONTAINERS=true
+        ok "docker răspunde ca ${SENTINEL_USER}: server ${DOCKER_SERVER_VERSION}. \
+Nimic de acordat."
+        return 0
+    fi
+    local why="${DOCKER_PROBE_ERR:-fără mesaj}"
+
+    if getent group "$DOCKER_GROUP" >/dev/null; then
+        warn "apartenența la grupul ${DOCKER_GROUP} e echivalentă cu root pe gazda asta — \
+vezi docs/ARHITECTURA.md §3.14. E cerută de scanarea imaginilor de container."
+        usermod -aG "$DOCKER_GROUP" "$SENTINEL_USER" \
+            || warn "usermod -aG ${DOCKER_GROUP} ${SENTINEL_USER} a raportat un eșec; \
+efectul e măsurat mai jos oricum, fiindcă nici reușita lui n-ar fi fost o dovadă."
+    else
+        warn "grupul ${DOCKER_GROUP} nu există pe gazda asta, deci apartenența NU poate fi \
+acordată."
+    fi
+
+    rc=0
+    docker_server_version_as "$SENTINEL_USER" || rc=$?
+    if (( rc == 0 )); then
+        DOCKER_ACCESS_STATE=granted
+        SCAN_CONTAINERS=true
+        ok "${SENTINEL_USER} a fost adăugat în grupul ${DOCKER_GROUP} și daemonul îi \
+răspunde: server ${DOCKER_SERVER_VERSION}."
+        info "Procesele sentinel deja pornite păstrează setul VECHI de grupuri — systemd \
+le rezolvă la pornirea unității, nu la daemon-reload. Pasul 32 repornește fiecare unitate, \
+iar sentinel-scan e Type=oneshot, deci ia grupurile noi la următoarea declanșare a \
+temporizatorului."
+        return 0
+    fi
+    why="${DOCKER_PROBE_ERR:-$why}"
+
+    # Nu ajungem la daemon ca `sentinel`. Două cauze foarte diferite, despărțite
+    # de o a doua întrebare, pusă lui root: dacă nici root nu primește o versiune
+    # de server, daemonul e mut pentru toată lumea și refuzul nu e despre
+    # apartenență.
+    local unaskable=0 daemon_silent=0
+    if (( rc == 2 )); then
+        unaskable=1
+    elif ! docker_server_version_as root; then
+        daemon_silent=1
+    fi
+
+    if sentinel_in_docker_group && (( unaskable || daemon_silent )); then
+        DOCKER_ACCESS_STATE=unproven
+        SCAN_CONTAINERS=true
+        warn "apartenența lui ${SENTINEL_USER} la grupul ${DOCKER_GROUP} e în /etc/group, \
+dar EFECTUL nu a putut fi dovedit: ${why}"
+        if (( daemon_silent )); then
+            warn "daemonul docker nu răspunde nici lui root, deci refuzul nu e despre \
+apartenență. Pornește-l  (systemctl status docker)  și uită-te apoi la cheia \
+scan:last:trivy_image."
+        else
+            warn "nu există nici runuser, nici sudo pe gazda asta, deci nu am cum să rulez \
+docker CA ${SENTINEL_USER}. Verifică tu:  runuser -u ${SENTINEL_USER} -- docker version \
+--format '{{.Server.Version}}'"
+        fi
+        warn "scan.containers rămâne true fiindcă intrarea din /etc/group e o dovadă a CĂII \
+de acces — dar nu e o dovadă a efectului. Dacă daemonul rămâne mut, scanerul scrie un rând \
+failed în fiecare noapte și cheia scan:last:trivy_image se face roșie."
+        return 0
+    fi
+
+    DOCKER_ACCESS_STATE=denied
+    SCAN_CONTAINERS=false
+    warn "docker e pe gazda asta, dar ${SENTINEL_USER} NU ajunge la daemon: ${why}"
+    if ! getent group "$DOCKER_GROUP" >/dev/null; then
+        warn "cauza vizibilă: grupul ${DOCKER_GROUP} nu există. Un client docker care e de \
+fapt un înveliș peste podman arată exact așa, și acolo apartenența n-are ce să acorde."
+    elif ! sentinel_in_docker_group; then
+        warn "cauza vizibilă: după usermod -aG, id -nG ${SENTINEL_USER} tot nu arată \
+${DOCKER_GROUP}."
+    else
+        warn "cauza vizibilă: root primește un răspuns de la daemon și ${SENTINEL_USER} nu \
+— apartenența e scrisă, dar socketul o refuză oricum."
+    fi
+    warn "De asta scan.containers se scrie FALSE, și nu e o preferință: un true fără acces \
+ar produce un rând failed în fiecare noapte, iar scanerul nu poate să-și acorde singur \
+apartenența."
+    if [[ "$wanted" == "true" ]]; then
+        warn "ATENȚIE: ${SENTINEL_CONFIG_DIR}/sentinel.yaml de pe gazdă are DEJA \
+scan.containers: true, iar install_config nu rescrie un fișier viu — scrie sentinel.yaml.new \
+lângă el. Până schimbi valoarea cu mâna, scanarea containerelor eșuează în fiecare noapte."
     fi
 }
 
@@ -1135,6 +1436,15 @@ auditd_feeds_the_collector() {
 }
 
 step_configs() {
+    # `scan.containers` is measured, never guessed. `ensure_docker_access` runs
+    # unconditionally before this step and leaves the answer in SCAN_CONTAINERS;
+    # an empty value means something reordered main, and the quiet alternative
+    # would be a configuration claiming a capability nobody checked for.
+    if [[ -z "${SCAN_CONTAINERS:-}" ]]; then
+        die "internal: ensure_docker_access did not run before step 26, so \
+scan.containers would be written on a guess"
+    fi
+
     # NOT a `trap ... RETURN`: without `set -o functrace` a RETURN trap set in a
     # function is not cleared when that function returns, so it fires again on the
     # next function return — run_step's — where $tmp is out of scope and `set -u`
@@ -1190,6 +1500,7 @@ ingest.auditd is written as FALSE rather than pointed at a file that will not ex
         -e "s|@@BPF_FILTER@@|${bpf}|g" \
         -e "s|@@SURICATA_ENABLED@@|$( (( SURICATA_OK )) && echo true || echo false )|g" \
         -e "s|@@AUDITD_ENABLED@@|${auditd_enabled}|g" \
+        -e "s|@@SCAN_CONTAINERS@@|${SCAN_CONTAINERS}|g" \
         -e "s|@@TELEGRAM_CHAT_ID@@|${SECRETS[TELEGRAM_CHAT_ID]:-0}|g" \
         -e "s|@@EXTRA_ALLOWLIST@@|${extra_allow}|g" \
         "${SCRIPT_DIR}/config/sentinel.yaml.tmpl" > "${tmp}/sentinel.yaml"
@@ -3524,6 +3835,17 @@ main() {
 
     run_step 18 snapshot          step_snapshot
     run_step 19 user_and_dirs     step_user_and_dirs
+
+    # Necondiționat, la fiecare rulare — NU un pas, exact ca `resolve_config` și
+    # `ensure_instance_id`. Motivele, pe larg, la definiția funcției: pasul 26
+    # (ALWAYS) scrie `scan.containers` din măsurătoarea asta, iar docker poate
+    # apărea pe gazdă oricând după ziua instalării, când pasul 19 e demult marcat.
+    #
+    # Aici, și nu mai jos: systemd rezolvă grupurile suplimentare la PORNIREA
+    # unității. Pasul 32 repornește unitățile, deci o apartenență acordată după el
+    # n-ar ajunge la niciun proces până la deploy-ul următor.
+    ensure_docker_access
+
     run_step 20 packages          step_packages
     run_step 21 external_tools    step_external_tools
     run_step 22 postgres          step_postgres
