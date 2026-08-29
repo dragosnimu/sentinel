@@ -578,6 +578,59 @@ async def _concentrated_asn_insight(db: Database) -> list[Insight]:
 _FORTARE_ESECURI_MIN = 20
 
 
+# The headline query, lifted out of the function so a test can RUN it and not
+# merely read it: the aggregated shape below has to produce exactly the numbers
+# the row-by-row shape it replaced produced, and the only honest way to show
+# that is to put both over the same events.
+#
+# Two things make it cheap, and both of them matter on the one day the rule
+# actually fires — an address that both forces and gets in:
+#
+#   * `publickey` is excluded in the `ok` CTE, not only in the Python loop
+#     below. On this host every SSH success in a 24h window is a key, so
+#     without it the database pays for the join on 100% of the rows Python
+#     throws away on the next line. `IS DISTINCT FROM` rather than `<>` because
+#     an UNKNOWN method must stay counted — same reasoning as the guard below,
+#     said once in each layer.
+#   * failures are aggregated BEFORE the join. The row-by-row shape was a
+#     nested loop over successes × failures; measured on this host, 500
+#     successes against 13 191 failures took 20 s — past the 30 s
+#     `statement_timeout_ms` — and `posture()` is NOT inside the per-rule
+#     `try/except` of `collect()` (see `analytics/page.py` and
+#     `telegram/views.py`), so a timeout here is a 500 on the dashboard.
+#
+# `esecuri_cont` counts failures on the account that got in, `esecuri_ip` every
+# failure from that address; grouping by `ok.id` keeps one output row per
+# successful login, as before.
+_FORTARE_SQL = """
+    WITH ok AS (
+        SELECT id, src_ip, username, raw->>'auth_method' AS metoda
+          FROM raw_events
+         WHERE source = 'sshd' AND action = 'auth_ok'
+           AND src_ip IS NOT NULL
+           AND ts > now() - interval '24 hours'
+           AND raw->>'auth_method' IS DISTINCT FROM 'publickey'
+    ),
+    esec AS (
+        SELECT src_ip, username, count(*) AS n
+          FROM raw_events
+         WHERE source = 'sshd' AND action = 'auth_fail'
+           AND src_ip IS NOT NULL
+           AND ts > now() - interval '24 hours'
+           AND raw->>'auth_method' IS DISTINCT FROM 'publickey'
+         GROUP BY 1, 2
+    )
+    SELECT host(ok.src_ip) AS ip, ok.username AS cont, ok.metoda AS metoda,
+           coalesce(sum(f.n) FILTER (WHERE f.username = ok.username), 0)::bigint
+               AS esecuri_cont,
+           coalesce(sum(f.n), 0)::bigint AS esecuri_ip
+      FROM ok
+      LEFT JOIN esec f ON f.src_ip = ok.src_ip
+     GROUP BY ok.id, ok.src_ip, ok.username, ok.metoda
+     ORDER BY 4 DESC, 5 DESC
+"""
+
+
 async def posture(db: Database, insights: list[Insight]) -> dict[str, Any]:
     """One-line verdict for the top of the dashboard. The point is that someone
     can glance at it and know whether to keep reading."""
@@ -612,34 +665,17 @@ async def posture(db: Database, insights: list[Insight]) -> dict[str, Any]:
     # which is how three "attacks" appeared within three seconds on 28 August.
     # Comparing against the `users` table would still be wrong: those are
     # dashboard accounts, not system accounts.
-    rows = await db.fetch(
-        """
-        WITH ok AS (
-            SELECT id, src_ip, username, raw->>'auth_method' AS metoda
-              FROM raw_events
-             WHERE source = 'sshd' AND action = 'auth_ok'
-               AND src_ip IS NOT NULL
-               AND ts > now() - interval '24 hours'
-        )
-        SELECT host(ok.src_ip) AS ip, ok.username AS cont, ok.metoda AS metoda,
-               count(f.id) FILTER (WHERE f.username = ok.username) AS esecuri_cont,
-               count(f.id) AS esecuri_ip
-          FROM ok
-          LEFT JOIN raw_events f
-            ON f.src_ip = ok.src_ip AND f.source = 'sshd'
-           AND f.action = 'auth_fail'
-           AND f.ts > now() - interval '24 hours'
-           AND f.raw->>'auth_method' IS DISTINCT FROM 'publickey'
-         GROUP BY ok.id, ok.src_ip, ok.username, ok.metoda
-         ORDER BY 4 DESC, 5 DESC
-        """
-    )
+    rows = await db.fetch(_FORTARE_SQL)
     fortari: list[dict[str, Any]] = []
     for r in rows:
         # A key is not arrived at by guessing, so a `publickey` success is not a
         # forcing that worked. An UNKNOWN method is not read as safe: the sshd
         # parser leaves `auth_method` out of "Invalid user" lines, and "I cannot
         # tell" must not turn into "all clear".
+        # `_FORTARE_SQL` already drops these rows; this is not leftover
+        # duplication. There it buys the query its speed, here it decides the
+        # verdict — so whoever edits the CTE next cannot delete the defence by
+        # accident, only the optimisation.
         if r["metoda"] == "publickey":
             continue
         cont = r["cont"]

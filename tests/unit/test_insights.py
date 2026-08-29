@@ -8,6 +8,8 @@ its interesting branch without a live PostgreSQL.
 from __future__ import annotations
 
 import asyncio
+import re
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 from sentinel.analytics import insights as ins
@@ -326,6 +328,17 @@ def test_a_deploy_session_is_not_announced_as_a_break_in():
     veche cerea doar „aceeași adresă a și eșuat, și a și reușit în 24h” și
     striga cel mai tare mesaj pe care Sentinel îl poate produce. Contul pe care
     s-a intrat nu e printre cele pe care s-a eșuat, iar reușita e pe cheie.
+
+    Testul ăsta nu poate fi făcut să pice de niciun defect singur, și asta e o
+    proprietate a incidentului, nu o scăpare: cifrele lui reale (0 eșecuri pe
+    cont, 3 pe adresă) trec și de garda de metodă, și de prag, deci scoaterea
+    oricăreia îl lasă verde. E documentație executabilă — ține incidentul lipit
+    de regulă. Dinții sunt în altă parte, pe cifre destul de mari cât să conteze
+    o singură apărare: `test_a_key_login_is_not_called_a_successful_guess`
+    (312 eșecuri pe contul care intră, pe cheie) apără metoda, iar
+    `test_the_operators_own_seven_failures_are_not_a_break_in` apără pragul.
+    Umflarea cifrelor de aici ca să pice ar însemna alt incident decât cel din
+    28 august.
     """
     p = run(ins.posture(_posture_db([
         _ok("sentinel-deploy", "publickey", esecuri_cont=0, esecuri_ip=3),
@@ -471,3 +484,245 @@ def test_absurd_ratio_is_reported_as_unreliable_not_as_a_surge():
     out = run(ins._trend_insight(db))
     assert out and out[0].level == "info"
     assert "nu este de încredere" in out[0].title
+def test_the_loudest_forcing_is_the_one_in_the_headline():
+    """Cu mai multe forțări deodată, titlul o poartă pe cea mai gravă.
+
+    Eșecul pe care îl previne: `fortari[0]` scris ca `fortari[-1]` (sau lista
+    parcursă în altă ordine). Interogarea întoarce rândurile descrescător după
+    eșecuri, deci prima e cea mai apăsată; dacă titlul o ia pe ultima,
+    operatorul citește „25 de eșecuri pe deploy” în ziua în care `root` a fost
+    forțat de 312 ori, și pornește de la capătul greșit. Numărul din colț rămâne
+    corect, ceea ce face greșeala invizibilă în restul suitei — niciun alt test
+    de aici nu are mai mult de o forțare în listă.
+    """
+    p = run(ins.posture(_posture_db([
+        _ok("root", "password", esecuri_cont=312, ip="45.134.26.7"),
+        _ok("deploy", "password", esecuri_cont=25, ip="203.0.113.9"),
+    ]), []))
+    assert p["intruziuni"] == 2
+    assert "root" in p["verdict"] and "312" in p["verdict"], (
+        f"titlul poartă altă forțare decât cea mai gravă: {p['verdict']}")
+
+
+# --- forma agregată a interogării de titlu ----------------------------------
+#
+# Ce se dovedește mai jos: `_FORTARE_SQL` agregă eșecurile ÎNAINTE de join (ca
+# să nu mai fie un nested loop `reușite × eșecuri`) și scoate reușitele pe cheie
+# din CTE. Amândouă schimbă forma cifrelor, nu doar viteza — deci se rulează
+# AMÂNDOUĂ variantele peste aceleași evenimente și se cere egalitate, nu se
+# citește SQL-ul și se dă din cap.
+#
+# Rulează pe SQLite, fiindcă aici nu există PostgreSQL. Traducerea e mică și
+# declarată mai jos, iar ce rămâne netradus face testul să crape, nu să treacă.
+# **Ce NU dovedesc testele astea**: comportamentul tipurilor proprii lui
+# PostgreSQL — `inet` la egalitate, `jsonb ->>` peste un `raw` NULL, `host()` —
+# și nici planul de execuție ales de planificator. Alea se văd pe gazdă.
+
+#: Forma pe rânduri, dinainte de agregare (de1dcb5), păstrată ca martor. NU se
+#: actualizează când se schimbă `_FORTARE_SQL`: rostul ei e să fie cealaltă
+#: variantă, nu aceeași.
+_SQL_PE_RANDURI = """
+        WITH ok AS (
+            SELECT id, src_ip, username, raw->>'auth_method' AS metoda
+              FROM raw_events
+             WHERE source = 'sshd' AND action = 'auth_ok'
+               AND src_ip IS NOT NULL
+               AND ts > now() - interval '24 hours'
+        )
+        SELECT host(ok.src_ip) AS ip, ok.username AS cont, ok.metoda AS metoda,
+               count(f.id) FILTER (WHERE f.username = ok.username) AS esecuri_cont,
+               count(f.id) AS esecuri_ip
+          FROM ok
+          LEFT JOIN raw_events f
+            ON f.src_ip = ok.src_ip AND f.source = 'sshd'
+           AND f.action = 'auth_fail'
+           AND f.ts > now() - interval '24 hours'
+           AND f.raw->>'auth_method' IS DISTINCT FROM 'publickey'
+         GROUP BY ok.id, ok.src_ip, ok.username, ok.metoda
+         ORDER BY 4 DESC, 5 DESC
+"""
+
+#: Singurele lucruri pe care SQLite nu le are din dialectul folosit în
+#: interogare. Fiecare e o înlocuire de formă, nu de înțeles: `IS NOT` din
+#: SQLite are exact semantica lui `IS DISTINCT FROM` (adevărat și pe NULL), iar
+#: `json_extract` întoarce NULL exact unde `->>` întoarce NULL.
+_TRADUCERI = (
+    (re.compile(r"host\(([^()]*)\)"), r"\1"),
+    (re.compile(r"now\(\)\s*-\s*interval\s*'24 hours'"), "datetime('now','-24 hours')"),
+    (re.compile(r"(\w+\.)?raw->>'auth_method'"), r"json_extract(\1raw, '$.auth_method')"),
+    (re.compile(r"\bIS DISTINCT FROM\b"), "IS NOT"),
+    (re.compile(r"::bigint"), ""),
+)
+
+#: Ce nu are voie să rămână după traducere. Fără verificarea asta, o construcție
+#: PostgreSQL rămasă pe loc ar putea fi acceptată de SQLite cu ALT înțeles, iar
+#: testul ar compara liniștit două lucruri greșite — exact tiparul „grep după un
+#: tipar care nu există” din CLAUDE.md.
+_RAMASITE_PG = ("->>", "::", "interval '", "host(", "IS DISTINCT FROM", "now()")
+
+
+def _tradu(sql: str) -> str:
+    for tipar, inlocuire in _TRADUCERI:
+        sql = tipar.sub(inlocuire, sql)
+    ramase = [m for m in _RAMASITE_PG if m in sql]
+    assert not ramase, f"construcții PostgreSQL netraduse: {ramase}"
+    return sql
+
+
+def _ev(minute_in_urma, source, action, ip, user, metoda, fara_raw=False):
+    ts = datetime.now(timezone.utc) - timedelta(minutes=minute_in_urma)
+    if fara_raw:
+        raw = None                       # rând fără `raw` deloc
+    elif metoda is None:
+        raw = '{"port": 22}'             # linie „Invalid user”: fără metodă
+    else:
+        raw = f'{{"auth_method": "{metoda}"}}'
+    return (ts.strftime("%Y-%m-%d %H:%M:%S"), source, action, ip, user, raw)
+
+
+def _ruleaza(sql, evenimente):
+    """Execută interogarea peste evenimentele date, pe SQLite."""
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    con.execute("CREATE TABLE raw_events (id INTEGER PRIMARY KEY, ts TEXT, "
+                "source TEXT, action TEXT, src_ip TEXT, username TEXT, raw TEXT)")
+    con.executemany("INSERT INTO raw_events (ts, source, action, src_ip, username, raw) "
+                    "VALUES (?, ?, ?, ?, ?, ?)", evenimente)
+    try:
+        return [dict(r) for r in con.execute(_tradu(sql)).fetchall()]
+    finally:
+        con.close()
+
+
+def _evenimente_amestecate():
+    """Mai multe conturi și adrese încrucișate, plus fiecare margine a regulii."""
+    return [
+        # 45.134.26.7 — forțare adevărată pe `root`, plus zgomot pe alt cont.
+        _ev(10, "sshd", "auth_ok", "45.134.26.7", "root", "password"),
+        _ev(20, "sshd", "auth_ok", "45.134.26.7", "root", "password"),
+        *[_ev(30 + i, "sshd", "auth_fail", "45.134.26.7", "root", "password")
+          for i in range(7)],
+        *[_ev(40 + i, "sshd", "auth_fail", "45.134.26.7", "admin", None)
+          for i in range(3)],
+        # Eșec pe cheie: nu se numără nicăieri (agentul refuză cheie cu cheie).
+        _ev(41, "sshd", "auth_fail", "45.134.26.7", "root", "publickey"),
+        # În afara ferestrei și din altă sursă: nu intră în niciun număr.
+        _ev(60 * 25, "sshd", "auth_fail", "45.134.26.7", "root", "password"),
+        _ev(15, "sudo", "auth_fail", "45.134.26.7", "root", "password"),
+
+        # 185.53.199.62 — sesiunea de deploy: intrare pe cheie, refuzuri pe alții.
+        _ev(5, "sshd", "auth_ok", "185.53.199.62", "sentinel-deploy", "publickey"),
+        _ev(5, "sshd", "auth_fail", "185.53.199.62", "admin", "publickey"),
+        _ev(5, "sshd", "auth_fail", "185.53.199.62", "deploy", None),
+        # ...și o intrare pe parolă de la ACEEAȘI adresă, pe un cont fără eșecuri.
+        _ev(6, "sshd", "auth_ok", "185.53.199.62", "operator", "password"),
+
+        # 86.35.255.78 — ziua operatorului: metodă necunoscută, eșecuri pe cont.
+        _ev(3, "sshd", "auth_ok", "86.35.255.78", "cont-operator", None),
+        *[_ev(50 + i, "sshd", "auth_fail", "86.35.255.78", "cont-operator", "password")
+          for i in range(4)],
+        _ev(55, "sshd", "auth_fail", "86.35.255.78", None, "password"),
+        _ev(56, "sshd", "auth_fail", "86.35.255.78", "root", None, fara_raw=True),
+
+        # 203.0.113.9 — reușită fără cont: numai eșecurile adresei stau martor.
+        _ev(4, "sshd", "auth_ok", "203.0.113.9", None, "password"),
+        *[_ev(12 + i, "sshd", "auth_fail", "203.0.113.9", "root", "password")
+          for i in range(6)],
+
+        # 198.51.100.4 — reușită curată, niciun eșec: rândul trebuie să rămână.
+        _ev(2, "sshd", "auth_ok", "198.51.100.4", "nobody", "password"),
+    ]
+
+
+def _cheie(r):
+    return (r["ip"], r["cont"], r["metoda"], int(r["esecuri_cont"]), int(r["esecuri_ip"]))
+
+
+def test_aggregating_failures_before_the_join_keeps_the_same_numbers():
+    """Agregarea de dinaintea join-ului nu are voie să schimbe nicio cifră.
+
+    Eșecul pe care îl previne: interogarea de titlu a fost rescrisă ca să nu mai
+    facă un nested loop `reușite × eșecuri` (20 s măsurate pe gazdă, peste
+    `statement_timeout_ms` de 30 s doar cu o fereastră mai lungă — adică 500 pe
+    panou fix în ziua în care regula se aprinde). O rescriere de genul ăsta
+    strică ușor exact ce numără: `sum` peste grupuri în loc de `count` peste
+    rânduri, `FILTER` mutat de partea greșită a agregării, sau un `LEFT JOIN`
+    devenit `JOIN`, care face să dispară reușitele fără niciun eșec. Cifrele
+    sunt tot ce citește pragul de forțare, deci se cere egalitate rând cu rând
+    cu forma pe rânduri, pe conturi și adrese încrucișate.
+    """
+    ev = _evenimente_amestecate()
+    noi = _ruleaza(ins._FORTARE_SQL, ev)
+    vechi = _ruleaza(_SQL_PE_RANDURI, ev)
+
+    # Singura deosebire admisă: forma nouă scoate reușitele pe cheie din CTE, pe
+    # care forma veche le întorcea ca să le arunce Python-ul pe linia următoare.
+    assert [r for r in vechi if r["metoda"] == "publickey"], (
+        "fixture-ul nu conține nicio reușită pe cheie, deci nu deosebește cele "
+        "două forme acolo unde chiar diferă")
+    vechi_fara_cheie = [r for r in vechi if r["metoda"] != "publickey"]
+
+    # `key=repr`: cheile poartă `None` pe poziția contului, iar `None` nu se
+    # compară cu un șir — fără el, un rând nou în fixture ar da TypeError în loc
+    # de o comparație.
+    agregat = sorted(map(_cheie, noi), key=repr)
+    randuri = sorted(map(_cheie, vechi_fara_cheie), key=repr)
+    assert agregat == randuri, (
+        f"forma agregată dă alte cifre decât cea pe rânduri:\n"
+        f"  agregat: {agregat}\n"
+        f"  rânduri: {randuri}")
+
+    # Egalitatea de mai sus ar fi adevărată și despre două interogări greșite la
+    # fel, așa că se fixează și cifrele, pe fiecare margine care contează.
+    numere = {r["cont"]: (int(r["esecuri_cont"]), int(r["esecuri_ip"])) for r in noi}
+    assert numere["root"] == (7, 10), (
+        f"eșecurile pe cont și pe adresă nu mai sunt deosebite: {numere['root']}")
+    assert numere[None] == (0, 6), (
+        f"o reușită fără cont iese 0 pe cont și 6 pe adresă: {numere[None]}")
+    assert numere["nobody"] == (0, 0), (
+        "o reușită fără niciun eșec a dispărut — join-ul nu mai e LEFT")
+    assert numere["cont-operator"] == (4, 6), (
+        f"eșecurile fără cont sau fără `raw` s-au pierdut din numărul pe "
+        f"adresă: {numere['cont-operator']}")
+    assert sum(1 for r in noi if r["cont"] == "root") == 2, (
+        "cele două reușite de pe același cont și aceeași adresă au fost topite "
+        "într-un singur rând")
+
+
+def test_key_logins_never_reach_the_python_guard():
+    """Reușitele pe cheie sunt scoase din interogare, nu doar sărite în Python.
+
+    Eșecul pe care îl previne: filtrul pus în CTE ca `<> 'publickey'` în loc de
+    `IS DISTINCT FROM`. Cu `<>`, un rând cu metodă NECUNOSCUTĂ (liniile „Invalid
+    user” nu poartă metoda) iese din comparație ca NULL, deci nu trece filtrul
+    și dispare din rezultat — iar regula ar tăcea tocmai despre rândurile despre
+    care se știe cel mai puțin. Al doilea eșec prevenit: filtrul scăpat de tot
+    la o rescriere, care redă bazei tot costul mutării lui în CTE.
+    """
+    noi = _ruleaza(ins._FORTARE_SQL, _evenimente_amestecate())
+    assert all(r["metoda"] != "publickey" for r in noi), (
+        "o reușită pe cheie a ieșit din interogare, deci filtrul din CTE lipsește")
+    conturi = {r["cont"] for r in noi}
+    assert "sentinel-deploy" not in conturi
+    assert "cont-operator" in conturi, (
+        "reușita cu metodă necunoscută a fost înghițită de filtru — `<>` în loc "
+        "de `IS DISTINCT FROM`")
+    assert "operator" in conturi, (
+        "reușita pe parolă de la adresa de deploy s-a pierdut odată cu reușita "
+        "pe cheie de la aceeași adresă")
+
+
+def test_the_headline_query_returns_the_hardest_pressed_account_first():
+    """Ordinea rândurilor e ce alege forțarea din titlu.
+
+    Eșecul pe care îl previne: `ORDER BY`-ul pierdut sau ajuns pe alte coloane
+    la rescriere. `posture` ia `fortari[0]` ca titlu și nimic din Python nu
+    resortează, deci dacă interogarea nu mai întoarce cea mai apăsată reușită
+    prima, titlul arată o forțare minoră în ziua în care una mare e în listă.
+    """
+    noi = _ruleaza(ins._FORTARE_SQL, _evenimente_amestecate())
+    ordonate = [(int(r["esecuri_cont"]), int(r["esecuri_ip"])) for r in noi]
+    assert ordonate == sorted(ordonate, reverse=True), (
+        f"rândurile nu mai vin descrescător după eșecuri: {ordonate}")
+    assert noi[0]["cont"] == "root", (
+        f"prima reușită întoarsă nu e cea mai apăsată: {noi[0]}")
