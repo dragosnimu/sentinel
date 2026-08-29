@@ -295,6 +295,174 @@ def test_insights_are_sorted_most_severe_first():
     assert [i.level for i in items] == ["critical", "warning", "info", "good"]
 
 
+# --- headline verdict: "did somebody get in?" -------------------------------
+#
+# Rândurile de mai jos sunt măsurate pe gazdă, nu inventate: sesiunea de deploy
+# din 28 august 2026 (185.53.199.62) și ziua operatorului (86.35.255.78). Prima
+# a produs verdictul „Autentificare reușită de la un atacator — verifică ACUM”
+# fără să fi fost spart nimic; pe 30 de zile de date, regula veche n-a avut
+# dreptate niciodată.
+def _posture_db(rows, atacatori=629, ev=3861):
+    """Stub pentru `posture`: interogarea de titlu plus numărătoarea de atacatori."""
+    return _StubDB(
+        fetch_map={"esecuri_cont": rows},
+        row_map={"count(DISTINCT host(src_ip))": {"atacatori": atacatori, "ev": ev}},
+    )
+
+
+def _ok(cont, metoda, esecuri_cont, esecuri_ip=None, ip="185.53.199.62"):
+    return {"ip": ip, "cont": cont, "metoda": metoda,
+            "esecuri_cont": esecuri_cont,
+            "esecuri_ip": esecuri_cont if esecuri_ip is None else esecuri_ip}
+
+
+def test_a_deploy_session_is_not_announced_as_a_break_in():
+    """Cazul real din 28 august: refuzuri pe alte conturi, apoi intrarea de deploy.
+
+    Eșecul pe care îl previne: exact panica de care a avut parte operatorul.
+    Trei chei refuzate pe `admin`, `deploy` și pe contul operatorului, la
+    16:59:20-22, apoi o autentificare reușită pe `sentinel-deploy` de pe
+    ACEEAȘI adresă — regula
+    veche cerea doar „aceeași adresă a și eșuat, și a și reușit în 24h” și
+    striga cel mai tare mesaj pe care Sentinel îl poate produce. Contul pe care
+    s-a intrat nu e printre cele pe care s-a eșuat, iar reușita e pe cheie.
+    """
+    p = run(ins.posture(_posture_db([
+        _ok("sentinel-deploy", "publickey", esecuri_cont=0, esecuri_ip=3),
+    ]), []))
+    assert p["intruziuni"] == 0, (
+        f"o sesiune de deploy a fost numărată ca intruziune: {p['verdict']}")
+    assert p["level"] != "critical"
+
+
+def test_the_operators_own_seven_failures_are_not_a_break_in():
+    """Ziua operatorului (86.35.255.78): 7 eșecuri și o intrare, același cont.
+
+    Eșecul pe care îl previne: pragul pus prea jos, sau lipsa lui. Adresa
+    operatorului a produs 7 eșecuri în aceeași fereastră de 24h în care s-a și
+    conectat; dacă ar fi de ajuns ca eșecurile să fie pe același cont, fiecare
+    tastare greșită de parolă i-ar spune operatorului că i-a fost spart
+    serverul. Metoda e necunoscută aici dinadins, ca testul să pice pe prag, nu
+    pe altă apărare.
+    """
+    p = run(ins.posture(_posture_db([
+        _ok("cont-operator", None, esecuri_cont=7, ip="86.35.255.78"),
+    ]), []))
+    assert p["intruziuni"] == 0, (
+        f"7 eșecuri au fost citite ca forțare: {p['verdict']}")
+
+
+def test_failures_on_other_accounts_do_not_convict_the_account_that_got_in():
+    """Sute de eșecuri pe `root`, dar intrarea e pe alt cont — nu e forțare reușită.
+
+    Eșecul pe care îl previne: numărarea eșecurilor pe adresă în loc de pe
+    contul care a intrat. O gazdă cu un scaner pe `root` și un deploy legitim
+    de la aceeași adresă (proxy, VPN, NAT-ul unui furnizor) ar fi raportată ca
+    spartă la fiecare livrare.
+    """
+    p = run(ins.posture(_posture_db([
+        _ok("sentinel-deploy", "password", esecuri_cont=0, esecuri_ip=412),
+    ]), []))
+    assert p["intruziuni"] == 0, (
+        f"eșecurile pe alt cont au condamnat o intrare legitimă: {p['verdict']}")
+
+
+def test_hundreds_of_failures_on_the_account_that_got_in_stay_critical():
+    """O forțare care CHIAR reușește trebuie să rămână cel mai tare mesaj.
+
+    Eșecul pe care îl previne: o regulă moartă. Dacă apărarea împotriva falsului
+    pozitiv taie și cazul real, operatorul află despre o spargere de pe `root`
+    dintr-un rând de listă, nu din titlul paginii. Se verifică și că titlul
+    duce cu el faptele (contul și numărul de eșecuri), nu doar culoarea.
+    """
+    p = run(ins.posture(_posture_db([
+        _ok("root", "password", esecuri_cont=312, ip="45.134.26.7"),
+    ]), []))
+    assert p["intruziuni"] == 1
+    assert p["level"] == "critical"
+    assert "root" in p["verdict"] and "312" in p["verdict"], (
+        f"titlul nu poartă dovada: {p['verdict']}")
+
+
+def test_the_breach_verdict_outranks_a_page_full_of_critical_insights():
+    """Când chiar s-a intrat, asta e ce citește operatorul primul.
+
+    Eșecul pe care îl previne: verdictul de forțare pus după ramura `crit`, deci
+    înlocuit de „Necesită atenție acum” ori de câte ori mai există o constatare
+    critică pe pagină — adică fix în ziua în care se întâmplă totul deodată.
+    """
+    p = run(ins.posture(_posture_db([
+        _ok("root", "password", esecuri_cont=312, ip="45.134.26.7"),
+    ]), [ins.Insight("critical", "KEV", "d"), ins.Insight("warning", "w", "d")]))
+    assert "Reușită SSH" in p["verdict"], (
+        f"forțarea reușită a fost îngropată sub restul paginii: {p['verdict']}")
+
+
+def test_an_unknown_auth_method_is_not_read_as_safe():
+    """Fără metodă în jurnal, „nu știu” nu are voie să devină „e în regulă”.
+
+    Eșecul pe care îl previne: filtrul scris invers — „raportează doar dacă
+    metoda e `password`”. Liniile „Invalid user …” nu poartă deloc metoda (vezi
+    `collectors/sshd.py`), iar un jurnal mai vechi sau alt colector poate lăsa
+    câmpul gol; un filtru pozitiv ar tăcea tocmai despre rândurile despre care
+    se știe cel mai puțin.
+    """
+    p = run(ins.posture(_posture_db([
+        _ok("root", None, esecuri_cont=312, ip="45.134.26.7"),
+    ]), []))
+    assert p["intruziuni"] == 1, (
+        f"o metodă necunoscută a fost tratată ca sigură: {p['verdict']}")
+
+
+def test_a_key_login_is_not_called_a_successful_guess():
+    """O cheie nu se nimerește din încercări, oricâte eșecuri ar fi înainte.
+
+    Eșecul pe care îl previne: chiar alarma din 28 august. Sesiunile de deploy
+    intră pe `publickey`; dacă metoda nu contează, orice zi în care agentul
+    operatorului greșește contul de destinație de destule ori se termină cu
+    „ai fost spart”.
+    """
+    p = run(ins.posture(_posture_db([
+        _ok("sentinel-deploy", "publickey", esecuri_cont=312),
+    ]), []))
+    assert p["intruziuni"] == 0, (
+        f"o intrare pe cheie a fost numită forțare reușită: {p['verdict']}")
+
+
+def test_a_success_without_a_username_falls_back_instead_of_going_quiet():
+    """Un `auth_ok` fără cont e o necunoscută, nu o dovadă de liniște.
+
+    Eșecul pe care îl previne: potrivirea pe cont scrisă în SQL, unde un
+    `username` NULL nu se potrivește cu nimic, deci iese zero eșecuri și
+    rândul dispare tăcut. O intrare pe care sistemul n-o poate atribui, de pe o
+    adresă cu sute de eșecuri, e ultimul lucru care ar trebui să treacă
+    neobservat.
+    """
+    p = run(ins.posture(_posture_db([
+        _ok(None, None, esecuri_cont=0, esecuri_ip=312, ip="45.134.26.7"),
+    ]), []))
+    assert p["intruziuni"] == 1, "o intrare neatribuită a fost trecută cu vederea"
+    assert p["level"] == "critical"
+
+
+def test_an_attacker_chosen_username_cannot_wreck_the_headline():
+    """Numele contului vine din jurnal, deci îl scrie atacatorul.
+
+    Eșecul pe care îl previne: titlul paginii și prima linie din Telegram sunt
+    construite acum dintr-un text ales de cel care atacă. O sută de rânduri noi
+    sau cinci sute de caractere într-un `<b>` deschis strică exact ecranul care
+    trebuie citit în timpul unui incident. Scăparea de HTML o fac șabloanele;
+    lungimea și caracterele de control se taie aici.
+    """
+    p = run(ins.posture(_posture_db([
+        _ok("root\n\n<b>" + "A" * 500, "password", esecuri_cont=312),
+    ]), []))
+    assert p["level"] == "critical"
+    assert "\n" not in p["verdict"], "un nume de cont cu linii noi a spart titlul"
+    assert len(p["verdict"]) < 160, (
+        f"titlul a ajuns la {len(p['verdict'])} caractere")
+
+
 def test_absurd_ratio_is_reported_as_unreliable_not_as_a_surge():
     # ×37 means the comparison window was broken (collector down, rows pruned),
     # not that attacks grew 37-fold. Saying "surge" sends someone hunting a

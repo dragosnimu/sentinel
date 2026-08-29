@@ -559,6 +559,25 @@ async def _concentrated_asn_insight(db: Database) -> list[Insight]:
 
 
 # --- headline --------------------------------------------------------------
+#: Câte eșecuri pe ACELAȘI cont, de la aceeași adresă, fac dintr-o reușită o
+#: forțare care a mers — și nu pe cineva care și-a încurcat cheia.
+#:
+#: Ales pe datele gazdei (29 august 2026, 30 de zile): 3 354 de adrese au
+#: produs 235 640 de eșecuri de autentificare, iar adresele care s-au
+#: autentificat VREODATĂ cu succes sunt șase, toate ale operatorului. Cea mai
+#: proastă zi a lor înseamnă 7 eșecuri într-o fereastră de 24h, deci pragul
+#: trebuie să stea deasupra lui 7 ca o cheie greșită să nu mai fie numită
+#: spargere. Douăzeci lasă aproape trei ori marja aia și rămâne mult sub ce
+#: produce cine chiar forțează un cont de aici (~70 de eșecuri pe adresă în
+#: medie, sutele pe adresele care insistă), deci nu golește regula.
+#:
+#: Ce se pierde cu el: o forțare „joasă și lentă” — sub 20 de încercări pe zi,
+#: de la o adresă, pe contul în care intră — nu mai ridică titlul paginii.
+#: Aceea rămâne în seama regulii de incident `intrusion.login_after_bruteforce`,
+#: care se aprinde la 5 eșecuri în 30 de minute.
+_FORTARE_ESECURI_MIN = 20
+
+
 async def posture(db: Database, insights: list[Insight]) -> dict[str, Any]:
     """One-line verdict for the top of the dashboard. The point is that someone
     can glance at it and know whether to keep reading."""
@@ -572,26 +591,87 @@ async def posture(db: Database, insights: list[Insight]) -> dict[str, Any]:
           AND action IN ('auth_fail', 'alert')
         """
     )
-    # "Did a brute-force succeed?" — a successful SSH login from an address that
-    # was ALSO failing against this host in the same window. Comparing against
-    # the `users` table would be wrong: those are dashboard accounts, not system
-    # accounts, so every legitimate SSH login would read as a breach.
-    breaches = int(await db.fetchval(
+    # "Did a brute-force succeed?" — the version this replaced asked only
+    # whether the address that logged in had ALSO failed here in the same 24h.
+    # That is coexistence, not causality: on 28 August it read a deploy session
+    # (three refused logins on `admin`, `deploy` and the operator's own account
+    # within three seconds, then a key login as `sentinel-deploy` from the very
+    # same address) as a break-in and told the
+    # operator he was compromised. Over thirty days of this host's data the rule
+    # was wrong every single time it fired — the six addresses that ever
+    # authenticated successfully here are all the operator's.
+    #
+    # So the query asks for the evidence of forcing instead of the coincidence:
+    #   * how many failures came from that address ON THE ACCOUNT THAT GOT IN —
+    #     a brute-force that succeeds succeeds on the account it attacks, and
+    #     failures on `admin` say nothing about a success on `sentinel-deploy`;
+    #   * with what method the success happened — `publickey` is the one that
+    #     cannot be reached by guessing.
+    # `publickey` failures are left out of the count on purpose: an ssh-agent
+    # holding several keys emits one refusal per key on a single connection,
+    # which is how three "attacks" appeared within three seconds on 28 August.
+    # Comparing against the `users` table would still be wrong: those are
+    # dashboard accounts, not system accounts.
+    rows = await db.fetch(
         """
-        SELECT count(*) FROM raw_events ok
-        WHERE ok.source = 'sshd' AND ok.action = 'auth_ok'
-          AND ok.ts > now() - interval '24 hours'
-          AND EXISTS (
-              SELECT 1 FROM raw_events f
-              WHERE f.src_ip = ok.src_ip AND f.source = 'sshd'
-                AND f.action = 'auth_fail' AND f.ts > now() - interval '24 hours'
-          )
-        """) or 0)
+        WITH ok AS (
+            SELECT id, src_ip, username, raw->>'auth_method' AS metoda
+              FROM raw_events
+             WHERE source = 'sshd' AND action = 'auth_ok'
+               AND src_ip IS NOT NULL
+               AND ts > now() - interval '24 hours'
+        )
+        SELECT host(ok.src_ip) AS ip, ok.username AS cont, ok.metoda AS metoda,
+               count(f.id) FILTER (WHERE f.username = ok.username) AS esecuri_cont,
+               count(f.id) AS esecuri_ip
+          FROM ok
+          LEFT JOIN raw_events f
+            ON f.src_ip = ok.src_ip AND f.source = 'sshd'
+           AND f.action = 'auth_fail'
+           AND f.ts > now() - interval '24 hours'
+           AND f.raw->>'auth_method' IS DISTINCT FROM 'publickey'
+         GROUP BY ok.id, ok.src_ip, ok.username, ok.metoda
+         ORDER BY 4 DESC, 5 DESC
+        """
+    )
+    fortari: list[dict[str, Any]] = []
+    for r in rows:
+        # A key is not arrived at by guessing, so a `publickey` success is not a
+        # forcing that worked. An UNKNOWN method is not read as safe: the sshd
+        # parser leaves `auth_method` out of "Invalid user" lines, and "I cannot
+        # tell" must not turn into "all clear".
+        if r["metoda"] == "publickey":
+            continue
+        cont = r["cont"]
+        # Without a username on the success there is no account to match, so the
+        # address' own failures stand in — weaker evidence, but staying silent
+        # here would be the same lie the old rule told, pointed the other way.
+        esecuri = int((r["esecuri_ip"] if cont is None else r["esecuri_cont"]) or 0)
+        if esecuri >= _FORTARE_ESECURI_MIN:
+            fortari.append({"ip": r["ip"], "cont": cont, "esecuri": esecuri})
+    breaches = len(fortari)
 
-    # A successful login from an address that was brute-forcing outranks
-    # everything else on the page: it means an attempt stopped being an attempt.
-    if breaches:
-        level, verdict = "critical", "Autentificare reușită de la un atacator — verifică ACUM"
+    # This outranks everything else on the page, and it says what was SEEN — a
+    # success on an account the same address had been failing on, and how many
+    # times — not the conclusion "an attacker got in". That conclusion is the
+    # operator's to draw; drawing it for him is what turned a deploy into a
+    # 3 a.m. scare.
+    if fortari:
+        top = fortari[0]
+        level = "critical"
+        if top["cont"] is None:
+            verdict = (f"Reușită SSH de la o adresă cu {top['esecuri']} eșecuri "
+                       f"în aceleași 24h; contul nu a putut fi citit — "
+                       f"verifică ACUM")
+        else:
+            # The account name is copied verbatim out of the sshd log, so the
+            # attacker picks it (see collectors/sshd.py). Escaping is done by
+            # the templates and by `views.esc`; the length and the control
+            # characters are nobody's job but this one's.
+            cont = "".join(c for c in top["cont"] if c.isprintable())[:48]
+            verdict = (f"Reușită SSH pe „{cont}” de la o adresă cu "
+                       f"{top['esecuri']} eșecuri pe același cont în 24h — "
+                       f"verifică ACUM")
     elif crit:
         level, verdict = "critical", "Necesită atenție acum"
     elif warn:
