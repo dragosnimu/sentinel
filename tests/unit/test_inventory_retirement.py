@@ -428,6 +428,40 @@ def test_the_operator_is_told_by_name_which_assets_were_retired(tmp_path):
         "mesajul numește și un activ care NU a fost retras")
 
 
+def test_the_retirement_notice_does_not_pierce_the_operators_quiet_hours(tmp_path):
+    """Retragerea ajunge dimineața, nu la 03:00.
+
+    Pana pe care o previne: `NEVER_MUTED_SEVERITIES` conține exact `critical`,
+    iar `notifications.kind` implicit e `selfcheck`, care NU e în
+    `NEVER_MUTED_KINDS`. Deci o retragere trimisă ca `critical` ar trece prin
+    fereastra de liniște a operatorului și l-ar trezi ca să-i spună că un fișier
+    de configurație s-a schimbat — o știre care poate aștepta până la 09:00.
+
+    Docstring-ul lui `_announce_retired` argumenta deja asta, dar nimic nu-l
+    ținea: măsurat de verificator pe 29 august 2026, mutarea de la `high` la
+    `critical` trecea TOATĂ suita. O apărare scrisă doar în comentariu e o
+    apărare pe care următorul o șterge cu încredere — iar ziua în care a fost
+    scrisă a fost chiar ziua în care rata de alerte a fost coborâtă de la 9,31
+    la 0,66 pe oră, tocmai stingând mesaje care sunau noaptea degeaba.
+
+    Se verifică decizia de livrare, nu doar eticheta: `passes_anyway` e funcția
+    pe care o consultă botul, deci ea răspunde la întrebarea care contează.
+    """
+    from sentinel.services import health_service
+    from sentinel.telegram import quiet
+
+    db, _ = populated(tmp_path)
+    run(health_service._sync_inventory(db, write(tmp_path, ["sshd"])))
+    (mesaj,) = db.notifications
+
+    assert mesaj["severity"] == "high", (
+        f"retragerea pleacă la severitatea {mesaj['severity']!r}; `critical` ar "
+        "ocoli fereastra de liniște și ar suna noaptea")
+    assert not quiet.passes_anyway(mesaj["severity"], mesaj.get("kind")), (
+        "mesajul de retragere trece de fereastra de liniște — un fișier de "
+        "configurație schimbat nu justifică trezirea operatorului")
+
+
 def test_the_retirement_notice_is_sent_once_not_on_every_probe(tmp_path):
     """Sonda rulează la 30 de secunde; un mesaj pe tură ar fi 2880 pe zi.
 
