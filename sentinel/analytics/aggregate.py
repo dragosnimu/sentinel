@@ -478,6 +478,38 @@ async def activity_feed(db: Database, limit: int = 10) -> list[dict[str, Any]]:
 
 
 async def service_health(db: Database) -> dict[str, int]:
+    """How many services are up, down, degraded or unmeasured, right now.
+
+    Cifra pe care o citește operatorul: linia `Servicii: 🟢 10 · 🔴 4` din
+    rezumatul de pe Telegram (`telegram/views.py`) și cardul „Servicii
+    monitorizate" de pe prima pagină vin amândouă de aici.
+
+    ## De ce `retired_at IS NULL`
+
+    Fiindcă starea citită mai jos e ULTIMUL eșantion al activului, fără nicio
+    margine de timp. Pentru un activ care încă se sondează, „ultimul" înseamnă
+    „acum câteva minute". Pentru unul care nu se mai sondează, înseamnă pe
+    vecie ultima măsurătoare făcută vreodată — iar dacă ea era `down`, activul
+    rămâne roșu în numărătoare pentru totdeauna.
+
+    Exact asta s-a întâmplat: pe 29 august 2026 panoul arăta patru servicii
+    roșii de optsprezece zile — `n8n`, `n8n-traefik`, `qdrant`, `webmin` — deși
+    niciunul nu era picat. Fuseseră dezinstalate de pe gazdă (niciun pachet,
+    nicio unitate, niciun container, niciun port ascultat pe 88, 6333 sau
+    5678), ultima sondă reușită pe 11, respectiv 7 august.
+
+    `sentinel/scan/inventory.py:sync` le poate acum retrage, iar
+    `assets_repo.list_all` le ascunde implicit — de-asta sonda, pagina Servicii
+    și `/services` de pe Telegram s-au conformat fără nicio schimbare. Dar
+    interogarea ASTA nu trece prin `list_all`; citește direct din tabelă. Fără
+    rândul de mai jos, retragerea unui activ nu ar schimba cu nimic chiar cifra
+    pentru care a fost făcută.
+
+    Numără activele, nu eșantioanele: un activ retras iese cu totul din
+    numărătoare — nici la verde, nici la roșu, nici la „necunoscut". Rândurile
+    lui din `health_samples` rămân pe disc și rămân interogabile; doar că nu mai
+    răspund la întrebarea „ce se întâmplă acum".
+    """
     rows = await db.fetch(
         """
         SELECT COALESCE(s.status, 'necunoscut') AS stare, count(*) AS n
@@ -486,6 +518,7 @@ async def service_health(db: Database) -> dict[str, int]:
             SELECT status FROM health_samples h
             WHERE h.asset_id = a.id ORDER BY ts DESC LIMIT 1
         ) s ON true
+        WHERE a.retired_at IS NULL
         GROUP BY 1
         """
     )
