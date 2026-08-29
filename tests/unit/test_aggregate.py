@@ -24,9 +24,27 @@ def run(coro):
     return asyncio.run(coro)
 
 
+#: Momentul de referință al fișierului, luat O SINGURĂ DATĂ.
+#:
+#: `_t()` era chemat de două ori pentru același moment — o dată la construirea
+#: fixturii, o dată în aserțiune — iar între cele două apeluri se putea trece o
+#: graniță de secundă. Măsurat pe 29 august 2026: ~0,25% eșec pe rulare de
+#: fișier, adică un roșu fals la câteva sute de rulări de suită. Un roșu fals e
+#: mai puțin grav decât un verde fals, dar are același efect asupra omului care
+#: îl vede: îl învață că suita minte uneori, și atunci nu mai crede nici roșul
+#: adevărat.
+#:
+#: Înghețat aici, `_t(minutes=70)` întoarce același șir oriunde e chemat în
+#: aceeași rulare. Interogările folosesc `now()`-ul real al lui SQLite, deci
+#: între import și rulare se pot scurge secundele suitei — inofensiv, fiindcă
+#: ferestrele testelor sunt de ordinul minutelor și al zilelor, iar decalajul
+#: mută toate momentele împreună.
+_ACUM = datetime.now(timezone.utc)
+
+
 def _t(**delta) -> str:
     """Un moment din trecut, în formatul în care SQLite compară text cu text."""
-    return (datetime.now(timezone.utc) - timedelta(**delta)).strftime("%Y-%m-%d %H:%M:%S")
+    return (_ACUM - timedelta(**delta)).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _minut(ts: str) -> str:
@@ -258,3 +276,30 @@ def test_the_minute_of_precision_is_lost_only_backwards():
         raw=[(tarziu, "sshd", "auth_ok")],
     )
     assert _pe_sursa(run(aggregate.sources(proaspat)))["sshd"]["ultim"] == tarziu
+
+
+def test_the_tail_ceiling_never_drops_below_the_silence_floor():
+    """Plafonul cozii rămâne cel puțin cât pragul de la care se judecă tăcerea.
+
+    Pana pe care o previne: `_gap_insights` refuză să răspundă când rollup-ul e
+    mai vechi de `_TACERE_MINIMA_H` — asta e apărarea lui împotriva unei surse
+    care a amuțit fără să se vadă. Coada din `last_activity_sql()` e plafonată
+    la `_PLAFON_COADA_ORE`; dacă plafonul ar fi mai MIC decât pragul, ar exista
+    o fereastră în care rollup-ul e destul de proaspăt cât regula să răspundă,
+    dar coada nu mai acoperă golul dintre frontieră și acum. Regula ar judeca
+    atunci tăcerea pe un `ultim` fals de vechi și ar striga „sursa a amuțit"
+    despre un colector care scrie — chiar alarma pe care întregul mecanism
+    există ca s-o evite, întoarsă pe dos.
+
+    Invariantul era scris doar în comentariu. Măsurat de verificator pe 29
+    august 2026: orice valoare între 2 și 5 trecea toată suita fără să atingă
+    un test. Constantele stau în module diferite și NU se importă una din alta,
+    ca să nu se inverseze dependența `insights → aggregate`; aserțiunea de aici
+    e singurul loc în care se pot privi împreună.
+    """
+    from sentinel.analytics import insights
+
+    assert aggregate._PLAFON_COADA_ORE >= insights._TACERE_MINIMA_H, (
+        f"coada e plafonată la {aggregate._PLAFON_COADA_ORE}h, dar tăcerea se "
+        f"judecă abia de la {insights._TACERE_MINIMA_H}h — între ele, "
+        f"`_gap_insights` ar citi o ultimă activitate mai veche decât e")
