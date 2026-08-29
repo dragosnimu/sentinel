@@ -94,22 +94,95 @@ async def upsert_finding(db: Database, f: dict[str, Any]) -> bool:
     return bool(row["is_new"])
 
 
+# The statuses a scan is allowed to close. `patching`, `accepted_risk` and
+# `false_positive` are decisions somebody made; a scan does not overturn them.
+_RESOLVABLE_STATUSES = "status IN ('open','patch_planned','deferred')"
+
+
+def _visible_sql(sev_param: int, unscored_param: int) -> str:
+    """SQL for "this run could have seen that finding", given what it asked for.
+
+    Written once and used by both queries below, because they are two halves of
+    the same statement: what a run may close, and what it left behind. Two
+    hand-written copies would drift, and the drift would be silent in exactly the
+    direction that matters — closing a finding nobody looked for.
+
+    A scanner records the severity it was given (`findings.severity`) and whether
+    that severity was ever scored (`raw.severity_known`, written by
+    `trivy_fs.map_severity`). Both halves are needed: an unscored finding is
+    parked at `medium`, so matching on `severity` alone would let a run that asked
+    for UNKNOWN close the real MEDIUMs it never looked for.
+
+    `COALESCE(... , false)`, not a bare comparison: a row whose `raw` has no
+    `severity_known` key yields NULL, `NOT (… OR NULL)` is NULL, and the row
+    would silently fall out of BOTH queries — neither closed nor counted, which
+    is the shape of a leak rather than a decision. Missing means "not known to be
+    unscored", so it is treated as scored.
+    """
+    return (f"(severity = ANY(${sev_param}::text[])"
+            f" OR (${unscored_param}::boolean"
+            f" AND COALESCE(raw->'severity_known' = 'false'::jsonb, false)))")
+
+
 async def mark_resolved_absent(db: Database, scanner: str, asset_id: int | None,
-                               seen_keys: list[str]) -> int:
+                               seen_keys: list[str], *,
+                               visible_severities: list[str] | None = None,
+                               visible_unscored: bool = False) -> int:
     """Findings this scanner used to report for the asset but did not this run
     are resolved. Passing an empty seen list resolves them all — correct when a
-    scan comes back clean."""
+    scan comes back clean.
+
+    `visible_severities` fences that off to what the run could actually see. A
+    scanner that filters at the source — `trivy_image` asks trivy for HIGH and
+    above — stops reporting the severities below its floor, and "not reported"
+    then covers two states that are not the same thing: fixed, and no longer
+    looked for. Without the fence, raising a floor announces every finding under
+    it as repaired overnight, which is a worse lie than the noise the floor was
+    raised to escape.
+
+    None (the default) means the run had no floor and may close anything, which
+    is what `dnf`/`apt` and `trivy_fs` do today: behaviour unchanged for them.
+    """
+    where = ["scanner = $1 AND asset_id IS NOT DISTINCT FROM $2",
+             _RESOLVABLE_STATUSES,
+             "finding_key <> ALL($3::text[])"]
+    args: list[Any] = [scanner, asset_id, seen_keys or [""]]
+    if visible_severities is not None:
+        where.append(_visible_sql(4, 5))
+        args += [list(visible_severities), bool(visible_unscored)]
+
     rows = await db.fetch(
-        """
+        f"""
         UPDATE findings SET status = 'resolved', resolved_at = now(),
             resolution = 'absent_from_latest_scan'
-        WHERE scanner = $1 AND asset_id IS NOT DISTINCT FROM $2
-          AND status IN ('open','patch_planned','deferred')
-          AND finding_key <> ALL($3::text[])
+        WHERE {' AND '.join(where)}
         RETURNING id
         """,
-        scanner, asset_id, seen_keys or [""])
+        *args)
     return len(rows)
+
+
+async def count_open_outside_severities(db: Database, scanner: str,
+                                        asset_id: int | None, *,
+                                        visible_severities: list[str],
+                                        visible_unscored: bool = False) -> int:
+    """How many still-open findings this scanner no longer looks for.
+
+    The counterpart of the fence above. Those rows are protected from being
+    closed, which is right — but protected and unmentioned is its own quiet lie:
+    they sit on the panel looking like today's measurement while nothing has
+    re-checked them since the floor moved. The caller puts the number in the
+    journal at WARNING so the operator has the fact instead of having to infer it
+    from a count that stopped moving.
+    """
+    return int(await db.fetchval(
+        f"""
+        SELECT count(*) FROM findings
+        WHERE scanner = $1 AND asset_id IS NOT DISTINCT FROM $2
+          AND {_RESOLVABLE_STATUSES}
+          AND NOT {_visible_sql(3, 4)}
+        """,
+        scanner, asset_id, list(visible_severities), bool(visible_unscored)) or 0)
 
 
 async def open_counts(db: Database) -> dict[str, int]:

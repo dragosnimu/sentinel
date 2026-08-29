@@ -78,26 +78,32 @@ def _cfg(enabled: bool = True):
     return SimpleNamespace(scan=SimpleNamespace(enabled=enabled))
 
 
+#: `scans.target` e `NOT NULL` în 0003, deci un rând fără el nu există pe gazdă.
+#: Ciotul îl poartă ca să semene cu baza; ramura fără `target` are testul ei.
+TINTA = "localhost"
+
+
 def _row(status: str, ore_in_urma: float, scanner: str = "dnf",
-         error: str | None = None, findings: int = 0):
+         error: str | None = None, findings: int = 0, target: str = TINTA):
     return {"scanner": scanner, "status": status,
             "started_at": NOW - timedelta(hours=ore_in_urma),
             "finished_at": NOW - timedelta(hours=ore_in_urma),
-            "error": error, "findings_count": findings}
+            "error": error, "findings_count": findings, "target": target}
 
 
 def _row_lung(status: str, pornit_acum_ore: float, incheiat_acum_ore: float,
-              scanner: str = "dnf", findings: int = 0):
+              scanner: str = "dnf", findings: int = 0, target: str = TINTA):
     """O rulare care a ținut ore — pornită demult, încheiată recent."""
     return {"scanner": scanner, "status": status,
             "started_at": NOW - timedelta(hours=pornit_acum_ore),
             "finished_at": NOW - timedelta(hours=incheiat_acum_ore),
-            "error": None, "findings_count": findings}
+            "error": None, "findings_count": findings, "target": target}
 
 
 def _rand_running(pornit_acum_ore: float, scanner: str = "dnf",
                   scan_id: int = 41, *, ultima_incheiata_acum_ore: float | None = None,
-                  ultima_constatari: int = 0):
+                  ultima_constatari: int = 0, target: str = TINTA,
+                  ultima_tinta: str = TINTA):
     """Un rând `running`, cu sau fără o rulare încheiată în urma lui.
 
     `finished_at` e NULL prin construcție — un rând deschis de `start_scan` nu-l
@@ -112,8 +118,10 @@ def _rand_running(pornit_acum_ore: float, scanner: str = "dnf",
     return {"id": scan_id, "scanner": scanner, "status": "running",
             "started_at": NOW - timedelta(hours=pornit_acum_ore),
             "finished_at": None, "error": None, "findings_count": 0,
+            "target": target,
             "ok_started_at": ok_ts, "ok_finished_at": ok_ts,
-            "ok_findings_count": None if ok_ts is None else ultima_constatari}
+            "ok_findings_count": None if ok_ts is None else ultima_constatari,
+            "ok_target": None if ok_ts is None else ultima_tinta}
 
 
 def _by_key(results):
@@ -154,6 +162,77 @@ def test_a_recent_successful_scan_is_ok() -> None:
                                    _cfg()))[0]
     assert r.status == "ok"
     assert "31" in r.detail, "numărul de constatări nu apare"
+
+
+def test_the_number_of_findings_is_never_spoken_without_its_scope() -> None:
+    """O cifră fără domeniul ei se citește ca starea gazdei, nu ca o măsurătoare.
+
+    Eșecul pe care îl previne: de la 29 august 2026 `trivy_image` cere lui trivy
+    doar severitățile mari, deci «450 constatări» înseamnă «450 dintre cele
+    mari». Spusă goală, cifra îl lasă pe operator să creadă că restul
+    containerelor sunt curate — când adevărul e că cele ~2388 de constatări
+    MEDIUM n-au mai fost căutate. Domeniul se ia din RÂNDUL rulării, nu din
+    constantele de azi, ca o cifră veche să nu fie reetichetată cu pragul curent.
+    """
+    tinta = "docker: imaginile containerelor în rulare, severități UNKNOWN,HIGH,CRITICAL"
+    r = run(checks.check_last_scan(
+        _DB([_row("completed", 2.0, scanner="trivy_image", findings=450,
+                  target=tinta)]), _cfg()))[0]
+    assert r.status == "ok"
+    assert "450" in r.detail
+    assert tinta in r.detail, (
+        f"numărul e spus fără domeniul rulării: {r.detail!r}")
+    assert r.facts.get("target") == tinta
+
+
+def test_a_row_without_a_target_says_so_instead_of_inventing_one() -> None:
+    """„Nu știu peste ce" nu are voie să arate ca „peste tot".
+
+    Eșecul pe care îl previne: `scans.target` e `NOT NULL` din 0003, deci un rând
+    fără el înseamnă că interogarea nu mai aduce ce credem — nu că scanarea a
+    mers bine. Acoperit cu o formulare neutră, defectul ar rămâne invizibil exact
+    în propoziția care trebuia să spună cât de mult s-a căutat.
+    """
+    rand = _row("completed", 2.0, findings=31)
+    rand.pop("target")
+    r = run(checks.check_last_scan(_DB([rand]), _cfg()))[0]
+    assert r.status == "ok"
+    assert "nu-l spune" in r.detail, (
+        f"un rând fără domeniu trece drept unul cu domeniu: {r.detail!r}")
+
+
+def test_the_shadowed_result_is_labelled_with_its_own_scope() -> None:
+    """Cifra ascunsă de un rând blocat își poartă domeniul EI, nu pe al lui.
+
+    Eșecul pe care îl previne: un rând rămas `running` (deci scris cu pragul de
+    azi) umbrește ultimul rezultat real, care poate fi de dinaintea unei
+    schimbări de prag. Etichetată cu domeniul rândului blocat, cifra veche ar
+    părea măsurată la un prag la care nimeni n-a măsurat-o — confirmarea
+    intenției în locul efectului, în singurul loc unde operatorul se uită.
+    """
+    r = run(checks.check_last_scan(
+        _DB([_rand_running(checks.STUCK_SCAN_HOURS + 10, ultima_incheiata_acum_ore=26,
+                           ultima_constatari=31, target="TINTA_BLOCATA",
+                           ultima_tinta="TINTA_VECHE")]), _cfg()))[0]
+    assert r.status == "degraded"
+    assert "TINTA_VECHE" in r.detail, (
+        f"cifra ultimului rezultat real e spusă fără domeniul ei: {r.detail!r}")
+    assert "TINTA_BLOCATA" not in r.detail, (
+        f"cifra veche e etichetată cu domeniul rândului blocat: {r.detail!r}")
+
+
+def test_a_long_target_is_cut_so_the_rest_of_the_message_survives() -> None:
+    """Un `trivy_fs` cu multe căi nu are voie să împingă restul afară din mesaj.
+
+    Eșecul pe care îl previne: `scans.target` are până la 400 de caractere pentru
+    scanarea de fișiere. Pus întreg în `/selfcheck`, un singur scaner ocupă
+    mesajul, iar Telegram taie coada — adică tocmai celelalte constatări.
+    """
+    r = run(checks.check_last_scan(
+        _DB([_row("completed", 2.0, findings=92, target="/opt/x" * 60)]),
+        _cfg()))[0]
+    assert "…" in r.detail
+    assert len(r.detail) < 300, f"detaliul a rămas nemărginit: {len(r.detail)}"
 
 
 def test_a_scan_that_stopped_running_is_reported_even_without_a_failure() -> None:

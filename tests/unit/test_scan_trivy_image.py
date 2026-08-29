@@ -406,7 +406,87 @@ def test_the_command_scans_the_running_id_and_writes_json_to_a_file() -> None:
         "altă bază de vulnerabilități decât a lui trivy_fs ar însemna două "
         "vechimi diferite pentru aceeași gazdă"
     )
-    assert argv[argv.index("--severity") + 1] == ",".join(trivy_fs.SEVERITIES)
+    assert argv[argv.index("--severity") + 1] == ",".join(trivy_image.SEVERITIES)
+
+
+# --------------------------------------------------------------------------
+# Pragul de severitate: al imaginilor, nu al fișierelor
+# --------------------------------------------------------------------------
+def test_the_image_floor_is_high_and_the_filesystem_one_stays_medium() -> None:
+    """Cele două scanere NU au voie să împartă din nou o singură listă.
+
+    Eșecul pe care îl previne, în amândouă direcțiile — și fiecare a fost trăit
+    sau e la o linie distanță:
+
+    * lipite pe valoarea lui `trivy_fs` (MEDIUM), scanarea de imagini se întoarce
+      la 2838 de constatări peste plafonul de 2500, refuză să ingereze în fiecare
+      noapte și nu mai raportează NIMIC despre containere — starea din 29 august
+      2026, `scan:last:trivy_image` roșu în `/selfcheck`;
+    * lipite pe valoarea de aici (HIGH), scanarea de FIȘIERE tace despre
+      constatările ei medii fără ca cineva să fi cerut asta: 92 de constatări azi,
+      nicăieri lângă plafonul ei, deci ridicarea n-ar repara nimic și ar ascunde
+      ceva. Operatorul a cerut pragul pentru imagini.
+    """
+    imagini = trivy_image.build_argv(IMG_NGINX, "/tmp/x.json", TRIVY)
+    ceruta = imagini[imagini.index("--severity") + 1].split(",")
+    assert "HIGH" in ceruta and "CRITICAL" in ceruta
+    assert "MEDIUM" not in ceruta, (
+        f"scanarea de imagini cere din nou MEDIUM: {ceruta} — plafonul de "
+        f"{trivy_image.MAX_FINDINGS} o va face să refuze în fiecare noapte")
+
+    fisiere = trivy_fs.build_argv("/opt", "/tmp/y.json", TRIVY)
+    ale_fisierelor = fisiere[fisiere.index("--severity") + 1].split(",")
+    assert "MEDIUM" in ale_fisierelor, (
+        f"scanarea de fișiere a pierdut MEDIUM: {ale_fisierelor} — nimeni n-a "
+        f"cerut asta, iar constatările ei medii ar dispărea tăcut")
+
+    # Și deosebirea în sine, nu doar valorile de azi: dacă cineva le unește iar
+    # printr-un alias, aserțiunile de sus pot rămâne adevărate o vreme.
+    assert trivy_image.SEVERITIES is not trivy_fs.SEVERITIES
+    assert set(trivy_image.SEVERITIES) != set(trivy_fs.SEVERITIES)
+
+
+def test_the_image_floor_still_asks_for_the_unscored_ones() -> None:
+    """„Nu știu" nu are voie să cadă odată cu „nu contează".
+
+    Eșecul pe care îl previne: `UNKNOWN` scos din listă odată cu MEDIUM. O
+    vulnerabilitate căreia niciun furnizor nu i-a dat încă o notă nu e una mică —
+    e una neevaluată, și dispărută din filtru dispare fără urmă, fix schimbul pe
+    care `trivy_fs.map_severity` există ca să-l refuze. Operatorul a ridicat
+    pragul; `UNKNOWN` nu e sub HIGH, e în afara scării.
+    """
+    argv = trivy_image.build_argv(IMG_NGINX, "/tmp/x.json", TRIVY)
+    assert "UNKNOWN" in argv[argv.index("--severity") + 1].split(",")
+
+
+def test_what_a_run_can_see_is_derived_from_what_it_asked_for() -> None:
+    """Garda de rezolvare trebuie să urmeze pragul, nu o copie a lui.
+
+    Eșecul pe care îl previne: mulțimea „ce poate vedea rularea" scrisă de mână a
+    doua oară. La prima schimbare de prag lista rămâne în urmă, iar
+    `mark_resolved_absent` închide exact constatările pe care noua rulare nu le
+    mai poate vedea — adică tocmai ce garda e pusă să oprească, tăcut.
+    """
+    vazute, nenotate = trivy_image.visible_severities()
+    assert set(vazute) == {"high", "critical"}
+    assert nenotate is True, (
+        "cu UNKNOWN în prag, constatările nenotate (parcate la `medium` cu "
+        "`severity_known=false`) sunt vizibile și pot fi închise")
+    assert "medium" not in vazute, (
+        "un MEDIUM măsurat ar putea fi închis de o rulare care nu-l mai caută")
+
+
+def test_the_visible_set_follows_a_changed_floor(monkeypatch) -> None:
+    """Derivarea se probează schimbând pragul, nu citind valorile de azi.
+
+    Eșecul pe care îl previne: testul de mai sus trece și peste o listă scrisă de
+    mână, atâta timp cât cifrele coincid azi. Aici pragul se mută sub el.
+    """
+    monkeypatch.setattr(trivy_image, "SEVERITIES", ("MEDIUM", "HIGH", "CRITICAL"))
+    vazute, nenotate = trivy_image.visible_severities()
+    assert set(vazute) == {"medium", "high", "critical"}
+    assert nenotate is False, (
+        "fără UNKNOWN în prag, o rulare nu mai poate vedea constatările nenotate")
 
 
 def test_trivy_gets_a_shorter_deadline_than_the_one_we_enforce() -> None:
@@ -984,19 +1064,31 @@ def test_the_database_is_checked_after_the_scan_not_before(gazda) -> None:
 # Orchestratorul: rândul din `scans` și ce NU se rezolvă
 # --------------------------------------------------------------------------
 class _DB:
-    """Ciot de bază care ține minte ce s-a scris. Nu asertează nimic singur."""
+    """Ciot de bază care ține minte ce s-a scris. Nu asertează nimic singur.
 
-    def __init__(self) -> None:
+    `sub_prag` e ce răspunde la interogarea care numără constatările rămase sub
+    pragul de severitate — implicit zero, ca o bază fără istoric.
+    """
+
+    def __init__(self, sub_prag: int = 0) -> None:
         self.scans: list[dict] = []
         self.finished: list[dict] = []
         self.upserted: list[dict] = []
         self.resolved: list[tuple] = []
+        # SQL-ul și TOATE argumentele rezolvării, ca să poată fi văzută garda de
+        # severitate, nu doar cele trei argumente vechi.
+        self.resolve_calls: list[tuple] = []
+        self.counted: list[tuple] = []
+        self.sub_prag = sub_prag
 
     async def fetchval(self, sql, *args):
         if "INSERT INTO scans" in sql:
             self.scans.append({"scanner": args[0], "target": args[1],
                                "triggered_by": args[3]})
             return len(self.scans)
+        if "SELECT count(*) FROM findings" in sql:
+            self.counted.append((sql, args))
+            return self.sub_prag
         return 0
 
     async def fetchrow(self, sql, *args):
@@ -1007,6 +1099,7 @@ class _DB:
     async def fetch(self, sql, *args):
         if "SET status = 'resolved'" in sql:
             self.resolved.append((args[0], args[1], args[2]))
+            self.resolve_calls.append((sql, args))
         return []
 
     async def execute(self, sql, *args):
@@ -1071,9 +1164,10 @@ def test_an_unreachable_docker_writes_a_failed_row_and_resolves_nothing(
     (rand,) = db.finished
     assert rand["status"] == "failed"
     assert "permission denied" in rand["error"]
-    assert db.scans == [{"scanner": "trivy_image",
-                         "target": "docker: imaginile containerelor în rulare",
-                         "triggered_by": "test"}]
+    (deschis,) = db.scans
+    assert deschis["scanner"] == "trivy_image"
+    assert deschis["triggered_by"] == "test"
+    assert deschis["target"].startswith("docker: imaginile containerelor în rulare")
 
 
 def test_a_completed_scan_ingests_and_closes_what_disappeared(monkeypatch) -> None:
@@ -1107,6 +1201,186 @@ def test_a_completed_scan_ingests_and_closes_what_disappeared(monkeypatch) -> No
     (rand,) = db.finished
     assert rand["status"] == "completed"
     assert rand["db_version"] == "trivy-db v2 proaspătă"
+
+
+def _merge_stub(monkeypatch, findings=None, facts=None):
+    """`trivy_image.scan` înlocuit cu un rezultat gata făcut."""
+    async def merge(_probe):
+        return (list(findings if findings is not None
+                     else trivy_image.parse(SAMPLE, reference="nginx:1.27",
+                                            image_id=IMG_NGINX)),
+                None,
+                {"db_version": "trivy-db v2 proaspătă", "images": 1,
+                 "containers": 2, "references": ["nginx:1.27"],
+                 "severities": list(trivy_image.SEVERITIES), **(facts or {})})
+
+    monkeypatch.setattr(orchestrator.trivy_image, "scan", merge)
+
+
+def test_the_scan_row_says_at_what_threshold_it_looked(monkeypatch) -> None:
+    """O scanare care se uită la mai puțin trebuie să SPUNĂ că se uită la mai puțin.
+
+    Eșecul pe care îl previne: rândul din `scans` poartă „450 constatări" și
+    nimic despre pragul la care au fost numărate. Citit ca stare a containerelor,
+    numărul spune „atât au", când adevărul e „atât s-au căutat" — iar cele ~2388
+    de constatări MEDIUM nu dispar de pe gazdă, doar din raport.
+
+    Scris la DESCHIDEREA rândului, nu la încheiere, și de aceea se probează pe
+    calea eșuată: rândul `failed` e chiar cel pe care se uită operatorul azi.
+    """
+    _probe(monkeypatch, trivy_image.DOCKER_UNREACHABLE, "permission denied")
+    _no_kev(monkeypatch)
+    db = _DB()
+    run(orchestrator._run_trivy_image(db, "test"))
+
+    (deschis,) = db.scans
+    assert trivy_image.severity_scope() in deschis["target"], (
+        f"pragul nu e pe rândul din `scans`: {deschis['target']!r}")
+    assert "HIGH" in deschis["target"] and "MEDIUM" not in deschis["target"]
+
+
+def test_the_selfcheck_says_the_threshold_next_to_the_number(monkeypatch) -> None:
+    """Cifra din `/selfcheck` nu are voie să circule fără domeniul ei.
+
+    Eșecul pe care îl previne: «Scanarea „trivy_image" — ok, 450 constatări» pe
+    Telegram. Operatorul citește „atâtea au containerele" și nu are de unde ști
+    că MEDIUM nu s-a mai căutat de la ridicarea pragului. Absența unui semnal
+    citită ca dovadă de bine — tiparul din CLAUDE.md.
+
+    Capăt la capăt, nu pe o constantă: domeniul e cel pe care l-a scris
+    orchestratorul în rând și e citit înapoi DIN rând de verificare.
+    """
+    from sentinel.selfcheck import checks
+
+    _probe(monkeypatch, trivy_image.DOCKER_READY)
+    _no_kev(monkeypatch)
+    _merge_stub(monkeypatch)
+    db = _DB()
+    run(orchestrator._run_trivy_image(db, "test"))
+    (scris,) = db.scans
+    acum = datetime.now(timezone.utc)
+
+    class _SelfcheckDB:
+        async def fetch(self, _sql, *_a):
+            return [{"id": 1, "scanner": scris["scanner"], "status": "completed",
+                     "started_at": acum, "finished_at": acum, "error": None,
+                     "findings_count": 450, "target": scris["target"],
+                     "ok_started_at": acum, "ok_finished_at": acum,
+                     "ok_findings_count": 450, "ok_target": scris["target"]}]
+
+        async def fetchval(self, _sql, *args):
+            return (acum - args[0]).total_seconds()
+
+    cfg = SimpleNamespace(scan=SimpleNamespace(enabled=True))
+    (r,) = run(checks.check_last_scan(_SelfcheckDB(), cfg))
+    assert r.status == "ok" and "450 constatări" in r.detail
+    assert "HIGH" in r.detail, (
+        f"numărul e spus fără pragul la care a fost măsurat: {r.detail!r}")
+    assert trivy_image.severity_scope() in r.detail
+
+
+def test_a_run_at_the_new_floor_does_not_close_the_old_medium_findings(
+        monkeypatch) -> None:
+    """2388 de vulnerabilități nu se repară într-o noapte fiindcă am încetat să le cerem.
+
+    Eșecul pe care îl previne: `mark_resolved_absent` închide tot ce scanerul nu
+    a mai raportat. După ridicarea pragului, „nu a mai raportat" acoperă două
+    lucruri diferite — ce s-a reparat, și ce nu mai e căutat. Nediferențiate,
+    prima rulare la HIGH ar fi marcat toate constatările MEDIUM ale imaginilor
+    drept `absent_from_latest_scan`, iar panoul ar fi arătat o gazdă care s-a
+    reparat singură peste noapte.
+    """
+    _probe(monkeypatch, trivy_image.DOCKER_READY)
+    _no_kev(monkeypatch)
+    _merge_stub(monkeypatch)
+    db = _DB()
+    run(orchestrator._run_trivy_image(db, "test"))
+
+    (sql, args) = db.resolve_calls[0]
+    assert "severity = ANY($4::text[])" in sql, (
+        f"rezolvarea nu e îngrădită de severitățile cerute: {sql}")
+    assert set(args[3]) == {"high", "critical"}
+    assert "medium" not in args[3], (
+        "o rulare care nu mai cere MEDIUM poate închide constatări MEDIUM")
+    assert args[4] is True, (
+        "constatările nenotate (`UNKNOWN`, parcate la `medium`) sunt cerute, "
+        "deci ele TREBUIE să se poată închide când dispar")
+    # Al doilea jumătate a predicatului. Fără ea, `UNKNOWN` — parcat de
+    # `map_severity` la `medium`, la fel ca un MEDIUM măsurat — n-ar mai putea fi
+    # deosebit de el, iar garda ar închide și ce apără, sau ar apăra și ce nu
+    # trebuie. Aserțiune pe TEXT fiindcă aici nu există bază de date; că Postgres
+    # acceptă expresia nu se poate proba de aici.
+    assert "severity_known" in sql, (
+        f"constatările nenotate nu sunt deosebite de un MEDIUM măsurat: {sql}")
+
+
+def test_the_severity_fence_numbers_its_parameters_correctly(monkeypatch) -> None:
+    """Un `$N` greșit nu se vede la citire; se vede noaptea, ca scanare căzută.
+
+    Eșecul pe care îl previne: predicatul de severitate e cusut în două
+    interogări cu numerotări diferite — `$4/$5` la rezolvare, `$3/$4` la
+    numărătoare. O nepotrivire între câți parametri poartă textul și câți se
+    trimit e respinsă de Postgres la execuție: excepție în orchestrator, rând
+    `failed` în fiecare noapte, nicio constatare ingerată — și niciun test de
+    aici n-ar fi văzut-o, fiindcă în suită nu rulează nicio bază.
+
+    Cât se poate verifica fără gazdă: că textul și argumentele se potrivesc la
+    număr. Că expresia e SQL valid rămâne de probat pe Postgres.
+    """
+    _probe(monkeypatch, trivy_image.DOCKER_READY)
+    _no_kev(monkeypatch)
+    _merge_stub(monkeypatch)
+    db = _DB(sub_prag=7)
+    run(orchestrator._run_trivy_image(db, "test"))
+
+    perechi = [db.resolve_calls[0], db.counted[0]]
+    assert len(perechi) == 2, "una dintre cele două interogări nu s-a executat"
+    for sql, args in perechi:
+        numere = {int(n) for n in re.findall(r"\$(\d+)", sql)}
+        assert numere == set(range(1, len(args) + 1)), (
+            f"textul folosește {sorted(numere)} dar se trimit {len(args)} "
+            f"argumente: {sql}")
+
+
+def test_the_findings_left_below_the_floor_are_counted_and_said(
+        monkeypatch, caplog) -> None:
+    """Protejate și netrecute nicăieri ar fi doar o altă formă de tăcere.
+
+    Eșecul pe care îl previne: constatările MEDIUM rămase deschise stau în panou
+    arătând ca măsurătoarea de azi, deși nimic nu le-a mai verificat de la
+    mutarea pragului. Operatorul trebuie să afle numărul de la noi, nu să-l
+    deducă dintr-o cifră care a încetat să se miște.
+    """
+    _probe(monkeypatch, trivy_image.DOCKER_READY)
+    _no_kev(monkeypatch)
+    _merge_stub(monkeypatch)
+    db = _DB(sub_prag=2388)
+    with caplog.at_level("WARNING", logger="sentinel.scan.orchestrator"):
+        out = run(orchestrator._run_trivy_image(db, "test"))
+
+    assert out["below_floor_open"] == 2388
+    assert db.counted, "nimeni n-a numărat ce a rămas sub prag"
+    randuri = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert randuri, "numărul rămas sub prag nu ajunge în jurnal"
+    assert getattr(randuri[0], "open", None) == 2388
+
+
+def test_a_host_with_nothing_below_the_floor_says_nothing(monkeypatch, caplog) -> None:
+    """Zero rămase nu are voie să producă un avertisment în fiecare noapte.
+
+    Eșecul pe care îl previne: un `WARNING` nocturn cu „0 constatări sub prag"
+    e zgomotul care îl învață pe operator să nu mai citească nivelul ăla — și
+    atunci se pierde și avertismentul care conta.
+    """
+    _probe(monkeypatch, trivy_image.DOCKER_READY)
+    _no_kev(monkeypatch)
+    _merge_stub(monkeypatch)
+    db = _DB(sub_prag=0)
+    with caplog.at_level("WARNING", logger="sentinel.scan.orchestrator"):
+        out = run(orchestrator._run_trivy_image(db, "test"))
+
+    assert out["below_floor_open"] == 0
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
 
 def test_the_orchestrator_only_runs_it_when_the_config_says_so() -> None:

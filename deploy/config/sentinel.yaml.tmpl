@@ -323,6 +323,12 @@ scan:
   # `ensure_docker_access` in deploy/install.sh measures what is actually
   # reachable and writes the answer here. What the membership costs is in
   # docs/ARHITECTURA.md §3.14.
+  #
+  # The severity floor for images is HIGH and is deliberately NOT a key here:
+  # it is paired with a refusal cap, and a floor lowered independently of that
+  # cap stops the scan from reporting anything at all, silently, every night —
+  # which is the state it was raised out of on 29 August 2026. It lives in
+  # `trivy_image.SEVERITIES`, next to the cap, and the reasoning is there.
   containers: @@SCAN_CONTAINERS@@
   filesystem: true
   source_sca: true

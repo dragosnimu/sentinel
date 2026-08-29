@@ -326,6 +326,27 @@ niciun rând în `scans`. Docker prezent dar inaccesibil **e** o eroare, cu rân
 face. Detaliile sunt în docstring-ul lui
 [`sentinel/scan/trivy_image.py`](../sentinel/scan/trivy_image.py).
 
+**Pragul de severitate al imaginilor e HIGH, al fișierelor a rămas MEDIUM.**
+Ridicat pe 29 august 2026, la cererea operatorului: pe cele șase imagini care
+rulau, trivy 0.73.0 dădea 2838 de constatări de la MEDIUM în sus față de un
+plafon de refuz de 2500, deci scanarea refuza să ingereze în fiecare noapte și
+nu raporta *nimic* despre containere; la HIGH sunt 450. `trivy_fs` n-a fost
+atins — 92 de constatări, nicăieri lângă plafonul lui.
+
+O scanare care se uită la mai puțin trebuie să **spună** că se uită la mai
+puțin, altfel „0 vulnerabilități medii pe containere" se citește ca „containerele
+sunt curate" când înseamnă „nu ne-am uitat". Deci pragul se scrie în
+`scans.target` la deschiderea rândului — e acolo și pe rândurile `failed` — iar
+`check_last_scan` îl citește înapoi *din rând* și îl spune lângă numărul de
+constatări. Din rând, nu din constantele de azi: altfel o cifră măsurată la alt
+prag ar fi reetichetată cu cel curent.
+
+Și cele ~2388 de constatări MEDIUM ingerate de rulările de dinainte **nu** se
+închid: `mark_resolved_absent` primește severitățile pe care rularea chiar le
+putea vedea, fiindcă „nu mai e raportată" acoperă două lucruri diferite — ce s-a
+reparat, și ce nu mai e căutat. Ele rămân deschise, iar câte sunt se scrie în
+jurnal la `WARNING` după fiecare rulare.
+
 ### 3.15 Familia se detectează o dată, la instalare
 
 Runtime-ul Python **nu se uită în `/etc/os-release`**. `distro_detect` din

@@ -2371,18 +2371,25 @@ STUCK_SCAN_HOURS = 5
 #: să iasă din interogare cu `ok_*` NULL, ca verificarea să poată spune „nu
 #: există niciun rezultat real" — nu să dispară din listă, fiindcă atunci nu s-ar
 #: mai spune nimic despre el, iar runner-ul ar citi tăcerea ca pe o revenire.
+#: `target` e adus de doua ori — de pe randul cel mai nou si de pe ultimul
+#: incheiat — fiindca numarul de constatari se raporteaza din amandoua, iar
+#: domeniul trebuie sa vina de pe RANDUL a carui cifra se spune. Luate de pe
+#: acelasi rand, o cifra masurata ieri, cu alt prag, ar fi etichetata cu
+#: domeniul de azi: exact reeticheterea pe care restul fisierului o refuza.
 _LAST_SCAN_SQL = """
 SELECT last.id, last.scanner, last.status, last.started_at, last.finished_at,
-       last.error, last.findings_count,
+       last.error, last.findings_count, last.target,
        ok.started_at     AS ok_started_at,
        ok.finished_at    AS ok_finished_at,
-       ok.findings_count AS ok_findings_count
+       ok.findings_count AS ok_findings_count,
+       ok.target         AS ok_target
   FROM (SELECT DISTINCT ON (scanner)
-               id, scanner, status, started_at, finished_at, error, findings_count
+               id, scanner, status, started_at, finished_at, error,
+               findings_count, target
           FROM scans
          ORDER BY scanner, started_at DESC) last
   LEFT JOIN LATERAL (
-        SELECT started_at, finished_at, findings_count
+        SELECT started_at, finished_at, findings_count, target
           FROM scans c
          WHERE c.scanner = last.scanner AND c.status = 'completed'
          ORDER BY c.started_at DESC
@@ -2390,6 +2397,38 @@ SELECT last.id, last.scanner, last.status, last.started_at, last.finished_at,
        ) ok ON true
  ORDER BY last.scanner
 """
+
+#: Cat din `scans.target` intra intr-o constatare de selfcheck. Textul ajunge pe
+#: Telegram langa celelalte constatari, iar `trivy_fs` isi scrie acolo toate
+#: caile din `scan.discovery_paths` (taiate la 400 de caractere de orchestrator):
+#: netaiat, un singur scaner ar impinge restul mesajului afara.
+SCAN_TARGET_CHARS = 120
+
+
+def _scan_scope(target: Any) -> str:
+    """„peste <ce s-a scanat>", pentru propozitia care spune un numar.
+
+    Eșecul pe care il previne: `trivy_image` cere lui trivy doar severitatile
+    mari de pe 29 august 2026, deci «450 constatări» inseamna «450 dintre cele
+    mari». Spus fara domeniu, numarul se citeste ca stare a containerelor —
+    „atat au", cand adevarul e „atat s-au cautat" — iar cele ~2388 de constatari
+    MEDIUM nu dispar de pe gazda, doar din raport. Absenta unui semnal citita ca
+    dovada de bine e chiar tiparul din CLAUDE.md.
+
+    Domeniul se ia din RANDUL rularii, nu din constantele de azi: o cifra
+    masurata saptamana trecuta, cu alt prag, reetichetata cu pragul curent ar fi
+    confirmarea intentiei in locul efectului.
+
+    Un rand fara `target` nu se acopera cu o formulare linistitoare: coloana e
+    `NOT NULL` in 0003, deci tacerea ei ar insemna ca interogarea de mai sus nu
+    mai aduce ce credem, nu ca scanarea a mers bine.
+    """
+    text = str(target).strip() if isinstance(target, str) else ""
+    if not text:
+        return "peste un domeniu pe care rândul din `scans` nu-l spune"
+    if len(text) > SCAN_TARGET_CHARS:
+        text = text[:SCAN_TARGET_CHARS - 1].rstrip() + "…"
+    return f"peste {text}"
 
 
 async def _scan_age_s(db: Database, ts: Any) -> float | None:
@@ -2433,15 +2472,19 @@ async def _last_completed_phrase(db: Database, r: dict) -> tuple[str, dict[str, 
                 {"last_completed": None})
 
     findings = int(r.get("ok_findings_count") or 0)
+    # Domeniul rularii ÎNCHEIATE, nu al randului blocat: cifra spusa aici e a ei.
+    scope = _scan_scope(r.get("ok_target"))
     age_s = await _scan_age_s(db, ts)
     if age_s is None:
-        return (f"există o rulare încheiată mai devreme, cu {findings} constatări, "
-                f"dar nu i-am putut citi vârsta",
-                {"last_completed_findings": findings})
+        return (f"există o rulare încheiată mai devreme, cu {findings} constatări "
+                f"{scope}, dar nu i-am putut citi vârsta",
+                {"last_completed_findings": findings,
+                 "last_completed_target": r.get("ok_target")})
     return (f"ultimul rezultat real e de acum {_ago(age_s / 60)}, cu {findings} "
-            f"constatări — aia e cifra din panou",
+            f"constatări {scope} — aia e cifra din panou",
             {"last_completed_age_h": int(age_s / 3600),
-             "last_completed_findings": findings})
+             "last_completed_findings": findings,
+             "last_completed_target": r.get("ok_target")})
 
 
 async def check_last_scan(db: Database, cfg: Config) -> list[CheckResult]:
@@ -2465,6 +2508,13 @@ async def check_last_scan(db: Database, cfg: Config) -> list[CheckResult]:
     ajuns niciodată la capăt, ȘI din când e ultimul rezultat real — fiindcă
     `_LAST_SCAN_SQL` alege rândul cel mai nou, deci cel blocat umbrește tocmai
     cifra pe care operatorul o vede în panou.
+
+    Al treilea, de pe 29 august 2026: numărul de constatări se spunea gol.
+    `trivy_image` cere de atunci lui trivy doar severitățile mari, deci «450
+    constatări» înseamnă «450 dintre cele mari», iar citit ca stare a
+    containerelor spune că restul sunt curate. De aceea orice propoziție care
+    conține cifra conține și `_scan_scope` — domeniul luat din RÂNDUL a cărui
+    cifră se spune, nu din constantele de azi.
 
     `degraded`, nu `down`: nimic de pe gazdă nu s-a oprit — colectarea și blocarea
     merg mai departe. Ce e stricat e prospețimea unei liste. Fiecare scanner își
@@ -2611,8 +2661,9 @@ async def check_last_scan(db: Database, cfg: Config) -> list[CheckResult]:
         results.append(CheckResult(
             key, f"Scanarea „{scanner}”", "ok",
             detail=f"ultima rulare încheiată acum {_ago(age_s / 60)}, "
-                   f"{findings} constatări",
-            facts={"scanner": scanner, "status": status, "findings": findings}))
+                   f"{findings} constatări {_scan_scope(r.get('target'))}",
+            facts={"scanner": scanner, "status": status, "findings": findings,
+                   "target": r.get("target")}))
     return results
 
 

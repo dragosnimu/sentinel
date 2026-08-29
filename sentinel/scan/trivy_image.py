@@ -90,6 +90,29 @@ vendor's own advisory feed (Debian's, Alpine's, Ubuntu's), which is the feed tha
 knows about its own backports. So `--scanners vuln` here reports both classes,
 and it is the only source that reports either.
 
+## The severity floor is HIGH here and MEDIUM in `trivy_fs`, on purpose
+
+`SEVERITIES` below says the whole of why. The short version: on 29 August 2026
+the six running images carried 2838 findings at MEDIUM and above against a
+`MAX_FINDINGS` cap of 2500, so this scanner refused every night and reported
+nothing whatsoever about the containers; at HIGH they carry 450. `trivy_fs`
+keeps MEDIUM — its 92 findings are nowhere near its own cap, and nobody asked
+for it to change.
+
+A scan that looks at less has to SAY it looks at less, or the number it reports
+gets read as "the containers are clean" when it means "we did not look" — the
+absence of a signal taken for evidence of health, which is this repository's
+house defect. So the floor is not only a constant: `severity_scope()` is written
+onto the `scans` row by the orchestrator, before the run starts, so it is there
+even on a `failed` row, and `check_last_scan` reads it back out of the row and
+says it next to the count.
+
+And a run at this floor is not allowed to close what it can no longer see: the
+MEDIUM findings earlier runs ingested are still on the host, they were merely
+dropped from the report. `visible_severities()` is what `mark_resolved_absent`
+is fenced with, so those rows stay open instead of being announced as 2388
+vulnerabilities that repaired themselves overnight.
+
 ## Budgets: the unit is killed as a whole, so this scanner bounds itself
 
 `sentinel-scan.service` has `TimeoutStartSec=14400` and `MemoryMax=1G` for the
@@ -204,6 +227,49 @@ MAX_CONTAINERS = 200
 #: secunda, nu dupa a 3599-a.
 MAX_IMAGES = 40
 
+#: Ce severitati cere trivy PENTRU IMAGINI. Lista proprie, nu
+#: `trivy_fs.SEVERITIES`, si deosebirea e chiar rostul ei.
+#:
+#: Ridicata la HIGH pe 29 august 2026, la cererea explicita a operatorului. Ce
+#: s-a masurat pe gazda in ziua aia, cu trivy 0.73.0, pe cele sase imagini care
+#: rulau: 2838 de constatari de la MEDIUM in sus si 450 de la HIGH in sus, cu
+#: `MAX_FINDINGS` la 2500. Adica scanarea refuza sa ingereze in fiecare noapte —
+#: pe drept, vezi mai jos — deci despre containere nu se raporta nimic. O singura
+#: imagine (`snipe-it`) aducea 75% din volumul de la MEDIUM.
+#:
+#: De ce o lista proprie si nu ridicarea celei din `trivy_fs`: constanta de acolo
+#: e folosita de amandoua scanerele, deci ridicata acolo ar fi mutat si scanarea
+#: de fisiere, care merge azi cu 92 de constatari si pe care nimeni n-a cerut
+#: s-o schimbe. Nici nu se uita la acelasi lucru: sub `scan.discovery_paths` sunt
+#: dependintele pe care le-a pus operatorul, si acolo un MEDIUM e o linie
+#: intr-un lockfile pe care el o poate ridica singur; intr-o imagine, un MEDIUM e
+#: aproape mereu un pachet al distributiei din imagine, reparabil doar printr-o
+#: reconstructie care le repara oricum pe toate deodata.
+#:
+#: De ce NU o cheie de configuratie: pragul si `MAX_FINDINGS` sunt o PERECHE, iar
+#: perechea are o stare in care scanarea nu mai raporteaza nimic — exact starea
+#: din care iesim aici. O cheie reglabila separat de plafon o face din nou
+#: atingibila dintr-un fisier de configuratie, tacut, in fiecare noapte. In plus
+#: `sentinel.yaml` de pe gazda nu se regenereaza la deploy, deci o cheie noua
+#: n-ar ajunge acolo si tot implicitul din cod ar decide. Daca se cere vreodata
+#: reglabil, se adauga IMPREUNA cu validarea perechii — si aia e o decizie a
+#: operatorului, nu a acestui fisier.
+#:
+#: `UNKNOWN` ramane in lista, si nu din inertie: o vulnerabilitate careia nimeni
+#: nu i-a dat inca o nota nu e una mica. Scoasa, ar disparea tacut — „nu stiu"
+#: citit ca „nu conteaza", fix ce interzice CLAUDE.md, si nici nu e ce a cerut
+#: operatorul: el a ridicat pragul, iar UNKNOWN nu e sub HIGH, e in afara scarii.
+#: Consecinta, scrisa ca sa nu surprinda pe nimeni: constatarile de aici pot avea
+#: `severity = medium` chiar cu pragul la HIGH, fiindca `map_severity` parcheaza
+#: `UNKNOWN` la `medium`; se deosebesc de un MEDIUM masurat prin
+#: `raw.severity_known = false`.
+#:
+#: Ce se pierde, si e o pierdere reala: cele ~2388 de constatari MEDIUM din
+#: imagini nu dispar de pe gazda, doar din raport. De aceea pragul se SPUNE
+#: (`severity_scope`) si de aceea o rulare cu el nu are voie sa inchida
+#: constatarile MEDIUM ingerate inainte (`visible_severities`).
+SEVERITIES = ("UNKNOWN", "HIGH", "CRITICAL")
+
 #: Plafonul de volum, ca REFUZ, nu ca trunchiere — acelasi rationament ca la
 #: `trivy_fs.MAX_FINDINGS`: o lista taiata ar fi urmata de
 #: `mark_resolved_absent`, care ar marca restul drept rezolvate, si panoul ar
@@ -215,8 +281,11 @@ MAX_IMAGES = 40
 #: in fiecare noapte si n-ar raporta niciodata nimic — un plafon care nu poate fi
 #: respectat e o scanare oprita, nu o scanare prudenta.
 #:
-#: Daca panoul se dovedeste prea zgomotos, parghia e pragul de severitate, si e
-#: decizia operatorului, nu a acestui fisier.
+#: Parghia cand panoul e prea zgomotos e pragul de severitate, si a fost trasa:
+#: `SEVERITIES` e la HIGH de pe 29 august 2026, cu 450 de constatari masurate
+#: fata de plafonul asta. Numarul de aici a ramas neatins dinadins — el
+#: margineste memoria si ingestia, nu zgomotul, iar coborat acum ar lua marja
+#: care face ca urmatoarea imagine adaugata sa nu opreasca scanarea.
 MAX_FINDINGS = 2500
 
 #: Starile lui docker. Doar `unreachable` e o eroare; vezi docstring-ul de sus.
@@ -234,6 +303,52 @@ _HEX_ID = re.compile(r"^[0-9a-f]{64}$")
 #: gol. `docker inspect .Config.Image` intoarce asta pentru un container pornit
 #: direct dupa id, si atunci nu e un nume pe care operatorul sa-l recunoasca.
 _DIGEST_REF = re.compile(r"^(sha256:)?[0-9a-f]{12,64}$")
+
+
+def severity_scope() -> str:
+    """Pragul de severitate, ca text, pentru locurile unde se CITESTE rezultatul.
+
+    O singura sursa pentru toate: `scans.target` (scris de orchestrator la
+    deschiderea randului, deci prezent si pe randurile `failed` si `running`),
+    mesajul de refuz al plafonului, si — prin `target` — constatarea din
+    `/selfcheck`. Compusa, nu scrisa de mana in fiecare loc: doua copii ar
+    diverge exact cand cineva schimba `SEVERITIES`, iar atunci panoul ar declara
+    alt prag decat cel cerut lui trivy. Un prag raportat gresit e mai rau decat
+    unul neraportat — al doilea se vede ca lipsa, primul nu.
+    """
+    return "severități " + ",".join(SEVERITIES)
+
+
+def visible_severities() -> tuple[tuple[str, ...], bool]:
+    """Ce POATE vedea o rulare cu `SEVERITIES`, in vocabularul coloanei
+    `findings.severity`: (severitatile notate, si daca vede si nenotatele).
+
+    Exista fiindca `mark_resolved_absent` inchide tot ce scanerul nu a mai
+    raportat, iar dupa ridicarea pragului „nu a mai raportat" acopera doua
+    lucruri care nu inseamna acelasi lucru: ce s-a reparat, si ce nu mai e
+    cautat. Fara garda asta, prima rulare la HIGH ar fi anuntat ~2388 de
+    constatari MEDIUM ca rezolvate intr-o noapte.
+
+    Derivata din `SEVERITIES` prin chiar maparea folosita la ingestie
+    (`trivy_fs.map_severity`), nu scrisa inca o data ca lista: o a doua lista ar
+    ramane in urma la prima schimbare de prag, si atunci garda ar inchide exact
+    constatarile pe care noua rulare nu le mai poate vedea — adica ar face
+    tacut chiar ce e pusa sa opreasca.
+
+    Al doilea membru e separat de primul fiindca `UNKNOWN` nu are o severitate a
+    lui la noi: `map_severity` il parcheaza la `medium` cu steagul `False`, iar
+    un `medium` masurat si un `medium` nenotat trebuie deosebite — altfel garda
+    ar lasa sa treaca fix constatarile MEDIUM pe care le apara.
+    """
+    scored: list[str] = []
+    unscored = False
+    for label in SEVERITIES:
+        severity, known = trivy_fs.map_severity(label)
+        if known:
+            scored.append(severity)
+        else:
+            unscored = True
+    return tuple(sorted(set(scored))), unscored
 
 
 @dataclass(frozen=True)
@@ -504,7 +619,11 @@ def build_argv(image_id: str, output: str, binary: str = trivy_fs.BINARY,
         # In fisier, nu la stdout: marimea se verifica cu `stat` INAINTE sa fie
         # citita in proces. Acelasi rationament ca la `trivy_fs`.
         "--output", output,
-        "--severity", ",".join(trivy_fs.SEVERITIES),
+        # `SEVERITIES` de aici, NU `trivy_fs.SEVERITIES`: pragul imaginilor e la
+        # HIGH, al fisierelor a ramas la MEDIUM. Filtrul e la SURSA din acelasi
+        # motiv ca la `trivy_fs` — la ingestie, randurile ar fi deja serializate
+        # in JSON si citite in proces inainte sa avem ce arunca.
+        "--severity", ",".join(SEVERITIES),
         # Sursa imaginii, fixata. Fara steagul asta trivy incearca in lant
         # docker, containerd, podman si apoi REMOTE — iar „remote" inseamna ca ar
         # putea trage o imagine din registry si raporta despre ea in loc de cea
@@ -671,9 +790,14 @@ async def scan(probe: DockerProbe | None = None
     singurele statusuri disponibile ar face-o sa arate ori ca un esec, ori ca o
     masuratoare cu zero constatari.
     """
+    # `severities` e scris din prima linie, nu la sfarsit: apelantul il duce in
+    # sumar si in jurnal, iar o rulare care a esuat inainte sa vada vreo imagine
+    # tot a fost o rulare cu pragul asta. Lipsa lui pe drumurile de eroare ar
+    # face ca „ce s-a cautat" sa se stie doar cand s-a si gasit ceva.
     facts: dict[str, Any] = {"docker": None, "docker_detail": None,
                              "db_version": None, "containers": 0, "images": 0,
-                             "references": [], "total": 0}
+                             "references": [], "total": 0,
+                             "severities": list(SEVERITIES)}
 
     probe = probe or await probe_docker()
     facts["docker"] = probe.state
@@ -788,13 +912,18 @@ async def scan(probe: DockerProbe | None = None
                     extra={"age_h": int(age_h), "db_version": described})
 
     if len(unique) > MAX_FINDINGS:
-        return [], (f"trivy a raportat {len(unique)} constatări ≥ MEDIUM pe "
-                    f"{len(images)} imagini, peste plafonul de {MAX_FINDINGS}; nu "
+        # Pragul se NUMESTE in mesaj, nu se scrie de mana: randul `failed` din
+        # `scans` e singurul loc in care operatorul citeste cifra asta, iar
+        # „2838 de constatări" fara pragul la care au fost numarate nu-i spune
+        # daca parghia a fost deja trasa sau nu.
+        return [], (f"trivy a raportat {len(unique)} constatări ({severity_scope()}) "
+                    f"pe {len(images)} imagini, peste plafonul de {MAX_FINDINGS}; nu "
                     f"se ingerează nimic, fiindcă o listă tăiată ar face ca restul "
                     f"să fie marcate rezolvate. Ridică pragul de severitate sau "
                     f"reduce numărul de imagini"), facts
 
     log.info("trivy image scan parsed",
              extra={"findings": len(unique), "images": len(images),
-                    "containers": facts["containers"], "db_version": described})
+                    "containers": facts["containers"], "db_version": described,
+                    "severities": facts["severities"]})
     return list(unique.values()), None, facts

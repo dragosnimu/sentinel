@@ -560,6 +560,31 @@ def test_a_failed_scan_resolves_under_no_other_scanner_name(monkeypatch):
         f"curățenia s-a făcut sub {resolved[0][1][0]!r}, nu sub scanerul care a rulat"
 
 
+def test_a_scanner_without_a_severity_floor_still_closes_everything(monkeypatch):
+    """Garda de severitate a lui `trivy_image` nu are voie să îngrădească dnf/apt.
+
+    Eșecul pe care îl previne: `mark_resolved_absent` a primit pe 29 august 2026
+    o îngrădire opțională, ca o rulare la un prag ridicat să nu închidă
+    constatările de sub el. Aplicată din greșeală și scanerelor care NU filtrează
+    la sursă, constatările reparate de operator ar rămâne deschise pentru
+    totdeauna — panoul ar arăta vulnerabilități care nu mai există, adică exact
+    inversul pauzei din 21 august, și la fel de scump.
+    """
+    db = _FakeDB()
+
+    async def clean(family):
+        return [], None, {"scanner": os_packages.scanner_for(family),
+                          "family": family, "db_version": None}
+
+    monkeypatch.setattr(orchestrator.os_packages, "scan", clean)
+    _run(orchestrator._run_os_packages(db, "debian", "schedule"))
+
+    (sql, args) = _sql_of(db.fetched, "absent_from_latest_scan")[0]
+    assert "severity = ANY" not in sql, (
+        f"curățenia lui apt e îngrădită de severitate: {sql}")
+    assert len(args) == 3, f"parametri în plus pe o rulare fără prag: {args}"
+
+
 def test_unrecognised_family_still_leaves_a_scans_row():
     """A config with a mistyped family must produce a visible failed scan, not
     silence. Silence is the state that reads as 'no vulnerabilities'."""

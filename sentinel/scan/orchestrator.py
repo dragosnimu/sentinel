@@ -274,6 +274,21 @@ async def _run_trivy_image(db: Database, triggered_by: str) -> dict:
         cu tot cu dovada (proprietarul socketului, modul, grupurile noastre).
         Asa ajunge in `/selfcheck`, sub `scan:last:trivy_image`, ceea ce e tot
         rostul: cineva a cerut scanarea containerelor si ea nu se face.
+
+    Si doua lucruri care vin din pragul de severitate al scanerului
+    (`trivy_image.SEVERITIES`, la HIGH de pe 29 august 2026):
+
+      * pragul intra in `scans.target`, la DESCHIDEREA randului. Acolo, nu la
+        incheiere: un rand `failed` sau unul ramas `running` e tocmai cel pe care
+        se uita operatorul, iar o cifra fara pragul la care a fost masurata se
+        citeste ca stare a containerelor. `target` e coloana care raspunde la „ce
+        s-a scanat", iar un prag care ingusteaza cautarea e parte din raspuns;
+      * rularea inchide doar ce PUTEA vedea. `mark_resolved_absent` inchide tot
+        ce n-a mai fost raportat, iar dupa ridicarea pragului aia ar fi inclus
+        constatarile MEDIUM ingerate de rularile de dinainte — raportate drept
+        reparate peste noapte, desi nimic de pe gazda nu s-a schimbat. Ce ramane
+        astfel deschis se si NUMARA, si se spune in jurnal: protejat si nespus ar
+        fi doar o alta forma de tacere.
     """
     probe = await trivy_image.probe_docker()
     if probe.state == trivy_image.DOCKER_ABSENT:
@@ -282,9 +297,11 @@ async def _run_trivy_image(db: Database, triggered_by: str) -> dict:
         return {"status": "not_applicable", "docker": probe.state,
                 "detail": probe.detail}
 
-    scan_id = await fx.start_scan(db, trivy_image.SCANNER,
-                                  "docker: imaginile containerelor în rulare",
-                                  triggered_by=triggered_by)
+    scan_id = await fx.start_scan(
+        db, trivy_image.SCANNER,
+        f"docker: imaginile containerelor în rulare, "
+        f"{trivy_image.severity_scope()}",
+        triggered_by=triggered_by)
     try:
         raw, error, facts = await trivy_image.scan(probe)
         db_version = facts.get("db_version")
@@ -318,20 +335,39 @@ async def _run_trivy_image(db: Database, triggered_by: str) -> dict:
                 new_items.append(dict(f))
             seen.append(f["finding_key"])
 
-        resolved = await fx.mark_resolved_absent(db, trivy_image.SCANNER, None, seen)
+        vazute, nenotate = trivy_image.visible_severities()
+        resolved = await fx.mark_resolved_absent(
+            db, trivy_image.SCANNER, None, seen,
+            visible_severities=list(vazute), visible_unscored=nenotate)
+        # Cate au ramas deschise sub pragul de azi. Se citeste DUPA rezolvare, ca
+        # sa numere starea in care ramane baza, nu una de dinaintea ei.
+        sub_prag = await fx.count_open_outside_severities(
+            db, trivy_image.SCANNER, None,
+            visible_severities=list(vazute), visible_unscored=nenotate)
         await fx.finish_scan(
             db, scan_id, status="completed", findings_count=len(raw),
             new_findings=new, resolved_findings=resolved, db_version=db_version)
+        if sub_prag:
+            # WARNING, nu INFO: sunt constatari care raman in panou fara ca ceva
+            # sa le mai verifice, iar operatorul trebuie sa afle numarul de la
+            # noi, nu sa-l deduca dintr-o cifra care a incetat sa se miste.
+            log.warning("constatări sub pragul de severitate al scanării",
+                        extra={"scanner": trivy_image.SCANNER, "open": sub_prag,
+                               "severities": facts.get("severities")})
         log.info("trivy image scan complete",
                  extra={"findings": len(raw), "new": new, "resolved": resolved,
                         "kev": len(kev_map), "images": facts.get("images"),
                         "containers": facts.get("containers"),
-                        "db_version": db_version})
+                        "db_version": db_version,
+                        "severities": facts.get("severities"),
+                        "below_floor_open": sub_prag})
         return {"status": "completed", "findings": len(raw), "new": new,
                 "resolved": resolved, "kev": len(kev_map),
                 "db_version": db_version, "images": facts.get("images"),
                 "containers": facts.get("containers"),
-                "references": facts.get("references"), "new_items": new_items}
+                "references": facts.get("references"),
+                "severities": facts.get("severities"),
+                "below_floor_open": sub_prag, "new_items": new_items}
     except Exception as exc:  # noqa: BLE001 - record and surface, do not crash the pass
         await fx.finish_scan(db, scan_id, status="failed", error=str(exc)[:500])
         log.error("trivy image scan crashed", extra={"detail": str(exc)})
