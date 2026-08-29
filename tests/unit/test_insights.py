@@ -114,27 +114,96 @@ def test_a_human_driven_source_is_reported_without_being_called_a_fault():
 
 
 def test_a_traffic_driven_source_over_its_threshold_is_still_a_fault():
-    """`nginx` și `suricata` tăcute peste prag rămân constatări, cu vecinii vii.
+    """`nginx` și `sshd` tăcute peste prag rămân constatări, cu vecinii vii.
 
     Pana pe care o previne: scutirea surselor tastate de om e o listă, nu o
     relaxare generală. Dacă ea se lățește peste sursele care scriu un rând la
-    fiecare cerere sau potrivire de semnătură, se pierde chiar detectorul
-    pentru care există regula — pana de trei zile în care colectarea SSH murise
-    și fiecare ecran arăta un zero liniștitor.
+    fiecare conexiune, se pierde chiar detectorul pentru care există regula —
+    pana de trei zile în care colectarea SSH murise și fiecare ecran arăta un
+    zero liniștitor.
+
+    Cele două surse sunt alese pe măsurătoare, nu pe intuiție: în 14 zile de
+    date de pe gazdă, cel mai mare gol al lor a fost 31m46s și 18m45s. Șase ore
+    de tăcere nu li se pot întâmpla dintr-o zi liniștită.
     """
     db = _StubDB(fetch_map={"hours_silent": [
         {"source": "nginx", "last_seen": NOW - timedelta(hours=30), "hours_silent": 30.0},
-        {"source": "suricata", "last_seen": NOW - timedelta(hours=8), "hours_silent": 8.0},
+        {"source": "sshd", "last_seen": NOW - timedelta(hours=8), "hours_silent": 8.0},
         {"source": "sudo", "last_seen": NOW - timedelta(minutes=5), "hours_silent": 0.08},
     ]})
     out = run(ins._gap_insights(db))
     dupa_sursa = {i.evidence["sursa"]: i for i in out}
-    assert set(dupa_sursa) == {"nginx", "suricata"}, (
+    assert set(dupa_sursa) == {"nginx", "sshd"}, (
         f"altcine decât sursele continue tăcute a fost raportat: {set(dupa_sursa)}")
     assert dupa_sursa["nginx"].level == "critical"      # 30h ≥ 4 × 6h
-    assert dupa_sursa["suricata"].level == "warning"    # 8h ≥ 6h, sub 24h
+    assert dupa_sursa["sshd"].level == "warning"        # 8h ≥ 6h, sub 24h
     assert all("sentinel-ingest" in (i.action or "") for i in out), (
         "constatarea de defect nu mai spune ce colector să fie verificat")
+
+
+def test_the_largest_real_suricata_gap_is_not_a_fault():
+    """Cel mai mare gol real al lui `suricata` — 6h43m — nu are voie să fie alarmă.
+
+    Pana pe care o previne, măsurată pe gazdă pe 14 zile de date: `suricata` a
+    avut un gol de 6h42m59s, unul peste 3h și nouă peste o oră, în timp ce
+    `eve.json` creștea cu ~333 MB/zi. Cititorul lucra; doar că nimic nu depășea
+    un prag de semnătură. Judecată cu pragul surselor continue (6h), regula ar
+    fi anunțat „Sursa «suricata» a amuțit" o dată la două săptămâni despre un
+    colector sănătos — exact falsul pozitiv scos din selfcheck pe 28 august
+    2026, mutat pe celălalt ecran. Al doilea card fals despre același colector,
+    pe alt ecran, e cum se termină de pierdut încrederea în amândouă.
+
+    Vecinii sunt vii, deci nu e o gazdă moartă: `nginx` și `sshd` au scris în
+    ultimele minute.
+    """
+    db = _StubDB(fetch_map={"hours_silent": [
+        {"source": "suricata", "last_seen": NOW - timedelta(hours=6, minutes=43),
+         "hours_silent": 6 + 43 / 60},
+        {"source": "nginx", "last_seen": NOW - timedelta(minutes=4), "hours_silent": 0.07},
+        {"source": "sshd", "last_seen": NOW - timedelta(minutes=2), "hours_silent": 0.03},
+    ]})
+    out = run(ins._gap_insights(db))
+    assert out == [], (
+        f"un gol măsurat ca normal a fost raportat ca defect: "
+        f"{[(i.level, i.title) for i in out]}")
+
+
+def test_a_suricata_silent_for_days_is_still_a_fault():
+    """Peste pragul larg, tăcerea lui `suricata` rămâne constatare.
+
+    Pana pe care o previne: perechea testului de mai sus. Mutarea lui
+    `suricata` pe pragul larg e o lărgire, nu o scutire — dacă cititorul de
+    `eve.json` chiar moare, panoul trebuie să spună. Un prag lărgit până la
+    „niciodată", sau o mutare pe lista surselor tastate de om, ar pierde
+    colectorul în al doilea fel, mai liniștit decât primul: nu cu o alarmă
+    falsă, ci cu o pagină verde peste un IDS mort.
+
+    Se verifică și NIVELUL, nu doar existența: un card `info` — ce primesc
+    sursele acționate de om — nu ajunge în `/dashboard` pe Telegram, deci un
+    suricata mort ar rămâne nespus acolo unde se citește la 3 dimineața.
+
+    Cele 120 de ore sunt scrise ca număr, nu ca `_TACERE_ALTE_SURSE_H + ceva`.
+    Prima variantă a testului era relativă la constantă și trecea liniștită cu
+    pragul mutat la 100 000 de ore — adică exact pe defectul pe care spunea că
+    îl păzește. Un număr absolut îl mărginește pe celălalt capăt: împreună cu
+    testul de deasupra (6h43m nu e alarmă), pragul e prins între golul real
+    măsurat și cinci zile. Cinci zile sunt ~18× cel mai mare gol observat în
+    14 zile, pe o gazdă cu mii de adrese ostile pe lună: acolo nu mai există
+    explicația „n-a trecut nimic de un prag de semnătură".
+    """
+    db = _StubDB(fetch_map={"hours_silent": [
+        {"source": "suricata", "last_seen": NOW - timedelta(hours=120),
+         "hours_silent": 120.0},
+        {"source": "nginx", "last_seen": NOW - timedelta(minutes=4), "hours_silent": 0.07},
+    ]})
+    out = run(ins._gap_insights(db))
+    assert [i.evidence["sursa"] for i in out] == ["suricata"], (
+        f"un IDS tăcut de cinci zile n-a produs constatarea: "
+        f"{[(i.level, i.title) for i in out]}")
+    assert out[0].level in ("warning", "critical"), (
+        f"constatarea a ajuns pe `{out[0].level}`, nivel care nu se vede în "
+        f"`/dashboard` pe Telegram — un IDS mort ar rămâne nespus acolo")
+    assert "sentinel-ingest" in (out[0].action or "")
 
 
 def test_a_missing_last_activity_says_it_cannot_know_instead_of_all_clear():
@@ -442,6 +511,82 @@ def test_probe_for_installed_app_is_a_warning():
     })
     out = run(ins._probe_campaign_insights(db))
     assert out and out[0].level == "warning" and out[0].action
+
+
+class _StubDBActive:
+    """Ca `_StubDB`, dar interogarea de active se EXECUTĂ, pe SQLite.
+
+    `_probe_campaign_insights` decide din rândurile de `assets` dacă urcă
+    severitatea, iar ce hotărăște acum e o clauză `WHERE`. Un stub care întoarce
+    rânduri gata făcute ar fi de acord și cu interogarea care n-o are — deci
+    rândurile stau într-o tabelă și filtrul chiar rulează.
+    """
+
+    def __init__(self, sonde, active):
+        self.sonde = sonde
+        self.active = active            # (name, retired_at) — NULL = urmărit
+
+    async def fetch(self, sql, *a):
+        if "FROM assets" not in sql:
+            return self.sonde
+        strain = [c for c in ("::", "interval '", "now()", "->>") if c in sql]
+        assert not strain, (
+            f"interogarea de active a devenit specifică PostgreSQL ({strain}); "
+            f"testul n-o mai poate rula, deci n-o mai poate dovedi")
+        con = sqlite3.connect(":memory:")
+        con.row_factory = sqlite3.Row
+        con.execute("CREATE TABLE assets (name TEXT, retired_at TEXT)")
+        con.executemany("INSERT INTO assets (name, retired_at) VALUES (?, ?)",
+                        self.active)
+        try:
+            return [dict(r) for r in con.execute(sql).fetchall()]
+        finally:
+            con.close()
+
+
+_SONDE_GLPI = [{"http_path": "/glpi/front/inventory.php", "n": 375, "ips": 2}]
+
+
+def test_a_retired_asset_no_longer_counts_as_installed():
+    """Un pachet dezinstalat nu mai face sondele după el „relevante".
+
+    Pana pe care o previne: un activ scos din `inventory.yaml` nu se șterge —
+    istoricul lui e referit de `incidents`, `findings`, `scans`, `health_samples`
+    — ci se marchează retras (`assets.retired_at`, migrația 0032). Interogarea
+    din regula asta e SQL crud și NU trece prin filtrul lui
+    `assets_repo.list_all`, deci fără `WHERE retired_at IS NULL` un pachet
+    dezinstalat rămâne „instalat" pe vecie: sondele după el urcă la `warning`
+    cu „**Rulezi această aplicație** — merită verificată versiunea", iar
+    operatorul e trimis să caute versiunea a ceva ce nu mai are pe server.
+    Greșeala e în direcția care sperie degeaba, adică exact cea care golește de
+    înțeles culoarea galbenă.
+    """
+    db = _StubDBActive(_SONDE_GLPI, [("glpi", "2026-08-20 10:00:00")])
+    out = run(ins._probe_campaign_insights(db))
+    assert len(out) == 1
+    assert out[0].evidence["instalat"] is False, (
+        "un activ retras încă trece drept instalat")
+    assert out[0].level == "info"
+    assert out[0].action is None, (
+        f"tot cere verificarea versiunii unui pachet dezinstalat: {out[0].action}")
+
+
+def test_an_asset_still_in_the_inventory_keeps_raising_the_severity():
+    """Perechea: filtrul nu are voie să golească lista de active.
+
+    Pana pe care o previne: `WHERE retired_at IS NULL` scris greșit — pe o
+    coloană `NOT NULL`, cu `= NULL` în loc de `IS NULL`, sau negat — nu dă o
+    eroare, dă o listă goală. Atunci NIMIC nu mai e „instalat", fiecare campanie
+    de sondare devine `info` cu textul „nu te poate atinge", și tocmai sondele
+    după singurul lucru pe care chiar îl rulezi ar fi cele coborâte. Un filtru
+    prea larg se citește la fel de liniștitor ca unul care lipsește.
+    """
+    db = _StubDBActive(_SONDE_GLPI, [("glpi", None)])
+    out = run(ins._probe_campaign_insights(db))
+    assert len(out) == 1
+    assert out[0].evidence["instalat"] is True, (
+        "un activ urmărit nu mai e văzut ca instalat")
+    assert out[0].level == "warning" and out[0].action
 
 
 # --- blocklist drift --------------------------------------------------------

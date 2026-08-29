@@ -83,20 +83,57 @@ async def collect(db: Database) -> list[Insight]:
 #: folosește mai jos — dacă ăla se mișcă, se mișcă și ăsta.
 _TACERE_MINIMA_H = 6
 
-#: Sursele care scriu un rând pe unitate de trafic — o conexiune, o cerere, o
-#: potrivire de semnătură. Pe o gazdă expusă traficul nu se oprește, deci
-#: tăcerea lor chiar înseamnă că s-a rupt ceva la colectare; se judecă cu
-#: pragul cel mai scurt de mai sus.
-_SURSE_CONTINUE = frozenset({"nginx", "suricata", "sshd"})
+#: Sursele care scriu un rând pe unitate de trafic — o conexiune, o cerere. Pe
+#: o gazdă expusă traficul nu se oprește, deci câteva ore de tăcere chiar
+#: înseamnă că s-a rupt ceva la colectare; se judecă cu pragul cel mai scurt de
+#: mai sus.
+#:
+#: Măsurat pe gazdă pe 14 zile de date, cel mai mare gol: `nginx` 31m46s,
+#: `sshd` 18m45s. Pragul de șase ore lasă peste zece ori marja aia.
+#:
+#: `suricata` A FOST aici și nu mai e. Rândurile ei nu vin din trafic, ci din
+#: potriviri de semnătură: în aceleași 14 zile a avut un gol de 6h42m59s, unul
+#: peste 3h și nouă peste o oră, în timp ce `eve.json` creștea cu ~333 MB/zi —
+#: cititorul lucra, doar că nimic nu depășea un prag. La șase ore, panoul ar fi
+#: strigat „sursa a amuțit" o dată la două săptămâni despre un colector
+#: sănătos, adică fix falsul pozitiv scos din selfcheck pe 28 august 2026,
+#: mutat pe celălalt ecran. Vezi `_TACERE_ALTE_SURSE_H`, unde a ajuns.
+_SURSE_CONTINUE = frozenset({"nginx", "sshd"})
 
-#: Pragul pentru sursele care nu sunt nici în lista de mai sus, nici acționate
-#: de om. E moștenit, nu măsurat pe fiecare sursă: singura lui proprietate e că
-#: e mult mai larg decât al surselor continue.
+#: Pragul pentru sursele care nu sunt nici continue, nici acționate de om —
+#: azi, `suricata`, `auditd` și ce mai apare în inventar.
+#:
+#: Pentru `suricata` e o marjă de ~10× peste cel mai mare gol observat în 14
+#: zile (6h42m59s) — aceeași marjă pe care pragul de șase ore o are față de
+#: `nginx` și `sshd`. Ales mai strâns n-are sens: golul de șase ore și trei
+#: sferturi s-a întâmplat o dată, deci un prag pus la 12 sau la 24 de ore ar
+#: aștepta doar săptămâna mai liniștită ca să dea aceeași alarmă falsă.
+#:
+#: De ce `suricata` nu stă la `_SURSE_ACTIONATE_DE_OM`, deși amândouă tac din
+#: motive normale: tăcerea lui `su` nu se poate măsura DELOC — nu există nicio
+#: cantitate din care să afli dacă cineva ar fi trebuit să tasteze ceva.
+#: Tăcerea lui `suricata` se poate: golurile ei au o distribuție, iar 6h43m e
+#: coada ei observată. Un suricata care chiar moare trebuie să se vadă, doar că
+#: pe scara zecilor de ore, nu a orelor.
+#:
+#: Și, mai important: pragul ăsta e o PLASĂ LARGĂ peste una fină care există
+#: deja în altă parte. `selfcheck/checks.py` judecă `suricata` pe offsetul
+#: cursorului cititorului (`CURSOR_BACKED_SOURCES`), adică pe întrebarea
+#: corectă — „mai citește cititorul?" — și prinde oprirea în minute, nu în ore.
+#: Panoul n-are cursorul și nu trebuie să capete unul: numără și interpretează,
+#: nu măsoară mecanismul. Cine strânge pragul de aici crezând că e singura
+#: apărare a lui `suricata` reintroduce alarma falsă fără să câștige nimic —
+#: plasa fină a prins deja ce era de prins, cu o oră înainte.
 _TACERE_ALTE_SURSE_H = 72
 
 #: Sursele ale căror evenimente există DOAR când un om tastează ceva pe server.
 #: Tăcerea lor nu e dovadă de nimic: o gazdă pe care n-a lucrat nimeni o zi
 #: produce zero evenimente `sudo`, iar aia e starea sănătoasă.
+#:
+#: Nu e lista „tot ce tace din motive normale". `suricata` tace și ea normal,
+#: dar tăcerea ei se poate măsura, deci primește un prag larg
+#: (`_TACERE_ALTE_SURSE_H`). Aici intră doar sursele a căror tăcere nu spune
+#: NIMIC, fiindcă nu există nicio cantitate care s-o interpreteze.
 #:
 #: Regula de aici le judeca cu pragul de 72 de ore și i-a spus operatorului, în
 #: `/dashboard`, „🟡 Sursa «su» a amuțit de 81 ore”, cu sfatul să verifice un
@@ -352,7 +389,20 @@ async def _probe_campaign_insights(db: Database) -> list[Insight]:
         GROUP BY 1 ORDER BY n DESC LIMIT 40
         """
     )
-    installed = {r["name"].lower() for r in await db.fetch("SELECT name FROM assets")}
+    # `retired_at IS NULL` = urmărit; NULL e starea în care se nasc rândurile,
+    # iar un moment scris acolo înseamnă „scos din inventory.yaml atunci" (vezi
+    # migrația 0032 și `scan/inventory.py:sync`). Interogarea de aici e SQL crud,
+    # deci NU moștenește filtrul din `assets_repo.list_all` — trebuie scris.
+    #
+    # Fără el, `webmin` — dezinstalat de pe gazdă în august, deci retras la
+    # următoarea sincronizare — ar continua să treacă drept instalat, iar o
+    # sondă după `/webmin/` ar fi urcată la `warning` cu textul „**Rulezi
+    # această aplicație**". Greșeala e în direcția care sperie degeaba: îl
+    # trimite pe operator să verifice versiunea unui pachet pe care nu-l mai
+    # are. Un activ retras își păstrează rândul fiindcă îi e referit istoricul,
+    # nu fiindcă mai e instalat.
+    installed = {r["name"].lower() for r in
+                 await db.fetch("SELECT name FROM assets WHERE retired_at IS NULL")}
     hits: dict[str, dict[str, int]] = {}
     for r in rows:
         path = (r["http_path"] or "").lower()
