@@ -21,10 +21,16 @@ iar `count(*)` l-ar număra ca pe încă o adresă — exact rezultatul pe care
 **Întrebările „pe sursă" nu citesc toate rândurile.** `sources` — și
 `_gap_insights` din insights.py — întreabă *când s-a văzut ultima dată fiecare
 colector*. Scris ca `GROUP BY source` peste fereastră, răspunsul costă cât
-întreaga fereastră, deși are ~20 de rânduri. Scris ca o căutare punctuală pe
-fiecare pereche (sursă, acțiune), costă cât numărul de perechi. Vezi comentariul
-de la `_INVENTAR_SQL` pentru de unde vine lista de perechi și ce se întâmplă
-când ea lipsește.
+întreaga fereastră, deși are ~20 de rânduri.
+
+Pentru „ultima activitate" nici atât nu e nevoie: răspunsul stă deja în
+`event_rollup_1m`, care e mărginit de (minute × perechi), nu de volumul de
+evenimente. Vezi `last_activity_sql` — și acolo scrie și ce se pierde.
+
+Numărătoarea pe 24 h a rămas o căutare punctuală pe fiecare pereche (sursă,
+acțiune): costă cât numărul de perechi, iar fereastra ei e ziua curentă. Vezi
+comentariul de la `_INVENTAR_SQL` pentru de unde vine lista de perechi și ce se
+întâmplă când ea lipsește.
 """
 
 from __future__ import annotations
@@ -56,6 +62,10 @@ from sentinel.db.engine import Database
 #: Cine judecă tăcerea (`_gap_insights`) trebuie să verifice separat vârsta
 #: rollup-ului și să spună că nu poate ști, în loc să raporteze „nimic tăcut"
 #: dintr-o listă din care tăcuții au dispărut.
+#:
+#: Nu mai e folosit în modulul ăsta — `sources` ia și inventarul, și ultima
+#: activitate, dintr-o singură trecere prin `last_activity_sql`. Rămâne fiindcă
+#: `_gap_insights` din insights.py îl importă de aici.
 _INVENTAR_SQL = """
     SELECT DISTINCT source, action FROM event_rollup_1m
      WHERE bucket > now() - interval '30 days'
@@ -63,6 +73,106 @@ _INVENTAR_SQL = """
     SELECT DISTINCT source, action FROM raw_events
      WHERE ts > now() - interval '1 hour'
 """
+
+#: Cât de veche are voie să fie frontiera rollup-ului înainte ca „ultima
+#: activitate" să nu mai poată fi citită întreagă, în ore.
+#:
+#: Coada citită din `raw_events` pornește de la frontiera rollup-ului, deci în
+#: mod normal cele două jumătăți se ating și nu există gaură. Plafonul ăsta e
+#: singurul lucru care poate deschide una: dacă frontiera e mai veche de atât,
+#: evenimentele dintre ea și plafon nu se văd nicăieri.
+#:
+#: E ales să fie ≥ întârzierea la care `_gap_insights` refuză deja să judece
+#: tăcerea (`_TACERE_MINIMA_H`, 6 ore, în insights.py). Așa, gaura nu poate
+#: apărea decât după ce singurul consumator care trage o concluzie din valoarea
+#: asta a spus deja „nu pot ști" — altfel un `ultim` prea vechi ar fi produs
+#: exact alarma falsă „sursa a amuțit" pe care regula aia o dă. Constanta nu se
+#: importă de acolo fiindcă insights.py importă modulul ăsta, nu invers; dacă
+#: pragul de acolo se mișcă, se mișcă și ăsta.
+_PLAFON_COADA_ORE = 6
+
+
+def last_activity_sql() -> str:
+    """SQL fragment: one row per known (source, action) pair, with the last
+    moment that pair was seen — columns `source`, `action`, `ultim`.
+
+    Se pune în `WITH`-ul apelantului. `sources` de mai jos și `_gap_insights`
+    din insights.py pun aceeași întrebare; scrisă de două ori, era plătită de
+    două ori la fiecare încărcare a paginii — măsurat pe gazdă, ~9 s dintr-o
+    pagină de 18,4 s, pe același răspuns.
+
+    ## De unde vine răspunsul
+
+    Din `event_rollup_1m`, nu din `raw_events`. Rollup-ul e mărginit de
+    (minute × perechi) — 147 764 de rânduri și 24 de perechi pe gazdă — pe când
+    `raw_events` are milioane, cu o partiție de 2967 MB. Măsurat pe gazdă, în
+    același moment și pe aceleași date: 4445 ms peste `raw_events` pe 30 de
+    zile, 104 ms așa, aceleași surse și aceleași valori.
+
+    ## Coada neagregată, și de ce nu e o oră fixă
+
+    Rollup-ul rămâne în urmă între rulări, deci ultima bucată de timp există
+    doar în `raw_events`. Fereastra aia nu e o constantă: începe exact de la
+    `max(bucket)`, frontiera rollup-ului, deci cele două jumătăți se ating
+    oricât ar întârzia rularea.
+
+    O oră fixă — ce face `_INVENTAR_SQL` — ar fi lăsat o gaură în funcționare
+    normală: `sentinel-maintenance.timer` e `OnCalendar=hourly` cu
+    `RandomizedDelaySec=300` și `AccuracySec=60`, deci între două rulări pot
+    trece peste 66 de minute fără ca nimic să fie stricat. O sursă care a scris
+    exact în minutele alea ar fi ieșit cu ultima activitate mai veche decât e,
+    fix când cineva se uită dacă mai scrie.
+
+    Legată de frontieră, fereastra e și mai ieftină decât ora fixă: în
+    funcționare normală citește cât e de veche frontiera, adică minute.
+
+    ## Ce se pierde: un minut, într-o singură direcție
+
+    `bucket` e trunchiat la minut, deci pentru ce e deja agregat `ultim` poate
+    fi cu până la 59 de secunde mai vechi decât adevărul — `max(bucket)` nu
+    poate depăși `max(ts)`, deci niciodată invers. Pragurile care citesc
+    valoarea sunt în ORE (6 și 72, în `_gap_insights`), iar eroarea e într-o
+    singură direcție: poate face o sursă să pară puțin mai tăcută, niciodată
+    mai proaspătă. O valoare de monitorizare care greșește spre vechi nu spune
+    niciodată „e bine" când nu e.
+
+    ## Ce se strică dacă rollup-ul se oprește
+
+    Frontiera îngheață. Sub plafon, coada din `raw_events` acoperă în
+    continuare tot ce e după ea, deci răspunsul rămâne întreg. Peste plafon
+    (`_PLAFON_COADA_ORE`) se deschide o gaură, iar sursele care tăcuseră deja
+    rămân cu `ultim` fix pe ultima frontieră — „tăcute de când s-a oprit
+    rollup-ul", ceea ce e adevărat.
+
+    Dacă rollup-ul e GOL, perechile rămân doar cele care au scris în ultimele
+    `_PLAFON_COADA_ORE` ore — adică exact cele care nu tac. E aceeași gaură pe
+    care o descrie `_INVENTAR_SQL`: cine trage o concluzie din tăcere verifică
+    separat vârsta rollup-ului.
+
+    ## Un singur rând pe pereche
+
+    `UNION ALL` plus un `GROUP BY` exterior, nu `UNION ALL` gol. O pereche
+    văzută în ambele ramuri ar ieși de două ori, iar un apelant care leagă
+    rândurile de altceva — `sources` numără evenimentele pe 24 h pe fiecare
+    pereche — ar număra și acolo de două ori.
+    """
+    return f"""
+        SELECT source, action, max(ultim) AS ultim
+          FROM (
+            SELECT source, action, max(bucket) AS ultim
+              FROM event_rollup_1m
+             WHERE bucket > now() - interval '30 days'
+             GROUP BY 1, 2
+            UNION ALL
+            SELECT source, action, max(ts) AS ultim
+              FROM raw_events
+             WHERE ts > now() - interval '{_PLAFON_COADA_ORE} hours'
+               AND ts >= COALESCE((SELECT max(bucket) FROM event_rollup_1m),
+                                  now() - interval '{_PLAFON_COADA_ORE} hours')
+             GROUP BY 1, 2
+          ) t
+         GROUP BY 1, 2
+    """  # noqa: S608 - interpolarea e o constantă de modul, nu date de la cineva
 
 
 async def kpis(db: Database) -> dict[str, Any]:
@@ -107,32 +217,47 @@ async def sources(db: Database) -> list[dict[str, Any]]:
     """Which collectors are actually producing. A zero row here is the fastest
     way to spot a silent collector.
 
-    Costul e dat de numărul de perechi (sursă, acțiune), nu de fereastră: pentru
-    fiecare pereche, `max(ts)` e o singură coborâre în `raw_events_source_idx`,
-    iar numărătoarea pe 24h e o citire mărginită de ziua curentă. Varianta
-    dinainte grupa peste toate cele 7 zile ca să scoată ~20 de rânduri, deci
-    plătea întreaga tabelă pentru un tabel de ecran.
+    Inventarul și „ultima activitate" vin amândouă din `last_activity_sql`,
+    adică din `event_rollup_1m`, nu din `raw_events`. Măsurată pe gazdă,
+    funcția asta era 4373 ms din cele 18,4 s ale paginii, aproape tot în
+    `max(ts)` per pereche peste 30 de zile de evenimente brute.
 
-    O sursă cu `ultim` NULL a fost cândva în inventar și n-a mai scris nimic în
-    30 de zile. Apare, cu zero — asta e chiar întrebarea panoului.
+    Numărătoarea pe 24 h a rămas ce era: o coborâre în `raw_events_source_idx`
+    pentru fiecare pereche, mărginită de ziua curentă. Din rollup s-ar putea
+    lua și ea — `n` e chiar `count(*)` pe minut — dar numai cu o tăietură fix
+    pe frontieră, fiindcă bucketul de la frontieră e încă parțial și
+    suprapunerea ar aduna de două ori aceleași evenimente. Și, mai important,
+    ar deveni greșită tăcut ori de câte ori rollup-ul rămâne în urmă: cifra
+    asta e singura din tabel din care șablonul trage o concluzie (punctul
+    „activă/tăcută"), deci un colector viu ar fi desenat tăcut. Un `ultim` cu
+    un minut mai vechi nu minte pe nimeni; un zero, da. Cât din pagină costă
+    numărătoarea nu s-a măsurat separat, deci nu s-a atins.
+
+    O sursă fără niciun eveniment în ultimele 24 h apare, cu zero — asta e
+    chiar întrebarea panoului.
+
+    Nu are propriul refuz „nu pot ști" când rollup-ul e vechi, deși atunci
+    inventarul lui se subțiază la fel ca al lui `_gap_insights`. Motivul e că
+    tabelul ăsta nu dă niciun verdict — numără și afișează — iar pagina pe care
+    ajunge poartă deja, deasupra lui, cardul lui `_gap_insights` pentru exact
+    condiția asta. Un al doilea mecanism care întreabă aceeași vârstă ar putea
+    să nu fie de acord cu primul, și atunci panoul s-ar contrazice singur. Dacă
+    `sources` ajunge vreodată să fie desenat singur — Telegram, un API —
+    moștenește o gaură neanunțată și îi trebuie și lui verificarea.
     """
     rows = await db.fetch(
         f"""
-        WITH inventar AS ({_INVENTAR_SQL})
-        SELECT i.source,
+        WITH activitate AS ({last_activity_sql()})
+        SELECT a.source,
                COALESCE(sum(c.n), 0)::bigint AS ev_24h,
-               max(u.ultim) AS ultim
-          FROM inventar i
-          LEFT JOIN LATERAL (
-              SELECT max(e.ts) AS ultim FROM raw_events e
-               WHERE e.source = i.source AND e.action = i.action
-                 AND e.ts > now() - interval '30 days') u ON true
+               max(a.ultim) AS ultim
+          FROM activitate a
           LEFT JOIN LATERAL (
               SELECT count(*) AS n FROM raw_events e
-               WHERE e.source = i.source AND e.action = i.action
+               WHERE e.source = a.source AND e.action = a.action
                  AND e.ts > now() - interval '24 hours') c ON true
          GROUP BY 1 ORDER BY ev_24h DESC
-        """  # noqa: S608 - _INVENTAR_SQL e o constantă de modul, nu date de la cineva
+        """  # noqa: S608 - SQL din constante de modul, nu din date de la cineva
     )
     return [dict(r) for r in rows]
 
