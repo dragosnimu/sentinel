@@ -67,29 +67,101 @@ def test_briefly_quiet_source_is_not_flagged():
 
 
 def test_intermittent_source_gets_a_longer_leash():
-    # sudo genuinely goes quiet on an idle host; flagging it at 6h is noise.
+    """Zece ore fără `sudo` nu produc niciun card — nici măcar unul informativ.
+
+    Pana pe care o previne: `sudo` scrie doar când cineva lucrează pe server,
+    deci o dimineață în care n-a intrat nimeni e starea obișnuită. Dacă regula
+    ar raporta tăcerea de la prima oră, panoul ar purta un card permanent
+    despre nimic — iar un panou pe care scrie mereu același lucru se citește o
+    dată și pe urmă se sare peste el, împreună cu rândul de sub el, care
+    contează.
+    """
     db = _StubDB(fetch_map={"hours_silent": [
         {"source": "sudo", "last_seen": NOW - timedelta(hours=10), "hours_silent": 10.0},
     ]})
     assert run(ins._gap_insights(db)) == []
 
 
-def test_a_source_with_no_events_at_all_is_the_loudest_silence():
-    """O sursă din inventar fără niciun eveniment în 30 de zile e cel mai mort colector.
+def test_a_human_driven_source_is_reported_without_being_called_a_fault():
+    """`su` tăcut de 81 de ore, cu `sshd` viu, nu e un defect — dar rămâne vizibil.
 
-    Eșecul pe care îl previne: `float(r["hours_silent"] or 0)`. Când
-    `max(ts)` nu găsește nimic, `hours_silent` iese NULL, iar `or 0` îl citește
-    ca „văzută acum" — deci regula tace exact despre sursa care n-a mai scris
-    niciodată. E aceeași formă cu pana pe care regula o previne (tăcerea arată
-    identic cu liniștea), doar mutată în Python.
+    Pana pe care o previne, verbatim din `/dashboard`: „🟡 Sursa «su» a amuțit
+    de 81 ore … → Verifică colectorul". `su` scrie un eveniment doar când un om
+    îi tastează numele, deci 81 de ore de tăcere sunt exact ce arată un server
+    pe care n-a lucrat nimeni de vineri. Un avertisment galben pe starea
+    normală, cu un sfat de reparat ce nu e stricat, e cum se pierde încrederea
+    în canal — și, odată cu ea, alarma adevărată de dedesubt.
+
+    Ce nu are voie să dispară odată cu alarma: momentul ultimei activități.
+    Ăla era singurul lucru util din card, și rămâne în text.
+    """
+    db = _StubDB(fetch_map={"hours_silent": [
+        {"source": "su", "last_seen": NOW - timedelta(hours=81), "hours_silent": 81.0},
+        # Vecinul care chiar dovedește că citirea merge: același cititor
+        # journald scrie și `sshd`, iar el a scris acum două minute.
+        {"source": "sshd", "last_seen": NOW - timedelta(minutes=2), "hours_silent": 0.03},
+    ]})
+    out = run(ins._gap_insights(db))
+    assert [i.level for i in out] == ["info"], (
+        f"tăcerea unei surse tastate de om a fost raportată ca defect: "
+        f"{[(i.level, i.title) for i in out]}")
+    assert "su" in out[0].title
+    assert "31.07 03:00" in out[0].detail, (
+        f"cardul nu mai spune când a scris „su” ultima dată: {out[0].detail}")
+    assert out[0].action is None, (
+        f"tot mai cere o reparație pentru un colector care funcționează: "
+        f"{out[0].action}")
+
+
+def test_a_traffic_driven_source_over_its_threshold_is_still_a_fault():
+    """`nginx` și `suricata` tăcute peste prag rămân constatări, cu vecinii vii.
+
+    Pana pe care o previne: scutirea surselor tastate de om e o listă, nu o
+    relaxare generală. Dacă ea se lățește peste sursele care scriu un rând la
+    fiecare cerere sau potrivire de semnătură, se pierde chiar detectorul
+    pentru care există regula — pana de trei zile în care colectarea SSH murise
+    și fiecare ecran arăta un zero liniștitor.
+    """
+    db = _StubDB(fetch_map={"hours_silent": [
+        {"source": "nginx", "last_seen": NOW - timedelta(hours=30), "hours_silent": 30.0},
+        {"source": "suricata", "last_seen": NOW - timedelta(hours=8), "hours_silent": 8.0},
+        {"source": "sudo", "last_seen": NOW - timedelta(minutes=5), "hours_silent": 0.08},
+    ]})
+    out = run(ins._gap_insights(db))
+    dupa_sursa = {i.evidence["sursa"]: i for i in out}
+    assert set(dupa_sursa) == {"nginx", "suricata"}, (
+        f"altcine decât sursele continue tăcute a fost raportat: {set(dupa_sursa)}")
+    assert dupa_sursa["nginx"].level == "critical"      # 30h ≥ 4 × 6h
+    assert dupa_sursa["suricata"].level == "warning"    # 8h ≥ 6h, sub 24h
+    assert all("sentinel-ingest" in (i.action or "") for i in out), (
+        "constatarea de defect nu mai spune ce colector să fie verificat")
+
+
+def test_a_missing_last_activity_says_it_cannot_know_instead_of_all_clear():
+    """O ultimă activitate lipsă nu are voie să se citească „văzută acum".
+
+    Eșecul pe care îl previne: `float(r["hours_silent"] or 0)`. Ramura asta a
+    răspuns până acum la „sursa e în inventar, dar n-a scris nimic în
+    fereastră", iar `or 0` ar fi citit-o ca „văzută acum" — regula ar fi tăcut
+    exact despre colectorul cel mai mort din listă.
+
+    Întrebarea aia are acum alt răspuns: inventarul și ultima activitate vin
+    din același `max` (vezi `test_a_source_alive_only_in_the_rollup_keeps_its_real_age`),
+    deci o sursă listată iese cu vârsta ei adevărată și cade în pragurile
+    obișnuite. Rămâne cazul în care valoarea lipsește totuși — o formă a
+    datelor pe care n-o cunoaștem. Atunci nu se știe nimic despre sursa aia, iar
+    „nu pot ști" și „e bine" sunt stări diferite: se raportează, nu se tace.
     """
     db = _StubDB(fetch_map={"hours_silent": [
         {"source": "suricata", "last_seen": None, "hours_silent": None},
     ]})
     out = run(ins._gap_insights(db))
-    assert len(out) == 1, "o sursă fără niciun eveniment n-a produs nicio constatare"
-    assert out[0].level == "critical"
+    assert len(out) == 1, "o sursă fără ultimă activitate a produs tăcere"
     assert "suricata" in out[0].title
+    assert out[0].level in ("warning", "critical"), (
+        f"starea „nu pot ști” a ajuns pe un nivel care nu se vede: {out[0].level}")
+    assert out[0].evidence["ore_tacere"] is None, (
+        "s-a inventat o vechime pentru o sursă despre care nu se știe nimic")
 
 
 def test_an_empty_inventory_says_it_cannot_know_instead_of_all_clear():
@@ -162,6 +234,160 @@ def test_the_inventory_guard_matches_the_shortest_silence_the_rule_reports():
         f"o tăcere de {ins._TACERE_MINIMA_H}h — exact cât e garda inventarului — "
         f"n-a fost raportată, deci garda e mai largă decât regula pe care o "
         f"apără")
+
+
+def test_the_two_screens_agree_on_which_sources_a_human_drives():
+    """Panoul și autoverificarea nu au voie să se contrazică pe aceeași sursă.
+
+    Pana pe care o previne: `selfcheck` ține deja lista asta (`HUMAN_DRIVEN`),
+    din același motiv și după aceeași pățanie. Dacă listele se despart — cineva
+    adaugă o sursă tastată de om într-un singur loc — operatorul primește două
+    verdicte contrare despre același colector: `/selfcheck` spune „normal,
+    evenimentele apar doar când cineva lucrează pe server", iar panoul spune
+    „a amuțit de 81 de ore, verifică colectorul". Când două ecrane ale
+    aceluiași agent nu sunt de acord, cel crezut e cel care sperie.
+
+    Listele stau în module separate și NU se importă una din alta:
+    `selfcheck/checks.py` e diagnosticul gazdei și vine cu `yaml`, `subprocess`
+    și configurația după el, iar `insights.py` se încarcă la fiecare afișare a
+    panoului. Testul ăsta e singurul loc care are voie să le vadă pe amândouă —
+    același tipar ca invariantul dintre `_PLAFON_COADA_ORE` și
+    `_TACERE_MINIMA_H` din test_aggregate.py.
+    """
+    from sentinel.selfcheck import checks
+
+    assert ins._SURSE_ACTIONATE_DE_OM == checks.HUMAN_DRIVEN, (
+        f"panoul scutește {sorted(ins._SURSE_ACTIONATE_DE_OM)}, autoverificarea "
+        f"{sorted(checks.HUMAN_DRIVEN)} — două ecrane, două verdicte")
+    # `sshd` e dovada de viață pe care se sprijină scutirea celorlalte două: vin
+    # din același cititor journald, iar el, expus la internet, nu tace. Dacă ar
+    # ajunge și el pe lista scutiților, argumentul s-ar sprijini pe nimic, iar
+    # un cititor stricat n-ar mai fi raportat de nicăieri.
+    assert not (ins._SURSE_CONTINUE & ins._SURSE_ACTIONATE_DE_OM), (
+        f"o sursă e și continuă, și tastată de om: "
+        f"{sorted(ins._SURSE_CONTINUE & ins._SURSE_ACTIONATE_DE_OM)}")
+    assert "sshd" in ins._SURSE_CONTINUE, (
+        "`sshd` nu mai e judecat ca sursă continuă, deci nu mai poate fi dovada "
+        "de viață pentru `sudo` și `su`")
+
+
+# --- interogarea de inventar, rulată ----------------------------------------
+#
+# Ce se dovedește mai jos: `_GAP_SQL` nu mai află ultima activitate dintr-un
+# `max(ts)` per pereche peste 30 de zile de `raw_events`, ci din
+# `event_rollup_1m`, prin `aggregate.last_activity_sql()`. Mutarea schimbă și
+# cifrele, nu doar viteza — o sursă tăcută de mai mult decât retenția rândurilor
+# brute ieșea NULL, iar acum iese cu vârsta ei adevărată — deci interogarea se
+# RULEAZĂ. Un stub care întoarce rânduri gata făcute ar fi de acord cu orice
+# interogare, inclusiv cu una care pierde exact sursele tăcute.
+#
+# Ce NU se dovedește aici: planul ales de PostgreSQL și timpul câștigat pe
+# gazdă. Alea se măsoară acolo.
+
+#: Momentul de referință al secțiunii, luat O SINGURĂ DATĂ — vezi `_ACUM` din
+#: test_aggregate.py: `_t()` chemat de două ori pentru același moment putea
+#: cădea de o parte și de alta a unei granițe de secundă, iar un roșu fals la
+#: câteva sute de rulări îl învață pe om că suita minte uneori.
+_ACUM_GAP = datetime.now(timezone.utc)
+
+
+def _t(**delta) -> str:
+    """Un moment din trecut, în formatul în care SQLite compară text cu text."""
+    return (_ACUM_GAP - timedelta(**delta)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _minut(ts: str) -> str:
+    """Bucketul de rollup în care ar cădea momentul dat."""
+    return ts[:16] + ":00"
+
+
+#: Singurele construcții din `_GAP_SQL` pe care SQLite nu le are. `julianday`
+#: dă zile, deci înmulțit cu 24 e chiar `EXTRACT(EPOCH FROM …) / 3600`.
+_TRADUCERI_GAP = (
+    (re.compile(r"EXTRACT\(EPOCH FROM \(now\(\) - max\(ultim\)\)\) / 3600"),
+     "(julianday('now') - julianday(max(ultim))) * 24"),
+    (re.compile(r"now\(\)\s*-\s*interval\s*'(\d+) (\w+)'"), r"datetime('now','-\1 \2')"),
+)
+
+#: Ce nu are voie să rămână după traducere: o construcție PostgreSQL rămasă pe
+#: loc ar putea fi acceptată de SQLite cu ALT înțeles, iar testul ar compara
+#: liniștit două lucruri greșite.
+_RAMASITE_GAP = ("LATERAL", "ON true", "interval '", "now()", "EXTRACT", "::", "->>")
+
+
+def _tradu_gap(sql: str) -> str:
+    for tipar, inlocuire in _TRADUCERI_GAP:
+        sql = tipar.sub(inlocuire, sql)
+    ramase = [m for m in _RAMASITE_GAP if m in sql]
+    assert not ramase, f"construcții PostgreSQL netraduse: {ramase}"
+    return sql
+
+
+def _ruleaza_gap(rollup=(), raw=()):
+    """`_GAP_SQL` peste rollup-ul și evenimentele brute date."""
+    con = sqlite3.connect(":memory:")
+    con.row_factory = sqlite3.Row
+    con.execute("CREATE TABLE event_rollup_1m (bucket TEXT, asset_id INTEGER, "
+                "source TEXT, action TEXT, n INTEGER)")
+    con.execute("CREATE TABLE raw_events (id INTEGER PRIMARY KEY, ts TEXT, "
+                "source TEXT, action TEXT)")
+    con.executemany("INSERT INTO event_rollup_1m (bucket, asset_id, source, action, n) "
+                    "VALUES (?, 0, ?, ?, ?)", list(rollup))
+    con.executemany("INSERT INTO raw_events (ts, source, action) VALUES (?, ?, ?)",
+                    list(raw))
+    try:
+        return [dict(r) for r in con.execute(_tradu_gap(ins._GAP_SQL)).fetchall()]
+    finally:
+        con.close()
+
+
+def test_a_source_alive_only_in_the_rollup_keeps_its_real_age():
+    """Vârsta unei surse tăcute nu mai depinde de rândurile brute, care expiră.
+
+    Pana pe care o previne: `raw_events` se taie la 30 de zile, și până la 7
+    când `disk_guard` strânge retenția; rollup-ul ține 90. Citită din rândurile
+    brute, o sursă moartă de trei săptămâni ieșea cu ultima activitate NULL —
+    „niciun eveniment vreodată" — și era raportată cu un plafon inventat de 30
+    de zile, deși rollup-ul știe exact când a vorbit ultima dată. Un card care
+    spune „720 de ore" despre o tăcere de 480 face imposibil de aflat din panou
+    când a murit colectorul, adică fix întrebarea pentru care e deschis panoul.
+
+    E și dovada că interogarea chiar citește rollup-ul: pentru `suricata` nu
+    există niciun rând brut, deci o interogare care ar întreba `raw_events`
+    n-ar găsi nimic aici.
+    """
+    randuri = {r["source"]: r for r in _ruleaza_gap(
+        rollup=[(_minut(_t(days=20)), "suricata", "alert", 3),
+                (_minut(_t(minutes=4)), "nginx", "request", 9)],
+        raw=[(_t(minutes=4), "nginx", "request")])}
+    assert "suricata" in randuri, "sursa tăcută a dispărut din inventar"
+    assert randuri["suricata"]["last_seen"] == _minut(_t(days=20)), (
+        f"ultima activitate s-a pierdut odată cu rândurile brute: "
+        f"{randuri['suricata']['last_seen']}")
+    assert 479 < randuri["suricata"]["hours_silent"] < 481, (
+        f"vechimea raportată nu e cea reală: {randuri['suricata']['hours_silent']}")
+
+
+def test_a_source_with_several_actions_produces_one_row():
+    """O sursă cu mai multe acțiuni dă un singur rând, cu cea mai nouă activitate.
+
+    Pana pe care o previne: `last_activity_sql()` dă un rând pe PERECHE (sursă,
+    acțiune), iar `sshd` are și `auth_fail`, și `auth_ok`. Fără gruparea pe
+    sursă, bucla din `_gap_insights` ar vedea două rânduri și ar scrie două
+    carduri despre același colector — al doilea cu vechimea perechii mai rare:
+    „Sursa «sshd» a amuțit de 40 de ore" lângă un `sshd` care scrie de trei.
+    Un panou care se contrazice singur nu mai poate fi folosit ca să se decidă
+    ceva.
+    """
+    randuri = _ruleaza_gap(
+        rollup=[(_minut(_t(hours=3)), "sshd", "auth_fail", 12),
+                (_minut(_t(hours=40)), "sshd", "auth_ok", 1)],
+        raw=[(_t(hours=3), "sshd", "auth_fail")])
+    assert [r["source"] for r in randuri] == ["sshd"], (
+        f"o sursă cu două acțiuni a ieșit pe mai multe rânduri: {randuri}")
+    assert randuri[0]["last_seen"] == _t(hours=3), (
+        f"a rămas cu activitatea perechii mai vechi: {randuri[0]['last_seen']}")
+    assert 2.9 < randuri[0]["hours_silent"] < 3.5
 
 
 # --- multi-vector attackers -------------------------------------------------

@@ -83,6 +83,86 @@ async def collect(db: Database) -> list[Insight]:
 #: folosește mai jos — dacă ăla se mișcă, se mișcă și ăsta.
 _TACERE_MINIMA_H = 6
 
+#: Sursele care scriu un rând pe unitate de trafic — o conexiune, o cerere, o
+#: potrivire de semnătură. Pe o gazdă expusă traficul nu se oprește, deci
+#: tăcerea lor chiar înseamnă că s-a rupt ceva la colectare; se judecă cu
+#: pragul cel mai scurt de mai sus.
+_SURSE_CONTINUE = frozenset({"nginx", "suricata", "sshd"})
+
+#: Pragul pentru sursele care nu sunt nici în lista de mai sus, nici acționate
+#: de om. E moștenit, nu măsurat pe fiecare sursă: singura lui proprietate e că
+#: e mult mai larg decât al surselor continue.
+_TACERE_ALTE_SURSE_H = 72
+
+#: Sursele ale căror evenimente există DOAR când un om tastează ceva pe server.
+#: Tăcerea lor nu e dovadă de nimic: o gazdă pe care n-a lucrat nimeni o zi
+#: produce zero evenimente `sudo`, iar aia e starea sănătoasă.
+#:
+#: Regula de aici le judeca cu pragul de 72 de ore și i-a spus operatorului, în
+#: `/dashboard`, „🟡 Sursa «su» a amuțit de 81 ore”, cu sfatul să verifice un
+#: colector care funcționa. Aceeași greșeală o făcuse deja autoverificarea
+#: (`HUMAN_DRIVEN` în selfcheck/checks.py), unde a costat un „SENTINEL NU
+#: FUNCȚIONEAZĂ COMPLET" pe prima zi liniștită — iar o alarmă care sună într-un
+#: weekend normal antrenează exact reflexul de a nu mai citi canalul.
+#:
+#: Ce NU le poate salva: un discriminator „vecinii scriu". Acela răspunde la
+#: „gazda e liniștită sau colectorul e stricat?" comparând surse care numără
+#: același fel de lucru. Nu răspunde la „a tastat cineva `sudo`?", fiindcă
+#: nicio altă sursă nu măsoară asta.
+#:
+#: Ce le ține totuși supravegheate: `sshd`, `sudo` și `su` vin din ACELAȘI
+#: cititor journald — un singur set de `_COMM`, o singură buclă, clasificate în
+#: surse abia după aceea (`JOURNALD_COMMS` în services/ingest_service.py). Un
+#: cititor stricat le oprește pe toate trei deodată, iar `sshd` e în
+#: `_SURSE_CONTINUE` și pe o gazdă expusă nu tace niciodată. Deci rândul lui
+#: `sshd` E dovada de viață pentru `sudo` și `su`, iar defectul se anunță o
+#: dată, acolo unde e cauza, nu de trei ori.
+#:
+#: Ce rămâne neprins, spus în loc să fie ascuns: o regresie de parsare doar pe
+#: `sudo` — o distribuție care schimbă formatul liniei, iar tiparul din
+#: collectors/system.py nu mai potrivește — ar lăsa `sudo` gol la nesfârșit
+#: lângă un `sshd` care curge. Aceeași gaură e descrisă și în selfcheck.
+#:
+#: Nu se importă `HUMAN_DRIVEN` din selfcheck/checks.py, deși e aceeași listă:
+#: modulul ăla e diagnosticul gazdei, aduce cu el `yaml`, `subprocess` și
+#: `CONFIG_PATH`, iar `insights.py` se încarcă la fiecare afișare a panoului.
+#: Un import făcut doar ca să se scutească două nume ar lega pagina de
+#: subsistemul de autoverificare pentru totdeauna. E același raționament ca la
+#: `_PLAFON_COADA_ORE` din aggregate.py, care nu importă `_TACERE_MINIMA_H` de
+#: aici: constantele stau local, iar faptul că cele două liste trebuie să fie
+#: identice se verifică în testul care are voie să le vadă pe amândouă (vezi
+#: tests/unit/test_insights.py). Dacă se despart, operatorul primește două
+#: verdicte contrare despre aceeași sursă, pe două ecrane.
+_SURSE_ACTIONATE_DE_OM = frozenset({"sudo", "su"})
+
+#: De la cât timp merită SPUS, fără să fie defect, că o sursă acționată de om
+#: n-a mai scris. Aceeași cifră ca `_TACERE_ALTE_SURSE_H`, din alt motiv: acolo
+#: e pragul de la care tăcerea e o pană, aici doar cât e nevoie ca să nu apară
+#: un card la fiecare încărcare a paginii. Se mișcă independent.
+_TACERE_DE_MENTIONAT_H = 72
+
+# Ridicată din funcție ca un test s-o poată RULA, nu doar citi — același motiv
+# ca la `_FORTARE_SQL` mai jos.
+#
+# `last_activity_sql()` dă inventarul ȘI ultima activitate dintr-o singură
+# trecere prin `event_rollup_1m`, cu o coadă din `raw_events` care pornește de
+# la frontiera rollup-ului. Forma dinainte punea un `LATERAL` cu `max(ts)` per
+# pereche peste 30 de zile de evenimente brute: măsurată pe gazdă, 4624 ms
+# dintr-o pagină de 18,4 s — și încă o dată atâta în `aggregate.sources`, care
+# punea aceeași întrebare pentru cardul de alături.
+#
+# Ce se schimbă în datele care ies, nu doar în viteză: `last_seen` nu mai poate
+# fi NULL, fiindcă fiecare rând vine dintr-un `max` peste un rând care există.
+# Vezi bucla de mai jos pentru ce se întâmplă cu întrebarea la care răspundea
+# NULL-ul.
+_GAP_SQL = f"""
+    WITH activitate AS ({aggregate.last_activity_sql()})
+    SELECT source, max(ultim) AS last_seen,
+           EXTRACT(EPOCH FROM (now() - max(ultim))) / 3600 AS hours_silent
+      FROM activitate
+     GROUP BY 1
+"""  # noqa: S608 - SQL din constante de modul, nu din date de la cineva
+
 
 async def _gap_insights(db: Database) -> list[Insight]:
     """A source that stopped reporting. This is the most dangerous failure mode
@@ -90,9 +170,12 @@ async def _gap_insights(db: Database) -> list[Insight]:
     every other screen, and it is exactly what happened when an OpenSSH upgrade
     renamed the process that logs authentication.
 
-    Costul e dat de numărul de perechi (sursă, acțiune), nu de fereastră: vezi
-    `aggregate._INVENTAR_SQL`. Varianta dinainte grupa 30 de zile de
-    `raw_events` ca să scoată șase rânduri.
+    Costul e dat de mărimea rollup-ului, nu de a evenimentelor brute: vezi
+    `_GAP_SQL` mai sus și `aggregate.last_activity_sql`.
+
+    Nu tot ce tace e defect. `sudo` și `su` scriu doar când un om tastează, deci
+    despre ele se raportează CÂND au scris ultima dată, fără verdict — vezi
+    `_SURSE_ACTIONATE_DE_OM`.
     """
     # Inventarul e ce face regula capabilă să vadă o sursă TĂCUTĂ: o sursă care
     # nu mai scrie nu apare în date, deci trebuie să știm dinainte că ar fi
@@ -115,42 +198,73 @@ async def _gap_insights(db: Database) -> list[Insight]:
             evidence={"rollup_lag_ore": None if lag_h is None else round(float(lag_h), 1)},
         )]
 
-    rows = await db.fetch(
-        f"""
-        WITH inventar AS ({aggregate._INVENTAR_SQL})
-        SELECT i.source, max(u.ultim) AS last_seen,
-               EXTRACT(EPOCH FROM (now() - max(u.ultim))) / 3600 AS hours_silent
-          FROM inventar i
-          LEFT JOIN LATERAL (
-              SELECT max(e.ts) AS ultim FROM raw_events e
-               WHERE e.source = i.source AND e.action = i.action
-                 AND e.ts > now() - interval '30 days') u ON true
-         GROUP BY 1
-        """  # noqa: S608 - _INVENTAR_SQL e o constantă de modul, nu date de la cineva
-    )
+    rows = await db.fetch(_GAP_SQL)
     out: list[Insight] = []
     for r in rows:
-        if r["last_seen"] is None:
-            # În inventar, dar niciun rând în 30 de zile. `or 0` ar fi citit asta
-            # ca „văzută acum" și ar fi tăcut exact despre colectorul cel mai
-            # mort din listă.
-            hours = 30 * 24.0
-        else:
-            hours = float(r["hours_silent"] or 0)
-        # sudo/su are genuinely intermittent on a quiet host; the always-on
-        # sources are the ones whose silence means a broken collector.
-        threshold = _TACERE_MINIMA_H if r["source"] in ("nginx", "suricata", "sshd") else 72
+        sursa = r["source"]
+        if r["last_seen"] is None or r["hours_silent"] is None:
+            # Ramura asta a rămas fără intrarea ei din date: cu `_GAP_SQL`,
+            # inventarul și ultima activitate vin din același `max`, deci o
+            # sursă listată are întotdeauna un moment. Întrebarea la care
+            # răspundea NULL-ul — „e în inventar, dar n-a scris nimic în
+            # fereastră" — și-a găsit un răspuns mai bun: sursa iese acum cu
+            # vârsta ei adevărată (rollup-ul ține 90 de zile, mai mult decât
+            # retenția rândurilor brute) și cade în pragurile de mai jos, în loc
+            # de un plafon inventat de 30 de zile.
+            #
+            # Ce se face aici e altceva. Dacă valoarea lipsește TOTUȘI, nu se
+            # știe nimic despre sursa asta, iar `or 0` ar fi citit-o ca „văzută
+            # acum" și ar fi tăcut — exact forma de minciună pe care regula
+            # există ca s-o prevină. „Nu pot ști" și „e bine" sunt stări
+            # diferite, și rămân diferite și când starea nu e explicabilă.
+            out.append(Insight(
+                level="warning",
+                title=f"Nu se poate spune de când tace sursa „{sursa}”",
+                detail=("Sursa apare în inventar, dar ultima ei activitate a ieșit "
+                        "goală — ceea ce nu se poate întâmpla cât timp inventarul "
+                        "și ultima activitate vin din același loc. Verificarea NU "
+                        "spune că sursa e în regulă."),
+                action=f"Verifică colectorul: journalctl -u sentinel-ingest | grep {sursa}",
+                evidence={"sursa": sursa, "ore_tacere": None},
+            ))
+            continue
+        hours = float(r["hours_silent"])
+        ultim = f"{r['last_seen']:%d.%m %H:%M}"
+        if sursa in _SURSE_ACTIONATE_DE_OM:
+            # Raportată, niciodată alarmă: operatorul vede în continuare sursa
+            # și când a scris ultima dată, dar tăcerea ei nu mai e defect.
+            #
+            # `info` înseamnă că nu ajunge în `/dashboard` pe Telegram, care
+            # arată doar `critical` și `warning` (vezi telegram/views.py). Asta
+            # e chiar ce se voia: canalul de alertare poartă defecte, iar aici
+            # nu e niciunul. Pe pagina web cardul se vede întreg, iar sursa
+            # rămâne oricum în tabelul „Surse de date", cu ultima ei activitate.
+            if hours < _TACERE_DE_MENTIONAT_H:
+                continue
+            out.append(Insight(
+                level="info",
+                title=f"Sursa „{sursa}” tace de {hours:.0f} ore — normal",
+                detail=(f"Ultimul eveniment: {ultim}. „{sursa}” scrie doar când "
+                        f"cineva tastează comanda pe server, deci tăcerea ei nu "
+                        f"spune nimic despre colector — o zi în care nu a lucrat "
+                        f"nimeni arată exact așa. Că citirea funcționează se vede "
+                        f"din „sshd”, care vine din același cititor journald și "
+                        f"care, expus la internet, nu tace niciodată; dacă s-ar "
+                        f"opri, ar apărea aici ca defect."),
+                evidence={"sursa": sursa, "ore_tacere": round(hours, 1),
+                          "actionata_de_om": True},
+            ))
+            continue
+        threshold = _TACERE_MINIMA_H if sursa in _SURSE_CONTINUE else _TACERE_ALTE_SURSE_H
         if hours >= threshold:
-            ultim = (f"{r['last_seen']:%d.%m %H:%M}" if r["last_seen"] is not None
-                     else "niciunul în 30 de zile")
             out.append(Insight(
                 level="critical" if hours >= threshold * 4 else "warning",
-                title=f"Sursa „{r['source']}” a amuțit de {hours:.0f} ore",
+                title=f"Sursa „{sursa}” a amuțit de {hours:.0f} ore",
                 detail=(f"Ultimul eveniment: {ultim}. O sursă care "
                         f"tace arată identic cu „nu s-a întâmplat nimic” — dar înseamnă "
                         f"că nu mai vezi ce se întâmplă acolo."),
-                action=f"Verifică colectorul: journalctl -u sentinel-ingest | grep {r['source']}",
-                evidence={"sursa": r["source"], "ore_tacere": round(hours, 1)},
+                action=f"Verifică colectorul: journalctl -u sentinel-ingest | grep {sursa}",
+                evidence={"sursa": sursa, "ore_tacere": round(hours, 1)},
             ))
     return out
 
