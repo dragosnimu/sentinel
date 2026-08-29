@@ -341,11 +341,26 @@ sunt curate" când înseamnă „nu ne-am uitat". Deci pragul se scrie în
 constatări. Din rând, nu din constantele de azi: altfel o cifră măsurată la alt
 prag ar fi reetichetată cu cel curent.
 
-Și cele ~2388 de constatări MEDIUM ingerate de rulările de dinainte **nu** se
-închid: `mark_resolved_absent` primește severitățile pe care rularea chiar le
-putea vedea, fiindcă „nu mai e raportată" acoperă două lucruri diferite — ce s-a
-reparat, și ce nu mai e căutat. Ele rămân deschise, iar câte sunt se scrie în
-jurnal la `WARNING` după fiecare rulare.
+O rulare la pragul ăsta nu are voie să închidă ce nu mai poate vedea:
+`mark_resolved_absent` primește severitățile pe care rularea chiar le putea
+vedea, fiindcă „nu mai e raportată" acoperă două lucruri diferite — ce s-a
+reparat, și ce nu mai e căutat. Câte rămân deschise sub prag se scrie în jurnal
+la `WARNING` după fiecare rulare.
+
+**Pe gazda asta, garda protejează zero rânduri, și e cinstit s-o spunem aici.**
+Măsurat pe 29 august 2026: `trivy_image` are o singură rulare, vreodată, și
+aceea `failed` — plafonul a respins-o. În `findings` nu există niciun rând
+`trivy_image` (doar `dnf` 5207 și `trivy_fs` 92). Deci cele ~2388 de constatări
+MEDIUM n-au fost niciodată ingerate; ele există pe gazdă, dar nu în baza asta,
+iar `count_open_outside_severities` va întoarce 0 la fiecare rulare — deci
+`WARNING`-ul nu se va aprinde. Garda rămâne corectă pentru o mutare viitoare de
+prag sau pentru altă instalare, dar nu apără nimic azi.
+
+Singurul loc unde se vede că 2388 de constatări nu mai sunt căutate e textul din
+`scans.target`. Panoul de vulnerabilități numără pe severitate, fără să spună
+pragul fiecărui scaner — cine filtrează „medium" acolo nu are din ce afla că
+imaginile lipsesc din numărătoare. Asta e limita apărării, nu o regresie:
+înainte, scanarea nu raporta absolut nimic.
 
 ### 3.15 Familia se detectează o dată, la instalare
 

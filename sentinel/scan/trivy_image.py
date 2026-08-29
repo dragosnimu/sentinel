@@ -107,11 +107,18 @@ onto the `scans` row by the orchestrator, before the run starts, so it is there
 even on a `failed` row, and `check_last_scan` reads it back out of the row and
 says it next to the count.
 
-And a run at this floor is not allowed to close what it can no longer see: the
-MEDIUM findings earlier runs ingested are still on the host, they were merely
-dropped from the report. `visible_severities()` is what `mark_resolved_absent`
-is fenced with, so those rows stay open instead of being announced as 2388
-vulnerabilities that repaired themselves overnight.
+And a run at this floor is not allowed to close what it can no longer see:
+"no longer reported" would otherwise cover two different things — what was
+fixed, and what is no longer looked for. `visible_severities()` is what
+`mark_resolved_absent` is fenced with.
+
+Measured on 29 Aug 2026, and worth stating where the mechanism is justified:
+on THIS host the fence protects zero rows. `trivy_image` has exactly one run
+ever, and it failed on the cap, so no image finding was ever ingested —
+`findings` holds only `dnf` (5207) and `trivy_fs` (92). The ~2388 MEDIUM
+findings are on the host but not in this database. The fence is still correct
+for a future floor change or another install; it is not load-bearing today, and
+saying otherwise would be the pattern this repository is named after.
 
 ## Budgets: the unit is killed as a whole, so this scanner bounds itself
 
@@ -326,8 +333,14 @@ def visible_severities() -> tuple[tuple[str, ...], bool]:
     Exista fiindca `mark_resolved_absent` inchide tot ce scanerul nu a mai
     raportat, iar dupa ridicarea pragului „nu a mai raportat" acopera doua
     lucruri care nu inseamna acelasi lucru: ce s-a reparat, si ce nu mai e
-    cautat. Fara garda asta, prima rulare la HIGH ar fi anuntat ~2388 de
-    constatari MEDIUM ca rezolvate intr-o noapte.
+    cautat. Fara garda asta, o instalare care ARE constatari MEDIUM ingerate
+    le-ar anunta pe toate ca rezolvate intr-o noapte.
+
+    Pe gazda de productie, masurat pe 29 august 2026, numarul ala e ZERO:
+    `trivy_image` n-a ingerat niciodata nimic, fiindca singura lui rulare a
+    picat pe plafon. Garda e scrisa pentru cazul general si pentru mutarea
+    urmatoare de prag, nu pentru o pierdere observata aici — si asta se spune,
+    ca sa nu para masurata.
 
     Derivata din `SEVERITIES` prin chiar maparea folosita la ingestie
     (`trivy_fs.map_severity`), nu scrisa inca o data ca lista: o a doua lista ar
