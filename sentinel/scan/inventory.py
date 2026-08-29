@@ -63,11 +63,16 @@ def load(path: Path = INVENTORY_PATH) -> list[dict[str, Any]]:
     return cleaned
 
 
-async def sync(db: Database, path: Path = INVENTORY_PATH) -> dict[str, int]:
+async def sync(db: Database, path: Path = INVENTORY_PATH) -> dict[str, Any]:
     """Make the assets table match inventory.yaml, in both directions.
 
     Upserts every listed asset, then retires every asset that is not listed.
-    Returns {'assets': n, 'retired': k, 'retire_skipped': 0 or 1}.
+    Returns {'assets': n, 'retired': k, 'retired_names': […], 'retire_skipped': 0 or 1}.
+
+    `retired_names` is there because a count cannot be acted on. The caller has
+    to be able to tell the operator WHICH probes stopped — "3 retired" and
+    "n8n, qdrant, webmin retired" are the difference between a number to shrug
+    at and a list to check against what you actually edited.
 
     Idempotent: re-running only refreshes discovered fields and last_seen, and
     retires nothing the second time because `retire_missing` skips rows that
@@ -104,7 +109,9 @@ async def sync(db: Database, path: Path = INVENTORY_PATH) -> dict[str, int]:
     What this cannot detect is a PARTIALLY truncated file: eleven assets left
     of fourteen looks exactly like three assets removed on purpose. Nothing in
     the file distinguishes them, so retirement is deliberately reversible and
-    every retired name is logged, rather than guessed at with a threshold.
+    every retired name is both logged and RETURNED, rather than guessed at with
+    a threshold. The one party who can tell an edit from a truncation is the
+    operator, and the only way they get to answer is by being shown the names.
     """
     specs = load(path)
     for spec in specs:
@@ -115,17 +122,20 @@ async def sync(db: Database, path: Path = INVENTORY_PATH) -> dict[str, int]:
             "inventory lists no assets; nothing retired",
             extra={"path": str(path), "file_exists": path.exists()},
         )
-        return {"assets": 0, "retired": 0, "retire_skipped": 1}
+        return {"assets": 0, "retired": 0, "retired_names": [], "retire_skipped": 1}
 
     # Everything in the table that the file no longer names. Assets only ever
     # enter this table through this function, so "not in the file" is the same
     # statement as "the operator stopped watching it" — including for
     # `protected` assets, whose flag means "no automated patch plan may touch
     # it", not "this row is permanent".
-    retired = await assets_repo.retire_missing(db, [spec["name"] for spec in specs])
+    retired = sorted(await assets_repo.retire_missing(db, [spec["name"] for spec in specs]))
     if retired:
         # Named, not counted: four rows going quiet has to be traceable back to
-        # one edit of one file, months later, from the log alone.
-        log.info("assets retired", extra={"names": ", ".join(sorted(retired))})
+        # one edit of one file, months later, from the log alone. The journal is
+        # the record; it is not the notice — see `health_service._sync_inventory`
+        # for the half of this that reaches a human.
+        log.info("assets retired", extra={"names": ", ".join(retired)})
     log.info("inventory synced", extra={"assets": len(specs), "retired": len(retired)})
-    return {"assets": len(specs), "retired": len(retired), "retire_skipped": 0}
+    return {"assets": len(specs), "retired": len(retired),
+            "retired_names": retired, "retire_skipped": 0}

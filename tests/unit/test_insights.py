@@ -168,6 +168,43 @@ def test_the_largest_real_suricata_gap_is_not_a_fault():
         f"{[(i.level, i.title) for i in out]}")
 
 
+def test_a_suricata_gap_of_two_days_is_still_not_a_fault():
+    """Pragul larg nu are voie să fie strâns înapoi peste coada golurilor reale.
+
+    Pana pe care o previne: falsul pozitiv de la 28 august 2026, reintrodus
+    printr-o cifră. Perechea de teste de deasupra și de dedesubt prinde pragul
+    între 6h43m (fără alarmă) și 120h (cu alarmă), deci ORICE valoare din
+    (6,72h, 120h] trecea suita — inclusiv 7, adică la șaptesprezece minute peste
+    cel mai mare gol pe care `suricata` chiar l-a avut în 14 zile. Cineva care
+    strânge pragul crezând că apără colectorul primește înapoi „🟡 Sursa
+    «suricata» a amuțit" o dată la două săptămâni despre un cititor sănătos, și
+    nimic din suită nu-l oprește. Comentariul de lângă constantă avertizează
+    exact împotriva asta — un comentariu nu e un test.
+
+    De ce 48 de ore, și nu 12 sau 24: codul le respinge deja pe amândouă, pe
+    măsurătoare. Golul de 6h42m59s s-a întâmplat O DATĂ în 14 zile, iar unul
+    peste 3h încă o dată; un prag la 12 sau la 24 nu face decât să aștepte
+    săptămâna mai liniștită ca să dea aceeași alarmă falsă. 48 de ore sunt ~7×
+    cel mai mare gol observat și prima valoare rotundă dincolo de ce respinge
+    codul însuși. Împreună cu testul de 120 de ore, pragul rămâne prins în
+    (48h, 120h]: nu poate fi nici strâns pe coada măsurată, nici lărgit până la
+    „niciodată".
+
+    Vecinii au scris în ultimele minute, deci nu e o gazdă moartă — dacă ar fi,
+    răspunsul corect ar fi altul și l-ar da alt test.
+    """
+    db = _StubDB(fetch_map={"hours_silent": [
+        {"source": "suricata", "last_seen": NOW - timedelta(hours=48),
+         "hours_silent": 48.0},
+        {"source": "nginx", "last_seen": NOW - timedelta(minutes=4), "hours_silent": 0.07},
+        {"source": "sshd", "last_seen": NOW - timedelta(minutes=2), "hours_silent": 0.03},
+    ]})
+    out = run(ins._gap_insights(db))
+    assert out == [], (
+        f"pragul larg a fost strâns sub două zile, deci un `suricata` sănătos "
+        f"redevine alarmă: {[(i.level, i.title) for i in out]}")
+
+
 def test_a_suricata_silent_for_days_is_still_a_fault():
     """Peste pragul larg, tăcerea lui `suricata` rămâne constatare.
 

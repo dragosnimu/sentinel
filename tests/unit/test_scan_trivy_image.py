@@ -1314,6 +1314,19 @@ def test_a_run_at_the_new_floor_does_not_close_the_old_medium_findings(
         f"constatările nenotate nu sunt deosebite de un MEDIUM măsurat: {sql}")
 
 
+# Ce fel de valoare acceptă fiecare turnare pe care o modelăm. `bool` înainte de
+# `int`, fiindcă în Python `True` E un `int` și un `$N::int` care primește `True`
+# n-ar mai fi prins.
+_TURNARI = {
+    "text[]": lambda v: isinstance(v, (list, tuple)) and all(isinstance(x, str) for x in v),
+    "boolean": lambda v: isinstance(v, bool),
+    "text": lambda v: isinstance(v, str),
+    "int": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "bigint": lambda v: isinstance(v, int) and not isinstance(v, bool),
+}
+
+
 def test_the_severity_fence_numbers_its_parameters_correctly(monkeypatch) -> None:
     """Un `$N` greșit nu se vede la citire; se vede noaptea, ca scanare căzută.
 
@@ -1324,8 +1337,16 @@ def test_the_severity_fence_numbers_its_parameters_correctly(monkeypatch) -> Non
     `failed` în fiecare noapte, nicio constatare ingerată — și niciun test de
     aici n-ar fi văzut-o, fiindcă în suită nu rulează nicio bază.
 
+    Al doilea eșec, pe care versiunea de dinainte a testului NU-l prindea deși
+    numele îl promitea: `_visible_sql(5, 4)` — parametrii INVERSAȚI. Mulțimea
+    `$N` din text rămâne aceeași, deci o aserțiune doar pe numerotare trece.
+    Ce se schimbă la inversare e perechea dintre `$N` și TIPUL valorii trimise
+    pe poziția aia: lista de severități ajunge sub `::boolean` și steagul sub
+    `::text[]`. Postgres refuză și asta, tot la execuție, tot noaptea — iar
+    inversarea fusese prinsă până acum din întâmplare, de alt test.
+
     Cât se poate verifica fără gazdă: că textul și argumentele se potrivesc la
-    număr. Că expresia e SQL valid rămâne de probat pe Postgres.
+    număr ȘI la tip. Că expresia e SQL valid rămâne de probat pe Postgres.
     """
     _probe(monkeypatch, trivy_image.DOCKER_READY)
     _no_kev(monkeypatch)
@@ -1333,13 +1354,82 @@ def test_the_severity_fence_numbers_its_parameters_correctly(monkeypatch) -> Non
     db = _DB(sub_prag=7)
     run(orchestrator._run_trivy_image(db, "test"))
 
-    perechi = [db.resolve_calls[0], db.counted[0]]
+    perechi = [("rezolvare", db.resolve_calls[0]), ("numărătoare", db.counted[0])]
     assert len(perechi) == 2, "una dintre cele două interogări nu s-a executat"
-    for sql, args in perechi:
+    for eticheta, (sql, args) in perechi:
         numere = {int(n) for n in re.findall(r"\$(\d+)", sql)}
         assert numere == set(range(1, len(args) + 1)), (
-            f"textul folosește {sorted(numere)} dar se trimit {len(args)} "
-            f"argumente: {sql}")
+            f"{eticheta}: textul folosește {sorted(numere)} dar se trimit "
+            f"{len(args)} argumente: {sql}")
+
+        turnari = {int(n): t.lower()
+                   for n, t in re.findall(r"\$(\d+)::(\w+(?:\[\])?)", sql)}
+        vazute = set()
+        for n, cast in turnari.items():
+            accepta = _TURNARI.get(cast)
+            if accepta is None:      # turnare pe care testul n-o modelează
+                continue
+            vazute.add(cast)
+            assert accepta(args[n - 1]), (
+                f"{eticheta}: ${n} e turnat `{cast}` dar primește "
+                f"{args[n - 1]!r} — parametrii gardei sunt inversați: {sql}")
+        # Fără asta, o schimbare care scoate turnările din text ar lăsa bucla de
+        # mai sus să nu verifice nimic și testul ar rămâne verde degeaba — exact
+        # forma de listă parametrizată ieșită goală din CLAUDE.md.
+        assert {"text[]", "boolean"} <= vazute, (
+            f"{eticheta}: garda de severitate nu mai poartă ambele turnări "
+            f"({sorted(vazute)}), deci potrivirea pe tip n-a verificat nimic: {sql}")
+
+
+# Forma exactă a gărzii. Scrisă o dată aici, ca testul de mai jos să poată
+# număra aparițiile ei față de aparițiile cheii pe care o apără.
+_GARDA_NENOTAT = "COALESCE(raw->'severity_known' = 'false'::jsonb, false)"
+
+
+def test_a_finding_with_no_scored_flag_at_all_stays_inside_the_fence(
+        monkeypatch) -> None:
+    """Un rând fără cheia `severity_known` n-are voie să cadă din AMBELE interogări.
+
+    Eșecul pe care îl previne: `COALESCE(..., false)` scos din `_visible_sql`.
+    `raw->'severity_known'` pe un rând care n-are cheia dă NULL, `... OR NULL`
+    dă NULL, iar `NOT (... OR NULL)` dă tot NULL — deci rândul nu e nici închis
+    de rezolvare, nici numărat de numărătoare. Nu rămâne „protejat": dispare din
+    amândouă, adică nici nu se repară, nici nu se spune că e acolo. Asta e forma
+    unei scurgeri, nu a unei decizii — și e singurul fel de defect pe care
+    panoul îl arată ca liniște.
+
+    Nu e teoretic: pe gazdă există 19 constatări `dnf` low/medium fără cheia
+    aia, scrise înainte ca steagul să existe. Azi nu se scurg, fiindcă garda se
+    aplică doar scanerelor care declară un prag și singurul care declară unul —
+    `trivy_image` — își scrie steagul necondiționat. Garda e însă scrisă
+    generic, iar docstring-ul lui `_visible_sql` o dă drept apărare centrală: în
+    ziua în care al doilea scaner capătă un prag, rândurile fără cheie sunt ale
+    lui, și nimic nu le-ar fi oprit.
+
+    Se verifică pe textul care AJUNGE la bază, în amândouă interogările, nu pe
+    constanta din modul — o gardă pusă într-o interogare și uitată în cealaltă e
+    exact drift-ul pentru care `_visible_sql` e scris o singură dată. Că
+    Postgres evaluează `COALESCE` așa cum spune docstring-ul nu se poate proba
+    de aici; asta rămâne pentru gazdă.
+    """
+    _probe(monkeypatch, trivy_image.DOCKER_READY)
+    _no_kev(monkeypatch)
+    _merge_stub(monkeypatch)
+    db = _DB(sub_prag=7)
+    run(orchestrator._run_trivy_image(db, "test"))
+
+    for eticheta, (sql, _args) in (("rezolvare", db.resolve_calls[0]),
+                                   ("numărătoare", db.counted[0])):
+        assert "severity_known" in sql, (
+            f"{eticheta}: constatările nenotate nu mai sunt deosebite deloc: {sql}")
+        # Egalitate, nu „conține": fiecare apariție a cheii trebuie să fie
+        # înăuntrul unui COALESCE cu implicit `false`. O a doua comparație goală
+        # adăugată mai târziu ar reintroduce NULL-ul fără să scoată garda asta.
+        assert sql.count("severity_known") == sql.count(_GARDA_NENOTAT), (
+            f"{eticheta}: `raw->'severity_known'` apare "
+            f"{sql.count('severity_known')} ori, dar numai "
+            f"{sql.count(_GARDA_NENOTAT)} sub `COALESCE(..., false)` — un rând "
+            f"fără cheia aia dă NULL și cade tăcut din amândouă interogările: {sql}")
 
 
 def test_the_findings_left_below_the_floor_are_counted_and_said(

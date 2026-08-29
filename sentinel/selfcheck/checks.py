@@ -53,7 +53,9 @@ import yaml
 from sentinel.config import CONFIG_PATH, Config, resolve_skip_command_accounts
 from sentinel.constants import SYSTEMD_UNITS
 from sentinel.db.engine import Database
+from sentinel.db.repo import assets as assets_repo
 from sentinel.db.repo.logins import REAL_TTY_SQL
+from sentinel.scan import inventory
 from sentinel.logging_setup import get_logger
 from sentinel.util import tz
 
@@ -3139,6 +3141,78 @@ async def check_dashboard_latency(db: Database) -> list[CheckResult]:
                "mod": "rapid"})]
 
 
+async def check_inventory(db: Database) -> list[CheckResult]:
+    """`inventory.yaml` decides what is watched; a blank one decides nothing.
+
+    The counterpart of the retirement notice in `health_service`. Retiring is an
+    EVENT: it happens once per edit, and is announced once, by name, there. This
+    is the STATE underneath it, and it needs a different mechanism for a
+    concrete reason — `sync` refuses to retire anything from an empty list,
+    because a truncated file would otherwise switch off every probe on the host
+    at once, and it reports that refusal on EVERY pass, thirty seconds apart. As
+    a notification that is 2880 messages a day; as a log line it is exactly
+    where the four permanently-red services hid for eighteen days. Change
+    detection is what turns a standing condition into one message, and change
+    detection lives in the self-check.
+
+    The two states being kept apart are "there was nothing to retire" and "I
+    could not tell what to retire", and the discriminator is the assets table,
+    not the file. An empty file on a host with no active assets is a fresh
+    install — a valid state, and `load` says so. An empty file while assets are
+    still being probed means the file that decides what is watched no longer
+    confirms a single one of them, and the probing is running on a list only the
+    database still holds.
+
+    A file that does not parse is the same class of fact by another route:
+    `health_service` catches the exception, logs it and keeps probing, so
+    nothing on the host looks different and nothing but a journal line says the
+    inventory stopped being applied.
+
+    `degraded`, not `unknown`: `unknown` is not `bad`, so it never reaches the
+    operator, and this is the case that has to.
+    """
+    key = "inventory:assets"
+    cale = str(inventory.INVENTORY_PATH)
+    try:
+        specs = inventory.load(inventory.INVENTORY_PATH)
+    except Exception as exc:  # noqa: BLE001 - the point of the check is to report this
+        return [CheckResult(
+            key, "Inventarul nu se poate citi", "degraded",
+            detail=f"`{cale}` nu se încarcă: {str(exc)[:160]}. Sondarea continuă "
+                   f"pe lista din bază, dar fișierul nu se mai aplică — nici "
+                   f"activele adăugate, nici cele scoase nu mai au efect.",
+            action=f"python3 -c \"import yaml; yaml.safe_load(open('{cale}'))\"",
+            facts={"cale": cale, "citit": False})]
+
+    active = await assets_repo.list_all(db)
+    facts = {"cale": cale, "citit": True,
+             "active_in_fisier": len(specs), "active_in_baza": len(active)}
+
+    if specs:
+        return [CheckResult(
+            key, "Inventarul de active", "ok",
+            detail=f"{_numar(len(specs), 'activ listat', 'active listate')} în "
+                   f"`{cale}`, {_numar(len(active), 'activ', 'active')} în bază",
+            facts=facts)]
+
+    if not active:
+        return [CheckResult(
+            key, "Inventarul de active", "ok",
+            detail=f"`{cale}` nu listează niciun activ și nu e nimic de "
+                   f"supravegheat — starea unei instalări noi, nu un defect",
+            facts=facts)]
+
+    return [CheckResult(
+        key, "Inventarul nu mai listează niciun activ", "degraded",
+        detail=f"`{cale}` e gol, dar {_numar(len(active), 'activ e sondat', 'active sunt sondate')} "
+               f"mai departe din bază. Retragerea e sărită intenționat pe o listă "
+               f"goală — altfel un fișier trunchiat ar stinge toate sondele deodată "
+               f"— deci nimic nu s-a retras, și nu se poate ști dacă golul e voit.",
+        action=f"restaurează {cale} din backup, sau confirmă că gazda chiar nu mai "
+               f"are nimic de supravegheat",
+        facts=facts)]
+
+
 # ---------------------------------------------------------------------------
 CHECKS: tuple[tuple[str, Callable], ...] = (
     ("units", check_units),
@@ -3153,6 +3227,7 @@ CHECKS: tuple[tuple[str, Callable], ...] = (
     ("code", check_running_code_is_current),
     ("ship", check_ship_lag),
     ("scan", check_last_scan),
+    ("inventory", check_inventory),
     ("audit", check_audit_records),
     ("history", check_command_history_filter),
     ("beacon", check_beacon_delivery),

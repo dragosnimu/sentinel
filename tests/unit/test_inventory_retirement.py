@@ -28,6 +28,12 @@ operator:
     trecere a serviciului de sănătate. Dacă a doua trecere ar rescrie momentul
     retragerii, „retras de 18 zile" ar fi mereu „retras acum" și n-ar mai spune
     nimic.
+  * **O retragere pe care n-o află nimeni.** `sync` a întors ce a retras din
+    prima zi, iar singurul apelant de producție arunca valoarea: schimbarea
+    ajungea la operator ca două linii de jurnal. Un `inventory.yaml` trunchiat
+    de la 14 la 11 active stinge trei sonde în liniște, iar unsprezece active
+    arată exact ca o gazdă cu unsprezece active. De aici încolo se numesc, o
+    singură dată — vezi `health_service._announce_retired`.
 
 Dublul de mai jos ȚINE RÂNDURI și își citește regulile din CHIAR TEXTUL
 instrucțiunilor pe care i le dă codul: lista de coloane a `INSERT`-ului,
@@ -61,6 +67,7 @@ class FakeDB:
     def __init__(self) -> None:
         self.rows: list[dict] = []
         self.statements: list[str] = []
+        self.notifications: list[dict] = []
         self._next_id = 1
         self.clock = T0
 
@@ -149,6 +156,26 @@ class FakeDB:
         if "retired_at IS NULL" in sql:
             rows = [r for r in rows if r["retired_at"] is None]
         return dict(rows[0]) if rows else None
+
+    async def execute(self, sql: str, *args):
+        self.statements.append(sql)
+        assert "INSERT INTO notifications" in sql, f"execute neașteptat:\n{sql}"
+        # Pozițiile se citesc din CHIAR textul instrucțiunii, ca restul dublului:
+        # dacă lista de coloane se schimbă și argumentele nu, testul o vede în
+        # loc s-o presupună.
+        m = re.search(r"INSERT INTO notifications\s*\((.*?)\)\s*VALUES\s*\((.*?)\)",
+                      sql, re.S)
+        assert m, f"nu găsesc coloanele notificării:\n{sql}"
+        coloane = [c.strip() for c in m.group(1).split(",")]
+        valori = [v.strip() for v in m.group(2).split(",")]
+        assert len(coloane) == len(valori), sql
+        rand: dict = {}
+        for col, val in zip(coloane, valori):
+            if val.startswith("$"):
+                rand[col] = args[int(val[1:].split("::")[0]) - 1]
+            else:
+                rand[col] = val.strip("'")
+        self.notifications.append(rand)
 
 
 def write(tmp_path: Path, names, *, protected=(), text: str | None = None) -> Path:
@@ -353,6 +380,116 @@ def test_sync_is_idempotent_and_does_not_move_retired_at(tmp_path):
     assert {r["name"]: r["retired_at"] for r in db.rows} == \
         {r["name"]: r["retired_at"] for r in instantaneu}
     assert active_names(db) == {"sshd"}
+
+
+# --- retragerea ajunge la operator ----------------------------------------
+def test_sync_returns_the_names_it_retired_not_only_how_many(tmp_path):
+    """Un număr nu se poate compara cu ce ai editat; o listă de nume, da.
+
+    Pana pe care o previne: operatorul citește „3 retrase" și n-are cum să
+    verifice că cele trei sunt chiar cele pe care le-a scos el. Dacă
+    `inventory.yaml` a fost trunchiat de la 14 la 11, cifra 3 e la fel de
+    liniștitoare ca o ștergere voită — numele nu sunt.
+    """
+    db, _ = populated(tmp_path)
+
+    rezultat = run(inventory.sync(db, write(tmp_path, ["sshd"])))
+
+    assert rezultat["retired_names"] == ["n8n", "qdrant", "webmin"], (
+        "retragerea se raportează fără nume, deci nu se poate verifica")
+    assert rezultat["retired"] == len(rezultat["retired_names"])
+
+
+def test_the_operator_is_told_by_name_which_assets_were_retired(tmp_path):
+    """Trei sonde stinse în tăcere se află la fel ca cele patru roșii: peste săptămâni.
+
+    Pana pe care o previne, și e aceeași boală în oglindă: `sync` întorcea de la
+    început ce a retras, iar singurul apelant de producție — serviciul de
+    sănătate — arunca valoarea. Schimbarea a ajuns la operator ca două linii în
+    jurnal, adică exact locul în care cele patru servicii roșii au stat
+    optsprezece zile fără să fie observate. Un instrument de supraveghere care
+    își schimbă obiectul supravegherii fără s-o spună a revenit la confirmarea
+    propriei intenții.
+    """
+    from sentinel.services import health_service
+
+    db, _ = populated(tmp_path)
+
+    run(health_service._sync_inventory(db, write(tmp_path, ["sshd"])))
+
+    assert len(db.notifications) == 1, (
+        f"retragerea n-a produs exact un mesaj: {db.notifications}")
+    (mesaj,) = db.notifications
+    assert mesaj["channel"] == "telegram"
+    for nume in ("n8n", "qdrant", "webmin"):
+        assert nume in mesaj["body"], (
+            f"activul retras `{nume}` nu apare în mesaj: {mesaj['body']!r}")
+    assert "sshd" not in mesaj["body"], (
+        "mesajul numește și un activ care NU a fost retras")
+
+
+def test_the_retirement_notice_is_sent_once_not_on_every_probe(tmp_path):
+    """Sonda rulează la 30 de secunde; un mesaj pe tură ar fi 2880 pe zi.
+
+    Pana pe care o previne: zgomotul care îl învață pe operator să nu mai
+    citească canalul — tocmai s-a petrecut o zi stingându-l. „O dată" nu vine
+    dintr-o fereastră de suprimare care se poate greși, ci din mecanism:
+    `retire_missing` atinge doar rândurile cu `retired_at IS NULL`, deci a doua
+    trecere nu mai are ce raporta.
+    """
+    from sentinel.services import health_service
+
+    db, _ = populated(tmp_path)
+    ramase = write(tmp_path, ["sshd"])
+
+    run(health_service._sync_inventory(db, ramase))
+    run(health_service._sync_inventory(db, ramase))
+    run(health_service._sync_inventory(db, ramase))
+
+    assert len(db.notifications) == 1, (
+        f"retragerea s-a anunțat la fiecare trecere: {len(db.notifications)} mesaje")
+
+
+def test_an_empty_inventory_announces_no_retirement(tmp_path):
+    """„N-am putut ști ce să retrag" nu are voie să se citească „am retras".
+
+    Pana pe care o previne: un `inventory.yaml` golit de o editare eșuată nu
+    retrage nimic — deliberat, altfel ar stinge toate sondele deodată. Dacă
+    drumul spre operator ar porni de la faptul că sincronizarea „a trecut pe
+    lângă" ceva, s-ar trimite un mesaj despre o retragere care nu s-a
+    întâmplat, la fiecare 30 de secunde, câtă vreme fișierul e gol. Starea asta
+    se spune în altă parte, o singură dată — vezi `check_inventory` din
+    autoverificare.
+    """
+    from sentinel.services import health_service
+
+    db, _ = populated(tmp_path)
+    gol = write(tmp_path, [], text="assets: []\n")
+
+    run(health_service._sync_inventory(db, gol))
+    run(health_service._sync_inventory(db, gol))
+
+    assert db.notifications == [], (
+        f"un fișier gol a produs un anunț de retragere: {db.notifications}")
+    assert active_names(db) == {"n8n", "qdrant", "sshd", "webmin"}
+
+
+def test_a_broken_inventory_neither_announces_nor_stops_the_probe(tmp_path):
+    """Un YAML stricat nu are voie nici să anunțe o retragere, nici să oprească tura.
+
+    Pana pe care o previne: dacă `_sync_inventory` ar lăsa excepția să iasă,
+    o greșeală de indentare în fișier ar opri sondarea întregii gazde — panoul
+    ar îngheța pe ultima măsurătoare, ceea ce arată identic cu „totul e verde".
+    """
+    from sentinel.services import health_service
+
+    db, _ = populated(tmp_path)
+    stricat = write(tmp_path, [], text="assets: [unu")
+
+    run(health_service._sync_inventory(db, stricat))
+
+    assert db.notifications == []
+    assert active_names(db) == {"n8n", "qdrant", "sshd", "webmin"}
 
 
 def test_list_all_hides_retired_from_every_consumer(tmp_path):
