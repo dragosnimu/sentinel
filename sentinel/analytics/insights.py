@@ -593,11 +593,22 @@ _FORTARE_ESECURI_MIN = 20
 #     an UNKNOWN method must stay counted — same reasoning as the guard below,
 #     said once in each layer.
 #   * failures are aggregated BEFORE the join. The row-by-row shape was a
-#     nested loop over successes × failures; measured on this host, 500
-#     successes against 13 191 failures took 20 s — past the 30 s
-#     `statement_timeout_ms` — and `posture()` is NOT inside the per-rule
-#     `try/except` of `collect()` (see `analytics/page.py` and
-#     `telegram/views.py`), so a timeout here is a 500 on the dashboard.
+#     nested loop over successes × failures: measured on this host, 500
+#     fabricated successes against one address' 1 525 real failures ran
+#     2 745 ms row-by-row and 31 ms aggregated (29 Aug 2026). That matters
+#     because `posture()` is NOT inside the per-rule `try/except` of
+#     `collect()` (see `analytics/page.py` and `telegram/views.py`), so a
+#     timeout here is a 500 on the dashboard, not a missing card.
+#
+#     Do not read the aggregation as the bound on this query — it is the
+#     second line, and a weaker one than it looks. `esec` groups by
+#     `(src_ip, username)`, and the reduction is only as good as the account
+#     reuse: measured the same day, 7 240 failure rows collapsed to 1 344
+#     groups (5.4x), and on one address that enumerates users it was 4x. An
+#     attacker using a distinct account per attempt collapses nothing and the
+#     join is back to O(successes × failures). What actually bounds this query
+#     is the `publickey` filter above, which empties `ok` on a host where every
+#     success is a key — `esec` is then never executed at all.
 #
 # `esecuri_cont` counts failures on the account that got in, `esecuri_ip` every
 # failure from that address; grouping by `ok.id` keeps one output row per

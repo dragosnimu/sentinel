@@ -329,16 +329,26 @@ def test_a_deploy_session_is_not_announced_as_a_break_in():
     striga cel mai tare mesaj pe care Sentinel îl poate produce. Contul pe care
     s-a intrat nu e printre cele pe care s-a eșuat, iar reușita e pe cheie.
 
-    Testul ăsta nu poate fi făcut să pice de niciun defect singur, și asta e o
+    Testul ăsta nu pică la scoaterea unei singure apărări, și asta e o
     proprietate a incidentului, nu o scăpare: cifrele lui reale (0 eșecuri pe
-    cont, 3 pe adresă) trec și de garda de metodă, și de prag, deci scoaterea
-    oricăreia îl lasă verde. E documentație executabilă — ține incidentul lipit
-    de regulă. Dinții sunt în altă parte, pe cifre destul de mari cât să conteze
-    o singură apărare: `test_a_key_login_is_not_called_a_successful_guess`
+    cont, 3 pe adresă) trec și de garda de metodă, și de prag, deci oricare
+    dintre ele îl ține verde singură.
+
+    Dar NU e fără dinți, și prima versiune a notei ăsteia lăsa impresia asta.
+    Măsurat de verificator pe 29 august 2026: reintroducerea regulii VECHI —
+    garda de metodă scoasă, numărătoarea pe adresă în loc de cont, pragul la
+    `> 0` — îl înroșește, împreună cu încă trei. Adică pică exact pe defectul
+    pe care îl numește, doar că defectul ăla e o revenire de proiectare, nu o
+    mutație de o linie. Ăsta e felul de martor pe care îl vrei pentru un
+    incident: nu se aprinde la fiecare atingere, se aprinde când cineva
+    reface greșeala.
+
+    Apărările individuale sunt fixate separat, pe cifre destul de mari cât să
+    conteze una singură: `test_a_key_login_is_not_called_a_successful_guess`
     (312 eșecuri pe contul care intră, pe cheie) apără metoda, iar
     `test_the_operators_own_seven_failures_are_not_a_break_in` apără pragul.
-    Umflarea cifrelor de aici ca să pice ar însemna alt incident decât cel din
-    28 august.
+    Umflarea cifrelor de aici ca să pice la o mutație singură ar însemna alt
+    incident decât cel din 28 august.
     """
     p = run(ins.posture(_posture_db([
         _ok("sentinel-deploy", "publickey", esecuri_cont=0, esecuri_ip=3),
@@ -484,6 +494,8 @@ def test_absurd_ratio_is_reported_as_unreliable_not_as_a_surge():
     out = run(ins._trend_insight(db))
     assert out and out[0].level == "info"
     assert "nu este de încredere" in out[0].title
+
+
 def test_the_loudest_forcing_is_the_one_in_the_headline():
     """Cu mai multe forțări deodată, titlul o poartă pe cea mai gravă.
 
