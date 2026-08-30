@@ -514,6 +514,7 @@ def test_the_path_rules_declare_themselves_path_backed():
         "sudoers_change": intrusion.privilege_escalation,
         "webroot_change": intrusion.webroot_tampering,
         "suid_change": intrusion.suid_change,
+        "bait_touched": intrusion.bait_touched,
     }
     for action, rule in cases.items():
         db = _DB(rows={"e.source = 'auditd'": [_row(action=action, paths=["/etc/x"])]})
@@ -580,6 +581,31 @@ def test_setuid_gets_its_own_rule_naming_the_file():
     assert s.severity == "critical"
     assert "/tmp/.hidden/rootshell" in s.summary
     assert "unealt" not in s.title.lower()
+
+
+def test_bait_touched_is_critical_and_names_the_file():
+    """O momeală citită e printre puținele lucruri care justifică trezirea
+    operatorului noaptea — cerut explicit pentru funcționalitatea 05."""
+    db = _DB(rows={"e.source = 'auditd'": [_row(
+        action="bait_touched", n=1, paths=["/root/.pgpass"],
+        procs=["/usr/bin/cat"], users=["1000"])]})
+    s = run(intrusion.bait_touched(db, 0))[0]
+    assert s.severity == "critical"
+    assert "/root/.pgpass" in s.summary
+    assert s.path_backed
+
+
+def test_bait_touched_passes_the_quiet_window():
+    """Fereastra de liniște ține totul, în afară de `critical` și de câteva
+    tipuri numite. O momeală critică care ar fi ținută până dimineața ar rata
+    exact fereastra în care contează — noaptea, când nimeni nu se uită."""
+    from sentinel.telegram import quiet
+
+    db = _DB(rows={"e.source = 'auditd'": [_row(
+        action="bait_touched", paths=["/root/.aws/credentials"])]})
+    s = run(intrusion.bait_touched(db, 0))[0]
+    assert quiet.passes_anyway(s.severity), (
+        "o momeală citită nu are voie să aștepte până la 06:00")
 
 
 def test_module_load_is_its_own_rule():

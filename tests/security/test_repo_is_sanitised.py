@@ -564,7 +564,10 @@ VALUE_EXEMPT: dict[str, tuple[dict[str, int], str]] = {
     # Hexa care nu e cheie: o adresă IPv6 în forma din /proc/net și un
     # `proctitle` auditd, care e hexa prin definiția formatului.
     "tests/unit/test_exposed.py": ({SHAPE_HEX: 1}, "adresă IPv6 în forma din /proc/net"),
-    "tests/unit/test_auditd_watch.py": ({SHAPE_HEX: 1}, "proctitle auditd, hexa prin format"),
+    # Era 1 până la funcționalitatea 05 (momelile): un singur fixture cu
+    # PROCTITLE. `BAIT_READ` a adăugat al doilea (`cat /root/.pgpass`), deci
+    # numărul crește odată cu fixture-urile, nu înainte.
+    "tests/unit/test_auditd_watch.py": ({SHAPE_HEX: 2}, "proctitle auditd, hexa prin format"),
 
     # Sumele sha256 ale unor binare publice, fixate dinadins: e chiar mecanismul
     # care face `curl | bash` inutil. Nu sunt secrete, sunt opusul lor — valori

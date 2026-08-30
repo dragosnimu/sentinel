@@ -162,6 +162,82 @@ def test_the_kernel_backlog_is_sized_for_the_command_history(lines: list[str]) -
         "care minte")
 
 
+def test_bait_lines_are_the_last_rules_in_the_file(lines: list[str]) -> None:
+    """Cerut in runda 2: chiar cu filtrul de existenta reparat, ordinea e o
+    aparare gratuita. Daca vreodata o linie de momeala ajunge totusi refuzata
+    -- o platforma noua, un colt al filtrului neacoperit -- pozitia de ultima
+    face ca singurul lucru pierdut sa fie ea insasi, nu `sentinel_cmd` sau
+    suprimarile `never,exit`."""
+    bait_idx = [i for i, ln in enumerate(lines)
+                if ln.startswith("-w ") and ln.rstrip().endswith("sentinel_bait")]
+    assert bait_idx, "nicio regula de momeala gasita"
+    assert bait_idx == list(range(len(lines) - len(bait_idx), len(lines))), (
+        "liniile de momeala nu mai sunt ultimele din fisier: "
+        f"{bait_idx} vs ultimele {len(bait_idx)} pozitii din {len(lines)}")
+
+
+def test_bait_watch_is_read_only(lines: list[str]) -> None:
+    """`-p r`, nu `-p rwxa`.
+
+    Un `stat` (deci `ls`/`find`, exact ce face operatorul în diagnostic) nu e
+    nici r, nici w, nici x, nici a — kernelul nu-l clasifică sub niciuna dintre
+    cele patru, deci nici `-p rwxa` nu s-ar aprinde la o listare. Diferența
+    reală e în cealaltă direcție: `a` s-ar aprinde la orice `chmod -R`,
+    `chown -R` sau `restorecon` care nu citește conținutul, iar `w` la o
+    restaurare de backup viitoare. Momeala trebuie să prindă DOAR citirea.
+    """
+    bait_rules = [ln for ln in lines
+                  if ln.startswith("-w ") and ln.rstrip().endswith("sentinel_bait")]
+    assert bait_rules, "nicio regulă de momeală în fișier"
+    for rule in bait_rules:
+        assert re.search(r"-p\s+r\s", rule), f"momeala nu e -p r: {rule}"
+        assert "rwxa" not in rule and "wa" not in rule.split("-p")[1].split()[0], (
+            f"momeala prinde mai mult decât citirea: {rule}")
+
+
+def test_bait_files_sit_outside_every_other_watch(lines: list[str]) -> None:
+    """O momeală sub o urmărire deja existentă ar produce acțiunea VECHE
+    (`ssh_key_change`, `webroot_change`, ...), nu semnalul dedicat — exact
+    coliziunea tăcută împotriva căreia avertizează planul funcționalității 05.
+    """
+    # Momeala se identifică după CHEIE, nu după o listă de căi copiată aici —
+    # o listă scrisă a doua oară ar rămâne neschimbată dacă fișierul de reguli
+    # se schimbă și ar trece, vacuu, exact defectul numit în CLAUDE.md.
+    watches = [ln for ln in lines if ln.startswith("-w ")]
+    bait_lines = [ln for ln in watches if ln.rstrip().endswith("sentinel_bait")]
+    other = [ln.split()[1] for ln in watches if not ln.rstrip().endswith("sentinel_bait")]
+    bait = [ln.split()[1] for ln in bait_lines]
+    assert bait, "nicio cale de momeală găsită"
+    for b in bait:
+        for prefix in other:
+            assert not (b == prefix or b.startswith(prefix.rstrip("/") + "/")), \
+                f"{b} e deja acoperit de urmărirea {prefix}"
+
+
+def test_the_configurable_bait_paths_match_the_shipped_watch_lines(lines: list[str]) -> None:
+    """`CANARY_PGPASS_PATH`/`CANARY_AWS_CREDS_PATH` din `install.sh` afirmau
+    deja, printr-un comentariu, ca sunt legate de fisierul static de reguli —
+    dar nicio garda nu exista, si comentariul mintea. `sentinel.rules` e un
+    fisier static: daca cineva schimba implicitul unei variabile fara sa
+    schimbe si linia `-w`, sau invers, nucleul ajunge sa supravegheze o cale,
+    iar instalatorul planteaza momeala pe alta — cele doua se despart tacut.
+    """
+    import re as _re
+
+    install_sh = (RULES.parents[1] / "install.sh").read_text(encoding="utf-8")
+    watch_paths = {ln.split()[1] for ln in lines
+                   if ln.startswith("-w ") and ln.rstrip().endswith("sentinel_bait")}
+    assert watch_paths, "nicio regula de momeala in fisierul de reguli"
+
+    for var in ("CANARY_PGPASS_PATH", "CANARY_AWS_CREDS_PATH"):
+        m = _re.search(rf'{var}="\$\{{{var}:-([^}}]+)\}}"', install_sh)
+        assert m, f"{var} nu mai are o valoare implicita in install.sh"
+        default = m.group(1)
+        assert default in watch_paths, (
+            f"{var} implicit e {default!r}, dar nicio linie -w din sentinel.rules "
+            f"nu supravegheaza exact calea asta: {sorted(watch_paths)}")
+
+
 def test_every_key_used_is_known_to_the_collector(lines: list[str]) -> None:
     """O cheie pe care colectorul nu o cunoaște produce evenimente pe care
     nimeni nu le citește — cost de disc fără niciun semnal."""

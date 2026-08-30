@@ -191,3 +191,47 @@
 -a never,exit -F dir=/opt/sentinel
 -a never,exit -F dir=/var/lib/sentinel
 -a never,exit -F dir=/var/lib/docker
+
+# --- Bait files (canaries) ---------------------------------------------------
+# Files with no legitimate reason to ever be read. Nothing on this host opens
+# them: no locate/mlocate/plocate index, no antivirus or rootkit scanner
+# (clamav/rkhunter/aide), no backup tool (borg/restic/duplicity), no scan timer
+# -- measured on the host on 30 August 2026, not assumed. Their content and
+# creation live in deploy/install.sh (install_canary_baits); this is only the
+# kernel side of it.
+#
+# Both paths sit outside every watch above on purpose: /root itself is not
+# watched (only /root/.ssh is, by sentinel_ssh), so a read here cannot collide
+# with an existing rule and arrive under the wrong action.
+#
+# -p r, not -p rwxa. A `stat()` -- what `ls` and `find` do, including the
+# operator's own diagnostics -- is neither a read, a write, an execute nor an
+# attribute change; the kernel does not classify it under any of the four
+# letters, so even `-p rwxa` would stay silent on a listing. The real
+# difference is in the other direction: `a` fires on any bulk attribute sweep
+# that never opens the content -- `chmod -R`, `chown -R`, `restorecon` after an
+# SELinux relabel, a backup tool restoring permissions -- and `w` fires on that
+# same tool restoring the file's bytes. None of those exist on this host today,
+# but the design assumes one might tomorrow, and reading the CONTENT is the
+# one thing a bait exists to catch. `-p r` is the only choice that stays quiet
+# through all of the above and still fires on the one action that matters.
+# What it misses: an attacker who only stats or chmods the file without ever
+# opening it gains nothing from that, so the miss costs nothing a bait was
+# meant to catch.
+#
+# LAST in the file, deliberately, and for a reason that only exists because of
+# a defect these two lines almost caused. `-w` on a path that does not exist
+# is REFUSED by the kernel exactly like `-F dir=` on one -- MEASURED on the
+# AlmaLinux 9.8 production host (5.14 kernel, auditctl 3.1.5, 30 August 2026),
+# after this file shipped with the opposite belief, sourced from an Ubuntu VM
+# where it happens not to be true. `deploy/install.sh` now filters an absent
+# `-w` path out before offering it to the kernel (see
+# `audit_rules_for_this_host`), so a missing bait no longer takes anything down
+# with it -- but that fix lives in a second file, and a defence that costs
+# nothing belongs here too. Putting these two lines last means that if the
+# filter is ever wrong, or a future rule is added the same way without reading
+# this comment, the only thing a missing bait can cost is itself. Moved here
+# from between "Module loading" and "Command history" on 30 August 2026, for
+# exactly that reason.
+-w /root/.pgpass          -p r -k sentinel_bait
+-w /root/.aws/credentials -p r -k sentinel_bait

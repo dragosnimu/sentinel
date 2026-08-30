@@ -55,6 +55,12 @@ POST_COMPROMISE_ACTIONS = (
     # descărcarea — de asta textul alertei din `detect/intrusion.py` spune
     # „încărcat sau descărcat".
     "module_load",
+    # Un fișier-momeală a fost CITIT. Fără prag, fără fereastră de învățare:
+    # fișierul n-are niciun cititor legitim, deci prima citire e dovada.
+    # Aparține aici, nu într-o categorie separată — e exact ce spune numele
+    # categoriei: cineva e deja înăuntru și caută. Vezi
+    # `deploy/audit/sentinel.rules` și `detect/intrusion.bait_touched`.
+    "bait_touched",
 )
 
 # Normalised outcome. Rules match on this rather than on source-specific text.

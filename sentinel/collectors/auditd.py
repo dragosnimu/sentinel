@@ -90,6 +90,10 @@ _WATCH_KEYS = {
     "sentinel_exec":     "suspicious_exec",   # nc, ncat, socat, wget, curl
     "sentinel_suid":     "suid_change",
     "sentinel_module":   "module_load",
+    # Fisiere-momeala (functionalitatea 05): fara motiv legitim sa fie citite,
+    # niciodata. Vezi deploy/audit/sentinel.rules pentru ce anume si de ce
+    # -p r; regula de detectie e in detect/intrusion.bait_touched.
+    "sentinel_bait":     "bait_touched",
     # Istoricul de comenzi: fiecare `execve` dintr-o sesiune cu login.
     #
     # E singura cheie care produce volum de ordinul miilor pe zi, iar antetul

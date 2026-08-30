@@ -765,6 +765,14 @@ AUDITD_LOG_PATH=/var/log/audit/audit.log
 # that is not /etc.
 AUDITD_RULES_DEST=/etc/audit/rules.d/sentinel.rules
 
+# The two bait files (functionality 05), overridable for the same reason as
+# the paths above: a test has to be able to run this against a tmp directory
+# instead of a real /root. The paths themselves are also duplicated in
+# deploy/audit/sentinel.rules, which is a static file and cannot read a shell
+# variable — tests/security/test_audit_rules_scope.py ties the two together.
+CANARY_PGPASS_PATH="${CANARY_PGPASS_PATH:-/root/.pgpass}"
+CANARY_AWS_CREDS_PATH="${CANARY_AWS_CREDS_PATH:-/root/.aws/credentials}"
+
 # auditd installed is not auditd running, and only the running one produces
 # anything.
 #
@@ -3453,7 +3461,7 @@ audit_rule_signatures() {
     '
 }
 
-# The rules THIS host can load, and the `-F dir=` lines it cannot.
+# The rules THIS host can load, and the lines whose path does not resolve.
 #
 # MEASURED on the Ubuntu 24.04.4 VM (10.30.1.134) on 26 August 2026, before any
 # of this was written:
@@ -3469,40 +3477,154 @@ audit_rule_signatures() {
 #     among the three lost, so Sentinel audited its own writes. That is the exact
 #     noise those lines exist to remove. Measured again with an empty
 #     /var/lib/docker created by hand: all 30 loaded.
-#   * `-w /nonexistent -p wa -k x` loads FINE. Only `-F dir=` needs its path, so
-#     only `-F dir=` is filtered here.
 #   * a loaded `-F dir=` rule DISAPPEARS from `auditctl -l` the moment the
 #     directory is removed, and does not come back when it is recreated. That is
 #     why this filters rather than creating the directory: a /var/lib/docker we
 #     invented would be a claim that docker is here, and would still be one
 #     `rmdir` away from silently dropping the suppression.
 #
-# So a `-F dir=` rule whose path is absent is left OUT of the file that goes to
-# /etc/audit/rules.d, and the caller NAMES it. Everything else passes through
-# byte for byte: on a host where every path is present — every RHEL host in
-# production, which has docker — the installed file is identical to the shipped
-# one, and so is what the kernel ends up holding.
+# `-w /nonexistent -p wa -k x` was believed, on the strength of the Ubuntu
+# measurement above, to load FINE -- and for a day this function filtered ONLY
+# `-F dir=`, on that belief. MEASURED on the AlmaLinux 9.8 production host (5.14
+# kernel, auditctl 3.1.5, 30 August 2026): `-w /nu/exista -p wa -k proba` and
+# `-w /nu/exista -p r -k proba` are BOTH refused, byte for byte the same error
+# as `-F dir=`. The behaviour is not one fact about the kernel, it is two facts
+# about two different kernels, and a comment that states a measurement from one
+# platform as a rule for all of them is exactly the pattern CLAUDE.md warns
+# about. Here it nearly cost the command-history rule and both `never,exit`
+# suppressions: functionality 05 plants two bait files before this function ever
+# runs, so a normal deploy never hit this. The moment either bait file is
+# missing when `augenrules --load` next runs -- an operator deleting a file they
+# do not recognise, a repointed `CANARY_*_PATH` whose plant failed, any reboot
+# after either -- `auditctl -R` would stop there and silently drop
+# `sentinel_cmd` and both suppressions with it. So `-w` is filtered exactly like
+# `-F dir=` now, for the same reason and with the same fix: existence is checked
+# before offering the line to the kernel, not assumed from what one platform
+# happened to do.
+#
+# So a `-w` or `-F dir=` rule whose path is absent is left OUT of the file that
+# goes to /etc/audit/rules.d, and the caller NAMES it. Everything else passes
+# through byte for byte: on a host where every path is present — every RHEL
+# host in production, which has docker and both baits planted — the installed
+# file is identical to the shipped one, and so is what the kernel ends up
+# holding.
 #
 # Writes the kept rules to $1; prints the dropped lines on stdout.
 audit_rules_for_this_host() {
-    local dest="$1" line dir
+    local dest="$1" line target
     : > "$dest"
     while IFS= read -r line || [[ -n "$line" ]]; do
+        target=""
         if [[ "$line" =~ ^[[:space:]]*-[aA][[:space:]] ]] &&
            [[ "$line" =~ -F[[:space:]]+dir=([^[:space:]]+) ]]; then
-            dir="${BASH_REMATCH[1]}"
-            if [[ ! -e "$dir" ]]; then
-                printf '%s\n' "$line"
-                continue
-            fi
+            target="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^[[:space:]]*-w[[:space:]]+([^[:space:]]+) ]]; then
+            target="${BASH_REMATCH[1]}"
+        fi
+        if [[ -n "$target" ]] && [[ ! -e "$target" ]]; then
+            printf '%s\n' "$line"
+            continue
         fi
         printf '%s\n' "$line" >> "$dest"
+    done
+}
+
+# Functionality 05: the two bait files the sentinel_bait rule below watches.
+#
+# Fixed marker, embedded in everything this installer writes. It is what a
+# repeat deploy uses to tell "ours, maybe edited by the operator since — leave
+# it" from "something real already occupies this path, and must never be
+# treated as a decoy". The marker line has to be safe to leave inside the
+# file after an edit, so it says exactly what it is.
+#
+# Kept LOCAL to the function rather than a module-level constant: a test that
+# extracts only this function's body (the pattern the rest of this file's
+# tests use) must not depend on a global assignment living outside it.
+#
+# The two contents. Neither looks like a real secret (no key- or hash-shaped
+# string): the whole point of a bait is that its content is worthless, so
+# whoever reads it — attacker or, years later, the operator staring at a dump —
+# cannot mistake it for something that still needs rotating.
+_canary_content() {
+    local marker="# sentinel-canary: fake content, planted on purpose -- not a real credential"
+    case "$1" in
+        "$CANARY_PGPASS_PATH")
+            cat <<EOF
+${marker}
+# format: hostname:port:database:username:password
+127.0.0.1:5432:*:svc_backup:not-a-real-password
+EOF
+            ;;
+        "$CANARY_AWS_CREDS_PATH")
+            cat <<EOF
+${marker}
+[default]
+aws_access_key_id = not-a-real-access-key
+aws_secret_access_key = not-a-real-secret-key
+EOF
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# Plants whichever baits are missing; never rewrites one that is already
+# there, for either reason above. `-w` requires the watched path to EXIST at
+# load time (same constraint as `-F dir=` above, and the same failure mode:
+# `auditctl -R` refuses a rule for a path that is not there), so this has to
+# run and finish before install_audit_rules stages anything — a bait created
+# after the rules load is a rule silently missing from the kernel.
+#
+# Writes to $1, one per line, the path of any bait that already existed
+# WITHOUT the marker: something real lives there, and the caller must drop the
+# sentinel_bait watch for that one path rather than let the kernel watch real
+# content under a decoy's name.
+install_canary_baits() {
+    local foreign_file="$1" path dir content
+    : > "$foreign_file"
+
+    for path in "$CANARY_PGPASS_PATH" "$CANARY_AWS_CREDS_PATH"; do
+        if [[ -e "$path" ]]; then
+            if grep -qF "sentinel-canary" "$path" 2>/dev/null; then
+                info "bait already at ${path}, left untouched (a repeat deploy never rewrites one, edited or not)"
+            else
+                warn "bait NOT planted at ${path}: something else is already there. The \
+sentinel_bait watch for this path is left OUT of the kernel rather than monitor real content \
+under a decoy's name -- move what's there, or accept the risk yourself."
+                printf '%s\n' "$path" >> "$foreign_file"
+            fi
+            continue
+        fi
+        dir="$(dirname "$path")"
+        if [[ ! -d "$dir" ]]; then
+            mkdir -p "$dir"
+            chmod 0700 "$dir"
+        fi
+        if ! content="$(_canary_content "$path")"; then
+            warn "no bait content defined for ${path}, skipping"
+            printf '%s\n' "$path" >> "$foreign_file"
+            continue
+        fi
+        printf '%s\n' "$content" > "$path"
+        chmod 0600 "$path"
+        chown root:root "$path" 2>/dev/null || true
+        # `info`, not `ok`: planting the file is intent, not the effect this
+        # repository cares about. Whether the bait is actually ARMED is decided
+        # by the very same kernel count/verdict below that covers every other
+        # rule in this file — a second, separate green line here would be a
+        # claim of success this function cannot back on its own.
+        info "bait planted at ${path} (armed below, by the sentinel_bait audit rule)"
     done
 }
 
 install_audit_rules() {
     local src="${SCRIPT_DIR}/audit/sentinel.rules"
     [[ -f "$src" ]] || return 0
+
+    # Baits before rules, always -- see install_canary_baits for why order
+    # here is not cosmetic.
+    local foreign_baits
+    foreign_baits="$(mktemp)"
+    install_canary_baits "$foreign_baits"
 
     # What reaches /etc/audit/rules.d is what this host can load, not the whole
     # shipped file — see audit_rules_for_this_host for what was measured and why.
@@ -3514,6 +3636,32 @@ install_audit_rules() {
     while IFS= read -r line; do
         [[ -n "$line" ]] && dropped+=("$line")
     done < <(audit_rules_for_this_host "$staged" < "$src")
+
+    # A bait path occupied by something foreign (see install_canary_baits): its
+    # `-w` line is stripped here, after the general filter above and before the
+    # file reaches the kernel, so auditctl never ends up watching whatever real
+    # content actually lives there under the sentinel_bait key.
+    if [[ -s "$foreign_baits" ]]; then
+        local -a foreign_paths=()
+        while IFS= read -r path || [[ -n "$path" ]]; do
+            [[ -n "$path" ]] && foreign_paths+=("$path")
+        done < "$foreign_baits"
+        local filtered out_line skip fp
+        filtered="$(mktemp)"
+        while IFS= read -r out_line || [[ -n "$out_line" ]]; do
+            skip=0
+            for fp in "${foreign_paths[@]}"; do
+                if [[ "$out_line" == "-w $fp "* ]]; then
+                    skip=1
+                    break
+                fi
+            done
+            (( skip )) || printf '%s\n' "$out_line" >> "$filtered"
+        done < "$staged"
+        mv "$filtered" "$staged"
+    fi
+    rm -f "$foreign_baits"
+
     install -D -m 0640 "$staged" "$AUDITD_RULES_DEST"
     rm -f "$staged"
 
@@ -3651,7 +3799,7 @@ reaches ${AUDITD_LOG_PATH} however many rules the kernel holds")
     # reading two opposite statements believes the second one.
     local problems=("${missing[@]}" "${dead[@]}")
     for line in ${dropped_other[@]+"${dropped_other[@]}"}; do
-        problems+=("NOT installed, its directory does not exist here: ${line}")
+        problems+=("NOT installed, the path it names does not exist here: ${line}")
     done
     [[ -n "$errs" ]] && problems+=("augenrules did not load the whole file:
 ${errs}")

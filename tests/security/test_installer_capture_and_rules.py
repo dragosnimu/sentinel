@@ -661,8 +661,8 @@ def test_the_step_reads_all_three_outcomes(tmp_path):
 # ===========================================================================
 SYNTHETIC_RULES = """\
 # Un set mic, ca numerele să fie verificabile cu ochiul.
--w /etc/passwd -p wa -k sentinel_identity
--w /etc/shadow -p wa -k sentinel_identity
+-w @@FILE_PASSWD@@ -p wa -k sentinel_identity
+-w @@FILE_SHADOW@@ -p wa -k sentinel_identity
 -a always,exit -F arch=b64 -S execve -F path=/usr/bin/nc -F auid>=1000 -F auid!=unset -k sentinel_exec
 -a always,exit -F arch=b64 -S execve -F path=/usr/bin/curl -F auid>=1000 -F auid!=unset -k sentinel_exec
 -b 8192
@@ -672,8 +672,8 @@ SYNTHETIC_RULES = """\
 """
 
 ALL_LOADED = """\
--w /etc/passwd -p wa -k sentinel_identity
--w /etc/shadow -p wa -k sentinel_identity
+-w @@FILE_PASSWD@@ -p wa -k sentinel_identity
+-w @@FILE_SHADOW@@ -p wa -k sentinel_identity
 -a always,exit -F arch=b64 -S execve -F path=/usr/bin/nc -F auid>=1000 -F auid!=-1 -F key=sentinel_exec
 -a always,exit -F arch=b64 -S execve -F path=/usr/bin/curl -F auid>=1000 -F auid!=-1 -F key=sentinel_exec
 -a never,exit -F dir=@@DIR_CHURN@@
@@ -687,12 +687,38 @@ ALL_LOADED = """\
 # calea absentă e ȚINUTĂ AFARĂ din fișierul instalat. Un test care ar depinde de
 # ce are din întâmplare mașina de test ar trece sau ar pica după gazdă — exact
 # felul de test care nu păzește nimic.
-DIR_CHURN = "@@DIR_CHURN@@"   # ține locul lui /var/lib/docker
-DIR_SELF = "@@DIR_SELF@@"     # ține locul lui /opt/sentinel
+DIR_CHURN = "@@DIR_CHURN@@"   # tine locul lui /var/lib/docker
+DIR_SELF = "@@DIR_SELF@@"     # tine locul lui /opt/sentinel
+
+# Doua `-w` sintetice, pentru acelasi motiv: `/etc/passwd`/`/etc/shadow`
+# hardcodate ar fi existat sau nu dupa cum se intampla sa arate MASINA care
+# ruleaza suita (nu exista pe masina asta de dezvoltare), iar de cand
+# `audit_rules_for_this_host` filtreaza si liniile `-w` cu cale absenta -- nu
+# doar `-F dir=` -- un test care ar depinde de asta ar trece sau ar pica dupa
+# gazda, exact felul de test care nu pazeste nimic.
+FILE_PASSWD = "@@FILE_PASSWD@@"   # tine locul lui /etc/passwd
+FILE_SHADOW = "@@FILE_SHADOW@@"   # tine locul lui /etc/shadow
 
 
 def _dir_map(tmp_path: Path) -> dict[str, Path]:
-    return {DIR_CHURN: tmp_path / "churn", DIR_SELF: tmp_path / "self"}
+    return {DIR_CHURN: tmp_path / "churn", DIR_SELF: tmp_path / "self",
+            FILE_PASSWD: tmp_path / "passwd", FILE_SHADOW: tmp_path / "shadow"}
+
+
+def _materialize(tmp_path: Path, token: str) -> None:
+    """Face sa existe pe disc calea din spatele unui token.
+
+    Director pentru `@@DIR_*@@` (asa cum verifica un `-F dir=`), fisier gol
+    pentru `@@FILE_*@@` (asa cum verifica un `-w`) -- nucleul cere doar ca
+    inode-ul sa existe, nu un anume tip, dar testele trebuie sa poata simula pe
+    oricare din cele doua sintaxe independent una de alta.
+    """
+    path = _dir_map(tmp_path)[token]
+    if token.startswith("@@FILE_"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+    else:
+        path.mkdir(parents=True, exist_ok=True)
 
 
 def _expand(text: str, tmp_path: Path) -> str:
@@ -710,7 +736,7 @@ def _audit_harness(tmp_path: Path, *, rules: str = SYNTHETIC_RULES,
                    loaded: str = ALL_LOADED, status: str = HEALTHY_STATUS,
                    augen_out: str = "", augen_rc: int = 0,
                    tools_present: bool = True,
-                   present: tuple[str, ...] = (DIR_CHURN, DIR_SELF),
+                   present: tuple[str, ...] = (DIR_CHURN, DIR_SELF, FILE_PASSWD, FILE_SHADOW),
                    ) -> subprocess.CompletedProcess:
     """Rulează `install_audit_rules` LIVRATĂ, cu `augenrules` și `auditctl`
     momeală. `loaded` e exact ce răspunde `auditctl -l` — în forma în care o
@@ -718,10 +744,11 @@ def _audit_harness(tmp_path: Path, *, rules: str = SYNTHETIC_RULES,
     binpath = tmp_path / "bin"
     scriptdir = tmp_path / "deploy"
     (scriptdir / "audit").mkdir(parents=True)
-    # Doar directoarele din `present` există; celelalte sunt exact cazul măsurat
-    # pe VM — calea lipsă pentru care nucleul refuză regula.
+    # Doar căile din `present` există; celelalte sunt exact cazul măsurat pe
+    # VM — calea lipsă pentru care nucleul refuză regula, indiferent dacă e un
+    # `-F dir=` sau un `-w`.
     for token in present:
-        _dir_map(tmp_path)[token].mkdir(parents=True, exist_ok=True)
+        _materialize(tmp_path, token)
     (scriptdir / "audit" / "sentinel.rules").write_text(
         _expand(rules, tmp_path), encoding="utf-8", newline="\n")
 
@@ -749,6 +776,15 @@ exit 0
         f'SCRIPT_DIR="{_p(scriptdir)}"\n'
         f'AUDITD_RULES_DEST="{_p(tmp_path / "installed.rules")}"\n'
         "AUDITD_LOG_PATH=/var/log/audit/audit.log\n"
+        # `install_audit_rules` plants the two functionality-05 baits before it
+        # stages anything. None of the tests in THIS section are about them, so
+        # they get redirected under tmp_path — otherwise every one of these
+        # would try to write into the real /root of the machine running the
+        # suite.
+        f'CANARY_PGPASS_PATH="{_p(tmp_path / "root" / ".pgpass")}"\n'
+        f'CANARY_AWS_CREDS_PATH="{_p(tmp_path / "root" / ".aws" / "credentials")}"\n'
+        + _func(INSTALL, "_canary_content") + "\n"
+        + _func(INSTALL, "install_canary_baits") + "\n"
         + _func(INSTALL, "audit_rule_signatures") + "\n"
         + _func(INSTALL, "audit_rules_for_this_host") + "\n"
         + _func(INSTALL, "install_audit_rules") + "\n"
@@ -965,8 +1001,9 @@ def test_the_shipped_rules_file_is_fully_recognised(tmp_path):
     assert sigs, "nicio semnătură: fișierul de reguli n-a fost citit deloc"
     assert not [s for s in sigs if s.startswith("unchecked ")], \
         [s for s in sigs if s.startswith("unchecked ")]
-    # 30 de reguli + 2 opțiuni, măsurat pe fișierul livrat.
-    assert len([s for s in sigs if not s.startswith("option ")]) == 30, sigs
+    # 32 de reguli + 2 opțiuni, măsurat pe fișierul livrat (30 + cele 2 momeli
+    # din funcționalitatea 05).
+    assert len([s for s in sigs if not s.startswith("option ")]) == 32, sigs
 
 
 # ===========================================================================
@@ -992,7 +1029,7 @@ def test_a_missing_directory_no_longer_takes_the_rules_after_it_down(tmp_path):
     refuzată, `auditctl -R` se oprește la ea, și cele două suprimări de după ea
     — /opt/sentinel și /var/lib/sentinel — nu mai ajung în nucleu. Sentinel își
     auditează atunci propriile scrieri: și zgomot, și buclă de reacție."""
-    proc = _audit_harness(tmp_path, present=(DIR_SELF,))
+    proc = _audit_harness(tmp_path, present=(DIR_SELF, FILE_PASSWD, FILE_SHADOW))
     assert proc.returncode == 0, proc.stdout + proc.stderr
     installed = _installed(tmp_path)
     churn = _p(_dir_map(tmp_path)[DIR_CHURN])
@@ -1007,7 +1044,7 @@ def test_the_rule_left_out_is_named_not_silent(tmp_path):
     """„Nu s-a putut" și „nu era nevoie" sunt stări diferite. O regulă tăiată
     tăcut înseamnă un operator care crede că suprimarea e activă și se întreabă
     de ce i se umple jurnalul."""
-    proc = _audit_harness(tmp_path, present=(DIR_SELF,))
+    proc = _audit_harness(tmp_path, present=(DIR_SELF, FILE_PASSWD, FILE_SHADOW))
     churn = _p(_dir_map(tmp_path)[DIR_CHURN])
     assert churn in proc.stdout, \
         f"regula lăsată afară nu e numită nicăieri: {proc.stdout!r}"
@@ -1021,72 +1058,116 @@ def test_the_count_is_taken_from_what_was_offered_to_the_kernel(tmp_path):
     operatorul se învață să-l sară."""
     without_churn = "\n".join(
         l for l in ALL_LOADED.splitlines() if DIR_CHURN not in l) + "\n"
-    proc = _audit_harness(tmp_path, loaded=without_churn, present=(DIR_SELF,))
+    proc = _audit_harness(tmp_path, loaded=without_churn, present=(DIR_SELF, FILE_PASSWD, FILE_SHADOW))
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "all 5 rules" in proc.stdout, proc.stdout + proc.stderr
     assert proc.stderr.strip() == "", proc.stderr
 
 
-def test_a_watch_on_a_path_that_does_not_exist_is_kept(tmp_path):
-    """Cealaltă jumătate, și ea măsurată: nucleul ACCEPTĂ `-w /cale/inexistentă`.
-    Dacă filtrul ar tăia și `-w`, un `/var/www` absent de pe o gazdă ar scoate
-    tăcut detecția `host.webroot_write` — o pierdere reală, în numele unei
-    probleme pe care watch-urile n-o au."""
+def test_a_watch_on_a_path_that_does_not_exist_is_dropped_and_named(tmp_path):
+    """Corectat in runda 2, dupa o gazda reala. MASURAT pe AlmaLinux 9.8
+    (nucleu 5.14, auditctl 3.1.5): `-w /nu/exista -p wa` SI `-w /nu/exista -p r`
+    sunt REFUZATE de nucleu, byte cu byte aceeasi eroare ca `-F dir=`. Testul
+    asta inlocuieste unul care afirma opusul -- masurat doar pe Ubuntu -- si
+    care ar fi trecut, vacuu, langa un filtru care nu mai filtra deloc `-w`.
+
+    Regula de DUPA cea absenta trebuie sa supravietuiasca: `auditctl -R` se
+    opreste la prima linie refuzata, iar cele doua momeli din functionalitatea
+    05 stau chiar inaintea `sentinel_cmd` si a celor doua suprimari `never,exit`
+    -- un `-w` nefiltrat ar fi luat cu el tot ce urmeaza.
+    """
     rules = ("-w /nu-exista-nicaieri -p wa -k sentinel_webroot\n"
              "-a never,exit -F dir=" + DIR_SELF + "\n")
-    proc = _audit_harness(tmp_path, rules=rules, loaded=rules,
+    loaded = "-a never,exit -F dir=" + DIR_SELF + "\n"
+    proc = _audit_harness(tmp_path, rules=rules, loaded=loaded,
                           present=(DIR_SELF,))
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "/nu-exista-nicaieri" in _installed(tmp_path), \
-        "un watch a fost tăiat degeaba; nucleul îl acceptă"
-    assert "all 2 rules" in proc.stdout, proc.stdout + proc.stderr
+    installed = _installed(tmp_path)
+    assert "/nu-exista-nicaieri" not in installed, \
+        "un watch pe o cale absenta a ajuns in fisierul instalat; nucleul il refuza"
+    assert f"-a never,exit -F dir={_p(_dir_map(tmp_path)[DIR_SELF])}" in installed, \
+        "regula de DUPA cea absenta a fost pierduta odata cu ea"
+    assert "[+]" not in proc.stdout, proc.stdout
+    assert "/nu-exista-nicaieri" in proc.stderr, \
+        "watch-ul scos afara nu e numit nicaieri"
+    assert "the path it names does not exist here" in proc.stderr, proc.stderr
 
 
 def test_a_dropped_rule_that_is_not_a_suppression_is_in_the_verdict(tmp_path):
-    """O regulă `always` pentru un director absent e o DETECȚIE pe care gazda
-    n-o are, nu zgomot pe care nu-l are. Cele două nu au voie să se raporteze la
-    fel: una e o notă, cealaltă e o gaură."""
-    rules = ("-w /etc/passwd -p wa -k sentinel_identity\n"
+    """O regula `always` pentru un director absent e o DETECTIE pe care gazda
+    n-o are, nu zgomot pe care nu-l are. Cele doua nu au voie sa se raporteze la
+    fel: una e o nota, cealalta e o gaura."""
+    rules = ("-w " + FILE_PASSWD + " -p wa -k sentinel_identity\n"
              "-a always,exit -F dir=" + DIR_CHURN + " -F perm=wa -k sentinel_webroot\n")
-    loaded = "-w /etc/passwd -p wa -k sentinel_identity\n"
-    proc = _audit_harness(tmp_path, rules=rules, loaded=loaded, present=())
+    loaded = "-w " + FILE_PASSWD + " -p wa -k sentinel_identity\n"
+    proc = _audit_harness(tmp_path, rules=rules, loaded=loaded, present=(FILE_PASSWD,))
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "[+]" not in proc.stdout, proc.stdout
-    assert "NOT installed, its directory does not exist here" in proc.stderr, proc.stderr
+    assert "NOT installed, the path it names does not exist here" in proc.stderr, proc.stderr
 
 
 def test_a_host_where_every_directory_exists_keeps_the_shipped_file_byte_for_byte(
         tmp_path):
-    """Non-regresie pentru producție. AlmaLinux ARE docker (9 containere), deci
-    toate cele trei directoare există acolo, iar fișierul instalat trebuie să fie
-    identic cu cel livrat: filtrul n-are voie să schimbe nimic pe gazda unde nu e
-    nimic de schimbat."""
+    """Non-regresie pentru productie. AlmaLinux ARE docker (9 containere) SI
+    ambele momeli plantate la fiecare deploy, deci toate caile astea exista
+    acolo, iar fisierul instalat trebuie sa fie identic cu cel livrat: filtrul
+    n-are voie sa schimbe nimic pe gazda unde nu e nimic de filtrat.
+
+    Acopera si liniile `-w`, nu doar `-F dir=`: de cand runda 2 a aratat ca
+    nucleul refuza si un `-w` pe o cale absenta, o regresie care ar redeveni
+    dependenta de ce are din intamplare masina de test trebuie prinsa aici,
+    la fel ca la `-F dir=`.
+    """
     shipped = (REPO / "deploy" / "audit" / "sentinel.rules").read_text(
         encoding="utf-8")
     dirs = sorted(set(re.findall(r"-F dir=(\S+)", shipped)))
-    assert dirs, "fișierul livrat nu mai are reguli `-F dir=`; testul n-ar păzi nimic"
+    watches = sorted(set(re.findall(r"^-w\s+(\S+)", shipped, re.M)))
+    assert dirs, "fisierul livrat nu mai are reguli `-F dir=`; testul n-ar pazi nimic"
+    assert watches, "fisierul livrat nu mai are reguli `-w`; testul n-ar pazi nimic"
 
-    # Fiecare director din fișierul livrat primește o cale care CHIAR există pe
-    # mașina asta. Substituția e generată din fișier, deci o regulă `dir=` nouă
-    # nu poate scăpa neacoperită.
+    # Fiecare director din fisierul livrat primeste o cale care CHIAR exista pe
+    # masina asta. Substitutia e generata din fisier, deci o regula `dir=` noua
+    # nu poate scapa neacoperita.
     rewritten = shipped
     for i, d in enumerate(dirs):
         real = tmp_path / f"d{i}"
         real.mkdir()
         rewritten = rewritten.replace("-F dir=" + d, "-F dir=" + _p(real))
 
+    # Fiecare cale de `-w`, la fel, dar rescrisa LINIE CU LINIE, nu printr-un
+    # `.replace()` global: `/etc/sudoers` e prefix literal al lui
+    # `/etc/sudoers.d`, iar o inlocuire globala ar fi lovit ambele cai pentru
+    # un singur token. Nucleul cere doar ca inode-ul sa existe, nu un anume
+    # tip, deci un fisier gol e suficient chiar si pentru o cale care in
+    # productie e un director.
+    out_lines = []
+    seen: dict[str, str] = {}
+    counter = 0
+    for line in rewritten.splitlines(keepends=True):
+        m = re.match(r"^(-w\s+)(\S+)(.*)$", line, re.S)
+        if m:
+            old_path = m.group(2)
+            if old_path not in seen:
+                real = tmp_path / f"w{counter}"
+                counter += 1
+                real.write_text("", encoding="utf-8")
+                seen[old_path] = _p(real)
+            line = m.group(1) + seen[old_path] + m.group(3)
+        out_lines.append(line)
+    rewritten = "".join(out_lines)
+
     src = tmp_path / "in.rules"
     dest = tmp_path / "kept.rules"
-    src.write_text(rewritten, encoding="utf-8", newline="\n")
+    src.write_text(rewritten, encoding="utf-8", newline='\n')
     proc = _run(
         "set -euo pipefail\n"
         + _func(INSTALL, "audit_rules_for_this_host") + "\n"
         f'audit_rules_for_this_host "{_p(dest)}" < "{_p(src)}"\n',
         tmp_path)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert proc.stdout == "", f"s-a tăiat ceva deși toate căile există: {proc.stdout!r}"
+    assert proc.stdout == "", f"s-a taiat ceva desi toate caile exista: {proc.stdout!r}"
     assert dest.read_text(encoding="utf-8") == rewritten, \
-        "fișierul instalat diferă de cel livrat pe o gazdă unde nu e nimic de filtrat"
+        "fisierul instalat difera de cel livrat pe o gazda unde nu e nimic de filtrat"
 
 
 # ===========================================================================
@@ -1486,3 +1567,156 @@ def test_sentinels_own_suppressions_come_before_any_third_party_one():
     for d in theirs:
         assert dirs.index(d) > last_ours, \
             f"{d} e înaintea suprimărilor Sentinelului; dacă dispare, le ia cu el"
+
+
+# ===========================================================================
+# Funcționalitatea 05 — momelile (`install_canary_baits`)
+# ===========================================================================
+def _canary_harness(tmp_path: Path, *, pre_pgpass: str | None = None,
+                    pre_aws: str | None = None) -> tuple[subprocess.CompletedProcess, Path, Path, Path]:
+    """Rulează `install_canary_baits` LIVRATĂ, cu cele două căi redirectate spre
+    `tmp_path` în loc de `/root` — altfel testul ar scrie în /root de pe mașina
+    care rulează suita."""
+    pgpass = tmp_path / "root" / ".pgpass"
+    aws = tmp_path / "root" / ".aws" / "credentials"
+    if pre_pgpass is not None:
+        pgpass.parent.mkdir(parents=True, exist_ok=True)
+        pgpass.write_text(pre_pgpass, encoding="utf-8", newline="\n")
+    if pre_aws is not None:
+        aws.parent.mkdir(parents=True, exist_ok=True)
+        aws.write_text(pre_aws, encoding="utf-8", newline="\n")
+
+    foreign = tmp_path / "foreign.txt"
+    script = (
+        "set -euo pipefail\n"
+        "source ./lib/common.sh\n"
+        f'CANARY_PGPASS_PATH="{_p(pgpass)}"\n'
+        f'CANARY_AWS_CREDS_PATH="{_p(aws)}"\n'
+        + _func(INSTALL, "_canary_content") + "\n"
+        + _func(INSTALL, "install_canary_baits") + "\n"
+        f'install_canary_baits "{_p(foreign)}"\n'
+    )
+    proc = _run(script, tmp_path)
+    return proc, pgpass, aws, foreign
+
+
+def test_a_missing_bait_is_planted_with_the_marker(tmp_path):
+    """Prima instalare: fișierul nu există, deci trebuie creat, cu conținutul
+    fals și marcajul care va deosebi, la redeploy, „al nostru" de „ceva real"."""
+    proc, pgpass, aws, foreign = _canary_harness(tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert pgpass.exists() and aws.exists()
+    assert "sentinel-canary" in pgpass.read_text(encoding="utf-8")
+    assert "sentinel-canary" in aws.read_text(encoding="utf-8")
+    assert foreign.read_text(encoding="utf-8").strip() == "", \
+        "ambele momeli sunt ale noastre, nu ar trebui raportată nicio coliziune"
+    assert "bait planted" in proc.stdout, proc.stdout
+
+
+def test_the_content_is_not_shaped_like_a_real_secret(tmp_path):
+    """Cerut explicit: dacă momeala e exfiltrată, conținutul nu are voie să fie
+    confundat de operator cu o credențială reală. Nicio formă de cheie/hash —
+    aceeași gardă de formă ca `test_repo_is_sanitised`."""
+    proc, pgpass, aws, _ = _canary_harness(tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    for f in (pgpass, aws):
+        text = f.read_text(encoding="utf-8")
+        assert not re.search(r"[0-9a-fA-F]{32,}", text), \
+            f"{f}: arată a hexazecimal generat, poate fi confundat cu un secret real"
+        assert not re.search(r"(?=[A-Za-z0-9+/_-]{32,})(?=[a-z]*[A-Z])(?=[A-Za-z]*[0-9])"
+                             r"[A-Za-z0-9+/_-]{32,}", text), \
+            f"{f}: arată a base64/base64url generat"
+
+
+def test_a_repeat_deploy_never_rewrites_a_bait_even_if_the_operator_edited_it(tmp_path):
+    """Cerința D1: idempotent. Operatorul a editat momeala (a păstrat marcajul);
+    un redeploy nu are voie să o rescrie peste editarea lui."""
+    edited = "# sentinel-canary: fake content, planted on purpose -- not a real credential\nedited by operator\n"
+    proc, pgpass, aws, foreign = _canary_harness(tmp_path, pre_pgpass=edited)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert pgpass.read_text(encoding="utf-8") == edited, "editarea operatorului a fost rescrisă"
+    assert foreign.read_text(encoding="utf-8").strip() == "", \
+        "momeala editată tot poartă marcajul, nu e o coliziune"
+    assert "left untouched" in proc.stdout, proc.stdout
+
+
+def test_a_foreign_file_at_the_bait_path_is_never_overwritten_and_is_reported(tmp_path):
+    """Ceva real (fără marcaj) ocupă deja calea — poate un `.pgpass` adevărat.
+    Instalatorul nu are voie nici să-l suprascrie, nici să pretindă tăcut că a
+    plantat o momeală acolo: raportează calea ca „străină", ca apelantul să
+    scoată urmărirea de nucleu de pe ea."""
+    real = "127.0.0.1:5432:*:sentinel:S3cr3tRealPassw0rd\n"
+    proc, pgpass, aws, foreign = _canary_harness(tmp_path, pre_pgpass=real)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert pgpass.read_text(encoding="utf-8") == real, "conținutul real a fost atins"
+    assert _p(pgpass) in foreign.read_text(encoding="utf-8").splitlines(), \
+        "calea ocupată de conținut străin nu a fost raportată apelantului"
+    assert "NOT planted" in proc.stderr, proc.stderr
+
+
+def test_the_foreign_bait_path_is_dropped_from_the_installed_rules(tmp_path):
+    """Efectul, nu doar avertismentul: linia `-w` pentru o cale ocupată de
+    conținut străin nu are voie să ajungă în fișierul instalat, altfel nucleul
+    ar supraveghea un fișier real sub eticheta unei momele."""
+    real = "127.0.0.1:5432:*:sentinel:S3cr3tRealPassw0rd\n"
+    pgpass = tmp_path / "root" / ".pgpass"
+    aws = tmp_path / "root" / ".aws" / "credentials"
+    pgpass.parent.mkdir(parents=True, exist_ok=True)
+    pgpass.write_text(real, encoding="utf-8", newline="\n")
+
+    binpath = tmp_path / "bin"
+    scriptdir = tmp_path / "deploy"
+    (scriptdir / "audit").mkdir(parents=True)
+    rules = (f"-w {_p(pgpass)} -p r -k sentinel_bait\n"
+             f"-w {_p(aws)} -p r -k sentinel_bait\n"
+             "-b 8192\n--backlog_wait_time 60000\n")
+    (scriptdir / "audit" / "sentinel.rules").write_text(rules, encoding="utf-8", newline="\n")
+    _stub(binpath, "augenrules", "exit 0\n")
+    _stub(binpath, "auditctl", f"""
+case "${{1:-}}" in
+    -l) : ;;
+    -s) printf '{HEALTHY_STATUS}' ;;
+esac
+exit 0
+""")
+
+    script = (
+        "set -euo pipefail\n"
+        "source ./lib/common.sh\n"
+        f'CANARY_PGPASS_PATH="{_p(pgpass)}"\n'
+        f'CANARY_AWS_CREDS_PATH="{_p(aws)}"\n'
+        f'SCRIPT_DIR="{_p(scriptdir)}"\n'
+        f'AUDITD_RULES_DEST="{_p(tmp_path / "installed.rules")}"\n'
+        "AUDITD_LOG_PATH=/var/log/audit/audit.log\n"
+        + _func(INSTALL, "_canary_content") + "\n"
+        + _func(INSTALL, "install_canary_baits") + "\n"
+        + _func(INSTALL, "audit_rule_signatures") + "\n"
+        + _func(INSTALL, "audit_rules_for_this_host") + "\n"
+        + _func(INSTALL, "install_audit_rules") + "\n"
+        "install_audit_rules\n"
+    )
+    proc = _run(script, tmp_path, extra_path=binpath)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    installed = (tmp_path / "installed.rules").read_text(encoding="utf-8")
+    assert _p(pgpass) not in installed, (
+        "o cale ocupată de conținut străin a ajuns totuși în fișierul instalat "
+        "pentru nucleu:\n" + installed)
+    assert _p(aws) in installed, "momeala fără coliziune nu are voie să dispară odată cu cealaltă"
+
+
+def test_baits_are_planted_before_the_rules_are_staged(tmp_path):
+    """`-w` cere ca fișierul să existe la ÎNCĂRCARE. Regulile trebuie scrise
+    DUPĂ ce momelile au fost plantate, altfel nucleul refuză exact regula pe
+    care funcționalitatea asta o adaugă.
+
+    Comparat pe APELURI reale, nu pe orice apariție a numelui — un comentariu
+    care menționează cealaltă funcție, scris mai sus din întâmplare, ar trece
+    verificarea fără să spună nimic despre ordinea în care rulează codul.
+    """
+    body = _func(INSTALL, "install_audit_rules")
+    call = re.search(r"^\s*install_canary_baits\b", body, re.M)
+    stage = re.search(r'audit_rules_for_this_host\s+"\$staged"', body)
+    assert call and stage, "una dintre cele două invocări a dispărut din pas"
+    assert call.start() < stage.start(), \
+        "momelile se plantează după ce fișierul de reguli a fost deja pregătit"

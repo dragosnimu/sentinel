@@ -158,6 +158,9 @@ trafic.
   hotspot sau un al doilea VPS.
 - **Nu atinge nimic marcat `protected: true`** sau aflat sub o cale din
   `patch.extra_protected_paths`. Nu sunt ale lui Sentinel.
+- **Nu șterge `/root/.pgpass` sau `/root/.aws/credentials`** doar pentru că
+  arată a fișiere de credențiale rătăcite. Sunt momeli — §16 — și un fișier
+  care nu ar trebui să existe e exact ce trebuie să pară.
 
 ---
 
@@ -750,3 +753,49 @@ trigger care ridică excepție la UPDATE (`0002_response.sql`); fluxul lui merge
 Cât timp constatarea e pe `/selfcheck`, fluxul e **oprit** — dinadins. Un flux
 care ar continua ar părea la zi și n-ar duce nicio modificare, ceea ce e mai rău
 decât o linie galbenă.
+
+## 16. Momelile (fișiere-canar)
+
+Doi fișiere pe gazdă n-au niciun motiv legitim să fie citite, niciodată:
+`/root/.pgpass` și `/root/.aws/credentials`. Conținutul lor e fals — o parolă și
+o pereche de chei care nu funcționează nicăieri — pus acolo deliberat, ca momeală.
+O citire a oricăruia dintre ele produce un incident `critical` care trece de
+orice fereastră de liniște: nimic de pe gazdă n-are motiv să le deschidă, deci o
+citire înseamnă că cineva e deja înăuntru și caută credențiale.
+
+**Nu le șterge și nu le edita.** Dacă dai peste ele într-un `find` sau într-un
+backup și arată a fișiere uitate de altcineva, nu sunt — sunt puse de instalator,
+la fiecare deploy, dacă lipsesc.
+
+### Le poți muta
+
+Locul lor implicit e ghicibil de oricine citește codul — depozitul e public. Dacă
+vrei momeli pe căi specifice gazdei tale (de exemplu, o cale care seamănă cu ce
+chiar folosești pe serverul ăsta, nu cu implicitul din depozit), setează înainte
+de instalare:
+
+```bash
+export CANARY_PGPASS_PATH=/root/altundeva/.pgpass
+export CANARY_AWS_CREDS_PATH=/root/altundeva/credentials
+```
+
+Instalatorul plantează momelile la căile alea în loc de cele implicite, și tot
+el le arată regulii de audit — nu trebuie schimbat nimic altundeva. Câștigul e
+strict împotriva unui atacator care a citit exact acest depozit și evită căile
+implicite pe motiv că par o momeală; oricine altcineva le caută oricum pe căile
+canonice (`.pgpass`, `.aws/credentials`), indiferent de ce repository există.
+
+### Dacă mută un fișier real acolo unde stă o momeală
+
+Instalatorul nu suprascrie niciodată un fișier care există deja la calea unei
+momele — verifică un marcaj de conținut, nu doar prezența fișierului. Dacă
+marcajul lipsește, planificarea unei momele noi acolo e refuzată, avertizat, iar
+urmărirea de audit pentru CALEA ASTA e scoasă din fișierul instalat, ca nucleul
+să nu ajungă să supravegheze un fișier real sub eticheta unei momele.
+
+**Ce nu acoperă asta**: dacă păstrezi marcajul de conținut dar înlocuiești restul
+fișierului cu o credențială reală, instalatorul nu are cum să deosebească asta
+de o editare inofensivă — rămâne sub urmărire `critical`, iar o citire legitimă
+(un script de backup, un cron care chiar folosește fișierul) ar produce o alertă
+de 3 dimineața. Nu repurpoza o cale de momeală pentru ceva real; alege o cale
+nouă, din afara celor două de mai sus.

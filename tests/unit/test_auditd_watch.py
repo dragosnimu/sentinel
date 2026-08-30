@@ -87,6 +87,20 @@ MODULE_LOAD = [
     'proctitle=696E736D6F64002E2F726F6F746B69742E6B6F',
 ]
 
+# `cat /root/.pgpass`, o momeală citită. openat (257) cu succes, fără PATH de
+# tip CREATE/DELETE — fișierul exista deja, cineva doar l-a deschis.
+BAIT_READ = [
+    'type=SYSCALL msg=audit(1754390800.100:9600): arch=c000003e syscall=257 '
+    'success=yes exit=3 a0=ffffff9c a1=55e1 a2=0 a3=0 items=1 ppid=4300 '
+    'pid=5200 auid=1000 uid=0 gid=0 euid=0 tty=pts1 ses=5 comm="cat" '
+    'exe="/usr/bin/cat" subj=unconfined key="sentinel_bait"',
+    'type=CWD msg=audit(1754390800.100:9600): cwd="/root"',
+    'type=PATH msg=audit(1754390800.100:9600): item=0 name="/root/.pgpass" '
+    'inode=555 dev=fd:00 mode=0100600 ouid=0 ogid=0 nametype=NORMAL',
+    'type=PROCTITLE msg=audit(1754390800.100:9600): '
+    'proctitle=636174002F726F6F742F2E706770617373',
+]
+
 # Regula altcuiva de pe aceeași gazdă. Nu e a noastră, nu ne privește.
 FOREIGN_RULE = [
     'type=SYSCALL msg=audit(1754390300.777:9100): arch=c000003e syscall=257 '
@@ -179,6 +193,21 @@ def test_a_kernel_module_load_becomes_an_event():
     assert ev.process == "/usr/sbin/insmod"
     assert ev.username is None, "auid=unset nu e un utilizator"
     assert ev.raw["audit_key"] == "sentinel_module"
+
+
+def test_a_bait_file_read_becomes_an_event():
+    """Citirea unei momele e semnalul fără ambiguitate al funcționalității 05:
+    fișierul n-are cititor legitim, deci prima citire e dovada. Fără cale sau
+    fără acțiunea corectă, `detect/intrusion.bait_touched` n-ar avea pe ce să
+    se declanșeze."""
+    evs = parse_auditd_lines(BAIT_READ)
+    assert len(evs) == 1, "citirea momelii trebuie să producă un eveniment"
+    ev = evs[0]
+    assert ev.action == "bait_touched"
+    assert ev.file_path == "/root/.pgpass"
+    assert ev.process == "/usr/bin/cat"
+    assert ev.raw["audit_key"] == "sentinel_bait"
+    assert "unmapped_action" not in ev.raw, "acțiunea nu are voie să fie degradată"
 
 
 @pytest.mark.parametrize("group", [FOREIGN_RULE, UNKEYED], ids=["altă regulă", "fără cheie"])

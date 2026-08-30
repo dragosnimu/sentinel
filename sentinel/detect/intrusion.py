@@ -569,6 +569,34 @@ async def module_load(db: Database, cursor: int) -> list[DetectionSpec]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# 9. Momeală citită
+# ---------------------------------------------------------------------------
+async def bait_touched(db: Database, cursor: int) -> list[DetectionSpec]:
+    """Un fișier fără niciun cititor legitim tocmai a fost citit.
+
+    Nu e o tentativă și nu e o anomalie statistică calibrată pe istoric: e
+    citirea unui fișier pe care nimic de pe gazdă nu are motiv să-l deschidă,
+    niciodată — vezi antetul de la `sentinel_bait` din
+    `deploy/audit/sentinel.rules` pentru ce s-a verificat pe gazdă și de ce
+    urmărirea e `-p r`, nu `-p rwxa`. Critic de la prima citire, la fel ca
+    restul regulilor din fișierul ăsta: a doua nu adaugă nimic la ce trebuie
+    să știi.
+    """
+    out: list[DetectionSpec] = []
+    for row in await _grouped(db, cursor, ("bait_touched",)):
+        out.append(_spec(
+            row, rule_id="intrusion.bait_touched", severity="critical",
+            title="Momeală citită: fișier fără motiv legitim de acces",
+            summary=(f"{row['n']} citiri în {WINDOW_MIN} min · "
+                     f"{_fmt_paths(row['paths'] or [])} · "
+                     f"proces: {', '.join((row['procs'] or [])[:3]) or '—'} · "
+                     f"auid: {', '.join((row['users'] or [])[:3]) or '—'}. "
+                     f"Nimic legitim de pe gazdă nu deschide vreodată acest "
+                     f"fișier — cineva e deja înăuntru și caută credențiale.")))
+    return out
+
+
 INTRUSION_RULES = (
     persistence,
     privilege_escalation,
@@ -578,4 +606,5 @@ INTRUSION_RULES = (
     account_created,
     suid_change,
     module_load,
+    bait_touched,
 )
