@@ -253,13 +253,25 @@ def test_scanner_category_does_not_lower_the_threshold():
 
 
 def test_allowlisted_wins_over_a_hostile_reputation_tag():
-    """CLAUDE.md's exact case: an address on `response.extra_allowlist`
-    (reflected here as `actors.is_allowlisted`) that is ALSO on a hostile feed
-    must never be touched — guard 5's allowlist check runs unconditionally
-    after guard 2 and does not care whether reputation lowered the severity
-    floor. Severity is `high` here — enough to arm WITHOUT any lowering — so
-    a failure of this guard would prove reputation can override an explicit
-    allowlist, not merely fail to help it."""
+    """Un actor marcat ca protejat nu se blochează, oricât de ostil l-ar numi
+    un feed. Guard 5 rulează necondiționat după guard 2 și nu-l interesează
+    dacă reputația a coborât pragul. Severitatea e `high` — destulă ca să
+    armeze FĂRĂ nicio coborâre — deci un eșec aici ar dovedi că reputația
+    poate anula o protecție explicită, nu doar că nu ajută.
+
+    Ce NU dovedește, și prima versiune a notei ăsteia pretindea că dovedește:
+    că `response.extra_allowlist` ajunge aici. Nu ajunge — măsurat pe gazdă pe
+    30 august 2026, `actors.is_allowlisted` e `true` pentru 0 din 2239 de
+    rânduri, iar niciun cod din repository nu scrie coloana. Testul acoperă
+    poarta, nu drumul până la ea.
+
+    Adresa operatorului e protejată totuși, de un al doilea mecanism,
+    independent de tot ce se întâmplă aici: `executor/policy.py` încarcă
+    `response.extra_allowlist` la pornire (`refresh_runtime_allowlist`) și
+    `check_blockable` refuză orice țintă care se suprapune, prin
+    `network.overlaps(protected)`. Deci apărarea reală e sub decident, nu în
+    el — iar cine repară vreodată coloana asta trebuie să știe că nu repară o
+    gaură de securitate, ci o afirmație."""
     db = _StubDB(flags={"is_allowlisted": True, "is_known_scanner": False,
                          "reputation": ["botnet"]})
     assert _decide(db, _cfg(enabled=True, min_severity="high"),
