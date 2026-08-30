@@ -708,7 +708,7 @@ def test_insights_are_sorted_most_severe_first():
 # --- headline verdict: "did somebody get in?" -------------------------------
 #
 # Rândurile de mai jos sunt măsurate pe gazdă, nu inventate: sesiunea de deploy
-# din 28 august 2026 (185.53.199.62) și ziua operatorului (86.35.255.78). Prima
+# din 28 august 2026 și ziua operatorului. Prima
 # a produs verdictul „Autentificare reușită de la un atacator — verifică ACUM”
 # fără să fi fost spart nimic; pe 30 de zile de date, regula veche n-a avut
 # dreptate niciodată.
@@ -720,7 +720,7 @@ def _posture_db(rows, atacatori=629, ev=3861):
     )
 
 
-def _ok(cont, metoda, esecuri_cont, esecuri_ip=None, ip="185.53.199.62"):
+def _ok(cont, metoda, esecuri_cont, esecuri_ip=None, ip="198.51.100.62"):
     return {"ip": ip, "cont": cont, "metoda": metoda,
             "esecuri_cont": esecuri_cont,
             "esecuri_ip": esecuri_cont if esecuri_ip is None else esecuri_ip}
@@ -767,7 +767,7 @@ def test_a_deploy_session_is_not_announced_as_a_break_in():
 
 
 def test_the_operators_own_seven_failures_are_not_a_break_in():
-    """Ziua operatorului (86.35.255.78): 7 eșecuri și o intrare, același cont.
+    """Ziua operatorului: 7 eșecuri și o intrare, același cont.
 
     Eșecul pe care îl previne: pragul pus prea jos, sau lipsa lui. Adresa
     operatorului a produs 7 eșecuri în aceeași fereastră de 24h în care s-a și
@@ -777,7 +777,7 @@ def test_the_operators_own_seven_failures_are_not_a_break_in():
     pe altă apărare.
     """
     p = run(ins.posture(_posture_db([
-        _ok("cont-operator", None, esecuri_cont=7, ip="86.35.255.78"),
+        _ok("cont-operator", None, esecuri_cont=7, ip="203.0.113.78"),
     ]), []))
     assert p["intruziuni"] == 0, (
         f"7 eșecuri au fost citite ca forțare: {p['verdict']}")
@@ -1030,19 +1030,19 @@ def _evenimente_amestecate():
         _ev(60 * 25, "sshd", "auth_fail", "45.134.26.7", "root", "password"),
         _ev(15, "sudo", "auth_fail", "45.134.26.7", "root", "password"),
 
-        # 185.53.199.62 — sesiunea de deploy: intrare pe cheie, refuzuri pe alții.
-        _ev(5, "sshd", "auth_ok", "185.53.199.62", "sentinel-deploy", "publickey"),
-        _ev(5, "sshd", "auth_fail", "185.53.199.62", "admin", "publickey"),
-        _ev(5, "sshd", "auth_fail", "185.53.199.62", "deploy", None),
+        # 198.51.100.62 — sesiunea de deploy: intrare pe cheie, refuzuri pe alții.
+        _ev(5, "sshd", "auth_ok", "198.51.100.62", "sentinel-deploy", "publickey"),
+        _ev(5, "sshd", "auth_fail", "198.51.100.62", "admin", "publickey"),
+        _ev(5, "sshd", "auth_fail", "198.51.100.62", "deploy", None),
         # ...și o intrare pe parolă de la ACEEAȘI adresă, pe un cont fără eșecuri.
-        _ev(6, "sshd", "auth_ok", "185.53.199.62", "operator", "password"),
+        _ev(6, "sshd", "auth_ok", "198.51.100.62", "operator", "password"),
 
-        # 86.35.255.78 — ziua operatorului: metodă necunoscută, eșecuri pe cont.
-        _ev(3, "sshd", "auth_ok", "86.35.255.78", "cont-operator", None),
-        *[_ev(50 + i, "sshd", "auth_fail", "86.35.255.78", "cont-operator", "password")
+        # 203.0.113.78 — ziua operatorului: metodă necunoscută, eșecuri pe cont.
+        _ev(3, "sshd", "auth_ok", "203.0.113.78", "cont-operator", None),
+        *[_ev(50 + i, "sshd", "auth_fail", "203.0.113.78", "cont-operator", "password")
           for i in range(4)],
-        _ev(55, "sshd", "auth_fail", "86.35.255.78", None, "password"),
-        _ev(56, "sshd", "auth_fail", "86.35.255.78", "root", None, fara_raw=True),
+        _ev(55, "sshd", "auth_fail", "203.0.113.78", None, "password"),
+        _ev(56, "sshd", "auth_fail", "203.0.113.78", "root", None, fara_raw=True),
 
         # 203.0.113.9 — reușită fără cont: numai eșecurile adresei stau martor.
         _ev(4, "sshd", "auth_ok", "203.0.113.9", None, "password"),

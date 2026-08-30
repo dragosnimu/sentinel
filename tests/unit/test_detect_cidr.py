@@ -134,8 +134,8 @@ def test_prefix_containing_an_allowlisted_address_is_never_proposed():
     IP) would still fire on an operator's own subnet the moment three OTHER
     hosts in it misbehaved."""
     specs = build_specs(
-        [_row(prefix="185.53.199.0/24", distinct=50, events=5000)],
-        protected=["185.53.199.7/32"], armed=True,
+        [_row(prefix="198.51.100.0/24", distinct=50, events=5000)],
+        protected=["198.51.100.7/32"], armed=True,
     )
     assert specs == []
 
@@ -145,7 +145,7 @@ def test_prefix_with_no_allowlist_overlap_is_unaffected():
     entry must not suppress a real proposal — a guard that matches everything
     would pass the previous test for the wrong reason."""
     specs = build_specs(
-        [_row(prefix="185.53.199.0/24", distinct=50, events=5000)],
+        [_row(prefix="198.51.100.0/24", distinct=50, events=5000)],
         protected=["86.35.255.0/24"], armed=True,
     )
     assert len(specs) == 1
@@ -156,8 +156,8 @@ def test_wider_allowlisted_network_also_vetoes():
     /20 that swallows the candidate /24 is exactly as protective as a single
     address inside it."""
     specs = build_specs(
-        [_row(prefix="185.53.199.0/24", distinct=50)],
-        protected=["185.53.192.0/20"], armed=True,
+        [_row(prefix="198.51.100.0/24", distinct=50)],
+        protected=["198.51.96.0/20"], armed=True,
     )
     assert specs == []
 
