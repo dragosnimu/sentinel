@@ -1172,6 +1172,31 @@ exit 0
     return proc
 
 
+def test_the_stats_effect_is_checked_on_every_deploy_not_only_when_it_changed(tmp_path):
+    """Un `stats.log` reînviat de un upgrade de pachet e prins la deploy-ul următor.
+
+    Pana pe care o previne: `dnf`/`apt` pot restaura `suricata.yaml` la varianta
+    împachetată printr-o fuziune de conffile, deci `enabled: yes` se poate
+    întoarce fără ca nimeni s-o ceară. Dacă verificarea de efect ar rula numai
+    la deploy-ul care TOCMAI a editat fișierul (`stats_status == 0`), atunci
+    exact deploy-ul de după restaurare — singurul care ar fi putut s-o observe —
+    ar tăcea, iar cei 120 MB/zi s-ar întoarce nevăzuți.
+
+    Măsurat de verificator pe 30 august 2026: mutarea apelului înapoia acelei
+    condiții lăsa TOATĂ suita verde. Invariantul era corect implementat și
+    nepăzit de nimic, adică la o refactorizare distanță de a se pierde.
+
+    Se verifică pe toate cele trei stări pe care le poate întoarce editarea, nu
+    doar pe cea comodă: tocmai dezactivat, deja dezactivat, formă nerecunoscută.
+    """
+    for stats_status in (0, 1, 2):
+        proc = _suricata_step(tmp_path, stats_status=stats_status)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "STATS-REPORT-RAN" in proc.stdout, (
+            f"cu stats_status={stats_status} nu s-a verificat efectul asupra "
+            f"lui stats.log: {proc.stdout!r}")
+
+
 def test_a_rejected_suricata_config_does_not_abort_the_rest_of_the_deploy(tmp_path):
     """Pasul 35 e în ALWAYS_STEPS de pe 26 august, deci rulează la fiecare
     deploy. Un `die` aici ar opri rularea ÎNAINTE de pasul 37 (regulile auditd),
