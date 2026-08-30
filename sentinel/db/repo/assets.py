@@ -40,6 +40,18 @@ class Asset:
     container_image: str | None
     vhost_file: str | None
     webroot: str | None
+    # `repo_path`, `repo_branch` si `repo_remote` exista in tabela din 0001 dar
+    # NU sunt aici, nu sunt in `_COLUMNS` si nu sunt scrise de `upsert`. Pe
+    # 30 august 2026 au fost scoase si din `inventory.yaml.example`, fiindca
+    # `_ALLOWED` le respinge: un exemplu care sugereaza chei pe care
+    # incarcatorul le refuza opreste tacut aplicarea intregului inventar.
+    #
+    # Ce ramane, si merita stiut inainte sa le adauge cineva: dosarul de
+    # incident LE CITESTE (`.claude/skills/sentinel-soc/scripts/`), deci azi
+    # coloana e lizibila si nescriibila — apare mereu goala. Nu e o scapare, e
+    # o functionalitate necoborata: cine o vrea trebuie sa decida intai ce plan
+    # de patch foloseste un `repo_remote` si cum se valideaza, nu doar sa
+    # adauge trei nume in doua liste.
     stack: str | None
     databases: list[dict[str, Any]]
     protected: bool
