@@ -14,10 +14,23 @@ matches the point in the data where the signal stabilises into a small,
 steady number — about 6 candidate prefixes a day here — instead of either
 nothing (1h, 6h) or a backlog (7d). A count of 2735 prefixes have exactly ONE
 hostile address in the 7-day bucket; a threshold of 3 excludes all of those by
-construction, which is also what keeps the operator's own networks (each
-contributing exactly one hostile address in the 7-day window — an agent's own
-failed key auth, an operator's own failed login) off this list without the
-allowlist guard below having to do that work alone.
+construction — including the operator's own networks, each contributing
+exactly one hostile address in the 7-day window (an agent's own failed key
+auth, an operator's own failed login).
+
+**What actually protects those two networks today is not the allowlist guard
+below — measured on the production host, the `allowlist` TABLE has 0 rows,
+confirmed and 0 unconfirmed, and nothing in this codebase ever writes to it
+(`grep -rn "INSERT INTO allowlist"` is empty).** The real protection today is
+two things: the threshold of 3 above (both operator networks show exactly one
+hostile address in the 7-day bucket), and `response.extra_allowlist`, which
+DOES hold the operator's address on this host and IS read by
+this rule (see `cidr_cluster` below). The `_overlaps_any` guard against the
+`allowlist` table is still correct code — for the day someone starts writing
+confirmed entries into it, or for another install that already has some — but
+saying it protects this host's operator today, when the table is empty, would
+be the exact pattern this repository is named after (see commit `0122ee0`).
+This rule does not write to `allowlist`; that is out of scope here.
 
 Guards, each argued where it is enforced:
 
@@ -25,14 +38,15 @@ Guards, each argued where it is enforced:
   only. A prefix with a single address and 30 000 events is one loud host and
   a `/32` job, not this rule's; distinct_addrs=1 never clears the floor no
   matter how many events came with it.
-* **the whole interval against the allowlist, not one address in it** —
+* **the whole interval against BOTH allowlists, not one address in it** —
   `_overlaps_any` checks the *candidate network* for overlap with every
-  confirmed, unexpired allowlist entry. `respond/actions.py:is_allowlisted`
-  answers "is this one address protected"; the question here is the reverse —
-  "does the /24 I am about to propose touch anything protected at all" — and
-  a single protected address anywhere inside it is enough to drop the whole
-  proposal, unconditionally, regardless of how many hostile addresses the rest
-  of the prefix has.
+  confirmed, unexpired row in the `allowlist` table AND every entry in
+  `response.extra_allowlist`. `respond/actions.py:is_allowlisted` answers "is
+  this one address protected"; the question here is the reverse — "does the
+  /24 I am about to propose touch anything protected at all" — and a single
+  protected address anywhere inside it is enough to drop the whole proposal,
+  unconditionally, regardless of how many hostile addresses the rest of the
+  prefix has.
 * **never wider than /24** — the SQL only ever masks to /24, but `build_specs`
   re-parses every candidate with `strict=True` and refuses anything wider
   (lower prefixlen) as a second, independent check: a `/16` on this host is
@@ -45,6 +59,8 @@ Guards, each argued where it is enforced:
 * **CIDR blocks stay observe-only** — likewise the decider's job
   (`allow_cidr_blocks` guard 3): this rule only ever produces a proposal, the
   actual arm/observe split happens after it, the same as every other rule.
+* **severity follows whether the proposal is actionable, not just its size**
+  — see `_severity_for`.
 """
 
 from __future__ import annotations
@@ -52,6 +68,7 @@ from __future__ import annotations
 import ipaddress
 from typing import Any
 
+from sentinel.config import Config
 from sentinel.db.engine import Database
 from sentinel.detect.spec import DetectionSpec
 from sentinel.logging_setup import get_logger
@@ -65,12 +82,38 @@ CIDR_PREFIX_LEN = 24
 # hitting the same /24 in a single day has no precedent in the measured data
 # (the 24h bucket tops out at "5-9"); it is a deliberately conservative jump to
 # critical for a scale this host has not yet shown, not a value read off a
-# sample of it.
-CIDR_SEVERITY = ((25, "critical"), (CIDR_MIN_DISTINCT, "high"))
+# sample of it. Used only once auto-block is armed for CIDR — see
+# `_severity_for`.
+CIDR_SEVERITY_ARMED = ((25, "critical"), (CIDR_MIN_DISTINCT, "high"))
 
 
-def _severity_for(distinct_addrs: int) -> str | None:
-    for threshold, sev in CIDR_SEVERITY:
+def _severity_for(distinct_addrs: int, armed: bool) -> str | None:
+    """Severity follows whether the proposal can be ACTED on, not only its
+    scale.
+
+    Measured on the production host, last 7 days: 23.3 `high` alerts/day and
+    4.9 `critical`. `allow_cidr_blocks` defaults to false and is false on this
+    host, so every proposal from this rule comes out `observed` — there is no
+    button: `telegram/bot.py:_incident_block_kb` parses `actor_key` as a plain
+    address and returns no keyboard for anything with a `/` in it (confirmed).
+    Marking that `high` would have pushed ~6 unactionable alerts/day to a
+    channel that already pushes 23.3 actionable ones — +26% noise for zero
+    available action, straight back into the volume this repository spent its
+    last two days pulling down from 9.31/h to 0.66/h.
+
+    So: while `allow_cidr_blocks` is false, everything above the floor is
+    `medium` — below `telegram.min_severity` (`high` on this host), so the
+    incident still exists on the page and in selfcheck for whoever goes
+    looking, but nobody's phone rings for a decision that cannot be made yet.
+    The moment `allow_cidr_blocks` flips true, the same cluster IS a decision,
+    and severity follows that switch back up to the CIDR_SEVERITY_ARMED
+    tiers — the same shape every other actionable rule in this file uses.
+    This is not a quieter threshold dressed up as a design choice: it is the
+    same threshold, gated on whether there is anything to do with it yet.
+    """
+    if not armed:
+        return "medium" if distinct_addrs >= CIDR_MIN_DISTINCT else None
+    for threshold, sev in CIDR_SEVERITY_ARMED:
         if distinct_addrs >= threshold:
             return sev
     return None
@@ -78,10 +121,11 @@ def _severity_for(distinct_addrs: int) -> str | None:
 
 def _overlaps_any(candidate: ipaddress.IPv4Network | ipaddress.IPv6Network,
                    protected: list[str]) -> bool:
-    """True if `candidate` touches ANY confirmed, unexpired allowlist entry —
-    a single protected address inside the /24 is enough. `overlaps()` is
-    symmetric, so this also catches the (currently theoretical, on this host)
-    case of an allowlisted network wider than the candidate."""
+    """True if `candidate` touches ANY protected entry — a single protected
+    address inside the /24 is enough. `overlaps()` is symmetric, so this also
+    catches an allowlisted network wider than the candidate. `protected` is
+    the UNION of the `allowlist` table and `response.extra_allowlist` — see
+    the module docstring for which of the two actually has rows today."""
     for raw in protected:
         try:
             net = ipaddress.ip_network(raw, strict=False)
@@ -92,14 +136,17 @@ def _overlaps_any(candidate: ipaddress.IPv4Network | ipaddress.IPv6Network,
     return False
 
 
-def build_specs(rows: list[dict[str, Any]], protected: list[str]) -> list[DetectionSpec]:
+def build_specs(rows: list[dict[str, Any]], protected: list[str],
+                 *, armed: bool) -> list[DetectionSpec]:
     """Pure: turn aggregated rows (one per candidate /24 that already cleared
     CIDR_MIN_DISTINCT in the SQL's HAVING) into proposals. Kept separate from
-    the query so the guards above are unit-testable without a database."""
+    the query so the guards above are unit-testable without a database.
+    `armed` is `cfg.response.auto_block.allow_cidr_blocks`, passed down for
+    `_severity_for` — see its docstring for why severity depends on it."""
     specs: list[DetectionSpec] = []
     for r in rows:
         distinct = int(r["distinct_addrs"])
-        sev = _severity_for(distinct)
+        sev = _severity_for(distinct, armed)
         if sev is None:
             continue  # belt-and-suspenders: the SQL already enforces the floor
 
@@ -139,11 +186,18 @@ def build_specs(rows: list[dict[str, Any]], protected: list[str]) -> list[Detect
     return specs
 
 
-async def cidr_cluster(db: Database, cursor: int) -> list[DetectionSpec]:
+async def cidr_cluster(db: Database, cursor: int, cfg: Config) -> list[DetectionSpec]:
     """One row per /24 with a fresh hostile address since `cursor` and at
     least CIDR_MIN_DISTINCT distinct hostile addresses in the trailing
     CIDR_WINDOW_HOURS. IPv4 only — /24 grouping and the measured thresholds
-    above are both IPv4-specific; IPv6 addresses never enter fresh_ips."""
+    above are both IPv4-specific; IPv6 addresses never enter fresh_ips.
+
+    Takes `cfg` — unlike the other rules in `rules.py` — because the
+    allowlist guard needs `cfg.response.extra_allowlist`, which the shared
+    `rule(db, cursor)` signature in `detect/engine.py` has no way to carry.
+    `detect/engine.py:run_once` calls this one separately for exactly that
+    reason; see the comment there.
+    """
     rows = await db.fetch(
         """
         WITH fresh_ips AS (
@@ -182,9 +236,17 @@ async def cidr_cluster(db: Database, cursor: int) -> list[DetectionSpec]:
          WHERE confirmed = true AND (expires_at IS NULL OR expires_at > now())
         """
     )
-    protected = [r["net"] for r in allow_rows]
+    # Table first, then the operator's config-managed additions — see the
+    # module docstring for which of the two has rows on the production host
+    # today. Both are addresses/CIDRs as plain strings; _overlaps_any parses
+    # either shape (a bare address is treated as a /32).
+    protected = [r["net"] for r in allow_rows] + list(cfg.response.extra_allowlist)
 
-    return build_specs([dict(r) for r in rows], protected)
+    armed = cfg.response.auto_block.allow_cidr_blocks
+    return build_specs([dict(r) for r in rows], protected, armed=armed)
 
 
+# Not consumed by detect/engine.py's generic RULES loop (see cidr_cluster's
+# docstring for why) — kept as a named export for anything that wants the
+# function without reaching into the module directly.
 CIDR_RULES = (cidr_cluster,)

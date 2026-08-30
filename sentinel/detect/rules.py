@@ -269,14 +269,18 @@ def _all_rules() -> tuple:
     diferite, cu praguri diferite — tentativele contează în rafală, o
     compromitere contează de la prima apariție — și le ține împreună doar faptul
     că motorul le rulează pe amândouă.
+
+    `detect.cidr.cidr_cluster` NU e aici: are semnătura `(db, cursor, cfg)`, nu
+    `(db, cursor)` ca toate celelalte — are nevoie de `cfg.response.extra_allowlist`
+    pentru garda pe lista albă. `detect/engine.py:run_once` îl cheamă separat,
+    lângă bucla asta, cu același cursor.
     """
     from sentinel.detect.accounts import ACCOUNT_RULES
-    from sentinel.detect.cidr import CIDR_RULES
     from sentinel.detect.exposed import EXPOSURE_RULES
     from sentinel.detect.intrusion import INTRUSION_RULES
     from sentinel.detect.novelty import NOVELTY_RULES
     return (_ATTEMPT_RULES + INTRUSION_RULES + ACCOUNT_RULES + NOVELTY_RULES
-            + EXPOSURE_RULES + CIDR_RULES)
+            + EXPOSURE_RULES)
 
 
 RULES = _all_rules()

@@ -82,6 +82,17 @@ def test_auto_action_text_rendering():
     assert "rată" in bot._auto_action_text("skipped:rate_cap")
 
 
+def test_cidr_skip_reasons_are_translated_not_shown_raw():
+    """decider.py's two CIDR-specific skip reasons (added alongside the /24
+    proposer) must render in Romanian like every other skip reason — an
+    untranslated code in the alert body is what a diacritic bug in this exact
+    dict caused a day-long silent-bot incident here before."""
+    text = bot._auto_action_text("skipped:cidr_requires_ttl")
+    assert "cidr_requires_ttl" not in text
+    text = bot._auto_action_text("skipped:max_active_cidrs")
+    assert "max_active_cidrs" not in text
+
+
 def test_close_commands_are_registered_and_share_one_body():
     # /resolve and /fp must not pass state through bot_data: that dict is global
     # across every chat, so two operators acting at once could swap verdicts.

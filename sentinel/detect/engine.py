@@ -12,6 +12,7 @@ from __future__ import annotations
 from sentinel.config import Config
 from sentinel.db.engine import Database
 from sentinel.db.repo import incidents as inc_repo
+from sentinel.detect.cidr import cidr_cluster
 from sentinel.detect.rules import RULES, DetectionSpec
 from sentinel.detect.spec import enforce_path_evidence
 from sentinel.logging_setup import get_logger
@@ -41,6 +42,21 @@ async def run_once(db: Database, cfg: Config) -> dict[str, int]:
             n, was_new = await _apply(db, cfg, spec)
             detections += n
             new_incidents += was_new
+
+    # net.cidr_cluster is not in RULES: it needs cfg.response.extra_allowlist
+    # for its allowlist guard, which the uniform rule(db, cursor) signature
+    # above has no way to carry. Called here, before the cursor advances, so
+    # "fresh since cursor" means the same thing it means for every other rule
+    # in the loop above — just with one more argument on this one call.
+    try:
+        cidr_specs = await cidr_cluster(db, cursor, cfg)
+    except Exception as exc:  # noqa: BLE001 - one broken rule must not stop the rest
+        log.error("rule failed", extra={"rule": "cidr_cluster", "detail": str(exc)})
+        cidr_specs = []
+    for spec in cidr_specs:
+        n, was_new = await _apply(db, cfg, spec)
+        detections += n
+        new_incidents += was_new
 
     await inc_repo.set_detect_cursor(db, max_id)
 

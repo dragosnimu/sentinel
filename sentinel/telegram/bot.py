@@ -242,6 +242,8 @@ _SKIP_REASON_RO = {
     "allowlisted": "sursă în allowlist",
     "known_scanner": "scanner cunoscut",
     "cidr_not_allowed": "bloc CIDR nepermis",
+    "cidr_requires_ttl": "interval fără expirare configurată",
+    "max_active_cidrs": "plafon de intervale active atins",
     "refused_client": "refuzat la validare",
     "executor_error": "executor indisponibil",
 }
