@@ -325,19 +325,23 @@ async def ids_signatures(db: Database, limit: int = 6) -> list[dict[str, Any]]:
     """Real threat signatures only — engine diagnostics are dropped at the
     collector, but older rows predate that filter.
 
-    Rămâne cea mai scumpă interogare a paginii, și niciun index n-o ieftinește:
-    `signature` stă în `raw`, deci fiecare rând de suricata din fereastră cere o
-    pagină de heap, iar rândurile sunt intercalate printre cele de auditd — pe
-    replica gazdei, 258 000 de rânduri împrăștiate pe 253 000 de pagini. Vezi
-    migrația 0030 pentru indexul care s-a construit, s-a măsurat și NU e acolo.
+    Citește coloana `signature`, nu `raw->>'signature'`. PostgreSQL 16 nu poate
+    întoarce valoarea unei expresii dintr-un index — `check_index_only` o
+    ignoră — deci cu expresia în WHERE fiecare rând de suricata din fereastră
+    cerea o pagină de heap, intercalate printre milioane de rânduri de auditd:
+    233 187 de buffere pentru 233 595 de rânduri, măsurat pe replică. Coloana
+    reală, umplută de declanșatorul de pe `raw_events` (migrația 0034), face
+    `Index Only Scan` posibil: 3 536 de buffere pe aceleași date, `Heap
+    Fetches: 0`. Verificat cu `EXCEPT`: zero rânduri diferite față de forma
+    veche, pe toată fereastra.
     """
     rows = await db.fetch(
         """
         SELECT sig, sum(n)::bigint AS n, count(ip) AS ips
-        FROM (SELECT raw->>'signature' AS sig, host(src_ip) AS ip, count(*) AS n
+        FROM (SELECT signature AS sig, host(src_ip) AS ip, count(*) AS n
                 FROM raw_events
                WHERE source = 'suricata' AND ts > now() - interval '7 days'
-                 AND raw->>'signature' NOT LIKE 'SURICATA %'
+                 AND signature NOT LIKE 'SURICATA %'
                GROUP BY 1, 2) pereche
         GROUP BY 1 ORDER BY n DESC LIMIT $1
         """,
