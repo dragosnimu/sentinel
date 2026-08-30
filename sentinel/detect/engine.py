@@ -88,6 +88,31 @@ async def _apply(db: Database, cfg: Config, spec: DetectionSpec) -> tuple[int, i
     if await inc_repo.actor_is_allowlisted(db, spec.actor_key):
         return 0, 0
 
+    # One lookup per DETECTION (not per raw event — see
+    # `sentinel/intel/reputation.py:lookup`'s docstring for why that volume is
+    # fine for a database call while the per-event ingest path needs its own
+    # in-memory answer instead). `category=scanner` sets `is_known_scanner`;
+    # every other category feeds `reputation`, which only ever LOWERS the
+    # auto-block threshold in `respond/decider.py`, never arms one by itself.
+    #
+    # `categories` starts `None`, not `[]`: `upsert_actor` treats `None` as
+    # "do not touch" and `[]` as "overwrite with nothing hostile" (see its
+    # docstring), and those are different facts. A lookup that RAISES must
+    # stay `None` — if it defaulted to `[]` instead, a transient database
+    # blip while looking up a previously-flagged scanner would erase
+    # `is_known_scanner` on this very detection, and the actor it protects
+    # could be auto-blocked on the failure of an unrelated query.
+    categories: list[str] | None = None
+    if spec.src_ip:
+        from sentinel.intel import reputation as intel_reputation
+
+        try:
+            categories = await intel_reputation.lookup(db, spec.src_ip)
+        except Exception as exc:  # noqa: BLE001 - a feed lookup failure must not lose the detection
+            log.warning("reputation lookup failed", extra={"ip": spec.src_ip, "detail": str(exc)})
+    is_known_scanner = None if categories is None else ("scanner" in categories)
+    hostile = None if categories is None else [c for c in categories if c != "scanner"]
+
     await inc_repo.upsert_actor(
         db, spec.actor_key,
         src_ip=spec.src_ip,
@@ -95,6 +120,8 @@ async def _apply(db: Database, cfg: Config, spec: DetectionSpec) -> tuple[int, i
         asn=spec.evidence.get("asn"),
         user_agent=spec.evidence.get("user_agent"),
         asset_id=spec.asset_id,
+        reputation=hostile,
+        is_known_scanner=is_known_scanner,
     )
     detection_id = await inc_repo.record_detection(
         db,

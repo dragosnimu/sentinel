@@ -41,6 +41,7 @@ from sentinel.db.engine import Database
 from sentinel.db.repo import events as events_repo
 from sentinel.db.repo import logins
 from sentinel.enrich.geoip import GeoEnricher
+from sentinel.enrich.reputation import ReputationEnricher
 from sentinel.logging_setup import get_logger, setup_logging
 from sentinel.model.event import Event
 from sentinel.services import parse_service_args
@@ -88,6 +89,10 @@ class Ingest:
                 "skip_command_accounts names accounts absent from this host",
                 extra={"unresolved": list(self.skip_accounts.unresolved)})
         self.geo = GeoEnricher()
+        # Reloaded periodically from `intel_feed_entries`, never queried per
+        # event — see `sentinel/enrich/reputation.py`'s docstring for the
+        # measurement behind that split.
+        self.reputation = ReputationEnricher()
         self._journald = None
         self._nginx_cursors: dict[str, str | None] = {}
         self._eve_path: str | None = None
@@ -182,8 +187,12 @@ class Ingest:
             batch.extend(parse_auditd_lines(lines))
 
         batch = [e for e in batch if e.source not in self.exclude]
+        # Reload check first: a no-op unless the interval elapsed, so this
+        # never adds a query to the common case of "nothing due yet".
+        await self.reputation.maybe_refresh(self.db)
         for ev in batch:
             self.geo.enrich(ev)
+            self.reputation.enrich(ev)
 
         if batch:
             await events_repo.insert_batch(self.db, batch)

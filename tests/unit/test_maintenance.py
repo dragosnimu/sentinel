@@ -420,3 +420,72 @@ def test_the_step_is_registered_in_the_run():
     import inspect
     src = inspect.getsource(ms.run)
     assert "close_stale_incidents" in src
+
+
+# --- refresh_intel: KEV + feed-uri de reputație, în același pas izolat ----
+def test_refresh_intel_calls_both_kev_and_reputation(monkeypatch):
+    """Funcționalitatea 03 a adăugat feed-urile de reputație lângă KEV, în
+    ACELAȘI pas — nu într-un timer separat (vezi argumentul din docstring-ul
+    modulului: reîmprospătarea are nevoie de rețea, iar un timer nou nu apără
+    nimic ce timerul orar existent n-ar fi apărat deja)."""
+    from sentinel.intel import kev, reputation
+
+    calls: list[str] = []
+
+    async def _fake_kev_refresh(db):
+        calls.append("kev")
+        return 3
+
+    async def _fake_reputation_refresh_all(db):
+        calls.append("reputation")
+        return {"feed-a": 10}
+
+    monkeypatch.setattr(kev, "refresh", _fake_kev_refresh)
+    monkeypatch.setattr(reputation, "refresh_all", _fake_reputation_refresh_all)
+    detail, facts = run(ms.refresh_intel(_DB()))
+    assert calls == ["kev", "reputation"]
+    assert facts == {"kev": 3, "reputation": {"feed-a": 10}}
+    assert "3 intrări KEV" in detail
+    assert "10 intrări de reputație pe 1 feed-uri" in detail
+
+
+def test_refresh_intel_reports_a_failed_feed_without_losing_kev(monkeypatch):
+    """Un feed căzut (`_refresh_one` întoarce -1) nu are voie să șteargă din
+    raport ce KEV a reușit între timp — izolarea e ÎNTRE feed-uri, nu doar
+    între pași; `sentinel/intel/reputation.py:_refresh_one` deja garantează
+    asta per-feed, testul de aici pinuiește că `refresh_intel` nu strică
+    dicționarul pe care i-l dă."""
+    from sentinel.intel import kev, reputation
+
+    async def _fake_kev_refresh(db):
+        return 0
+
+    async def _fake_reputation_refresh_all(db):
+        return {"good-feed": 5, "dead-feed": -1}
+
+    monkeypatch.setattr(kev, "refresh", _fake_kev_refresh)
+    monkeypatch.setattr(reputation, "refresh_all", _fake_reputation_refresh_all)
+    detail, facts = run(ms.refresh_intel(_DB()))
+    assert facts["reputation"] == {"good-feed": 5, "dead-feed": -1}
+    assert "dead-feed" in detail
+    assert "1 eșuate" in detail
+
+
+def test_refresh_intel_with_no_feeds_configured_says_nothing_extra(monkeypatch):
+    """Starea de livrare — `intel_feeds` goală sau dezactivată — trebuie să
+    producă un raport care nu vorbește despre feed-uri deloc, nu unul care
+    spune «0 feed-uri, 0 intrări» ca zgomot permanent în jurnalul de
+    mentenanță de fiecare oră."""
+    from sentinel.intel import kev, reputation
+
+    async def _fake_kev_refresh(db):
+        return 0
+
+    async def _fake_reputation_refresh_all(db):
+        return {}
+
+    monkeypatch.setattr(kev, "refresh", _fake_kev_refresh)
+    monkeypatch.setattr(reputation, "refresh_all", _fake_reputation_refresh_all)
+    detail, facts = run(ms.refresh_intel(_DB()))
+    assert "feed" not in detail.lower()
+    assert facts["reputation"] == {}

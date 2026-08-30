@@ -20,7 +20,8 @@ class _StubDB:
 
     def __init__(self, *, flags=None, active_count=0, auto_recent=0, is_active=False,
                  active_cidrs=0):
-        self.flags = flags or {"is_allowlisted": False, "is_known_scanner": False}
+        self.flags = flags or {"is_allowlisted": False, "is_known_scanner": False,
+                                "reputation": []}
         self.active_count = active_count
         self.auto_recent = auto_recent
         self._is_active = is_active
@@ -101,17 +102,20 @@ def test_disabled_is_always_observe():
 
 
 def test_allowlisted_actor_skipped_when_armed():
-    db = _StubDB(flags={"is_allowlisted": True, "is_known_scanner": False})
+    db = _StubDB(flags={"is_allowlisted": True, "is_known_scanner": False,
+                         "reputation": []})
     assert _decide(db, _cfg(enabled=True), _spec()) == "skipped:allowlisted"
 
 
 def test_known_scanner_skipped_when_armed():
-    db = _StubDB(flags={"is_allowlisted": False, "is_known_scanner": True})
+    db = _StubDB(flags={"is_allowlisted": False, "is_known_scanner": True,
+                         "reputation": []})
     assert _decide(db, _cfg(enabled=True), _spec()) == "skipped:known_scanner"
 
 
 def test_known_scanner_not_skipped_if_option_off():
-    db = _StubDB(flags={"is_allowlisted": False, "is_known_scanner": True}, is_active=True)
+    db = _StubDB(flags={"is_allowlisted": False, "is_known_scanner": True,
+                         "reputation": []}, is_active=True)
     # skip_known_scanners off -> passes that guard; is_active short-circuits to
     # "blocked" without touching the executor.
     assert _decide(db, _cfg(enabled=True, skip_known_scanners=False), _spec()) == "blocked"
@@ -185,3 +189,78 @@ def test_max_active_cidrs_cap_does_not_throttle_single_ip_blocks():
     db = _StubDB(active_cidrs=999, is_active=True)
     cfg = _cfg(enabled=True, max_active_cidrs=1)
     assert _decide(db, cfg, _spec()) == "blocked"  # plain IP, unaffected
+
+
+# --- Reputation moves the threshold, never the decision (function 03) ------
+
+def test_lower_by_one_shifts_down_one_tier():
+    assert decider._lower_by_one("high") == "medium"
+    assert decider._lower_by_one("medium") == "low"
+
+
+def test_lower_by_one_never_drops_below_low():
+    """Even the maximally hostile address must still clear SOME local
+    threshold — a floor of 'info' would mean any single event from a
+    hostile-tagged address, however trivial, could arm a block."""
+    assert decider._lower_by_one("low") == "low"
+
+
+def test_reputation_alone_without_enough_local_evidence_stays_observed():
+    """A hostile-feed address with a detection too weak even for the LOWERED
+    gate must not be armed — reputation shortens the local-evidence
+    requirement, it never waives it. If this failed, a single bad feed entry
+    could arm a block with essentially no evidence from this host at all."""
+    db = _StubDB(flags={"is_allowlisted": False, "is_known_scanner": False,
+                         "reputation": ["botnet"]})
+    # min_severity="high" -> lowered to "medium" by the botnet tag; "low" is
+    # still below that lowered floor, so this must stay observed.
+    assert _decide(db, _cfg(enabled=True, min_severity="high"),
+                   _spec(severity="low")) == "observed"
+
+
+def test_reputation_lowers_the_threshold_and_arms_one_tier_earlier():
+    """The concrete case CLAUDE.md asks for: the same local evidence
+    (`medium`) that is ordinarily below the `high` gate must arm a block once
+    the address is tagged with a hostile reputation category. `is_active=True`
+    short-circuits to 'blocked' without touching the executor, same as the
+    other already-past-guard-5 tests in this file."""
+    db = _StubDB(flags={"is_allowlisted": False, "is_known_scanner": False,
+                         "reputation": ["botnet"]}, is_active=True)
+    assert _decide(db, _cfg(enabled=True, min_severity="high"),
+                   _spec(severity="medium")) == "blocked"
+
+
+def test_without_reputation_the_same_medium_severity_stays_observed():
+    """Falsifies the lowering the other way: WITHOUT a hostile tag, the same
+    `medium` detection against the same `high` gate must NOT arm — otherwise
+    the test above would be proving nothing about reputation at all, just
+    that `medium` always arms."""
+    db = _StubDB(flags={"is_allowlisted": False, "is_known_scanner": False,
+                         "reputation": []})
+    assert _decide(db, _cfg(enabled=True, min_severity="high"),
+                   _spec(severity="medium")) == "observed"
+
+
+def test_scanner_category_does_not_lower_the_threshold():
+    """`scanner` has the OPPOSITE effect (protects via `is_known_scanner`,
+    guard 5) and must never also count as a hostile category at guard 2 — an
+    address tagged only `scanner` (no is_known_scanner flag set, an
+    inconsistency that must not matter here) must not get an earlier gate."""
+    db = _StubDB(flags={"is_allowlisted": False, "is_known_scanner": False,
+                         "reputation": ["scanner"]})
+    assert _decide(db, _cfg(enabled=True, min_severity="high"),
+                   _spec(severity="medium")) == "observed"
+
+
+def test_allowlisted_wins_over_a_hostile_reputation_tag():
+    """CLAUDE.md's exact case: an address on `response.extra_allowlist`
+    (reflected here as `actors.is_allowlisted`) that is ALSO on a hostile feed
+    must never be touched — guard 5's allowlist check runs unconditionally
+    after guard 2 and does not care whether reputation lowered the severity
+    floor. Severity is `high` here — enough to arm WITHOUT any lowering — so
+    a failure of this guard would prove reputation can override an explicit
+    allowlist, not merely fail to help it."""
+    db = _StubDB(flags={"is_allowlisted": True, "is_known_scanner": False,
+                         "reputation": ["botnet"]})
+    assert _decide(db, _cfg(enabled=True, min_severity="high"),
+                   _spec(severity="high")) == "skipped:allowlisted"

@@ -375,9 +375,22 @@ async def _alert(db: Database, *, severity: str, dedup_key: str,
 # 5. Intelligence și backup-uri
 # ---------------------------------------------------------------------------
 async def refresh_intel(db: Database) -> tuple[str, dict[str, Any]]:
-    from sentinel.intel import kev
+    from sentinel.intel import kev, reputation
+
     n = await kev.refresh(db)
-    return (f"{n} intrări KEV actualizate" if n else "KEV era la zi", {"kev": n})
+    # Ships with `intel_feeds` empty/disabled (see that module's docstring),
+    # deci `rep` e de obicei `{}` — un WHERE peste zero rânduri activate, nu o
+    # cerere de rețea. Fiecare feed e izolat de `_refresh_one`: unul căzut nu-l
+    # oprește pe următorul, la fel ca separarea dintre pașii de aici.
+    rep = await reputation.refresh_all(db)
+    ok_feeds = {k: v for k, v in rep.items() if v >= 0}
+    failed_feeds = [k for k, v in rep.items() if v < 0]
+    parts = [f"{n} intrări KEV actualizate" if n else "KEV era la zi"]
+    if rep:
+        parts.append(
+            f"{sum(ok_feeds.values())} intrări de reputație pe {len(ok_feeds)} feed-uri"
+            + (f", {len(failed_feeds)} eșuate ({', '.join(failed_feeds)})" if failed_feeds else ""))
+    return "; ".join(parts), {"kev": n, "reputation": rep}
 
 
 async def prune_backups(db: Database, cfg: Config) -> tuple[str, dict[str, Any]]:

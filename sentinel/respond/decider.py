@@ -14,7 +14,10 @@ and shapes the alert. That split means:
 Guards, in order (any one stops the block; armed mode records why):
   1. actor must be a real network address — a single host, or (only relevant
      once allow_cidr_blocks is armed) an aligned range;
-  2. severity at or above the gate (default: high) — noise must not arm;
+  2. severity at or above the gate (default: high) — noise must not arm. A
+     known-hostile actor (reputation feed category botnet/tor/compromised/
+     drop) clears this one severity tier earlier — see "Reputation moves the
+     threshold" below;
   3. no CIDR unless explicitly allowed — one /24 takes out a NAT'd building;
   4. a CIDR must carry a real TTL — auto-block never places a permanent
      block, and a range even less so;
@@ -26,6 +29,27 @@ Guards, in order (any one stops the block; armed mode records why):
 The executor re-checks its own never-block on top of all this, so even a bug
 here cannot firewall off the admin. Ships DISABLED: with auto_block.enabled
 false, every path lands in observe mode and nothing is ever placed automatically.
+
+## Reputation moves the threshold, never the decision
+
+A reputation feed says what an address did somewhere ELSE, on somebody else's
+network, aggregated by a third party this host has no way to audit. Blocking
+on that alone would import every mistake in that feed as a blind spot this
+host cannot diagnose — a wrong DROP-list entry becomes a block with no local
+evidence behind it, and nobody investigating this host's own logs would ever
+find a reason for it.
+
+So `flags["reputation"]` (categories: `botnet`, `tor`, `compromised`, `drop` —
+see `sentinel/intel/reputation.py`; `scanner` is handled separately at guard 5,
+with the OPPOSITE effect) only ever shifts guard 2's severity floor down by
+one tier — `high` needs `medium` instead, `medium` needs `low`. It can never
+push the floor below `low`, and it never substitutes for severity: `severity`
+on every `DetectionSpec` is still assigned purely from what a rule measured on
+THIS host (a count of failed logins, a rate of 404s — see `detect/rules.py`),
+never from the feed. A hostile-tagged address with zero local evidence never
+reaches this function with a severity at all, because no rule ever fired for
+it; a lower floor cannot arm what was never proposed. That is the literal
+meaning of "shortens the local-evidence requirement, does not waive it".
 """
 
 from __future__ import annotations
@@ -42,7 +66,21 @@ from sentinel.respond import actions
 
 log = get_logger(__name__)
 
-_SEV_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+_SEV_ORDER = ("info", "low", "medium", "high", "critical")
+_SEV_RANK = {s: i for i, s in enumerate(_SEV_ORDER)}
+
+# Categories that make an address MORE likely to deserve an earlier block.
+# `scanner` is deliberately absent — it has the inverse effect, handled at
+# guard 5 via `is_known_scanner`/`skip_known_scanners`, never here.
+_HOSTILE_CATEGORIES = frozenset({"botnet", "tor", "compromised", "drop"})
+
+
+def _lower_by_one(min_sev: str) -> str:
+    """One severity tier below `min_sev`, never below `low`. A known-hostile
+    actor earns a SHORTER local-evidence requirement, not a WAIVED one — see
+    "Reputation moves the threshold" in the module docstring."""
+    idx = _SEV_RANK.get(min_sev, _SEV_RANK["high"])
+    return _SEV_ORDER[max(idx - 1, 1)]
 
 
 def _is_ip(actor_key: str | None) -> bool:
@@ -86,9 +124,19 @@ async def _decide(db: Database, cfg: Config, spec: DetectionSpec, incident_id: i
     if not _is_ip(spec.actor_key):
         return "observed"
 
+    # Fetched here, not at guard 5 where only allowlist/scanner used to need
+    # it: guard 2 below now also reads `flags["reputation"]`.
+    flags = await inc_repo.actor_flags(db, spec.actor_key)
+
     # Guard 2: severity gate. Below it, never arm — but still surface the alert
-    # with a manual block button.
-    if _SEV_RANK.get(spec.severity, 0) < _SEV_RANK.get(ab.min_severity, 3):
+    # with a manual block button. A known-hostile actor clears the gate one
+    # tier earlier; see "Reputation moves the threshold" in the module
+    # docstring for why this can only ever shorten the local-evidence
+    # requirement, never replace it.
+    effective_min = ab.min_severity
+    if any(cat in _HOSTILE_CATEGORIES for cat in flags.get("reputation", ())):
+        effective_min = _lower_by_one(ab.min_severity)
+    if _SEV_RANK.get(spec.severity, 0) < _SEV_RANK.get(effective_min, 3):
         return "observed"
 
     is_cidr = "/" in spec.actor_key
@@ -108,8 +156,8 @@ async def _decide(db: Database, cfg: Config, spec: DetectionSpec, incident_id: i
         return "skipped:cidr_requires_ttl" if ab.enabled else "observed"
 
     # Guard 5: allowlisted or a known research scanner — internet background
-    # noise, blocking it achieves nothing and risks a false positive.
-    flags = await inc_repo.actor_flags(db, spec.actor_key)
+    # noise, blocking it achieves nothing and risks a false positive. `flags`
+    # was already fetched above, for guard 2's reputation check.
     if flags.get("is_allowlisted"):
         return "skipped:allowlisted" if ab.enabled else "observed"
     if ab.skip_known_scanners and flags.get("is_known_scanner"):

@@ -34,18 +34,34 @@ async def upsert_actor(
     country: str | None = None,
     asn: int | None = None,
     asset_id: int | None = None,
+    reputation: list[str] | None = None,
+    is_known_scanner: bool | None = None,
 ) -> None:
+    """`reputation`/`is_known_scanner` are the caller's CURRENT read of the
+    feeds (see `detect/engine.py:_apply`, which looks them up via
+    `sentinel.intel.reputation.lookup` on every detection). `None` for either
+    means "the caller did not look up" — leave the existing value alone —
+    never "clear it"; a lookup failure must not erase a real scanner flag that
+    was set on a previous, successful detection. When a value IS supplied it
+    OVERWRITES rather than merges with history: unlike `countries`/`asns`
+    (append-only, since "this actor was once seen from FR" stays true forever),
+    reputation is a claim about what the feeds say RIGHT NOW, and an
+    accumulating array would keep a category from a feed entry removed months
+    ago on the row forever."""
     await db.execute(
         """
         INSERT INTO actors (actor_key, kind, member_ips, last_seen, detection_count,
-                            user_agents, countries, asns, targeted_assets)
+                            user_agents, countries, asns, targeted_assets,
+                            reputation, is_known_scanner)
         VALUES ($1, 'ip',
                 CASE WHEN $2::inet IS NULL THEN '{}'::inet[] ELSE ARRAY[$2::inet] END,
                 now(), 1,
                 CASE WHEN $3::text IS NULL THEN '{}'::text[] ELSE ARRAY[$3] END,
                 CASE WHEN $4::text IS NULL THEN '{}'::text[] ELSE ARRAY[$4] END,
                 CASE WHEN $5::int  IS NULL THEN '{}'::int[]  ELSE ARRAY[$5] END,
-                CASE WHEN $6::bigint IS NULL THEN '{}'::bigint[] ELSE ARRAY[$6] END)
+                CASE WHEN $6::bigint IS NULL THEN '{}'::bigint[] ELSE ARRAY[$6] END,
+                COALESCE($7::text[], '{}'::text[]),
+                COALESCE($8::boolean, false))
         ON CONFLICT (actor_key) DO UPDATE SET
             last_seen        = now(),
             detection_count  = actors.detection_count + 1,
@@ -55,9 +71,11 @@ async def upsert_actor(
             countries        = COALESCE((SELECT array_agg(DISTINCT c) FROM unnest(actors.countries || EXCLUDED.countries) c), '{}'::text[]),
             asns             = COALESCE((SELECT array_agg(DISTINCT a) FROM unnest(actors.asns || EXCLUDED.asns) a), '{}'::int[]),
             user_agents      = COALESCE((SELECT array_agg(DISTINCT u) FROM unnest((actors.user_agents || EXCLUDED.user_agents)[1:20]) u), '{}'::text[]),
-            targeted_assets  = COALESCE((SELECT array_agg(DISTINCT t) FROM unnest(actors.targeted_assets || EXCLUDED.targeted_assets) t), '{}'::bigint[])
+            targeted_assets  = COALESCE((SELECT array_agg(DISTINCT t) FROM unnest(actors.targeted_assets || EXCLUDED.targeted_assets) t), '{}'::bigint[]),
+            reputation       = CASE WHEN $7::text[]  IS NULL THEN actors.reputation      ELSE $7::text[]  END,
+            is_known_scanner = CASE WHEN $8::boolean IS NULL THEN actors.is_known_scanner ELSE $8::boolean END
         """,
-        actor_key, src_ip, user_agent, country, asn, asset_id,
+        actor_key, src_ip, user_agent, country, asn, asset_id, reputation, is_known_scanner,
     )
 
 
@@ -65,15 +83,22 @@ async def actor_is_allowlisted(db: Database, actor_key: str) -> bool:
     return bool(await db.fetchval("SELECT is_allowlisted FROM actors WHERE actor_key = $1", actor_key))
 
 
-async def actor_flags(db: Database, actor_key: str) -> dict[str, bool]:
-    """The two flags the decider consults before an auto-block. A missing actor
-    (never seen the enrichment pass) reads as neither allowlisted nor scanner."""
+async def actor_flags(db: Database, actor_key: str) -> dict[str, Any]:
+    """What the decider consults before an auto-block: the two boolean gates
+    plus the hostile-category list that only ever LOWERS the local-evidence
+    threshold (see `respond/decider.py`, guard 2 — never arms a block by
+    itself). A missing actor (never seen the enrichment pass) reads as
+    allowlisted=false, known_scanner=false, reputation=[] — absence of
+    reputation, not evidence of innocence, and the decider treats it exactly
+    like any other actor with no feed match: no threshold change."""
     row = await db.fetchrow(
-        "SELECT is_allowlisted, is_known_scanner FROM actors WHERE actor_key = $1", actor_key)
+        "SELECT is_allowlisted, is_known_scanner, reputation FROM actors WHERE actor_key = $1",
+        actor_key)
     if row is None:
-        return {"is_allowlisted": False, "is_known_scanner": False}
+        return {"is_allowlisted": False, "is_known_scanner": False, "reputation": []}
     return {"is_allowlisted": bool(row["is_allowlisted"]),
-            "is_known_scanner": bool(row["is_known_scanner"])}
+            "is_known_scanner": bool(row["is_known_scanner"]),
+            "reputation": list(row["reputation"] or [])}
 
 
 async def set_auto_action(db: Database, incident_id: int, action: str) -> None:

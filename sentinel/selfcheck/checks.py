@@ -2670,6 +2670,109 @@ async def check_last_scan(db: Database, cfg: Config) -> list[CheckResult]:
 
 
 # ---------------------------------------------------------------------------
+# Feed-uri de reputație: întrerupătorul de circuit din 0006 nu e vizibil dacă
+# nimeni nu-l citește altundeva decât în `intel_feeds.last_error`.
+# ---------------------------------------------------------------------------
+async def check_reputation_feeds(db: Database) -> list[CheckResult]:
+    """Fiecare feed de reputație ACTIVAT e proaspăt, iar un feed căzut se vede
+    aici — nu doar în `last_error`, un rând pe care altfel nimeni nu-l citește.
+
+    `sentinel/intel/reputation.py` scrie întregul întrerupător de circuit din
+    migrația 0006 (`failures`/`disabled_until`/`last_error`) la fiecare eșec de
+    reîmprospătare, o dată pe oră, din `sentinel-maintenance`. Un câmp scris
+    într-un tabel pe care nimeni nu-l citește e exact tiparul din CLAUDE.md —
+    un fapt real care nu ajunge niciodată la operator. Verificarea de aici e
+    drumul lui spre `selfcheck_state`, deci și spre Telegram.
+
+    Tabela goală sau cu toate feed-urile dezactivate — starea în care
+    funcționalitatea se livrează — e `ok`, nu `unknown`: absența unui feed
+    ACTIVAT nu e o scanare care n-a rulat niciodată (cazul lui
+    `check_last_scan`), e o decizie a operatorului de a nu porni încă niciunul.
+
+    Un feed peste `MAX_FEED_AGE_H` fără succes nu mai are efect — nici la
+    îmbogățirea din ingestie (`enrich/reputation.py`), nici la pragul din
+    `respond/decider.py` — și asta se spune explicit, ca „e degradat" să nu se
+    citească drept „nu contează".
+    """
+    from sentinel.intel.reputation import MAX_FEED_AGE_H
+
+    rows = await db.fetch(
+        """
+        SELECT name, category, confidence, entry_count, failures, last_error,
+               last_refresh, last_success, disabled_until,
+               (disabled_until IS NOT NULL AND disabled_until > now()) AS circuit_tripped,
+               EXTRACT(EPOCH FROM (now() - last_success)) AS success_age_s
+          FROM intel_feeds
+         WHERE enabled
+         ORDER BY name
+        """)
+    if not rows:
+        return [CheckResult(
+            "intel:feeds", "Feed-uri de reputație", "ok",
+            detail="niciun feed activat — starea de livrare a funcționalității; "
+                   "operatorul decide ce pornește (vezi `sentinel/intel/reputation.py`)",
+            facts={"enabled": 0})]
+
+    results: list[CheckResult] = []
+    for row in rows:
+        r = dict(row)
+        name = str(r["name"])
+        key = f"intel:feed:{name}"
+        category = str(r.get("category") or "?")
+        failures = int(r.get("failures") or 0)
+
+        if r.get("circuit_tripped"):
+            results.append(CheckResult(
+                key, f"Feed-ul „{name}” — întrerupător de circuit declanșat", "degraded",
+                detail=f"{failures} eșecuri consecutive la reîmprospătare, oprit "
+                       f"temporar. Ultima eroare: {str(r.get('last_error') or '—')[:200]}",
+                action="journalctl -u sentinel-maintenance -n 80",
+                facts={"category": category, "failures": failures,
+                       "disabled_until": r.get("disabled_until").isoformat()
+                       if r.get("disabled_until") else None}))
+            continue
+
+        if r.get("last_success") is None:
+            results.append(CheckResult(
+                key, f"Feed-ul „{name}” nu s-a reîmprospătat niciodată cu succes", "degraded",
+                detail=f"{failures} eșecuri până acum. Ultima eroare: "
+                       f"{str(r.get('last_error') or '—')[:200]}",
+                action="journalctl -u sentinel-maintenance -n 80",
+                facts={"category": category, "failures": failures}))
+            continue
+
+        age_s = r.get("success_age_s")
+        if age_s is None:
+            results.append(CheckResult(
+                key, f"Feed-ul „{name}” — nu-i pot afla vârsta", "unknown",
+                detail="nu am putut citi de când e ultimul succes",
+                facts={"category": category}))
+            continue
+
+        age_s = float(age_s)
+        if age_s > MAX_FEED_AGE_H * 3600:
+            results.append(CheckResult(
+                key, f"Feed-ul „{name}” a rămas în urmă", "degraded",
+                detail=f"ultimul succes acum {_ago(age_s / 60)} — mai vechi de "
+                       f"{MAX_FEED_AGE_H} de ore, pragul de prospețime. Categoria "
+                       f"lui „{category}” nu mai are efect: nici la îmbogățirea "
+                       f"evenimentelor, nici la pragul de auto-block",
+                action="journalctl -u sentinel-maintenance -n 80",
+                facts={"category": category, "age_h": int(age_s / 3600),
+                       "entry_count": int(r.get("entry_count") or 0)}))
+            continue
+
+        results.append(CheckResult(
+            key, f"Feed-ul „{name}”", "ok",
+            detail=f"reîmprospătat cu succes acum {_ago(age_s / 60)}, "
+                   f"{int(r.get('entry_count') or 0)} intrări, categorie „{category}”",
+            facts={"category": category, "entries": int(r.get("entry_count") or 0),
+                   "confidence": int(r.get("confidence") or 0),
+                   "age_h": int(age_s / 3600)}))
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Auditd: nucleul își aruncă înregistrările?
 # ---------------------------------------------------------------------------
 #: Pragul de înregistrări pierdute e ZERO, dinadins. `lost` e cumulativ de la
@@ -3227,6 +3330,7 @@ CHECKS: tuple[tuple[str, Callable], ...] = (
     ("code", check_running_code_is_current),
     ("ship", check_ship_lag),
     ("scan", check_last_scan),
+    ("reputation", check_reputation_feeds),
     ("inventory", check_inventory),
     ("audit", check_audit_records),
     ("history", check_command_history_filter),
