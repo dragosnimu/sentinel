@@ -108,6 +108,27 @@ async def count_active(db: Database) -> int:
     return int(await db.fetchval("SELECT count(*) FROM blocklist WHERE active") or 0)
 
 
+async def count_active_cidrs(db: Database) -> int:
+    """How many active blocks are RANGES rather than single addresses.
+
+    Reads the mask straight off `ip`, not `prefix_len`: `record_block` above
+    never sets `prefix_len` on insert, only `ip` — so a query keyed on
+    `prefix_len` would read back zero forever regardless of what is actually
+    blocked. `ip` genuinely carries the mask for whatever string was inserted
+    (a plain address defaults to /32 or /128; a CIDR string keeps its own),
+    so that is what the decider's max_active_cidrs guard must trust.
+    """
+    return int(await db.fetchval(
+        """
+        SELECT count(*) FROM blocklist
+         WHERE active AND (
+           (family(ip) = 4 AND masklen(ip) < 32) OR
+           (family(ip) = 6 AND masklen(ip) < 128)
+         )
+        """
+    ) or 0)
+
+
 async def count_auto_since(db: Database, seconds: int) -> int:
     """How many the decider has auto-blocked in the last `seconds`. Feeds the
     per-minute rate cap: a runaway detector must not black-hole the internet one

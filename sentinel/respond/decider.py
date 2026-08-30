@@ -12,12 +12,16 @@ and shapes the alert. That split means:
     whether the block is actually placed.
 
 Guards, in order (any one stops the block; armed mode records why):
-  1. actor must be a real IP — a campaign cluster key has nothing to block;
+  1. actor must be a real network address — a single host, or (only relevant
+     once allow_cidr_blocks is armed) an aligned range;
   2. severity at or above the gate (default: high) — noise must not arm;
-  3. actor not allowlisted and not a known research scanner;
-  4. no CIDR unless explicitly allowed — one /24 takes out a NAT'd building;
-  5. blocklist below max_elements;
-  6. under max_per_minute — the runaway-detector backstop.
+  3. no CIDR unless explicitly allowed — one /24 takes out a NAT'd building;
+  4. a CIDR must carry a real TTL — auto-block never places a permanent
+     block, and a range even less so;
+  5. actor not allowlisted and not a known research scanner;
+  6. blocklist below max_elements;
+  7. a CIDR stays below its own max_active_cidrs, tighter than max_elements;
+  8. under max_per_minute — the runaway-detector backstop.
 
 The executor re-checks its own never-block on top of all this, so even a bug
 here cannot firewall off the admin. Ships DISABLED: with auto_block.enabled
@@ -42,10 +46,19 @@ _SEV_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 
 
 def _is_ip(actor_key: str | None) -> bool:
+    """A real network address for nftables — a single host, or (only relevant
+    once allow_cidr_blocks is armed) an aligned network like `198.51.100.0/24`.
+
+    `ip_network(actor_key, strict=True)` accepts both and rejects a sloppy
+    `198.51.100.5/24` (host bits set past the mask) exactly as it rejects
+    `campaign:<hash>` — neither is something nftables can drop. Before this
+    used `ip_address`, any CIDR-shaped actor_key failed here and returned
+    "observed" before ever reaching guard 3 below, so the CIDR gate there was
+    unreachable code — dead for every proposal, not just the disallowed ones."""
     if not actor_key:
         return False
     try:
-        ipaddress.ip_address(actor_key)
+        ipaddress.ip_network(actor_key, strict=True)
     except ValueError:
         return False
     return True
@@ -78,12 +91,23 @@ async def _decide(db: Database, cfg: Config, spec: DetectionSpec, incident_id: i
     if _SEV_RANK.get(spec.severity, 0) < _SEV_RANK.get(ab.min_severity, 3):
         return "observed"
 
+    is_cidr = "/" in spec.actor_key
+
     # Guard 3: a /24 is a CIDR; actor_key is a single host here, but keep the
     # guard honest for when cluster actors gain address ranges.
-    if "/" in spec.actor_key and not ab.allow_cidr_blocks:
+    if is_cidr and not ab.allow_cidr_blocks:
         return "skipped:cidr_not_allowed" if ab.enabled else "observed"
 
-    # Guard 4: allowlisted or a known research scanner — internet background
+    # Guard 4: 0002's schema comment is explicit that only an operator creates
+    # a permanent block and "auto-block never does" — a range even less than a
+    # single host, since a bad /24 sits on far more innocent addresses than a
+    # bad /32. default_ttl_s is a required int in config, but a stray YAML
+    # `null` or a `0` must not silently turn into a permanent range block —
+    # refuse instead of placing one nobody decided on.
+    if is_cidr and not ab.default_ttl_s:
+        return "skipped:cidr_requires_ttl" if ab.enabled else "observed"
+
+    # Guard 5: allowlisted or a known research scanner — internet background
     # noise, blocking it achieves nothing and risks a false positive.
     flags = await inc_repo.actor_flags(db, spec.actor_key)
     if flags.get("is_allowlisted"):
@@ -101,12 +125,21 @@ async def _decide(db: Database, cfg: Config, spec: DetectionSpec, incident_id: i
     if await blocklist_repo.is_active(db, spec.actor_key):
         return "blocked"
 
-    # Guard 5: hard ceiling on set size.
+    # Guard 6: hard ceiling on set size.
     if await blocklist_repo.count_active(db) >= ab.max_elements:
         log.error("auto-block cap: max_elements reached", extra={"cap": ab.max_elements})
         return "skipped:max_elements"
 
-    # Guard 6: rate cap — the runaway-detector backstop.
+    # Guard 7: a separate, tighter ceiling on active RANGE blocks. max_elements
+    # counts individual addresses too — a handful of /24s already covers
+    # thousands of them without the raw element count coming anywhere near its
+    # cap, so a runaway CIDR proposer needs its own backstop.
+    if is_cidr and await blocklist_repo.count_active_cidrs(db) >= ab.max_active_cidrs:
+        log.error("auto-block cap: max_active_cidrs reached",
+                  extra={"cap": ab.max_active_cidrs})
+        return "skipped:max_active_cidrs"
+
+    # Guard 8: rate cap — the runaway-detector backstop.
     if await blocklist_repo.count_auto_since(db, 60) >= ab.max_per_minute:
         log.error("auto-block cap: max_per_minute reached", extra={"cap": ab.max_per_minute})
         return "skipped:rate_cap"

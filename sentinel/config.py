@@ -296,6 +296,15 @@ class AutoBlockConfig:
     # Blocking a whole /24 takes out NAT'd offices. Off by default.
     allow_cidr_blocks: bool = False
     default_ttl_s: int = 86_400
+    # A ceiling on active RANGE blocks specifically, separate from
+    # max_elements: a single /24 quietly covers 254 addresses, so a handful of
+    # them fills a meaningful share of max_elements without the *count* of
+    # active blocks looking anywhere near its cap. sentinel/detect/cidr.py
+    # measured ≈6 qualifying /24 candidates a day at its chosen threshold; 20
+    # gives the operator more than three days of headroom to react to a
+    # sustained wave before this stops arming new ranges. Moot while
+    # allow_cidr_blocks stays False — this is the backstop for when it does not.
+    max_active_cidrs: int = 20
     # Never auto-block something the reputation feeds identify as a research
     # scanner; it is internet background noise, not an attack on you.
     skip_known_scanners: bool = True

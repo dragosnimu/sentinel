@@ -18,11 +18,13 @@ class _StubDB:
     """Answers exactly the reads the decider makes. `flags` is what actor_flags
     resolves to; counters keep the caps from tripping unless a test asks."""
 
-    def __init__(self, *, flags=None, active_count=0, auto_recent=0, is_active=False):
+    def __init__(self, *, flags=None, active_count=0, auto_recent=0, is_active=False,
+                 active_cidrs=0):
         self.flags = flags or {"is_allowlisted": False, "is_known_scanner": False}
         self.active_count = active_count
         self.auto_recent = auto_recent
         self._is_active = is_active
+        self.active_cidrs = active_cidrs
         self.updates: list[tuple] = []
 
     async def fetchrow(self, sql, *args):
@@ -31,6 +33,11 @@ class _StubDB:
         return None
 
     async def fetchval(self, sql, *args):
+        # Checked before the generic "WHERE active" branch below: count_active
+        # and count_active_cidrs both contain that substring, and only the
+        # latter also mentions masklen.
+        if "masklen(ip)" in sql:
+            return self.active_cidrs
         if "WHERE active" in sql and "created_by" not in sql:
             return self.active_count
         if "created_by LIKE 'auto:%'" in sql:
@@ -45,11 +52,13 @@ class _StubDB:
 
 
 def _cfg(*, enabled, min_severity="high", max_per_minute=60, max_elements=20000,
-         skip_known_scanners=True, allow_cidr_blocks=False, default_ttl_s=86400):
+         skip_known_scanners=True, allow_cidr_blocks=False, default_ttl_s=86400,
+         max_active_cidrs=20):
     return SimpleNamespace(response=SimpleNamespace(auto_block=SimpleNamespace(
         enabled=enabled, min_severity=min_severity, max_per_minute=max_per_minute,
         max_elements=max_elements, skip_known_scanners=skip_known_scanners,
-        allow_cidr_blocks=allow_cidr_blocks, default_ttl_s=default_ttl_s)))
+        allow_cidr_blocks=allow_cidr_blocks, default_ttl_s=default_ttl_s,
+        max_active_cidrs=max_active_cidrs)))
 
 
 def _spec(actor_key="203.0.113.53", severity="high"):
@@ -67,6 +76,14 @@ def test_is_ip():
     assert decider._is_ip("2001:db8::1")
     assert not decider._is_ip("campaign:abc")
     assert not decider._is_ip(None)
+
+
+def test_is_ip_accepts_an_aligned_prefix_but_not_a_sloppy_one():
+    """`_is_ip` must recognise a properly masked /24 — otherwise every CIDR
+    proposal dies at guard 1 and the CIDR guard at guard 3 is unreachable code,
+    which is exactly the bug this change fixes (verified below)."""
+    assert decider._is_ip("65.49.1.0/24")
+    assert not decider._is_ip("65.49.1.5/24")  # host bits set past the mask
 
 
 def test_non_ip_actor_is_observe_only():
@@ -113,3 +130,58 @@ def test_rate_cap_when_armed():
 def test_already_active_is_not_reblocked():
     db = _StubDB(is_active=True)
     assert _decide(db, _cfg(enabled=True), _spec()) == "blocked"
+
+
+# --- CIDR-specific guards (function 02) -------------------------------------
+
+def test_cidr_default_config_is_observed_not_blocked():
+    """The shipped default (allow_cidr_blocks=false, ships disabled) must turn
+    a /24 proposal into 'observed', never 'blocked' — this is the whole point
+    of shipping the detector before the operator arms it."""
+    db = _StubDB()
+    assert _decide(db, _cfg(enabled=False), _spec(actor_key="65.49.1.0/24")) == "observed"
+
+
+def test_cidr_guard_is_reached_and_stops_the_block_when_armed():
+    """With auto-block armed but allow_cidr_blocks still off, a /24 must be
+    stopped by name at guard 3 ('skipped:cidr_not_allowed'), not merely land on
+    'observed' for the unrelated reason that guard 1 failed to recognise it as
+    an address. Before the guard-1 fix this returned 'observed' regardless of
+    allow_cidr_blocks, silently making guard 3 dead code."""
+    db = _StubDB()
+    cfg = _cfg(enabled=True, allow_cidr_blocks=False)
+    assert _decide(db, cfg, _spec(actor_key="65.49.1.0/24")) == "skipped:cidr_not_allowed"
+
+
+def test_cidr_without_a_ttl_is_refused_when_armed():
+    """0002's schema comment: only an operator creates a permanent block, and
+    auto-block never does — a range even less so. A misconfigured
+    default_ttl_s of 0 must refuse the range rather than place a permanent
+    one nobody decided on."""
+    db = _StubDB()
+    cfg = _cfg(enabled=True, allow_cidr_blocks=True, default_ttl_s=0)
+    assert _decide(db, cfg, _spec(actor_key="65.49.1.0/24")) == "skipped:cidr_requires_ttl"
+
+
+def test_cidr_without_a_ttl_is_observed_when_disabled():
+    db = _StubDB()
+    cfg = _cfg(enabled=False, allow_cidr_blocks=True, default_ttl_s=0)
+    assert _decide(db, cfg, _spec(actor_key="65.49.1.0/24")) == "observed"
+
+
+def test_max_active_cidrs_cap_when_armed():
+    """A separate, tighter ceiling than max_elements: a handful of /24s covers
+    thousands of addresses without the raw element count coming close to
+    max_elements, so this cap needs its own trip wire."""
+    db = _StubDB(active_cidrs=5)
+    cfg = _cfg(enabled=True, allow_cidr_blocks=True, max_active_cidrs=5)
+    assert _decide(db, cfg, _spec(actor_key="65.49.1.0/24")) == "skipped:max_active_cidrs"
+
+
+def test_max_active_cidrs_cap_does_not_throttle_single_ip_blocks():
+    """Falsifies the cap the other way: it must only ever gate CIDR actor
+    keys. A cap that also counted against ordinary /32 auto-blocks would
+    quietly stop unrelated single-IP blocking once a few ranges were active."""
+    db = _StubDB(active_cidrs=999, is_active=True)
+    cfg = _cfg(enabled=True, max_active_cidrs=1)
+    assert _decide(db, cfg, _spec()) == "blocked"  # plain IP, unaffected
