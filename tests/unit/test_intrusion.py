@@ -94,13 +94,28 @@ def test_intrusion_rules_never_produce_a_blockable_address():
         assert spec.actor_key == "host"
 
 
+def _bf_row(**kw):
+    """Rândul pe care `_BRUTEFORCE_SQL` l-ar întoarce: cont + adresă,
+    numărate separat, ca funcția să aleagă dovada corectă."""
+    base = {
+        "ip": "203.0.113.47", "username": "root", "geo_country": "DE",
+        "geo_asn": 200651, "metoda": "password", "ok_id": 99, "ok_ts": NOW,
+        "fails_cont": 0, "fails_ip": 0,
+        "first_fail_cont": None, "first_fail_ip": None,
+        "fail_ids_cont": [], "fail_ids_ip": [],
+    }
+    base.update(kw)
+    return base
+
+
 def test_a_successful_login_after_a_burst_of_failures_is_critical():
     """Restul motorului alertează pe cele 200 de încercări eșuate. Asta
-    alertează pe a 201-a — singura care contează."""
-    db = _DB(rows={"WITH ok AS": [{
-        "ip": "203.0.113.47", "username": "root", "geo_country": "DE",
-        "geo_asn": 200651, "ok_id": 99, "ok_ts": NOW, "fails": 214,
-        "first_fail": NOW - timedelta(minutes=7), "fail_ids": [1, 2, 3]}]})
+    alertează pe a 201-a — singura care contează. Sute de eșecuri pe `root`
+    urmate de o reușită pe `root`, cu parola: ESTE incident."""
+    db = _DB(rows={"WITH ok AS": [_bf_row(
+        fails_cont=214, fails_ip=214,
+        first_fail_cont=NOW - timedelta(minutes=7),
+        fail_ids_cont=[1, 2, 3])]})
     specs = run(intrusion.successful_login_after_bruteforce(db, 0))
     assert len(specs) == 1
     s = specs[0]
@@ -108,6 +123,32 @@ def test_a_successful_login_after_a_burst_of_failures_is_critical():
     assert "REUȘITĂ" in s.title
     assert "214" in s.summary
     assert s.evidence["fails_before"] == 214
+
+
+def test_failures_on_other_accounts_do_not_taint_a_different_accounts_success():
+    """Defectul reparat pe 30 august 2026, exact ca la `insights.posture`:
+    trei refuzuri pe `dragos`, `deploy` și `admin`, apoi o reușită pe
+    `sentinel-deploy` de pe ACEEAȘI adresă — alt cont, deci nimic spart. Nu e
+    incident, fiindcă eșecurile de pe contul care a reușit sunt zero.
+
+    `fails_ip=7` (peste `MIN_FAILS_BEFORE`) e ales anume: dacă regula ar mai
+    citi eșecurile pe adresă în loc de cele pe cont, testul ăsta ar trece
+    fals — un `fails_ip` sub prag n-ar fi deosebit cazul bun de cel reparat."""
+    db = _DB(rows={"WITH ok AS": [_bf_row(
+        username="sentinel-deploy",
+        fails_cont=0,   # nimic pe `sentinel-deploy` însuși
+        fails_ip=7)]})  # cele trei refuzuri există, dar pe alte conturi
+    specs = run(intrusion.successful_login_after_bruteforce(db, 0))
+    assert specs == [], "eșecuri pe alt cont nu fac reușita suspectă"
+
+
+def test_a_publickey_success_is_never_flagged_no_matter_how_many_failures():
+    """O cheie nu se ghicește. Reușită pe `publickey` după oricâte eșecuri pe
+    parolă de la aceeași adresă/cont: nu e o forțare care a mers."""
+    db = _DB(rows={"WITH ok AS": [_bf_row(
+        metoda="publickey", fails_cont=500, fails_ip=500)]})
+    specs = run(intrusion.successful_login_after_bruteforce(db, 0))
+    assert specs == [], "publickey nu poate fi rezultatul unei ghiciri"
 
 
 def test_a_reverse_shell_command_line_reaches_the_alert():
@@ -265,10 +306,10 @@ def test_a_full_intrusion_produces_alerts_at_each_stage():
     stages = []
 
     # 1. a intrat
-    db = _DB(rows={"WITH ok AS": [{
-        "ip": "203.0.113.47", "username": "deploy", "geo_country": "RU",
-        "geo_asn": 12345, "ok_id": 1, "ok_ts": NOW, "fails": 180,
-        "first_fail": NOW - timedelta(minutes=9), "fail_ids": [1]}]})
+    db = _DB(rows={"WITH ok AS": [_bf_row(
+        username="deploy", geo_country="RU", geo_asn=12345,
+        ok_id=1, fails_cont=180, fails_ip=180,
+        first_fail_cont=NOW - timedelta(minutes=9), fail_ids_cont=[1])]})
     stages += run(intrusion.successful_login_after_bruteforce(db, 0))
 
     # 2. și-a lăsat cheia

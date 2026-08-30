@@ -53,8 +53,18 @@ MAX_QUOTED = 8
 # Fereastra în care se caută eșecurile dinaintea unei autentificări reușite.
 BRUTEFORCE_LOOKBACK_MIN = 30
 
-# Câte eșecuri de la aceeași adresă fac reușita suspectă. Sub cinci, e un om
-# care și-a greșit parola de câteva ori.
+# Câte eșecuri fac reușita suspectă. Sub cinci, e un om care și-a greșit
+# parola de câteva ori.
+#
+# Numărate pe ACELAȘI cont ca reușita, nu doar de la aceeași adresă — vezi
+# comentariul de la `_BRUTEFORCE_SQL` pentru defectul pe care asta îl repară.
+# Rămâne 5, nu cei 20 de la `analytics/insights.py._FORTARE_ESECURI_MIN`,
+# fiindcă întreabă altceva: fereastra de-aici e de `BRUTEFORCE_LOOKBACK_MIN`
+# minute, sub un singur incident, nu 24h agregate pentru un titlu de pagină.
+# Măsurat pe gazdă (29 august 2026, 30 de zile): pentru ORICE autentificare
+# reușită reală, `max(eșecuri pe același cont)` e 0 — deci 5 rămâne mult
+# deasupra a orice a produs vreodată o reușită legitimă aici, nu doar deasupra
+# pragului de „câteva greșeli de tastare" din motivația inițială.
 MIN_FAILS_BEFORE = 5
 
 # Binarele care, executate de un utilizator obișnuit, sunt mai des unelte de
@@ -224,6 +234,65 @@ async def privilege_escalation(db: Database, cursor: int) -> list[DetectionSpec]
 # ---------------------------------------------------------------------------
 # 3. Autentificare reușită după o rafală de eșecuri
 # ---------------------------------------------------------------------------
+#
+# Reparat pe același defect ca `analytics/insights.py._FORTARE_SQL` (vezi
+# comentariul de-acolo, 28 august 2026): forma veche cerea doar COEXISTENȚA —
+# aceeași adresă avea ≥5 eșecuri în fereastră ȘI o reușită oarecare — nu
+# CAUZALITATEA. Pe gazda asta asta a însemnat un „🔴 Autentificare reușită de
+# la un atacator" pentru o sesiune de deploy: trei refuzuri pe `dragos`,
+# `deploy` și `admin`, apoi o reușită pe `sentinel-deploy` de pe ACEEAȘI
+# adresă — alt cont, deci nimic spart. Reluată peste 30 de zile de date reale,
+# regula veche a dat zero rânduri: nu e o pană în așteptare, e o mină care n-a
+# explodat încă doar fiindcă nimeni n-a reușit să intre de pe o adresă care și
+# eșuase des.
+#
+# Doi eșecuri o mai leagă de reușită: cont și metodă.
+#   * `f.username = ok.username` — o forțare care reușește, reușește pe
+#     contul pe care îl atacă. Eșecurile pe `admin` nu spun nimic despre o
+#     reușită pe `sentinel-deploy`.
+#   * `auth_method IS DISTINCT FROM 'publickey'`, pe reușită ȘI pe eșecuri —
+#     o cheie nu se ghicește, deci o reușită pe cheie nu e o forțare care a
+#     mers, indiferent câte eșecuri au precedat-o (un agent ssh cu mai multe
+#     chei încărcate emite câte un refuz per cheie pe aceeași conexiune,
+#     ceea ce a produs exact cele trei „atacuri" de mai sus în trei secunde).
+#     `IS DISTINCT FROM`, nu `<>`: o metodă NECUNOSCUTĂ (parserul sshd n-o
+#     scrie pe liniile „Invalid user") tot trebuie numărată — necunoscut nu
+#     e sigur.
+#
+# `ok.username` poate lipsi (unele metode nu-l scriu pe linia de succes).
+# Atunci contul nu poate fi verificat, deci SQL-ul întoarce și eșecurile pe
+# toată adresa, iar Python alege: cu cont — dovadă tare; fără — dovadă mai
+# slabă, dar tăcerea aici ar fi aceeași minciună ca regula veche, doar
+# întoarsă pe dos.
+_BRUTEFORCE_SQL = """
+    WITH ok AS (
+        SELECT id, ts, src_ip, username, geo_country, geo_asn,
+               raw->>'auth_method' AS metoda
+        FROM raw_events
+        WHERE id > $1 AND source = 'sshd' AND action = 'auth_ok'
+          AND src_ip IS NOT NULL AND ts > now() - make_interval(mins => $2)
+          AND raw->>'auth_method' IS DISTINCT FROM 'publickey'
+    )
+    SELECT host(ok.src_ip) AS ip, ok.username, ok.geo_country, ok.geo_asn,
+           ok.metoda, ok.id AS ok_id, ok.ts AS ok_ts,
+           coalesce(count(f.id) FILTER (WHERE f.username = ok.username), 0)
+               AS fails_cont,
+           coalesce(count(f.id), 0) AS fails_ip,
+           min(f.ts) FILTER (WHERE f.username = ok.username) AS first_fail_cont,
+           min(f.ts) AS first_fail_ip,
+           array_agg(f.id ORDER BY f.id DESC)
+               FILTER (WHERE f.username = ok.username) AS fail_ids_cont,
+           array_agg(f.id ORDER BY f.id DESC) AS fail_ids_ip
+    FROM ok
+    LEFT JOIN raw_events f
+      ON f.src_ip = ok.src_ip AND f.source = 'sshd' AND f.action = 'auth_fail'
+     AND f.raw->>'auth_method' IS DISTINCT FROM 'publickey'
+     AND f.ts BETWEEN ok.ts - make_interval(mins => $3) AND ok.ts
+    GROUP BY ok.id, ok.ts, ok.src_ip, ok.username, ok.geo_country, ok.geo_asn,
+             ok.metoda
+"""  # noqa: S608 - SQL din constante de modul, nu din date de la cineva
+
+
 async def successful_login_after_bruteforce(db: Database, cursor: int) -> list[DetectionSpec]:
     """Semnalul cel mai direct pentru „a intrat".
 
@@ -231,52 +300,55 @@ async def successful_login_after_bruteforce(db: Database, cursor: int) -> list[D
     alertează pe a două sute una — singura care contează. Fereastra e strânsă
     dinadins: o autentificare reușită la o oră după o rafală e probabil
     administratorul care s-a întors, una la trei minute după e altceva.
+
+    Nu orice reușită după eșecuri e o forțare care a mers — vezi comentariul
+    de la `_BRUTEFORCE_SQL` pentru cont și metodă, cele două lucruri care o
+    deosebesc de o coincidență.
     """
     rows = await db.fetch(
-        """
-        WITH ok AS (
-            SELECT id, ts, src_ip, username, geo_country, geo_asn
-            FROM raw_events
-            WHERE id > $1 AND source = 'sshd' AND action = 'auth_ok'
-              AND src_ip IS NOT NULL AND ts > now() - make_interval(mins => $2)
-        )
-        SELECT host(ok.src_ip) AS ip, ok.username, ok.geo_country, ok.geo_asn,
-               ok.id AS ok_id, ok.ts AS ok_ts,
-               count(f.id) AS fails,
-               min(f.ts)   AS first_fail,
-               array_agg(f.id ORDER BY f.id DESC) AS fail_ids
-        FROM ok
-        JOIN raw_events f
-          ON f.src_ip = ok.src_ip AND f.source = 'sshd' AND f.action = 'auth_fail'
-         AND f.ts BETWEEN ok.ts - make_interval(mins => $3) AND ok.ts
-        GROUP BY ok.id, ok.ts, ok.src_ip, ok.username, ok.geo_country, ok.geo_asn
-        HAVING count(f.id) >= $4
-        """,
-        cursor, WINDOW_MIN, BRUTEFORCE_LOOKBACK_MIN, MIN_FAILS_BEFORE)
+        _BRUTEFORCE_SQL, cursor, WINDOW_MIN, BRUTEFORCE_LOOKBACK_MIN)
 
     out: list[DetectionSpec] = []
     for r in rows:
+        # A doua gardă pe metodă: `_BRUTEFORCE_SQL` deja exclude reușitele pe
+        # cheie, dar asta ține garda vizibilă și aici, ca la
+        # `insights.posture` — cine editează CTE-ul mai târziu nu poate șterge
+        # apărarea din greșeală, doar optimizarea.
+        if r["metoda"] == "publickey":
+            continue
+        cont = r["username"]
+        if cont is None:
+            fails = int(r["fails_ip"] or 0)
+            first_fail = r["first_fail_ip"]
+            fail_ids = r["fail_ids_ip"] or []
+        else:
+            fails = int(r["fails_cont"] or 0)
+            first_fail = r["first_fail_cont"]
+            fail_ids = r["fail_ids_cont"] or []
+        if fails < MIN_FAILS_BEFORE:
+            continue
         out.append(DetectionSpec(
             rule_id="intrusion.login_after_bruteforce",
             rule_family="intrusion",
             severity="critical",
             src_ip=r["ip"],
             dst_port=22,
-            fingerprint=f"intrusion.login_after_bruteforce:{r['ip']}:{r['username']}",
+            fingerprint=f"intrusion.login_after_bruteforce:{r['ip']}:{cont}",
             title=f"Autentificare REUȘITĂ după brute-force · {r['ip']}",
-            summary=(f"Contul `{r['username'] or '?'}` s-a autentificat cu succes după "
-                     f"{r['fails']} încercări eșuate de la aceeași adresă în ultimele "
-                     f"{BRUTEFORCE_LOOKBACK_MIN} min. "
+            summary=(f"Contul `{cont or '?'}` s-a autentificat cu succes după "
+                     f"{fails} încercări eșuate "
+                     f"{'pe același cont' if cont is not None else 'de la aceeași adresă'} "
+                     f"în ultimele {BRUTEFORCE_LOOKBACK_MIN} min. "
                      f"Țara: {r['geo_country'] or '?'} · ASN: {r['geo_asn'] or '?'}. "
                      f"Dacă nu ești tu, contul e compromis ACUM."),
             evidence={
-                "username": r["username"], "fails_before": r["fails"],
-                "first_fail": r["first_fail"].isoformat(),
+                "username": cont, "fails_before": fails,
+                "first_fail": first_fail.isoformat() if first_fail else None,
                 "success_at": r["ok_ts"].isoformat(),
                 "country": r["geo_country"], "asn": r["geo_asn"],
                 "lookback_min": BRUTEFORCE_LOOKBACK_MIN,
             },
-            event_ids=[r["ok_id"], *list(r["fail_ids"])[:200]],
+            event_ids=[r["ok_id"], *list(fail_ids)[:200]],
         ))
     return out
 
