@@ -18,6 +18,7 @@ the real `probe_kind` property — not through a copy of either.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -126,6 +127,52 @@ def test_no_example_asset_is_unprobeable(path: Path) -> None:
                    if _asset(spec).probe_kind == "unknown"]
     assert not unprobeable, (
         f"{path.name}: assets with no probe method: {', '.join(unprobeable)}")
+
+
+_KEY_IN_ASSET_COMMENT = re.compile(r"^  #   ([a-z_]+):")
+
+
+def _keys_suggested_by_commented_examples(path: Path) -> set[str]:
+    """Top-level keys shown in the *commented-out* sample entries under
+    `assets:` — the blocks an operator uncomments by hand rather than
+    parses. Scoped to the `assets:` section only: `allowlist:` and
+    `discovered:` use unrelated keys (`cidr`, `reason`) that are not, and
+    should not be, in `inventory._ALLOWED`.
+
+    Matches exactly the indentation `inventory.yaml.example` uses for a
+    top-level field inside a commented list item (`  #   key:`), not the
+    deeper indentation of a nested block like `databases:` (`  #     - key:`)
+    — a nested key belongs to a different schema and does not go in
+    `_ALLOWED` at all.
+    """
+    lines = path.read_text(encoding="utf-8").splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("assets:"))
+    end = next((i for i, ln in enumerate(lines[start + 1:], start + 1)
+                if ln and not ln[0].isspace()), len(lines))
+    keys = {m.group(1) for ln in lines[start:end]
+            if (m := _KEY_IN_ASSET_COMMENT.match(ln))}
+    keys.discard("name")  # required and validated separately by `load`
+    return keys
+
+
+@pytest.mark.parametrize("path", EXAMPLES, ids=lambda p: p.name)
+def test_commented_example_keys_are_all_accepted_by_the_loader(path: Path) -> None:
+    """A key suggested in a commented example but missing from `_ALLOWED`
+    is invisible until the day an operator uncomments it: `inventory.load`
+    then raises "unknown keys", `health_service` swallows the exception into
+    one log line, and the inventory stops being applied with nothing on any
+    screen saying so. `repo_path`/`repo_branch` shipped exactly this way —
+    suggested here, rejected by `_ALLOWED` — until 30 August 2026.
+
+    This is the case `test_example_loads_through_the_real_loader` cannot
+    catch: a YAML comment is never parsed, so a bad key hiding in one never
+    reaches `inventory.load` at all.
+    """
+    suggested = _keys_suggested_by_commented_examples(path)
+    unknown = suggested - inventory._ALLOWED
+    assert not unknown, (
+        f"{path.name}: commented example suggests keys `load()` would reject: "
+        f"{sorted(unknown)}")
 
 
 def test_the_filled_example_still_exercises_every_probe_method() -> None:

@@ -70,8 +70,6 @@ assets:
   #   systemd_unit: php-fpm.service
   #   vhost_file: /etc/nginx/conf.d/blog.conf
   #   webroot: /var/www/blog
-  #   repo_path: /var/www/blog
-  #   repo_branch: main
   #   databases:
   #     - engine: mariadb
   #       name: blog
