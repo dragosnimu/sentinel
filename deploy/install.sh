@@ -2857,11 +2857,12 @@ step_admin_user() {
 }
 
 # --- 35 -------------------------------------------------------------------
-# The two files step 35 has to look at by name. Constants, so the verification
-# below reads exactly the config the daemon was given and exactly the log the
-# daemon writes, rather than a second guess at either name.
+# The three files step 35 has to look at by name. Constants, so the
+# verification below reads exactly the config the daemon was given and
+# exactly the logs the daemon writes, rather than a second guess at any name.
 SURICATA_YAML=/etc/suricata/suricata.yaml
 SURICATA_EVE=/var/log/suricata/eve.json
+SURICATA_STATS=/var/log/suricata/stats.log
 
 # How long step 35 waits for the first packet to reach eve.json.
 #
@@ -2873,6 +2874,18 @@ SURICATA_EVE=/var/log/suricata/eve.json
 # healthy install as unconfirmed, and a warning that appears on every deploy is
 # a warning nobody reads by the third one.
 SURICATA_CAPTURE_WAIT_S=210
+
+# How long step 35 waits to prove stats.log has STOPPED growing.
+#
+# Proving a negative needs the whole window, unlike the eve.json check above,
+# which can stop early the moment a byte lands. Suricata's default counters
+# interval (the top-level `stats: interval:` block — untouched by this change)
+# is 8s, so 20s covers two ticks with margin. An operator who raised that
+# interval well past this window will not see a false "still growing" here —
+# they will see a false "stopped", for one run — but the SAME check runs again
+# on the next deploy, against the SAME file, so a real failure to disable it
+# does not go unnoticed, only delayed by one deploy.
+SURICATA_STATS_WAIT_S=20
 
 # /proc, as a variable purely so the checks below can be exercised against a
 # made-up process instead of only on a live host.
@@ -2979,6 +2992,91 @@ suricata_eve_size() {
     stat -c %s "$SURICATA_EVE" 2>/dev/null || printf '0'
 }
 
+# Bytes in stats.log right now; 0 when it is not there.
+suricata_stats_size() {
+    stat -c %s "$SURICATA_STATS" 2>/dev/null || printf '0'
+}
+
+# Turns off the ONE output that writes stats.log, narrowly and idempotently.
+#
+# Measured on the production host, 2026-08-30: stats.log and its rotated
+# copies came to roughly 120 MB/day, and nothing Sentinel ships reads it —
+# `grep -rn stats.log sentinel/ deploy/ scripts/` finds three historical
+# comments and no code; the collector reads eve.json. On a host with 7.6 GB of
+# RAM and ~2.8 GB of page cache, that is not "just disk": it is continuous
+# pressure on the exact cache a slow dashboard query already exhausted once
+# (see step_configs' logrotate comment for that history).
+#
+# The comment above step_suricata says the distro's suricata.yaml is not ours
+# to REPLACE. It does not say the file is not ours to edit narrowly, and there
+# is no `--set` override for a single entry inside the `outputs:` list — that
+# mechanism only reaches leaf keys like vars.address-groups.HOME_NET, not one
+# item picked out of a YAML sequence. So this follows the OTHER precedent
+# already on this host, `nginx_disable_default_listener`: a single, marked,
+# idempotent line edit, not a rewrite.
+#
+# `filename: stats.log` is the anchor because it names exactly one output. A
+# packaged suricata.yaml carries a SECOND, unrelated `stats:` block at the top
+# level (the internal counters interval, which this does not touch) and can
+# carry a THIRD, nested `- stats:` entry inside eve-log's own `types:` list
+# (the periodic stats record folded into eve.json, which the task explicitly
+# forbids touching) — neither of those has a `filename:` key, so neither is
+# ever mistaken for this one.
+#
+# Returns 0 having just disabled it, 1 if it was already disabled (by an
+# earlier run of this or by the operator), 2 if the file is missing, the
+# anchor is not found or not unique, or the line above it is not a plain
+# `enabled: yes`/`enabled: no` — any shape this was not written to recognise,
+# left untouched rather than guessed at.
+suricata_disable_stats_output() {
+    [[ -f "$SURICATA_YAML" ]] || {
+        printf 'stats.log output not checked: %s does not exist\n' "$SURICATA_YAML"
+        return 2
+    }
+
+    local anchor_count anchor_line enabled_no enabled_line marker
+    marker="SENTINEL-DISABLED: stats.log ran ~120MB/day and nothing reads it (deploy/install.sh step_suricata, 2026-08-30)"
+
+    # `grep -c` always prints a count, 0 included, even on no match — so this
+    # is safe under `set -e` without an `|| true`.
+    anchor_count="$(grep -cE '^[[:space:]]*filename:[[:space:]]*stats\.log[[:space:]]*$' "$SURICATA_YAML")"
+
+    if (( anchor_count == 0 )); then
+        printf 'no "filename: stats.log" line in %s; nothing to disable there, or it is already gone\n' \
+            "$SURICATA_YAML"
+        return 2
+    fi
+    if (( anchor_count > 1 )); then
+        printf '%d "filename: stats.log" lines in %s, expected exactly 1; not editing a file this ambiguous about which one it means\n' \
+            "$anchor_count" "$SURICATA_YAML"
+        return 2
+    fi
+
+    anchor_line="$(grep -nE '^[[:space:]]*filename:[[:space:]]*stats\.log[[:space:]]*$' "$SURICATA_YAML" | cut -d: -f1)"
+    enabled_no=$((anchor_line - 1))
+    enabled_line="$(sed -n "${enabled_no}p" "$SURICATA_YAML")"
+
+    # Already off — ours or the operator's, either is fine, neither is edited
+    # again.
+    if [[ "$enabled_line" =~ ^[[:space:]]*enabled:[[:space:]]*no[[:space:]]*(#.*)?$ ]]; then
+        printf 'stats.log output already disabled (line %d of %s)\n' "$enabled_no" "$SURICATA_YAML"
+        return 1
+    fi
+
+    if [[ ! "$enabled_line" =~ ^[[:space:]]*enabled:[[:space:]]*yes[[:space:]]*$ ]]; then
+        printf 'line %d of %s, immediately above "filename: stats.log", is %s — not a plain "enabled: yes"; leaving a shape this was not written for alone\n' \
+            "$enabled_no" "$SURICATA_YAML" "${enabled_line:-<empty>}"
+        return 2
+    fi
+
+    sed -i -E "${enabled_no}s|^([[:space:]]*)enabled:[[:space:]]*yes[[:space:]]*\$|\1enabled: no  # ${marker}|" \
+        "$SURICATA_YAML"
+
+    printf 'disabled stats.log output (line %d of %s was "enabled: yes"); undo: edit that line back to "enabled: yes" and restart suricata\n' \
+        "$enabled_no" "$SURICATA_YAML"
+    return 0
+}
+
 # Step 35's verdict, assembled out of things this host can be observed doing.
 #
 # Nothing here trusts `systemctl is-active`. It said `active` on the Ubuntu host
@@ -3049,6 +3147,33 @@ A freshly updated ruleset can still be loading. Confirm before trusting the IDS:
     fi
 }
 
+# The proof that stats.log stopped, as opposed to the yaml line saying it did.
+#
+# A rewritten `enabled: no` is a file on disk, not a daemon that read it. This
+# runs every step-35, disabled or not, changed just now or already — so a
+# package upgrade that quietly restores `enabled: yes` in a future conffile
+# merge is caught on the very next deploy, the same way an operator's own
+# revert would be, rather than only on the one run that happened to flip it.
+suricata_report_stats_effect() {
+    local before="$1" waited=0 after
+    after="$(suricata_stats_size)"
+    while (( waited < SURICATA_STATS_WAIT_S )); do
+        (( after > before )) && break
+        sleep 5
+        waited=$((waited + 5))
+        after="$(suricata_stats_size)"
+    done
+
+    if (( after > before )); then
+        warn "stats.log grew ${before} -> ${after} bytes in ${waited}s AFTER being marked \
+disabled — it is STILL being written, so the edit did not take effect (or something \
+else re-enabled it). Check:
+    systemctl status suricata ; grep -n -B1 'filename: stats.log' ${SURICATA_YAML}"
+    else
+        ok "stats.log stayed at ${after} bytes for ${waited}s — the output is off"
+    fi
+}
+
 step_suricata() {
     if (( ! SURICATA_OK )); then
         info "Suricata skipped (RAM gate). Sentinel runs log-only."
@@ -3101,6 +3226,18 @@ daemon will capture on whatever ${SURICATA_YAML} names, which is not this host's
         setfacl -R -d -m u:"${SENTINEL_USER}":rX /var/log/suricata 2>/dev/null || true
     fi
 
+    # stats.log: an output nobody reads, at ~120 MB/day on the production
+    # host. This runs BEFORE the -T test below on purpose — a broken edit
+    # fails there, exactly like a broken OPTIONS or drop-in already does,
+    # rather than being caught nowhere.
+    local stats_status=0 stats_msg
+    stats_msg="$(suricata_disable_stats_output)" || stats_status=$?
+    case $stats_status in
+        0) ok "$stats_msg" ;;
+        1) info "$stats_msg" ;;
+        *) warn "$stats_msg" ;;
+    esac
+
     suricata-update >/dev/null 2>&1 || warn "suricata-update failed; using shipped rules"
     # A rejected configuration stops the IDS work here and NOTHING else.
     #
@@ -3127,6 +3264,15 @@ re-run this step:  --force-step 35"
     local restart_reason=""
     restart_reason="$(suricata_needs_restart "$options")" || restart_reason=""
 
+    # Disabling an output is a change to the config the running process
+    # already parsed at startup — SIGHUP only makes Suricata reopen files it
+    # already has open for rotation, it does not re-read the outputs list, so
+    # the daemon would otherwise keep writing stats.log under the OLD config
+    # for however long it happened to run next.
+    if [[ -z "$restart_reason" && $stats_status -eq 0 ]]; then
+        restart_reason="stats.log output was just disabled in ${SURICATA_YAML}, and only a full restart re-reads the outputs list"
+    fi
+
     if [[ -n "$restart_reason" ]]; then
         info "restarting suricata: ${restart_reason}"
         systemctl restart suricata || warn "systemctl restart suricata returned non-zero"
@@ -3136,6 +3282,9 @@ re-run this step:  --force-step 35"
 
     local eve_before; eve_before="$(suricata_eve_size)"
     suricata_report_effect "$iface" "$pubip" "$bpf_file" "$eve_before"
+
+    local stats_before; stats_before="$(suricata_stats_size)"
+    suricata_report_stats_effect "$stats_before"
 }
 
 # --- 36 -------------------------------------------------------------------

@@ -1093,11 +1093,17 @@ def test_a_host_where_every_directory_exists_keeps_the_shipped_file_byte_for_byt
 # Pasul 35 — acum în ALWAYS_STEPS, deci rulează la FIECARE deploy
 # ===========================================================================
 def _suricata_step(tmp_path: Path, *, test_rc: int = 0,
-                   needs_restart: bool = True) -> subprocess.CompletedProcess:
+                   needs_restart: bool = True,
+                   stats_status: int = 1) -> subprocess.CompletedProcess:
     """Rulează `step_suricata` LIVRATĂ, cu binare momeală și cu cele două căi din
     /etc mutate în tmp. `systemctl` își scrie argumentele într-un fișier, ca
     întrebarea „a fost repornit demonul?" să aibă un răspuns observat, nu unul
-    dedus din codul de ieșire."""
+    dedus din codul de ieșire.
+
+    `stats_status` momește rezultatul editării stats.log — 1 (deja dezactivat)
+    implicit, ca testele scrise înainte de acea schimbare să vadă exact
+    decizia de repornire pe care o verificau: cea luată din argv, nu din
+    stats.log."""
     binpath = tmp_path / "bin"
     calls = tmp_path / "systemctl-calls.txt"
     defaults = tmp_path / "default-suricata"
@@ -1155,6 +1161,9 @@ exit 0
         + restart_stub + "\n"
         "suricata_eve_size() { echo 0; }\n"
         "suricata_report_effect() { echo REPORT-RAN; }\n"
+        f"suricata_disable_stats_output() {{ printf 'stats stub status={stats_status}'; return {stats_status}; }}\n"
+        "suricata_stats_size() { echo 0; }\n"
+        "suricata_report_stats_effect() { echo STATS-REPORT-RAN; }\n"
         "step_suricata\n"
         'echo "STEP-RC=$?"\n'
     )
@@ -1209,6 +1218,226 @@ def test_a_config_that_passes_still_reaches_the_restart(tmp_path):
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "restart suricata" in proc.calls, proc.calls
     assert "REPORT-RAN" in proc.stdout, proc.stdout
+
+
+def test_disabling_stats_forces_a_restart_even_when_argv_is_unchanged(tmp_path):
+    """Dezactivarea stats.log e o schimbare în FIȘIER, nu în argv — verificarea
+    pe linia de comandă (`suricata_needs_restart`) n-o poate vedea singură.
+    Fără un motiv separat de repornire aici, demonul ar continua să scrie
+    stats.log sub configurația VECHE la nesfârșit: exact `systemctl enable
+    --now` peste un serviciu deja pornit din CLAUDE.md, aplicat unei schimbări
+    de fișier în loc de uneia de linie de comandă."""
+    proc = _suricata_step(tmp_path, test_rc=0, needs_restart=False, stats_status=0)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "restart suricata" in proc.calls, proc.calls
+
+
+def test_an_unrecognised_stats_shape_does_not_force_a_restart_on_its_own(tmp_path):
+    """Cealaltă jumătate. Dacă editarea n-a schimbat nimic (fișier nerecunoscut,
+    deja dezactivat, sau lipsă), o repornire pornită din motivul ăsta n-ar face
+    decât să lase gazda fără IDS 2-3 minute pentru absolut niciun efect."""
+    proc = _suricata_step(tmp_path, test_rc=0, needs_restart=False, stats_status=2)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "restart" not in proc.calls, \
+        f'repornire fără motiv real, doar din starea „nerecunoscut": {proc.calls!r}'
+
+
+# ===========================================================================
+# B3 — stats.log: o singură linie, editată o singură dată
+# ===========================================================================
+# Un suricata.yaml de test cu TREI apariții ale cuvântului „stats" — exact cât
+# poartă un fișier împachetat real:
+#   * blocul de la nivelul de sus (contorul intern, `interval:`, fără
+#     `filename:`) — NU trebuie atins, altfel `stats` din eve.json ar tăcea și
+#     el, ceea ce task-ul interzice explicit;
+#   * `- stats:` cuibărit în `types:` al `eve-log` (fără `filename:` nici el);
+#   * `- stats:` din `outputs:`, singurul cu `filename: stats.log` — ăsta e
+#     singura țintă.
+STATS_YAML = """\
+stats:
+  enabled: yes
+  interval: 8
+
+outputs:
+  - fast:
+      enabled: yes
+      filename: fast.log
+  - eve-log:
+      enabled: yes
+      filename: eve.json
+      types:
+        - alert
+        - stats:
+            totals: yes
+            threads: no
+  - stats:
+      enabled: {value}
+      filename: stats.log
+      append: yes
+      totals: yes
+      threads: no
+"""
+
+
+def _disable_stats(tmp_path: Path, yaml_text: str) -> tuple[int, str, str]:
+    """Rulează `suricata_disable_stats_output` LIVRATĂ peste un suricata.yaml de
+    test. Întoarce (cod, mesaj, conținutul fișierului DUPĂ rulare) — codul pe
+    stderr, separat de mesaj, ca să nu se amestece."""
+    yaml_path = tmp_path / "suricata.yaml"
+    yaml_path.write_text(yaml_text, encoding="utf-8", newline="\n")
+    script = (
+        "set -euo pipefail\n"
+        f'SURICATA_YAML="{_p(yaml_path)}"\n'
+        + _func(INSTALL, "suricata_disable_stats_output") + "\n"
+        "rc=0\n"
+        'msg="$(suricata_disable_stats_output)" || rc=$?\n'
+        'printf "%s" "$msg"\n'
+        'printf "RC=%s\\n" "$rc" >&2\n'
+    )
+    proc = _run(script, tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    rc_lines = [l for l in proc.stderr.splitlines() if l.startswith("RC=")]
+    assert rc_lines, proc.stderr
+    rc = int(rc_lines[0].split("=")[1])
+    return rc, proc.stdout, yaml_path.read_text(encoding="utf-8")
+
+
+def test_stats_output_is_disabled_and_marked(tmp_path):
+    """Cazul măsurat pe gazdă: `enabled: yes` sub `filename: stats.log`. Fără
+    editarea asta, fișierul de 120 MB/zi rămâne exact așa cum a scris pachetul
+    — ceea ce a și făcut, până acum."""
+    rc, msg, after = _disable_stats(tmp_path, STATS_YAML.format(value="yes"))
+    assert rc == 0, msg
+    assert "disabled stats.log output" in msg
+    assert "enabled: no  # SENTINEL-DISABLED" in after
+    assert after.count("filename: stats.log") == 1
+    # Vecinii nu s-au mișcat.
+    assert "enabled: yes\n  interval: 8" in after, "blocul de contoare interne a fost atins"
+    assert "- fast:\n      enabled: yes" in after, "output-ul fast a fost atins"
+    assert "- eve-log:\n      enabled: yes" in after, "output-ul eve-log a fost atins"
+    assert "- stats:\n            totals: yes" in after, \
+        "stats-ul cuibărit în types-ul eve-log a fost atins"
+
+
+def test_a_second_run_is_idempotent_and_does_not_double_mark(tmp_path):
+    """A doua rulare pe fișierul deja editat nu are voie să mai scrie nimic —
+    altfel fiecare deploy ar adăuga câte un comentariu nou pe aceeași linie."""
+    rc1, msg1, after1 = _disable_stats(tmp_path, STATS_YAML.format(value="yes"))
+    assert rc1 == 0, msg1
+    rc2, msg2, after2 = _disable_stats(tmp_path, after1)
+    assert rc2 == 1, msg2
+    assert after2 == after1, "a doua rulare a schimbat un fișier deja dezactivat"
+    assert after1.count("SENTINEL-DISABLED") == 1
+
+
+def test_an_operators_own_disabled_line_is_left_exactly_as_written(tmp_path):
+    """Dacă operatorul a pus deja `enabled: no`, fără comentariul nostru, linia
+    rămâne a lui — nu i-o „adoptăm" adăugând comentariul peste ea."""
+    yaml_text = STATS_YAML.format(value="no")
+    rc, msg, after = _disable_stats(tmp_path, yaml_text)
+    assert rc == 1, msg
+    assert after == yaml_text
+    assert "SENTINEL-DISABLED" not in after
+
+
+def test_a_removed_stats_output_is_reported_not_guessed_at(tmp_path):
+    """Dacă operatorul a scos complet output-ul, nu mai există ce dezactiva —
+    și pasul trebuie s-o spună, nu s-o treacă sub tăcere ca „succes"."""
+    without = STATS_YAML.format(value="yes").replace(
+        "  - stats:\n      enabled: yes\n      filename: stats.log\n"
+        "      append: yes\n      totals: yes\n      threads: no\n", "")
+    assert "filename: stats.log" not in without, "montajul testului nu a scos blocul"
+    rc, msg, after = _disable_stats(tmp_path, without)
+    assert rc == 2, msg
+    assert 'no "filename: stats.log"' in msg
+    assert after == without
+
+
+def test_two_stats_log_outputs_are_left_alone_as_ambiguous(tmp_path):
+    """Două linii `filename: stats.log` înseamnă că nu se știe care e cea
+    reală — o editare la întâmplare ar putea schimba output-ul greșit."""
+    doubled = STATS_YAML.format(value="yes") + (
+        "  - stats:\n      enabled: yes\n      filename: stats.log\n"
+        "      append: yes\n      totals: yes\n      threads: no\n")
+    rc, msg, after = _disable_stats(tmp_path, doubled)
+    assert rc == 2, msg
+    assert "expected exactly 1" in msg
+    assert after == doubled
+
+
+def test_a_reordered_block_is_not_guessed_at(tmp_path):
+    """Dacă `enabled:` nu mai e imediat deasupra lui `filename: stats.log` —
+    fișierul a fost rescris altfel decât ce știe editarea asta să recunoască —
+    pasul lasă blocul în pace în loc să ghicească ce linie să schimbe."""
+    reordered = STATS_YAML.format(value="yes").replace(
+        "      enabled: yes\n      filename: stats.log\n",
+        "      filename: stats.log\n      enabled: yes\n")
+    rc, msg, after = _disable_stats(tmp_path, reordered)
+    assert rc == 2, msg
+    assert "not a plain" in msg
+    assert after == reordered
+
+
+def test_a_missing_suricata_yaml_is_unknown_not_fine(tmp_path):
+    """Fără fișier, nu e nimic de dezactivat — și codul 2 (necunoscut) e
+    obligatoriu aici, nu 0 sau 1, care ar însemna ambele „stats.log e tratat"."""
+    missing = tmp_path / "does-not-exist.yaml"
+    script = (
+        "set -euo pipefail\n"
+        f'SURICATA_YAML="{_p(missing)}"\n'
+        + _func(INSTALL, "suricata_disable_stats_output") + "\n"
+        "rc=0\n"
+        "suricata_disable_stats_output || rc=$?\n"
+        'printf "RC=%s" "$rc"\n'
+    )
+    proc = _run(script, tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "RC=2" in proc.stdout, proc.stdout
+
+
+def _stats_effect(tmp_path: Path, *, grows: bool,
+                  before_bytes: int = 500) -> subprocess.CompletedProcess:
+    """Rulează `suricata_report_stats_effect` LIVRATĂ. `sleep` momeală face
+    fișierul să crească DOAR dacă i se cere — proba pentru „nu mai crește"
+    trebuie să vină din octeți reali, nu dintr-o linie din yaml necitită de
+    nimeni altcineva în acest test."""
+    binpath = tmp_path / "bin"
+    stats = tmp_path / "stats.log"
+    stats.write_bytes(b"x" * before_bytes)
+    grow = f'printf x >> "{_p(stats)}"' if grows else "true"
+    _stub(binpath, "sleep", f"{grow}\nexit 0\n")
+    script = (
+        "set -euo pipefail\n"
+        "source ./lib/common.sh\n"
+        f'SURICATA_STATS="{_p(stats)}"\n'
+        "SURICATA_STATS_WAIT_S=10\n"
+        "SURICATA_YAML=/etc/suricata/suricata.yaml\n"
+        + _func(INSTALL, "suricata_stats_size") + "\n"
+        + _func(INSTALL, "suricata_report_stats_effect") + "\n"
+        f'suricata_report_stats_effect "{before_bytes}"\n'
+    )
+    return _run(script, tmp_path, extra_path=binpath)
+
+
+def test_a_stats_log_that_keeps_growing_after_being_disabled_is_reported(tmp_path):
+    """Faptul, nu intenția: dacă `enabled: no` e scris și fișierul tot crește,
+    editarea n-a avut efect — un restart care n-a prins, sau altceva scrie
+    acolo — și un `[+]` aici ar fi exact minciuna pe care CLAUDE.md o
+    interzice."""
+    proc = _stats_effect(tmp_path, grows=True)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "[+]" not in proc.stdout, proc.stdout
+    assert "STILL being written" in proc.stderr, proc.stderr
+
+
+def test_a_stats_log_that_stays_flat_earns_the_success_line(tmp_path):
+    """Cealaltă jumătate: fără proba asta, „am scris enabled: no" ar fi tot ce
+    ar dovedi vreodată pasul — fix fișierul pe disc care nu dovedește
+    încărcarea, din CLAUDE.md."""
+    proc = _stats_effect(tmp_path, grows=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "the output is off" in proc.stdout, proc.stdout
+    assert proc.stderr.strip() == "", proc.stderr
 
 
 def test_sentinels_own_suppressions_come_before_any_third_party_one():
