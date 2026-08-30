@@ -141,7 +141,10 @@ async def mark_resolved_absent(db: Database, scanner: str, asset_id: int | None,
     raised to escape.
 
     None (the default) means the run had no floor and may close anything, which
-    is what `dnf`/`apt` and `trivy_fs` do today: behaviour unchanged for them.
+    is what `dnf`/`apt` do today — their source is a security advisory feed,
+    not a severity argument to the scan itself, so there is no floor to fence.
+    `trivy_fs` and `trivy_image` both filter at the source and both pass their
+    own `visible_severities()` here.
     """
     where = ["scanner = $1 AND asset_id IS NOT DISTINCT FROM $2",
              _RESOLVABLE_STATUSES,

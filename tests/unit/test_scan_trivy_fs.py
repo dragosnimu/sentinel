@@ -1036,22 +1036,68 @@ def test_a_report_that_is_not_json_is_an_error_not_an_empty_result(
 
 
 # --------------------------------------------------------------------------
+# `visible_severities`: garda pe care se sprijină rezolvarea din orchestrator
+# --------------------------------------------------------------------------
+def test_what_a_trivy_fs_run_can_see_is_derived_from_what_it_asked_for() -> None:
+    """Garda de rezolvare trebuie să urmeze pragul, nu o copie a lui.
+
+    Eșecul pe care îl previne: mulțimea „ce poate vedea rularea" scrisă de mână
+    a doua oară. La prima schimbare de prag lista rămâne în urmă, iar
+    `mark_resolved_absent` închide exact constatările pe care noua rulare nu le
+    mai poate vedea — adică tocmai ce garda e pusă să oprească, tăcut.
+    """
+    vazute, nenotate = trivy_fs.visible_severities()
+    assert set(vazute) == {"medium", "high", "critical"}
+    assert nenotate is True, (
+        "cu UNKNOWN în prag, constatările nenotate (parcate la `medium` cu "
+        "`severity_known=false`) sunt vizibile și pot fi închise")
+
+
+def test_the_trivy_fs_visible_set_follows_a_changed_floor(monkeypatch) -> None:
+    """Derivarea se probează schimbând pragul, nu citind valorile de azi.
+
+    Eșecul pe care îl previne: testul de mai sus trece și peste o listă scrisă
+    de mână, atâta timp cât cifrele coincid azi. Aici pragul se mută sub el —
+    exact scenariul din docstring-ul lui `SEVERITIES`, care invită explicit la
+    ridicarea pragului de la MEDIUM.
+    """
+    monkeypatch.setattr(trivy_fs, "SEVERITIES", ("HIGH", "CRITICAL"))
+    vazute, nenotate = trivy_fs.visible_severities()
+    assert set(vazute) == {"high", "critical"}
+    assert "medium" not in vazute
+    assert nenotate is False, (
+        "fără UNKNOWN în prag, o rulare nu mai poate vedea constatările nenotate")
+
+
+# --------------------------------------------------------------------------
 # Orchestratorul: rândul din `scans` și ce NU se rezolvă
 # --------------------------------------------------------------------------
 class _DB:
-    """Ciot de bază care ține minte ce s-a scris. Nu asertează nimic singur."""
+    """Ciot de bază care ține minte ce s-a scris. Nu asertează nimic singur.
 
-    def __init__(self) -> None:
+    `sub_prag` e ce răspunde la interogarea care numără constatările rămase sub
+    pragul de severitate — implicit zero, ca o bază fără istoric.
+    """
+
+    def __init__(self, sub_prag: int = 0) -> None:
         self.scans: list[dict] = []
         self.finished: list[dict] = []
         self.upserted: list[dict] = []
         self.resolved: list[tuple] = []
+        # SQL-ul și TOATE argumentele rezolvării, ca să poată fi văzută garda de
+        # severitate, nu doar cele trei argumente vechi.
+        self.resolve_calls: list[tuple] = []
+        self.counted: list[tuple] = []
+        self.sub_prag = sub_prag
 
     async def fetchval(self, sql, *args):
         if "INSERT INTO scans" in sql:
             self.scans.append({"scanner": args[0], "target": args[1],
                                "triggered_by": args[3]})
             return len(self.scans)
+        if "SELECT count(*) FROM findings" in sql:
+            self.counted.append((sql, args))
+            return self.sub_prag
         return 0
 
     async def fetchrow(self, sql, *args):
@@ -1065,6 +1111,7 @@ class _DB:
             # `mark_resolved_absent`, ca testul să poată spune nu doar CĂ s-a
             # rezolvat, ci pe ce mulțime.
             self.resolved.append((args[0], args[1], args[2]))
+            self.resolve_calls.append((sql, args))
         return []
 
     async def execute(self, sql, *args):
@@ -1138,6 +1185,46 @@ def test_a_completed_scan_records_the_database_version(monkeypatch) -> None:
     (rand,) = db.finished
     assert rand["status"] == "completed"
     assert rand["db_version"] == "trivy-db v2 proaspătă"
+
+
+def test_a_run_at_a_raised_floor_does_not_close_the_old_medium_findings(
+        monkeypatch) -> None:
+    """`_run_trivy_fs` trebuie să treacă `visible_severities()` lui
+    `mark_resolved_absent`, la fel ca `_run_trivy_image`.
+
+    Eșecul pe care îl previne: fără gardă, `mark_resolved_absent` primea doar
+    (scanner, asset_id, chei_văzute) — fără severitate. Azi, cu `SEVERITIES` la
+    MEDIUM, asta nu strică nimic; dar `SEVERITIES` are un docstring care invită
+    explicit la ridicarea pragului („nimeni n-a cerut asta" — până când cineva
+    cere). Prima rulare de după acea ridicare, fără gardă, ar fi marcat
+    `absent_from_latest_scan` orice constatare MEDIUM ingerată cu pragul vechi —
+    44 dintre ele, măsurate pe gazdă pe 30 august 2026 — raportate operatorului
+    drept reparate peste noapte, deși nimic de pe gazdă nu s-a schimbat.
+
+    Pragul e ridicat aici prin `monkeypatch`, nu citit la valoarea de azi:
+    la MEDIUM garda ar trece și fără să fenteze nimic, fiindcă nimic nu e sub
+    prag încă — vezi docstring-ul lui `trivy_fs.visible_severities`.
+    """
+    monkeypatch.setattr(trivy_fs, "SEVERITIES", ("HIGH", "CRITICAL"))
+
+    async def merge(_paths):
+        return list(trivy_fs.parse(SAMPLE)), None, {"db_version": "trivy-db v2"}
+
+    monkeypatch.setattr(orchestrator.trivy_fs, "scan", merge)
+    _no_kev(monkeypatch)
+    db = _DB()
+    run(orchestrator._run_trivy_fs(db, _cfg(), "test"))
+
+    (sql, args) = db.resolve_calls[0]
+    assert "severity = ANY($4::text[])" in sql, (
+        f"rezolvarea nu e îngrădită de severitățile cerute: {sql}")
+    assert set(args[3]) == {"high", "critical"}
+    assert "medium" not in args[3], (
+        "o rulare care nu mai cere MEDIUM ar putea închide constatări MEDIUM "
+        "ingerate cu pragul vechi")
+    assert args[4] is False, (
+        "fără UNKNOWN în pragul ridicat, o rulare nu mai poate vedea "
+        "constatările nenotate")
 
 
 def test_the_scan_row_names_the_paths_that_were_asked_for(monkeypatch) -> None:

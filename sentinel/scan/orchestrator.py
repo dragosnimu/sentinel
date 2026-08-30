@@ -199,7 +199,7 @@ async def _run_os_packages(db: Database, family: str, triggered_by: str) -> dict
 async def _run_trivy_fs(db: Database, cfg: Config, triggered_by: str) -> dict:
     """trivy peste caile din `scan.discovery_paths`.
 
-    Aceeasi forma ca `_run_os_packages`, cu doua lucruri in plus, si amandoua
+    Aceeasi forma ca `_run_os_packages`, cu trei lucruri in plus, si toate
     exista fiindca trivy poate raspunde cu incredere si totusi gresit:
 
       * `db_version` se scrie pe rand la FIECARE incheiere, si pe cele esuate:
@@ -207,7 +207,16 @@ async def _run_trivy_fs(db: Database, cfg: Config, triggered_by: str) -> dict:
         careia nu i se poate afla valabilitatea nici a doua zi;
       * cand scanerul intoarce o eroare nu se rezolva NIMIC. O rulare care n-a
         putut sa se uite n-are voie sa inchida o constatare — lipsa unui rezultat
-        nu e un zero.
+        nu e un zero;
+      * `mark_resolved_absent` primeste garda de severitate a lui
+        `trivy_fs.visible_severities()`, ca la `trivy_image` (`2b6b43a`).
+        `trivy_fs.SEVERITIES` e la MEDIUM azi si nimic nu e sub prag — dar
+        propriul docstring al pragului invita explicit sa fie ridicat, iar fara
+        garda asta o ridicare ar inchide tacut orice constatare MEDIUM ingerata
+        cu pragul vechi, raportata drept reparata peste noapte. Ce ramane
+        deschis sub pragul curent se si numara, si se spune in jurnal — la fel
+        ca la `trivy_image`, protejat si nespus ar fi doar o alta forma de
+        tacere.
     """
     target = ",".join(cfg.scan.discovery_paths or []) or "(nicio cale configurată)"
     scan_id = await fx.start_scan(db, trivy_fs.SCANNER, target[:400],
@@ -242,16 +251,34 @@ async def _run_trivy_fs(db: Database, cfg: Config, triggered_by: str) -> dict:
                 new_items.append(dict(f))
             seen.append(f["finding_key"])
 
-        resolved = await fx.mark_resolved_absent(db, trivy_fs.SCANNER, None, seen)
+        vazute, nenotate = trivy_fs.visible_severities()
+        resolved = await fx.mark_resolved_absent(
+            db, trivy_fs.SCANNER, None, seen,
+            visible_severities=list(vazute), visible_unscored=nenotate)
+        # Cate au ramas deschise sub pragul de azi. Se citeste DUPA rezolvare,
+        # ca sa numere starea in care ramane baza, nu una de dinaintea ei —
+        # acelasi motiv ca la `trivy_image`.
+        sub_prag = await fx.count_open_outside_severities(
+            db, trivy_fs.SCANNER, None,
+            visible_severities=list(vazute), visible_unscored=nenotate)
         await fx.finish_scan(
             db, scan_id, status="completed", findings_count=len(raw),
             new_findings=new, resolved_findings=resolved, db_version=db_version)
+        if sub_prag:
+            # WARNING, nu INFO: sunt constatari care raman in panou fara ca
+            # ceva sa le mai verifice, iar operatorul trebuie sa afle numarul
+            # de la noi, nu sa-l deduca dintr-o cifra care a incetat sa se
+            # miste.
+            log.warning("constatări sub pragul de severitate al scanării",
+                        extra={"scanner": trivy_fs.SCANNER, "open": sub_prag})
         log.info("trivy fs scan complete",
                  extra={"findings": len(raw), "new": new, "resolved": resolved,
-                        "kev": len(kev_map), "db_version": db_version})
+                        "kev": len(kev_map), "db_version": db_version,
+                        "below_floor_open": sub_prag})
         return {"status": "completed", "findings": len(raw), "new": new,
                 "resolved": resolved, "kev": len(kev_map),
-                "db_version": db_version, "new_items": new_items}
+                "db_version": db_version, "below_floor_open": sub_prag,
+                "new_items": new_items}
     except Exception as exc:  # noqa: BLE001 - record and surface, do not crash the pass
         await fx.finish_scan(db, scan_id, status="failed", error=str(exc)[:500])
         log.error("trivy fs scan crashed", extra={"detail": str(exc)})

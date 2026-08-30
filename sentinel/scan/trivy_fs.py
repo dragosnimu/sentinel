@@ -278,6 +278,36 @@ def map_severity(raw: Any) -> tuple[str, bool]:
     return (known, True) if known else ("medium", False)
 
 
+def visible_severities() -> tuple[tuple[str, ...], bool]:
+    """Ce POATE vedea o rulare cu `SEVERITIES`, in vocabularul coloanei
+    `findings.severity`: (severitatile notate, si daca vede si nenotatele).
+
+    Copiata dupa `trivy_image.visible_severities`, care i-a servit drept model
+    — acelasi motiv, acelasi risc. `mark_resolved_absent` inchide tot ce
+    scanerul nu a mai raportat, iar daca pragul `SEVERITIES` de mai sus se
+    ridica vreodata de la MEDIUM (docstring-ul de acolo chiar invita asta:
+    „nimeni n-a cerut asta"), „nu a mai raportat" ar acoperi si constatarile
+    MEDIUM ingerate cu pragul vechi, nu doar pe cele chiar reparate. Masurat pe
+    gazda pe 30 august 2026: 44 de constatari MEDIUM `trivy_fs` deschise chiar
+    azi — inchise tacut si raportate operatorului drept reparate, la prima
+    schimbare de prag, daca garda asta ar lipsi.
+
+    Derivata din `SEVERITIES` prin `map_severity`, nu scrisa inca o data ca
+    lista separata: o a doua lista ar ramane in urma la prima schimbare de
+    prag, si atunci garda ar inchide exact constatarile pe care noua rulare
+    nu le mai poate vedea — adica ar face tacut chiar ce e pusa sa opreasca.
+    """
+    scored: list[str] = []
+    unscored = False
+    for label in SEVERITIES:
+        severity, known = map_severity(label)
+        if known:
+            scored.append(severity)
+        else:
+            unscored = True
+    return tuple(sorted(set(scored))), unscored
+
+
 def _cvss(entry: dict[str, Any]) -> tuple[float | None, str | None]:
     """Scorul si vectorul CVSS, din ACELASI furnizor.
 
