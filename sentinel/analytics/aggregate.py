@@ -330,7 +330,7 @@ async def ids_signatures(db: Database, limit: int = 6) -> list[dict[str, Any]]:
     ignoră — deci cu expresia în WHERE fiecare rând de suricata din fereastră
     cerea o pagină de heap, intercalate printre milioane de rânduri de auditd:
     233 187 de buffere pentru 233 595 de rânduri, măsurat pe replică. Coloana
-    reală, umplută de declanșatorul de pe `raw_events` (migrația 0034), face
+    reală, umplută de declanșatorul de pe `raw_events` (migrația 0035), face
     `Index Only Scan` posibil: 3 536 de buffere pe aceleași date, `Heap
     Fetches: 0`. Verificat cu `EXCEPT`: zero rânduri diferite față de forma
     veche, pe toată fereastra.
