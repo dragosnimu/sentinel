@@ -146,7 +146,7 @@ def test_prefix_with_no_allowlist_overlap_is_unaffected():
     would pass the previous test for the wrong reason."""
     specs = build_specs(
         [_row(prefix="198.51.100.0/24", distinct=50, events=5000)],
-        protected=["86.35.255.0/24"], armed=True,
+        protected=["203.0.113.0/24"], armed=True,
     )
     assert len(specs) == 1
 
