@@ -783,6 +783,7 @@ exit 0
         # suite.
         f'CANARY_PGPASS_PATH="{_p(tmp_path / "root" / ".pgpass")}"\n'
         f'CANARY_AWS_CREDS_PATH="{_p(tmp_path / "root" / ".aws" / "credentials")}"\n'
+        f'CANARY_STATE_PATH="{_p(tmp_path / "etc-sentinel" / "canary-state")}"\n'
         + _func(INSTALL, "_canary_content") + "\n"
         + _func(INSTALL, "install_canary_baits") + "\n"
         + _func(INSTALL, "audit_rule_signatures") + "\n"
@@ -1572,38 +1573,63 @@ def test_sentinels_own_suppressions_come_before_any_third_party_one():
 # ===========================================================================
 # Funcționalitatea 05 — momelile (`install_canary_baits`)
 # ===========================================================================
+def _canary_paths(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Cele trei căi pe care le folosește orice test din secțiunea asta, toate
+    sub `tmp_path` — inclusiv fișierul de stare, ca niciun test să nu scrie
+    sub /etc/sentinel de pe mașina care rulează suita."""
+    return (tmp_path / "root" / ".pgpass",
+            tmp_path / "root" / ".aws" / "credentials",
+            tmp_path / "etc-sentinel" / "canary-state")
+
+
+def _canary_step(tmp_path: Path, foreign_name: str,
+                  extra_path: Path | None = None) -> subprocess.CompletedProcess:
+    """O singură trecere prin `install_canary_baits` LIVRATĂ, peste orice a mai
+    rămas pe disc din trecerile anterioare pe același `tmp_path` — inclusiv
+    fișierul de stare, exact ca între două deploy-uri reale pe aceeași gazdă.
+    """
+    pgpass, aws, state = _canary_paths(tmp_path)
+    foreign = tmp_path / foreign_name
+    script = (
+        "set -euo pipefail\n"
+        "source ./lib/common.sh\n"
+        f'CANARY_PGPASS_PATH="{_p(pgpass)}"\n'
+        f'CANARY_AWS_CREDS_PATH="{_p(aws)}"\n'
+        f'CANARY_STATE_PATH="{_p(state)}"\n'
+        + _func(INSTALL, "_canary_content") + "\n"
+        + _func(INSTALL, "install_canary_baits") + "\n"
+        f'install_canary_baits "{_p(foreign)}"\n'
+    )
+    return _run(script, tmp_path, extra_path=extra_path)
+
+
 def _canary_harness(tmp_path: Path, *, pre_pgpass: str | None = None,
-                    pre_aws: str | None = None) -> tuple[subprocess.CompletedProcess, Path, Path, Path]:
-    """Rulează `install_canary_baits` LIVRATĂ, cu cele două căi redirectate spre
-    `tmp_path` în loc de `/root` — altfel testul ar scrie în /root de pe mașina
-    care rulează suita."""
-    pgpass = tmp_path / "root" / ".pgpass"
-    aws = tmp_path / "root" / ".aws" / "credentials"
+                    pre_aws: str | None = None
+                    ) -> tuple[subprocess.CompletedProcess, Path, Path, Path, Path]:
+    """Rulează `install_canary_baits` LIVRATĂ o singură dată. Întoarce și calea
+    fișierului de stare, ca testele care simulează un al doilea deploy s-o
+    poată citi sau șterge între trecere."""
+    pgpass, aws, state = _canary_paths(tmp_path)
     if pre_pgpass is not None:
         pgpass.parent.mkdir(parents=True, exist_ok=True)
         pgpass.write_text(pre_pgpass, encoding="utf-8", newline="\n")
     if pre_aws is not None:
         aws.parent.mkdir(parents=True, exist_ok=True)
         aws.write_text(pre_aws, encoding="utf-8", newline="\n")
+    proc = _canary_step(tmp_path, "foreign.txt")
+    return proc, pgpass, aws, tmp_path / "foreign.txt", state
 
-    foreign = tmp_path / "foreign.txt"
-    script = (
-        "set -euo pipefail\n"
-        "source ./lib/common.sh\n"
-        f'CANARY_PGPASS_PATH="{_p(pgpass)}"\n'
-        f'CANARY_AWS_CREDS_PATH="{_p(aws)}"\n'
-        + _func(INSTALL, "_canary_content") + "\n"
-        + _func(INSTALL, "install_canary_baits") + "\n"
-        f'install_canary_baits "{_p(foreign)}"\n'
-    )
-    proc = _run(script, tmp_path)
-    return proc, pgpass, aws, foreign
+
+def _state_sizes(state: Path) -> dict[str, str]:
+    return dict(line.split() for line in state.read_text(encoding="utf-8").splitlines() if line)
 
 
 def test_a_missing_bait_is_planted_with_the_marker(tmp_path):
     """Prima instalare: fișierul nu există, deci trebuie creat, cu conținutul
-    fals și marcajul care va deosebi, la redeploy, „al nostru" de „ceva real"."""
-    proc, pgpass, aws, foreign = _canary_harness(tmp_path)
+    fals și marcajul care rămâne în el pentru un om, nu pentru clasificare —
+    și dimensiunea lui trebuie înregistrată în starea de canar, altfel al
+    doilea deploy n-are cu ce compara."""
+    proc, pgpass, aws, foreign, state = _canary_harness(tmp_path)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert pgpass.exists() and aws.exists()
     assert "sentinel-canary" in pgpass.read_text(encoding="utf-8")
@@ -1612,12 +1638,18 @@ def test_a_missing_bait_is_planted_with_the_marker(tmp_path):
         "ambele momeli sunt ale noastre, nu ar trebui raportată nicio coliziune"
     assert "bait planted" in proc.stdout, proc.stdout
 
+    recorded = _state_sizes(state)
+    assert recorded.get(_p(pgpass)) == str(pgpass.stat().st_size), \
+        f"mărimea plantată pentru {pgpass} nu a fost înregistrată corect: {recorded}"
+    assert recorded.get(_p(aws)) == str(aws.stat().st_size), \
+        f"mărimea plantată pentru {aws} nu a fost înregistrată corect: {recorded}"
+
 
 def test_the_content_is_not_shaped_like_a_real_secret(tmp_path):
     """Cerut explicit: dacă momeala e exfiltrată, conținutul nu are voie să fie
     confundat de operator cu o credențială reală. Nicio formă de cheie/hash —
     aceeași gardă de formă ca `test_repo_is_sanitised`."""
-    proc, pgpass, aws, _ = _canary_harness(tmp_path)
+    proc, pgpass, aws, _, _state = _canary_harness(tmp_path)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     for f in (pgpass, aws):
         text = f.read_text(encoding="utf-8")
@@ -1628,39 +1660,144 @@ def test_the_content_is_not_shaped_like_a_real_secret(tmp_path):
             f"{f}: arată a base64/base64url generat"
 
 
-def test_a_repeat_deploy_never_rewrites_a_bait_even_if_the_operator_edited_it(tmp_path):
-    """Cerința D1: idempotent. Operatorul a editat momeala (a păstrat marcajul);
-    un redeploy nu are voie să o rescrie peste editarea lui."""
-    edited = "# sentinel-canary: fake content, planted on purpose -- not a real credential\nedited by operator\n"
-    proc, pgpass, aws, foreign = _canary_harness(tmp_path, pre_pgpass=edited)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+def test_a_repeat_deploy_leaves_an_unedited_bait_untouched(tmp_path):
+    """Al doilea deploy dintr-o instalare normală: momeala plantată la primul
+    rulaj trebuie regăsită la a doua trecere prin MĂRIME, nu prin conținut
+    citit din nou — dacă ar fi raportată drept coliziune aici, o gazdă
+    nemodificată ar pierde urmărirea de nucleu la fiecare livrare."""
+    proc1, pgpass, aws, _, state = _canary_harness(tmp_path)
+    assert proc1.returncode == 0, proc1.stdout + proc1.stderr
+    original_pgpass = pgpass.read_text(encoding="utf-8")
+    original_aws = aws.read_text(encoding="utf-8")
+
+    proc2 = _canary_step(tmp_path, "foreign2.txt")
+    assert proc2.returncode == 0, proc2.stdout + proc2.stderr
+    assert pgpass.read_text(encoding="utf-8") == original_pgpass
+    assert aws.read_text(encoding="utf-8") == original_aws
+    assert proc2.stdout.count("left untouched") == 2, proc2.stdout
+    assert (tmp_path / "foreign2.txt").read_text(encoding="utf-8").strip() == "", \
+        "o momeală neatinsă a fost raportată drept străină la al doilea deploy"
+
+
+def test_a_repeat_deploy_never_reads_the_bait_content(tmp_path):
+    """Incidentul 65237 (31 august 2026): `install_canary_baits` deschidea
+    momeala cu `grep -qF "sentinel-canary" "$path"` ca s-o clasifice, iar asta
+    declanșa regula `sentinel_bait -p r` la fiecare livrare de după prima —
+    un `critical` fals, emis de instalator împotriva lui însuși, pe conturi
+    care nu au făcut nimic. Testul dovedește efectul, nu intenția: dacă
+    funcția ar mai invoca `grep` vreodată, comanda-momeală de mai jos ar
+    prinde apelul."""
+    binpath = tmp_path / "bin"
+    marker = tmp_path / "grep_was_called"
+    _stub(binpath, "grep", f'''
+printf "called with: %s\\n" "$*" >> "{_p(marker)}"
+exit 1
+''')
+
+    proc1 = _canary_step(tmp_path, "foreign1.txt", extra_path=binpath)
+    assert proc1.returncode == 0, proc1.stdout + proc1.stderr
+    assert not marker.exists(), \
+        "install_canary_baits a citit conținutul momelii la PLANTARE: " + \
+        (marker.read_text(encoding="utf-8") if marker.exists() else "")
+
+    proc2 = _canary_step(tmp_path, "foreign2.txt", extra_path=binpath)
+    assert proc2.returncode == 0, proc2.stdout + proc2.stderr
+    assert not marker.exists(), \
+        "install_canary_baits a invocat grep la al doilea deploy -- exact citirea " \
+        "care a produs incidentul 65237: " + \
+        (marker.read_text(encoding="utf-8") if marker.exists() else "")
+
+
+def test_an_operator_edit_that_keeps_the_planted_size_is_left_untouched(tmp_path):
+    """Cerința D1: operatorul a editat conținutul păstrându-i lungimea (de
+    exemplu a schimbat parola falsă cu alta la fel de lungă). Clasificarea se
+    face STRICT pe mărime, dinadins ca să nu mai citească fișierul — o editare
+    care păstrează mărimea trebuie tot lăsată în pace, nu rescrisă și nu
+    raportată drept coliziune."""
+    proc1, pgpass, aws, _, state = _canary_harness(tmp_path)
+    assert proc1.returncode == 0, proc1.stdout + proc1.stderr
+
+    original = pgpass.read_text(encoding="utf-8")
+    # swapcase() păstrează exact numărul de octeți (ASCII), deci conținutul e
+    # vizibil diferit fără să mute mărimea de pe care se face clasificarea.
+    edited = original.swapcase()
+    assert len(edited.encode("utf-8")) == len(original.encode("utf-8"))
+    pgpass.write_text(edited, encoding="utf-8", newline="\n")
+
+    proc2 = _canary_step(tmp_path, "foreign2.txt")
+    assert proc2.returncode == 0, proc2.stdout + proc2.stderr
     assert pgpass.read_text(encoding="utf-8") == edited, "editarea operatorului a fost rescrisă"
-    assert foreign.read_text(encoding="utf-8").strip() == "", \
-        "momeala editată tot poartă marcajul, nu e o coliziune"
-    assert "left untouched" in proc.stdout, proc.stdout
+    assert "left untouched" in proc2.stdout, proc2.stdout
+    assert _p(pgpass) not in (tmp_path / "foreign2.txt").read_text(encoding="utf-8").splitlines(), \
+        "o editare de aceeași mărime a fost raportată drept coliziune"
 
 
-def test_a_foreign_file_at_the_bait_path_is_never_overwritten_and_is_reported(tmp_path):
-    """Ceva real (fără marcaj) ocupă deja calea — poate un `.pgpass` adevărat.
-    Instalatorul nu are voie nici să-l suprascrie, nici să pretindă tăcut că a
-    plantat o momeală acolo: raportează calea ca „străină", ca apelantul să
-    scoată urmărirea de nucleu de pe ea."""
+def test_an_operator_edit_that_changes_the_size_loses_the_watch_but_not_the_content(tmp_path):
+    """Ce NU acoperă mărimea (documentat și în docs/OPERARE.md): o editare care
+    schimbă lungimea fișierului nu mai poate fi deosebită, prin metadate, de
+    un fișier real pus acolo din greșeală -- așa că instalatorul o tratează ca
+    pe orice cale străină: avertizează, scoate urmărirea de nucleu, dar NU
+    rescrie niciodată conținutul. Vizibil, nu tăcut -- exact direcția de eșec
+    cerută."""
+    proc1, pgpass, aws, _, state = _canary_harness(tmp_path)
+    assert proc1.returncode == 0, proc1.stdout + proc1.stderr
+
+    edited = pgpass.read_text(encoding="utf-8") + "extra line appended by the operator\n"
+    pgpass.write_text(edited, encoding="utf-8", newline="\n")
+
+    proc2 = _canary_step(tmp_path, "foreign2.txt")
+    assert proc2.returncode == 0, proc2.stdout + proc2.stderr
+    assert pgpass.read_text(encoding="utf-8") == edited, "conținutul editat a fost atins"
+    assert _p(pgpass) in (tmp_path / "foreign2.txt").read_text(encoding="utf-8").splitlines(), \
+        "mărimea schimbată nu a fost raportată drept nesigură"
+    assert "NOT planted" in proc2.stderr, proc2.stderr
+
+
+def test_a_bait_with_no_state_record_is_treated_as_foreign_and_never_overwritten(tmp_path):
+    """Ceva ocupă deja calea și nu există nicio înregistrare de stare pentru
+    ea -- poate un `.pgpass` real, poate propria momeală de dinainte ca acest
+    fișier de stare să existe. Instalatorul nu are voie nici s-o suprascrie,
+    nici să pretindă tăcut că a plantat o momeală acolo: raportează calea ca
+    „străină", ca apelantul să scoată urmărirea de nucleu de pe ea."""
     real = "127.0.0.1:5432:*:sentinel:S3cr3tRealPassw0rd\n"
-    proc, pgpass, aws, foreign = _canary_harness(tmp_path, pre_pgpass=real)
+    proc, pgpass, aws, foreign, state = _canary_harness(tmp_path, pre_pgpass=real)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert pgpass.read_text(encoding="utf-8") == real, "conținutul real a fost atins"
     assert _p(pgpass) in foreign.read_text(encoding="utf-8").splitlines(), \
-        "calea ocupată de conținut străin nu a fost raportată apelantului"
+        "calea ocupată de conținut fără înregistrare nu a fost raportată apelantului"
     assert "NOT planted" in proc.stderr, proc.stderr
 
 
+def test_a_host_restored_from_backup_loses_the_state_and_the_watch_not_silently(tmp_path):
+    """Direcția de eșec cerută explicit: o gazdă restaurată dintr-un backup
+    dinainte ca acest fișier de stare să existe își pierde propria momeală din
+    evidență. Consecința trebuie să fie un avertisment și o regulă nearmată --
+    vizibil în ieșirea deploy-ului -- niciodată o citire tăcută a conținutului
+    ca să recupereze clasificarea."""
+    proc1, pgpass, aws, _, state = _canary_harness(tmp_path)
+    assert proc1.returncode == 0, proc1.stdout + proc1.stderr
+    original_pgpass = pgpass.read_text(encoding="utf-8")
+
+    state.unlink()  # exact ce lasă în urmă o restaurare dintr-un backup vechi
+
+    proc2 = _canary_step(tmp_path, "foreign2.txt")
+    assert proc2.returncode == 0, proc2.stdout + proc2.stderr
+    assert pgpass.read_text(encoding="utf-8") == original_pgpass, \
+        "conținutul propriei momele a fost atins după pierderea stării"
+    foreign2 = (tmp_path / "foreign2.txt").read_text(encoding="utf-8").splitlines()
+    assert _p(pgpass) in foreign2 and _p(aws) in foreign2, \
+        "starea lipsă trebuia să claseze AMBELE momeli drept fără evidență, nu doar una"
+    assert "NOT planted" in proc2.stderr, proc2.stderr
+
+
 def test_the_foreign_bait_path_is_dropped_from_the_installed_rules(tmp_path):
-    """Efectul, nu doar avertismentul: linia `-w` pentru o cale ocupată de
-    conținut străin nu are voie să ajungă în fișierul instalat, altfel nucleul
-    ar supraveghea un fișier real sub eticheta unei momele."""
+    """Efectul, nu doar avertismentul: linia `-w` pentru o cale fără
+    înregistrare de stare nu are voie să ajungă în fișierul instalat, altfel
+    nucleul ar supraveghea conținut nesigur sub eticheta unei momele."""
     real = "127.0.0.1:5432:*:sentinel:S3cr3tRealPassw0rd\n"
     pgpass = tmp_path / "root" / ".pgpass"
     aws = tmp_path / "root" / ".aws" / "credentials"
+    state = tmp_path / "etc-sentinel" / "canary-state"
     pgpass.parent.mkdir(parents=True, exist_ok=True)
     pgpass.write_text(real, encoding="utf-8", newline="\n")
 
@@ -1685,6 +1822,7 @@ exit 0
         "source ./lib/common.sh\n"
         f'CANARY_PGPASS_PATH="{_p(pgpass)}"\n'
         f'CANARY_AWS_CREDS_PATH="{_p(aws)}"\n'
+        f'CANARY_STATE_PATH="{_p(state)}"\n'
         f'SCRIPT_DIR="{_p(scriptdir)}"\n'
         f'AUDITD_RULES_DEST="{_p(tmp_path / "installed.rules")}"\n'
         "AUDITD_LOG_PATH=/var/log/audit/audit.log\n"
@@ -1700,7 +1838,7 @@ exit 0
 
     installed = (tmp_path / "installed.rules").read_text(encoding="utf-8")
     assert _p(pgpass) not in installed, (
-        "o cale ocupată de conținut străin a ajuns totuși în fișierul instalat "
+        "o cale fără înregistrare de stare a ajuns totuși în fișierul instalat "
         "pentru nucleu:\n" + installed)
     assert _p(aws) in installed, "momeala fără coliziune nu are voie să dispară odată cu cealaltă"
 

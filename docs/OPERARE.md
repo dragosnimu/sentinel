@@ -785,17 +785,31 @@ strict împotriva unui atacator care a citit exact acest depozit și evită căi
 implicite pe motiv că par o momeală; oricine altcineva le caută oricum pe căile
 canonice (`.pgpass`, `.aws/credentials`), indiferent de ce repository există.
 
-### Dacă mută un fișier real acolo unde stă o momeală
+### Cum știe instalatorul care momeală e a lui
 
-Instalatorul nu suprascrie niciodată un fișier care există deja la calea unei
-momele — verifică un marcaj de conținut, nu doar prezența fișierului. Dacă
-marcajul lipsește, planificarea unei momele noi acolo e refuzată, avertizat, iar
-urmărirea de audit pentru CALEA ASTA e scoasă din fișierul instalat, ca nucleul
-să nu ajungă să supravegheze un fișier real sub eticheta unei momele.
+La plantare, instalatorul scrie mărimea fișierului (în octeți) în
+`/etc/sentinel/canary-state`. La un redeploy, dacă fișierul e deja acolo,
+decizia „e a mea" se ia comparând mărimea CURENTĂ, luată cu `stat`, cu cea
+înregistrată — niciodată deschizând fișierul. Asta e dinadins: o deschidere a
+momelii de către instalatorul însuși, odată ce regula `sentinel_bait` e armată
+dintr-un deploy anterior, nu se deosebește de o citire a unui atacator, iar
+exact asta a produs un `critical` fals la fiecare livrare, până pe 31 august
+2026. Marcajul de text (`sentinel-canary`) a rămas în conținut, dar nu mai e
+citit de nimic automat — e acolo pentru un om care se uită la un dump.
 
-**Ce nu acoperă asta**: dacă păstrezi marcajul de conținut dar înlocuiești restul
-fișierului cu o credențială reală, instalatorul nu are cum să deosebească asta
-de o editare inofensivă — rămâne sub urmărire `critical`, iar o citire legitimă
-(un script de backup, un cron care chiar folosește fișierul) ar produce o alertă
-de 3 dimineața. Nu repurpoza o cale de momeală pentru ceva real; alege o cale
-nouă, din afara celor două de mai sus.
+**Editare a operatorului care păstrează mărimea** (de exemplu, o parolă falsă
+înlocuită cu alta la fel de lungă): lăsată în pace, tot sub urmărire `critical`.
+
+**Editare care schimbă mărimea, sau un fișier real mutat pe aceeași cale**:
+instalatorul nu mai poate deosebi cele două fără să deschidă fișierul, așa că
+nu încearcă — tratează calea ca „fără evidență", exact ca pe un fișier străin:
+avertizează, scoate urmărirea de audit pentru calea aia din fișierul instalat,
+dar nu atinge niciodată conținutul. Nu repurpoza o cale de momeală pentru ceva
+real; alege o cale nouă, din afara celor două de mai sus.
+
+**O gazdă restaurată dintr-un backup dinainte ca `canary-state` să existe**
+își pierde evidența propriilor momeli. Consecința e aceeași ca mai sus —
+avertisment, urmărire scoasă din nucleu — niciodată o citire tăcută ca să
+recupereze clasificarea. Vizibil în ieșirea deploy-ului, nu tăcut: rulează
+din nou pasul după ce ștergi fișierele vechi, ca să fie replantate și
+înregistrate.

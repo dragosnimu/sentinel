@@ -773,6 +773,13 @@ AUDITD_RULES_DEST=/etc/audit/rules.d/sentinel.rules
 CANARY_PGPASS_PATH="${CANARY_PGPASS_PATH:-/root/.pgpass}"
 CANARY_AWS_CREDS_PATH="${CANARY_AWS_CREDS_PATH:-/root/.aws/credentials}"
 
+# What install_canary_baits planted last time: path and size, in bytes, one
+# pair per line. A repeat deploy reads THIS, not the bait's content, to decide
+# whether a bait already at one of the two paths above is its own -- see the
+# function for why. Overridable for the same reason as every other path here:
+# a test must not write under a real /etc/sentinel.
+CANARY_STATE_PATH="${CANARY_STATE_PATH:-${SENTINEL_CONFIG_DIR}/canary-state}"
+
 # auditd installed is not auditd running, and only the running one produces
 # anything.
 #
@@ -3531,11 +3538,20 @@ audit_rules_for_this_host() {
 
 # Functionality 05: the two bait files the sentinel_bait rule below watches.
 #
-# Fixed marker, embedded in everything this installer writes. It is what a
-# repeat deploy uses to tell "ours, maybe edited by the operator since — leave
-# it" from "something real already occupies this path, and must never be
-# treated as a decoy". The marker line has to be safe to leave inside the
-# file after an edit, so it says exactly what it is.
+# Fixed marker, embedded in everything this installer writes. It used to be
+# what a repeat deploy READ to tell "ours" from "something real already
+# occupies this path" — `grep -qF "sentinel-canary" "$path"` opened the bait
+# and read its content. That is gone (see install_canary_baits): opening the
+# bait's content is the one action the sentinel_bait rule exists to catch, and
+# once that rule is armed — true of every deploy after the first — the
+# installer's own grep is indistinguishable, to the kernel, from an
+# attacker's. MEASURED on production: incident 65237, 31 August 2026, a
+# `critical` "bait read" raised by the installer against itself, on every
+# single delivery. Classification now goes by size, from `stat`, against what
+# was recorded when the bait was planted; the marker stays in the content
+# anyway, because it is still what tells a human — the operator staring at a
+# dump, or an attacker who already read the file — that it was worthless on
+# purpose.
 #
 # Kept LOCAL to the function rather than a module-level constant: a test that
 # extracts only this function's body (the pattern the rest of this file's
@@ -3568,28 +3584,62 @@ EOF
 }
 
 # Plants whichever baits are missing; never rewrites one that is already
-# there, for either reason above. `-w` requires the watched path to EXIST at
+# there, for either reason below. `-w` requires the watched path to EXIST at
 # load time (same constraint as `-F dir=` above, and the same failure mode:
 # `auditctl -R` refuses a rule for a path that is not there), so this has to
 # run and finish before install_audit_rules stages anything — a bait created
 # after the rules load is a rule silently missing from the kernel.
 #
+# A bait already present is classified by comparing SIZE, from `stat`, against
+# what THIS installer recorded in $CANARY_STATE_PATH when it planted it —
+# never by opening the file. `stat()` is a pure metadata call: it is not a
+# read, a write, an execute nor an attribute change, so `-p r` on the
+# sentinel_bait rule cannot see it — see the comment on that rule in
+# deploy/audit/sentinel.rules for the kernel-side reasoning this relies on.
+#
+# Losing the record — a host restored from a backup taken before this state
+# file existed, or one that never ran this version of the installer — is NOT
+# read as "trust whatever is there": with no matching record, a bait already
+# present is classified exactly like foreign content always was — a warning,
+# and its `-w` line left OUT of the kernel. Chosen on purpose: a lost record
+# costs a watch and a visible line in the deploy output, never a silent read
+# and never the false `critical` this replaces. A host upgrading from an
+# installer old enough to have no state file pays this once, the same way,
+# for a bait it planted itself; the remedy is the one the warning prints.
+#
 # Writes to $1, one per line, the path of any bait that already existed
-# WITHOUT the marker: something real lives there, and the caller must drop the
-# sentinel_bait watch for that one path rather than let the kernel watch real
-# content under a decoy's name.
+# WITHOUT a matching size record: either something else lives there, or the
+# record of what was planted is gone, and either way the caller must drop the
+# sentinel_bait watch for that one path rather than let the kernel watch
+# unrecorded content under a decoy's name.
 install_canary_baits() {
-    local foreign_file="$1" path dir content
+    local foreign_file="$1" path dir content size recorded
     : > "$foreign_file"
 
+    # What was planted last time: path -> size in bytes. Read once, up front,
+    # so the loop below never has to touch the bait's content to decide.
+    local -A planted_size=()
+    if [[ -f "$CANARY_STATE_PATH" ]]; then
+        local rec_path rec_size
+        while read -r rec_path rec_size; do
+            [[ -n "$rec_path" ]] && planted_size["$rec_path"]="$rec_size"
+        done < "$CANARY_STATE_PATH"
+    fi
+
+    local -a state_lines=()
     for path in "$CANARY_PGPASS_PATH" "$CANARY_AWS_CREDS_PATH"; do
         if [[ -e "$path" ]]; then
-            if grep -qF "sentinel-canary" "$path" 2>/dev/null; then
+            size="$(stat -c %s -- "$path" 2>/dev/null || true)"
+            recorded="${planted_size[$path]:-}"
+            if [[ -n "$size" && -n "$recorded" && "$size" == "$recorded" ]]; then
                 info "bait already at ${path}, left untouched (a repeat deploy never rewrites one, edited or not)"
+                state_lines+=("$path $size")
             else
-                warn "bait NOT planted at ${path}: something else is already there. The \
-sentinel_bait watch for this path is left OUT of the kernel rather than monitor real content \
-under a decoy's name -- move what's there, or accept the risk yourself."
+                warn "bait NOT planted at ${path}: no record of it at this size (${size:-unknown} \
+bytes now) in ${CANARY_STATE_PATH}. The sentinel_bait watch for this path is left OUT of the \
+kernel rather than monitor unrecorded content under a decoy's name -- if this really is the bait, \
+from before this state file existed or after its record was lost, delete it and re-run this step \
+so it gets replanted and recorded; if it's something else, move it."
                 printf '%s\n' "$path" >> "$foreign_file"
             fi
             continue
@@ -3607,6 +3657,8 @@ under a decoy's name -- move what's there, or accept the risk yourself."
         printf '%s\n' "$content" > "$path"
         chmod 0600 "$path"
         chown root:root "$path" 2>/dev/null || true
+        size="$(stat -c %s -- "$path" 2>/dev/null || true)"
+        [[ -n "$size" ]] && state_lines+=("$path $size")
         # `info`, not `ok`: planting the file is intent, not the effect this
         # repository cares about. Whether the bait is actually ARMED is decided
         # by the very same kernel count/verdict below that covers every other
@@ -3614,6 +3666,19 @@ under a decoy's name -- move what's there, or accept the risk yourself."
         # claim of success this function cannot back on its own.
         info "bait planted at ${path} (armed below, by the sentinel_bait audit rule)"
     done
+
+    # Written LAST, and only over what this run actually confirmed — matched
+    # or freshly planted. A path that fell through to the foreign branch above
+    # is deliberately left OUT, so it stays unrecorded, and therefore foreign,
+    # on the next deploy too, until whatever is really there gets resolved.
+    if (( ${#state_lines[@]} )); then
+        dir="$(dirname "$CANARY_STATE_PATH")"
+        [[ -d "$dir" ]] || mkdir -p "$dir"
+        ( umask 077; printf '%s\n' "${state_lines[@]}" > "${CANARY_STATE_PATH}.tmp" )
+        chown root:root "${CANARY_STATE_PATH}.tmp" 2>/dev/null || true
+        chmod 0600 "${CANARY_STATE_PATH}.tmp"
+        mv "${CANARY_STATE_PATH}.tmp" "$CANARY_STATE_PATH"
+    fi
 }
 
 install_audit_rules() {
