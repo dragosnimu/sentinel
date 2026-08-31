@@ -269,7 +269,7 @@ def test_evenimente_fereastra_scurta_citeste_din_raw_events():
 
     assert "FROM raw_events" in db.sql
     assert "event_rollup_1h" not in db.sql
-    assert result == {"total": 10, "ostile": 2, "ips": 3}
+    assert result == {"total": 10, "ostile": 2, "ips": 3, "aproximat": False}
 
 
 def test_evenimente_fereastra_lunga_citeste_din_rollup_nu_din_raw_events():
@@ -291,15 +291,30 @@ def test_evenimente_fereastra_lunga_citeste_din_rollup_nu_din_raw_events():
     assert "event_rollup_1h" in db.sql
     assert result["total"] == 6916603
     assert result["ips"] is None, "adresele distincte nu pot ieși corect din rollup — vezi randarea"
+    assert result["aproximat"] is True, "fereastra lungă trebuie marcată explicit ca aproximativă"
 
 
 def test_randarea_ferestrei_lungi_spune_nedisponibil_nu_zero():
     """`ips: None` trebuie să se citească drept „nu s-a calculat", nu drept
     „zero adrese distincte" — un zero fals ar arăta ca o gazdă netouchată."""
-    text = ask_mod._r_scalar_dict({"total": 500, "ostile": 12, "ips": None})
+    text = ask_mod._r_evenimente_fereastra(
+        {"total": 500, "ostile": 12, "ips": None, "aproximat": True})
     assert "nedisponibil" in text
     assert "ips: 0" not in text
     assert "ips: None" not in text
+
+
+def test_randarea_ferestrei_lungi_spune_ca_e_aproximata():
+    """Runda 3: fereastra lungă e ancorată pe ora întreagă (poate include până
+    la 59 de minute în plus) — operatorul trebuie să afle asta din răspuns,
+    nu doar din codul sursă."""
+    text = ask_mod._r_evenimente_fereastra(
+        {"total": 500, "ostile": 12, "ips": None, "aproximat": True})
+    assert "rotunjită" in text or "aproxima" in text.lower()
+
+    text_scurta = ask_mod._r_evenimente_fereastra(
+        {"total": 10, "ostile": 2, "ips": 3, "aproximat": False})
+    assert "rotunjită" not in text_scurta
 
 
 def test_o_interogare_care_pica_nu_iese_din_answer_question_ca_exceptie(monkeypatch):
@@ -394,6 +409,17 @@ def test_un_float_fara_parte_fractionara_e_acceptat():
     spec = ask_mod.ParamSpec("int", minimum=1, maximum=20, default=10)
     value, error = ask_mod.validate_param("limita", spec, 5.0)
     assert value == 5 and error is None
+
+
+def test_un_sir_numeric_pentru_un_intreg_e_respins():
+    """Runda 3: `validate_param(int, "5")` trecea tăcut prin `int("5")` — un
+    efect secundar al conversiei, nu o regulă scrisă. `parametri` e un `object`
+    JSON generic (fără schemă per câmp, vezi `_interpret_tool`), deci un model
+    poate întoarce un număr ca text; regula e acum explicită: se respinge,
+    exact ca `bool`-ul și float-ul cu parte fracționară, nu se convertește."""
+    spec = ask_mod.ParamSpec("int", minimum=1, maximum=20, default=10)
+    value, error = ask_mod.validate_param("limita", spec, "5")
+    assert value is None and error is not None
 
 
 def test_parametri_de_alt_tip_decat_dict_e_respins_nu_golit_tacut(monkeypatch):

@@ -41,19 +41,37 @@ _WRITE_VERBS = re.compile(
     re.IGNORECASE)
 
 
-def _sql_argument_strings() -> list[tuple[str, int]]:
-    """Fiecare literal-șir trimis ca prim argument unei metode `db.*` de citire/
-    scriere, cu linia lui. Nu docstring-uri, nu comentarii, nu proză — doar ce
-    ajunge cu adevărat la PostgreSQL."""
-    tree = ast.parse(ASK_PY.read_text(encoding="utf-8"), filename=str(ASK_PY))
+def _sql_argument_strings(path: Path = ASK_PY) -> list[tuple[str, int]]:
+    """Fiecare literal-șir trimis ca argumentul `sql` al unei metode `db.*` de
+    citire/scriere, cu linia lui. Nu docstring-uri, nu comentarii, nu proză —
+    doar ce ajunge cu adevărat la PostgreSQL.
+
+    `Database.execute(self, sql, ...)` (și celelalte) acceptă `sql` fie
+    poziţional, fie pe nume — `db.execute(sql="...")` e o formă la fel de
+    validă ca `db.execute("...")`. O primă versiune verifica doar
+    `node.args[0]` și sărea tăcut orice apel scris cu `sql=`, exact gaura pe
+    care `test_telegram_command_names.py` a documentat-o deja pentru
+    `CommandHandler(command=...)` — aceeași lecție, alt fișier, nescrisă aici
+    până acum.
+
+    `path` e parametrizabil ca `test_the_search_finds_sql_passed_as_a_keyword_argument`
+    să poată rula EXTRACȚIA REALĂ pe un modul fabricat, nu o copie a logicii ei
+    — o copie ar putea diverge tăcut de original și ar da o falsă senzație de
+    siguranță."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     found: list[tuple[str, int]] = []
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
             continue
-        if node.func.attr not in _DB_METHODS or not node.args:
+        if node.func.attr not in _DB_METHODS:
             continue
-        first = node.args[0]
-        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+        first = node.args[0] if node.args else next(
+            (kw.value for kw in node.keywords if kw.arg == "sql"), None)
+        if first is None:
+            # Nici argument poziţional, nici `sql=` pe nume — un apel căruia
+            # nu i se poate găsi interogarea nu poate fi declarat curat.
+            found.append((f"<fără argument sql găsit, linia {node.lineno}>", node.lineno))
+        elif isinstance(first, ast.Constant) and isinstance(first.value, str):
             found.append((first.value, first.lineno))
         else:
             # O interogare construită altfel decât un literal-șir simplu (o
@@ -75,8 +93,35 @@ def test_the_search_actually_walks_real_calls() -> None:
     garda de mai jos pare să treacă fără să fi verificat nimic."""
     queries = _sql_argument_strings()
     assert len(queries) >= 10, f"doar {len(queries)} interogări găsite; formatul s-a schimbat?"
-    assert not any(q.startswith("<neconstant") for q in (t[0] for t in queries)), (
-        "o interogare nu e literal-șir simplu, deci nu poate fi verificată static")
+    ilizibile = [q for q in (t[0] for t in queries)
+                if q.startswith("<neconstant") or q.startswith("<fără argument")]
+    assert not ilizibile, f"interogări necitibile static: {ilizibile}"
+
+
+def test_the_search_finds_sql_passed_as_a_keyword_argument() -> None:
+    """`Database.execute(self, sql, ...)` acceptă `sql` și pe nume —
+    `db.execute(sql="DELETE FROM ask_log")` e la fel de valid pentru Python ca
+    forma pozițională. O primă versiune a gărzii verifica doar `node.args[0]`
+    și sărea complet un apel scris așa — verificatorul a demonstrat exact asta
+    injectat în `ask.py`, cu garda rămasă verde. Aici se dovedește prin
+    execuție, pe un modul fabricat, că extragerea chiar vede forma pe nume."""
+    import tempfile
+
+    sursa = (
+        "async def f(db):\n"
+        "    await db.execute(sql=\"DELETE FROM ask_log\")\n"
+    )
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False,
+                                     encoding="utf-8", newline="\n") as tmp:
+        tmp.write(sursa)
+        tmp_path = Path(tmp.name)
+    try:
+        # Extracția REALĂ, nu o copie a ei — vezi docstring-ul lui `_sql_argument_strings`.
+        found = _sql_argument_strings(tmp_path)
+        assert found == [("DELETE FROM ask_log", 2)], found
+        assert _WRITE_VERBS.search(found[0][0])
+    finally:
+        tmp_path.unlink()
 
 
 def test_no_catalog_query_contains_a_write_verb() -> None:

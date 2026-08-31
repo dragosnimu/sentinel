@@ -76,19 +76,23 @@ def validate_param(name: str, spec: ParamSpec, raw: Any) -> tuple[Any, str | Non
             return None, f"„{name}” trebuie să fie {spec.describe()}, nu {raw!r}"
         return raw, None
     if spec.kind == "int":
-        # `bool` e subclasă de `int` în Python — `int(True) == 1` ar trece
-        # neobservat prin `int(raw)` de mai jos. Respins explicit, nu convertit.
-        if isinstance(raw, bool):
+        # Doar `int`, sau un `float` fără parte fracționară — nimic altceva se
+        # CONVERTEȘTE, totul altceva se RESPINGE. Regula explicită, nu un efect
+        # secundar al lui `int()`:
+        #   * `bool` e subclasă de `int` în Python (`int(True) == 1`) — respins,
+        #     nu confundat cu 1;
+        #   * `3.7` -> `int(3.7) == 3` ar fi o TRUNCHIERE tăcută — respinsă, nu
+        #     rotunjită. `5.0` reprezintă exact aceeași valoare ca `5`, deci trece;
+        #   * un ȘIR ca `"5"` NU se acceptă, deși `int("5")` ar reuși fără
+        #     eroare — un model care întoarce numere ca text pentru un câmp
+        #     fără schemă (`parametri` e un `object` generic, vezi
+        #     `_interpret_tool`) trebuie corectat, nu urmat tăcut. Aceeași
+        #     regulă pentru toate formele nenumerice: se respinge, nu se ajustează.
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
             return None, f"„{name}” trebuie să fie {spec.describe()}, nu {raw!r}"
-        # `int(3.7) == 3` e o TRUNCHIERE tăcută, exact ce interzice contractul
-        # funcției ăsteia — respinsă, nu rotunjită. Un float fără parte
-        # fracționară (5.0) reprezintă exact aceeași valoare ca 5, deci trece.
         if isinstance(raw, float) and not raw.is_integer():
             return None, f"„{name}” trebuie să fie {spec.describe()}, nu {raw!r}"
-        try:
-            value = int(raw)
-        except (TypeError, ValueError):
-            return None, f"„{name}” trebuie să fie {spec.describe()}, nu {raw!r}"
+        value = int(raw)
         if value < (spec.minimum or 0) or value > (spec.maximum or 0):
             return None, f"„{name}”={value} iese din limita permisă ({spec.describe()})"
         return value, None
@@ -279,7 +283,9 @@ async def _q_evenimente_fereastra(db: Database, p: dict[str, Any]) -> dict[str, 
               FROM raw_events WHERE ts > now() - make_interval(hours => $1::int)
             """,
             ore)
-        return dict(row)
+        d = dict(row)
+        d["aproximat"] = False
+        return d
 
     # Fereastră lungă: `event_rollup_1h` există exact pentru asta — mărginit de
     # (ore × perechi sursă/acțiune), nu de volumul brut (vezi analytics/aggregate.py,
@@ -290,48 +296,80 @@ async def _q_evenimente_fereastra(db: Database, p: dict[str, Any]) -> dict[str, 
     # tipar ca `last_activity_sql`. E ieftină oricum: mărginită de întârzierea
     # rollup-ului (job orar), nu de `ore`.
     #
+    # RUNDA 3 — cusătura de la frontieră, corectată. `bucket` e ÎNCEPUTUL orei
+    # (0007_partitions.sql), iar mentenanța agregă până la `now()`, nu până la
+    # ora completă (`maintenance_service.py`) — deci bucket-ul maxim e mereu
+    # PARȚIAL. Runda 2 folosea `bucket <= frontiera.pana` (îl includea în
+    # `vechi`) ȘI `ts > frontiera.pana` (recount tot ce e după ÎNCEPUTUL aceleiași
+    # ore în `recent`) — aceeași oră era numărată de două ori. Corect:
+    #   vechi:  bucket ÎNTRE începutul ferestrei ȘI ÎNAINTE de frontieră
+    #           (`bucket < frontiera.pana`, nu `<=` — bucket-ul parțial e
+    #           exclus complet de-aici, se numără o singură dată mai jos)
+    #   recent: ts DE LA frontieră ÎNAINTE (`ts >= frontiera.pana`) — exact
+    #           complementul lui `vechi`, fără suprapunere și fără gaură.
+    # `greatest(frontiera.pana, fereastra.start)` în `recent` închide și modul
+    # de eșec semnalat separat: dacă job-ul de rollup e mult în urmă (frontiera
+    # mai veche decât începutul ferestrei), `vechi` rămâne gol și `recent`
+    # citește DOAR fereastra cerută din `raw_events` — nu tot ce e după o
+    # frontieră veche, ceea ce ar fi numărat evenimente din AFARA ferestrei.
+    #
+    # Marginea de START: fereastra e ancorată pe ORĂ ÎNTREAGĂ —
+    # `date_trunc('hour', now() - ore)`, nu `now() - ore` direct. Altfel bucket-ul
+    # care se suprapune peste începutul ferestrei ar fi exclus ÎN ÎNTREGIME de
+    # `bucket >= fereastra.start` (bucket-ul lui începe înainte de graniță, deci
+    # `>=` l-ar respinge), deși o parte din el chiar e în fereastră — pe gazda
+    # măsurată de verificator, o oră de vârf avea 233 000 de rânduri. Ancorarea
+    # pe oră întreagă nu pierde nimic: fereastra rezultată e cu până la 59 de
+    # minute MAI MARE decât s-a cerut, niciodată mai mică — iar `aproximat=True`
+    # spune asta operatorului, nu lasă cifra să pară exactă.
+    #
     # Ce se PIERDE față de calea exactă: `ips` (adrese distincte) nu poate ieși
     # din rollup — `event_rollup_1h.n` e o sumă asociativă (corectă din bucket-uri
     # separate), dar o adresă activă în mai multe ore ar fi numărată de mai multe
     # ori dacă am aduna `uniq_src` pe bucket. Mai degrabă lipsă decât greșită:
-    # întoarce `None`, iar `_r_scalar_dict` spune explicit că nu s-a calculat,
-    # nu zero.
+    # întoarce `None`, iar `_r_evenimente_fereastra` spune explicit că nu s-a
+    # calculat, nu zero.
     row = await db.fetchrow(
         """
-        WITH frontiera AS (
-            SELECT COALESCE(max(bucket), now() - make_interval(hours => $1::int)) AS pana
+        WITH fereastra AS (
+            SELECT date_trunc('hour', now() - make_interval(hours => $1::int)) AS start
+        ),
+        frontiera AS (
+            SELECT COALESCE(max(bucket), (SELECT start FROM fereastra)) AS pana
               FROM event_rollup_1h
         ),
         vechi AS (
             SELECT COALESCE(sum(n), 0)::bigint AS total,
                    COALESCE(sum(n) FILTER (WHERE action IN ('auth_fail','alert')), 0)::bigint AS ostile
-              FROM event_rollup_1h, frontiera
-             WHERE bucket > now() - make_interval(hours => $1::int)
-               AND bucket <= frontiera.pana
+              FROM event_rollup_1h, fereastra, frontiera
+             WHERE bucket >= fereastra.start
+               AND bucket <  frontiera.pana
         ),
         recent AS (
             SELECT count(*) AS total,
                    count(*) FILTER (WHERE action IN ('auth_fail','alert')) AS ostile
-              FROM raw_events, frontiera
-             WHERE ts > frontiera.pana
+              FROM raw_events, fereastra, frontiera
+             WHERE ts >= greatest(frontiera.pana, fereastra.start)
         )
         SELECT vechi.total + recent.total AS total,
                vechi.ostile + recent.ostile AS ostile
           FROM vechi, recent
         """,
         ore)
-    return {"total": int(row["total"]), "ostile": int(row["ostile"]), "ips": None}
+    return {"total": int(row["total"]), "ostile": int(row["ostile"]), "ips": None, "aproximat": True}
 
 
-def _r_scalar_dict(d: dict[str, Any]) -> str:
-    linii = []
-    for k, v in d.items():
-        if v is None:
-            linii.append(f"{k}: nedisponibil pentru ferestre peste "
-                         f"{_FEREASTRA_EXACTA_ORE_MAX}h (necesită o scanare completă; "
-                         "cere o fereastră mai scurtă pentru cifra exactă)")
-        else:
-            linii.append(f"{k}: {v}")
+def _r_evenimente_fereastra(d: dict[str, Any]) -> str:
+    linii = [f"total: {d['total']}", f"ostile: {d['ostile']}"]
+    if d.get("ips") is None:
+        linii.append(f"ips: nedisponibil pentru ferestre peste "
+                     f"{_FEREASTRA_EXACTA_ORE_MAX}h (necesită o scanare completă; "
+                     "cere o fereastră mai scurtă pentru cifra exactă)")
+    else:
+        linii.append(f"ips: {d['ips']}")
+    if d.get("aproximat"):
+        linii.append("fereastra e rotunjită la ora întreagă anterioară — poate acoperi "
+                     "până la 59 de minute în plus față de cât s-a cerut, niciodată mai puțin")
     return "\n".join(linii)
 
 
@@ -411,9 +449,10 @@ CATALOG: dict[str, Question] = {
             "Câte evenimente totale și câte ostile (auth_fail/alert), într-o "
             "fereastră de ore înapoi de la acum. Adresele IP distincte apar "
             "DOAR pentru ferestre de cel mult 24 de ore — peste atât, cifra "
-            "exactă ar cere o scanare completă, deci nu se calculează."),
+            "exactă ar cere o scanare completă, deci nu se calculează. Peste "
+            "24 de ore, fereastra e rotunjită la ora întreagă anterioară."),
         params={"ore": ParamSpec("int", minimum=1, maximum=168, default=24)},
-        query=_q_evenimente_fereastra, render=_r_scalar_dict),
+        query=_q_evenimente_fereastra, render=_r_evenimente_fereastra),
     "blocklist_activ": Question(
         description="Câte adrese IP sunt blocate acum, și cele mai recente blocări.",
         params={"limita": ParamSpec("int", minimum=1, maximum=20, default=10)},
