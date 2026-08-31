@@ -43,6 +43,24 @@ valoare de securitate; ~161 de sesiuni nu ocupă nimic.
 
 Iar filtrul e pe TERMINALUL COMENZII, nu pe contul sesiunii — vezi
 `is_dropped_command`, unde e scris de ce diferența asta e chiar reparația.
+
+## `session_commands.event_id`
+
+Coloana există din 0026 dar a rămas nescrisă până acum: `record_command` n-o
+punea în lista de coloane. Măsurat pe gazdă la descoperire: 0 din 420 494 de
+rânduri o aveau populată — o investigație nu putea lega o comandă din istoric
+înapoi de rândul brut din care a fost construită.
+
+Se completează din `ev.id`, pus de `events_repo.insert_batch` PE ACELEAȘI
+obiecte `Event` înainte ca lotul să ajungă la `project()` — nu se citește
+nimic înapoi din bază. Când preallocarea id-urilor eșuează pentru un lot,
+`ev.id` rămâne `None` și `event_id` se scrie NULL: o comandă scrisă fără
+legătură e corectă; una legată de rândul altcuiva ar fi otrăvit exact
+investigația pentru care există coloana.
+
+Rândurile scrise ÎNAINTE de reparația asta rămân NULL pentru totdeauna — vezi
+`sentinel/db/migrations/0040_session_commands_event_id_comment.sql` pentru
+decizia de a nu face backfill și de ce.
 """
 
 from __future__ import annotations
@@ -300,14 +318,22 @@ async def close_session(db: Database, ev: Event, key: str) -> int | None:
 # ---------------------------------------------------------------------------
 _INSERT_COMMAND = """
 INSERT INTO session_commands
-    (session_id, session_key, ts, username, exe, argv, cwd, tty, pid, ppid, success)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    (session_id, session_key, ts, username, exe, argv, cwd, tty, pid, ppid, success, event_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 """
 
 
 async def record_command(db: Database, ev: Event, key: str,
                          session_id: int | None) -> None:
-    """Scrie o comandă. `session_id` poate fi `None` — vezi capul modulului."""
+    """Scrie o comandă. `session_id` poate fi `None` — vezi capul modulului.
+
+    `event_id` vine din `ev.id`, pus de `events_repo.insert_batch` ÎNAINTE ca
+    lotul ăsta să ajungă aici — `project()` rulează pe ACELEAȘI obiecte
+    `Event`, nu pe copii citite din bază. Rămâne `None` dacă preallocarea
+    id-urilor a eșuat pentru lot: un `event_id` greșit ar lega comanda de
+    evenimentul altcuiva, ceea ce e mai rău decât o coloană goală — deci NULL
+    e răspunsul corect ori de câte ori legătura nu e sigură, nu doar aici.
+    """
     raw = ev.raw or {}
     await db.execute(
         _INSERT_COMMAND,
@@ -319,7 +345,8 @@ async def record_command(db: Database, ev: Event, key: str,
         raw.get("argv") or "",
         raw.get("cwd"), raw.get("tty"),
         _int(raw.get("pid")) or ev.pid, _int(raw.get("ppid")),
-        raw.get("success") == "yes" if raw.get("success") is not None else None)
+        raw.get("success") == "yes" if raw.get("success") is not None else None,
+        ev.id)
 
 
 async def _find_session(db: Database, key: str, ts: Any) -> int | None:

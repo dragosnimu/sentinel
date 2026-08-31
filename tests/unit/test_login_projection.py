@@ -62,15 +62,21 @@ def _logout(key: str = "432", *, ts: datetime = NOW + timedelta(hours=1),
 def _command(key: str = "432", argv: str = "/usr/bin/ls -la", *,
              exe: str = "/usr/bin/ls", ts: datetime = NOW,
              ppid: str = "100", tty: str = "(none)",
-             user: str = "operator") -> Event:
+             user: str = "operator", event_id: int | None = None) -> Event:
     """O comandă. `tty` implicit `(none)`: cazul obișnuit e o automatizare.
 
     557 de sesiuni fără terminal față de 29 cu, măsurat pe gazdă — deci
     implicitul care nu surprinde e cel fără.
+
+    `event_id`: simulează ce pune `events_repo.insert_batch` pe obiectul
+    `Event` ÎNAINTE de proiecție. Implicit `None`, ca la un lot pentru care
+    preallocarea id-urilor a eșuat.
     """
-    return Event(ts=ts, source="auditd", action="command", username=user,
-                 raw={"record_type": "SYSCALL", "ses": key, "argv": argv,
-                      "exe": exe, "ppid": ppid, "success": "yes", "tty": tty})
+    ev = Event(ts=ts, source="auditd", action="command", username=user,
+               raw={"record_type": "SYSCALL", "ses": key, "argv": argv,
+                    "exe": exe, "ppid": ppid, "success": "yes", "tty": tty})
+    ev.id = event_id
+    return ev
 
 
 def _interval(sql: str, dupa: str) -> timedelta:
@@ -102,10 +108,17 @@ class _DB:
         self.commands: list[dict] = []
         self.sql: list[str] = []
         self._next_id = 1
+        self._next_raw_event_id = 90_000
+        self.raw_events_rows: list[tuple] = []
 
     def _id(self) -> int:
         self._next_id += 1
         return self._next_id - 1
+
+    async def executemany(self, sql, rows):
+        """`raw_events`, scris de `events_repo.insert_batch`."""
+        self.sql.append(sql)
+        self.raw_events_rows.extend(rows)
 
     async def fetchrow(self, sql, *a):
         self.sql.append(sql)
@@ -189,10 +202,14 @@ class _DB:
     async def execute(self, sql, *a):
         self.sql.append(sql)
         if "INSERT INTO session_commands" in sql:
+            assert "event_id" in sql.split("VALUES")[0], (
+                "record_command nu mai scrie event_id -- coloana rămâne goală "
+                "din nou, ca înainte de reparație")
             self.commands.append({
                 "session_id": a[0], "session_key": a[1], "ts": a[2],
                 "username": a[3], "exe": a[4], "argv": a[5], "cwd": a[6],
-                "tty": a[7], "pid": a[8], "ppid": a[9], "success": a[10]})
+                "tty": a[7], "pid": a[8], "ppid": a[9], "success": a[10],
+                "event_id": a[11]})
             return "INSERT 0 1"
         if "UPDATE session_commands c SET session_id" in sql:
             assert "c.session_id IS NULL" in sql, sql
@@ -258,6 +275,15 @@ class _DB:
 
     async def fetch(self, sql, *a):
         self.sql.append(sql)
+        if "nextval" in sql:
+            # `events_repo._preallocate_ids` — ținut separat de contorul
+            # sesiunilor (`_next_id`), pornit de la 90 000, ca o eroare care
+            # ar amesteca id-uri de sesiune cu id-uri de eveniment să iasă la
+            # iveală ca o valoare imposibil de confundat cu cealaltă.
+            n = a[0]
+            ids = list(range(self._next_raw_event_id, self._next_raw_event_id + n))
+            self._next_raw_event_id += n
+            return [{"id": i} for i in ids]
         return []
 
 
@@ -423,6 +449,79 @@ def test_a_command_is_attached_to_its_session() -> None:
     run(logins.project(db, [_login(), _command()]))
     assert len(db.commands) == 1
     assert db.commands[0]["session_id"] == db.sessions[0]["id"]
+
+
+def test_event_id_lands_on_the_matching_row_not_a_neighbours() -> None:
+    """Un `event_id` greșit e mai rău decât unul absent (regula din CLAUDE.md).
+
+    `insert_batch` pune id-ul pe FIECARE obiect `Event` din lot, nu doar pe
+    unul. Dacă `record_command` ar citi un id fix, sau ar confunda ordinea
+    argumentelor SQL, o comandă ar apărea legată de rândul brut al vecinei ei
+    din același lot — o legătură care arată sigură și duce în altă parte,
+    otrăvind exact investigația pentru care există coloana. Verificăm prin
+    EXECUȚIE că fiecare comandă primește STRICT id-ul evenimentului care a
+    produs-o, într-un lot cu trei comenzi cu id-uri distincte și neordonate.
+    """
+    db = _DB()
+    evenimente = [
+        _login(),
+        _command(argv="/usr/bin/whoami", event_id=9001),
+        _command(argv="/usr/bin/id", event_id=42),
+        _command(argv="/usr/bin/pwd", event_id=777),
+    ]
+    run(logins.project(db, evenimente))
+
+    assert len(db.commands) == 3
+    by_argv = {c["argv"]: c["event_id"] for c in db.commands}
+    assert by_argv == {
+        "/usr/bin/whoami": 9001,
+        "/usr/bin/id": 42,
+        "/usr/bin/pwd": 777,
+    }, "event_id-ul unei comenzi s-a mutat pe rândul altei comenzi din lot"
+
+
+def test_event_id_survives_the_real_insert_batch_into_project() -> None:
+    """Capătul la capăt: nu doar că `record_command` scrie `ev.id` corect, ci
+    că `ev.id` chiar e id-ul real pe care `events_repo.insert_batch` l-a
+    scris pe rândul respectiv în `raw_events` — nu unul simulat de test.
+
+    Fără asta, celelalte teste ar putea trece doar fiindcă falsifică
+    `Event.id` direct (`_command(event_id=...)`), fără să dovedească vreodată
+    că firul `insert_batch → project → record_command`, așa cum rulează în
+    `ingest_service.poll_once`, chiar transportă valoarea corectă.
+    """
+    from sentinel.db.repo import events as events_repo
+
+    db = _DB()
+    evenimente = [_login(), _command(argv="/usr/bin/whoami"), _command(argv="/usr/bin/id")]
+
+    run(events_repo.insert_batch(db, evenimente))
+    # Preallocarea a reușit: fiecare eveniment poartă acum id-ul lui real.
+    assert all(e.id is not None for e in evenimente)
+    assert len(set(e.id for e in evenimente)) == len(evenimente), (
+        "două evenimente din lot au primit același id")
+
+    run(logins.project(db, evenimente))
+
+    by_argv = {c["argv"]: c["event_id"] for c in db.commands}
+    id_whoami = next(e.id for e in evenimente if e.raw.get("argv") == "/usr/bin/whoami")
+    id_id = next(e.id for e in evenimente if e.raw.get("argv") == "/usr/bin/id")
+    assert by_argv == {"/usr/bin/whoami": id_whoami, "/usr/bin/id": id_id}
+
+
+def test_event_id_is_null_when_preallocation_failed_upstream() -> None:
+    """Absența e răspunsul corect când legătura nu poate fi făcută cu certitudine.
+
+    Dacă `events_repo.insert_batch` n-a putut rezerva id-uri (bază picată,
+    timeout), `ev.id` rămâne `None`. Comanda tot trebuie scrisă — ingestia nu
+    are voie să cadă din cauza unei coloane de urmărire —, dar `event_id`
+    trebuie să rămână NULL, nu 0 sau alt implicit care ar arăta ca o legătură
+    reală.
+    """
+    db = _DB()
+    run(logins.project(db, [_login(), _command()]))  # event_id implicit None
+    assert len(db.commands) == 1
+    assert db.commands[0]["event_id"] is None
 
 
 def test_a_command_that_arrives_before_its_login_is_not_lost() -> None:

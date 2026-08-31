@@ -11,8 +11,14 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import asyncpg
+
 from sentinel.db.engine import Database
+from sentinel.errors import StorageError
+from sentinel.logging_setup import get_logger
 from sentinel.model.event import Event
+
+log = get_logger(__name__)
 
 # Column order for the batch insert. Must match the placeholders below exactly.
 _COLS = [
@@ -23,13 +29,33 @@ _COLS = [
     "tls_ja4", "geo_country", "geo_asn", "geo_as_org", "reputation", "raw",
 ]
 
-# src_ip/dst_ip are inet and raw is jsonb; the rest bind as-is. reputation is a
-# text[] which asyncpg maps from a Python list natively.
-_PLACEHOLDERS = ", ".join(
-    {"src_ip": "$5::inet", "dst_ip": "$7::inet", "raw": "$30::jsonb"}.get(c, f"${i}")
-    for i, c in enumerate(_COLS, start=1)
+# `id` merge ÎNAINTEA celorlalte, folosit doar când `_preallocate_ids` a reușit
+# — vezi `insert_batch`. Ținut separat de `_COLS` ca varianta obișnuită (fără
+# id, cu implicitul din `bigserial`) să rămână calea care nu poate pica din
+# cauza unei secvențe indisponibile.
+_COLS_WITH_ID = ["id", *_COLS]
+
+# src_ip/dst_ip sunt inet și raw e jsonb; restul se leagă ca atare. reputation
+# e text[], pe care asyncpg îl mapează nativ dintr-o listă Python.
+#
+# Tipul se leagă de NUMELE coloanei, nu de poziția ei: o valoare hardcodată de
+# tipul `"$5::inet"` ar rămâne corectă doar cât timp nimeni nu adaugă sau mută
+# o coloană înaintea lui `src_ip` — exact ce se întâmplă mai jos cu `id`.
+_TYPED_COLS = {"src_ip": "inet", "dst_ip": "inet", "raw": "jsonb"}
+
+
+def _placeholders(cols: list[str]) -> str:
+    return ", ".join(
+        f"${i}::{_TYPED_COLS[c]}" if c in _TYPED_COLS else f"${i}"
+        for i, c in enumerate(cols, start=1)
+    )
+
+
+_INSERT = f"INSERT INTO raw_events ({', '.join(_COLS)}) VALUES ({_placeholders(_COLS)})"
+_INSERT_WITH_ID = (
+    f"INSERT INTO raw_events ({', '.join(_COLS_WITH_ID)}) "
+    f"VALUES ({_placeholders(_COLS_WITH_ID)})"
 )
-_INSERT = f"INSERT INTO raw_events ({', '.join(_COLS)}) VALUES ({_PLACEHOLDERS})"
 
 
 #: Ce se pune în locul unui octet NUL care a ajuns până aici.
@@ -65,10 +91,10 @@ def _scrub(value: Any) -> Any:
     return value
 
 
-def _row_tuple(ev: Event) -> tuple[Any, ...]:
+def _row_tuple(ev: Event, cols: list[str] = _COLS) -> tuple[Any, ...]:
     row = ev.to_row()
     values: list[Any] = []
-    for c in _COLS:
+    for c in cols:
         if c == "raw":
             values.append(json.dumps(_scrub(row.get("raw") or {})))
         elif c == "reputation":
@@ -78,10 +104,60 @@ def _row_tuple(ev: Event) -> tuple[Any, ...]:
     return tuple(values)
 
 
+async def _preallocate_ids(db: Database, n: int) -> list[int] | None:
+    """Rezervă `n` valori din `raw_events_id_seq`, ÎNAINTE de a scrie lotul.
+
+    De ce înainte, și nu `INSERT ... RETURNING id` după: PostgreSQL nu
+    garantează că ordinea rândurilor din `RETURNING` corespunde ordinii de
+    intrare a unui `executemany`/`unnest` — „în practică se potrivesc" nu e o
+    dovadă, e o observație, și e exact genul de raționament care a produs
+    bug-urile din `CLAUDE.md`.
+
+    Aici problema aia nu există: fiecare `Event` primește id-ul lui ÎNAINTE de
+    orice INSERT, iar rândul se scrie cu id-ul pe care obiectul îl poartă deja.
+    Nu există moment în care corespondența dintre un rând scris și comanda
+    care i-a atribuit id-ul să depindă de ordinea vreunui rezultat — o
+    atribuim noi, în Python, nu o citim înapoi.
+
+    Eșuează închis: dacă secvența nu poate fi citită (bază picată, pool
+    închis, timeout), se întoarce `None`, iar `insert_batch` scrie lotul cu
+    id-ul implicit din `bigserial`, ca înainte de reparația asta. Colectarea
+    e calea vitală — n-are voie să cadă ca să câștige o coloană de urmărire
+    (`session_commands.event_id`, care rămâne NULL în cazul ăsta; vezi
+    `sentinel/db/repo/logins.py:record_command`).
+    """
+    try:
+        rows = await db.fetch(
+            "SELECT nextval('raw_events_id_seq') AS id FROM generate_series(1, $1)", n)
+    except (asyncpg.PostgresError, OSError, StorageError) as exc:
+        log.warning(
+            "could not preallocate raw_events ids; event_id will be NULL for this batch",
+            extra={"detail": str(exc), "batch_size": n},
+        )
+        return None
+    if len(rows) != n:
+        # N-ar trebui să se poată întâmpla — `generate_series(1, n)` dă exact
+        # `n` rânduri — dar o presupunere nevalidată aici ar însemna id-uri
+        # atribuite la nimereală unor evenimente greșite, ceea ce regula 1 a
+        # temei interzice explicit. Mai bine NULL peste tot lotul.
+        log.warning(
+            "raw_events id preallocation returned an unexpected row count",
+            extra={"expected": n, "got": len(rows)},
+        )
+        return None
+    return [int(r["id"]) for r in rows]
+
+
 async def insert_batch(db: Database, events: list[Event]) -> int:
     if not events:
         return 0
-    await db.executemany(_INSERT, [_row_tuple(e) for e in events])
+    ids = await _preallocate_ids(db, len(events))
+    if ids is not None:
+        for ev, new_id in zip(events, ids, strict=True):
+            ev.id = new_id
+        await db.executemany(_INSERT_WITH_ID, [_row_tuple(e, _COLS_WITH_ID) for e in events])
+    else:
+        await db.executemany(_INSERT, [_row_tuple(e) for e in events])
     return len(events)
 
 

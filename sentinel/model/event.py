@@ -124,6 +124,13 @@ class Event:
     # Set by ingest so a collector restart cannot silently re-read or skip.
     cursor: str | None = None
 
+    # The row's future id in `raw_events`, assigned by `insert_batch` BEFORE
+    # the write — see `sentinel/db/repo/events.py:_preallocate_ids`. No
+    # collector sets this; it stays `None` until the event has been inserted,
+    # or forever if preallocation failed for that batch (the write still
+    # happens, just without a traceable id — see `logins.record_command`).
+    id: int | None = None
+
     UNTRUSTED_FIELDS = frozenset(
         {
             "username", "http_path", "http_query", "http_ua", "http_host",
