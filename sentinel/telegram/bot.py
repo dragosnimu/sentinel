@@ -391,6 +391,65 @@ async def cmd_patches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+async def cmd_intreaba(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/intreaba <întrebare>` — întrebări în limbaj natural despre starea
+    serverului, răspunse dintr-un catalog fix de interogări scrise de mână
+    (`sentinel/ai/ask.py`). Modelul alege DOAR cheia din catalog și parametrii
+    ei, validați în Python contra unor limite absolute; nu scrie și nu compune
+    niciun SQL — vezi docstring-ul modulului pentru de ce granița asta contează
+    exact aici, unde întrebarea vine dintr-un canal Telegram.
+
+    Read-only prin construcție: fiecare interogare din catalog e un SELECT.
+    """
+    from sentinel.ai import ask as ask_mod
+    from sentinel.config import get_secrets
+    from sentinel.db.repo import ask_log as ask_log_repo
+
+    db: Database = context.bot_data["db"]
+    cfg: Config = context.bot_data["cfg"]
+    chat_id = update.effective_chat.id
+
+    question = " ".join(context.args or []).strip()
+    if not question:
+        await update.message.reply_text(
+            "Folosire: <code>/intreaba &lt;întrebare&gt;</code>\n\nPot răspunde la:\n"
+            + _esc(ask_mod.catalog_help_ro()), parse_mode=ParseMode.HTML)
+        return
+
+    api_key = get_secrets().get("ANTHROPIC_API_KEY")
+    if not api_key:
+        await update.message.reply_text(
+            "Funcția are nevoie de o cheie API Anthropic, care nu e configurată acum.")
+        return
+    if not cfg.ai.enabled:
+        await update.message.reply_text("Stratul AI e dezactivat în configurație.")
+        return
+
+    # Plafon per chat: comanda face DOUĂ apeluri către model, deci apăsată în
+    # buclă costă de două ori mai repede decât orice altă comandă din bot.
+    # `ask_rate_limit_per_hour` există în config din schema inițială și nu era
+    # citit de nimic — vezi 0041_ask_log.sql.
+    limit = cfg.ai.ask_rate_limit_per_hour
+    used = await ask_log_repo.count_last_hour(db, chat_id)
+    if used >= limit:
+        await update.message.reply_text(
+            f"Ai atins limita de {limit} întrebări pe oră pentru acest chat. "
+            "Mai încearcă peste puțin timp.")
+        return
+    # Scris ÎNAINTE de apel, nu după: cele două apeluri către model durează
+    # secunde, iar scrierea de aici ține fereastra de cursă (verifică apoi
+    # scrie) cât un singur round-trip la bază, nu cât toată comanda.
+    await ask_log_repo.record(db, chat_id)
+
+    result = await ask_mod.answer_question(db, cfg, api_key, question)
+    text = _esc(result.text)
+    if result.based_on:
+        text += f"\n\n<i>Bazat pe: {_esc(result.based_on)}</i>"
+    if result.ok and not result.ai_formulated:
+        text += "\n<i>(date reale; doar formularea în limbaj natural a lipsit)</i>"
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
 async def on_patch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Route every patch button. Role is checked here, once, before any branch —
     a viewer must not be able to dry-run either, since that still runs commands."""
@@ -1228,6 +1287,8 @@ READ_ONLY = [
             "Ce ascultă pe toate interfețele"),
     Command(("patches", "patch", "patchuri"), cmd_patches,
             "Planuri de patch în așteptare; /patch 3 pentru unul"),
+    Command(("intreaba", "ask"), cmd_intreaba,
+            "Întreabă în cuvinte proprii: /intreaba câte incidente critice azi?"),
 ]
 
 # State-changing. Each re-checks the role itself; `_guard` only enforces the

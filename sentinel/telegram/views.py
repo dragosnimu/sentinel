@@ -365,7 +365,10 @@ HELP = """🛡️ <b>Sentinel — comenzi</b>
 
 <b>Notificări</b>
 /mute 22:00-06:00 · /mute 2h · /unmute
-<i>Criticele, PANIC și eșecurile de patch trec oricum.</i>"""
+<i>Criticele, PANIC și eșecurile de patch trec oricum.</i>
+
+<b>Întrebări</b>
+/intreaba &lt;întrebare&gt; — răspuns din datele reale, în cuvinte proprii"""
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
