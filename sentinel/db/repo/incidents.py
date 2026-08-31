@@ -15,6 +15,10 @@ from datetime import datetime
 from typing import Any
 
 from sentinel.db.engine import Database
+from sentinel.db.repo import incident_campaigns as camp_repo
+from sentinel.logging_setup import get_logger
+
+log = get_logger(__name__)
 
 SEVERITIES = ("info", "low", "medium", "high", "critical")
 _SEV_RANK = {s: i for i, s in enumerate(SEVERITIES)}
@@ -154,6 +158,14 @@ async def upsert_incident(
     Telegram push versus a quiet update. Severity only ever ratchets UP: a
     brute-force that escalates to a critical count must not be quietly downgraded
     by a later, smaller batch.
+
+    Also attaches the incident to its campaign (`campaigns.attach_incident`,
+    keyed by the rule family — the part of `fingerprint` before the first
+    `:`). Campaign attachment is a reading convenience, not the detection
+    itself: if it raises, the incident this function just wrote must still
+    come back to the caller, so the call is wrapped and a failure only logs a
+    warning. A detection lost because grouping failed would be far worse than
+    a missing campaign.
     """
     row = await db.fetchrow(
         """
@@ -172,7 +184,14 @@ async def upsert_incident(
         """,
         fingerprint, severity, title, summary, actor_key, asset_id,
     )
-    return int(row["id"]), bool(row["is_new"])
+    incident_id, is_new = int(row["id"]), bool(row["is_new"])
+
+    try:
+        await camp_repo.attach_incident(db, incident_id, fingerprint.split(":", 1)[0], severity)
+    except Exception as exc:  # noqa: BLE001 - detection must survive a grouping failure
+        log.warning("campaign attach failed", extra={"incident_id": incident_id, "detail": str(exc)})
+
+    return incident_id, is_new
 
 
 async def link_detection(db: Database, detection_id: int, incident_id: int) -> None:

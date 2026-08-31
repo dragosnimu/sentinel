@@ -464,6 +464,24 @@ async def close_stale_incidents(db: Database, cfg: Config) -> tuple[str, dict[st
 
 
 # ---------------------------------------------------------------------------
+# 10. Campanii tăcute
+# ---------------------------------------------------------------------------
+async def quiet_campaigns(db: Database) -> tuple[str, dict[str, Any]]:
+    """Trece în `quiet` campaniile active fără activitate nouă de
+    `CAMPAIGN_QUIET_HOURS`.
+
+    La fel ca `close_stale_incidents`: nu șterge, nu închide — doar marchează
+    frontul ca stins, ca panoul să nu-l mai numere printre cele active. O
+    campanie `quiet` nu se reactivează niciodată; vezi
+    `sentinel/db/repo/incident_campaigns.py` pentru motiv.
+    """
+    from sentinel.db.repo import incident_campaigns as camp_repo
+    n = await camp_repo.quiet_stale(db, camp_repo.CAMPAIGN_QUIET_HOURS)
+    return (f"{n} campanii trecute în quiet" if n else "nicio campanie de liniștit",
+            {"quieted": n})
+
+
+# ---------------------------------------------------------------------------
 # Rularea
 # ---------------------------------------------------------------------------
 async def run(db: Database, cfg: Config) -> Report:
@@ -480,6 +498,7 @@ async def run(db: Database, cfg: Config) -> Report:
     await _step(rep, "intel", refresh_intel(db))
     await _step(rep, "backups", prune_backups(db, cfg))
     await _step(rep, "stale_incidents", close_stale_incidents(db, cfg))
+    await _step(rep, "quiet_campaigns", quiet_campaigns(db))
     return rep
 
 

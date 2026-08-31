@@ -38,6 +38,7 @@ from __future__ import annotations
 from typing import Any
 
 from sentinel.db.engine import Database
+from sentinel.db.repo import incident_campaigns as camp_repo
 
 #: Perechile (sursă, acțiune) care se știe că există.
 #:
@@ -527,3 +528,27 @@ async def service_health(db: Database) -> dict[str, int]:
         """
     )
     return {r["stare"]: int(r["n"]) for r in rows}
+
+
+async def campaigns(db: Database) -> list[dict[str, Any]]:
+    """Campaniile active — familii de regulă cu activitate în curs, nu
+    incidentele brute. Delegă la `db/repo/incident_campaigns.py:active_campaigns`; ea
+    trăiește acolo (nu aici) fiindcă `maintenance_service.quiet_campaigns` și
+    `insights._campaign_insight` trebuie să citească EXACT aceeași
+    interogare, nu o a doua copie care poate diverge.
+
+    Măsurat, nu presupus, de ce e sigur al 15-lea `await` din `page.load`
+    (vezi avertismentul din docstring-ul acelui modul): tabela
+    `incident_campaigns` are o singură campanie ACTIVĂ per familie (indexul
+    unic parțial din 0039), iar pe gazda pentru care a fost dimensionată asta
+    înseamnă 14 rânduri. Nu citește `incidents` și nu face nicio agregare la
+    citire — contoarele sunt deja recalculate la scriere, în `attach_incident`.
+
+    Măsurat cu `EXPLAIN (ANALYZE, BUFFERS)` pe un Postgres 16.4 local, cu 968
+    incidente și 14 campanii încărcate în aceeași formă ca pe gazdă: `Seq Scan`
+    pe `incident_campaigns` (planificatorul preferă scanarea directă unei
+    tabele de 14 rânduri, în locul indexului), 55 de buffere în total,
+    `Execution Time` 0,127 ms. Nu e cifra gazdei — e dovada că interogarea nu
+    poate deveni scumpă la volumul la care a fost gândită tabela.
+    """
+    return await camp_repo.active_campaigns(db)

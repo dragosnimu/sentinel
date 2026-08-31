@@ -648,6 +648,50 @@ def test_flood_fires_only_past_both_thresholds():
     assert run(ins._incident_flood_insight(small)) == []
 
 
+# --- active campaigns --------------------------------------------------------
+def test_campaign_insight_names_the_count_and_the_biggest_one():
+    """The operator reading the dashboard must see how many fronts are open
+    and which is largest without having to scroll a raw incident list — the
+    measured case this insight exists for: 968 open incidents read as 14
+    campaigns, one of which (auth.ssh_bruteforce) accounts for 37 of them."""
+    db = _StubDB(fetch_map={"FROM incident_campaigns": [
+        {"id": 1, "campaign_key": "auth.ssh_bruteforce", "severity": "medium",
+         "title": "Campanie: auth.ssh_bruteforce", "first_seen_at": None,
+         "last_activity_at": None, "incident_count": 37, "actor_count": 37},
+        {"id": 2, "campaign_key": "web.enumeration", "severity": "medium",
+         "title": "Campanie: web.enumeration", "first_seen_at": None,
+         "last_activity_at": None, "incident_count": 24, "actor_count": 24},
+    ]})
+    out = run(ins._campaign_insight(db))
+    assert len(out) == 1
+    assert "2 campanii" in out[0].title
+    assert "auth.ssh_bruteforce" in out[0].title
+    assert out[0].evidence["cea_mai_mare"]["incidente"] == 37
+
+
+def test_no_active_campaigns_is_quiet_not_an_empty_card():
+    """No active campaign is a legitimate state (a quiet host, or one where
+    every campaign has gone `quiet`) and must not render a zero-value card —
+    same rule as every other insight here: absence is silence, not a claim."""
+    assert run(ins._campaign_insight(_StubDB(fetch_map={"FROM incident_campaigns": []}))) == []
+
+
+def test_campaign_insight_is_registered_in_collect():
+    """A rule written and never wired into `collect()` never runs, in
+    silence — the two direct tests above would keep passing forever while
+    the dashboard never showed a thing. Same failure `test_maintenance.py`
+    guards for `run()`'s step list.
+
+    Word-boundary match, not a bare substring: `_campaign_insight` is itself
+    a substring of the unrelated, already-registered `_probe_campaign_insights`
+    (probe-pattern insight, section 4), so a plain `in` check here would pass
+    whether or not THIS rule was ever added to the tuple."""
+    import inspect
+    import re
+    src = inspect.getsource(ins.collect)
+    assert re.search(r"\b_campaign_insight\b", src)
+
+
 # --- vulnerability posture --------------------------------------------------
 def test_kev_is_critical_and_outranks_the_rest():
     db = _StubDB(row_map={"FROM findings": {"deschise": 50, "kev": 43, "rezolvate": 0}})

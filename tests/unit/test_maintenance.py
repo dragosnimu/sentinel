@@ -422,6 +422,29 @@ def test_the_step_is_registered_in_the_run():
     assert "close_stale_incidents" in src
 
 
+# --- quiet_campaigns: campaniile fără activitate nouă trec în quiet -------
+def test_quiet_campaigns_reports_the_count():
+    db = _DB(rows={"UPDATE incident_campaigns": [{"id": 1}, {"id": 2}, {"id": 3}]})
+    detail, evidence = run(ms.quiet_campaigns(db))
+    assert evidence["quieted"] == 3
+    assert "3 campanii" in detail
+
+
+def test_quiet_campaigns_is_quiet_when_nothing_is_stale():
+    """O rulare fără nimic de liniștit trebuie să spună asta, nu să tacă —
+    aceeași regulă ca la `close_stale_incidents`."""
+    detail, evidence = run(ms.quiet_campaigns(_DB()))
+    assert evidence["quieted"] == 0
+    assert "nicio campanie" in detail
+
+
+def test_quiet_campaigns_step_is_registered_in_the_run():
+    """O sarcină scrisă și neapelată nu rulează niciodată, în tăcere."""
+    import inspect
+    src = inspect.getsource(ms.run)
+    assert "quiet_campaigns" in src
+
+
 # --- refresh_intel: KEV + feed-uri de reputație, în același pas izolat ----
 def test_refresh_intel_calls_both_kev_and_reputation(monkeypatch):
     """Funcționalitatea 03 a adăugat feed-urile de reputație lângă KEV, în

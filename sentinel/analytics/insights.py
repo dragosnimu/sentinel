@@ -64,7 +64,7 @@ async def collect(db: Database) -> list[Insight]:
                  _incident_flood_insight, _vuln_insight, _trend_insight,
                  _enrichment_insight, _ai_disagreement_insight,
                  _privilege_insight, _concentrated_asn_insight,
-                 _exposure_crossing_insight):
+                 _exposure_crossing_insight, _campaign_insight):
         try:
             out.extend(await rule(db))
         except Exception:  # noqa: BLE001 - one bad rule must not empty the page
@@ -719,6 +719,33 @@ async def _concentrated_asn_insight(db: Database) -> list[Insight]:
                 "din același loc."),
         action="Ia în calcul blocarea intervalului, nu doar a adreselor individuale",
         evidence={"detalii": [names]},
+    )]
+
+
+# --- 13. campaigns, not incidents -------------------------------------------
+async def _campaign_insight(db: Database) -> list[Insight]:
+    """968 de incidente deschise citite ca 14 campanii, grupate pe familia
+    regulii — vezi `sentinel/db/repo/incident_campaigns.py`. Insight-ul ăsta spune câte
+    fronturi sunt deschise ACUM și care e cel mai mare, în loc să lase
+    judecata asta pe seama cuiva care derulează 968 de rânduri."""
+    from sentinel.db.repo import incident_campaigns as camp_repo
+
+    rows = await camp_repo.active_campaigns(db)
+    if not rows:
+        return []
+    top = rows[0]
+    return [Insight(
+        level="info",
+        title=(f"{len(rows)} campanii active — cea mai mare: „{top['campaign_key']}” "
+               f"({top['incident_count']} incidente, {top['actor_count']} actori)"),
+        detail=("Incidentele sunt grupate pe familia regulii care le-a produs, nu "
+                "citite unul câte unul. O campanie rămâne activă cât timp mai "
+                "primește incidente noi din aceeași familie."),
+        evidence={"campanii": len(rows),
+                  "cea_mai_mare": {"familie": top["campaign_key"],
+                                   "incidente": top["incident_count"],
+                                   "actori": top["actor_count"],
+                                   "severitate": top["severity"]}},
     )]
 
 

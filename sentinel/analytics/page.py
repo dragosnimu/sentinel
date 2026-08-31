@@ -55,4 +55,14 @@ async def load(db: Database) -> dict[str, Any]:
         "signatures": await aggregate.ids_signatures(db),
         "hourly": await aggregate.hourly_activity(db),
         "health": await aggregate.service_health(db),
+        # Al 15-lea `await`, adăugat cu măsurătoare, nu din inerție — vezi
+        # avertismentul din docstring-ul modulului. `aggregate.campaigns` nu
+        # citește `incidents` și nu agregă nimic la citire: contoarele sunt
+        # deja recalculate la scriere, în `attach_incident`. Tabela
+        # `incident_campaigns` are o singură campanie ACTIVĂ per familie
+        # (indexul unic parțial din 0039), adică 14 rânduri pe gazda pentru
+        # care a fost dimensionată asta. Măsurat local cu EXPLAIN (ANALYZE,
+        # BUFFERS) pe aceeași formă (968 incidente, 14 campanii): Seq Scan,
+        # 55 de buffere, 0,127 ms — vezi docstring-ul `aggregate.campaigns`.
+        "campaigns": await aggregate.campaigns(db),
     }
