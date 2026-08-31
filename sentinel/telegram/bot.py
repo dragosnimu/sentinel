@@ -436,12 +436,19 @@ async def cmd_intreaba(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"Ai atins limita de {limit} întrebări pe oră pentru acest chat. "
             "Mai încearcă peste puțin timp.")
         return
-    # Scris ÎNAINTE de apel, nu după: cele două apeluri către model durează
-    # secunde, iar scrierea de aici ține fereastra de cursă (verifică apoi
-    # scrie) cât un singur round-trip la bază, nu cât toată comanda.
-    await ask_log_repo.record(db, chat_id)
 
-    result = await ask_mod.answer_question(db, cfg, api_key, question)
+    # Scrierea în `ask_log` trece prin `on_attempt`, NU se face aici înainte de
+    # apel: `answer_question` mai are propriul ei refuz de buget, iar o comandă
+    # refuzată acolo n-a atins niciodată modelul — n-are voie să consume din
+    # plafonul orar al chat-ului (`ask_log.py` promite explicit „per attempt
+    # that actually reaches the model"). `on_attempt` rulează exact o dată, deci
+    # scrierea tot ține fereastra de cursă (verifică-apoi-scrie) cât un
+    # round-trip la bază, nu cât toată comanda — la fel ca înainte.
+    async def _consuma_plafonul() -> None:
+        await ask_log_repo.record(db, chat_id)
+
+    result = await ask_mod.answer_question(db, cfg, api_key, question,
+                                           on_attempt=_consuma_plafonul)
     text = _esc(result.text)
     if result.based_on:
         text += f"\n\n<i>Bazat pe: {_esc(result.based_on)}</i>"

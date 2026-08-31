@@ -128,7 +128,12 @@ def test_o_cerere_acceptata_scrie_in_jurnal_inainte_de_apel_si_arata_baza(monkey
         order.append("record")
         assert chat_id == CHAT_ID
 
-    async def _answer(db, cfg, api_key, question):
+    async def _answer(db, cfg, api_key, question, *, on_attempt=None):
+        # `on_attempt` e chiar mecanismul prin care comanda scrie în `ask_log` —
+        # simulez aici exact ce face `answer_question` real: îl cheamă o dată,
+        # după gardă, înainte de primul apel către model.
+        if on_attempt is not None:
+            await on_attempt()
         order.append("answer")
         assert api_key == "sk-test"
         assert question == "cate servicii sunt picate?"
@@ -161,7 +166,7 @@ def test_raspunsul_ai_e_escapat_pentru_html(monkeypatch):
     async def _record(db, chat_id):
         return None
 
-    async def _answer(db, cfg, api_key, question):
+    async def _answer(db, cfg, api_key, question, *, on_attempt=None):
         return ask_mod.AskResult(ok=True, ai_formulated=True, based_on="top_atacatori(limita=5)",
                                  text="<script>alert(1)</script>")
 
@@ -175,3 +180,33 @@ def test_raspunsul_ai_e_escapat_pentru_html(monkeypatch):
     text = msg.sent[0][0]
     assert "<script>" not in text
     assert "&lt;script&gt;" in text
+
+
+def test_daca_bugetul_refuza_ask_log_nu_se_scrie(monkeypatch):
+    """`ask_log.py` promite „per attempt that actually reaches the model". Ruta
+    reală de eșec e că `answer_question` refuză din cauza bugetului ÎNAINTE să
+    cheme `on_attempt` — `cmd_intreaba` doar transmite callback-ul mai departe,
+    nu scrie el însuși în `ask_log`. Dacă ar reveni la scrierea necondiționată
+    dinainte de apel, testul ăsta pică."""
+    monkeypatch.setattr("sentinel.config.get_secrets",
+                        lambda: SimpleNamespace(get=lambda k, d=None: "sk-test"))
+
+    async def _count_zero(db, chat_id):
+        return 0
+
+    async def _boom_record(db, chat_id):
+        raise AssertionError("ask_log nu trebuia scris — bugetul n-a lăsat cererea să atingă modelul")
+
+    async def _answer_budget_denied(db, cfg, api_key, question, *, on_attempt=None):
+        # Comportamentul real al lui `answer_question` când bugetul refuză:
+        # întoarce direct, fără să cheme `on_attempt`.
+        return ask_mod.AskResult(ok=False, text="Buget AI epuizat: plafon zilnic atins ($5.00/$5.00).")
+
+    monkeypatch.setattr(ask_log_repo, "count_last_hour", _count_zero)
+    monkeypatch.setattr(ask_log_repo, "record", _boom_record)
+    monkeypatch.setattr(ask_mod, "answer_question", _answer_budget_denied)
+
+    update, msg = _update()
+    run(bot.cmd_intreaba(update, _ctx(args=["orice", "intrebare"])))
+
+    assert "buget" in msg.sent[0][0].lower()

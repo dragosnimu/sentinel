@@ -250,3 +250,226 @@ def test_daca_al_doilea_apel_pica_raspunsul_arata_totusi_datele(monkeypatch):
     assert "nginx" in result.text
     assert "indisponibilă" in result.text
     assert result.based_on == "servicii_picate(limita=20)"
+
+
+# --- runda 2: evenimente_fereastra nu mai trebuie să pice gazda -------------
+def test_evenimente_fereastra_scurta_citeste_din_raw_events():
+    """Fereastra de 24h (implicitul) rămâne calea exactă, cu numărul de adrese
+    distincte — aceeași interogare de dinainte de runda 2, neschimbată."""
+    class _DB:
+        def __init__(self):
+            self.sql = None
+
+        async def fetchrow(self, sql, *args):
+            self.sql = sql
+            return {"total": 10, "ostile": 2, "ips": 3}
+
+    db = _DB()
+    result = run(ask_mod._q_evenimente_fereastra(db, {"ore": 24}))
+
+    assert "FROM raw_events" in db.sql
+    assert "event_rollup_1h" not in db.sql
+    assert result == {"total": 10, "ostile": 2, "ips": 3}
+
+
+def test_evenimente_fereastra_lunga_citeste_din_rollup_nu_din_raw_events():
+    """Motivul rundei 2: la 168h, interogarea veche scana tot volumul brut și
+    pica de `statement_timeout` (măsurat de verificator pe gazdă). Fereastra
+    lungă trebuie să treacă prin `event_rollup_1h`, mărginit de (ore × perechi),
+    nu de volumul de evenimente."""
+    class _DB:
+        def __init__(self):
+            self.sql = None
+
+        async def fetchrow(self, sql, *args):
+            self.sql = sql
+            return {"total": 6916603, "ostile": 12000}
+
+    db = _DB()
+    result = run(ask_mod._q_evenimente_fereastra(db, {"ore": 168}))
+
+    assert "event_rollup_1h" in db.sql
+    assert result["total"] == 6916603
+    assert result["ips"] is None, "adresele distincte nu pot ieși corect din rollup — vezi randarea"
+
+
+def test_randarea_ferestrei_lungi_spune_nedisponibil_nu_zero():
+    """`ips: None` trebuie să se citească drept „nu s-a calculat", nu drept
+    „zero adrese distincte" — un zero fals ar arăta ca o gazdă netouchată."""
+    text = ask_mod._r_scalar_dict({"total": 500, "ostile": 12, "ips": None})
+    assert "nedisponibil" in text
+    assert "ips: 0" not in text
+    assert "ips: None" not in text
+
+
+def test_o_interogare_care_pica_nu_iese_din_answer_question_ca_exceptie(monkeypatch):
+    """Docstring-ul lui `answer_question` promite „Never raises". Fără try/except
+    în jurul `q.query`, un timeout de bază de date (exact ce a măsurat
+    verificatorul la `ore=168` înainte de reparație) ar ieși ca excepție, ar
+    cădea în `_guard` din `bot.py`, și operatorul ar primi „A apărut o eroare la
+    procesarea comenzii" — fără să știe CE întrebare a picat — după ce cota de
+    rată și primul apel către model erau deja plătite."""
+    async def _boom_query(db, p):
+        raise TimeoutError("statement timeout")
+
+    monkeypatch.setitem(ask_mod.CATALOG, "evenimente_fereastra",
+                        replace(ask_mod.CATALOG["evenimente_fereastra"], query=_boom_query))
+
+    async def fake_call_structured(*a, **kw):
+        return Result(ok=True, tool_input={
+            "gasit": True, "intrebare": "evenimente_fereastra", "parametri": {"ore": 168},
+        }, usage=_usage())
+
+    monkeypatch.setattr(ask_mod, "call_structured", fake_call_structured)
+    monkeypatch.setattr(ask_mod.budget, "allowed", _allow)
+    monkeypatch.setattr(ask_mod.budget, "record", _noop_record)
+
+    result = run(ask_mod.answer_question(_NoopDB(), Config(), "sk-test",
+                                         "câte evenimente în ultima săptămână?"))
+
+    assert result.ok is False
+    assert result.based_on == "evenimente_fereastra(ore=168)"
+    assert "evenimente_fereastra" in result.text or "eșuat" in result.text.lower()
+
+
+# --- runda 2: a doua gardă de buget, păzită de-adevărat ----------------------
+def test_bugetul_epuizat_intre_apeluri_opreste_al_doilea_apel_catre_model(monkeypatch):
+    """Verificatorul a înlocuit `ok2, reason2 = await budget.allowed(...)` cu
+    `True, ""` și toată suita a rămas verde — nimic nu verifica execuția gărzii
+    a doua. Testul ăsta simulează exact scenariul real: bugetul trece la primul
+    apel (interpretarea) și refuză la al doilea (formularea)."""
+    async def _spy_query(db, p):
+        return {"activ": 5}
+
+    monkeypatch.setitem(ask_mod.CATALOG, "servicii_stare",
+                        replace(ask_mod.CATALOG["servicii_stare"], query=_spy_query))
+
+    calls = {"n": 0}
+
+    async def fake_call_structured(*a, **kw):
+        calls["n"] += 1
+        return Result(ok=True, tool_input={
+            "gasit": True, "intrebare": "servicii_stare", "parametri": {},
+        }, usage=_usage())
+
+    budget_calls = {"n": 0}
+
+    async def _flaky_allow(db, cfg):
+        budget_calls["n"] += 1
+        if budget_calls["n"] == 1:
+            return True, ""
+        return False, "daily cap reached ($5.00/$5.00)"
+
+    monkeypatch.setattr(ask_mod, "call_structured", fake_call_structured)
+    monkeypatch.setattr(ask_mod.budget, "allowed", _flaky_allow)
+    monkeypatch.setattr(ask_mod.budget, "record", _noop_record)
+
+    result = run(ask_mod.answer_question(_NoopDB(), Config(), "sk-test", "stare servicii?"))
+
+    assert calls["n"] == 1, "al doilea apel către model n-ar fi trebuit să pornească peste plafon"
+    assert result.ok is True and result.ai_formulated is False
+    assert "buget" in result.text.lower()
+
+
+# --- runda 2: fără ajustare tăcută la validare -------------------------------
+def test_un_bool_pentru_un_parametru_intreg_e_respins():
+    """`bool` e subclasă de `int` în Python — `int(True) == 1` ar trece
+    neobservat printr-o coerciție naivă, exact ajustarea tăcută interzisă."""
+    spec = ask_mod.ParamSpec("int", minimum=1, maximum=20, default=10)
+    value, error = ask_mod.validate_param("limita", spec, True)
+    assert value is None and error is not None
+
+
+def test_un_float_cu_parte_fractionara_e_respins_nu_trunchiat():
+    """`int(3.7) == 3` era o trunchiere tăcută — exact ce demonstrat de
+    verificator prin execuție directă pe `validate_param`."""
+    spec = ask_mod.ParamSpec("int", minimum=1, maximum=20, default=10)
+    value, error = ask_mod.validate_param("limita", spec, 3.7)
+    assert value is None and error is not None
+
+
+def test_un_float_fara_parte_fractionara_e_acceptat():
+    """5.0 reprezintă exact valoarea 5 — nu e o ajustare, e aceeași valoare
+    scrisă altfel. Doar trunchierea (pierderea de informație) se respinge."""
+    spec = ask_mod.ParamSpec("int", minimum=1, maximum=20, default=10)
+    value, error = ask_mod.validate_param("limita", spec, 5.0)
+    assert value == 5 and error is None
+
+
+def test_parametri_de_alt_tip_decat_dict_e_respins_nu_golit_tacut(monkeypatch):
+    """Înainte: `choice.get("parametri") or {}` transforma orice tip nevalid
+    (o listă, un șir) tăcut în `{}`, iar interogarea rula cu valorile implicite
+    fără ca operatorul să afle că răspunsul modelului fusese ignorat."""
+    called = {"query": False}
+
+    async def _spy_query(db, p):
+        called["query"] = True
+        return {}
+
+    monkeypatch.setitem(ask_mod.CATALOG, "servicii_stare",
+                        replace(ask_mod.CATALOG["servicii_stare"], query=_spy_query))
+
+    async def fake_call_structured(*a, **kw):
+        return Result(ok=True, tool_input={
+            "gasit": True, "intrebare": "servicii_stare", "parametri": ["nu", "e", "dict"],
+        }, usage=_usage())
+
+    monkeypatch.setattr(ask_mod, "call_structured", fake_call_structured)
+    monkeypatch.setattr(ask_mod.budget, "allowed", _allow)
+    monkeypatch.setattr(ask_mod.budget, "record", _noop_record)
+
+    result = run(ask_mod.answer_question(_NoopDB(), Config(), "sk-test", "stare servicii?"))
+
+    assert result.ok is False
+    assert called["query"] is False
+
+
+# --- runda 2: on_attempt — plafonul de rată nu se consumă fără să ajungă la model
+def test_on_attempt_nu_se_cheama_daca_bugetul_refuza_primul_apel(monkeypatch):
+    """`ask_log.py` promite „per attempt that actually reaches the model" — dacă
+    `on_attempt` ar porni oricum, o comandă respinsă de buget ar consuma din
+    plafonul orar al chat-ului fără să fi costat un ban."""
+    called = {"n": 0}
+
+    async def _on_attempt():
+        called["n"] += 1
+
+    async def _deny(db, cfg):
+        return False, "daily cap reached ($5.00/$5.00)"
+
+    monkeypatch.setattr(ask_mod.budget, "allowed", _deny)
+
+    result = run(ask_mod.answer_question(_NoopDB(), Config(), "sk-test", "orice",
+                                         on_attempt=_on_attempt))
+
+    assert called["n"] == 0
+    assert result.ok is False
+
+
+def test_on_attempt_se_cheama_o_singura_data_inainte_de_primul_apel(monkeypatch):
+    order: list[str] = []
+
+    async def _on_attempt():
+        order.append("on_attempt")
+
+    async def fake_call_structured(*a, **kw):
+        order.append("call")
+        return Result(ok=True, tool_input={"gasit": False}, usage=_usage())
+
+    monkeypatch.setattr(ask_mod, "call_structured", fake_call_structured)
+    monkeypatch.setattr(ask_mod.budget, "allowed", _allow)
+    monkeypatch.setattr(ask_mod.budget, "record", _noop_record)
+
+    run(ask_mod.answer_question(_NoopDB(), Config(), "sk-test", "orice", on_attempt=_on_attempt))
+
+    assert order == ["on_attempt", "call"]
+
+
+# --- runda 2: mesajul de gol nu se împrumută de la altă întrebare -----------
+def test_vulnerabilitati_fara_rezultate_nu_spune_niciun_serviciu():
+    """`_r_vuln` delega la `_r_dict`, al cărui mesaj implicit vorbea despre
+    „servicii" — un operator care întreabă de vulnerabilități și citește despre
+    servicii crede că a nimerit comanda greșită."""
+    text = ask_mod._r_vuln({"pe_severitate": {}, "kev": 0})
+    assert "serviciu" not in text.lower()
+    assert "vulnerabilitate" in text.lower()

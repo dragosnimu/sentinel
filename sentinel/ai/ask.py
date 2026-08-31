@@ -36,6 +36,9 @@ from sentinel.ai.client import call_structured
 from sentinel.config import Config
 from sentinel.db.engine import Database
 from sentinel.db.repo.incidents import SEVERITIES
+from sentinel.logging_setup import get_logger
+
+log = get_logger(__name__)
 
 # Distinct from "triage" in ai_usage.kind, and already a permitted `ai_jobs.kind`
 # value (migration 0006) — this feature is what that value was reserved for.
@@ -73,6 +76,15 @@ def validate_param(name: str, spec: ParamSpec, raw: Any) -> tuple[Any, str | Non
             return None, f"„{name}” trebuie să fie {spec.describe()}, nu {raw!r}"
         return raw, None
     if spec.kind == "int":
+        # `bool` e subclasă de `int` în Python — `int(True) == 1` ar trece
+        # neobservat prin `int(raw)` de mai jos. Respins explicit, nu convertit.
+        if isinstance(raw, bool):
+            return None, f"„{name}” trebuie să fie {spec.describe()}, nu {raw!r}"
+        # `int(3.7) == 3` e o TRUNCHIERE tăcută, exact ce interzice contractul
+        # funcției ăsteia — respinsă, nu rotunjită. Un float fără parte
+        # fracționară (5.0) reprezintă exact aceeași valoare ca 5, deci trece.
+        if isinstance(raw, float) and not raw.is_integer():
+            return None, f"„{name}” trebuie să fie {spec.describe()}, nu {raw!r}"
         try:
             value = int(raw)
         except (TypeError, ValueError):
@@ -165,10 +177,19 @@ async def _q_servicii_stare(db: Database, p: dict[str, Any]) -> dict[str, int]:
     return {r["stare"]: int(r["n"]) for r in rows}
 
 
-def _r_dict(rows: dict[str, Any]) -> str:
+def _r_dict(rows: dict[str, Any], *, gol: str = "Niciun rezultat.") -> str:
+    """Randare generică pentru un `dict` plat. `gol` e mesajul specific
+    întrebării care a chemat-o — nu unul împrumutat de la ALTĂ întrebare (vezi
+    `_r_vuln`, care altfel ar spune „niciun serviciu" unui operator care a
+    întrebat de vulnerabilități, și l-ar face să creadă că a nimerit comanda
+    greșită)."""
     if not rows:
-        return "Niciun serviciu înregistrat."
+        return gol
     return "\n".join(f"{k}: {v}" for k, v in rows.items())
+
+
+def _r_servicii_stare(rows: dict[str, Any]) -> str:
+    return _r_dict(rows, gol="Niciun serviciu înregistrat.")
 
 
 async def _q_servicii_picate(db: Database, p: dict[str, Any]) -> list[dict[str, Any]]:
@@ -200,7 +221,7 @@ async def _q_vulnerabilitati_severitate(db: Database, p: dict[str, Any]) -> dict
 
 
 def _r_vuln(v: dict[str, Any]) -> str:
-    corp = _r_dict(v.get("pe_severitate", {}))
+    corp = _r_dict(v.get("pe_severitate", {}), gol="Nicio vulnerabilitate deschisă.")
     return f"{corp}\nDintre acestea, cu exploatare cunoscută (KEV): {v.get('kev', 0)}"
 
 
@@ -235,20 +256,83 @@ async def _q_tari_atac(db: Database, p: dict[str, Any]) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+#: Peste asta, numărătoarea EXACTĂ pe `raw_events` citește tot volumul brut al
+#: ferestrei, fără niciun index parțial care s-o mărginească (spre deosebire de
+#: `tari_atac`/`conturi_tinta`, acoperite de `raw_events_hostile_idx` — și acolo
+#: filtrul e pe `action`, aici întrebarea vrea și traficul benign). Măsurat de
+#: verificator pe gazdă la 168h: `statement timeout` la 30s (plafonul pool-ului,
+#: `sentinel/db/engine.py`), pe 6 916 603 rânduri; la 24h, 133 ms. Pragul de mai
+#: jos e ales prin analogie cu fereastra de 24h deja folosită pe calea critică
+#: (`aggregate.kpis`, aceeași interogare, pe panou) — nu re-măsurat separat de
+#: aici, fiindcă nu am acces la gazdă; vezi raportul.
+_FEREASTRA_EXACTA_ORE_MAX = 24
+
+
 async def _q_evenimente_fereastra(db: Database, p: dict[str, Any]) -> dict[str, Any]:
+    ore = p["ore"]
+    if ore <= _FEREASTRA_EXACTA_ORE_MAX:
+        row = await db.fetchrow(
+            """
+            SELECT count(*) AS total,
+                   count(*) FILTER (WHERE action IN ('auth_fail','alert')) AS ostile,
+                   count(DISTINCT host(src_ip)) FILTER (WHERE src_ip IS NOT NULL) AS ips
+              FROM raw_events WHERE ts > now() - make_interval(hours => $1::int)
+            """,
+            ore)
+        return dict(row)
+
+    # Fereastră lungă: `event_rollup_1h` există exact pentru asta — mărginit de
+    # (ore × perechi sursă/acțiune), nu de volumul brut (vezi analytics/aggregate.py,
+    # `last_activity_sql`, care ține exact același argument pentru `event_rollup_1m`).
+    #
+    # Coada neagregată (de la frontiera rollup-ului până acum) se citește separat
+    # din `raw_events`, ca frontiera să nu lase o gaură de până la o oră — același
+    # tipar ca `last_activity_sql`. E ieftină oricum: mărginită de întârzierea
+    # rollup-ului (job orar), nu de `ore`.
+    #
+    # Ce se PIERDE față de calea exactă: `ips` (adrese distincte) nu poate ieși
+    # din rollup — `event_rollup_1h.n` e o sumă asociativă (corectă din bucket-uri
+    # separate), dar o adresă activă în mai multe ore ar fi numărată de mai multe
+    # ori dacă am aduna `uniq_src` pe bucket. Mai degrabă lipsă decât greșită:
+    # întoarce `None`, iar `_r_scalar_dict` spune explicit că nu s-a calculat,
+    # nu zero.
     row = await db.fetchrow(
         """
-        SELECT count(*) AS total,
-               count(*) FILTER (WHERE action IN ('auth_fail','alert')) AS ostile,
-               count(DISTINCT host(src_ip)) FILTER (WHERE src_ip IS NOT NULL) AS ips
-          FROM raw_events WHERE ts > now() - make_interval(hours => $1::int)
+        WITH frontiera AS (
+            SELECT COALESCE(max(bucket), now() - make_interval(hours => $1::int)) AS pana
+              FROM event_rollup_1h
+        ),
+        vechi AS (
+            SELECT COALESCE(sum(n), 0)::bigint AS total,
+                   COALESCE(sum(n) FILTER (WHERE action IN ('auth_fail','alert')), 0)::bigint AS ostile
+              FROM event_rollup_1h, frontiera
+             WHERE bucket > now() - make_interval(hours => $1::int)
+               AND bucket <= frontiera.pana
+        ),
+        recent AS (
+            SELECT count(*) AS total,
+                   count(*) FILTER (WHERE action IN ('auth_fail','alert')) AS ostile
+              FROM raw_events, frontiera
+             WHERE ts > frontiera.pana
+        )
+        SELECT vechi.total + recent.total AS total,
+               vechi.ostile + recent.ostile AS ostile
+          FROM vechi, recent
         """,
-        p["ore"])
-    return dict(row)
+        ore)
+    return {"total": int(row["total"]), "ostile": int(row["ostile"]), "ips": None}
 
 
 def _r_scalar_dict(d: dict[str, Any]) -> str:
-    return "\n".join(f"{k}: {v}" for k, v in d.items())
+    linii = []
+    for k, v in d.items():
+        if v is None:
+            linii.append(f"{k}: nedisponibil pentru ferestre peste "
+                         f"{_FEREASTRA_EXACTA_ORE_MAX}h (necesită o scanare completă; "
+                         "cere o fereastră mai scurtă pentru cifra exactă)")
+        else:
+            linii.append(f"{k}: {v}")
+    return "\n".join(linii)
 
 
 async def _q_blocklist_activ(db: Database, p: dict[str, Any]) -> dict[str, Any]:
@@ -303,7 +387,7 @@ CATALOG: dict[str, Question] = {
     "servicii_stare": Question(
         description="Câte servicii monitorizate sunt active, picate, degradate sau necunoscute, acum.",
         params={},
-        query=_q_servicii_stare, render=_r_dict),
+        query=_q_servicii_stare, render=_r_servicii_stare),
     "servicii_picate": Question(
         description="Ce servicii sunt ACUM picate sau degradate, pe nume.",
         params={"limita": ParamSpec("int", minimum=1, maximum=50, default=20)},
@@ -324,8 +408,10 @@ CATALOG: dict[str, Question] = {
         query=_q_tari_atac, render=_r_lista_generica),
     "evenimente_fereastra": Question(
         description=(
-            "Câte evenimente totale, câte ostile (auth_fail/alert) și câte "
-            "adrese IP distincte, într-o fereastră de ore înapoi de la acum."),
+            "Câte evenimente totale și câte ostile (auth_fail/alert), într-o "
+            "fereastră de ore înapoi de la acum. Adresele IP distincte apar "
+            "DOAR pentru ferestre de cel mult 24 de ore — peste atât, cifra "
+            "exactă ar cere o scanare completă, deci nu se calculează."),
         params={"ore": ParamSpec("int", minimum=1, maximum=168, default=24)},
         query=_q_evenimente_fereastra, render=_r_scalar_dict),
     "blocklist_activ": Question(
@@ -420,14 +506,26 @@ async def _spend(db: Database, model: str, usage) -> None:
                         cached_tokens=usage.cached_tokens)
 
 
-async def answer_question(db: Database, cfg: Config, api_key: str, question: str) -> AskResult:
+async def answer_question(db: Database, cfg: Config, api_key: str, question: str, *,
+                          on_attempt: Callable[[], Awaitable[None]] | None = None) -> AskResult:
     """Runs the full two-call flow. Never raises — every failure path returns
-    an `AskResult` the caller can show as-is."""
+    an `AskResult` the caller can show as-is.
+
+    `on_attempt`, if given, fires exactly once — right after the budget gate
+    passes and right before the first model call. That is deliberately the
+    ONLY point that counts as "reached the model" for a caller doing its own
+    per-chat rate-limiting (`telegram/bot.py:cmd_intreaba` uses it to write
+    `ask_log`): a question that never got past the budget check spent nothing
+    and must not consume the operator's hourly quota either.
+    """
     ok, reason = await budget.allowed(db, cfg)
     if not ok:
         if reason == "ai disabled":
             return AskResult(ok=False, text="Stratul AI e dezactivat în configurație.")
         return AskResult(ok=False, text=f"Buget AI epuizat: {reason}.")
+
+    if on_attempt is not None:
+        await on_attempt()
 
     model = cfg.ai.model_main
     r1 = await call_structured(
@@ -447,15 +545,37 @@ async def answer_question(db: Database, cfg: Config, api_key: str, question: str
         return AskResult(ok=False, text="Nu găsesc întrebarea asta în catalog. Pot răspunde la:\n"
                                         + catalog_help_ro())
 
-    raw_params = choice.get("parametri") or {}
-    if not isinstance(raw_params, dict):
+    raw_params = choice.get("parametri")
+    # Absent înseamnă "niciun parametru dat" — valorile implicite din catalog
+    # se aplică mai jos, în validate_params. Prezent dar de alt TIP (o listă, un
+    # șir, un număr) e un răspuns malformat de la model, nu o listă goală — se
+    # RESPINGE explicit, nu se înlocuiește tăcut cu {} (CLAUDE.md, regula
+    # "confirmarea intenției în locul efectului"; un `parametri` ignorat ar
+    # rula interogarea cu valorile implicite fără ca operatorul să afle că
+    # cererea lui a fost de fapt ignorată).
+    if raw_params is None:
         raw_params = {}
+    elif not isinstance(raw_params, dict):
+        return AskResult(ok=False,
+                         text=f"Modelul a întors parametri într-un format neașteptat "
+                              f"({type(raw_params).__name__}) — reformulează întrebarea.")
     clean_params, error = validate_params(q, raw_params)
     if error:
         return AskResult(ok=False, text=f"Parametru respins: {error}.")
 
-    rows = await q.query(db, clean_params)
     based_on = f"{key}({', '.join(f'{k}={v}' for k, v in clean_params.items())})"
+    try:
+        rows = await q.query(db, clean_params)
+    except Exception as exc:  # noqa: BLE001 - o interogare care pică (timeout
+        # inclusiv) nu are voie să iasă din funcția asta ca excepție: docstring-ul
+        # de mai sus promite "never raises", iar apelantul (`_guard` din
+        # `telegram/bot.py`) ar arăta doar "A apărut o eroare la procesarea
+        # comenzii" — fără să spună operatorului nici măcar CE întrebare a picat,
+        # și fără să elibereze bugetul deja cheltuit pe primul apel către model.
+        log.warning("ask query failed", extra={"question": key, "detail": str(exc)})
+        return AskResult(ok=False, based_on=based_on,
+                         text=f"Interogarea pentru „{key}” a eșuat ({type(exc).__name__}). "
+                              "Încearcă din nou, sau cu parametri mai mici.")
     rendered = q.render(rows)
 
     ok2, reason2 = await budget.allowed(db, cfg)
