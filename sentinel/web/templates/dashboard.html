@@ -193,6 +193,49 @@
 </div>
 {% endfor %}
 
+{# ── CAMPANII ───────────────────────────────────────────────────────────── #}
+{# `campaign_key` e identificatorul tehnic al familiei de regulă (ex.
+   „auth.ssh_bruteforce”) — nu se traduce: insight-ul de mai sus îl arată deja
+   neschimbat, iar „title” din `attach_incident` e doar „Campanie: <familie>”,
+   deci nu adaugă nimic peste coloana asta. Severitatea, în schimb, are un
+   vocabular fix (5 valori, impus de bază), deci se traduce, ca statusul
+   serviciilor mai jos. #}
+<h2>Campanii active</h2>
+<div class="table-scroll">
+  <table>
+    <thead>
+      <tr><th>Familie</th><th>Severitate</th><th class="num">Incidente</th>
+          <th class="num">Actori</th><th>De când</th><th>Ultima activitate</th></tr>
+    </thead>
+    <tbody>
+      {% for c in campaigns %}
+      {% set sev_ro = {'critical': 'critic', 'high': 'ridicat', 'medium': 'mediu',
+                        'low': 'scăzut', 'info': 'informativ'}.get(c.severity, c.severity) %}
+      {% set sev_class = {'critical': 'bad', 'high': 'bad', 'medium': 'warn'}.get(c.severity) %}
+      <tr class="{{ 'row-bad' if c.severity == 'critical' }}">
+        <td class="mono strong">{{ c.campaign_key }}</td>
+        <td>
+          {%- if sev_class %}<span class="pill pill-{{ sev_class }}">{{ sev_ro }}</span>
+          {%- else %}<span class="muted small">{{ sev_ro }}</span>{% endif -%}
+        </td>
+        <td class="num">{{ c.incident_count }}</td>
+        <td class="num">{{ c.actor_count }}</td>
+        <td class="mono nowrap small">{{ c.first_seen_at | ora }}</td>
+        <td class="mono nowrap small">{{ c.last_activity_at | ora }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="muted">Nicio campanie activă — nicio familie de reguli nu are un front deschis acum.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+<p class="muted small" style="margin:.7rem 0 0">
+  O campanie adună incidentele aceleiași familii de regulă într-un singur front,
+  cât timp mai primește incidente noi din ea. După 24 de ore fără nimic nou trece
+  în tăcere — dacă o campanie dispare de aici, înseamnă că frontul acela s-a oprit,
+  nu că a încetat să mai fie verificat.
+</p>
+
 {# ── TIPAR ORAR ─────────────────────────────────────────────────────────── #}
 {% if hourly %}
 <h2>Când te atacă</h2>

@@ -1768,15 +1768,18 @@ def test_a_bait_with_no_state_record_is_treated_as_foreign_and_never_overwritten
     assert "NOT planted" in proc.stderr, proc.stderr
 
 
-def test_a_host_restored_from_backup_loses_the_state_and_the_watch_not_silently(tmp_path):
-    """Direcția de eșec cerută explicit: o gazdă restaurată dintr-un backup
-    dinainte ca acest fișier de stare să existe își pierde propria momeală din
-    evidență. Consecința trebuie să fie un avertisment și o regulă nearmată --
-    vizibil în ieșirea deploy-ului -- niciodată o citire tăcută a conținutului
-    ca să recupereze clasificarea."""
+def test_a_host_restored_from_backup_recovers_an_unedited_bait_without_a_state_file(tmp_path):
+    """Runda 2: pierderea fișierului de stare (o restaurare dintr-un backup
+    mai vechi decât el) NU mai înseamnă „străină" pentru o momeală
+    neștearsă -- clasificarea cade pe mărimea CANONICĂ, pe care instalatorul
+    o cunoaște din propriul `_canary_content`, fără să deschidă fișierul.
+    Dacă ar mai fi tratată ca străină aici, orice gazdă care își pierde
+    starea (sau nu a avut-o niciodată) și-ar dezarma singură momelile la
+    următorul deploy."""
     proc1, pgpass, aws, _, state = _canary_harness(tmp_path)
     assert proc1.returncode == 0, proc1.stdout + proc1.stderr
     original_pgpass = pgpass.read_text(encoding="utf-8")
+    original_aws = aws.read_text(encoding="utf-8")
 
     state.unlink()  # exact ce lasă în urmă o restaurare dintr-un backup vechi
 
@@ -1784,10 +1787,147 @@ def test_a_host_restored_from_backup_loses_the_state_and_the_watch_not_silently(
     assert proc2.returncode == 0, proc2.stdout + proc2.stderr
     assert pgpass.read_text(encoding="utf-8") == original_pgpass, \
         "conținutul propriei momele a fost atins după pierderea stării"
+    assert aws.read_text(encoding="utf-8") == original_aws
+    assert proc2.stdout.count("left untouched") == 2, (
+        "starea lipsă, cu conținut neschimbat, a făcut o momeală neștearsă să fie "
+        "raportată drept străină:\n" + proc2.stdout + proc2.stderr)
+    assert (tmp_path / "foreign2.txt").read_text(encoding="utf-8").strip() == "", \
+        "starea lipsă nu are voie să claseze o momeală neatinsă drept coliziune"
+    assert state.exists(), "recuperarea prin mărimea canonică trebuie să re-înregistreze starea"
+
+
+def test_a_host_restored_from_backup_with_an_edited_bait_and_no_state_is_treated_as_foreign(tmp_path):
+    """Reziduul rămas după fallback-ul pe mărimea canonică: dacă backup-ul
+    pierdut e și mai vechi decât o editare care i-a schimbat lungimea, nu mai
+    există nicio mărime de comparat -- nici înregistrată, nici canonică --
+    așa că direcția de eșec rămâne cea veche: avertisment, regulă nearmată,
+    conținut neatins niciodată."""
+    proc1, pgpass, aws, _, state = _canary_harness(tmp_path)
+    assert proc1.returncode == 0, proc1.stdout + proc1.stderr
+    edited = pgpass.read_text(encoding="utf-8") + "extra line appended by the operator\n"
+    pgpass.write_text(edited, encoding="utf-8", newline="\n")
+    original_aws = aws.read_text(encoding="utf-8")
+
+    state.unlink()  # exact ce lasă în urmă o restaurare dintr-un backup vechi
+
+    proc2 = _canary_step(tmp_path, "foreign2.txt")
+    assert proc2.returncode == 0, proc2.stdout + proc2.stderr
+    assert pgpass.read_text(encoding="utf-8") == edited, "conținutul editat a fost atins"
+    assert aws.read_text(encoding="utf-8") == original_aws
     foreign2 = (tmp_path / "foreign2.txt").read_text(encoding="utf-8").splitlines()
-    assert _p(pgpass) in foreign2 and _p(aws) in foreign2, \
-        "starea lipsă trebuia să claseze AMBELE momeli drept fără evidență, nu doar una"
+    assert _p(pgpass) in foreign2, \
+        "o momeală editată, fără stare și fără mărime canonică, trebuia clasată străină"
+    assert _p(aws) not in foreign2, \
+        "cealaltă momeală, neștearsă, trebuia recuperată prin mărimea canonică"
     assert "NOT planted" in proc2.stderr, proc2.stderr
+
+
+def test_an_old_installers_bait_with_no_state_record_stays_armed(tmp_path):
+    """Runda 2, pe măsura făcută pe gazda reală: ambele momeli sunt DEJA
+    plantate de codul VECHI și ARMATE în nucleu (2 reguli sentinel_bait,
+    32/32 încărcate) -- iar acel cod nu a scris niciodată un fișier de stare.
+    Fără fallback-ul pe mărimea canonică, prima livrare a fixului ar găsi
+    starea absentă, ar clasa AMBELE momeli drept străine, și le-ar scoate din
+    regulile trimise către nucleu -- o dezarmare reală, tăcută pentru
+    /selfcheck, fiindcă acesta numără regulile TRIMISE, nu pe cele care
+    contează."""
+    pgpass, aws, state = _canary_paths(tmp_path)
+    pgpass.parent.mkdir(parents=True, exist_ok=True)
+    aws.parent.mkdir(parents=True, exist_ok=True)
+
+    # Conținutul canonic, byte cu byte -- generat aici prin același mecanism
+    # ca planting-ul însuși (`_canary_content`), ca fixture-ul să nu depindă
+    # de un literal copiat separat și să nu bată pasul cu el din întâmplare.
+    gen_script = (
+        "set -euo pipefail\n"
+        "source ./lib/common.sh\n"
+        f'CANARY_PGPASS_PATH="{_p(pgpass)}"\n'
+        f'CANARY_AWS_CREDS_PATH="{_p(aws)}"\n'
+        + _func(INSTALL, "_canary_content") + "\n"
+        f'printf \'%s\n\' "$(_canary_content "{_p(pgpass)}")" > "{_p(pgpass)}"\n'
+        f'printf \'%s\n\' "$(_canary_content "{_p(aws)}")" > "{_p(aws)}"\n'
+    )
+    gen = _run(gen_script, tmp_path)
+    assert gen.returncode == 0, gen.stdout + gen.stderr
+    assert not state.exists(), \
+        "fixture-ul a creat starea, nu doar conținutul -- testul ar verifica ramura greșită"
+
+    proc = _canary_step(tmp_path, "foreign.txt")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert proc.stdout.count("left untouched") == 2, (
+        "o momeală plantată de codul vechi, fără înregistrare de stare, a fost "
+        "declarată străină la prima livrare a fixului:\n" + proc.stdout + proc.stderr)
+    assert (tmp_path / "foreign.txt").read_text(encoding="utf-8").strip() == "", \
+        "momeala veche, fără stare, a fost raportată drept coliziune -- regula ei ar ieși din nucleu"
+
+
+def test_an_old_installers_bait_with_no_state_record_keeps_its_watch_in_the_installed_rules(tmp_path):
+    """Efectul, nu doar avertismentul, pentru exact scenariul de mai sus: linia
+    `-w` a unei momeli plantate de codul vechi trebuie să ajungă în fișierul
+    instalat pentru nucleu chiar în absența oricărei înregistrări de stare --
+    altfel /selfcheck vede „toate regulile TRIMISE sunt încărcate" și tace
+    exact peste regula pe care fixul ar fi scos-o din ce s-a trimis."""
+    pgpass = tmp_path / "root" / ".pgpass"
+    aws = tmp_path / "root" / ".aws" / "credentials"
+    state = tmp_path / "etc-sentinel" / "canary-state"
+    pgpass.parent.mkdir(parents=True, exist_ok=True)
+    aws.parent.mkdir(parents=True, exist_ok=True)
+
+    gen_script = (
+        "set -euo pipefail\n"
+        "source ./lib/common.sh\n"
+        f'CANARY_PGPASS_PATH="{_p(pgpass)}"\n'
+        f'CANARY_AWS_CREDS_PATH="{_p(aws)}"\n'
+        + _func(INSTALL, "_canary_content") + "\n"
+        f'printf \'%s\n\' "$(_canary_content "{_p(pgpass)}")" > "{_p(pgpass)}"\n'
+        f'printf \'%s\n\' "$(_canary_content "{_p(aws)}")" > "{_p(aws)}"\n'
+    )
+    gen = _run(gen_script, tmp_path)
+    assert gen.returncode == 0, gen.stdout + gen.stderr
+    assert not state.exists()
+
+    binpath = tmp_path / "bin"
+    scriptdir = tmp_path / "deploy"
+    (scriptdir / "audit").mkdir(parents=True)
+    rules = (f"-w {_p(pgpass)} -p r -k sentinel_bait\n"
+             f"-w {_p(aws)} -p r -k sentinel_bait\n"
+             "-b 8192\n--backlog_wait_time 60000\n")
+    (scriptdir / "audit" / "sentinel.rules").write_text(rules, encoding="utf-8", newline="\n")
+    _stub(binpath, "augenrules", "exit 0\n")
+    _stub(binpath, "auditctl", f"""
+case "${{1:-}}" in
+    -l) : ;;
+    -s) printf '{HEALTHY_STATUS}' ;;
+esac
+exit 0
+""")
+
+    script = (
+        "set -euo pipefail\n"
+        "source ./lib/common.sh\n"
+        f'CANARY_PGPASS_PATH="{_p(pgpass)}"\n'
+        f'CANARY_AWS_CREDS_PATH="{_p(aws)}"\n'
+        f'CANARY_STATE_PATH="{_p(state)}"\n'
+        f'SCRIPT_DIR="{_p(scriptdir)}"\n'
+        f'AUDITD_RULES_DEST="{_p(tmp_path / "installed.rules")}"\n'
+        "AUDITD_LOG_PATH=/var/log/audit/audit.log\n"
+        + _func(INSTALL, "_canary_content") + "\n"
+        + _func(INSTALL, "install_canary_baits") + "\n"
+        + _func(INSTALL, "audit_rule_signatures") + "\n"
+        + _func(INSTALL, "audit_rules_for_this_host") + "\n"
+        + _func(INSTALL, "install_audit_rules") + "\n"
+        "install_audit_rules\n"
+    )
+    proc = _run(script, tmp_path, extra_path=binpath)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+    installed = (tmp_path / "installed.rules").read_text(encoding="utf-8")
+    assert _p(pgpass) in installed, (
+        "momeala plantată de codul vechi, fără stare, și-a pierdut urmărirea "
+        "de nucleu la prima livrare a fixului:\n" + installed)
+    assert _p(aws) in installed, (
+        "cealaltă momeală veche și-a pierdut urmărirea de nucleu la prima livrare "
+        "a fixului:\n" + installed)
 
 
 def test_the_foreign_bait_path_is_dropped_from_the_installed_rules(tmp_path):

@@ -787,29 +787,54 @@ canonice (`.pgpass`, `.aws/credentials`), indiferent de ce repository există.
 
 ### Cum știe instalatorul care momeală e a lui
 
-La plantare, instalatorul scrie mărimea fișierului (în octeți) în
-`/etc/sentinel/canary-state`. La un redeploy, dacă fișierul e deja acolo,
-decizia „e a mea" se ia comparând mărimea CURENTĂ, luată cu `stat`, cu cea
-înregistrată — niciodată deschizând fișierul. Asta e dinadins: o deschidere a
-momelii de către instalatorul însuși, odată ce regula `sentinel_bait` e armată
-dintr-un deploy anterior, nu se deosebește de o citire a unui atacator, iar
-exact asta a produs un `critical` fals la fiecare livrare, până pe 31 august
-2026. Marcajul de text (`sentinel-canary`) a rămas în conținut, dar nu mai e
-citit de nimic automat — e acolo pentru un om care se uită la un dump.
+Clasificarea nu deschide niciodată fișierul — o deschidere a momelii de către
+instalatorul însuși, odată ce regula `sentinel_bait` e armată dintr-un deploy
+anterior, nu se deosebește de o citire a unui atacator, iar exact asta a produs
+un `critical` fals la fiecare livrare, până pe 31 august 2026. Marcajul de text
+(`sentinel-canary`) a rămas în conținut, dar nu mai e citit de nimic automat —
+e acolo pentru un om care se uită la un dump.
+
+Decizia „e a mea" se ia comparând MĂRIMEA, luată cu `stat`, cu una din două:
+
+1. **Mărimea înregistrată**, în `/etc/sentinel/canary-state`, de la ultima
+   plantare a acestui instalator — autoritară, fiindcă e chiar ce s-a scris
+   acolo.
+2. Dacă nu există înregistrare — fișierul de stare lipsește, sau n-a văzut
+   niciodată calea asta — **mărimea CANONICĂ**: lungimea pe care ar produce-o
+   astăzi conținutul fals al momelii, calculată fără să deschidă fișierul de
+   pe disc. Asta acoperă gazda care avea deja ambele momeli plantate de o
+   versiune mai veche a instalatorului, dinainte ca `canary-state` să existe —
+   fără fallback-ul ăsta, prima livrare a acestui mecanism ar fi găsit starea
+   absentă și ar fi dezarmat o urmărire deja funcțională, tăcut pentru
+   `/selfcheck`, care numără regulile TRIMISE, nu pe cele care contează.
+
+O potrivire, prin oricare din cele două, (re)scrie înregistrarea — deci orice
+livrare de după prima trece direct prin (1).
+
+**Slăbiciune acceptată dinadins**: comparând mărime, nu conținut, un fișier
+real care ar ajunge din întâmplare la exact aceeași lungime, în octeți, ca
+momeala falsă ar fi adoptat drept „al nostru" și armat sub `sentinel_bait`
+peste conținut real. Verificarea veche, pe conținut, nu avea gaura asta.
+Judecată acceptabilă: conținutul momelii are o lungime specifică, dintr-un bloc
+fals cu mai multe câmpuri, nu un număr rotund sau comun — iar alternativa nu e
+un caz de margine, e o dezarmare garantată, pe orice gazdă care are deja
+momelile astea plantate, chiar la livrarea care trebuia s-o liniștească.
 
 **Editare a operatorului care păstrează mărimea** (de exemplu, o parolă falsă
 înlocuită cu alta la fel de lungă): lăsată în pace, tot sub urmărire `critical`.
 
-**Editare care schimbă mărimea, sau un fișier real mutat pe aceeași cale**:
-instalatorul nu mai poate deosebi cele două fără să deschidă fișierul, așa că
-nu încearcă — tratează calea ca „fără evidență", exact ca pe un fișier străin:
-avertizează, scoate urmărirea de audit pentru calea aia din fișierul instalat,
-dar nu atinge niciodată conținutul. Nu repurpoza o cale de momeală pentru ceva
-real; alege o cale nouă, din afara celor două de mai sus.
+**Editare care schimbă mărimea, sau un fișier real mutat pe aceeași cale, ȘI
+fără nicio înregistrare de stare care să confirme originea**: instalatorul nu
+mai poate deosebi cele două fără să deschidă fișierul, așa că nu încearcă —
+tratează calea ca „fără evidență", exact ca pe un fișier străin: avertizează,
+scoate urmărirea de audit pentru calea aia din fișierul instalat, dar nu atinge
+niciodată conținutul. Nu repurpoza o cale de momeală pentru ceva real; alege o
+cale nouă, din afara celor două de mai sus.
 
-**O gazdă restaurată dintr-un backup dinainte ca `canary-state` să existe**
-își pierde evidența propriilor momeli. Consecința e aceeași ca mai sus —
-avertisment, urmărire scoasă din nucleu — niciodată o citire tăcută ca să
-recupereze clasificarea. Vizibil în ieșirea deploy-ului, nu tăcut: rulează
-din nou pasul după ce ștergi fișierele vechi, ca să fie replantate și
-înregistrate.
+**O gazdă restaurată dintr-un backup dinainte ca `canary-state` să existe**,
+dar cu momeala neatinsă, se recuperează automat prin mărimea canonică — rămâne
+armată, fără nicio citire și fără niciun pas manual. Dacă backup-ul e și mai
+vechi decât o editare care a schimbat mărimea momelii, nu mai există nicio
+mărime de comparat, și direcția de eșec rămâne cea veche: avertisment,
+urmărire scoasă din nucleu, niciodată o citire tăcută ca să recupereze
+clasificarea — vizibil în ieșirea deploy-ului, nu tăcut.

@@ -3590,34 +3590,60 @@ EOF
 # run and finish before install_audit_rules stages anything — a bait created
 # after the rules load is a rule silently missing from the kernel.
 #
-# A bait already present is classified by comparing SIZE, from `stat`, against
-# what THIS installer recorded in $CANARY_STATE_PATH when it planted it —
-# never by opening the file. `stat()` is a pure metadata call: it is not a
-# read, a write, an execute nor an attribute change, so `-p r` on the
-# sentinel_bait rule cannot see it — see the comment on that rule in
+# A bait already present is classified by comparing SIZE, from `stat`, never
+# by opening the file. `stat()` is a pure metadata call: it is not a read, a
+# write, an execute nor an attribute change, so `-p r` on the sentinel_bait
+# rule cannot see it — see the comment on that rule in
 # deploy/audit/sentinel.rules for the kernel-side reasoning this relies on.
 #
-# Losing the record — a host restored from a backup taken before this state
-# file existed, or one that never ran this version of the installer — is NOT
-# read as "trust whatever is there": with no matching record, a bait already
-# present is classified exactly like foreign content always was — a warning,
-# and its `-w` line left OUT of the kernel. Chosen on purpose: a lost record
-# costs a watch and a visible line in the deploy output, never a silent read
-# and never the false `critical` this replaces. A host upgrading from an
-# installer old enough to have no state file pays this once, the same way,
-# for a bait it planted itself; the remedy is the one the warning prints.
+# Which size it checks against, in order:
 #
-# Writes to $1, one per line, the path of any bait that already existed
-# WITHOUT a matching size record: either something else lives there, or the
-# record of what was planted is gone, and either way the caller must drop the
-# sentinel_bait watch for that one path rather than let the kernel watch
-# unrecorded content under a decoy's name.
+#   1. The size recorded in $CANARY_STATE_PATH when THIS installer last
+#      planted this path — authoritative, because it is what was actually
+#      written here.
+#   2. If there is no record — state file missing, or never seen this path —
+#      the CANONICAL size: the length `_canary_content "$path"` would produce
+#      today, computed by running it and measuring the result, never by
+#      opening $path. This closes a gap the record alone leaves open:
+#      MEASURED on production, both baits are already planted by an OLDER
+#      installer and already armed in the kernel — 2 sentinel_bait rules,
+#      32/32 loaded — and neither has ever been recorded, because
+#      $CANARY_STATE_PATH did not exist when they were planted. Falling back
+#      to "no record ⇒ foreign" on the very first deploy of this mechanism
+#      would warn on both, on every host already running this installer, and
+#      drop their `-w` lines from what reaches the kernel — disarming a real
+#      detection on the exact deploy meant to quiet a false one, while
+#      install_audit_rules's own count keeps reporting every SENT rule as
+#      loaded, because the dropped line was never sent to begin with. The
+#      canonical content has not changed, so an untouched old bait matches it
+#      immediately, with nothing to read and nothing to migrate.
+#
+# A match by either path adopts the size into $CANARY_STATE_PATH, so every
+# deploy after this one goes through (1) and never needs (2) again for a
+# bait that has not changed since.
+#
+# KNOWN WEAKNESS, accepted on purpose: classifying by size, not content, means
+# a real file that happens to land at this path with EXACTLY the same byte
+# count as the canonical bait would be adopted as "ours" and armed under
+# sentinel_bait over real content — the old content-marker check did not have
+# this hole. Judged acceptable because the canonical content is a specific,
+# multi-line fake-credentials block, not a round or common byte count, so a
+# coincidental match is unlikely, and the alternative — depending on the
+# record alone — is not a narrow edge case: it is a guaranteed, silent-to-
+# selfcheck disarm of an already-armed rule on every host that has this
+# installer's baits today, the first time this file ships.
+#
+# Writes to $1, one per line, the path of any bait that already existed and
+# matched NEITHER a recorded NOR a canonical size: either something else
+# lives there, or `_canary_content` no longer knows this path at all — and
+# either way the caller must drop the sentinel_bait watch for that one path
+# rather than let the kernel watch unrecognised content under a decoy's name.
 install_canary_baits() {
     local foreign_file="$1" path dir content size recorded
     : > "$foreign_file"
 
     # What was planted last time: path -> size in bytes. Read once, up front,
-    # so the loop below never has to touch the bait's content to decide.
+    # so the loop below never has to touch a bait's content to decide.
     local -A planted_size=()
     if [[ -f "$CANARY_STATE_PATH" ]]; then
         local rec_path rec_size
@@ -3631,14 +3657,20 @@ install_canary_baits() {
         if [[ -e "$path" ]]; then
             size="$(stat -c %s -- "$path" 2>/dev/null || true)"
             recorded="${planted_size[$path]:-}"
+            if [[ -z "$recorded" ]] && content="$(_canary_content "$path")"; then
+                # Measures what THIS content would occupy on disk, exactly as
+                # the planting branch below writes it (`printf '%s\n'`, one
+                # trailing newline) -- never opens $path itself.
+                recorded="$(printf '%s\n' "$content" | wc -c | tr -d '[:space:]')"
+            fi
             if [[ -n "$size" && -n "$recorded" && "$size" == "$recorded" ]]; then
                 info "bait already at ${path}, left untouched (a repeat deploy never rewrites one, edited or not)"
                 state_lines+=("$path $size")
             else
-                warn "bait NOT planted at ${path}: no record of it at this size (${size:-unknown} \
-bytes now) in ${CANARY_STATE_PATH}. The sentinel_bait watch for this path is left OUT of the \
-kernel rather than monitor unrecorded content under a decoy's name -- if this really is the bait, \
-from before this state file existed or after its record was lost, delete it and re-run this step \
+                warn "bait NOT planted at ${path}: its size (${size:-unknown} bytes) matches \
+neither the recorded plant in ${CANARY_STATE_PATH} nor the canonical bait content. The \
+sentinel_bait watch for this path is left OUT of the kernel rather than monitor unrecognised \
+content under a decoy's name -- if this really is the bait, move it aside and re-run this step \
 so it gets replanted and recorded; if it's something else, move it."
                 printf '%s\n' "$path" >> "$foreign_file"
             fi
@@ -3668,9 +3700,10 @@ so it gets replanted and recorded; if it's something else, move it."
     done
 
     # Written LAST, and only over what this run actually confirmed — matched
-    # or freshly planted. A path that fell through to the foreign branch above
-    # is deliberately left OUT, so it stays unrecorded, and therefore foreign,
-    # on the next deploy too, until whatever is really there gets resolved.
+    # (by record or by canonical size) or freshly planted. A path that fell
+    # through to the foreign branch above is deliberately left OUT, so it
+    # stays unrecorded, and therefore foreign, on the next deploy too, until
+    # whatever is really there gets resolved.
     if (( ${#state_lines[@]} )); then
         dir="$(dirname "$CANARY_STATE_PATH")"
         [[ -d "$dir" ]] || mkdir -p "$dir"

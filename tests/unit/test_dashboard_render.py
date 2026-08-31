@@ -5,6 +5,7 @@ catches it in CI instead.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -69,6 +70,16 @@ def _context(**over):
         "accounts": [{"username": "root", "n": 927, "ips": 74}],
         "paths": [{"http_path": "/glpi/front/inventory.php", "n": 375, "ips": 2}],
         "signatures": [{"sig": "ET DROP Dshield", "n": 137, "ips": 126}],
+        "campaigns": [
+            {"id": 1, "campaign_key": "auth.ssh_bruteforce", "severity": "high",
+             "title": "Campanie: auth.ssh_bruteforce",
+             "first_seen_at": NOW - timedelta(hours=6), "last_activity_at": NOW,
+             "incident_count": 17, "actor_count": 9},
+            {"id": 2, "campaign_key": "intrusion.persistence.unit_change",
+             "severity": "critical", "title": "Campanie: intrusion.persistence.unit_change",
+             "first_seen_at": NOW - timedelta(hours=1), "last_activity_at": NOW,
+             "incident_count": 5, "actor_count": 2},
+        ],
         "hourly": [{"ora": NOW - timedelta(hours=i), "n": 10 * i, "pct": min(100, 4 * i)}
                    for i in range(24, 0, -1)],
         "health": {"up": 12, "down": 1, "necunoscut": 1},
@@ -89,10 +100,11 @@ def test_dashboard_renders_with_no_data_at_all():
     # A fresh install must not 500 on empty tables.
     html = _env().get_template("dashboard.html").render(**_context(
         insights=[], attackers=[], accounts=[], paths=[], signatures=[],
-        hourly=[], sources=[], health={},
+        hourly=[], sources=[], health={}, campaigns=[],
     ))
     assert "Nicio observație de semnalat" in html
     assert "Nicio activitate ostilă" in html
+    assert "Nicio campanie activă" in html
 
 
 def test_panic_banner_appears_when_the_file_exists():
@@ -107,6 +119,63 @@ def test_attacker_text_is_escaped():
         paths=[{"http_path": "/<script>alert(1)</script>", "n": 1, "ips": 1}]))
     assert "<script>alert(1)</script>" not in html
     assert "&lt;script&gt;" in html
+
+
+def test_campaigns_section_renders_the_active_rows():
+    # Functionality 01 shipped `page.load()["campaigns"]` without any template
+    # reading it — the data reached the page and died there. This proves the
+    # values a triaging operator actually needs (which family, how severe, how
+    # many incidents/actors) reach the rendered HTML, not just that the word
+    # "campanii" appears somewhere on the page.
+    html = _env().get_template("dashboard.html").render(**_context())
+    assert "auth.ssh_bruteforce" in html
+    assert "intrusion.persistence.unit_change" in html
+    # Values tied to their COLUMN, not just present anywhere on the page: an
+    # operator triaging "17 incidents, 9 actors" from a swapped column reads
+    # the wave as smaller and less coordinated than it is. Distinctive counts,
+    # not ones already used elsewhere on the fixture page (attacker "surse" is 3).
+    assert re.search(r'>17</td>\s*<td class="num">9<', html), \
+        "incident_count must render before actor_count, in that column order"
+    assert re.search(r'>5</td>\s*<td class="num">2<', html)
+
+
+def test_campaign_severity_is_worded_and_matches_its_pill_colour():
+    # A colour-blind reader (or a printed/plain-text dump) must still know a
+    # campaign is critical from the text, not only from the pill's colour —
+    # same reasoning as test_kpi_delta_states_direction_in_text_not_only_colour.
+    # It also locks the severity->pill mapping so "critical" and "high" both
+    # land on the same red pill the rest of the dashboard uses for the worst
+    # tier, and "medium" gets the warn pill rather than silently sharing "bad".
+    html = _env().get_template("dashboard.html").render(**_context())
+    assert 'pill pill-bad">ridicat</span>' in html      # high
+    assert 'pill pill-bad">critic</span>' in html       # critical
+    html_medium = _env().get_template("dashboard.html").render(**_context(
+        campaigns=[{"id": 3, "campaign_key": "net.cidr_cluster", "severity": "medium",
+                    "title": "x", "first_seen_at": NOW, "last_activity_at": NOW,
+                    "incident_count": 1, "actor_count": 1}]))
+    assert 'pill pill-warn">mediu</span>' in html_medium
+    assert "pill-bad" not in html_medium
+
+
+def test_campaigns_empty_row_says_nothing_is_wrong():
+    # An empty campaigns table must read as "quiet, nothing open" — not as a
+    # blank table that looks like the query broke or the section was forgotten.
+    html = _env().get_template("dashboard.html").render(**_context(campaigns=[]))
+    assert "Nicio campanie activă" in html
+
+
+def test_campaign_key_is_shown_raw_not_via_the_useless_title_field():
+    # `attach_incident` writes `title` as literally "Campanie: <campaign_key>" —
+    # showing both would just repeat the same string twice. This locks in that
+    # the family column carries the real information once, not the redundant
+    # `title` copy, so a future edit doesn't silently duplicate the row.
+    html = _env().get_template("dashboard.html").render(**_context(
+        campaigns=[{"id": 9, "campaign_key": "net.cidr_cluster", "severity": "medium",
+                    "title": "Campanie: net.cidr_cluster",
+                    "first_seen_at": NOW, "last_activity_at": NOW,
+                    "incident_count": 1, "actor_count": 1}]))
+    assert "net.cidr_cluster" in html
+    assert "Campanie:" not in html
 
 
 def test_geographic_panel_renders_countries_and_operators():
