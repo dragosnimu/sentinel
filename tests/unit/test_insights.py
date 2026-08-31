@@ -669,6 +669,38 @@ def test_campaign_insight_names_the_count_and_the_biggest_one():
     assert out[0].evidence["cea_mai_mare"]["incidente"] == 37
 
 
+def test_campaign_insight_names_the_row_with_the_most_incidents_not_rows_zero():
+    """`active_campaigns` orders its rows by SEVERITY first (so the gravest
+    front leads a list a human reads directly) — see
+    `incident_campaigns.py:active_campaigns`. This insight names something
+    different ("biggest" = most incidents), so it must never read `rows[0]`
+    as if the two orderings coincided.
+
+    Reproduces the bug found in round 1: a `critical` family with a single
+    incident sorted first would have been announced as "the biggest" over a
+    `medium` family carrying 500 — on the host this was measured on, the one
+    surface a wrong operator ever sees for this whole feature, since
+    `page.load()["campaigns"]` itself is not rendered by any template yet."""
+    db = _StubDB(fetch_map={"FROM incident_campaigns": [
+        # Pre-sorted by severity DESC, exactly like the real query returns —
+        # the smallest campaign leads the list.
+        {"id": 1, "campaign_key": "fam.tiny", "severity": "critical",
+         "title": "t", "first_seen_at": None, "last_activity_at": None,
+         "incident_count": 1, "actor_count": 1},
+        {"id": 2, "campaign_key": "fam.scan", "severity": "medium",
+         "title": "t", "first_seen_at": None, "last_activity_at": None,
+         "incident_count": 1, "actor_count": 1},
+        {"id": 3, "campaign_key": "fam.brute", "severity": "medium",
+         "title": "t", "first_seen_at": None, "last_activity_at": None,
+         "incident_count": 500, "actor_count": 500},
+    ]})
+    out = run(ins._campaign_insight(db))
+    assert out[0].evidence["cea_mai_mare"]["familie"] == "fam.brute"
+    assert out[0].evidence["cea_mai_mare"]["incidente"] == 500
+    assert "fam.brute" in out[0].title
+    assert "fam.tiny" not in out[0].title
+
+
 def test_no_active_campaigns_is_quiet_not_an_empty_card():
     """No active campaign is a legitimate state (a quiet host, or one where
     every campaign has gone `quiet`) and must not render a zero-value card —

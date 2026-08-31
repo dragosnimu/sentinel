@@ -727,20 +727,30 @@ async def _campaign_insight(db: Database) -> list[Insight]:
     """968 de incidente deschise citite ca 14 campanii, grupate pe familia
     regulii — vezi `sentinel/db/repo/incident_campaigns.py`. Insight-ul ăsta spune câte
     fronturi sunt deschise ACUM și care e cel mai mare, în loc să lase
-    judecata asta pe seama cuiva care derulează 968 de rânduri."""
+    judecata asta pe seama cuiva care derulează 968 de rânduri.
+
+    „Cea mai mare" înseamnă cea cu cel mai mare `incident_count` — mărimea
+    frontului, nu severitatea lui. `active_campaigns` întoarce rândurile
+    ordonate după SEVERITATE (pentru cine se uită direct la listă, unde un
+    `critical` trebuie să iasă primul), deci `rows[0]` de-acolo ar fi campania
+    cea mai gravă, nu cea mai mare — iar un `critical` cu 2 incidente ar
+    eclipsa o familie cu 500, sub titlul greșit. Rândul se alege explicit din
+    tot setul, cu `max(..., key=...)`, tocmai ca sortarea listei sursă să nu
+    decidă tăcut sensul cuvântului "mare" de-aici."""
     from sentinel.db.repo import incident_campaigns as camp_repo
 
     rows = await camp_repo.active_campaigns(db)
     if not rows:
         return []
-    top = rows[0]
+    top = max(rows, key=lambda r: r["incident_count"])
     return [Insight(
         level="info",
         title=(f"{len(rows)} campanii active — cea mai mare: „{top['campaign_key']}” "
                f"({top['incident_count']} incidente, {top['actor_count']} actori)"),
         detail=("Incidentele sunt grupate pe familia regulii care le-a produs, nu "
                 "citite unul câte unul. O campanie rămâne activă cât timp mai "
-                "primește incidente noi din aceeași familie."),
+                "primește incidente noi din aceeași familie. „Cea mai mare” e "
+                "campania cu cele mai multe incidente, nu neapărat cea mai severă."),
         evidence={"campanii": len(rows),
                   "cea_mai_mare": {"familie": top["campaign_key"],
                                    "incidente": top["incident_count"],

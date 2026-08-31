@@ -62,8 +62,8 @@ _SEVERITY_ORDER_SQL = "ARRAY['info','low','medium','high','critical']"
 
 async def attach_incident(db: Database, incident_id: int, rule_family: str, severity: str) -> int:
     """Link `incident_id` to the active campaign for `rule_family`, creating
-    one if none is active, and recompute the campaign's counters from the
-    incidents that actually reference it. Returns the campaign id.
+    one if none is active, and recompute counters from the incidents that
+    actually reference each campaign touched. Returns the new campaign id.
 
     `incident_count`/`actor_count` are RECOMPUTED (`count(*)`,
     `count(DISTINCT actor_key)`) on every call, never incremented. An
@@ -71,9 +71,29 @@ async def attach_incident(db: Database, incident_id: int, rule_family: str, seve
     is retried or an incident moves to a different campaign; a recomputed one
     cannot, by construction — see `CLAUDE.md` on this exact class of bug.
 
-    The three statements (upsert the campaign row, link the incident,
-    recompute the counters) run inside one transaction, so a concurrent call
-    attaching a different incident to the same family cannot observe this
+    ## Moving an incident recomputes BOTH ends, not just the destination
+
+    An incident that was already attached to a campaign can move: its old
+    campaign went `quiet` (or `closed`), the partial index then let a NEW
+    active row open for the same family (see the module docstring), and the
+    next detection on this same incident attaches it there instead. Found in
+    round 1 review with the default production thresholds (medium incidents
+    close at 7 days, campaigns go quiet at `CAMPAIGN_QUIET_HOURS` = 24h) — not
+    a theoretical case. Recomputing only the destination left the SOURCE
+    campaign's stored counters wrong forever: `quiet_stale` promises those
+    rows "stay on record", and a wrong record is worse than none, because
+    nothing about a `quiet` row's shape says it might be lying. So both the
+    destination and — when it differs and existed — the incident's PREVIOUS
+    campaign are recomputed in the same transaction.
+
+    The previous campaign's `last_activity_at` is deliberately NOT touched:
+    losing a member is an accounting correction, not new activity on that
+    front, and bumping it would make an abandoned `quiet` row look freshly
+    active. Its `severity` falls back to whatever it already was if the
+    recompute leaves it with zero members — see `_recompute`.
+
+    All statements run inside one transaction, so a concurrent call
+    attaching a different incident to either campaign cannot observe this
     one half-done.
 
     Caller's responsibility, not this function's: if this raises, the
@@ -92,31 +112,57 @@ async def attach_incident(db: Database, incident_id: int, rule_family: str, seve
             """,
             rule_family, severity, f"Campanie: {rule_family}",
         )
+
+        old_campaign_id = await conn.fetchval(
+            "SELECT campaign_id FROM incidents WHERE id = $1", incident_id)
+
         await conn.execute(
             "UPDATE incidents SET campaign_id = $2 WHERE id = $1",
             incident_id, campaign_id,
         )
-        counts = await conn.fetchrow(
-            f"""
-            SELECT count(*) AS incident_count,
-                   count(DISTINCT actor_key) AS actor_count,
-                   (array_agg(severity ORDER BY array_position(
-                        {_SEVERITY_ORDER_SQL}, severity) DESC))[1] AS top_severity
-              FROM incidents WHERE campaign_id = $1
-            """,
-            campaign_id,
-        )
-        await conn.execute(
-            """
-            UPDATE incident_campaigns
-               SET incident_count = $2, actor_count = $3, severity = $4,
-                   last_activity_at = now()
-             WHERE id = $1
-            """,
-            campaign_id, int(counts["incident_count"]), int(counts["actor_count"]),
-            counts["top_severity"],
-        )
+
+        await _recompute(conn, campaign_id, bump_activity=True)
+        if old_campaign_id is not None and old_campaign_id != campaign_id:
+            await _recompute(conn, old_campaign_id, bump_activity=False)
     return int(campaign_id)
+
+
+async def _recompute(conn, campaign_id: int, *, bump_activity: bool) -> None:
+    """Recompute one campaign row's `incident_count`/`actor_count`/`severity`
+    from the incidents that actually point at it right now — never from the
+    row's own previous value, which is exactly the increment-drift bug this
+    module exists to avoid.
+
+    `severity` uses `COALESCE(sub.top_severity, c.severity)`: when the
+    campaign has been emptied (its last incident just moved elsewhere),
+    `array_agg` over zero rows is NULL, and `incident_campaigns.severity` is
+    `NOT NULL` — writing NULL there would fail the whole transaction. Falling
+    back to the existing value keeps the emptied row's last known severity
+    rather than crashing the caller over a row that is, by design, staying on
+    record with stale-but-valid data (see `quiet_stale`).
+
+    `bump_activity` is False for a campaign an incident just LEFT: that is a
+    bookkeeping correction, not activity on that front, and treating it as
+    activity would make an abandoned `quiet` campaign look freshly alive.
+    """
+    extra = ", last_activity_at = now()" if bump_activity else ""
+    await conn.execute(
+        f"""
+        UPDATE incident_campaigns c
+           SET incident_count = sub.incident_count,
+               actor_count = sub.actor_count,
+               severity = COALESCE(sub.top_severity, c.severity){extra}
+          FROM (
+              SELECT count(*) AS incident_count,
+                     count(DISTINCT actor_key) AS actor_count,
+                     (array_agg(severity ORDER BY array_position(
+                          {_SEVERITY_ORDER_SQL}, severity) DESC))[1] AS top_severity
+                FROM incidents WHERE campaign_id = $1
+          ) sub
+         WHERE c.id = $1
+        """,
+        campaign_id,
+    )
 
 
 async def quiet_stale(db: Database, quiet_hours: int = CAMPAIGN_QUIET_HOURS) -> int:

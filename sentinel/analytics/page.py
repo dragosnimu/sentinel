@@ -64,5 +64,22 @@ async def load(db: Database) -> dict[str, Any]:
         # care a fost dimensionată asta. Măsurat local cu EXPLAIN (ANALYZE,
         # BUFFERS) pe aceeași formă (968 incidente, 14 campanii): Seq Scan,
         # 55 de buffere, 0,127 ms — vezi docstring-ul `aggregate.campaigns`.
+        #
+        # A DOUA citire a aceleiași tabele, nu una: `insights_mod.collect`
+        # de mai sus a chemat deja `_campaign_insight`, care cheamă și el
+        # `camp_repo.active_campaigns`. Nu s-au unit, deliberat — verificat
+        # și lăsat, nu scăpat din vedere:
+        #   * unirea ar cere ca UNA dintre cele 13 reguli din `collect()` să
+        #     primească alt semnal decât restul (rândurile pre-citite), ceea
+        #     ce ar sparge exact uniformitatea care ține izolarea pe regulă
+        #     din `collect()` — fiecare regulă ia doar `db` și eșecul ei nu
+        #     golește pagina; o regulă hrănită din afară ar depinde de o
+        #     citire făcută înaintea propriului `try/except`;
+        #   * costul dublării e sub pragul la care ar conta: 55 de buffere,
+        #     sub o zecime de milisecundă, pe un tabel cu ~14 rânduri — nici
+        #     pe departe interogarea care a doborât pagina de 14 ori (0030+).
+        # Dacă tabela crește vreodată la o mărime la care dubla citire chiar
+        # costă, unirea se face atunci, cu o măsurătoare în mână, nu acum pe
+        # intuiție — exact regula de mai sus pentru paralelizare.
         "campaigns": await aggregate.campaigns(db),
     }
