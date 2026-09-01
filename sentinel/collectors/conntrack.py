@@ -45,8 +45,26 @@ against `HostIdentity` below.
 ## Where "this host's own addresses" comes from — and why it is not just IPs
 
 Never hardcoded — this repository is public. `discover_host_identity` reads
-`psutil.net_if_addrs()`, which is the kernel's own answer to "what addresses
-are bound to my interfaces", no network I/O, no root required.
+two files under `/proc/net/`, never a socket enumeration API. It USED to call
+`psutil.net_if_addrs()`; that shipped, passed three review rounds, and was
+**dead in production from the first poll**. `psutil` gets there through
+glibc's `getifaddrs()`, which enumerates interfaces over an `AF_NETLINK`
+socket — and `sentinel-ingest.service` restricts
+`RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`, deliberately, because this
+collector needs no socket of any kind to do its job. Under that sandbox
+`getifaddrs()` fails with `OSError: [Errno 97] Address family not supported
+by protocol`, every single time, forever — a dependency on a library call
+masquerading as a dependency on the kernel's own answer, caught only by
+reading the unit that runs it, not by any test, because no test in this
+repository runs under `RestrictAddressFamilies`. See git history for the
+production incident this caused: total, silent, permanently-zero output.
+
+The fix reads `/proc/net/route` and `/proc/net/fib_trie` — plain text files,
+open()/read(), no socket of any family, needing nothing the unit does not
+already grant. **The unit was not weakened to fix this**: `AF_PACKET`/
+`AF_NETLINK` was deliberately not added to `RestrictAddressFamilies`, because
+raw-socket access is far more than "enumerate my own interfaces" needs, on
+exactly the service that parses the least-trusted input in this system.
 
 A set of exact addresses is not enough. **Docker container egress is
 invisible with addresses alone**, and this was measured, not assumed: on the
@@ -59,21 +77,25 @@ drops it as "not ours" — exactly the case the module docstring's own honesty
 standard exists to catch: a compromised container phoning home is the literal
 example this detector is for, and it was the one silently missed.
 
-The fix: `HostIdentity` carries the host's own PRIVATE subnets too (built
-from each local interface's own address + netmask). A Docker bridge
-(`docker0`, `br-xxxx`) is a real local interface with its own private
-subnet, so a container's address on it is owned by that subnet the same way
-the host's public address is owned by its own.
+The fix: `HostIdentity` carries the host's own PRIVATE subnets too, built
+from `/proc/net/route`'s locally-attached routes (the `Gateway` column is
+all-zero — routed through nobody, dialled directly off this interface). A
+Docker bridge (`docker0`, `br-xxxx`) shows up there as its own route with its
+own private subnet, so a container's address on it is owned by that subnet
+the same way the host's public address is owned by its own.
 
-Widening PUBLIC interface subnets the same way was tried and measured wrong:
-the host's public interface here is a /21, the hosting provider's shared
+Widening PUBLIC subnets the same way was tried and measured wrong: the
+host's public interface here is a /21, the hosting provider's shared
 segment, not the host's own — widening it made every other customer on that
 segment "ours" and let an inbound scan from one of them pass the direction
 check with the host's own address as the "destination". `networks` therefore
-only ever holds PRIVATE subnets; the host's public address is still covered
-exactly by `ips`, and `is_outbound` separately refuses any destination that
-is itself owned, as a second line of defence. See `HostIdentity`'s docstring
-for the full shape and the ASSUMPTION the private-only rule still rests on.
+only ever holds routes whose network address is private (`ipaddress`'s own
+`is_private`, checked against the route's masked network, not a per-interface
+address — a route table has no "interface address" to ask); the host's
+public address is still covered exactly by `ips`, and `is_outbound`
+separately refuses any destination that is itself owned, as a second line of
+defence. See `HostIdentity`'s docstring for the full shape and the ASSUMPTION
+the private-only rule still rests on.
 
 ## What this catches, and what it cannot
 
@@ -140,8 +162,6 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-import psutil
-
 from sentinel.logging_setup import get_logger
 from sentinel.model.event import Event
 
@@ -179,6 +199,12 @@ _CACHE_TTL_S = DEDUP_WINDOW_S * 2
 # ceiling would throw away exactly the evidence a real incident produces).
 # It is a ceiling, not a target — routine operation never gets near it.
 MAX_NEW_PER_SAMPLE = 50
+
+# Where the host's own identity is read from. Plain text under /proc/net/ —
+# open()/read(), no socket of any family — see the module docstring for why
+# this replaced psutil.net_if_addrs() and what broke when it didn't.
+_ROUTE_PATH = "/proc/net/route"
+_FIB_TRIE_PATH = "/proc/net/fib_trie"
 
 _KV = re.compile(r"\b(?P<key>src|dst|sport|dport)=(?P<val>\S+)")
 
@@ -244,15 +270,17 @@ class HostIdentity:
     silently dropped it — the single example the module docstring uses for
     what this detector is FOR.
 
-    `networks` fixes it, built from each local interface's own
-    (address, netmask) — but ONLY when that interface's own address is
-    PRIVATE. A Docker bridge is a real local interface with a private
-    subnet, so a container's address on it is owned the same way. The
-    host's PUBLIC interface is deliberately NOT widened this way: it is
-    covered by its own exact address in `ips`, never by its subnet.
+    `networks` fixes it, built from `/proc/net/route`'s locally-attached
+    routes (the `Gateway` column all-zero — dialled directly off an
+    interface, not through anyone else) — but ONLY when the route's own
+    network address is PRIVATE. A Docker bridge shows up as its own
+    locally-attached route with a private network, so a container's address
+    on it is owned the same way. The host's PUBLIC route is deliberately NOT
+    widened this way: it is covered by its own exact address in `ips`, never
+    by its subnet.
 
     That distinction is not cosmetic — it is the second bug this class
-    fixes. The public interface's subnet is usually the hosting provider's
+    fixes. The public route's subnet is usually the hosting provider's
     shared segment, not the host's own: measured directly, `eth0` here is a
     /21, so widening it the same way as a Docker bridge would have made
     every one of roughly 2,000 OTHER CUSTOMERS' addresses "ours". An inbound
@@ -273,12 +301,15 @@ class HostIdentity:
     Docker containers, the case this was built for and measured against;
     re-check before reusing this on a host that forwards someone else's LAN.
 
-    IPv6 is exact-address-only: the kernel writes UNABBREVIATED IPv6
-    addresses into the table, `psutil` returns the ABBREVIATED form, and a
-    plain string comparison between "2001:0db8:0000::0001" and "2001:db8::1"
-    never matches even for the identical address — not fixed here because
-    IPv6 is disabled on the host this was built for (zero entries in the
-    table to prove it against); see the module docstring.
+    IPv6 is not collected at all: `/proc/net/fib_trie` is the IPv4 FIB, and
+    IPv4 is what `/proc/net/nf_conntrack` needs to be checked against — the
+    kernel writes UNABBREVIATED IPv6 addresses into the conntrack table, and
+    matching those correctly is a separate problem this module has never
+    solved (the previous `psutil`-based version had the same gap, documented
+    the same way). IPv6 is disabled on the host this was built for — zero
+    entries in the conntrack table to test either implementation against —
+    so this is a stated limit, not a fixed bug, until it matters; see the
+    module docstring.
     """
 
     ips: frozenset[str]
@@ -326,63 +357,125 @@ def is_outbound(tup: ConnTuple, identity: HostIdentity) -> bool:
     return bool(dst.is_global)
 
 
+def _hex_to_ipv4(field: str) -> str:
+    """One 8-hex-char column of `/proc/net/route` -> dotted-decimal.
+
+    The kernel prints the 32-bit address as `%08X` of its raw in-memory
+    layout, which on this (little-endian) architecture puts the FIRST byte
+    of the address LAST in the hex string — measured directly against the
+    real route table: `0058DC1F` is the network for a /21 whose broadcast
+    form starts with a low byte, and `000011AC` is `172.17.0.0`, Docker's
+    default bridge network, spelled backwards a byte at a time. Reversing
+    the 4 raw bytes before handing them to `inet_ntoa` is what makes both
+    read correctly; treating the hex string as a plain big-endian integer
+    (the very first parse attempt, and the one that silently returned zero
+    subnets) does not.
+    """
+    raw = bytes.fromhex(field)
+    if len(raw) != 4:
+        raise ValueError(f"not a 4-byte IPv4 route field: {field!r}")
+    return socket.inet_ntoa(raw[::-1])
+
+
+def _local_subnets_from_route(text: str) -> list[ipaddress.IPv4Network]:
+    """`/proc/net/route` -> every PRIVATE subnet this host is directly
+    attached to.
+
+    Columns are `Iface Destination Gateway Flags RefCnt Use Metric Mask MTU
+    Window IRTT`, tab/space-separated, one header line first. `Gateway`
+    all-zero (`00000000`) is the discriminator for "reached directly off
+    this interface" — a routed line (a default route via the provider's
+    gateway, say) has a real gateway address there instead and is not a
+    subnet this host owns.
+
+    Only kept if the route's own network address is private
+    (`ipaddress.IPv4Network.is_private`) — the same reasoning `HostIdentity`
+    documents: a Docker bridge's route (`172.x/16`) is private and kept, the
+    host's public /21 is not and is left to `ips`' exact-address coverage
+    alone. A malformed line (too few columns, a hex field that will not
+    parse) is skipped, not guessed at.
+    """
+    networks: list[ipaddress.IPv4Network] = []
+    lines = text.splitlines()
+    for line in lines[1:]:  # first line is the column header, not a route
+        cols = line.split()
+        if len(cols) < 8:
+            continue
+        gw_hex, flags_hex, mask_hex = cols[2], cols[3], cols[7]
+        if gw_hex != "00000000":
+            continue  # reached through a gateway, not attached to us directly
+        try:
+            if not int(flags_hex, 16) & 0x1:  # RTF_UP
+                continue
+            net = ipaddress.ip_network(
+                f"{_hex_to_ipv4(cols[1])}/{_hex_to_ipv4(mask_hex)}", strict=False)
+        except ValueError:
+            continue
+        if not net.network_address.is_private:
+            continue
+        networks.append(net)
+    return networks
+
+
+_FIB_TRIE_ADDR = re.compile(r"^\s*[|+]--\s*(\d{1,3}(?:\.\d{1,3}){3})\s*$")
+
+
+def _host_addresses_from_fib_trie(text: str) -> set[str]:
+    """`/proc/net/fib_trie` -> every IPv4 address configured on this host.
+
+    The trie prints each leaf address on its own line, followed by one or
+    more route-type lines for that address; `/32 host LOCAL` is the kernel's
+    own label for "this exact address is mine", the same fact `ips` needs.
+    Real shape (addresses elided; see this module's own tests for a
+    synthetic fixture matching it exactly):
+
+        +-- <network>/21 2 0 1
+           |-- <host-address>
+              /32 host LOCAL
+
+    Only the line immediately following an address is checked — the
+    `/32 host LOCAL` leaf is always the first route line for a LOCAL address
+    in every kernel version this was checked against. An address whose next
+    line is anything else (a route, not a local address) is not collected.
+    """
+    ips: set[str] = set()
+    lines = text.splitlines()
+    for i in range(len(lines) - 1):
+        m = _FIB_TRIE_ADDR.match(lines[i])
+        if m and lines[i + 1].strip().startswith("/32 host LOCAL"):
+            ips.add(m.group(1))
+    return ips
+
+
 def discover_host_identity() -> HostIdentity:
     """Every address AND every locally-owned subnet — never hardcoded.
 
-    Reads `psutil.net_if_addrs()` — the kernel's own answer to "what
-    addresses (and netmasks) are bound to my interfaces", no network I/O, no
-    elevated privilege needed to ask it.
+    Reads two files under `/proc/net/`: `route` for locally-attached
+    subnets, `fib_trie` for exact addresses. Both are plain text, no socket
+    of any family, nothing `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`
+    on `sentinel-ingest.service` disallows — unlike the `psutil` version this
+    replaced, which called glibc's `getifaddrs()` under the hood, needed an
+    `AF_NETLINK` socket to do it, and failed with `OSError: [Errno 97]
+    Address family not supported by protocol` on every single poll in
+    production. See the module docstring for the full incident.
 
-    IPv4 netmasks build `HostIdentity.networks` — but ONLY for an interface
-    whose OWN address is PRIVATE (a Docker bridge, a VPN concentrator this
-    host runs). A PUBLIC interface's subnet is deliberately never widened
-    this way: it is usually the hosting provider's shared segment, not the
-    host's own, and widening it would own every neighbour on it. Measured
-    directly: this host's public interface is a /21, and including it made
-    an inbound scan from another customer on that segment pass the
-    direction check with the host's own address as the "new destination" —
-    see `HostIdentity`'s docstring for the full shape. The host's public
-    address itself is still covered, exactly, by `ips`.
-
-    IPv6 addresses are still collected into `ips` for the exact-address
-    case; their netmasks are not used for `networks`, since `ipaddress`
-    does not accept the netmask STRING form psutil returns for IPv6 the way
-    it does for IPv4's dotted-decimal form, and this host has nothing in
-    IPv6 to test that conversion against.
+    Both files are world-readable on a standard kernel (unlike
+    `/proc/net/nf_conntrack`, which needs `CAP_DAC_READ_SEARCH`) — this
+    function does not distinguish "absent" from "denied" the way `_read`
+    does for conntrack itself, because either failure means the same thing
+    here: identity cannot be established this round, try again next sample.
 
     Returns an identity with an empty `ips` on failure. The caller MUST treat
     that as "cannot tell direction" and stay quiet, never as "the host has no
     addresses".
     """
     try:
-        ips: set[str] = set()
-        networks: list[ipaddress.IPv4Network] = []
-        for iface_addrs in psutil.net_if_addrs().values():
-            for a in iface_addrs:
-                if a.family in (socket.AF_INET, socket.AF_INET6):
-                    # Strip an IPv6 zone id (fe80::1%eth0) before comparing.
-                    ips.add(a.address.split("%", 1)[0])
-                if a.family != socket.AF_INET or not a.netmask:
-                    continue
-                try:
-                    iface_addr = ipaddress.ip_address(a.address)
-                except ValueError:
-                    continue
-                if not iface_addr.is_private:
-                    # The provider's shared public segment (eth0's /21 on
-                    # the host this was measured against) is NOT ours
-                    # beyond this one exact address — widening it would own
-                    # every other customer on the same segment.
-                    continue
-                try:
-                    networks.append(ipaddress.ip_network(
-                        f"{a.address}/{a.netmask}", strict=False))
-                except ValueError:
-                    # An interface psutil cannot describe cleanly (a
-                    # malformed netmask, a point-to-point oddity) is
-                    # skipped, not guessed at — the exact address from
-                    # `ips` above still covers the interface itself.
-                    pass
+        with open(_ROUTE_PATH, "r", encoding="ascii", errors="strict") as fh:
+            route_text = fh.read()
+        with open(_FIB_TRIE_PATH, "r", encoding="ascii", errors="strict") as fh:
+            fib_text = fh.read()
+        networks = _local_subnets_from_route(route_text)
+        ips = _host_addresses_from_fib_trie(fib_text)
         return HostIdentity(frozenset(ips), tuple(networks))
     except Exception as exc:  # noqa: BLE001 - discovery failing degrades, never crashes ingest
         log.error(

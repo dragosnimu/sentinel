@@ -490,7 +490,7 @@ de încă două ori înainte să fie corect:
    gazdei. O verificare pe adrese exacte arunca exact cazul pe care
    detectorul îl caută — un container compromis care sună acasă. Reparat prin
    `HostIdentity`, care ține și subrețelele private ale gazdei (construite din
-   adresa + masca fiecărei interfețe locale), nu doar adresele ei.
+   rutele local-atașate citite din `/proc/net/route`), nu doar adresele ei.
 2. **Lărgirea a înghițit segmentul public.** Aplicat la fel pe interfața
    publică, `eth0` fiind un `/21` pe gazda măsurată, „subrețeaua proprie" a
    ajuns să însemne ~2.000 de adrese ale ALTOR clienți de la același

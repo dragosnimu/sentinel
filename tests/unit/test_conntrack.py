@@ -27,6 +27,8 @@ deliberately broken.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
+import textwrap
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -55,6 +57,97 @@ _CONTAINER_IP = "172.20.0.5"
 # else's LAN this host happens to see traffic from", the boundary case
 # `HostIdentity`'s docstring names as its assumption.
 _UNRELATED_PRIVATE_IP = "10.77.0.9"
+
+# ---------------------------------------------------------------------------
+# Fixtures for discover_host_identity's real source: /proc/net/route and
+# /proc/net/fib_trie. Shapes below mirror what was actually measured on the
+# production host (see the collector's module docstring), with every real
+# address replaced by a fabricated stand-in — this file is exempt from the
+# real-infrastructure scan, but there is no reason to tempt it.
+#
+# _HOST_IP (1.1.1.1) sits in a fabricated /21, same as the production
+# host's public interface. _BRIDGE_SUBNET_16/_BRIDGE_HOST_ADDR stand in for
+# a Docker bridge — deliberately a DIFFERENT /16 than `_BRIDGE_NET` above so
+# this section's fixtures stay independent of the is_outbound tests.
+_HOST_SUBNET_21 = "1.1.0.0"          # 1.1.1.1 & 255.255.248.0
+_BRIDGE_SUBNET_16 = "172.30.0.0"
+_BRIDGE_HOST_ADDR = "172.30.0.1"     # the bridge's OWN address, not a container's
+
+
+def _ip_to_route_hex(ip: str) -> str:
+    """Encode an IPv4 address the way `/proc/net/route` prints it: the raw
+    bytes, reversed. Written independently of `ct._hex_to_ipv4` — a
+    round-trip test using the SAME implementation on both sides would prove
+    only that the code agrees with itself."""
+    octets = [int(p) for p in ip.split(".")]
+    return "".join(f"{b:02X}" for b in reversed(octets))
+
+
+def _route_fixture_text() -> str:
+    """A `/proc/net/route` table with one of each shape that matters: a
+    gatewayed default route (not ours), a local-attached PUBLIC route (ours
+    exactly, not by subnet), a local-attached PRIVATE route (a Docker
+    bridge — ours by subnet), a down interface's route (must not count even
+    though its Gateway column is zero), and one unparseable line."""
+    header = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT"
+    gatewayed = (
+        f"eth0\t00000000\t{_ip_to_route_hex('1.1.0.1')}\t0003\t0\t0\t0\t"
+        f"{_ip_to_route_hex('0.0.0.0')}\t0\t0\t0"
+    )
+    local_public = (
+        f"eth0\t{_ip_to_route_hex(_HOST_SUBNET_21)}\t{_ip_to_route_hex('0.0.0.0')}\t0001\t0\t0\t0\t"
+        f"{_ip_to_route_hex('255.255.248.0')}\t0\t0\t0"
+    )
+    local_bridge = (
+        f"docker0\t{_ip_to_route_hex(_BRIDGE_SUBNET_16)}\t{_ip_to_route_hex('0.0.0.0')}\t0001\t0\t0\t0\t"
+        f"{_ip_to_route_hex('255.255.0.0')}\t0\t0\t0"
+    )
+    down_iface = (
+        f"eth1\t{_ip_to_route_hex('192.168.99.0')}\t{_ip_to_route_hex('0.0.0.0')}\t0000\t0\t0\t0\t"
+        f"{_ip_to_route_hex('255.255.255.0')}\t0\t0\t0"
+    )
+    malformed = "not a route line at all"
+    return "\n".join(
+        [header, gatewayed, local_public, local_bridge, down_iface, malformed]
+    ) + "\n"
+
+
+def _fib_trie_fixture_text() -> str:
+    """A `/proc/net/fib_trie` excerpt with the shape actually measured on
+    the production host: an address line immediately followed by
+    `/32 host LOCAL` for a real local address, and BROADCAST leaves (both
+    `/32 link BROADCAST` and a bare network `/N link BROADCAST`) that must
+    NOT be picked up. Includes a duplicate `Local:` section, as the real
+    file does, to prove the result is deduplicated."""
+    return textwrap.dedent(f"""\
+        Main:
+          +-- 0.0.0.0/0 3 0 5
+             +-- 127.0.0.0/8 2 0 2
+                +-- 127.0.0.0/8 2 0 2
+                   |-- 127.0.0.0
+                      /8 link BROADCAST
+                   |-- 127.0.0.1
+                      /32 host LOCAL
+                   |-- 127.255.255.255
+                      /32 link BROADCAST
+             +-- {_BRIDGE_SUBNET_16}/16 2 0 2
+                +-- {_BRIDGE_SUBNET_16}/16 2 0 2
+                   |-- {_BRIDGE_SUBNET_16}
+                      /16 link BROADCAST
+                   |-- {_BRIDGE_HOST_ADDR}
+                      /32 host LOCAL
+             +-- {_HOST_SUBNET_21}/21 2 0 1
+                |-- {_HOST_IP}
+                   /32 host LOCAL
+        Local:
+          +-- 0.0.0.0/0 3 0 5
+             +-- 127.0.0.0/8 2 0 2
+                |-- 127.0.0.1
+                   /32 host LOCAL
+             +-- {_HOST_SUBNET_21}/21 2 0 1
+                |-- {_HOST_IP}
+                   /32 host LOCAL
+        """)
 
 
 def _line(proto: str, src: str, dst: str, sport: int, dport: int) -> str:
@@ -224,87 +317,195 @@ def test_unparseable_destination_is_not_reported():
 
 
 # ---------------------------------------------------------------------------
-# discover_host_identity: never hardcoded, degrades to "cannot tell" on failure
+# _hex_to_ipv4: the little-endian hex fields /proc/net/route actually prints
 # ---------------------------------------------------------------------------
-def test_discover_host_identity_reads_all_local_interfaces(monkeypatch):
-    """`eth0` carries the REAL production shape: a /21, not a /32.
+def test_hex_to_ipv4_decodes_the_real_measured_shapes():
+    """Both values below are the EXACT hex strings measured on the
+    production host (see the collector's module docstring) — a /21 mask and
+    a Docker bridge's /16 network — decoded independently of `ct`'s own
+    encoder (`_ip_to_route_hex`), so this is not the code checking itself."""
+    assert ct._hex_to_ipv4("00F8FFFF") == "255.255.248.0"
+    assert ct._hex_to_ipv4(_ip_to_route_hex("172.30.0.0")) == "172.30.0.0"
+    assert ct._hex_to_ipv4(_ip_to_route_hex(_HOST_IP)) == _HOST_IP
 
-    A fixture that gives the public interface a /32 can never expose the
-    neighbour-widening bug — every other test in this file inherited that
-    fixture's shape and none of them could have caught it. The /21 here (and
-    the assertions below) is what makes "but what about the ~2,000 other
-    addresses on that segment?" unavoidable to ask.
+
+def test_hex_to_ipv4_rejects_a_field_that_is_not_4_bytes():
+    """A kernel field this parser cannot fully decode must raise, not
+    silently fabricate a truncated or padded address — the same standard
+    `parse_line` holds itself to for conntrack's own fields."""
+    with pytest.raises(ValueError):
+        ct._hex_to_ipv4("AB")
+    with pytest.raises(ValueError):
+        ct._hex_to_ipv4("not-hex-1")
+
+
+# ---------------------------------------------------------------------------
+# _local_subnets_from_route: /proc/net/route -> owned PRIVATE subnets only
+# ---------------------------------------------------------------------------
+def test_local_subnets_from_route_keeps_the_local_private_route():
+    nets = ct._local_subnets_from_route(_route_fixture_text())
+    assert ipaddress.ip_network(f"{_BRIDGE_SUBNET_16}/16") in nets
+
+
+def test_local_subnets_from_route_excludes_the_local_public_route():
+    """The /21-neighbour bug, at the route-parsing layer: a locally-attached
+    route whose OWN network address is public must not become a subnet the
+    host claims to own — that would recreate the exact widening `HostIdentity`
+    exists to prevent, just fed from a different source."""
+    nets = ct._local_subnets_from_route(_route_fixture_text())
+    assert ipaddress.ip_network(f"{_HOST_SUBNET_21}/21") not in nets
+
+
+def test_local_subnets_from_route_excludes_a_gatewayed_route():
+    """A route reached through a gateway (Destination 0.0.0.0/0 in the
+    fixture) is not this host's own subnet, whatever its mask says."""
+    nets = ct._local_subnets_from_route(_route_fixture_text())
+    assert ipaddress.ip_network("0.0.0.0/0") not in nets
+
+
+def test_local_subnets_from_route_excludes_a_down_interface():
+    """Flags=0000 (RTF_UP not set) in the fixture's `eth1` line: a route
+    whose Gateway column happens to be zero but whose interface is down must
+    not be read as an owned subnet."""
+    nets = ct._local_subnets_from_route(_route_fixture_text())
+    assert ipaddress.ip_network("192.168.99.0/24") not in nets
+
+
+def test_local_subnets_from_route_skips_unparseable_lines_without_raising():
+    # The fixture's last line ("not a route line at all") must not crash
+    # parsing of the well-formed lines around it.
+    nets = ct._local_subnets_from_route(_route_fixture_text())
+    assert len(nets) == 1
+
+
+# ---------------------------------------------------------------------------
+# _host_addresses_from_fib_trie: /proc/net/fib_trie -> exact local addresses
+# ---------------------------------------------------------------------------
+def test_host_addresses_from_fib_trie_finds_every_local_leaf():
+    ips = ct._host_addresses_from_fib_trie(_fib_trie_fixture_text())
+    assert ips == {"127.0.0.1", _BRIDGE_HOST_ADDR, _HOST_IP}
+
+
+def test_host_addresses_from_fib_trie_ignores_broadcast_leaves():
+    """The trap this fixes: a naive 'any address line under this trie'
+    read would also pick up `127.0.0.0` and `127.255.255.255`
+    (`/32 link BROADCAST`) and the bridge's bare network address
+    (`/16 link BROADCAST`) — none of which is an address configured on this
+    host. Only the line whose NEXT line is exactly `/32 host LOCAL` counts."""
+    ips = ct._host_addresses_from_fib_trie(_fib_trie_fixture_text())
+    assert "127.0.0.0" not in ips
+    assert "127.255.255.255" not in ips
+    assert _BRIDGE_SUBNET_16 not in ips
+
+
+# ---------------------------------------------------------------------------
+# discover_host_identity: reads /proc/net/route + /proc/net/fib_trie,
+# never hardcoded, degrades to "cannot tell" on failure
+# ---------------------------------------------------------------------------
+def test_discover_host_identity_reads_route_and_fib_trie(tmp_path, monkeypatch):
+    """End-to-end through the real entry point, not the parsing helpers in
+    isolation: given the fixture files on disk, `discover_host_identity`
+    must own the host's exact public address AND the bridge subnet, while
+    NOT owning the /21 neighbour around the public address — the same
+    /21-neighbour guarantee the old psutil-based version made, now proven
+    against the file-based source that replaced it.
     """
-    import socket
-    from types import SimpleNamespace as NS
+    route_path = tmp_path / "route"
+    fib_path = tmp_path / "fib_trie"
+    route_path.write_text(_route_fixture_text(), encoding="ascii")
+    fib_path.write_text(_fib_trie_fixture_text(), encoding="ascii")
+    monkeypatch.setattr(ct, "_ROUTE_PATH", str(route_path))
+    monkeypatch.setattr(ct, "_FIB_TRIE_PATH", str(fib_path))
 
-    fake = {
-        "lo": [NS(family=socket.AF_INET, address="127.0.0.1", netmask="255.0.0.0")],
-        "eth0": [
-            # /21 = 255.255.248.0 — the measured shape of the host's public
-            # interface, NOT a /32. 1.1.1.1/21 -> network 1.1.0.0/21.
-            NS(family=socket.AF_INET, address=_HOST_IP, netmask="255.255.248.0"),
-            NS(family=socket.AF_INET6, address="fe80::1%eth0", netmask=None),
-            # A MAC address on the same interface must not be treated as an IP.
-            NS(family=socket.AF_PACKET if hasattr(socket, "AF_PACKET") else -1,
-               address="aa:bb:cc:dd:ee:ff", netmask=None),
-        ],
-        "docker0": [NS(family=socket.AF_INET, address="172.20.0.1", netmask="255.255.0.0")],
-    }
-
-    import psutil
-    monkeypatch.setattr(psutil, "net_if_addrs", lambda: fake)
     identity = ct.discover_host_identity()
-    assert identity.ips == frozenset({"127.0.0.1", _HOST_IP, "fe80::1", "172.20.0.1"})
+
+    assert identity.ips == frozenset({"127.0.0.1", _BRIDGE_HOST_ADDR, _HOST_IP})
     # The docker bridge's own subnet must be usable to recognise container egress.
-    assert identity.owns(_CONTAINER_IP) is True
+    assert identity.owns(_BRIDGE_HOST_ADDR) is True
+    assert identity.owns(f"{_BRIDGE_SUBNET_16.rsplit('.', 1)[0]}.5") is True  # a container address
     # The exact host address is still ours...
     assert identity.owns(_HOST_IP) is True
     # ...but the /21 around it is the PROVIDER's shared segment, not ours.
-    # A neighbour on it (measured shape: 1.1.0.7, inside 1.1.0.0/21) must NOT
-    # be treated as the host's own — see `HostIdentity`'s docstring for what
-    # widening a public interface's subnet actually produced.
     assert identity.owns("1.1.0.7") is False
 
 
-def test_discover_host_identity_does_not_widen_a_public_interface_subnet(monkeypatch):
-    """The bug, isolated from the fixture above: given ONLY a public /21
-    interface (no docker bridge in the picture at all), a neighbour on that
-    segment must not be owned, and an inbound scan from that neighbour to
-    the host's own address must not be classified as outbound."""
-    import socket
-    from types import SimpleNamespace as NS
+def test_discover_host_identity_needs_no_socket_of_any_family(tmp_path, monkeypatch):
+    """THE regression test for the production outage: the previous,
+    psutil-based implementation needed an AF_NETLINK socket to enumerate
+    interfaces, and sentinel-ingest.service's
+    `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` blocks exactly that —
+    measured on the host as `OSError: [Errno 97] Address family not
+    supported by protocol`, on every single poll, forever. This test makes
+    ANY socket construction raise that same error and asserts discovery
+    still succeeds — so a regression back to a socket-enumeration library
+    (psutil or otherwise) fails HERE, in under a second, instead of silently
+    in production."""
+    import socket as _socket
 
-    fake = {"eth0": [NS(family=socket.AF_INET, address=_HOST_IP, netmask="255.255.248.0")]}
-    import psutil
-    monkeypatch.setattr(psutil, "net_if_addrs", lambda: fake)
+    def _no_sockets_allowed(*a, **kw):
+        raise OSError(97, "Address family not supported by protocol")
+
+    monkeypatch.setattr(_socket, "socket", _no_sockets_allowed)
+
+    route_path = tmp_path / "route"
+    fib_path = tmp_path / "fib_trie"
+    route_path.write_text(_route_fixture_text(), encoding="ascii")
+    fib_path.write_text(_fib_trie_fixture_text(), encoding="ascii")
+    monkeypatch.setattr(ct, "_ROUTE_PATH", str(route_path))
+    monkeypatch.setattr(ct, "_FIB_TRIE_PATH", str(fib_path))
 
     identity = ct.discover_host_identity()
-    assert identity.networks == (), "a public interface must contribute no subnet at all"
 
-    neighbour = "1.1.0.7"
-    tup = ct.parse_line(_line("tcp", neighbour, _HOST_IP, 55555, 22))
-    assert ct.is_outbound(tup, identity) is False
-
-
-def test_discover_host_identity_skips_an_unparseable_netmask(monkeypatch):
-    import socket
-    from types import SimpleNamespace as NS
-
-    fake = {"weird0": [NS(family=socket.AF_INET, address=_HOST_IP, netmask="not-a-netmask")]}
-    import psutil
-    monkeypatch.setattr(psutil, "net_if_addrs", lambda: fake)
-    identity = ct.discover_host_identity()
-    # The exact address still counts, even though no usable network came of it.
-    assert identity.ips == frozenset({_HOST_IP})
+    assert bool(identity) is True
     assert identity.owns(_HOST_IP) is True
 
 
-def test_discover_host_identity_failure_returns_empty_not_a_guess(monkeypatch):
-    import psutil
-    def _boom():
-        raise OSError("no netlink socket")
-    monkeypatch.setattr(psutil, "net_if_addrs", _boom)
+def test_conntrack_module_no_longer_imports_psutil():
+    """A direct guard on the regression itself: if `psutil` is ever
+    reimported at module scope here, this fails immediately — instead of
+    the collector going silent in production the next time
+    RestrictAddressFamilies is enforced (it already is, today)."""
+    assert not hasattr(ct, "psutil")
+
+
+def test_discover_host_identity_failure_returns_empty_not_a_guess(tmp_path, monkeypatch):
+    monkeypatch.setattr(ct, "_ROUTE_PATH", str(tmp_path / "does_not_exist_route"))
+    monkeypatch.setattr(ct, "_FIB_TRIE_PATH", str(tmp_path / "does_not_exist_fib_trie"))
+    identity = ct.discover_host_identity()
+    assert bool(identity) is False
+
+
+def test_discover_host_identity_returns_empty_when_only_one_file_is_missing(tmp_path, monkeypatch):
+    """Partial success is not success: a host where `fib_trie` reads fine but
+    `route` does not must stay quiet ENTIRELY, not build an identity with
+    addresses but silently no subnets. `bool(identity)` alone cannot catch
+    this — an identity with `ips` populated but `networks` silently empty is
+    already truthy, so this checks both fields directly: reproduced during
+    review, splitting the two reads into independent try/except blocks left
+    this exact case with `ips` populated and `networks` quietly empty, and
+    every test that only checked `bool(identity)` stayed green."""
+    fib_path = tmp_path / "fib_trie"
+    fib_path.write_text(_fib_trie_fixture_text(), encoding="ascii")
+    monkeypatch.setattr(ct, "_ROUTE_PATH", str(tmp_path / "does_not_exist_route"))
+    monkeypatch.setattr(ct, "_FIB_TRIE_PATH", str(fib_path))
+    identity = ct.discover_host_identity()
+    assert identity.ips == frozenset()
+    assert identity.networks == ()
+
+
+def test_discover_host_identity_is_falsy_if_fib_trie_format_ever_drifts(tmp_path, monkeypatch):
+    """The assumption this whole source rests on, made concrete: nothing
+    guarantees a future kernel keeps printing `/32 host LOCAL` the way this
+    parser expects. If the format ever drifts and no leaf matches, the
+    result must be the SAME safe "cannot tell" as any other discovery
+    failure — quiet, not a false claim that the host has no addresses being
+    read as "the host owns nothing, so nothing it does is outbound"."""
+    route_path = tmp_path / "route"
+    fib_path = tmp_path / "fib_trie"
+    route_path.write_text(_route_fixture_text(), encoding="ascii")
+    fib_path.write_text("Main:\n  totally reformatted, matches nothing\n", encoding="ascii")
+    monkeypatch.setattr(ct, "_ROUTE_PATH", str(route_path))
+    monkeypatch.setattr(ct, "_FIB_TRIE_PATH", str(fib_path))
     identity = ct.discover_host_identity()
     assert bool(identity) is False
 
