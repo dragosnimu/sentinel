@@ -362,12 +362,11 @@ def _hex_to_ipv4(field: str) -> str:
 
     The kernel prints the 32-bit address as `%08X` of its raw in-memory
     layout, which on this (little-endian) architecture puts the FIRST byte
-    of the address LAST in the hex string — measured directly against the
-    real route table: `0058DC1F` is the network for a /21 whose broadcast
-    form starts with a low byte, and `000011AC` is `172.17.0.0`, Docker's
-    default bridge network, spelled backwards a byte at a time. Reversing
-    the 4 raw bytes before handing them to `inet_ntoa` is what makes both
-    read correctly; treating the hex string as a plain big-endian integer
+    of the address LAST in the hex string — verified against a real route
+    table: `000011AC` is `172.17.0.0`, Docker's default bridge network,
+    spelled backwards a byte at a time, and `006433C6` is `198.51.100.0`.
+    Reversing the 4 raw bytes before handing them to `inet_ntoa` is what
+    makes both read correctly; treating the hex string as a plain big-endian integer
     (the very first parse attempt, and the one that silently returned zero
     subnets) does not.
     """
