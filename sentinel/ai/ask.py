@@ -57,6 +57,11 @@ class ParamSpec:
     minimum: int | None = None
     maximum: int | None = None
     default: Any = None
+    #: Explicație pentru OPERATOR, arătată alături de motivul respingerii —
+    #: nu "parametru invalid" sec, ci de ce limita există și ce poate întreba
+    #: în schimb. Opțional: majoritatea parametrilor (limite de listă, de
+    #: exemplu) sunt suficient de clari din `describe()` singur.
+    hint: str | None = None
 
     def describe(self) -> str:
         if self.kind == "enum":
@@ -68,7 +73,19 @@ class ParamSpec:
 
 def validate_param(name: str, spec: ParamSpec, raw: Any) -> tuple[Any, str | None]:
     """Returns (valoare_curata, None) sau (None, motiv_respingere). Un
-    parametru în afara limitelor se RESPINGE — nu se ajustează, nu se ignoră."""
+    parametru în afara limitelor se RESPINGE — nu se ajustează, nu se ignoră.
+
+    Un refuz sec ("parametru invalid") lasă operatorul fără nimic de făcut cu
+    el. `spec.hint`, dacă există, se atașează la ORICE respingere a acestui
+    parametru — nu doar la depășirea limitei — ca omul să afle de ce limita
+    e acolo și ce poate întreba în schimb, nu doar că a greșit ceva."""
+    value, error = _validate_param_core(name, spec, raw)
+    if error and spec.hint:
+        error = f"{error} — {spec.hint}"
+    return value, error
+
+
+def _validate_param_core(name: str, spec: ParamSpec, raw: Any) -> tuple[Any, str | None]:
     if raw is None:
         return spec.default, None
     if spec.kind == "enum":
@@ -271,6 +288,39 @@ async def _q_tari_atac(db: Database, p: dict[str, Any]) -> list[dict[str, Any]]:
 #: aici, fiindcă nu am acces la gazdă; vezi raportul.
 _FEREASTRA_EXACTA_ORE_MAX = 24
 
+#: Plafonul lui `ore` pentru calea de rollup. NU e o limită de performanță —
+#: cusătura de la runda 3 a fost verificată corectă pe gazdă și rămâne
+#: neatinsă. E granița DOVEDITĂ până la care `event_rollup_1h` e fidel
+#: brutului, măsurată de operator prin comparație directă:
+#:
+#:   fereastră   cusătură     exact        diferență
+#:   25 ore         89 335      89 335              0
+#:   48 ore        170 854     170 854              0
+#:   168 ore     2 544 434   6 045 192     -3 500 758
+#:
+#: La 168 de ore, divergența nu vine din interogarea asta — vine din
+#: `event_rollup_1h` însuși, incomplet pentru zile mai vechi:
+#:
+#:   zi        rollup      brut        lipsă
+#:   08-23      9 993      10 314         321
+#:   08-24  1 690 045  5 646 508   3 956 463   <- ziua potopului udp/514
+#:   08-25    671 428    960 875     289 447
+#:   08-26..08-30                   diferență 0
+#:
+#: Cauza e filigranul din `rollup_events` (`maintenance_service.py`): avansează
+#: și nu se mai întoarce, deci rândurile ingerate DUPĂ ce filigranul a trecut
+#: de ora lor nu se mai agregă niciodată. Pe 24 august ingestia a rămas mult în
+#: urmă din cauza volumului — exact ziua cu cele mai multe date, deci exact
+#: ziua unde lipsa doare cel mai mult. Reparația filigranului e muncă separată,
+#: decisă de operator, și NU e făcută aici.
+#:
+#: Cine ridică plafonul ăsta fără să repare mai întâi filigranul nu face
+#: răspunsul mai lent — îl face FALS, cu aer de cifră exactă: 2,5 milioane
+#: în loc de 6, fără nicio urmă în text că lipsește ceva. Rămâne 48 până când
+#: cineva demonstrează, la fel ca mai sus, o fereastră mai lungă pentru care
+#: rollup-ul chiar e complet.
+_FEREASTRA_MAX_ORE_ROLLUP = 48
+
 
 async def _q_evenimente_fereastra(db: Database, p: dict[str, Any]) -> dict[str, Any]:
     ore = p["ore"]
@@ -447,11 +497,20 @@ CATALOG: dict[str, Question] = {
     "evenimente_fereastra": Question(
         description=(
             "Câte evenimente totale și câte ostile (auth_fail/alert), într-o "
-            "fereastră de ore înapoi de la acum. Adresele IP distincte apar "
-            "DOAR pentru ferestre de cel mult 24 de ore — peste atât, cifra "
-            "exactă ar cere o scanare completă, deci nu se calculează. Peste "
-            "24 de ore, fereastra e rotunjită la ora întreagă anterioară."),
-        params={"ore": ParamSpec("int", minimum=1, maximum=168, default=24)},
+            "fereastră de CEL MULT 48 de ore înapoi de la acum — nu acceptă o "
+            "fereastră mai lungă, indiferent ce a cerut operatorul (de ex. "
+            "\"săptămâna asta\" înseamnă mai mult de 48h și NU se poate răspunde "
+            "exact prin întrebarea asta). Adresele IP distincte apar DOAR pentru "
+            "ferestre de cel mult 24 de ore — peste atât, cifra exactă ar cere o "
+            "scanare completă, deci nu se calculează. Peste 24 de ore, fereastra "
+            "e rotunjită la ora întreagă anterioară."),
+        params={"ore": ParamSpec(
+            "int", minimum=1, maximum=_FEREASTRA_MAX_ORE_ROLLUP, default=24,
+            hint=("peste limita asta, rezumatul orar din care se calculează "
+                 "răspunsul e cunoscut incomplet pentru zile mai vechi, iar cifra "
+                 "ar părea exactă fără să fie. Cere o fereastră mai scurtă, sau "
+                 "repetă întrebarea pentru fiecare interval dacă ai nevoie de o "
+                 "perioadă mai lungă"))},
         query=_q_evenimente_fereastra, render=_r_evenimente_fereastra),
     "blocklist_activ": Question(
         description="Câte adrese IP sunt blocate acum, și cele mai recente blocări.",

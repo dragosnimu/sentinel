@@ -319,11 +319,12 @@ def test_randarea_ferestrei_lungi_spune_ca_e_aproximata():
 
 def test_o_interogare_care_pica_nu_iese_din_answer_question_ca_exceptie(monkeypatch):
     """Docstring-ul lui `answer_question` promite „Never raises". Fără try/except
-    în jurul `q.query`, un timeout de bază de date (exact ce a măsurat
-    verificatorul la `ore=168` înainte de reparație) ar ieși ca excepție, ar
+    în jurul `q.query`, un timeout de bază de date ar ieși ca excepție, ar
     cădea în `_guard` din `bot.py`, și operatorul ar primi „A apărut o eroare la
     procesarea comenzii" — fără să știe CE întrebare a picat — după ce cota de
-    rată și primul apel către model erau deja plătite."""
+    rată și primul apel către model erau deja plătite. `ore=48` (plafonul
+    valid, nu 168 — vezi runda 4) ca testul ăsta să exercite calea lungă și nu
+    validarea parametrului, care e testată separat."""
     async def _boom_query(db, p):
         raise TimeoutError("statement timeout")
 
@@ -332,7 +333,7 @@ def test_o_interogare_care_pica_nu_iese_din_answer_question_ca_exceptie(monkeypa
 
     async def fake_call_structured(*a, **kw):
         return Result(ok=True, tool_input={
-            "gasit": True, "intrebare": "evenimente_fereastra", "parametri": {"ore": 168},
+            "gasit": True, "intrebare": "evenimente_fereastra", "parametri": {"ore": 48},
         }, usage=_usage())
 
     monkeypatch.setattr(ask_mod, "call_structured", fake_call_structured)
@@ -340,10 +341,10 @@ def test_o_interogare_care_pica_nu_iese_din_answer_question_ca_exceptie(monkeypa
     monkeypatch.setattr(ask_mod.budget, "record", _noop_record)
 
     result = run(ask_mod.answer_question(_NoopDB(), Config(), "sk-test",
-                                         "câte evenimente în ultima săptămână?"))
+                                         "câte evenimente în ultimele 48 de ore?"))
 
     assert result.ok is False
-    assert result.based_on == "evenimente_fereastra(ore=168)"
+    assert result.based_on == "evenimente_fereastra(ore=48)"
     assert "evenimente_fereastra" in result.text or "eșuat" in result.text.lower()
 
 
@@ -499,3 +500,60 @@ def test_vulnerabilitati_fara_rezultate_nu_spune_niciun_serviciu():
     text = ask_mod._r_vuln({"pe_severitate": {}, "kev": 0})
     assert "serviciu" not in text.lower()
     assert "vulnerabilitate" in text.lower()
+
+
+# --- runda 4: plafonul lui `ore` e granița dovedită a rollup-ului, nu 168 ---
+def test_evenimente_fereastra_nu_accepta_peste_48_de_ore():
+    """`event_rollup_1h` e el însuși incomplet pentru zile mai vechi (filigranul
+    din `maintenance_service.py` avansează și nu se mai întoarce — măsurat de
+    operator: 3 956 463 rânduri lipsă doar pe 24 august, ziua potopului
+    udp/514). La 168 de ore, cusătura din runda 3 ar întoarce 2 544 434 în loc
+    de 6 045 192 — operatorul primește 2,5 milioane când adevărul e 6, cu aer
+    de cifră exactă. Numărul e absolut: 48, măsurat de operator ca fiind
+    fereastra până la care rollup-ul chiar e fidel (0 diferență la 25h și 48h).
+    Cine îl urcă înapoi la 168 fără să repare filigranul face asta din nou."""
+    spec = ask_mod.CATALOG["evenimente_fereastra"].params["ore"]
+    assert spec.maximum == 48
+
+    value, error = ask_mod.validate_param("ore", spec, 168)
+    assert value is None and error is not None
+
+
+def test_descrierea_din_catalog_nu_promite_o_fereastra_mai_lunga_de_48h():
+    """Runda 1 a avariei: catalogul promitea modelului o interogare pe care
+    gazda n-o ducea. Aceeași clasă de defect, altă formă — descrierea NU are
+    voie să lase modelul să creadă că poate cere o fereastră mai lungă de 48h."""
+    descriere = ask_mod.CATALOG["evenimente_fereastra"].description
+    assert "48" in descriere
+    assert "168" not in descriere
+
+
+def test_refuzul_pentru_o_fereastra_prea_lunga_spune_de_ce_si_ce_sa_intrebe():
+    """Un „parametru invalid" sec nu-i spune operatorului nimic util. Refuzul
+    trebuie să numească MOTIVUL (rollup incomplet pentru date vechi) și O
+    ALTERNATIVĂ (fereastră mai scurtă, sau întrebări repetate)."""
+    spec = ask_mod.CATALOG["evenimente_fereastra"].params["ore"]
+    _, error = ask_mod.validate_param("ore", spec, 168)
+
+    assert "incomplet" in error.lower()
+    assert "scurt" in error.lower() or "repet" in error.lower()
+
+
+def test_refuzul_de_parametru_ajunge_intreg_pana_la_operator(monkeypatch):
+    """Cablajul cap la cap: `answer_question` nu are voie să scurteze sau să
+    înlocuiască motivul cu unul generic pe drum spre `AskResult`."""
+    async def fake_call_structured(*a, **kw):
+        return Result(ok=True, tool_input={
+            "gasit": True, "intrebare": "evenimente_fereastra", "parametri": {"ore": 168},
+        }, usage=_usage())
+
+    monkeypatch.setattr(ask_mod, "call_structured", fake_call_structured)
+    monkeypatch.setattr(ask_mod.budget, "allowed", _allow)
+    monkeypatch.setattr(ask_mod.budget, "record", _noop_record)
+
+    result = run(ask_mod.answer_question(_NoopDB(), Config(), "sk-test",
+                                         "câte evenimente au fost săptămâna asta?"))
+
+    assert result.ok is False
+    assert "incomplet" in result.text.lower()
+    assert "scurt" in result.text.lower() or "repet" in result.text.lower()
