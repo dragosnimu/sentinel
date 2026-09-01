@@ -193,6 +193,21 @@ def test_is_outbound_does_not_widen_to_unrelated_private_sources():
     assert ct.is_outbound(tup, identity) is False
 
 
+def test_is_outbound_rejects_a_destination_that_is_the_host_itself():
+    """The second line of defence: even if `src` were wrongly considered
+    ours (a subnet-ownership mistake anywhere upstream), a destination that
+    is the host's OWN address can never be a genuine outbound connection.
+    Independent of `HostIdentity.networks` being private-only — this check
+    would still have caught the /21-neighbour false positive on its own."""
+    identity = _identity(ips={_HOST_IP})
+    # Contrive the exact shape of the measured bug directly: something the
+    # identity considers "owned" (the host's own address, standing in for a
+    # source a broken network rule might wrongly own) dialling the host's
+    # own address back.
+    tup = ct.ConnTuple(proto="tcp", src=_HOST_IP, dst=_HOST_IP, sport=1, dport=22)
+    assert ct.is_outbound(tup, identity) is False
+
+
 def test_private_destination_is_not_reported():
     # Postgres on loopback, a docker bridge, an internal sidecar — all
     # host-initiated, none of them "outbound" in the sense that matters here.
@@ -212,13 +227,23 @@ def test_unparseable_destination_is_not_reported():
 # discover_host_identity: never hardcoded, degrades to "cannot tell" on failure
 # ---------------------------------------------------------------------------
 def test_discover_host_identity_reads_all_local_interfaces(monkeypatch):
+    """`eth0` carries the REAL production shape: a /21, not a /32.
+
+    A fixture that gives the public interface a /32 can never expose the
+    neighbour-widening bug — every other test in this file inherited that
+    fixture's shape and none of them could have caught it. The /21 here (and
+    the assertions below) is what makes "but what about the ~2,000 other
+    addresses on that segment?" unavoidable to ask.
+    """
     import socket
     from types import SimpleNamespace as NS
 
     fake = {
         "lo": [NS(family=socket.AF_INET, address="127.0.0.1", netmask="255.0.0.0")],
         "eth0": [
-            NS(family=socket.AF_INET, address=_HOST_IP, netmask="255.255.255.255"),
+            # /21 = 255.255.248.0 — the measured shape of the host's public
+            # interface, NOT a /32. 1.1.1.1/21 -> network 1.1.0.0/21.
+            NS(family=socket.AF_INET, address=_HOST_IP, netmask="255.255.248.0"),
             NS(family=socket.AF_INET6, address="fe80::1%eth0", netmask=None),
             # A MAC address on the same interface must not be treated as an IP.
             NS(family=socket.AF_PACKET if hasattr(socket, "AF_PACKET") else -1,
@@ -233,6 +258,33 @@ def test_discover_host_identity_reads_all_local_interfaces(monkeypatch):
     assert identity.ips == frozenset({"127.0.0.1", _HOST_IP, "fe80::1", "172.20.0.1"})
     # The docker bridge's own subnet must be usable to recognise container egress.
     assert identity.owns(_CONTAINER_IP) is True
+    # The exact host address is still ours...
+    assert identity.owns(_HOST_IP) is True
+    # ...but the /21 around it is the PROVIDER's shared segment, not ours.
+    # A neighbour on it (measured shape: 1.1.0.7, inside 1.1.0.0/21) must NOT
+    # be treated as the host's own — see `HostIdentity`'s docstring for what
+    # widening a public interface's subnet actually produced.
+    assert identity.owns("1.1.0.7") is False
+
+
+def test_discover_host_identity_does_not_widen_a_public_interface_subnet(monkeypatch):
+    """The bug, isolated from the fixture above: given ONLY a public /21
+    interface (no docker bridge in the picture at all), a neighbour on that
+    segment must not be owned, and an inbound scan from that neighbour to
+    the host's own address must not be classified as outbound."""
+    import socket
+    from types import SimpleNamespace as NS
+
+    fake = {"eth0": [NS(family=socket.AF_INET, address=_HOST_IP, netmask="255.255.248.0")]}
+    import psutil
+    monkeypatch.setattr(psutil, "net_if_addrs", lambda: fake)
+
+    identity = ct.discover_host_identity()
+    assert identity.networks == (), "a public interface must contribute no subnet at all"
+
+    neighbour = "1.1.0.7"
+    tup = ct.parse_line(_line("tcp", neighbour, _HOST_IP, 55555, 22))
+    assert ct.is_outbound(tup, identity) is False
 
 
 def test_discover_host_identity_skips_an_unparseable_netmask(monkeypatch):
@@ -403,6 +455,26 @@ def test_sampler_dedups_a_steady_destination_within_the_window(tmp_path, monkeyp
         now += ct.SAMPLE_INTERVAL_S
     # First sample emits; the following 59, all inside DEDUP_WINDOW_S, must not.
     assert total_events == 1
+
+
+def test_dedup_key_distinguishes_destinations_by_port(tmp_path, monkeypatch):
+    """Reproduced during review: reducing the dedup key to `(proto, dst)`,
+    dropping `dport`, left every test in this file green — 69 passed across
+    all four files touching conntrack. Two DIFFERENT services on the same
+    destination address (443 and 8443) are two different destinations for
+    this purpose, and must not suppress each other."""
+    lines = [
+        _line("tcp", _HOST_IP, _PUBLIC_DST, 1, 443),
+        _line("tcp", _HOST_IP, _PUBLIC_DST, 2, 8443),
+    ]
+    s = _sampler(tmp_path, monkeypatch, lines)
+
+    events = s.maybe_sample(now=1000.0)
+
+    ports = sorted(e.dst_port for e in events)
+    assert ports == [443, 8443], (
+        "a dedup key without dport would treat these as the same "
+        "destination and drop one of them")
 
 
 def test_sampler_re_announces_after_the_dedup_window(tmp_path, monkeypatch):

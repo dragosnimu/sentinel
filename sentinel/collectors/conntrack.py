@@ -59,13 +59,21 @@ drops it as "not ours" — exactly the case the module docstring's own honesty
 standard exists to catch: a compromised container phoning home is the literal
 example this detector is for, and it was the one silently missed.
 
-The fix: `HostIdentity` carries the host's own SUBNETS too (built from each
-local interface's own address + netmask), not only its addresses. A Docker
-bridge (`docker0`, `br-xxxx`) is a real local interface with its own subnet,
-so a container's address on it is owned by that subnet the same way the
-host's public address is owned by its own. See `HostIdentity`'s docstring for
-the ASSUMPTION this rests on, stated there because that is where it can go
-wrong.
+The fix: `HostIdentity` carries the host's own PRIVATE subnets too (built
+from each local interface's own address + netmask). A Docker bridge
+(`docker0`, `br-xxxx`) is a real local interface with its own private
+subnet, so a container's address on it is owned by that subnet the same way
+the host's public address is owned by its own.
+
+Widening PUBLIC interface subnets the same way was tried and measured wrong:
+the host's public interface here is a /21, the hosting provider's shared
+segment, not the host's own — widening it made every other customer on that
+segment "ours" and let an inbound scan from one of them pass the direction
+check with the host's own address as the "destination". `networks` therefore
+only ever holds PRIVATE subnets; the host's public address is still covered
+exactly by `ips`, and `is_outbound` separately refuses any destination that
+is itself owned, as a second line of defence. See `HostIdentity`'s docstring
+for the full shape and the ASSUMPTION the private-only rule still rests on.
 
 ## What this catches, and what it cannot
 
@@ -237,18 +245,33 @@ class HostIdentity:
     what this detector is FOR.
 
     `networks` fixes it, built from each local interface's own
-    (address, netmask): a Docker bridge is a real local interface with its
-    own subnet, so a container's address on it is owned the same way the
-    host's public address is owned by its own /32 (or wider) subnet.
+    (address, netmask) — but ONLY when that interface's own address is
+    PRIVATE. A Docker bridge is a real local interface with a private
+    subnet, so a container's address on it is owned the same way. The
+    host's PUBLIC interface is deliberately NOT widened this way: it is
+    covered by its own exact address in `ips`, never by its subnet.
+
+    That distinction is not cosmetic — it is the second bug this class
+    fixes. The public interface's subnet is usually the hosting provider's
+    shared segment, not the host's own: measured directly, `eth0` here is a
+    /21, so widening it the same way as a Docker bridge would have made
+    every one of roughly 2,000 OTHER CUSTOMERS' addresses "ours". An inbound
+    scan from a neighbour on that segment (`src=neighbour`,
+    `dst=this host's own public IP`) would then pass the direction check —
+    the exact 81-vs-5 bug from the top of the module, reborn on a subnet
+    nobody meant to include. `owns()` below also refuses any destination
+    that is itself ours, as a second, independent line of defence: a real
+    outbound connection can never dial the host's own address, whichever
+    check let the source through.
 
     ASSUMPTION, stated here because this is exactly where it can go wrong:
-    every subnet in `networks` is reachable ONLY behind this host's own
-    NAT/forwarding path (a Docker bridge, a VPN concentrator this host runs
-    itself). A host that also ROUTES a foreign network through one of its
-    interfaces — without NAT-ing or owning it — would have that foreign
-    traffic misread as its own. True for a single VPS running Docker
-    containers, the case this was built for and measured against; re-check
-    before reusing this on a host that forwards someone else's LAN.
+    every PRIVATE subnet in `networks` is reachable ONLY behind this host's
+    own NAT/forwarding path (a Docker bridge, a VPN concentrator this host
+    runs itself). A host that also ROUTES a foreign PRIVATE network through
+    one of its interfaces — without NAT-ing or owning it — would have that
+    foreign traffic misread as its own. True for a single VPS running
+    Docker containers, the case this was built for and measured against;
+    re-check before reusing this on a host that forwards someone else's LAN.
 
     IPv6 is exact-address-only: the kernel writes UNABBREVIATED IPv6
     addresses into the table, `psutil` returns the ABBREVIATED form, and a
@@ -276,19 +299,29 @@ class HostIdentity:
 
 def is_outbound(tup: ConnTuple, identity: HostIdentity) -> bool:
     """True only when THIS host (or something it NATs for) dialled a
-    globally-routable destination.
+    globally-routable destination that is NOT itself.
 
-    Both halves matter. Without the direction check, an inbound SSH session
-    counts as an "outbound connection to :22" the moment conntrack's reply
-    tuple is read instead of the original. Without the scope check, every
-    Postgres query on 127.0.0.1 counts as a new "destination" and buries the
-    handful that are real.
+    Three checks, each closing a different way this has actually been wrong:
+    without the direction check, an inbound SSH session counts as an
+    "outbound connection to :22" the moment conntrack's reply tuple is read
+    instead of the original; without the scope check, every Postgres query
+    on 127.0.0.1 counts as a new "destination"; without the destination
+    check, a spoofed or genuinely inbound packet whose source happens to
+    fall inside a subnet `HostIdentity` owns reports the host's OWN address
+    as a newly-contacted destination — see `HostIdentity`'s docstring for
+    the /21-neighbour measurement that produced exactly this shape.
     """
     if not identity.owns(tup.src):
         return False
     try:
         dst = ipaddress.ip_address(tup.dst)
     except ValueError:
+        return False
+    if identity.owns(tup.dst):
+        # A real outbound connection never dials the host's own address.
+        # Independent of whatever let `src` pass above — a subnet-ownership
+        # mistake anywhere upstream should not also need this check to be
+        # the only thing standing between it and a false "new destination".
         return False
     return bool(dst.is_global)
 
@@ -300,13 +333,22 @@ def discover_host_identity() -> HostIdentity:
     addresses (and netmasks) are bound to my interfaces", no network I/O, no
     elevated privilege needed to ask it.
 
-    IPv4 netmasks build `HostIdentity.networks` (this is what makes Docker
-    bridge subnets, and therefore container egress, visible — see
-    `HostIdentity`'s docstring). IPv6 addresses are still collected into
-    `ips` for the exact-address case; their netmasks are not used, since
-    `ipaddress` does not accept the netmask STRING form psutil returns for
-    IPv6 the way it does for IPv4's dotted-decimal form, and this host has
-    nothing in IPv6 to test that conversion against.
+    IPv4 netmasks build `HostIdentity.networks` — but ONLY for an interface
+    whose OWN address is PRIVATE (a Docker bridge, a VPN concentrator this
+    host runs). A PUBLIC interface's subnet is deliberately never widened
+    this way: it is usually the hosting provider's shared segment, not the
+    host's own, and widening it would own every neighbour on it. Measured
+    directly: this host's public interface is a /21, and including it made
+    an inbound scan from another customer on that segment pass the
+    direction check with the host's own address as the "new destination" —
+    see `HostIdentity`'s docstring for the full shape. The host's public
+    address itself is still covered, exactly, by `ips`.
+
+    IPv6 addresses are still collected into `ips` for the exact-address
+    case; their netmasks are not used for `networks`, since `ipaddress`
+    does not accept the netmask STRING form psutil returns for IPv6 the way
+    it does for IPv4's dotted-decimal form, and this host has nothing in
+    IPv6 to test that conversion against.
 
     Returns an identity with an empty `ips` on failure. The caller MUST treat
     that as "cannot tell direction" and stay quiet, never as "the host has no
@@ -320,16 +362,27 @@ def discover_host_identity() -> HostIdentity:
                 if a.family in (socket.AF_INET, socket.AF_INET6):
                     # Strip an IPv6 zone id (fe80::1%eth0) before comparing.
                     ips.add(a.address.split("%", 1)[0])
-                if a.family == socket.AF_INET and a.netmask:
-                    try:
-                        networks.append(ipaddress.ip_network(
-                            f"{a.address}/{a.netmask}", strict=False))
-                    except ValueError:
-                        # An interface psutil cannot describe cleanly (a
-                        # malformed netmask, a point-to-point oddity) is
-                        # skipped, not guessed at — the exact address from
-                        # `ips` above still covers the interface itself.
-                        pass
+                if a.family != socket.AF_INET or not a.netmask:
+                    continue
+                try:
+                    iface_addr = ipaddress.ip_address(a.address)
+                except ValueError:
+                    continue
+                if not iface_addr.is_private:
+                    # The provider's shared public segment (eth0's /21 on
+                    # the host this was measured against) is NOT ours
+                    # beyond this one exact address — widening it would own
+                    # every other customer on the same segment.
+                    continue
+                try:
+                    networks.append(ipaddress.ip_network(
+                        f"{a.address}/{a.netmask}", strict=False))
+                except ValueError:
+                    # An interface psutil cannot describe cleanly (a
+                    # malformed netmask, a point-to-point oddity) is
+                    # skipped, not guessed at — the exact address from
+                    # `ips` above still covers the interface itself.
+                    pass
         return HostIdentity(frozenset(ips), tuple(networks))
     except Exception as exc:  # noqa: BLE001 - discovery failing degrades, never crashes ingest
         log.error(

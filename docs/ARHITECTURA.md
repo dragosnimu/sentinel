@@ -468,6 +468,76 @@ mediul de test nu rulează apt. Forma e fixată din sursa lui apt, iar punctul 3
 de mai sus e ce transformă o presupunere greșită într-un eșec zgomotos în loc de
 o listă mai scurtă.
 
+### 3.18 Al zecelea colector se uită la ce PLEACĂ, nu la ce intră
+
+Toate celelalte nouă mecanisme privesc înăuntru: sshd, nginx, Suricata, auditd.
+Un server deja compromis nu mai generează neapărat niciunul dintre semnalele
+alea a doua oară — sună acasă. `sentinel/collectors/conntrack.py` e singurul
+care poate prinde o compromitere reușită, nu doar o tentativă, citind
+`/proc/net/nf_conntrack` (nu binarul `conntrack`, care nu e instalat) la
+fiecare 60 de secunde, nu la fiecare tur de ingestie.
+
+**Direcția e partea grea, de trei ori.** Conntrack ține tuplul ORIGINAL și
+tuplul de RĂSPUNS pentru fiecare conexiune; un `grep dst=` naiv pe gazda de
+test a găsit 81 de „destinații" în 24h, din care 57 erau SSH-uri PRIMITE,
+citite din tuplul greșit. Discriminatorul — gazda e inițiatoare doar dacă
+`src=` din tuplul ORIGINAL e o adresă a ei — a redus cifra la 5, dar a picat
+de încă două ori înainte să fie corect:
+
+1. **Egresul containerelor era invizibil.** Docker rescrie sursa cu
+   MASQUERADE doar la ieșire; tuplul ORIGINAL păstrat de conntrack e cel
+   DINAINTE de NAT, deci poartă adresa containerului pe bridge (172.x), nu a
+   gazdei. O verificare pe adrese exacte arunca exact cazul pe care
+   detectorul îl caută — un container compromis care sună acasă. Reparat prin
+   `HostIdentity`, care ține și subrețelele private ale gazdei (construite din
+   adresa + masca fiecărei interfețe locale), nu doar adresele ei.
+2. **Lărgirea a înghițit segmentul public.** Aplicat la fel pe interfața
+   publică, `eth0` fiind un `/21` pe gazda măsurată, „subrețeaua proprie" a
+   ajuns să însemne ~2.000 de adrese ale ALTOR clienți de la același
+   furnizor. Un scan SSH primit de la un vecin de pe segment trecea de
+   verificarea de direcție cu adresa publică a gazdei drept „destinație nouă"
+   — capcana de la punctul 1, renăscută pe altă rețea. Reparat prin două căi
+   independente: `networks` ține doar subrețele PRIVATE (interfața publică
+   rămâne acoperită exact de propria adresă, nu de tot segmentul), și
+   `is_outbound` refuză separat orice destinație care e ea însăși a gazdei —
+   o conexiune de ieșire reală nu se sună niciodată pe sine.
+
+Ipoteza care rămâne, scrisă explicit în docstring-ul lui `HostIdentity`: orice
+subrețea privată din `networks` e presupusă accesibilă DOAR prin NAT-ul
+propriu al gazdei (un bridge Docker, un concentrator VPN găzduit local). O
+gazdă care rutează o rețea privată STRĂINĂ printr-o interfață — fără s-o
+stăpânească — ar vedea traficul ăla citit greșit ca al ei. Adevărat pentru un
+VPS singular cu Docker, cazul măsurat; de reverificat înainte de refolosire pe
+o gazdă care rutează LAN-ul altcuiva.
+
+**Volumul e mărginit din două direcții diferite.** Deduplicarea (`DEDUP_WINDOW_S`,
+o oră) mărginește o destinație REPETATĂ — o conexiune stabilă produce un rând
+pe oră, nu unul pe eșantion. Nu mărginește însă un eșantion plin de destinații
+niciodată văzute: un scanner pornit de pe gazdă ar produce mii de destinații
+„noi" într-un singur eșantion, fără plafon. `MAX_NEW_PER_SAMPLE` (50) e
+plafonul absolut pentru cazul ăsta, ales deliberat mare — atingerea lui
+înseamnă un eveniment activ chiar acum, iar rafala e ea însăși parte din
+semnal — și raportat zgomotos de fiecare dată când se declanșează, nu doar la
+prima schimbare de stare, fiindcă „văzut N, păstrat 50" e o informație diferită
+la fiecare eșantion.
+
+**Semnalul principal e noutatea, nu volumul.** O destinație de ieșire
+niciodată contactată e o nouă dimensiune (`outbound_dst`) în motorul deja
+existent din `predict/behaviour.py`; volumul pe oră-din-săptămână e al doilea
+semnal, prin `predict/baseline.py`, dependent de un asset `kind: host` pe
+care operatorul trebuie să-l adauge — până atunci metrica stă tăcută, la fel
+ca oricare alta din listă a cărei asset lipsește.
+
+**Limitele, scrise, nu ascunse.** Eșantionarea o dată pe minut ratează orice
+conexiune care se deschide și se închide între două eșantioane — prinde C2
+persistent și exfiltrare lentă, nu o cerere rapidă. Egresul prin `macvlan`
+sau `ipvlan` (containerul primește o adresă pe LAN-ul fizic, fără nicio
+subrețea de interfață locală care s-o revendice) rămâne invizibil — cazul
+măsurat aici e bridge networking standard. IPv6 e doar pe adresă exactă, nu pe
+subrețea: nucleul scrie adresele IPv6 neabreviat, `psutil` le întoarce
+abreviat, iar o comparație de șiruri n-ar potrivi niciodată aceeași adresă —
+latent pe gazda măsurată (IPv6 dezactivat, zero intrări), nu reparat.
+
 ---
 
 ## 4. Predicția — ce este de fapt
