@@ -103,22 +103,62 @@ def test_a_failed_drill_is_degraded_and_names_the_reason() -> None:
     assert "nicio sursă declarată" in r.detail
 
 
-def test_an_informational_only_point_is_never_reported_as_a_success() -> None:
-    """Chiar constrângerea centrală a Funcționalității 07: un punct doar
-    informativ nu iese `ok` numai fiindcă nimic n-a picat.
+def test_an_informational_only_point_is_neither_a_failure_nor_a_proof() -> None:
+    """«Nimic de dovedit» NU e «a picat» — runda 2 a corectat exact confuzia
+    asta: un punct fără nicio arhivă trece corect prin exercițiu (nimic nu
+    crapă), dar n-are ce extrage, deci n-are cum să producă o dovadă.
+    Etichetat «a picat», ar acuza mecanismul de o limitare a CONȚINUTULUI
+    punctului — operatorul ar citi-o ca pe ceva de reparat prin `journalctl`,
+    când nimic n-a rulat greșit.
 
-    `restore_drill.py` scrie `succeeded=False` pentru punctele numai
-    informative — verificarea de aici trebuie doar să respecte acel boolean,
-    nu să-l reinterpreteze. Falsificat mai jos prin inversarea lui `succeeded`.
+    `ok`, nu `degraded`: nu e un eșec al exercițiului. Dar NU e nici succesul
+    „dovedit restaurabil" — `facts.nothing_to_prove` trebuie să spună asta
+    explicit, ca Funcționalitatea 08 (sau orice alt consumator) să nu
+    confunde „a rulat curat" cu „s-a dovedit că se poate restaura".
     """
     r = run(checks.check_restore_drill(_DB([_point(
         age_days=1.0, succeeded=False,
         notes="punct numai informativ (rpm_state / git_ref) — nimic din el "
               "a fost extras, deci nimic din el a fost dovedit restaurabil",
         result={"informational_only": 1})])))[0]
-    assert r.status != "ok", (
-        "un punct numai informativ a fost raportat ca restaurare reușită")
-    assert "informativ" in r.detail
+    assert r.status == "ok", (
+        f"un punct fără nicio arhivă a ieșit ca {r.status} — n-are ce să fi "
+        f"«picat», exercițiul chiar a rulat corect")
+    assert r.facts.get("nothing_to_prove") is True, (
+        "nimic din fapte nu spune că n-a fost nimic de dovedit, deci un "
+        "consumator ar citi acest «ok» ca pe restaurare dovedită")
+    assert "a picat" not in r.title.lower()
+    assert "a picat" not in r.detail.lower()
+
+
+def test_a_genuine_failure_is_not_softened_by_the_informational_carve_out() -> None:
+    """Reparația de mai sus nu are voie să înmoaie un eșec REAL — o arhivă
+    coruptă tot trebuie să iasă `degraded`, cu «nothing_to_prove» absent.
+
+    Falsificat: dacă `_drill_had_nothing_to_prove` ar întoarce `True` pentru
+    orice `succeeded=False` (nu doar pentru cazul strict informativ), testul
+    ăsta pică — proba directă că cele două cazuri chiar se disting prin
+    conținutul lui `result`, nu doar prin titlu.
+    """
+    r = run(checks.check_restore_drill(_DB([_point(
+        succeeded=False, result={"corrupt": 1},
+        notes="sha256 nu corespunde manifestului — arhiva e coruptă")])))[0]
+    assert r.status == "degraded"
+    assert r.facts.get("nothing_to_prove") is not True
+    assert "a picat" in r.title.lower()
+
+
+def test_a_corrupted_archive_next_to_an_informational_item_still_fails() -> None:
+    """Un punct amestecat — un artefact informativ lângă o arhivă coruptă —
+    tot are ceva real de dovedit, și acel ceva a picat. Prezența artefactului
+    informativ NU are voie să mascheze problema reală de lângă el."""
+    r = run(checks.check_restore_drill(_DB([_point(
+        succeeded=False, result={"informational_only": 1, "corrupt": 1},
+        notes="cel puțin un artefact nu a trecut verificarea: "
+              "etc_nginx.tar.zst: corrupt")])))[0]
+    assert r.status == "degraded", (
+        "artefactul informativ a mascat arhiva coruptă de lângă el")
+    assert r.facts.get("nothing_to_prove") is not True
 
 
 def test_a_stale_successful_drill_is_degraded() -> None:
@@ -162,6 +202,8 @@ def test_no_verdict_from_this_check_is_ever_down() -> None:
         "gol": _DB([]),
         "netestat": _DB([_point(drill=False)]),
         "picat": _DB([_point(succeeded=False, notes="coruptă")]),
+        "nimic de dovedit": _DB([_point(succeeded=False,
+                                        result={"informational_only": 1})]),
         "învechit": _DB([_point(age_days=checks.RESTORE_DRILL_STALE_DAYS + 20,
                                 succeeded=True)]),
         "reușit": _DB([_point(succeeded=True)]),

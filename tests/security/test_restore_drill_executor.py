@@ -6,15 +6,19 @@ and `DRILL_ROOT` monkeypatched onto a pytest `tmp_path`. `hashlib`, `json` and
 plain filesystem operations do not need root, so these are genuine
 falsifications, not source-text assertions dressed up as tests.
 
-What could NOT be exercised for real here: the zstd decompression itself.
-`tar --zstd` shells out to an external `zstd` binary that is not available in
-this sandbox, so the happy path — an archive that extracts cleanly and either
-matches or fails to match its declared sources — is covered by static
-assertions on the source at the bottom of this file instead, matching the
-convention already used for the rest of the root executor in
-`tests/security/test_patch_safety.py`. Said plainly: the "restorable_verified"
-and "structure_mismatch" verdicts have not been proven by running real tar+zstd
-here.
+What could NOT be exercised for real HERE, in this file: `tar --zstd`'s own
+compression, since this sandbox has no standalone `zstd` binary. The
+`restorable_verified` and `structure_mismatch` verdicts — the actual happy
+path this function exists for — ARE proven by real execution, real tar
+create-then-extract, real `--one-top-level`, in
+`tests/security/test_backup_create_path_structure.py`, which substitutes
+`--zstd` for no compression and (only where `--one-top-level` is needed)
+routes through a real GNU tar found on the machine's own PATH — see that
+file's module docstring for exactly what is substituted and why. The
+STATIC assertions at the bottom of this file remain as a second, cheap
+check on the exact source shape (matching the convention used for the rest
+of the root executor in `tests/security/test_patch_safety.py`), not as the
+only proof of the verdicts.
 """
 
 from __future__ import annotations

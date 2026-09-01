@@ -422,8 +422,23 @@ def op_backup_create(args: dict[str, Any]) -> dict[str, Any]:
         if not Path(path).exists():
             return {"ok": False, "error": f"{path} does not exist"}
         artifact = target_dir / (re.sub(r"[^A-Za-z0-9_-]", "_", path.strip("/")) + ".tar.zst")
-        parent, name = str(Path(path).parent), Path(path).name
-        result = _run(["tar", "--zstd", "-cf", str(artifact), "-C", parent, name], timeout=1800)
+        # `-C / <relative path>`, NOT `-C <parent> <basename>`. The member
+        # names stored in the archive must be the FULL path relative to `/`
+        # (e.g. "etc/nginx/nginx.conf"), because restore.sh — and
+        # op_restore_drill_verify — extract with `-C /`. Archiving relative to
+        # the immediate parent instead stores only the basename ("nginx.conf"
+        # or "nginx/..."), which a `-C /` extraction then writes to
+        # `/nginx.conf` or `/nginx/...` — never back to `/etc/nginx/...`.
+        # Found by building the restore drill (Funcționalitatea 07): every
+        # archive it could check came back `structure_mismatch`, and
+        # `tar -tf` on a real archive confirmed the member names were missing
+        # their path prefix. `path.lstrip("/")` is safe here specifically
+        # because `policy.check_path` already rejected anything not starting
+        # with `/`, containing `..`, or containing a null byte — there is no
+        # traversal left to strip.
+        relative = path.lstrip("/")
+        result = _run(["tar", "--zstd", "-cf", str(artifact), "-C", "/", relative],
+                      timeout=1800)
     elif kind == "rpm_state":
         artifact = target_dir / f"rpm-{re.sub(r'[^A-Za-z0-9_.-]', '_', source)}.txt"
         result = _run(["rpm", "-q", "--qf", "%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n", source],

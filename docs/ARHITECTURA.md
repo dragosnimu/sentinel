@@ -555,21 +555,35 @@ face `restore.sh`), sub `--one-top-level`, apoi șterge directorul izolat
 înainte să răspundă — vezi `op_restore_drill_verify`.
 
 **Descoperirea care a rezultat din construirea exercițiului, nu dintr-o
-căutare anume:** arhivele `tar.zst` create de `op_backup_create` sunt
+căutare anume:** arhivele `tar.zst` create de `op_backup_create` erau
 împachetate cu `tar --zstd -cf artefact -C <părinte> <nume-final>` — adică
-membrii arhivei poartă doar ULTIMA componentă a căii (`nginx/...`), nu calea
+membrii arhivei purtau doar ULTIMA componentă a căii (`nginx/...`), nu calea
 întreagă relativă la rădăcină (`etc/nginx/...`). `restore.sh` extrage cu
-`-C /`, deci o restaurare reală ar scrie la `/nginx/...`, nu la `/etc/nginx/...`
-— pentru orice sursă cu mai mult de o componentă sub rădăcină, ceea ce
-înseamnă aproape orice cale reală de backup. Verificat direct, cu `tar` simplu
-(fără zstd) și `tar -tf`: membrii arhivei confirmă exact acest lucru. Exercițiul
-de restaurare prinde asta structural — verdictul `structure_mismatch`, arhivă
-cu checksum bun, extrasă fără eroare, dar care nu reproduce nicio sursă
-declarată la calea ei — fără să presupună dinainte care e defectul. **Nereparat
-aici**: e o constatare pe `executor/commands.py:op_backup_create`, în afara
-sferei Funcționalității 07, și trebuie tratată ca schimbare de comportament pe
-componenta cea mai sensibilă din proiect — cu propria trecere prin cei doi
-agenți, nu ca linie ascunsă într-o schimbare despre altceva.
+`-C /`, deci o restaurare reală ar fi scris la `/nginx/...`, nu la
+`/etc/nginx/...` — pentru orice sursă cu mai mult de o componentă sub
+rădăcină, ceea ce înseamnă aproape orice cale reală de backup. Verificat
+direct, cu `tar` simplu (fără zstd) și `tar -tf`: membrii arhivei confirmau
+exact acest lucru. Exercițiul de restaurare prinde defectul ăsta structural —
+verdictul `structure_mismatch`, arhivă cu checksum bun, extrasă fără eroare,
+dar care nu reproduce nicio sursă declarată la calea ei — fără să presupună
+dinainte care e defectul.
+
+**Reparat**, în aceeași funcționalitate, după ce prima predare l-a lăsat
+descris dar netratat pe motiv de sferă: `op_backup_create` arhivează acum cu
+`tar --zstd -cf artefact -C / <cale-relativă-la-rădăcină>`, deci membrii
+arhivei poartă calea întreagă (`etc/nginx/...`), iar o extragere cu `-C /`
+aterizează exact unde a fost sursa. Motivul răsturnării: pe gazdă existau
+zero arhive `tar.zst` — singurul punct viu era doar informativ — deci fără
+reparație, primul exercițiu ar fi ales acel punct, ar fi ieșit
+`informational_only`, iar orice punct viitor de tip `path` ar fi ieșit
+permanent `structure_mismatch` din cauza unui defect din altă componentă;
+Funcționalitatea 08 nu poate produce nimic din asta. Dovedit prin execuție
+reală de `tar` (creare ȘI extragere, inclusiv `--one-top-level`), nu prin
+aserțiune statică pe forma comenzii — vezi
+`tests/security/test_backup_create_path_structure.py`. Punctele de restaurare
+EXISTENTE, arhivate în formatul vechi, rămân corect `structure_mismatch` —
+chiar nu se pot restaura, iar exercițiul n-are voie să le trateze retroactiv
+ca valide.
 
 **Ce compară exercițiul, și de ce e suficient:** checksum-ul recalculat de pe
 disc (nu cel ținut minte din baza de date) pentru fiecare artefact, plus —
@@ -585,6 +599,18 @@ scris de timer) și `restore_drill_items`, un rând pe artefact — separarea
 există ca Funcționalitatea 08 să poată întreba „s-a dovedit vreodată că
 punctul ăsta, sau felul ăsta de artefact, se poate întoarce?" fără să
 moștenească ambiguitatea dintre „informativ" și „restaurat".
+
+**„Nimic de dovedit" nu e „a picat", și verificarea de sănătate le desparte.**
+Prima predare a acestei funcționalități le amestecase: un punct numai
+informativ ieșea `degraded`, titlu „Exercițiul de restaurare a picat" — deși
+exercițiul rulase corect, doar n-avea nicio arhivă de extras. `check_restore_drill`
+raportează acum acest caz `ok`, cu titlu propriu și `facts.nothing_to_prove =
+true`, ca să nu fie confundat nici cu eșecul real (checksum greșit, arhivă
+coruptă, `structure_mismatch` pe o arhivă care CHIAR exista), nici cu succesul
+dovedit prin extragere. Un punct amestecat — artefact informativ lângă o
+arhivă coruptă — tot iese eșec real: prezența informativului nu maschează
+problema de lângă el. Vezi `_drill_had_nothing_to_prove` în
+`sentinel/selfcheck/checks.py`.
 
 ---
 

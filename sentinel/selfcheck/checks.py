@@ -2684,26 +2684,57 @@ async def check_last_scan(db: Database, cfg: Config) -> list[CheckResult]:
 RESTORE_DRILL_STALE_DAYS = 45
 
 
+def _drill_had_nothing_to_prove(counts: dict) -> bool:
+    """Un punct fără nicio arhivă în el nu are ce extrage — deci exercițiul,
+    rulat corect, n-are cum să iasă cu o dovadă. Adevărat doar când NIMIC din
+    ce s-a văzut nu era măcar CANDIDAT la o dovadă (`restorable_verified`,
+    `corrupt` sau `structure_mismatch` — toate trei presupun o arhivă reală,
+    reușită sau nu). Un punct amestecat, cu o arhivă coruptă lângă un artefact
+    informativ, tot are ce dovedi — și tot a eșuat la asta — deci NU intră
+    aici; `corrupt`/`structure_mismatch` fiind prezente îl trimit direct la
+    ramura de eșec real."""
+    provable_attempted = any(
+        counts.get(k, 0) for k in
+        ("restorable_verified", "corrupt", "structure_mismatch"))
+    return not provable_attempted and bool(counts.get("informational_only", 0))
+
+
 async def check_restore_drill(db: Database) -> list[CheckResult]:
     """Fiecare punct de restaurare VIU a fost dovedit — sau nu — prin
     exercițiul lunar izolat, și proaspăt.
 
-    Trei stări diferite, și niciuna nu se lasă citită ca „e bine" în locul
+    Runda a doua a corectat o confuzie din prima: „nimic de dovedit" NU e
+    „a picat", și înainte erau amestecate sub același titlu, „Exercițiul de
+    restaurare a picat". Un punct format DOAR din artefacte informative
+    (`rpm_state`, `git_ref`, fără nicio arhivă `tar.zst`) trece corect prin
+    exercițiu — checksum-urile se verifică, nimic nu crapă — dar n-are ce
+    extrage, deci n-are cum să producă o dovadă. Titlul de „eșec" ar fi
+    acuzat mecanismul de o limitare a CONȚINUTULUI punctului, iar operatorul
+    ar fi citit-o ca pe ceva de reparat prin `journalctl` — nimic n-a rulat
+    greșit acolo.
+
+    Patru stări diferite, și niciuna nu se lasă citită ca „e bine" în locul
     alteia:
 
       * `unknown` — punctul există, dar exercițiul n-a rulat NICIODATĂ pentru
         el. Nu e „fine": e chiar starea măsurată pe gazdă pe 1 septembrie 2026,
         „restaurari incercate vreodata: ZERO", și motivul pentru care
         funcționalitatea asta există.
+      * `ok`, titlu „nimic de dovedit" — a rulat, dar punctul nu conține nicio
+        arhivă. Nu e succes ÎN SENSUL restaurabilității (Funcționalitatea 08
+        NU va trata punctul ăsta ca dovedit), dar nici eșec al exercițiului —
+        de-aia `ok`, nu `degraded`, și de-aia titlul propriu, ca să nu fie
+        confundat nici cu „a picat", nici cu „dovedit restaurabil".
+        `facts.nothing_to_prove` e `True` explicit, pentru orice consumator
+        care vrea să deosebească asta de succesul real.
       * `degraded` — a rulat, dar fie e prea vechi (timer-ul nu mai
-        funcționează la timp), fie a rulat și a găsit o problemă reală:
-        checksum greșit, arhivă coruptă, sau — cazul cel mai important —
-        arhiva se extrage curat și tot nu reface sursele declarate
-        (`structure_mismatch`). Un punct NUMAI informativ (`rpm_state`,
-        `git_ref`, fără nicio arhivă) intră tot aici: n-a dovedit nimic prin
-        extragere, deci nu iese `ok` doar fiindcă n-a picat nimic.
-      * `ok` — a rulat de curând și a dovedit prin extragere izolată, checksum
-        și potrivire de căi că cel puțin o arhivă chiar se reface.
+        funcționează la timp), fie a rulat și a găsit o problemă reală, pe
+        ceva ce CHIAR era o arhivă: checksum greșit, arhivă coruptă, sau —
+        cazul cel mai important — arhiva se extrage curat și tot nu reface
+        sursele declarate (`structure_mismatch`).
+      * `ok`, fără titlu special — a rulat de curând și a dovedit prin
+        extragere izolată, checksum și potrivire de căi că cel puțin o
+        arhivă chiar se reface.
 
     O gazdă fără niciun punct de restaurare încă (instalare proaspătă, nimic
     de patch-uit) e `ok`, la fel ca `scan:last` cu `scan.enabled: false` —
@@ -2756,6 +2787,28 @@ async def check_restore_drill(db: Database) -> list[CheckResult]:
             continue
 
         if not p.get("succeeded"):
+            counts = p.get("result") or {}
+            if _drill_had_nothing_to_prove(counts):
+                # „Nimic de dovedit" NU e „a picat": nimic din punctul ăsta a
+                # fost vreodată o arhivă, deci exercițiul n-a avut ce extrage.
+                # `restore.sh` însuși nu restaurează un `rpm_state`/`git_ref`
+                # — doar îl numește. Titlul care spune „a picat" ar acuza
+                # mecanismul de o limitare a CONȚINUTULUI punctului, iar
+                # operatorul l-ar citi ca pe ceva stricat de reparat prin
+                # `journalctl`, când de fapt nimic n-a rulat greșit.
+                results.append(CheckResult(
+                    key, f"Punct doar informativ — nimic de dovedit — {label}", "ok",
+                    detail=f"ultima rulare, acum {_ago(age_min)}: {p.get('notes')} — "
+                           f"exercițiul a rulat corect; punctul nu conține nicio "
+                           f"arhivă, deci nimic din el NU poate fi dovedit restaurabil "
+                           f"prin extragere. Nu e un eșec al exercițiului",
+                    action="Adaugă un artefact `path` (fișiere reale) la planul de "
+                           "backup pentru acest activ, dacă vrei o dovadă de "
+                           "restaurare — un `rpm_state`/`git_ref` nu poate produce una",
+                    facts={"restore_point_id": p["id"], "drill_id": p.get("drill_id"),
+                           "result": counts, "nothing_to_prove": True}))
+                continue
+
             results.append(CheckResult(
                 key, f"Exercițiul de restaurare a picat — {label}", "degraded",
                 detail=f"ultima rulare, acum {_ago(age_min)}: "
@@ -2765,7 +2818,7 @@ async def check_restore_drill(db: Database) -> list[CheckResult]:
                        "scripts/sentinel_query.py restore_drill_items "
                        f"--param drill_id={p.get('drill_id')} --format table",
                 facts={"restore_point_id": p["id"], "drill_id": p.get("drill_id"),
-                       "result": p.get("result")}))
+                       "result": counts}))
             continue
 
         results.append(CheckResult(
