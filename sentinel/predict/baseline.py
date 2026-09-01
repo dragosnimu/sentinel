@@ -54,6 +54,14 @@ class Metric:
 METRICS: tuple[Metric, ...] = (
     Metric("requests_per_min", "nginx", None, "nginx"),
     Metric("failed_auth_per_min", "sshd", "auth_fail", "sshd"),
+    # F04, secondary signal (novelty is primary — see
+    # `predict/behaviour.py`'s `outbound_dst` dimension). Needs an asset named
+    # "host" (`kind: host`) added to inventory.yaml by the operator; none is
+    # seeded by default (see `tests/unit/test_inventory_examples.py`), so
+    # until it exists this metric is silently skipped by `_asset_id` below —
+    # the same degradation every other metric here already has if its asset
+    # is missing, not a new failure mode.
+    Metric("outbound_connections_per_min", "conntrack", "connect", "host"),
 )
 
 

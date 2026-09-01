@@ -56,3 +56,15 @@ def test_severity_for_z_bands():
     assert _severity_for_z(3.5) == "medium"
     assert _severity_for_z(5.0) == "high"
     assert _severity_for_z(9.0) == "critical"
+
+
+# --- F04: outbound-volume metric wired into the existing engine ------------
+def test_outbound_metric_is_registered_on_the_conntrack_source():
+    """`detect/rules.volume_anomaly` iterates `bl.METRICS` generically — if
+    this metric isn't in the tuple, F04's volume signal silently never runs,
+    with no error anywhere to say so."""
+    names = {m.name: m for m in bl.METRICS}
+    assert "outbound_connections_per_min" in names
+    metric = names["outbound_connections_per_min"]
+    assert metric.source == "conntrack"
+    assert metric.action == "connect"

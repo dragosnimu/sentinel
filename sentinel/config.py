@@ -108,10 +108,18 @@ class IngestConfig:
     # collection is tracked as a known gap; auditd covers part of the FIM ground.
     docker: bool = False
     fim: bool = False
+    # Outbound-traffic sampling (F04). Reads /proc/net/nf_conntrack, which needs
+    # either root or a capability that bypasses its file mode — see
+    # `collectors/conntrack.py`'s module docstring. Left on by default like the
+    # other real collectors above: if the process cannot read the file it
+    # degrades loudly (a WARNING on the state change), it does not pretend the
+    # host has no outbound traffic.
+    conntrack: bool = True
     nginx_log_paths: list[str] = field(
         default_factory=lambda: ["/var/log/nginx/*access*.log"]
     )
     auditd_log_path: str = "/var/log/audit/audit.log"
+    conntrack_path: str = "/proc/net/nf_conntrack"
     # Sources that produce high volume with no security value on this host —
     # a chatty application log, a telemetry feed. Matched against the event
     # `source` field and dropped before they reach the database.

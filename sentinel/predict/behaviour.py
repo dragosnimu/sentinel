@@ -14,6 +14,7 @@ răspuns, iar o compromitere îl schimbă:
     sudo_user          cine folosește privilegii
     exec_binary        ce se execută sub supraveghere
     webroot_writer     ce proces scrie în conținutul servit
+    outbound_dst       ce destinație de ieșire contactează gazda (F04)
 
 Nu sunt alese ca să acopere tot, ci ca să fie STABILE. O dimensiune care se
 schimbă legitim în fiecare zi nu poate produce niciodată o alertă utilă: fie
@@ -117,6 +118,21 @@ DIMENSIONS: tuple[Dimension, ...] = (
         novel_title="Proces nou care scrie în conținutul servit",
         severity="high",
         min_observations=10),
+    # F04: o destinație de ieșire pe care gazda n-a mai contactat-o niciodată.
+    # Semnalul principal al colectorului conntrack — vezi
+    # `collectors/conntrack.py` pentru ce prinde (C2 persistent, exfiltrare
+    # lentă) și ce ratează (o conexiune scurtă între două eșantioane).
+    #
+    # Volum mult sub cel al logărilor SSH — eșantionare o dată pe minut, cu
+    # deduplicare pe oră, nu jurnal complet — deci pragul de încălzire e cel
+    # folosit și pentru `exec_binary`/`webroot_writer`, dimensiuni la fel de
+    # rare, nu cel implicit de 40 gândit pentru autentificări.
+    Dimension(
+        "outbound_dst", "conntrack", "connect", lambda r: _s(r["dst_ip"]),
+        label="destinație de ieșire contactată de gazdă",
+        novel_title="Conexiune de ieșire către o destinație nouă",
+        severity="high",
+        min_observations=15),
 )
 
 BY_NAME = {d.name: d for d in DIMENSIONS}
@@ -139,7 +155,7 @@ async def observe(db: Database, cursor: int) -> dict[str, dict[str, int]]:
     for dim in DIMENSIONS:
         rows = await db.fetch(
             """
-            SELECT id, username, process, geo_asn, geo_country, ts
+            SELECT id, username, process, geo_asn, geo_country, dst_ip, ts
             FROM raw_events
             WHERE id > $1 AND source = $2 AND action = $3
             ORDER BY id

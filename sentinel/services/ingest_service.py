@@ -9,7 +9,11 @@ Sources in this build:
   * journald — sshd/sshd-session (authentication) and sudo/su (privilege use);
   * nginx access logs (tailed, inode-aware);
   * Suricata eve.json (alerts only, engine diagnostics dropped);
-  * auditd audit.log (security record types only).
+  * auditd audit.log (security record types only);
+  * conntrack — periodic outbound-traffic sampling, not a log tail. See
+    `sentinel/collectors/conntrack.py`'s module docstring for what it catches
+    (persistent C2, slow exfiltration) and what it cannot (a connection that
+    opens and closes between two one-minute samples).
 
 Not yet collected, and deliberately marked false in config rather than claimed:
 docker container logs and standalone file-integrity monitoring.
@@ -32,6 +36,7 @@ from pathlib import Path
 
 from sentinel.collectors import nginx_tail
 from sentinel.collectors.auditd import parse_auditd_lines
+from sentinel.collectors.conntrack import ConntrackSampler
 from sentinel.collectors.nginx import parse_nginx
 from sentinel.collectors.sshd import parse_sshd
 from sentinel.collectors.suricata_eve import parse_suricata
@@ -99,6 +104,7 @@ class Ingest:
         self._eve_cursor: str | None = None
         self._audit_path: str | None = None
         self._audit_cursor: str | None = None
+        self._conntrack: ConntrackSampler | None = None
 
     async def setup(self) -> None:
         if self.cfg.ingest.journald:
@@ -135,6 +141,14 @@ class Ingest:
                 log.info("auditd tailer ready", extra={"path": path})
             else:
                 log.warning("auditd enabled but log absent", extra={"path": path})
+
+        if self.cfg.ingest.conntrack:
+            # No cursor: each sample is a self-contained snapshot of the
+            # kernel's current connection table, not a position in a log —
+            # there is nothing to resume from after a restart, and none is
+            # needed. `ConntrackSampler` owns its own cadence internally.
+            self._conntrack = ConntrackSampler(self.cfg.ingest.conntrack_path)
+            log.info("conntrack sampler ready", extra={"path": self.cfg.ingest.conntrack_path})
 
         if self.geo.available:
             log.info("geoip enrichment active")
@@ -185,6 +199,11 @@ class Ingest:
             # linii care împart un serial, iar cine, ce binar și pe ce fișier
             # sunt împrăștiate între ele.
             batch.extend(parse_auditd_lines(lines))
+
+        if self._conntrack is not None:
+            # A no-op call, no file I/O, unless its own (much slower) sample
+            # interval has elapsed — see the docstring on `maybe_sample`.
+            batch.extend(self._conntrack.maybe_sample())
 
         batch = [e for e in batch if e.source not in self.exclude]
         # Reload check first: a no-op unless the interval elapsed, so this

@@ -150,3 +150,6 @@ def test_config_does_not_claim_unimplemented_collectors():
     assert c.docker is False
     assert c.fim is False
     assert c.auditd is True and c.journald is True
+    # F04: a real collector exists (sentinel/collectors/conntrack.py), so this
+    # one earns the default the docker/fim ones above are denied.
+    assert c.conntrack is True
