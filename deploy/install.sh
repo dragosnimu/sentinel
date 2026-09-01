@@ -2116,7 +2116,7 @@ step_start_services() {
 
     for unit in sentinel-health.timer sentinel-maintenance.timer \
                 sentinel-watchdog.timer sentinel-selfcheck.timer \
-                sentinel-reconcile.timer; do
+                sentinel-reconcile.timer sentinel-restore-drill.timer; do
         [[ -f "/etc/systemd/system/${unit}" ]] && systemctl enable --now "$unit" >/dev/null 2>&1 \
             && ok "${unit} enabled"
     done

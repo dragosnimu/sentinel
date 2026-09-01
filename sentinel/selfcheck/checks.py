@@ -174,7 +174,7 @@ async def check_timers(cfg: Config) -> list[CheckResult]:
     results: list[CheckResult] = []
     for unit in ("sentinel-scan.timer", "sentinel-health.timer",
                  "sentinel-maintenance.timer", "sentinel-watchdog.timer",
-                 "sentinel-selfcheck.timer"):
+                 "sentinel-selfcheck.timer", "sentinel-restore-drill.timer"):
         state = await asyncio.to_thread(_systemctl, "is-active", unit)
         if not state:
             # An empty answer means `systemctl` is missing, errored, or timed
@@ -2670,6 +2670,113 @@ async def check_last_scan(db: Database, cfg: Config) -> list[CheckResult]:
 
 
 # ---------------------------------------------------------------------------
+# Exercițiul de restaurare (Funcționalitatea 07): un backup pe care nimeni nu
+# l-a restaurat nu e un backup — e o ipoteză. `verified_at` pe `restore_points`
+# confirmă doar că fișierul tocmai scris se poate citi înapoi ÎN ACEEAȘI
+# SECUNDĂ; nu spune nimic despre luna viitoare. Verificarea de aici citește
+# `restore_drills`/`restore_drill_items`, scrise de
+# `sentinel/patch/restore_drill.py` prin `sentinel-restore-drill.timer`.
+#
+# Cât poate îmbătrâni ultimul exercițiu reușit înainte ca panoul s-o spună.
+# ~1,5 cicluri lunare: destul cât `RandomizedDelaySec` și o rulare recuperată
+# la boot (`Persistent=true` pe timer) să nu declanșeze fals, dar nu atât cât
+# un timer oprit de-a binelea să treacă neobservat un sezon întreg.
+RESTORE_DRILL_STALE_DAYS = 45
+
+
+async def check_restore_drill(db: Database) -> list[CheckResult]:
+    """Fiecare punct de restaurare VIU a fost dovedit — sau nu — prin
+    exercițiul lunar izolat, și proaspăt.
+
+    Trei stări diferite, și niciuna nu se lasă citită ca „e bine" în locul
+    alteia:
+
+      * `unknown` — punctul există, dar exercițiul n-a rulat NICIODATĂ pentru
+        el. Nu e „fine": e chiar starea măsurată pe gazdă pe 1 septembrie 2026,
+        „restaurari incercate vreodata: ZERO", și motivul pentru care
+        funcționalitatea asta există.
+      * `degraded` — a rulat, dar fie e prea vechi (timer-ul nu mai
+        funcționează la timp), fie a rulat și a găsit o problemă reală:
+        checksum greșit, arhivă coruptă, sau — cazul cel mai important —
+        arhiva se extrage curat și tot nu reface sursele declarate
+        (`structure_mismatch`). Un punct NUMAI informativ (`rpm_state`,
+        `git_ref`, fără nicio arhivă) intră tot aici: n-a dovedit nimic prin
+        extragere, deci nu iese `ok` doar fiindcă n-a picat nimic.
+      * `ok` — a rulat de curând și a dovedit prin extragere izolată, checksum
+        și potrivire de căi că cel puțin o arhivă chiar se reface.
+
+    O gazdă fără niciun punct de restaurare încă (instalare proaspătă, nimic
+    de patch-uit) e `ok`, la fel ca `scan:last` cu `scan.enabled: false` —
+    e o stare validă, nu o măsurătoare lipsă.
+    """
+    from sentinel.db.repo import patches as patch_repo
+
+    points = await patch_repo.live_restore_points_with_last_drill(db)
+    if not points:
+        return [CheckResult(
+            "restore_drill:any", "Exercițiul de restaurare", "ok",
+            detail="niciun punct de restaurare pe gazdă — nimic de testat încă",
+            facts={"points": 0})]
+
+    results: list[CheckResult] = []
+    for p in points:
+        label = p.get("asset_name") or f"punct {p['id']}"
+        key = f"restore_drill:{p['id']}"
+
+        if p.get("drill_id") is None:
+            results.append(CheckResult(
+                key, f"Restaurare netestată — {label}", "unknown",
+                detail="niciun exercițiu automat rulat încă pentru acest punct de "
+                       "restaurare — «are un backup» și «se poate restaura» nu sunt "
+                       "același fapt",
+                action="systemctl start sentinel-restore-drill ; "
+                       "journalctl -u sentinel-restore-drill -n 50",
+                facts={"restore_point_id": p["id"], "asset": label}))
+            continue
+
+        age_min = p.get("drill_age_min")
+        if age_min is None:
+            results.append(CheckResult(
+                key, f"Exercițiu de restaurare — nu-i pot afla vârsta — {label}", "unknown",
+                detail="există un rând de exercițiu, dar vârsta lui nu s-a putut citi",
+                action="journalctl -u sentinel-restore-drill -n 50",
+                facts={"restore_point_id": p["id"]}))
+            continue
+        age_min = float(age_min)
+
+        if age_min > RESTORE_DRILL_STALE_DAYS * 24 * 60:
+            results.append(CheckResult(
+                key, f"Exercițiu de restaurare învechit — {label}", "degraded",
+                detail=f"ultimul a rulat acum {_ago(age_min)}, mai vechi de "
+                       f"{RESTORE_DRILL_STALE_DAYS} zile — sentinel-restore-drill.timer "
+                       f"nu mai rulează la timp",
+                action="systemctl list-timers sentinel-restore-drill.timer ; "
+                       "journalctl -u sentinel-restore-drill -n 50",
+                facts={"restore_point_id": p["id"], "age_days": int(age_min / 60 / 24)}))
+            continue
+
+        if not p.get("succeeded"):
+            results.append(CheckResult(
+                key, f"Exercițiul de restaurare a picat — {label}", "degraded",
+                detail=f"ultima rulare, acum {_ago(age_min)}: "
+                       f"{p.get('notes') or 'a eșuat'}",
+                action="sudo /opt/sentinel/venv/bin/python "
+                       "/opt/sentinel/claude-workspace/.claude/skills/sentinel-soc/"
+                       "scripts/sentinel_query.py restore_drill_items "
+                       f"--param drill_id={p.get('drill_id')} --format table",
+                facts={"restore_point_id": p["id"], "drill_id": p.get("drill_id"),
+                       "result": p.get("result")}))
+            continue
+
+        results.append(CheckResult(
+            key, f"Exercițiu de restaurare — {label}", "ok",
+            detail=f"ultima rulare, acum {_ago(age_min)}: {p.get('notes') or 'reușit'}",
+            facts={"restore_point_id": p["id"], "drill_id": p.get("drill_id"),
+                   "result": p.get("result")}))
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Feed-uri de reputație: întrerupătorul de circuit din 0006 nu e vizibil dacă
 # nimeni nu-l citește altundeva decât în `intel_feeds.last_error`.
 # ---------------------------------------------------------------------------
@@ -3330,6 +3437,7 @@ CHECKS: tuple[tuple[str, Callable], ...] = (
     ("code", check_running_code_is_current),
     ("ship", check_ship_lag),
     ("scan", check_last_scan),
+    ("restore_drill", check_restore_drill),
     ("reputation", check_reputation_feeds),
     ("inventory", check_inventory),
     ("audit", check_audit_records),

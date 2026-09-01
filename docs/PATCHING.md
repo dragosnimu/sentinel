@@ -144,6 +144,30 @@ INSERT INTO restore_drills (restore_point_id, performed_by, succeeded, notes)
 VALUES (<id>, 'operator', true, 'test trimestrial');
 ```
 
+Rândul de mai sus are `automated = false` (implicit) — vezi §6b pentru rândurile
+scrise automat, care nu trebuie amestecate cu astea.
+
+---
+
+## 6b. Exercițiul lunar, automat
+
+Pe lângă testul trimestrial de mai sus, `sentinel-restore-drill.timer` rulează
+lunar, singur, fără operator: alege un punct de restaurare (cel niciodată
+testat, sau cel mai vechi testat), cere executorului să-i extragă arhivele
+într-un director IZOLAT — niciodată `/`, niciodată producție — și verifică
+checksum-urile plus faptul că arborele extras chiar conține sursele declarate.
+Rezultatul intră în `restore_drills` (`automated = true`) și
+`restore_drill_items`, câte un rând pe artefact, și ajunge în `/selfcheck`
+prin `check_restore_drill`.
+
+**Dovedește mai puțin decât testul trimestrial** — checksum și structură de
+arhivă, nu că serviciul chiar pornește pe fișierele restaurate — dar rulează
+în fiecare lună, nu o dată la trei. Un punct numai cu artefacte informative
+(`rpm_state`, `git_ref`, fără nicio arhivă `tar.zst`) nu poate ieși niciodată
+„reușit": nimic din el a fost extras, deci nimic din el a fost dovedit. Vezi
+docstring-ul lui `sentinel/patch/restore_drill.py` și
+`executor/commands.py:op_restore_drill_verify` pentru mecanism.
+
 ---
 
 ## 7. Când un patch eșuează

@@ -1,0 +1,19 @@
+[Unit]
+Description=Monthly Sentinel restore drill
+
+[Timer]
+# Once a month is the cadence asked for. Inside the same maintenance window as
+# the vulnerability scan (03:00-05:00) but offset from it, so the two heavier
+# jobs on the host do not start at the same instant.
+OnCalendar=*-*-01 04:20:00
+RandomizedDelaySec=1800
+AccuracySec=60
+# Unlike sentinel-selfcheck.timer: a drill skipped because the host was off on
+# the 1st is not "observe the present a minute later", it is a whole month
+# with nothing proven. Persistent means a missed run fires at the next boot
+# instead of waiting for the 1st of the following month.
+Persistent=true
+Unit=sentinel-restore-drill.service
+
+[Install]
+WantedBy=timers.target

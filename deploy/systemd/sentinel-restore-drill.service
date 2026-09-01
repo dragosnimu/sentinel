@@ -1,0 +1,74 @@
+[Unit]
+# The monthly restore drill (Funcționalitatea 07): picks one restore point,
+# asks the executor to extract its archives into an ISOLATED, disposable
+# directory — never a real path — verify checksums and confirm the extracted
+# tree actually contains the declared sources, then records the verdict.
+#
+# This unit itself never touches `/var/backups/sentinel`: that directory is
+# `0700 root:root`, so extraction and checksum re-verification happen inside
+# sentinel-executor.service, the one root component. This unit only talks to
+# PostgreSQL and to the executor's unix socket.
+Description=Sentinel monthly restore drill
+Documentation=file:/opt/sentinel/lib/sentinel/patch/restore_drill.py
+After=network-online.target postgresql.service sentinel-executor.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=oneshot
+User=sentinel
+Group=sentinel
+WorkingDirectory=/opt/sentinel
+ExecStart=/opt/sentinel/bin/sentinel restoredrill
+# A restore point can carry more than one archive, each extracted with its own
+# 300s ceiling inside the executor (op_restore_drill_verify). Generous on
+# purpose: this is a slow, occasional job with no latency requirement, and a
+# unit killed mid-extraction is worse than one that finishes late.
+TimeoutStartSec=1200
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/sentinel/lib
+
+Nice=15
+IOSchedulingClass=idle
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @mount @debug @swap @reboot @raw-io @obsolete
+CapabilityBoundingSet=
+
+# Namespaces, realtime scheduling and a restrictive umask. This unit has no
+# use for either, and each denied is a step removed from a bug here becoming
+# something worse.
+RestrictNamespaces=yes
+RestrictRealtime=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+MemoryDenyWriteExecute=true
+UMask=0077
+
+# No ReadWritePaths at all: this unit writes nothing to the filesystem
+# directly. Every filesystem operation the drill performs — reading the
+# backup archives, extracting them, deleting the scratch copy — happens
+# inside sentinel-executor.service, over the unix socket below.
+ReadOnlyPaths=/etc/sentinel
+
+# The executor socket and PostgreSQL, nothing else.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+MemoryMax=256M
+TasksMax=64
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-restoredrill

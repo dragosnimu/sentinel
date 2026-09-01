@@ -69,6 +69,17 @@ TABLE = "inet sentinel"
 BACKUP_ROOT = Path("/var/backups/sentinel")
 MAX_OUTPUT_BYTES = 64 * 1024
 
+# Where the monthly restore drill extracts archives. A direct child of
+# BACKUP_ROOT, never `/`: a real restore targets `/`, this never does. See
+# op_restore_drill_verify.
+DRILL_ROOT = BACKUP_ROOT / ".restore-drill"
+
+# Extracting a compressed archive can expand well past its own size on disk,
+# and by an unknown ratio — unlike DEFAULT_SPACE_MULTIPLIER in backup.py, which
+# only has to cover the SOURCE size at creation time. Generous on purpose:
+# refusing to extract beats discovering a full disk mid-drill.
+DRILL_SPACE_MULTIPLIER = 5
+
 # Redacted from captured output before it is returned, logged or stored. Better
 # to over-redact a log line than to let a token reach the database and from
 # there a Telegram message.
@@ -607,6 +618,166 @@ def op_backup_restore(args: dict[str, Any]) -> dict[str, Any]:
     return {"ok": result["exit_code"] == 0, "artifact": artifact, **result}
 
 
+def _reset_drill_root() -> None:
+    """Wipe and recreate DRILL_ROOT. Called before AND after every drill, so a
+    process killed mid-extraction never leaves the previous run's files behind
+    for the next one to trip over."""
+    if DRILL_ROOT.exists():
+        shutil.rmtree(DRILL_ROOT, ignore_errors=True)
+    DRILL_ROOT.mkdir(parents=True, exist_ok=True)
+    os.chmod(DRILL_ROOT, 0o700)
+
+
+def op_restore_drill_verify(args: dict[str, Any]) -> dict[str, Any]:
+    """Prove — or disprove — that a restore point actually restores, WITHOUT
+    ever touching a real path. Runs monthly, unattended, from
+    `sentinel/patch/restore_drill.py`.
+
+    Three things make this safe to run unattended on a live host:
+
+      1. Every archive is extracted under DRILL_ROOT, a directory this function
+         owns and rebuilds on every call. `restore.sh` extracts to `/` because
+         a real restore's whole job is to land on the real paths; this
+         function's job is the opposite, so it never passes `-C /` to tar.
+      2. `--one-top-level` is passed even though these archives are Sentinel's
+         own, not attacker input: it makes containment structural rather than
+         a property of what happens to be inside the archive, so a corrupted
+         or unexpectedly-shaped member still cannot land outside the drill
+         directory. (Whether the tar version on a given host actually enforces
+         this as documented has not been verified against a real host from
+         here — see the caller's docstring.)
+      3. Every checksum is RECOMPUTED from the artifact on disk right now,
+         exactly like op_backup_finalize — a manifest that says "sha256
+         matched at sealing time" is not proof it still does. `manifest.json`
+         is re-read from disk for the item list too, never trusted from the
+         caller: the caller cannot make this function believe an artifact
+         exists, or that it hashes to something it does not.
+
+    `sources` — the absolute paths the plan declared it was backing up — is
+    the one thing that DOES come from the caller, because it lives only in the
+    database-side manifest (`restore_points.manifest`); `manifest.json` on
+    disk never carried it (see op_backup_finalize). Each entry is re-checked
+    through `policy.check_path` before use: a bad string in that list is
+    excluded from the drill rather than trusted, and does not abort the run.
+
+    A restore point that is entirely `rpm_state`/`git_ref` records (no
+    archives at all) produces only `informational_only` verdicts, never
+    `restorable_verified` — nothing in it was ever extracted, so nothing was
+    ever proven to restore. The caller must not read that as success.
+    """
+    import hashlib
+
+    restore_point = re.sub(r"[^A-Za-z0-9_-]", "", str(args.get("restore_point_id", "")))[:64]
+    if not restore_point:
+        raise PolicyRefusal("restore_point_id is required")
+
+    raw_sources = args.get("sources") or []
+    if not isinstance(raw_sources, list):
+        raise PolicyRefusal("sources must be a list of strings")
+    sources: list[str] = []
+    for s in raw_sources:
+        try:
+            sources.append(policy.check_path(str(s), purpose="check against the restore drill"))
+        except PolicyRefusal:
+            continue  # excluded from matching below, not fatal to the drill
+
+    target_dir = BACKUP_ROOT / restore_point
+    if not target_dir.is_dir():
+        return {"ok": False,
+                "error": f"restore point {restore_point} does not exist on disk"}
+
+    try:
+        manifest = json.loads((target_dir / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"ok": False, "error": f"manifest.json unreadable: {exc}"}
+    items = manifest.get("items") or []
+    if not items:
+        return {"ok": False, "error": "manifest has no items"}
+
+    _reset_drill_root()
+    try:
+        results: list[dict[str, Any]] = []
+        for idx, item in enumerate(items):
+            name = str(item.get("artifact", ""))
+            is_archive = bool(item.get("is_archive"))
+            expected_sha = str(item.get("sha256", ""))
+            artifact = target_dir / name
+
+            if not name or "/" in name or not artifact.is_file():
+                results.append({
+                    "artifact": name, "is_archive": is_archive, "sha256_ok": False,
+                    "verdict": "corrupt", "matched_sources": [],
+                    "detail": "artefactul din manifest.json nu (mai) există pe disc"})
+                continue
+
+            digest = hashlib.sha256()
+            with open(artifact, "rb") as handle:
+                for chunk in iter(lambda: handle.read(1 << 20), b""):
+                    digest.update(chunk)
+            sha_ok = digest.hexdigest() == expected_sha
+
+            if not is_archive:
+                # rpm_state / git_ref: nothing to extract, nothing to prove
+                # restorable. A bad checksum here is still corruption — the
+                # file changed since sealing — but "informational" never
+                # becomes "restorable_verified" no matter what it says.
+                results.append({
+                    "artifact": name, "is_archive": False, "sha256_ok": sha_ok,
+                    "verdict": "informational_only" if sha_ok else "corrupt",
+                    "matched_sources": [],
+                    "detail": "" if sha_ok else "sha256 nu corespunde manifestului"})
+                continue
+
+            if not sha_ok:
+                results.append({
+                    "artifact": name, "is_archive": True, "sha256_ok": False,
+                    "verdict": "corrupt", "matched_sources": [],
+                    "detail": "sha256 nu corespunde manifestului — arhiva e coruptă"})
+                continue
+
+            free = shutil.disk_usage(str(BACKUP_ROOT)).free
+            if free < artifact.stat().st_size * DRILL_SPACE_MULTIPLIER:
+                results.append({
+                    "artifact": name, "is_archive": True, "sha256_ok": True,
+                    "verdict": "skipped_low_disk", "matched_sources": [],
+                    "detail": "spațiu insuficient pentru o extragere sigură — nu s-a "
+                              "încercat, ca să nu umple discul"})
+                continue
+
+            item_dir = DRILL_ROOT / f"item-{idx}"
+            item_dir.mkdir(parents=True, exist_ok=True)
+            extracted = _run(
+                ["tar", "--zstd", "--one-top-level=payload", "--no-same-owner",
+                 "-xf", str(artifact), "-C", str(item_dir)],
+                timeout=300)
+            if extracted["exit_code"] != 0:
+                results.append({
+                    "artifact": name, "is_archive": True, "sha256_ok": True,
+                    "verdict": "corrupt", "matched_sources": [],
+                    "detail": (extracted["stderr"] or "extragerea a eșuat")[:500]})
+                continue
+
+            payload = item_dir / "payload"
+            matched = [s for s in sources if (payload / s.lstrip("/")).exists()]
+            if matched:
+                results.append({
+                    "artifact": name, "is_archive": True, "sha256_ok": True,
+                    "verdict": "restorable_verified", "matched_sources": matched,
+                    "detail": ""})
+            else:
+                results.append({
+                    "artifact": name, "is_archive": True, "sha256_ok": True,
+                    "verdict": "structure_mismatch", "matched_sources": [],
+                    "detail": "arhiva s-a extras curat, dar nicio sursă declarată nu "
+                              "apare la calea așteptată — o restaurare reală "
+                              "(tar -xf ... -C /) nu ar reface sursele declarate"})
+        return {"ok": True, "restore_point_id": restore_point, "items": results}
+    finally:
+        # Belt and suspenders: cleaned up on the way out, AND wiped again at
+        # the start of the next call in case this process is killed first.
+        _reset_drill_root()
+
+
 def op_disk_free(args: dict[str, Any]) -> dict[str, Any]:
     path = policy.check_path(args.get("path", "/var/backups/sentinel"), purpose="stat")
     try:
@@ -700,6 +871,7 @@ OPERATIONS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "backup_finalize": op_backup_finalize,
     "backup_prune": op_backup_prune,
     "backup_restore": op_backup_restore,
+    "restore_drill_verify": op_restore_drill_verify,
     "disk_free": op_disk_free,
     "audit_status": op_audit_status,
     "terminate_session": op_terminate_session,

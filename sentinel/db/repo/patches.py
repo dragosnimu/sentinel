@@ -324,3 +324,108 @@ async def prunable_restore_points(db: Database, *, keep_count: int,
 async def mark_deleted(db: Database, restore_point_id: int) -> None:
     await db.execute("UPDATE restore_points SET deleted_at = now() WHERE id = $1",
                      restore_point_id)
+
+
+# --- restore drills (Funcționalitatea 07) ------------------------------------
+async def pick_restore_point_for_drill(db: Database) -> dict[str, Any] | None:
+    """Punctul de restaurare cel mai potrivit pentru drill-ul din luna asta.
+
+    Cel niciodată testat trece înaintea celui testat demult, iar între doi
+    niciodată testați câștigă cel mai vechi — altfel un punct nou, creat ieri,
+    ar sări în față și unul vechi de un an n-ar mai ajunge testat niciodată.
+    Un singur punct pe rulare: exercițiul cere lunar, deci acoperirea vine din
+    rotație, nu dintr-o singură trecere.
+    """
+    row = await db.fetchrow(
+        """
+        SELECT rp.id, rp.path, rp.manifest, rp.asset_id, rp.created_at,
+               ld.last_drill_at
+        FROM restore_points rp
+        LEFT JOIN LATERAL (
+            SELECT max(performed_at) AS last_drill_at
+            FROM restore_drills d WHERE d.restore_point_id = rp.id
+        ) ld ON true
+        WHERE rp.deleted_at IS NULL
+        ORDER BY ld.last_drill_at ASC NULLS FIRST, rp.created_at ASC
+        LIMIT 1
+        """)
+    if row is None:
+        return None
+    d = dict(row)
+    if isinstance(d.get("manifest"), str):
+        d["manifest"] = json.loads(d["manifest"])
+    return d
+
+
+async def any_live_restore_point(db: Database) -> bool:
+    return bool(await db.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM restore_points WHERE deleted_at IS NULL)"))
+
+
+async def record_drill(db: Database, *, restore_point_id: int | None,
+                       automated: bool, performed_by: str, succeeded: bool,
+                       duration_ms: int | None, notes: str,
+                       result: dict[str, Any] | None,
+                       items: list[dict[str, Any]]) -> int:
+    """Scrie drill-ul ȘI artefactele lui într-o singură tranzacție.
+
+    Un drill fără artefactele lui e o afirmație fără dovadă: rândul-cap ar
+    spune «reușit» sau «eșuat» și nimic n-ar mai spune despre CE anume a fost
+    verificat — exact separarea pe care 08 trebuie s-o poată citi.
+    """
+    async with db.transaction() as conn:
+        drill_id = int(await conn.fetchval(
+            """
+            INSERT INTO restore_drills
+                (restore_point_id, automated, performed_by, succeeded,
+                 duration_ms, notes, result)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+            RETURNING id
+            """,
+            restore_point_id, automated, performed_by, succeeded,
+            duration_ms, notes, json.dumps(result or {})))
+        for item in items:
+            await conn.execute(
+                """
+                INSERT INTO restore_drill_items
+                    (drill_id, artifact, is_archive, sha256_ok, verdict, detail)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                """,
+                drill_id, str(item.get("artifact", "")),
+                bool(item.get("is_archive")), bool(item.get("sha256_ok")),
+                str(item.get("verdict")), str(item.get("detail", ""))[:2000])
+    return drill_id
+
+
+async def live_restore_points_with_last_drill(db: Database) -> list[dict[str, Any]]:
+    """Fiecare punct viu, cu ultimul lui drill AUTOMAT — sau `None` dacă n-a
+    rulat niciodată niciunul. Sursa pentru verificarea de sănătate: unul câte
+    unul, ca un punct stricat să nu-l ascundă pe cel bun de lângă el.
+
+    Vârsta ultimului drill se calculează AICI, cu ceasul bazei — nu în Python,
+    cu ceasul gazdei care rulează verificarea — din același motiv ca la
+    `check_last_scan`: un decalaj de ceas ar apărea ca o vechime inventată.
+    """
+    rows = await db.fetch(
+        """
+        SELECT rp.id, rp.asset_id, rp.created_at, a.name AS asset_name,
+               ld.id AS drill_id, ld.performed_at, ld.succeeded, ld.notes, ld.result,
+               EXTRACT(EPOCH FROM (now() - ld.performed_at))/60 AS drill_age_min
+        FROM restore_points rp
+        LEFT JOIN assets a ON a.id = rp.asset_id
+        LEFT JOIN LATERAL (
+            SELECT id, performed_at, succeeded, notes, result
+            FROM restore_drills d
+            WHERE d.restore_point_id = rp.id AND d.automated
+            ORDER BY performed_at DESC LIMIT 1
+        ) ld ON true
+        WHERE rp.deleted_at IS NULL
+        ORDER BY rp.created_at
+        """)
+    out = []
+    for row in rows:
+        d = dict(row)
+        if isinstance(d.get("result"), str):
+            d["result"] = json.loads(d["result"])
+        out.append(d)
+    return out

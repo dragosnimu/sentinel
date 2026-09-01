@@ -301,6 +301,19 @@ QUERIES: list[Query] = [
         """,
         {"limit": "int:30"},
     ),
+    Query(
+        "restore_drill_items",
+        "Per-artifact verdicts of one restore drill (Funcționalitatea 07) — "
+        "read this to see WHICH artifact failed and why, not just that the "
+        "drill as a whole did.",
+        """
+        SELECT i.artifact, i.is_archive, i.sha256_ok, i.verdict, i.detail
+        FROM restore_drill_items i
+        WHERE i.drill_id = $1
+        ORDER BY i.id
+        """,
+        {"drill_id": "int"},
+    ),
     # -- Assets, health, capacity -------------------------------------------
     Query(
         "assets",

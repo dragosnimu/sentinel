@@ -93,6 +93,7 @@ Allowed operations — this is the complete list, and it is deliberately short:
 | `flush_blocklist` | Empty the blocklist (panic path) |
 | `list_sets` | Read current nftables set contents |
 | `backup_create` / `backup_restore` | Create or replay a restore point |
+| `restore_drill_verify` | Extract a restore point's archives into an isolated, disposable directory and verify them — never `/`. Used by the monthly restore drill |
 | `patch_step_exec` | Execute one validated argv from an approved patch plan |
 | `service_action` | `start` / `stop` / `restart` / `reload` on a unit in the inventory |
 | `read_privileged_file` | Read a specific allowlisted path (e.g. `/var/log/audit/audit.log`) |

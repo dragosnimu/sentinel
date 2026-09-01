@@ -538,6 +538,54 @@ subrețea: nucleul scrie adresele IPv6 neabreviat, `psutil` le întoarce
 abreviat, iar o comparație de șiruri n-ar potrivi niciodată aceeași adresă —
 latent pe gazda măsurată (IPv6 dezactivat, zero intrări), nu reparat.
 
+### 3.19 Un backup nedovedit e o ipoteză — exercițiul de restaurare, izolat
+
+Măsurat pe gazdă la 1 septembrie 2026: nouă execuții de patch, trei puncte de
+restaurare, **zero restaurări încercate vreodată**. `verified_at` pe fiecare
+punct e egal cu `created_at` — verificarea existentă confirmă fișierul tocmai
+scris, în aceeași secundă, nu că se mai poate citi înapoi o lună mai târziu.
+
+`sentinel-restore-drill.timer` rulează lunar exact acest test, fără operator,
+fără să atingă vreodată un fișier real. Constrângerea structurală: arhivele
+sunt sub `/var/backups/sentinel/<id>/`, `0700 root:root`, deci extragerea și
+re-verificarea checksum-urilor trebuie să ruleze în `sentinel-executor` — un
+serviciu neprivilegiat nu poate nici măcar citi arhiva. Executorul extrage
+fiecare arhivă cu `-C <director-izolat-propriu>` (niciodată `-C /`, ceea ce ar
+face `restore.sh`), sub `--one-top-level`, apoi șterge directorul izolat
+înainte să răspundă — vezi `op_restore_drill_verify`.
+
+**Descoperirea care a rezultat din construirea exercițiului, nu dintr-o
+căutare anume:** arhivele `tar.zst` create de `op_backup_create` sunt
+împachetate cu `tar --zstd -cf artefact -C <părinte> <nume-final>` — adică
+membrii arhivei poartă doar ULTIMA componentă a căii (`nginx/...`), nu calea
+întreagă relativă la rădăcină (`etc/nginx/...`). `restore.sh` extrage cu
+`-C /`, deci o restaurare reală ar scrie la `/nginx/...`, nu la `/etc/nginx/...`
+— pentru orice sursă cu mai mult de o componentă sub rădăcină, ceea ce
+înseamnă aproape orice cale reală de backup. Verificat direct, cu `tar` simplu
+(fără zstd) și `tar -tf`: membrii arhivei confirmă exact acest lucru. Exercițiul
+de restaurare prinde asta structural — verdictul `structure_mismatch`, arhivă
+cu checksum bun, extrasă fără eroare, dar care nu reproduce nicio sursă
+declarată la calea ei — fără să presupună dinainte care e defectul. **Nereparat
+aici**: e o constatare pe `executor/commands.py:op_backup_create`, în afara
+sferei Funcționalității 07, și trebuie tratată ca schimbare de comportament pe
+componenta cea mai sensibilă din proiect — cu propria trecere prin cei doi
+agenți, nu ca linie ascunsă într-o schimbare despre altceva.
+
+**Ce compară exercițiul, și de ce e suficient:** checksum-ul recalculat de pe
+disc (nu cel ținut minte din baza de date) pentru fiecare artefact, plus —
+doar pentru arhive — dacă arborele extras conține sursele declarate în
+manifestul din bază, la calea absolută unde ar trebui să existe. Un punct
+numai cu artefacte informative (`rpm_state`, `git_ref`) nu poate ieși
+niciodată „reușit": `restore.sh` însuși nu le restaurează, doar le numește —
+verificarea nu are voie să pretindă mai mult decât mecanismul real.
+
+**Ce înregistrează:** `restore_drills` (extinsă cu `automated`, ca rândul
+scris manual pe canary din §6 al `docs/PATCHING.md` să nu se amestece cu cel
+scris de timer) și `restore_drill_items`, un rând pe artefact — separarea
+există ca Funcționalitatea 08 să poată întreba „s-a dovedit vreodată că
+punctul ăsta, sau felul ăsta de artefact, se poate întoarce?" fără să
+moștenească ambiguitatea dintre „informativ" și „restaurat".
+
 ---
 
 ## 4. Predicția — ce este de fapt
