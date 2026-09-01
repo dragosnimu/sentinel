@@ -200,3 +200,56 @@ def test_full_window_reconciles_start_margin_and_frontier_without_double_count()
     assert result["ostile"] == asteptat_ostile
     assert result["ips"] is None
     assert result["aproximat"] is True
+
+
+# ---------------------------------------------------------------------------
+# Test 3: rollup-ul rămas mult în urmă — `recent` nu are voie să depășească
+# fereastra cerută
+# ---------------------------------------------------------------------------
+def test_stale_rollup_frontier_does_not_leak_events_from_outside_the_window():
+    """Ziua potopului udp/514 (24 august), reprodusă la scară mică: dacă
+    agregarea orară rămâne în urmă cu ZILE (nu cu minute), frontiera
+    (`max(bucket)` din `event_rollup_1h`) ajunge mai VECHE decât începutul
+    ferestrei cerute. Fără `greatest(frontiera.pana, fereastra.start)` în
+    `recent`, coada ar citi `ts >= frontiera.pana` — adică tot ce e după acea
+    frontieră veche, inclusiv evenimente dinaintea ferestrei cerute. Un
+    operator care întreabă de ultimele 48 de ore ar primi în răspuns
+    evenimente de acum o săptămână, fără nicio urmă că s-a întâmplat.
+
+    Aici frontiera e fixată la 24 august, fereastra cerută (48h înapoi de la
+    `acum`) începe abia pe 29 august — exact geometria în care cele două
+    fixture-uri de mai sus nu spun nimic, fiindcă acolo frontiera era mereu
+    proaspătă și `greatest` alegea mereu aceeași ramură."""
+    acum = "2026-08-31 14:05:43"
+    ore = 48
+    # date_trunc('hour', acum - 48h) = 2026-08-29 14:00:00
+    fereastra_start = "2026-08-29 14:00:00"
+    frontiera_veche = "2026-08-24 09:00:00"   # cu zile înaintea ferestrei cerute
+
+    db = _RollupSQLite(
+        acum,
+        # Un singur bucket, mult mai vechi decât `fereastra_start` — rollup-ul
+        # n-a mai avansat de-atunci. `vechi` (bucket >= fereastra_start AND
+        # bucket < frontiera.pana) e gol prin construcție: intervalul cerut e
+        # complet în AFARA a ce acoperă rollup-ul.
+        rollup=[(frontiera_veche, 500, "http")],
+        raw=[
+            # ÎNAINTE de fereastra cerută, dar DUPĂ frontiera veche — exact ce
+            # `greatest` trebuie să excludă. Fără el, ar intra în total.
+            ("2026-08-24 10:00:00", "http"),
+            ("2026-08-26 12:00:00", "http"),
+            ("2026-08-28 23:59:00", "auth_fail"),
+            # ÎN fereastra cerută — trebuie numărate.
+            ("2026-08-29 14:00:05", "http"),
+            ("2026-08-30 08:00:00", "http"),
+            ("2026-08-31 14:05:30", "auth_fail"),
+        ],
+    )
+
+    result = run(ask_mod._q_evenimente_fereastra(db, {"ore": ore}))
+
+    assert result["total"] == 3, (
+        "asteptat 3 (doar randurile din fereastra ceruta), primit "
+        + str(result["total"]) + " - evenimente de dinaintea ferestrei au scapat in total, "
+        "semn ca `greatest(frontiera.pana, fereastra.start)` nu mai limiteaza coada")
+    assert result["ostile"] == 1
