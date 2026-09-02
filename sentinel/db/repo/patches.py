@@ -519,9 +519,16 @@ async def expire_stale_window_candidates(db: Database, *,
     `status = 'expired'` nu e în lista de stări pe care `generate_for_kev` le
     consideră „are deja un plan viu" — deci expirarea de aici deblochează
     exact scanarea următoare să încerce din nou, cu versiunile de pachet și
-    ceasul de acum, nu cu cele de acum o lună. Vizibil totodată prin
-    `/patches` (`cmd_patches` listează orice status), deci „a expirat" nu mai
-    arată ca „nu există nimic de propus".
+    ceasul de acum, nu cu cele de acum o lună.
+
+    Vizibilă azi doar prin jurnal (`log.warning` din `window.run`), NU prin
+    `/patches`: `cmd_patches` (`sentinel/telegram/bot.py:379`) arată doar
+    planurile `status == 'validated'` din ultimele 10; restul stărilor apar
+    doar în ramura de rezervă, doar cât timp niciun plan validat nu e printre
+    acelea, și doar primele 5. În scenariul pe care expirarea asta îl rezolvă
+    — expiră luni, scanarea de marți redactează unul nou și validat — planul
+    expirat nu mai apare deloc în `/patches`: cel nou, validat, îi ia locul
+    în `pending` și-l scoate din listă.
     """
     rows = await db.fetch(
         """

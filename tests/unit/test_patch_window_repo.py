@@ -179,6 +179,21 @@ def test_expiring_executed_only_moves_plans_past_the_bound():
                         4: "approved", 5: "validated"}
 
 
+def test_expiring_returns_exactly_the_ids_the_database_expired():
+    """`window.run` nu se uită în baza de date ca să vadă ce s-a expirat —
+    citește STRICT ce întoarce funcția asta. O întoarcere greșită aici e o
+    dispariție tăcută cu alt nume: `UPDATE`-ul tot rulează în bază, dar
+    `log.warning`, `outcome.expired` și `patch_window_runs.detail` rămân
+    goale, iar operatorul nu află niciodată că un plan tocmai a fost expirat.
+    `RETURNING id` trebuie tradus 1:1 în `list[int]`, nu doar numărat (ca
+    `expire_stale_plans`, funcția-soră de mai sus, care întoarce `len(rows)`
+    fiindcă apelantul ei n-are nevoie de identitatea rândurilor — ăsta are)."""
+    db = _FetchDB(fetch_rows=[{"id": 11}, {"id": 42}])
+    out = run(repo.expire_stale_window_candidates(db, max_age_days=30))
+    assert out == [11, 42]
+    assert all(isinstance(x, int) for x in out), out
+
+
 # ===========================================================================
 # outstanding_window_plan
 # ===========================================================================

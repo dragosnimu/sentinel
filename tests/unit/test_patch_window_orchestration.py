@@ -213,3 +213,29 @@ def test_no_expiration_leaves_the_detail_unchanged(monkeypatch):
 
     assert outcome.expired == []
     assert "expirat" not in outcome.detail.lower()
+
+
+def test_expiring_mention_survives_every_branch(monkeypatch):
+    """Testele de mai sus pinează mențiunea expirării doar pe ramurile
+    «zăvorât» și «fără candidați» — cele două fără niciun plan viu de
+    evaluat. Pe «în așteptare» (`outstanding`), «eliberat» (un candidat
+    reversibil) și «niciunul eligibil», adică exact săptămânile în care
+    EXISTĂ planuri și se întâmplă ceva, `_with_expired` putea fi omis din
+    `detail` (uitat pe o singură ramură, la o schimbare viitoare) fără niciun
+    roșu: operatorul ar vedea planul propus sau blocat, dar n-ar mai afla
+    niciodată că altul, alături, tocmai a fost expirat. Verifică toate cele
+    cinci ramuri, nu doar pe cele două deja acoperite."""
+    scenarios = {
+        "halted": dict(halt={"plan_id": 3, "execution_id": 9, "status": "failed"}),
+        "outstanding": dict(outstanding={"id": 7}, candidates=[_plan(id_=8)]),
+        "no_candidates": dict(candidates=[]),
+        "released": dict(candidates=[_plan(id_=1, reversible=True, backup_kind="path")],
+                         evidence=_GOOD_EVIDENCE),
+        "none_eligible": dict(candidates=[_plan(id_=1, reversible=False)],
+                              evidence=_GOOD_EVIDENCE),
+    }
+    for name, kwargs in scenarios.items():
+        _wire(monkeypatch, expired=[42], **kwargs)
+        outcome = run(window.run(None, None))
+        assert "42" in outcome.detail, (name, outcome.detail)
+        assert "expirat" in outcome.detail.lower(), (name, outcome.detail)

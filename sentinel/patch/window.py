@@ -116,9 +116,15 @@ există deja.
 
 Deci `run()` expiră explicit, la ÎNCEPUTUL fiecărei rulări —
 `repo.expire_stale_window_candidates` — orice candidat mai vechi decât
-plafonul: planul devine vizibil ca `expired` în `/patches`, iar
+plafonul: expirarea se vede în jurnal, prin `log.warning` de mai jos, iar
 `generate_for_kev` e liber să redacteze unul nou, cu versiuni de pachet și
-ceas proaspete, la scanarea următoare. Rulează ÎNAINTEA verificării de
+ceas proaspete, la scanarea următoare.
+
+NU se vede în `/patches`: `cmd_patches` (`bot.py:379`) filtrează
+`status == 'validated'`, iar celelalte stări apar doar în ramura de rezervă,
+doar când niciun plan validat nu e printre ultimele zece, doar primele cinci.
+În scenariul descris mai sus — expiră luni, marți se redactează unul nou —
+planul expirat nu apare deloc, fiindcă cel nou îi ia locul. Rulează ÎNAINTEA verificării de
 oprire, fiindcă e o operație de întreținere independentă de zăvor — un plan
 expirat n-a fost eliberat niciodată, deci n-are nicio legătură cu execuții
 eșuate.
