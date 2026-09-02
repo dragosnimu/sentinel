@@ -1,0 +1,21 @@
+[Unit]
+Description=Weekly Sentinel patch repair window
+
+[Timer]
+# Once a week, inside the same maintenance window as the nightly scan
+# (03:00-05:00) but offset from both the scan (03:15) and the monthly restore
+# drill (day 1, 04:20), so the three heavier jobs on the host never start at
+# the same instant. Monday, so a plan proposed here has the whole working week
+# ahead of it for the operator to act on, rather than landing on a Friday
+# night.
+OnCalendar=Mon *-*-* 04:45:00
+RandomizedDelaySec=1800
+AccuracySec=60
+# A window skipped because the host was off on Monday is a week with nothing
+# proposed and nobody told — Persistent means a missed run fires at the next
+# boot instead of waiting a full week.
+Persistent=true
+Unit=sentinel-patch-window.service
+
+[Install]
+WantedBy=timers.target

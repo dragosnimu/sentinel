@@ -1,0 +1,69 @@
+[Unit]
+# Fereastra săptămânală de reparare (Funcționalitatea 08): alege cel mai vechi
+# plan de patch validat, neconsiderat încă, verifică dacă întoarcerea lui e
+# DOVEDITĂ prin exercițiul de restaurare (Funcționalitatea 07) și, dacă e,
+# marchează planul eliberat — nimic mai mult. Nu vorbește cu Telegram: bucla
+# de push deja existentă a botului preia planul eliberat și trimite mesajul
+# stampilat cu identitatea instanței, ca orice altă propunere de patch.
+#
+# Această unitate NU atinge executorul și NU atinge fișiere de pe disc — doar
+# citește și scrie în PostgreSQL. Fără socket-ul executorului în cale.
+Description=Sentinel weekly patch repair window
+Documentation=file:/opt/sentinel/lib/sentinel/patch/window.py
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=oneshot
+User=sentinel
+Group=sentinel
+WorkingDirectory=/opt/sentinel
+ExecStart=/opt/sentinel/bin/sentinel patchwindow
+TimeoutStartSec=120
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/sentinel/lib
+
+Nice=15
+IOSchedulingClass=idle
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @mount @debug @swap @reboot @raw-io @obsolete
+CapabilityBoundingSet=
+
+# Namespaces, realtime scheduling and a restrictive umask. This unit has no
+# use for either, and each denied is a step removed from a bug here becoming
+# something worse.
+RestrictNamespaces=yes
+RestrictRealtime=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+MemoryDenyWriteExecute=true
+UMask=0077
+
+# No ReadWritePaths at all: this unit writes nothing to the filesystem, only
+# to PostgreSQL over the network.
+ReadOnlyPaths=/etc/sentinel
+
+# PostgreSQL, nothing else — no unix socket, unlike sentinel-restore-drill,
+# because this unit never talks to sentinel-executor.
+RestrictAddressFamilies=AF_INET AF_INET6
+
+MemoryMax=256M
+TasksMax=64
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentinel-patchwindow

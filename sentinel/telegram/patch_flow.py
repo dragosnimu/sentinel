@@ -156,6 +156,26 @@ async def on_stage2(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await query.edit_message_text("⛔ Confirmarea a expirat sau a fost folosită.")
         return
 
+    # Funcționalitatea 08 — oprirea la primul eșec, recitită AICI, nu la
+    # propunere: fereastra a putut elibera acest plan cu zile în urmă, iar
+    # butonul de mai sus poate fi atins după ce UN ALT plan din fereastră a
+    # eșuat deja la aplicare între timp. Verificarea trebuie să stea pe drumul
+    # real spre execuție — dacă ar sta doar la propunere, două planuri
+    # eliberate înainte de primul eșec s-ar aplica amândouă oricum, indiferent
+    # de ordinea în care omul atinge butoanele. Scoasă DELIBERAT înaintea
+    # `approve_plan`: planul rămâne 'validated', nu blocat într-o stare
+    # 'approved' pe care niciun buton n-o mai poate mișca.
+    plan_for_halt = await patches.get_plan(db, second.plan_id or 0)
+    if plan_for_halt is not None and plan_for_halt.proposed_by_window:
+        halt = await patches.window_halt(db)
+        if halt is not None:
+            await query.edit_message_text(
+                f"⛔ Fereastra de reparare e oprită: planul #{halt['plan_id']} "
+                f"(execuția #{halt['execution_id']}) a ieșit '{halt['status']}'. "
+                f"Niciun alt plan propus de fereastră nu se mai aplică automat "
+                f"până la o decizie a operatorului.")
+            return
+
     approved = await patches.approve_plan(db, second.plan_id or 0, by=by,
                                           expected_hash=second.plan_hash or "")
     if not approved:

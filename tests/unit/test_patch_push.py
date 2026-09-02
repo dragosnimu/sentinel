@@ -61,6 +61,32 @@ def test_plan_push_is_capped():
     assert db.args[0][-1] == 3          # not "every plan we found at 3 a.m."
 
 
+def test_ai_drafted_plans_wait_for_the_window(monkeypatch):
+    """Funcționalitatea 08: un plan `generated_by='ai'` nu are voie să treacă
+    prin canalul rapid decât după ce `sentinel-patch-window` l-a marcat
+    eliberat. Fără clauza asta, poarta de eligibilitate a ferestrei ar fi
+    decorativă — planul ar ajunge oricum pe Telegram în 15 secunde, înainte
+    ca fereastra să apuce vreodată să-l evalueze."""
+    db = _StubDB()
+    run(repo.unnotified_plans(db))
+    sql = db.sql[0]
+    assert "generated_by <> 'ai'" in sql
+    assert "OR proposed_by_window" in sql
+    # Trebuie să fie ÎN INTERIORUL clauzei principale, altfel un plan AI ar
+    # trece indiferent de restul filtrelor.
+    assert "AND (generated_by <> 'ai' OR proposed_by_window)" in sql
+
+
+def test_a_window_released_plan_bypasses_the_recency_filter(monkeypatch):
+    """`PLAN_TTL_HOURS` e 72; fereastra rulează săptămânal. Fără excepția
+    asta, un plan pe care fereastra tocmai l-a eliberat ar cădea în afara
+    propriei ferestre de propunere exact în clipa în care devine eligibil."""
+    db = _StubDB()
+    run(repo.unnotified_plans(db))
+    sql = db.sql[0]
+    assert "make_interval(hours => $1) OR proposed_by_window)" in sql
+
+
 def test_telegram_triggered_executions_are_not_announced_twice():
     """`on_dry_run` edits its own message with the result. A second message
     saying the same thing teaches the operator that these can be ignored."""

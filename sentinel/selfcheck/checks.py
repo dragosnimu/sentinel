@@ -174,7 +174,8 @@ async def check_timers(cfg: Config) -> list[CheckResult]:
     results: list[CheckResult] = []
     for unit in ("sentinel-scan.timer", "sentinel-health.timer",
                  "sentinel-maintenance.timer", "sentinel-watchdog.timer",
-                 "sentinel-selfcheck.timer", "sentinel-restore-drill.timer"):
+                 "sentinel-selfcheck.timer", "sentinel-restore-drill.timer",
+                 "sentinel-patch-window.timer"):
         state = await asyncio.to_thread(_systemctl, "is-active", unit)
         if not state:
             # An empty answer means `systemctl` is missing, errored, or timed
@@ -2830,6 +2831,126 @@ async def check_restore_drill(db: Database) -> list[CheckResult]:
 
 
 # ---------------------------------------------------------------------------
+# Fereastra de reparare (Funcționalitatea 08): `sentinel-patch-window.timer`
+# ---------------------------------------------------------------------------
+#
+# ~1,5 cicluri săptămânale — aceeași rațiune ca RESTORE_DRILL_STALE_DAYS
+# pentru cel lunar: destul cât un `RandomizedDelaySec` și o recuperare la boot
+# să nu declanșeze fals, dar nu atât cât un timer oprit de-a binelea să treacă
+# neobservat mai multe săptămâni.
+PATCH_WINDOW_STALE_DAYS = 10
+
+
+async def check_patch_window(db: Database) -> list[CheckResult]:
+    """De ce n-a propus fereastra nimic — sau de ce n-a rulat deloc.
+
+    Un mecanism care tace când nu face nimic e indistinct de unul stricat, iar
+    aici tăcerea e starea IMPLICITĂ pe gazda măsurată 1 septembrie 2026: zero
+    puncte de restaurare dovedite prin arhivă, deci fereastra n-are ce elibera
+    niciodată încă. Patru stări, distincte pe scaunul operatorului:
+
+      * `unknown` — timerul n-a rulat NICIODATĂ. Nu e „fine": „niciun rând în
+        `patch_window_runs`" arată identic cu „a rulat de o sută de ori și n-a
+        găsit niciodată nimic eligibil" dacă nu se spune diferit.
+      * `degraded`, „timer învechit" — a rulat cândva, dar nu de curând:
+        `sentinel-patch-window.timer` nu mai rulează la timp.
+      * `degraded`, „oprită de un eșec anterior" — un plan eliberat de
+        fereastră a eșuat la aplicare, iar poarta din `on_stage2` refuză să
+        mai aplice orice alt plan din fereastră. Zgomotos, intenționat: e
+        exact oprirea la primul eșec cerută de Funcționalitatea 08, iar
+        tăcerea aici ar ascunde tocmai mecanismul de siguranță care lucrează.
+      * `ok` — fie un plan e deja eliberat și așteaptă o decizie, fie nu sunt
+        candidați, fie candidații există dar niciunul nu trece încă poarta de
+        eligibilitate (stare normală pe o gazdă fără arhive dovedite, nu un
+        defect — vezi `sentinel/patch/window.py` pentru cele trei stări).
+        Un candidat pentru care poarta a găsit o dovadă REALĂ de
+        NEreversibilitate (`not_reversible`) e raportat separat, `degraded`:
+        acela chiar e defectul pe care exercițiul de restaurare există să-l
+        prindă, nu o lipsă de informație.
+
+    Recalculată LIVE la fiecare rulare a verificării — nu doar citită din
+    ultimul rând de `patch_window_runs` — din același motiv ca la
+    `check_restore_drill`: dovada se schimbă lunar, independent de cadența
+    săptămânală a ferestrei, iar o stare veche de câteva zile ar putea arăta
+    „nimic eligibil" deși un exercițiu proaspăt a rezolvat între timp.
+    """
+    from sentinel.patch import window
+    from sentinel.db.repo import patches as patch_repo
+
+    last_run = await patch_repo.last_window_run(db)
+    if last_run is None:
+        return [CheckResult(
+            "patch_window:any", "Fereastra de reparare", "unknown",
+            detail="sentinel-patch-window.timer n-a rulat niciodată — «există "
+                   "planuri de patch» și «fereastra le-a luat în considerare» "
+                   "nu sunt același fapt",
+            action="systemctl start sentinel-patch-window ; "
+                   "journalctl -u sentinel-patchwindow -n 50",
+            facts={"ran": False})]
+
+    from datetime import datetime, timezone
+    age_min = (datetime.now(timezone.utc) - last_run["ran_at"]).total_seconds() / 60
+    if age_min > PATCH_WINDOW_STALE_DAYS * 24 * 60:
+        return [CheckResult(
+            "patch_window:any", "Fereastra de reparare — timer învechit", "degraded",
+            detail=f"ultima rulare acum {_ago(age_min)}, mai veche de "
+                   f"{PATCH_WINDOW_STALE_DAYS} zile — sentinel-patch-window.timer "
+                   f"nu mai rulează la timp",
+            action="systemctl list-timers sentinel-patch-window.timer ; "
+                   "journalctl -u sentinel-patchwindow -n 50",
+            facts={"ran": True, "age_days": int(age_min / 60 / 24)})]
+
+    halt = await patch_repo.window_halt(db)
+    if halt is not None:
+        return [CheckResult(
+            "patch_window:halted", "Fereastra de reparare — oprită de un eșec anterior",
+            "degraded",
+            detail=f"planul #{halt['plan_id']} (execuția #{halt['execution_id']}) "
+                   f"a ieșit '{halt['status']}' — niciun alt plan eliberat de "
+                   f"fereastră nu se mai aplică automat, indiferent de câte "
+                   f"butoane mai sunt active în Telegram",
+            action=f"analizează execuția #{halt['execution_id']} înainte de a "
+                   f"decide manual ce se întâmplă cu planurile în așteptare",
+            facts={"halted": True, "execution_id": halt["execution_id"],
+                   "plan_id": halt["plan_id"], "status": halt["status"]})]
+
+    outstanding = await patch_repo.outstanding_window_plan(db)
+    if outstanding is not None:
+        return [CheckResult(
+            "patch_window:any", "Fereastra de reparare", "ok",
+            detail=f"planul #{outstanding['id']} a fost eliberat de fereastră și "
+                   f"așteaptă o decizie a operatorului pe Telegram",
+            facts={"outstanding_plan_id": outstanding["id"]})]
+
+    candidates = await patch_repo.window_candidate_plans(db, limit=window.CANDIDATE_LIMIT)
+    if not candidates:
+        return [CheckResult(
+            "patch_window:any", "Fereastra de reparare", "ok",
+            detail="niciun plan validat în așteptarea ferestrei — nimic de propus",
+            facts={"candidates": 0})]
+
+    evidence = await patch_repo.latest_archive_drill_summary(db)
+    results: list[CheckResult] = []
+    for row in candidates:
+        gate = window.evaluate(row.plan, evidence)
+        key = f"patch_window:plan:{row.id}"
+        if gate.state == window.NOT_REVERSIBLE:
+            results.append(CheckResult(
+                key, f"Plan de patch #{row.id} — NU se propune, dovedit nereversibil",
+                "degraded", detail=gate.reason,
+                action=f"/patch {row.id} — citește planul înainte de o decizie manuală",
+                facts={"plan_id": row.id, "state": gate.state}))
+        else:
+            title = (f"Plan de patch #{row.id} — nedovedit reversibil încă"
+                     if gate.state == window.UNPROVEN else
+                     f"Plan de patch #{row.id} — eligibil la următoarea rulare")
+            results.append(CheckResult(
+                key, title, "ok", detail=gate.reason,
+                facts={"plan_id": row.id, "state": gate.state}))
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Feed-uri de reputație: întrerupătorul de circuit din 0006 nu e vizibil dacă
 # nimeni nu-l citește altundeva decât în `intel_feeds.last_error`.
 # ---------------------------------------------------------------------------
@@ -3491,6 +3612,7 @@ CHECKS: tuple[tuple[str, Callable], ...] = (
     ("ship", check_ship_lag),
     ("scan", check_last_scan),
     ("restore_drill", check_restore_drill),
+    ("patch_window", check_patch_window),
     ("reputation", check_reputation_feeds),
     ("inventory", check_inventory),
     ("audit", check_audit_records),

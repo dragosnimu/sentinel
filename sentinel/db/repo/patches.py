@@ -38,11 +38,16 @@ class PlanRow:
     approved_by: str | None
     approved_at: datetime | None
     validation_errors: Any
+    # Implicit `False`, ca fiecare `PlanRow(...)` scris deja în teste (dinainte
+    # de Funcționalitatea 08) să rămână valid fără să numească un câmp de care
+    # nu-i pasă.
+    proposed_by_window: bool = False
 
 
 _PLAN_COLS = """
     id, plan_id, plan_hash, plan, status, risk_level, requires_reboot, reversible,
-    estimated_downtime_s, asset_id, created_at, approved_by, approved_at, validation_errors
+    estimated_downtime_s, asset_id, created_at, approved_by, approved_at, validation_errors,
+    proposed_by_window
 """
 
 
@@ -51,7 +56,12 @@ def _plan(row: Any) -> PlanRow:
     for key in ("plan", "validation_errors"):
         if isinstance(d.get(key), str):
             d[key] = json.loads(d[key])
-    return PlanRow(**{k: d[k] for k in PlanRow.__dataclass_fields__})
+    # `.get(k, False)` only for `proposed_by_window`: a real row from
+    # `_PLAN_COLS` always carries it, but plenty of tests build a bare dict by
+    # hand to stand in for a row, predating Funcționalitatea 08 — those must
+    # keep meaning "not released by the window" rather than fail to construct.
+    return PlanRow(**{k: d.get(k, False) if k == "proposed_by_window" else d[k]
+                      for k in PlanRow.__dataclass_fields__})
 
 
 # --- plans ------------------------------------------------------------------
@@ -100,12 +110,29 @@ async def unnotified_plans(db: Database, *, limit: int = 3) -> list[PlanRow]:
     `limit` is small on purpose. A scan that turns up eight exploited CVEs at
     3 a.m. should not produce eight approval prompts stacked on a phone — the
     rest are still listed by `/patches`, and the next pass will offer them.
+
+    A plan drafted by the automatic planner (`generated_by = 'ai'`) is held
+    back from this fast, unconditional channel until `sentinel-patch-window`
+    (Funcționalitatea 08) has released it — `proposed_by_window`. Without this,
+    the window's eligibility gate (întoarcere dovedită prin exercițiul de
+    restaurare) would be decorative: every AI-drafted plan already reaches
+    `status = 'validated'` the moment it is generated, and this loop runs every
+    15 seconds, so it would offer the plan long before the weekly window ever
+    got a say. A plan from any OTHER origin (today: none, but the column exists
+    for a future manual-generation path) is unaffected — the split is about the
+    risk of unattended model output, not about patching in general.
+
+    The recency filter is skipped once a plan is window-released, for the same
+    reason: the window runs weekly, `PLAN_TTL_HOURS` is 72, so a plan old
+    enough to need the window's slower cadence would otherwise fall outside its
+    own release window the moment the window finally clears it.
     """
     rows = await db.fetch(
         f"""
         SELECT {_PLAN_COLS} FROM patch_plans
         WHERE notified_at IS NULL AND status = 'validated'
-          AND created_at > now() - make_interval(hours => $1)
+          AND (created_at > now() - make_interval(hours => $1) OR proposed_by_window)
+          AND (generated_by <> 'ai' OR proposed_by_window)
         ORDER BY created_at
         LIMIT $2
         """,
@@ -429,3 +456,127 @@ async def live_restore_points_with_last_drill(db: Database) -> list[dict[str, An
             d["result"] = json.loads(d["result"])
         out.append(d)
     return out
+
+
+# --- patch window (Funcționalitatea 08) --------------------------------------
+async def window_candidate_plans(db: Database, *, limit: int = 10) -> list[PlanRow]:
+    """Planuri validate pe care fereastra nu le-a considerat încă „eliberate".
+
+    Ordonate de la cel mai vechi: un plan care așteaptă de o săptămână are
+    prioritate față de unul generat aseară — altfel unul nou ar sări mereu
+    înainte și cele vechi n-ar mai ajunge niciodată evaluate.
+    """
+    rows = await db.fetch(
+        f"""
+        SELECT {_PLAN_COLS} FROM patch_plans
+        WHERE status = 'validated' AND NOT proposed_by_window
+        ORDER BY created_at
+        LIMIT $1
+        """,
+        limit)
+    return [_plan(r) for r in rows]
+
+
+async def outstanding_window_plan(db: Database) -> dict[str, Any] | None:
+    """Un plan deja eliberat de fereastră care încă așteaptă o decizie.
+
+    Cât timp există unul, fereastra nu mai eliberează altul — nu fiindcă
+    două propuneri simultane ar strica ceva prin ele însele, ci ca operatorul
+    să nu găsească mai multe decizii automate stivuite atunci când se
+    întoarce dintr-o săptămână ocupată.
+    """
+    row = await db.fetchrow(
+        """
+        SELECT id, created_at FROM patch_plans
+        WHERE proposed_by_window AND status = 'validated'
+        ORDER BY created_at LIMIT 1
+        """)
+    return dict(row) if row else None
+
+
+async def mark_proposed_by_window(db: Database, plan_db_id: int) -> None:
+    await db.execute(
+        "UPDATE patch_plans SET proposed_by_window = true WHERE id = $1", plan_db_id)
+
+
+async def window_halt(db: Database) -> dict[str, Any] | None:
+    """Execuția care a oprit fereastra, dacă vreuna dintre propunerile ei a
+    eșuat la aplicare — sau `None` dacă fereastra poate propune în continuare.
+
+    Cea mai VECHE execuție eșuată, nu cea mai nouă: „oprire la primul eșec"
+    înseamnă că raportul arată planul care a declanșat oprirea, nu ultimul din
+    listă. Recalculată la fiecare apel, din `patch_executions` +
+    `patch_plans.proposed_by_window` — nicio stare separată de „oprit" nu se
+    ține minte, ca să nu existe două surse de adevăr care se pot contrazice.
+    """
+    row = await db.fetchrow(
+        """
+        SELECT e.id AS execution_id, e.plan_id, e.status, e.finished_at
+        FROM patch_executions e
+        JOIN patch_plans p ON p.id = e.plan_id
+        WHERE p.proposed_by_window AND e.mode = 'apply'
+          AND e.status IN ('failed', 'rolled_back', 'rollback_failed')
+        ORDER BY e.finished_at ASC
+        LIMIT 1
+        """)
+    return dict(row) if row else None
+
+
+async def latest_archive_drill_summary(db: Database) -> dict[str, Any] | None:
+    """Ce arată, ÎN ANSAMBLU, cel mai recent exercițiu de restaurare care a
+    atins măcar o arhivă (`is_archive`) — indiferent de punctul de restaurare
+    din care venea. `None` dacă niciun exercițiu n-a atins vreodată o arhivă.
+
+    Agregată pe TOATE artefactele-arhivă din acel exercițiu, nu pe unul
+    singur: un exercițiu care a extras două arhive, una bună și una coruptă,
+    nu are voie să raporteze doar partea bună — vezi
+    `restore_drill.py`, aceeași regulă la nivel de punct.
+    """
+    row = await db.fetchrow(
+        """
+        WITH latest AS (
+            SELECT d.id, d.performed_at
+            FROM restore_drills d
+            JOIN restore_drill_items i ON i.drill_id = d.id AND i.is_archive
+            GROUP BY d.id, d.performed_at
+            ORDER BY d.performed_at DESC
+            LIMIT 1
+        )
+        SELECT l.performed_at,
+               EXTRACT(EPOCH FROM (now() - l.performed_at)) / 86400 AS age_days,
+               bool_or(i.verdict IN ('corrupt', 'structure_mismatch')) AS any_bad,
+               bool_and(i.verdict = 'restorable_verified') AS all_good
+        FROM latest l
+        JOIN restore_drill_items i ON i.drill_id = l.id AND i.is_archive
+        GROUP BY l.performed_at
+        """)
+    return dict(row) if row else None
+
+
+async def record_window_run(db: Database, *, candidates: int,
+                            proposed_plan_id: int | None, halted: bool,
+                            detail: str, skipped: list[dict[str, Any]]) -> int:
+    """Un rând PE RULARE, indiferent de rezultat — vezi migrația 0043 pentru
+    motivul separării de «niciodată rulat»."""
+    return int(await db.fetchval(
+        """
+        INSERT INTO patch_window_runs
+            (candidates, proposed_plan_id, halted, detail, skipped)
+        VALUES ($1, $2, $3, $4, $5::jsonb)
+        RETURNING id
+        """,
+        candidates, proposed_plan_id, halted, detail[:2000], json.dumps(skipped)))
+
+
+async def last_window_run(db: Database) -> dict[str, Any] | None:
+    row = await db.fetchrow(
+        """
+        SELECT id, ran_at, candidates, proposed_plan_id, halted, detail, skipped
+        FROM patch_window_runs ORDER BY ran_at DESC LIMIT 1
+        """)
+    if row is None:
+        return None
+    d = dict(row)
+    if isinstance(d.get("skipped"), str):
+        d["skipped"] = json.loads(d["skipped"])
+    return d

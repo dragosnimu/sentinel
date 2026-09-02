@@ -1,0 +1,162 @@
+"""`sentinel/patch/window.py:run` — orchestrarea ferestrei săptămânale.
+
+Proprietatea urmărită în tot fișierul: fereastra scrie ÎNTOTDEAUNA un rând în
+`patch_window_runs`, indiferent de rezultat (altfel „n-a rulat niciodată" și
+„a rulat și n-a găsit nimic" arată identic — zero rânduri), eliberează CEL
+MULT un plan pe rulare, și nu eliberează nimic nou cât timp fereastra e
+oprită sau mai are deja un plan eliberat, nerezolvat.
+
+Repo-ul e monkeypatch-uit funcție cu funcție, nu simulat prin SQL: decizia
+testată e a lui `window.run`, nu forma interogărilor din `patches.py` — acelea
+au propriile teste, cu propriul `_StubDB`.
+"""
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+from typing import Any
+
+from sentinel.db.repo import patches as repo
+from sentinel.patch import window
+
+
+def run(c):
+    return asyncio.run(c)
+
+
+def _plan(id_=1, reversible=True, backup_kind="path"):
+    return SimpleNamespace(
+        id=id_,
+        plan={"risk": {"reversible": reversible},
+              "backup": [{"kind": backup_kind, "source": "/etc/nginx"}]})
+
+
+_GOOD_EVIDENCE = {"age_days": 1.0, "any_bad": False, "all_good": True}
+
+
+def _wire(monkeypatch, *, halt=None, outstanding=None, candidates=None, evidence=None):
+    released: list[int] = []
+    recorded: list[dict[str, Any]] = []
+
+    async def _halt(db):
+        return halt
+
+    async def _outstanding(db):
+        return outstanding
+
+    async def _candidates(db, *, limit):
+        return candidates or []
+
+    async def _evidence(db):
+        return evidence
+
+    async def _mark(db, plan_id):
+        released.append(plan_id)
+
+    async def _record(db, *, candidates, proposed_plan_id, halted, detail, skipped):
+        recorded.append({"candidates": candidates, "proposed_plan_id": proposed_plan_id,
+                         "halted": halted, "detail": detail, "skipped": skipped})
+        return 1
+
+    monkeypatch.setattr(repo, "window_halt", _halt)
+    monkeypatch.setattr(repo, "outstanding_window_plan", _outstanding)
+    monkeypatch.setattr(repo, "window_candidate_plans", _candidates)
+    monkeypatch.setattr(repo, "latest_archive_drill_summary", _evidence)
+    monkeypatch.setattr(repo, "mark_proposed_by_window", _mark)
+    monkeypatch.setattr(repo, "record_window_run", _record)
+    return released, recorded
+
+
+# --- halted ------------------------------------------------------------------
+def test_a_halted_window_proposes_nothing_and_says_so(monkeypatch):
+    released, recorded = _wire(
+        monkeypatch, halt={"plan_id": 3, "execution_id": 9, "status": "failed"},
+        candidates=[_plan(id_=5)], evidence=_GOOD_EVIDENCE)
+
+    outcome = run(window.run(None, None))
+
+    assert outcome.halted is True
+    assert outcome.proposed_plan_id is None
+    assert released == [], "a plan was released while the window was halted"
+    assert recorded == [{"candidates": 0, "proposed_plan_id": None,
+                        "halted": True, "detail": outcome.detail, "skipped": []}]
+
+
+# --- outstanding -------------------------------------------------------------
+def test_an_outstanding_release_blocks_a_new_one(monkeypatch):
+    released, recorded = _wire(
+        monkeypatch, outstanding={"id": 7}, candidates=[_plan(id_=8)],
+        evidence=_GOOD_EVIDENCE)
+
+    outcome = run(window.run(None, None))
+
+    assert outcome.proposed_plan_id is None
+    assert released == []
+    assert "7" in outcome.detail
+
+
+# --- no candidates -----------------------------------------------------------
+def test_no_candidates_is_reported_as_nothing_pending(monkeypatch):
+    _wire(monkeypatch, candidates=[])
+
+    outcome = run(window.run(None, None))
+
+    assert outcome.proposed_plan_id is None
+    assert outcome.candidates == 0
+
+
+# --- the eligible one gets released, and only one -----------------------------
+def test_the_first_eligible_candidate_is_released_and_no_more_than_one(monkeypatch):
+    """Falsificat: dacă bucla n-ar opri la primul eligibil, ambele planuri
+    reversibile din listă ar fi eliberate simultan — exact configurația pe
+    care oprirea la primul eșec trebuie s-o evite."""
+    candidates = [_plan(id_=1, reversible=True, backup_kind="path"),
+                  _plan(id_=2, reversible=True, backup_kind="path")]
+    released, recorded = _wire(monkeypatch, candidates=candidates, evidence=_GOOD_EVIDENCE)
+
+    outcome = run(window.run(None, None))
+
+    assert outcome.proposed_plan_id == 1
+    assert released == [1]
+    assert recorded[0]["proposed_plan_id"] == 1
+
+
+def test_an_ineligible_candidate_is_skipped_in_favour_of_the_next_one(monkeypatch):
+    candidates = [_plan(id_=1, reversible=False),                      # blocked
+                  _plan(id_=2, reversible=True, backup_kind="path")]   # eligible
+    released, _ = _wire(monkeypatch, candidates=candidates, evidence=_GOOD_EVIDENCE)
+
+    outcome = run(window.run(None, None))
+
+    assert outcome.proposed_plan_id == 2
+    assert released == [2]
+    assert outcome.skipped and outcome.skipped[0]["plan_id"] == 1
+
+
+def test_no_eligible_candidate_releases_nothing(monkeypatch):
+    candidates = [_plan(id_=1, reversible=False), _plan(id_=2, backup_kind="rpm_state")]
+    released, recorded = _wire(monkeypatch, candidates=candidates, evidence=_GOOD_EVIDENCE)
+
+    outcome = run(window.run(None, None))
+
+    assert outcome.proposed_plan_id is None
+    assert released == []
+    assert len(outcome.skipped) == 2
+    assert recorded[0]["skipped"] == outcome.skipped
+
+
+# --- always writes a row, whatever happened -----------------------------------
+def test_every_outcome_writes_exactly_one_run_row(monkeypatch):
+    """«N-a rulat niciodată» trebuie să rămână distinct de «a rulat și n-a
+    găsit nimic» — imposibil dacă rularea nu scrie un rând."""
+    scenarios = [
+        dict(halt={"plan_id": 1, "execution_id": 1, "status": "failed"}),
+        dict(outstanding={"id": 1}, candidates=[_plan()]),
+        dict(candidates=[]),
+        dict(candidates=[_plan(reversible=True, backup_kind="path")],
+            evidence=_GOOD_EVIDENCE),
+    ]
+    for kwargs in scenarios:
+        _, recorded = _wire(monkeypatch, **kwargs)
+        run(window.run(None, None))
+        assert len(recorded) == 1, (kwargs, recorded)
