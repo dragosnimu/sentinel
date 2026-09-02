@@ -464,14 +464,19 @@ type Holder = { [POOL_KEY]?: Pool };
  * interogare. Vezi capul lui `schema-guard.ts` pentru CE verifică; aici e doar
  * cablarea: cine apelează, cât ține minte, și ce înseamnă „nu ține minte".
  *
- * Un obiect plan, nu un `Proxy` peste pool-ul brut al lui mysql2: pool-ul e un
- * `EventEmitter` care își scrie singur câmpuri interne (`this.x = …`) prin
- * metodele lui, iar un `Proxy` fără capcană `set` explicită le-ar redirecționa
- * pe RECEIVER (învelișul), nu pe `target` — o corupere tăcută a stării
- * driverului, pe drumul care duce spre baza de PRODUCȚIE. `Pool` din fișierul
- * ăsta e dinadins îngust (`query`, `end`, `on`), deci un obiect scris de mână
- * care deleagă exact cele trei metode e mai simplu ȘI mai sigur decât orice
- * încercare de a fi „transparent" cu un Proxy.
+ * Un obiect plan, nu un `Proxy` peste pool-ul brut al lui mysql2 — dar NU din
+ * motivul scris aici până pe 2 septembrie 2026. Comentariul de dinainte
+ * susținea că un `Proxy` fără capcană `set` ar redirecționa scrierile interne
+ * ale driverului pe înveliș în loc de țintă. **E fals**, măsurat: `OrdinarySet`
+ * ajunge la `[[DefineOwnProperty]]` pe proxy, care le trimite mai departe pe
+ * `target`; un `Proxy` doar cu `get` lasă `this.x = …` exact unde trebuie.
+ *
+ * Motivul adevărat e mai simplu: `Pool` din fișierul ăsta e dinadins îngust
+ * (`query`, `end`, `on`), deci un obiect scris de mână care deleagă exact cele
+ * trei metode e verificat de compilator — o metodă pe care cineva ar adăuga-o
+ * la interfață fără s-o împacheteze e eroare de tip la `tsc`, nu `undefined`
+ * la runtime, pe drumul care duce spre baza de PRODUCȚIE. Un `Proxy` ar fi
+ * „transparent" tocmai în felul care ascunde omisiunea aia.
  *
  * ## Ce ține minte, și ce NU
  *
