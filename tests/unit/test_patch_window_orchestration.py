@@ -235,7 +235,12 @@ def test_expiring_mention_survives_every_branch(monkeypatch):
                               evidence=_GOOD_EVIDENCE),
     }
     for name, kwargs in scenarios.items():
-        _wire(monkeypatch, expired=[42], **kwargs)
+        _, recorded = _wire(monkeypatch, expired=[42], **kwargs)
         outcome = run(window.run(None, None))
         assert "42" in outcome.detail, (name, outcome.detail)
+        # Și în RÂNDUL scris, nu doar în valoarea întoarsă. Fără asta, mutarea
+        # lui `_with_expired` DUPĂ `record_window_run` lasă rândul de audit
+        # fără mențiune și testul verde — dovedit pe ramura `outstanding`,
+        # unde `detail` se construiește în doi pași, nu într-o expresie.
+        assert "42" in recorded[0]["detail"], (name, recorded[0]["detail"])
         assert "expirat" in outcome.detail.lower(), (name, outcome.detail)
