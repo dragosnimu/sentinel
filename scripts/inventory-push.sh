@@ -163,7 +163,8 @@ ok "local file is valid (${LOCAL_COUNT} asset(s))"
 # See "Why an empty local file is refused" at the top of this file. Checked
 # here — before any SSH connection — because the whole point is to refuse
 # before a diff can be computed and shown as if it meant something.
-[[ "$LOCAL_COUNT" -gt 0 ]] || die "\n${FILE} lists NO assets. \`sentinel.scan.inventory.sync\` on the host treats an \nempty list as \"nothing to retire\", never as \"retire everything\" — a diff against it would show \
+[[ "$LOCAL_COUNT" -gt 0 ]] || die "${FILE} lists NO assets. \`sentinel.scan.inventory.sync\` on the host treats an \
+empty list as \"nothing to retire\", never as \"retire everything\" — a diff against it would show \
 retirements that will NOT happen on the host, and every asset already tracked there would stay exactly \
 as it is. Refusing before any network I/O."
 
