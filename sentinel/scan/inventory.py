@@ -63,6 +63,32 @@ def load(path: Path = INVENTORY_PATH) -> list[dict[str, Any]]:
     return cleaned
 
 
+def diff(current: list[dict[str, Any]], proposed: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """What `sync` would do if `proposed` replaced `current` as inventory.yaml.
+
+    Pure and DB-free, on purpose: `scripts/inventory-push.sh` needs to show an
+    operator what a push would change *before* anything reaches the host, and
+    the only way to make that promise honestly is to compute it from the same
+    two lists `sync` itself would see — not from a second, hand-written
+    comparison that could drift from what `sync` actually does. See `sync`'s
+    own docstring for why an empty `proposed` is `sync`'s special "retire
+    nothing" case; the caller (the push script) is the one that must refuse to
+    treat a locally-truncated file as "retire everything", by validating
+    `proposed` with `load` first and never diffing an empty list in here.
+
+    Returns `{"added": [...], "retired": [...], "kept": [...]}`, each sorted by
+    name. `retired` is exactly `assets_repo.retire_missing`'s effect: every
+    name in `current` that `proposed` does not repeat.
+    """
+    current_names = {spec["name"] for spec in current}
+    proposed_names = {spec["name"] for spec in proposed}
+    return {
+        "added": sorted(proposed_names - current_names),
+        "retired": sorted(current_names - proposed_names),
+        "kept": sorted(current_names & proposed_names),
+    }
+
+
 async def sync(db: Database, path: Path = INVENTORY_PATH) -> dict[str, Any]:
     """Make the assets table match inventory.yaml, in both directions.
 

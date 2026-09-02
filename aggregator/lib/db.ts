@@ -244,8 +244,10 @@
 import { createRequire } from "node:module";
 
 import { readDbConfig } from "./env";
+import { SchemaGuardError, checkSchemaGuard } from "./schema-guard";
 import type { Db } from "./migrate";
 import type { DbConfig, Env } from "./env";
+import type { SchemaGuardResult } from "./schema-guard";
 
 /** Ce folosim de la driver. Îngust dinadins: nimic de aici nu trebuie să
  *  cunoască mysql2, iar un dublu de test nu trebuie să-l implementeze. */
@@ -456,22 +458,97 @@ function describe(err: unknown): string {
 const POOL_KEY = Symbol.for("sentinel.aggregator.pool");
 type Holder = { [POOL_KEY]?: Pool };
 
+/**
+ * Învelește un pool ca fiecare `query()` să aștepte întâi garda de schemă din
+ * `lib/schema-guard.ts` — o singură dată cât trăiește ÎNVELIȘUL, nu o dată pe
+ * interogare. Vezi capul lui `schema-guard.ts` pentru CE verifică; aici e doar
+ * cablarea: cine apelează, cât ține minte, și ce înseamnă „nu ține minte".
+ *
+ * Un obiect plan, nu un `Proxy` peste pool-ul brut al lui mysql2: pool-ul e un
+ * `EventEmitter` care își scrie singur câmpuri interne (`this.x = …`) prin
+ * metodele lui, iar un `Proxy` fără capcană `set` explicită le-ar redirecționa
+ * pe RECEIVER (învelișul), nu pe `target` — o corupere tăcută a stării
+ * driverului, pe drumul care duce spre baza de PRODUCȚIE. `Pool` din fișierul
+ * ăsta e dinadins îngust (`query`, `end`, `on`), deci un obiect scris de mână
+ * care deleagă exact cele trei metode e mai simplu ȘI mai sigur decât orice
+ * încercare de a fi „transparent" cu un Proxy.
+ *
+ * ## Ce ține minte, și ce NU
+ *
+ * Un refuz REAL (`not-installed`, `outdated`) nu se rezolvă singur cât
+ * procesul trăiește — schimbarea vine dintr-un `npm run migrate` urmat de un
+ * restart, exact ciclul din `README.md`. Deci se ține minte, ca fiecare
+ * interogare de după prima să nu mai plătească din nou recensământul pe
+ * `schema_version`.
+ *
+ * Un `unknown` (baza n-a putut fi întrebată acum) NU se ține minte: altfel un
+ * singur blip de rețea la pornire ar bloca definitiv procesul, chiar după ce
+ * baza redevine sănătoasă — exact genul de eșec permanent dintr-o cădere
+ * trecătoare împotriva căruia scrie `docs/ARHITECTURA.md` §3.13. La fel, o
+ * eroare care nu vine de la gardă (conexiune refuzată, timeout) nu e o
+ * concluzie despre SCHEMĂ, deci nici ea nu se ține minte.
+ */
+export function withSchemaGuard(
+  rawPool: Pool, check: (db: Db) => Promise<SchemaGuardResult> = checkSchemaGuard,
+): Pool {
+  let attempt: Promise<void> | null = null;
+
+  const ensure = (): Promise<void> => {
+    if (attempt) return attempt;
+    const running: Promise<void> = check(queryableDb(rawPool)).then((result) => {
+      if (!result.ok) throw new SchemaGuardError(result);
+    });
+    attempt = running.catch((err) => {
+      const sticky = err instanceof SchemaGuardError && err.result.kind !== "unknown";
+      if (!sticky) attempt = null;
+      throw err;
+    });
+    return attempt;
+  };
+
+  return {
+    async query(sql: string, params?: unknown[]) {
+      await ensure();
+      return rawPool.query(sql, params);
+    },
+    end: () => rawPool.end(),
+    on: (event, handler) => rawPool.on(event, handler),
+  };
+}
+
 // `Env` scris pe față, nu dedus din `process.env`: tipul dedus ar fi
 // `NodeJS.ProcessEnv`, iar Next îl augmentează cu un `NODE_ENV` OBLIGATORIU —
 // deci orice apelant care dă un mediu de probă (testele) ar trebui să inventeze
 // o valoare pentru o variabilă care nu are nicio treabă cu baza de date. Ce
 // citește funcția e chiar `Env` din `lib/env.ts`.
-export function getPool(factory?: PoolFactory, env: Env = process.env): Pool {
+//
+// `guardCheck` există DOAR pentru `tests/db.test.ts`, ca proba „`getPool()`
+// fără `factory` leagă garda" să nu ceară MariaDB la capăt: pool-ul lui mysql2
+// e lazy — `createPool()` nu deschide nicio conexiune —, deci un `guardCheck`
+// injectat poate respinge sau accepta ÎNAINTE ca `query()` să atingă vreodată
+// rețeaua. Neprimit, cade pe implicitul lui `withSchemaGuard`
+// (`checkSchemaGuard`), exact ca pe drumul de producție.
+export function getPool(
+  factory?: PoolFactory, env: Env = process.env,
+  guardCheck?: (db: Db) => Promise<SchemaGuardResult>,
+): Pool {
   const holder = globalThis as unknown as Holder;
   const existing = holder[POOL_KEY];
   if (existing) return existing;
 
   const make: PoolFactory = factory ?? ((options) => mysql().createPool(options) as Pool);
-  const pool = make(buildPoolOptions(readDbConfig(env)));
+  const rawPool = make(buildPoolOptions(readDbConfig(env)));
   // AICI, nu în fabrica implicită: cârligul trebuie să prindă și pool-ul dat de
   // un apelant, altfel „toate conexiunile” ar însemna de fapt „cele pe care
-  // le-am făcut eu”. Se înregistrează o singură dată, ca și pool-ul.
-  pool.on("connection", (connection) => initPooledConnection(connection));
+  // le-am făcut eu”. Se înregistrează o singură dată, ca și pool-ul — pe
+  // pool-ul BRUT, dinadins: garda de schemă de mai jos învelește doar `query`,
+  // iar `sql_mode` trebuie pus pe fiecare conexiune nouă indiferent de gardă.
+  rawPool.on("connection", (connection) => initPooledConnection(connection));
+  // Garda se pune DOAR pe drumul driverului real (`factory` nesetat): un
+  // dublu de test dat de un apelant nu vorbește cu MariaDB, deci n-are ce
+  // schemă să apere — vezi `lib/schema-guard.ts` și `tests/schema-guard.test.ts`
+  // pentru proba directă a învelișului, fără să treacă prin `getPool`.
+  const pool = factory === undefined ? withSchemaGuard(rawPool, guardCheck) : rawPool;
   holder[POOL_KEY] = pool;
   return pool;
 }

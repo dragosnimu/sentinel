@@ -19,7 +19,9 @@ import assert from "node:assert/strict";
 
 import { buildPoolOptions, closePool, getPool, queryableDb } from "../lib/db";
 import { readDbConfig } from "../lib/env";
+import { SchemaGuardError } from "../lib/schema-guard";
 import type { Pool, Queryable } from "../lib/db";
+import type { SchemaGuardResult } from "../lib/schema-guard";
 
 const ENV = {
   AGGREGATOR_DB_USER: "u",
@@ -111,4 +113,55 @@ test("`all` întoarce rândurile, `run` nu se uită la ce a întors", async () =
   await db.run("CREATE TABLE t (id INT)");
   assert.deepEqual(calls.map((c) => c[0]), ["SELECT 1", "CREATE TABLE t (id INT)"]);
   assert.deepEqual(calls[0][1], ["x"]);
+});
+
+// ---------------------------------------------------------------------------
+// Garda de schemă: cine o primește prin `getPool`, și cine n-o primește
+// ---------------------------------------------------------------------------
+
+test("`getPool` FĂRĂ `factory` (driverul real) leagă garda de schemă", async () => {
+  // Proba pe care restul suitei n-o poate da: `withSchemaGuard` e testat izolat
+  // în `tests/schema-guard.test.ts`, dar nimic de acolo dovedește că `getPool`
+  // chiar îl pune pe drumul driverului REAL — cel pe care `factory` NU e dat,
+  // adică exact drumul pe care merg `lib/auth/context.ts`, ruta de sincronizare
+  // și cea de retenție.
+  //
+  // Fără MariaDB la capăt: pool-ul lui mysql2 e LAZY — `createPool()` nu
+  // deschide nicio conexiune —, deci se poate crea pool-ul REAL și totuși nu se
+  // atinge rețeaua, cât timp `guardCheck` injectat respinge ÎNAINTE ca vreo
+  // interogare să ajungă la `rawPool.query`. Dacă ternarul din `getPool` s-ar
+  // inversa sau s-ar șterge, `pool.query` ar fi cel al lui mysql2 direct —
+  // fie ar arunca imediat pe opțiuni greșite, fie ar încerca o conexiune reală
+  // la `127.0.0.1:3306`, nu s-ar opri cu `SchemaGuardError`.
+  await closePool();
+  try {
+    let checked = 0;
+    const pool = getPool(undefined, ENV, async (): Promise<SchemaGuardResult> => {
+      checked++;
+      return { ok: false, kind: "unknown", detail: "probă — fără MariaDB aici" };
+    });
+    await assert.rejects(pool.query("SELECT 1"), SchemaGuardError);
+    assert.equal(checked, 1, "`getPool` fără factory n-a chemat garda deloc");
+  } finally {
+    await closePool();
+  }
+});
+
+test("`getPool` CU `factory` explicit nu trece prin gardă", async () => {
+  // Cealaltă jumătate: dublurile de test (toate cele din `tests/*-harness.ts`)
+  // dau un `factory`, iar ele n-au nicio schemă de apărat. Dacă garda s-ar
+  // aplica și acolo, fiecare test care folosește un asemenea dublu ar trebui
+  // să știe să răspundă la interogările ei — ceea ce niciunul nu face azi.
+  await closePool();
+  try {
+    const pool = getPool(() => ({
+      async query() { return [[{ n: "1" }], []]; },
+      async end() { /* nimic */ },
+      on() { return this; },
+    }), ENV);
+    const [rows] = await pool.query("SELECT 1");
+    assert.deepEqual(rows, [{ n: "1" }]);
+  } finally {
+    await closePool();
+  }
 });
