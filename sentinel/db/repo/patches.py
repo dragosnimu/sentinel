@@ -21,6 +21,16 @@ from sentinel.db.engine import Database
 # installed versions it was written against have probably moved on.
 PLAN_TTL_HOURS = 72
 
+# Funcționalitatea 08 runs weekly, not on the 15-second push loop's clock, so
+# PLAN_TTL_HOURS (72h) is the wrong bound for it: a plan generated on Tuesday
+# night would already be gone by the time Monday's window looked at it. A
+# candidate is instead allowed a full monthly restore-drill cycle (plus
+# slack) to become eligible before the window stops considering it at all —
+# long enough that a plan is not dropped before it could ever be proven,
+# short enough that "arbitrarily old" (found on review: window_candidate_plans
+# had no age bound whatsoever) cannot happen.
+WINDOW_CANDIDATE_MAX_AGE_DAYS = 30
+
 
 @dataclass
 class PlanRow:
@@ -459,21 +469,30 @@ async def live_restore_points_with_last_drill(db: Database) -> list[dict[str, An
 
 
 # --- patch window (Funcționalitatea 08) --------------------------------------
-async def window_candidate_plans(db: Database, *, limit: int = 10) -> list[PlanRow]:
+async def window_candidate_plans(db: Database, *, limit: int = 10,
+                                 max_age_days: int = WINDOW_CANDIDATE_MAX_AGE_DAYS
+                                 ) -> list[PlanRow]:
     """Planuri validate pe care fereastra nu le-a considerat încă „eliberate".
 
     Ordonate de la cel mai vechi: un plan care așteaptă de o săptămână are
     prioritate față de unul generat aseară — altfel unul nou ar sări mereu
     înainte și cele vechi n-ar mai ajunge niciodată evaluate.
+
+    Mărginit la `max_age_days`: fără plafon, un plan validat acum patru luni
+    ar rămâne veșnic primul candidat (fiind cel mai vechi) și ar putea fi
+    eliberat oricând ar deveni eligibil, oricât de departe în timp — găsit la
+    revizuire, nu presupus. `PLAN_TTL_HOURS` (72h) e prea scurt pentru
+    cadența săptămânală a ferestrei; vezi `WINDOW_CANDIDATE_MAX_AGE_DAYS`.
     """
     rows = await db.fetch(
         f"""
         SELECT {_PLAN_COLS} FROM patch_plans
         WHERE status = 'validated' AND NOT proposed_by_window
+          AND created_at > now() - make_interval(days => $1)
         ORDER BY created_at
-        LIMIT $1
+        LIMIT $2
         """,
-        limit)
+        max_age_days, limit)
     return [_plan(r) for r in rows]
 
 
@@ -499,15 +518,54 @@ async def mark_proposed_by_window(db: Database, plan_db_id: int) -> None:
         "UPDATE patch_plans SET proposed_by_window = true WHERE id = $1", plan_db_id)
 
 
+# --- the informational notice: "generated" is not the same fact as "proposed"
+async def unnotified_window_gated_plans(db: Database, *, limit: int = 3) -> list[PlanRow]:
+    """Planuri AI, ținute deja în afara canalului de aprobare rapidă, cărora
+    nimeni nu le-a spus încă operatorului că există.
+
+    Găsit la revizuire (runda 2): fără asta, un plan generat de KEV putea sta
+    nevăzut o lună întreagă — cât durează primul exercițiu de restaurare care
+    l-ar putea face eligibil — fiindcă `unnotified_plans` îl ține în afara
+    canalului de aprobare exact pentru asta. „Nu poate fi aplicat automat" și
+    „nu trebuie să afli că există" sunt fapte diferite; coloana asta le
+    desparte de `notified_at`, care rămâne strict despre butonul de aprobare.
+
+    O dată eliberat de fereastră, planul nu mai are nevoie de-al doilea anunț
+    — `unnotified_plans` preia direct, prin `proposed_by_window`.
+    """
+    rows = await db.fetch(
+        f"""
+        SELECT {_PLAN_COLS} FROM patch_plans
+        WHERE window_notice_sent_at IS NULL AND status = 'validated'
+          AND generated_by = 'ai' AND NOT proposed_by_window
+        ORDER BY created_at
+        LIMIT $1
+        """,
+        limit)
+    return [_plan(r) for r in rows]
+
+
+async def mark_window_notice_sent(db: Database, plan_db_id: int) -> None:
+    await db.execute(
+        "UPDATE patch_plans SET window_notice_sent_at = now() WHERE id = $1", plan_db_id)
+
+
 async def window_halt(db: Database) -> dict[str, Any] | None:
     """Execuția care a oprit fereastra, dacă vreuna dintre propunerile ei a
-    eșuat la aplicare — sau `None` dacă fereastra poate propune în continuare.
+    eșuat la aplicare și n-a fost trecută cu vederea încă — sau `None` dacă
+    fereastra poate propune în continuare.
 
-    Cea mai VECHE execuție eșuată, nu cea mai nouă: „oprire la primul eșec"
-    înseamnă că raportul arată planul care a declanșat oprirea, nu ultimul din
-    listă. Recalculată la fiecare apel, din `patch_executions` +
-    `patch_plans.proposed_by_window` — nicio stare separată de „oprit" nu se
-    ține minte, ca să nu existe două surse de adevăr care se pot contrazice.
+    Cea mai VECHE execuție eșuată FĂRĂ derogare, nu cea mai nouă: „oprire la
+    primul eșec" înseamnă că raportul arată planul care a declanșat oprirea,
+    nu ultimul din listă. Recalculată la fiecare apel, din `patch_executions`
+    + `patch_plans.proposed_by_window` + `patch_window_overrides` — nicio
+    stare separată de „oprit" nu se ține minte, ca să nu existe două surse de
+    adevăr care se pot contrazice.
+
+    Derogarea (`patch_window_overrides`) exclude o execuție anume, nu
+    rescrie `patch_executions.status`: un operator poate decide să treacă
+    peste eșecul UNEI execuții, fără să pretindă că n-a eșuat — vezi
+    migrația 0043 pentru raționament.
     """
     row = await db.fetchrow(
         """
@@ -516,10 +574,28 @@ async def window_halt(db: Database) -> dict[str, Any] | None:
         JOIN patch_plans p ON p.id = e.plan_id
         WHERE p.proposed_by_window AND e.mode = 'apply'
           AND e.status IN ('failed', 'rolled_back', 'rollback_failed')
+          AND NOT EXISTS (
+              SELECT 1 FROM patch_window_overrides o WHERE o.execution_id = e.id
+          )
         ORDER BY e.finished_at ASC
         LIMIT 1
         """)
     return dict(row) if row else None
+
+
+async def record_window_override(db: Database, *, execution_id: int, by: str,
+                                 reason: str) -> int:
+    """Scrie un rând NOU care spune cine a decis să treacă peste eșecul unei
+    execuții — nu un `UPDATE` pe `patch_executions`, care ar rescrie istoricul
+    exact pe care restul acestui modul îl declară de nerescris. Vezi
+    migrația 0043 și `window_halt` mai sus."""
+    return int(await db.fetchval(
+        """
+        INSERT INTO patch_window_overrides (created_by, execution_id, reason)
+        VALUES ($1, $2, $3)
+        RETURNING id
+        """,
+        by, execution_id, reason[:2000]))
 
 
 async def latest_archive_drill_summary(db: Database) -> dict[str, Any] | None:
@@ -531,6 +607,11 @@ async def latest_archive_drill_summary(db: Database) -> dict[str, Any] | None:
     singur: un exercițiu care a extras două arhive, una bună și una coruptă,
     nu are voie să raporteze doar partea bună — vezi
     `restore_drill.py`, aceeași regulă la nivel de punct.
+
+    Vârsta se calculează AICI, cu ceasul bazei — nu în Python cu ceasul
+    procesului care rulează verificarea — din același motiv ca la
+    `check_last_scan`: un decalaj de ceas ar apărea ca o vechime inventată,
+    iar un test care îngheață un „acum" din Python nu mai are cu ce compara.
     """
     row = await db.fetchrow(
         """
@@ -569,9 +650,16 @@ async def record_window_run(db: Database, *, candidates: int,
 
 
 async def last_window_run(db: Database) -> dict[str, Any] | None:
+    """Ultima rulare, cu vârsta ei calculată de bază (`age_min`), nu de
+    Python: un test care îngheață un ceas fals ar trece azi și ar pica singur
+    peste `PATCH_WINDOW_STALE_DAYS` zile, fără nicio schimbare de cod, dacă
+    vârsta s-ar calcula din `datetime.now()` la citire — exact defectul găsit
+    la revizuire. Rescris ca la `check_restore_drill`/`drill_age_min`: vârsta
+    e o coloană calculată în interogare, verificarea doar o citește."""
     row = await db.fetchrow(
         """
-        SELECT id, ran_at, candidates, proposed_plan_id, halted, detail, skipped
+        SELECT id, ran_at, candidates, proposed_plan_id, halted, detail, skipped,
+               EXTRACT(EPOCH FROM (now() - ran_at)) / 60 AS age_min
         FROM patch_window_runs ORDER BY ran_at DESC LIMIT 1
         """)
     if row is None:

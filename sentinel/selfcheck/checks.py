@@ -2885,11 +2885,15 @@ async def check_patch_window(db: Database) -> list[CheckResult]:
                    "planuri de patch» și «fereastra le-a luat în considerare» "
                    "nu sunt același fapt",
             action="systemctl start sentinel-patch-window ; "
-                   "journalctl -u sentinel-patchwindow -n 50",
+                   "journalctl -u sentinel-patch-window -n 50",
             facts={"ran": False})]
 
-    from datetime import datetime, timezone
-    age_min = (datetime.now(timezone.utc) - last_run["ran_at"]).total_seconds() / 60
+    # Vârsta vine DEJA calculată de bază (`age_min`, din `last_window_run`),
+    # nu dintr-un `datetime.now()` citit aici: un test care îngheață un ceas
+    # fals pentru `ran_at` ar trece azi și ar pica singur, fără nicio
+    # schimbare de cod, în ziua în care ceasul REAL depășește pragul —
+    # defect găsit la revizuire. Motivul e același ca la `drill_age_min`.
+    age_min = float(last_run["age_min"])
     if age_min > PATCH_WINDOW_STALE_DAYS * 24 * 60:
         return [CheckResult(
             "patch_window:any", "Fereastra de reparare — timer învechit", "degraded",
@@ -2897,7 +2901,7 @@ async def check_patch_window(db: Database) -> list[CheckResult]:
                    f"{PATCH_WINDOW_STALE_DAYS} zile — sentinel-patch-window.timer "
                    f"nu mai rulează la timp",
             action="systemctl list-timers sentinel-patch-window.timer ; "
-                   "journalctl -u sentinel-patchwindow -n 50",
+                   "journalctl -u sentinel-patch-window -n 50",
             facts={"ran": True, "age_days": int(age_min / 60 / 24)})]
 
     halt = await patch_repo.window_halt(db)

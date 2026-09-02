@@ -74,6 +74,31 @@ unde singurul rollback încercat vreodată a eșuat (măsurat 1 septembrie
 genul de „recuperare tăcută" pe care restul acestui depozit îl refuză (vezi
 watchdog-ul, care golește blocklist-ul în loc să presupună că un detector în
 buclă de restart e, totuși, de încredere).
+
+Desfacerea nu e „fără cale", e fără cale PRIN TELEGRAM. `patch_window_overrides`
+(migrația 0043) ține câte un rând per execuție iertată — cine, când, de ce —
+niciodată un `UPDATE` pe `patch_executions`, care ar rescrie exact istoricul
+pe care `sentinel/db/repo/patches.py` îl declară scris-înainte-de-fapt și de
+nerescris. Scrierea rândului e azi manuală (psql / un script revizuit
+separat): CINE poate ierta un eșec, prin ce ceremonie, e o decizie a
+operatorului, nu ceva ce agentul a decis unilateral aici.
+
+## Anunțul informativ — „generat" nu e „propus"
+
+Runda 2 a arătat regresia: cu poarta de mai sus, un plan AI ținut în afara
+canalului rapid de aprobare (`unnotified_plans`) putea rămâne INVIZIBIL o
+lună întreagă — cât durează primul exercițiu de restaurare care l-ar putea
+face eligibil. „Nu poate fi aplicat automat" și „nu trebuie să afli că
+există" sunt fapte diferite, iar poarta de eligibilitate n-are voie să le
+amestece.
+
+`sentinel/telegram/bot.py:_push_window_gated_notices` trimite, o singură
+dată, un mesaj FĂRĂ buton de aplicare pentru fiecare plan AI încă neeliberat
+— `patches.unnotified_window_gated_plans` / `mark_window_notice_sent`,
+independente de `notified_at` (care rămâne strict despre butonul de
+aprobare). Modulul de față nu trimite nimic el însuși: `evaluate()` produce
+doar motivul, iar `bot.py` îl pune în text — păstrează separarea „acest
+modul nu vorbește cu Telegram" cerută de `test_telegram_names_its_instance.py`.
 """
 
 from __future__ import annotations

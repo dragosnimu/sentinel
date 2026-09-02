@@ -1125,6 +1125,46 @@ async def _push_plans(app: Application, cfg: Config, db: Database,
                       extra={"plan": row.id})
 
 
+async def _push_window_gated_notices(app: Application, cfg: Config, db: Database,
+                                     quiet_chats: set[int]) -> None:
+    """Spune că un plan a fost generat, chiar dacă fereastra săptămânală
+    (Funcționalitatea 08) nu l-a putut elibera încă — fără niciun buton de
+    aplicare.
+
+    `unnotified_plans` ține planurile AI în afara canalului rapid de aprobare
+    până când fereastra le dovedește eligibile — corect, dar găsit la
+    revizuire: asta, luat SINGUR, făcea planul INVIZIBIL, nu doar
+    neaplicabil automat, timp de o lună întreagă (cât durează primul
+    exercițiu de restaurare care l-ar putea face eligibil). „Nu poate fi
+    aplicat automat" și „nu trebuie să afli că există" sunt fapte diferite;
+    funcția asta acoperă a doua jumătate, fără să atingă prima — nimic de
+    aici nu cheamă `send_plan_for_approval`, `approve_plan` sau `runner`, iar
+    singura cale de aplicare rămâne cele două atingeri din `patch_flow`.
+
+    Ca la planuri: reținut ca netrimis până ajunge la cineva, nu abandonat la
+    primul eșec de livrare — vezi `_push_plans` mai sus, același motiv.
+    """
+    from sentinel.db.repo import patches as patch_repo
+    from sentinel.patch import window
+    from sentinel.telegram import patch_flow
+
+    rows = await patch_repo.unnotified_window_gated_plans(db)
+    if not rows:
+        return
+    evidence = await patch_repo.latest_archive_drill_summary(db)
+    for row in rows:
+        gate = window.evaluate(row.plan, evidence)
+        text = patch_flow.format_window_notice(row, gate.reason)
+        sent = await _broadcast(app, cfg, text, quiet_chats=quiet_chats)
+        if sent:
+            await patch_repo.mark_window_notice_sent(db, row.id)
+            log.warning("patch window notice pushed",
+                        extra={"plan": row.id, "chats": sent})
+        else:
+            log.error("patch window notice reached nobody — will retry",
+                      extra={"plan": row.id})
+
+
 async def _push_executions(app: Application, cfg: Config, db: Database,
                           quiet_chats: set[int]) -> None:
     from sentinel.db.repo import patches as patch_repo
@@ -1199,6 +1239,7 @@ async def _push_loop(app: Application, cfg: Config, db: Database) -> None:
     # Each source is isolated: a failure in one must not stop the others. An
     # exception in the plan query used to be enough to stop incident alerts.
     sources = (("incidents", _push_incidents), ("plans", _push_plans),
+               ("plan_notices", _push_window_gated_notices),
                ("executions", _push_executions),
                ("notifications", _push_notifications))
     while True:

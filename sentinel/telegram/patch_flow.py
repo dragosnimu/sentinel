@@ -76,6 +76,37 @@ def format_plan(row: patches.PlanRow) -> str:
     return "\n".join(lines)
 
 
+def format_window_notice(row: patches.PlanRow, reason: str) -> str:
+    """Anunț informativ despre un plan generat, FĂRĂ buton de aplicare.
+
+    Funcționalitatea 08, runda 2: `unnotified_plans` ține un plan AI în afara
+    canalului de aprobare până când fereastra îl eliberează — corect, dar
+    tăcerea completă până atunci confunda „nu poate fi aplicat automat" cu
+    „nu trebuie să afli că există". Mesajul ăsta e trimis O SINGURĂ DATĂ, nu
+    e reluat dacă motivul se schimbă, exact ca butonul de aprobare din
+    `send_plan_for_approval` — și, la fel ca acolo, nu conține nimic care
+    autorizează o schimbare pe mașină: `/patch <id>` rămâne singura cale
+    către cele două atingeri.
+    """
+    plan = row.plan
+    target = plan.get("target", {})
+    vulns = plan.get("vulnerabilities", [])
+
+    from sentinel.intel.links import cve_html
+
+    cves = " · ".join(cve_html(v.get("cve"), rpm=True)
+                      for v in vulns[:4] if v.get("cve")) or "—"
+    lines = [
+        f"📋 <b>Plan de patch #{row.id} generat</b> — {_esc(target.get('asset_name', '?'))}",
+        f"<b>Vulnerabilități:</b> {cves}",
+        "",
+        f"Nu e propus automat pentru aprobare: {_esc(reason)}",
+        "",
+        f"Poate fi revizuit manual cu <code>/patch {row.id}</code>.",
+    ]
+    return "\n".join(lines)
+
+
 async def send_plan_for_approval(bot: Any, db: Database, chat_id: int,
                                  row: patches.PlanRow) -> None:
     """Offer a validated plan. Dry-run needs no token; apply starts stage 1."""

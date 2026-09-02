@@ -87,6 +87,44 @@ def test_a_window_released_plan_bypasses_the_recency_filter(monkeypatch):
     assert "make_interval(hours => $1) OR proposed_by_window)" in sql
 
 
+def test_the_predicate_actually_excludes_ai_plans_when_executed():
+    """Interogarea asta decide ce ajunge pe telefon — nu e destul s-o citești.
+
+    Găsit la revizuire: o aserțiune pe SUBȘIRUL clauzei trece chiar dacă
+    cineva adaugă ` OR TRUE` la coada ei — precedența SQL face din
+    `A AND B OR TRUE` un `(A AND B) OR TRUE`, adică „orice rând", și
+    `3743 passed` n-a observat nimic. Testul ăsta EXECUTĂ clauza (peste
+    SQLite; `now() - make_interval(...)` legat la un literal, `$n` la `?`,
+    singurele substituții — decizia de filtrare rămâne verbatim) peste rânduri
+    concrete, ca o asemenea mutație să producă un rezultat greșit observabil.
+    """
+    import sqlite3
+
+    db = _StubDB()
+    run(repo.unnotified_plans(db))
+    where = db.sql[0].split("WHERE", 1)[1].split("ORDER BY", 1)[0]
+    cutoff = "2026-08-01T00:00:00+00:00"
+    where_sqlite = where.replace("now() - make_interval(hours => $1)", "?")
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE patch_plans (id INTEGER, notified_at TEXT, status TEXT, "
+                 "created_at TEXT, generated_by TEXT, proposed_by_window INTEGER)")
+    fresh = "2026-08-15T00:00:00+00:00"
+    stale = "2026-01-01T00:00:00+00:00"
+    conn.executemany("INSERT INTO patch_plans VALUES (?,?,?,?,?,?)", [
+        (1, None, "validated", fresh, "ai", 0),      # AI, not released -> EXCLUDED
+        (2, None, "validated", fresh, "ai", 1),      # AI, released -> included
+        (3, None, "validated", stale, "ai", 0),      # AI, stale, not released -> EXCLUDED
+        (4, None, "validated", stale, "ai", 1),      # AI, stale, released -> included
+        (5, None, "validated", fresh, "manual", 0),  # not AI -> included
+        (6, None, "rejected", fresh, "manual", 0),   # wrong status -> EXCLUDED
+        (7, "x", "validated", fresh, "manual", 0),   # already notified -> EXCLUDED
+    ])
+    sql = f"SELECT id FROM patch_plans WHERE {where_sqlite}"
+    matched = {r[0] for r in conn.execute(sql, (cutoff,))}
+    assert matched == {2, 4, 5}, matched
+
+
 def test_telegram_triggered_executions_are_not_announced_twice():
     """`on_dry_run` edits its own message with the result. A second message
     saying the same thing teaches the operator that these can be ignored."""
@@ -320,3 +358,127 @@ def test_a_plan_that_reached_nobody_is_retried():
     src = inspect.getsource(bot._push_plans)
     assert "if sent:" in src
     assert "mark_plan_notified" in src.split("if sent:")[1].split("else:")[0]
+
+
+# --- the informational notice (Funcționalitatea 08, runda 2) ----------------
+# «Nu poate fi aplicat automat» și «nu trebuie să afli că există» sunt fapte
+# diferite. `unnotified_plans` corect ține un plan AI în afara canalului
+# rapid de aprobare pana e eliberat de fereastra; testele de aici verifică
+# separat că EXISTENȚA lui ajunge oricum la operator, fără niciun buton.
+def _notice_plan(id_=7, asset_name="nginx"):
+    return SimpleNamespace(
+        id=id_,
+        plan={"target": {"asset_name": asset_name},
+              "vulnerabilities": [{"cve": "CVE-2026-1", "finding_id": 1,
+                                   "package": "nginx", "severity": "high"}]})
+
+
+def test_the_notice_names_the_plan_and_the_reason_but_offers_no_button():
+    pytest.importorskip("telegram")
+    from sentinel.telegram import patch_flow
+
+    text = patch_flow.format_window_notice(
+        _notice_plan(), "niciun exercitiu de restaurare n-a atins o arhiva")
+    assert "#7" in text
+    assert "nginx" in text
+    assert "niciun exercitiu de restaurare" in text
+    assert "/patch 7" in text
+    # Textul e trimis prin `_broadcast`, care nu primește niciun `kb` de la
+    # `format_window_notice` — funcția întoarce doar text, nu markup.
+    assert not isinstance(text, tuple)
+
+
+def test_the_notice_path_never_touches_approval_or_execution():
+    """Aserțiune structurală, ca `test_generation_is_not_application`: nimic
+    din calea asta n-are voie să apeleze fluxul de aprobare sau executorul."""
+    pytest.importorskip("telegram")
+    import inspect
+
+    from sentinel.telegram import bot
+    src = inspect.getsource(bot._push_window_gated_notices)
+    # Doar CORPUL, după docstring: docstring-ul chiar NUMEȘTE
+    # `send_plan_for_approval` ca să spună că nu-l cheamă, iar o aserțiune pe
+    # tot fișierul ar pica pe propria ei explicație.
+    body = src.split('"""', 2)[-1]
+    for forbidden in ("send_plan_for_approval", "approve_plan", "run_plan"):
+        assert forbidden not in body, f"{forbidden} apare în corpul anunțului informativ"
+
+
+def test_a_delivered_notice_is_marked_sent(monkeypatch):
+    """Executat, nu doar citit: livrarea reușită trebuie să oprească
+    retrimiterea, iar una eșuată trebuie să lase planul netrimis pentru
+    reîncercare — la fel ca la butonul de aprobare."""
+    pytest.importorskip("telegram")
+    from sentinel.db.repo import patches as patch_repo
+    from sentinel.telegram import bot
+
+    plan = _notice_plan(id_=11)
+    marked: list[int] = []
+
+    async def _rows(db):
+        return [plan]
+
+    async def _evidence(db):
+        return None
+
+    async def _mark(db, plan_id):
+        marked.append(plan_id)
+
+    monkeypatch.setattr(patch_repo, "unnotified_window_gated_plans", _rows)
+    monkeypatch.setattr(patch_repo, "latest_archive_drill_summary", _evidence)
+    monkeypatch.setattr(patch_repo, "mark_window_notice_sent", _mark)
+
+    sent_to: list[int] = []
+
+    async def send_message(chat_id, text, **kw):
+        sent_to.append(chat_id)
+
+    app = SimpleNamespace(bot=SimpleNamespace(send_message=send_message))
+    cfg = SimpleNamespace(telegram=SimpleNamespace(allowed_chat_ids=[111]))
+
+    run(bot._push_window_gated_notices(app, cfg, object(), set()))
+
+    assert sent_to == [111]
+    assert marked == [11]
+
+
+def test_a_notice_that_reached_nobody_is_not_marked_sent(monkeypatch):
+    pytest.importorskip("telegram")
+    from sentinel.db.repo import patches as patch_repo
+    from sentinel.telegram import bot
+
+    plan = _notice_plan(id_=12)
+    marked: list[int] = []
+
+    async def _rows(db):
+        return [plan]
+
+    async def _evidence(db):
+        return None
+
+    async def _mark(db, plan_id):
+        marked.append(plan_id)
+
+    monkeypatch.setattr(patch_repo, "unnotified_window_gated_plans", _rows)
+    monkeypatch.setattr(patch_repo, "latest_archive_drill_summary", _evidence)
+    monkeypatch.setattr(patch_repo, "mark_window_notice_sent", _mark)
+
+    async def send_message(chat_id, text, **kw):
+        raise RuntimeError("chat not found")
+
+    app = SimpleNamespace(bot=SimpleNamespace(send_message=send_message))
+    cfg = SimpleNamespace(telegram=SimpleNamespace(allowed_chat_ids=[111]))
+
+    run(bot._push_window_gated_notices(app, cfg, object(), set()))
+
+    assert marked == []
+
+
+def test_the_notice_source_is_registered_in_the_push_loop():
+    pytest.importorskip("telegram")
+    import inspect
+
+    from sentinel.telegram import bot
+    src = inspect.getsource(bot._push_loop)
+    assert '"plan_notices"' in src
+    assert "_push_window_gated_notices" in src
