@@ -54,6 +54,14 @@ export type SchemaGuardResult =
   | { ok: false; kind: "not-installed" }
   /** Nu se poate ști. Nu se confundă cu „bine". */
   | { ok: false; kind: "unknown"; detail: string }
+  /** `discover(dir)` a picat pe ENOENT/ENOTDIR: directorul de migrații nu
+   *  există pe mașina care servește, sau nu e director. NU e o stare a
+   *  schemei — schema n-a fost măcar întrebată — e o eroare de împachetare a
+   *  livrării: `migrations/` n-a ajuns în arhiva urcată pe găzduire. Spre
+   *  deosebire de `unknown`, cauza nu se rezolvă singură cât trăiește
+   *  procesul (nu e un blip trecător de rețea), deci `withSchemaGuard` din
+   *  `lib/db.ts` o ține minte la fel ca `not-installed` și `outdated`. */
+  | { ok: false; kind: "migrations-unreadable"; dir: string }
   /** `schema_version` există, dar codul cunoaște instrucțiuni pe care
    *  registrul nu le are consemnate (`missing`) — sau le are consemnate cu
    *  altă sumă de control decât fișierul de azi, adică migrația a fost
@@ -68,13 +76,25 @@ export type SchemaGuardResult =
  * NU rulează nimic și nu scrie nimic — o singură gardă de tabelă plus câte o
  * interogare pe registru per migrație cunoscută, aceeași formă ca `ledgerFor`
  * din `lib/migrate.ts`. Cade pe `discover()` dacă directorul de migrații e
- * stricat — la fel ca la migrare, un fișier cu numele greșit e o eroare de
- * cod, nu o stare de schemă, deci nu se transformă într-un `SchemaGuardResult`.
+ * stricat pe FOND — un fișier cu numele greșit, o versiune dublată — e o
+ * eroare de cod, nu o stare de schemă, deci nu se transformă într-un
+ * `SchemaGuardResult`. Singura excepție e când directorul însuși lipsește
+ * (ENOENT) sau nu e director (ENOTDIR): aia nu e un defect în migrații, e
+ * livrarea care nu l-a trimis — vezi `kind: "migrations-unreadable"`.
  */
 export async function checkSchemaGuard(
   db: Db, dir: string = MIGRATIONS_DIR,
 ): Promise<SchemaGuardResult> {
-  const migrations = discover(dir);
+  let migrations: ReturnType<typeof discover>;
+  try {
+    migrations = discover(dir);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | null)?.code;
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      return { ok: false, kind: "migrations-unreadable", dir };
+    }
+    throw err;
+  }
 
   const tablePresent = await guardPresent(db, { kind: "table", table: "schema_version" });
   if (tablePresent === false) return { ok: false, kind: "not-installed" };
@@ -135,6 +155,10 @@ export function schemaGuardMessage(
     case "unknown":
       return `schema agregatorului nu se poate verifica: ${result.detail}. ` +
              "Nu se servesc cereri către bază pe o presupunere.";
+    case "migrations-unreadable":
+      return `directorul de migrații nu poate fi citit (${result.dir}). ` +
+             "Asta nu e baza de date căzută — arhiva de livrare probabil nu " +
+             "conține migrations/. Vezi lista din aggregator/README.md.";
     case "outdated": {
       const parts: string[] = [];
       if (result.missing.length) {

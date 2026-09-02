@@ -60,6 +60,33 @@ instrucțiuni din `0001_core.sql`, inclusiv cele două triggere, iar aplicarea d
 după le-a creat pe amândouă. Verificarea e mai puternică decât o descria textul —
 dar pe altă versiune verdictul se poate întoarce, și de-aia ramura rămâne.
 
+## Publicarea pe găzduire — ce intră în arhivă
+
+Procedura de publicare (arhivă de surse, fără `node_modules/` și fără `.next/`)
+e cea din `watcher/INCARCARE-HOSTINGER.md`. Lista de fișiere de acolo **nu se
+aplică neschimbată aici**:
+
+```
+app/  lib/  public/  migrations/
+package.json  package-lock.json  tsconfig.json  next.config.mjs
+```
+
+Diferența față de martor e `migrations/`, și e obligatorie, nu opțională.
+`lib/schema-guard.ts` verifică schema LA SERVIRE, prin `discover(MIGRATIONS_DIR)`
+din `lib/migrate.ts` — iar `MIGRATIONS_DIR` e calculat din `import.meta.url`,
+pe care compilarea îl înlocuiește cu calea absolută de pe mașina de BUILD. La
+runtime, deci, `discover()` face `readdirSync` pe `<rădăcina aplicației
+publicate>/migrations`. Fără `migrations/` în arhivă, garda nu poate citi
+directorul (`ENOENT`) chiar la prima cerere — vezi
+`kind: "migrations-unreadable"` din `lib/schema-guard.ts` pentru ce vede
+operatorul atunci și cum se deosebește de o bază picată.
+
+`bin/` (inclusiv `bin/migrate.ts`, care rulează efectiv migrațiile) **nu**
+intră în arhivă — rămâne neschimbat față de martor. Migrarea se rulează de pe
+mașina operatorului, cu `npm run migrate`, spre baza de la distanță (vezi
+„Rulare" mai sus); pe găzduire nu rulează niciodată `bin/migrate.ts`, doar
+citește conținutul din `migrations/` ca să-l compare cu registrul.
+
 ## Configurație
 
 Totul din mediu, nimic în cod — numele bazei și al utilizatorului conțin

@@ -160,6 +160,86 @@ test("information_schema orb: unknown, nu «bine» și nu «lipsește»", async 
   assert.equal(result.kind, "unknown");
 });
 
+test("director de migrații lipsă (ENOENT): stare distinctă, nu excepție brută", async () => {
+  // Eșecul din constatarea Părții 1: arhiva de livrare nu conține `migrations/`,
+  // deci `discover()` moare pe ENOENT la primul contact cu baza. Fără starea
+  // asta, `withSchemaGuard` propaga excepția brută, iar operatorul vedea
+  // „ENOENT: no such file or directory" în locul unde se aștepta un verdict
+  // despre schemă — arată ca o gazdă stricată, nu ca o arhivă incompletă.
+  const missing = path.join(tmp(), "nu-exista-niciodata");
+  const db = new FakeDb({ schemaVersionTable: 1 }); // n-ar trebui interogată deloc
+  const result = await checkSchemaGuard(db, missing);
+  assert.deepEqual(result, { ok: false, kind: "migrations-unreadable", dir: missing });
+  assert.deepEqual(db.asked, [], "checkSchemaGuard a interogat baza înainte să știe că poate citi migrațiile");
+});
+
+test("calea e un fișier, nu director (ENOTDIR): aceeași stare distinctă", async () => {
+  // A doua formă a aceleiași cauze: `dir` există, dar nu e director (de pildă
+  // o legătură greșită în scriptul de livrare). `readdirSync` dă ENOTDIR, nu
+  // ENOENT — dacă am fi verificat doar codul dintâi, cazul ăsta ar fi rămas
+  // să iasă ca excepție brută.
+  const dir = tmp();
+  fixture(dir, "chiar-un-fisier.txt", "continut");
+  const notADir = path.join(dir, "chiar-un-fisier.txt");
+  const db = new FakeDb({ schemaVersionTable: 1 });
+  const result = await checkSchemaGuard(db, notADir);
+  assert.deepEqual(result, { ok: false, kind: "migrations-unreadable", dir: notADir });
+});
+
+test("director prezent dar fără nicio migrație: rămâne eroarea de cod, " +
+     "NU se confundă cu «migrații lipsă»", async () => {
+  // Deosebirea pe care garda de test trebuie s-o facă: un director care EXISTĂ
+  // dar e gol (sau are doar bootstrap-ul) e un defect în migrații — verificat
+  // deja de `migrate.ts:168` cu un `MigrationError` propriu — nu o livrare
+  // incompletă. Dacă prinderea din `checkSchemaGuard` ar fi lăsată să înghită
+  // ORICE eroare din `discover()`, cazul ăsta ar deveni tăcut «arhiva nu are
+  // migrations/» în loc să rămână eroarea lui reală, iar operatorul ar căuta
+  // în arhiva de livrare o cauză care e de fapt un director gol pe bază.
+  const dir = tmp(); // gol — niciun fișier de migrație
+  const db = new FakeDb({ schemaVersionTable: 1 });
+  await assert.rejects(
+    checkSchemaGuard(db, dir),
+    (err: unknown) => err instanceof Error && /nicio migrație/.test(err.message),
+  );
+});
+
+test("mesajul stării «migrations-unreadable» numește directorul și arhiva, " +
+     "nu baza de date", () => {
+  // Operatorul care citește „baza de date nu răspunde" caută în locul greșit
+  // — exact simptomul din constatare. Mesajul trebuie să spună «arhivă», nu
+  // să lase impresia unei baze picate.
+  const dir = path.join("cale", "de", "test", "migrations");
+  const msg = schemaGuardMessage({ ok: false, kind: "migrations-unreadable", dir });
+  assert.ok(msg.includes(dir), "mesajul nu numește directorul care lipsește");
+  assert.match(msg, /arhiv/i);
+  // Nu se confundă cu celelalte trei stări — nici în formă, nici în conținut.
+  assert.doesNotMatch(msg, /nu e instalată/);
+  assert.doesNotMatch(msg, /nu se poate verifica/);
+  assert.doesNotMatch(msg, /în urma codului/);
+});
+
+test("withSchemaGuard: directorul de migrații lipsă rămâne refuzat, fără să " +
+     "recitească directorul la fiecare interogare", async () => {
+  // Lipiciozitatea cerută: dacă starea asta s-ar comporta ca «unknown», un
+  // deploy cu arhivă incompletă ar re-parcurge sistemul de fișiere la fiecare
+  // cerere din panou, în loc să refuze o dată și clar. Rulează `checkSchemaGuard`
+  // REAL (nu un dublu care doar întoarce «migrations-unreadable») ca proba să
+  // treacă prin `discover()` adevărat, nu printr-o presupunere despre el.
+  const missing = path.join(tmp(), "nu-exista-niciodata");
+  let calls = 0;
+  const check = async (db: Db): Promise<SchemaGuardResult> => {
+    calls++;
+    return checkSchemaGuard(db, missing);
+  };
+  const raw = fakeRawPool();
+  const pool = withSchemaGuard(raw, check);
+
+  await assert.rejects(pool.query("SELECT 1"), SchemaGuardError);
+  await assert.rejects(pool.query("SELECT 2"), SchemaGuardError);
+  assert.equal(calls, 1, "directorul de migrații lipsă a fost re-verificat în loc să rămână ținut minte");
+  assert.deepEqual(raw.queries, [], "interogări au ajuns la pool-ul brut cât garda refuza");
+});
+
 test("instrucțiune consemnată cu altă sumă de control: istorie rescrisă, " +
      "raportată separat de cea neaplicată", async () => {
   const dir = tmp();
