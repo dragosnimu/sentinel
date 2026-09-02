@@ -23,12 +23,17 @@ PLAN_TTL_HOURS = 72
 
 # Funcționalitatea 08 runs weekly, not on the 15-second push loop's clock, so
 # PLAN_TTL_HOURS (72h) is the wrong bound for it: a plan generated on Tuesday
-# night would already be gone by the time Monday's window looked at it. A
-# candidate is instead allowed a full monthly restore-drill cycle (plus
-# slack) to become eligible before the window stops considering it at all —
-# long enough that a plan is not dropped before it could ever be proven,
-# short enough that "arbitrarily old" (found on review: window_candidate_plans
-# had no age bound whatsoever) cannot happen.
+# night would already be gone by the time Monday's window looked at it.
+#
+# Runda 3 a arătat că NICIUN plafon finit e „destul de mare": exercițiul de
+# restaurare rulează lunar (ziua 1, 04:20), fereastra săptămânal (luni,
+# 04:45) — pe gazda reală, un plan generat pe 2-5 septembrie are nevoie de
+# 30-36 de zile ca să apuce exercițiul următor PLUS luni de după, ca să fie
+# dovedit. Orice plafon fix va fi, pentru unele planuri, exact la limită sau
+# sub ea — problema nu e numărul, e ce se întâmplă când plafonul e depășit.
+# Vezi `expire_stale_window_candidates`: depășirea plafonului trebuie să fie
+# PRODUCTIVĂ (planul e marcat expirat și deblochează un plan proaspăt la
+# scanarea următoare), nu o dispariție tăcută din `window_candidate_plans`.
 WINDOW_CANDIDATE_MAX_AGE_DAYS = 30
 
 
@@ -494,6 +499,39 @@ async def window_candidate_plans(db: Database, *, limit: int = 10,
         """,
         max_age_days, limit)
     return [_plan(r) for r in rows]
+
+
+async def expire_stale_window_candidates(db: Database, *,
+                                         max_age_days: int = WINDOW_CANDIDATE_MAX_AGE_DAYS
+                                         ) -> list[int]:
+    """Marchează `expired` planurile AI, încă neeliberate, mai vechi decât
+    plafonul de candidatură al ferestrei — capătul PRODUCTIV al plafonului,
+    nu doar tăierea din `window_candidate_plans`.
+
+    Fără asta, un plan care depășește plafonul dispărea tăcut: nimic nu-l
+    marca `expired` (`expire_stale_plans`, definit mai sus pentru
+    `PLAN_TTL_HOURS`, n-are niciun apelant — cod mort, lăsat neatins aici,
+    fiindcă pragul lui de 72h e alt concept, pentru altă cale), iar
+    `planner.generate_for_kev` refuză să redacteze un plan nou cât timp
+    finding-ul are unul `validated` — deci finding-ul KEV rămânea fără plan
+    proaspăt PENTRU TOTDEAUNA, iar `/patches` nu spunea nimic despre asta.
+
+    `status = 'expired'` nu e în lista de stări pe care `generate_for_kev` le
+    consideră „are deja un plan viu" — deci expirarea de aici deblochează
+    exact scanarea următoare să încerce din nou, cu versiunile de pachet și
+    ceasul de acum, nu cu cele de acum o lună. Vizibil totodată prin
+    `/patches` (`cmd_patches` listează orice status), deci „a expirat" nu mai
+    arată ca „nu există nimic de propus".
+    """
+    rows = await db.fetch(
+        """
+        UPDATE patch_plans SET status = 'expired'
+        WHERE status = 'validated' AND generated_by = 'ai' AND NOT proposed_by_window
+          AND created_at <= now() - make_interval(days => $1)
+        RETURNING id
+        """,
+        max_age_days)
+    return [int(r["id"]) for r in rows]
 
 
 async def outstanding_window_plan(db: Database) -> dict[str, Any] | None:

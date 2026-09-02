@@ -99,6 +99,29 @@ independente de `notified_at` (care rămâne strict despre butonul de
 aprobare). Modulul de față nu trimite nimic el însuși: `evaluate()` produce
 doar motivul, iar `bot.py` îl pune în text — păstrează separarea „acest
 modul nu vorbește cu Telegram" cerută de `test_telegram_names_its_instance.py`.
+
+## Îmbătrânirea candidaților — zgomotoasă sau productivă, niciodată tăcută
+
+Runda 3: `WINDOW_CANDIDATE_MAX_AGE_DAYS` (în `sentinel/db/repo/patches.py`)
+taie exact în intervalul în care un plan chiar are nevoie să aștepte —
+exercițiul rulează lunar, fereastra săptămânal, iar suma celor două poate
+depăși plafonul de 30 de zile. Niciun plafon finit rezolvă asta prin
+mărime: problema nu e numărul, e ce se întâmplă la depășire. Un plan care
+dispare pur și simplu din `window_candidate_plans` fără nicio urmă ar fi
+exact confuzia pe care restul funcționalității o desparte cu grijă — „nimic
+nu s-a întâmplat" versus „n-am putut să mă uit" — și, mai rău, ar bloca
+PENTRU TOTDEAUNA un plan proaspăt pentru același finding, fiindcă
+`planner.generate_for_kev` refuză să redacteze cât timp unul `validated`
+există deja.
+
+Deci `run()` expiră explicit, la ÎNCEPUTUL fiecărei rulări —
+`repo.expire_stale_window_candidates` — orice candidat mai vechi decât
+plafonul: planul devine vizibil ca `expired` în `/patches`, iar
+`generate_for_kev` e liber să redacteze unul nou, cu versiuni de pachet și
+ceas proaspete, la scanarea următoare. Rulează ÎNAINTEA verificării de
+oprire, fiindcă e o operație de întreținere independentă de zăvor — un plan
+expirat n-a fost eliberat niciodată, deci n-are nicio legătură cu execuții
+eșuate.
 """
 
 from __future__ import annotations
@@ -139,6 +162,7 @@ class WindowOutcome:
     halt_detail: str | None = None
     candidates: int = 0
     skipped: list[dict[str, Any]] = field(default_factory=list)
+    expired: list[int] = field(default_factory=list)
     detail: str = ""
 
 
@@ -206,42 +230,66 @@ def evaluate(plan: dict[str, Any],
 
 
 async def run(db: Database, cfg: Config) -> WindowOutcome:
-    """Rulează fereastra săptămânală: verifică oprirea, verifică dacă mai e un
-    plan în așteptare, altfel caută primul candidat eligibil și îl eliberează.
+    """Rulează fereastra săptămânală: expiră candidații prea vechi, verifică
+    oprirea, verifică dacă mai e un plan în așteptare, altfel caută primul
+    candidat eligibil și îl eliberează.
 
     Scrie ÎNTOTDEAUNA un rând în `patch_window_runs`, indiferent de rezultat —
     „n-a rulat niciodată" trebuie să rămână distinct de „a rulat și n-a găsit
     nimic eligibil", exact tiparul cerut pentru Funcționalitatea 08 (vezi
     docstring-ul lui `check_restore_drill` din 07, pe care ăsta îl continuă).
+
+    Expirarea candidaților prea vechi (`expire_stale_window_candidates`) e
+    PRIMUL lucru făcut, înaintea oricărei verificări de oprire: e o operație
+    de întreținere independentă de zăvor — un plan expirat n-a fost eliberat
+    niciodată, deci n-are nicio legătură cu execuții eșuate — și trebuie să
+    ruleze chiar și cât fereastra e oprită de un eșec anterior, altfel un
+    plan ar putea îmbătrâni tăcut o săptămână în plus de fiecare dată când
+    fereastra e oprită.
     """
+    expired = await repo.expire_stale_window_candidates(db)
+    if expired:
+        log.warning("patch window expired stale candidates",
+                   extra={"plans": expired})
+
+    def _with_expired(text: str) -> str:
+        if not expired:
+            return text
+        ids = ", ".join(f"#{p}" for p in expired)
+        return (f"{text}; {len(expired)} plan(uri) expirate (prea vechi, "
+               f"redactate din nou la scanarea următoare): {ids}")
+
     halt = await repo.window_halt(db)
     if halt is not None:
         detail = (f"fereastra e oprită: planul #{halt['plan_id']} "
                   f"(execuția #{halt['execution_id']}) a ieșit "
                   f"'{halt['status']}' — niciun plan nou din fereastră nu se "
                   f"propune până la o decizie a operatorului")
+        detail = _with_expired(detail)
         log.error("patch window halted by a prior failure",
                  extra={"execution_id": halt["execution_id"],
                         "plan": halt["plan_id"]})
         await repo.record_window_run(db, candidates=0, proposed_plan_id=None,
                                      halted=True, detail=detail, skipped=[])
-        return WindowOutcome(halted=True, halt_detail=detail, detail=detail)
+        return WindowOutcome(halted=True, halt_detail=detail, detail=detail,
+                             expired=expired)
 
     outstanding = await repo.outstanding_window_plan(db)
     if outstanding is not None:
         detail = (f"planul #{outstanding['id']}, propus deja de fereastră, "
                   f"încă așteaptă o decizie — niciunul nou nu se propune "
                   f"peste el")
+        detail = _with_expired(detail)
         await repo.record_window_run(db, candidates=0, proposed_plan_id=None,
                                      halted=False, detail=detail, skipped=[])
-        return WindowOutcome(detail=detail)
+        return WindowOutcome(detail=detail, expired=expired)
 
     candidates = await repo.window_candidate_plans(db, limit=CANDIDATE_LIMIT)
     if not candidates:
-        detail = "niciun plan validat în așteptarea ferestrei"
+        detail = _with_expired("niciun plan validat în așteptarea ferestrei")
         await repo.record_window_run(db, candidates=0, proposed_plan_id=None,
                                      halted=False, detail=detail, skipped=[])
-        return WindowOutcome(detail=detail)
+        return WindowOutcome(detail=detail, expired=expired)
 
     evidence = await repo.latest_archive_drill_summary(db)
     skipped: list[dict[str, Any]] = []
@@ -249,17 +297,19 @@ async def run(db: Database, cfg: Config) -> WindowOutcome:
         gate = evaluate(row.plan, evidence)
         if gate.state == REVERSIBLE:
             await repo.mark_proposed_by_window(db, row.id)
-            detail = f"planul #{row.id} eliberat: {gate.reason}"
+            detail = _with_expired(f"planul #{row.id} eliberat: {gate.reason}")
             log.warning("patch window released a plan",
                        extra={"plan": row.id, "reason": gate.reason})
             await repo.record_window_run(
                 db, candidates=len(candidates), proposed_plan_id=row.id,
                 halted=False, detail=detail, skipped=skipped)
             return WindowOutcome(proposed_plan_id=row.id, candidates=len(candidates),
-                                 skipped=skipped, detail=detail)
+                                 skipped=skipped, detail=detail, expired=expired)
         skipped.append({"plan_id": row.id, "state": gate.state, "reason": gate.reason})
 
-    detail = f"{len(candidates)} plan(uri) în așteptare, niciunul eligibil încă"
+    detail = _with_expired(
+        f"{len(candidates)} plan(uri) în așteptare, niciunul eligibil încă")
     await repo.record_window_run(db, candidates=len(candidates), proposed_plan_id=None,
                                  halted=False, detail=detail, skipped=skipped)
-    return WindowOutcome(candidates=len(candidates), skipped=skipped, detail=detail)
+    return WindowOutcome(candidates=len(candidates), skipped=skipped, detail=detail,
+                         expired=expired)

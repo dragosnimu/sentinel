@@ -3,8 +3,11 @@
 Proprietatea urmărită în tot fișierul: fereastra scrie ÎNTOTDEAUNA un rând în
 `patch_window_runs`, indiferent de rezultat (altfel „n-a rulat niciodată" și
 „a rulat și n-a găsit nimic" arată identic — zero rânduri), eliberează CEL
-MULT un plan pe rulare, și nu eliberează nimic nou cât timp fereastra e
-oprită sau mai are deja un plan eliberat, nerezolvat.
+MULT un plan pe rulare, nu eliberează nimic nou cât timp fereastra e
+oprită sau mai are deja un plan eliberat, nerezolvat — și expiră explicit
+candidații prea vechi, ÎNAINTE de orice altceva, ca îmbătrânirea peste plafon
+să fie productivă (planul devine vizibil ca `expired` și deblochează un plan
+proaspăt), nu o dispariție tăcută din `window_candidate_plans`.
 
 Repo-ul e monkeypatch-uit funcție cu funcție, nu simulat prin SQL: decizia
 testată e a lui `window.run`, nu forma interogărilor din `patches.py` — acelea
@@ -34,9 +37,13 @@ def _plan(id_=1, reversible=True, backup_kind="path"):
 _GOOD_EVIDENCE = {"age_days": 1.0, "any_bad": False, "all_good": True}
 
 
-def _wire(monkeypatch, *, halt=None, outstanding=None, candidates=None, evidence=None):
+def _wire(monkeypatch, *, halt=None, outstanding=None, candidates=None,
+         evidence=None, expired=None):
     released: list[int] = []
     recorded: list[dict[str, Any]] = []
+
+    async def _expire(db):
+        return expired or []
 
     async def _halt(db):
         return halt
@@ -58,6 +65,7 @@ def _wire(monkeypatch, *, halt=None, outstanding=None, candidates=None, evidence
                          "halted": halted, "detail": detail, "skipped": skipped})
         return 1
 
+    monkeypatch.setattr(repo, "expire_stale_window_candidates", _expire)
     monkeypatch.setattr(repo, "window_halt", _halt)
     monkeypatch.setattr(repo, "outstanding_window_plan", _outstanding)
     monkeypatch.setattr(repo, "window_candidate_plans", _candidates)
@@ -160,3 +168,48 @@ def test_every_outcome_writes_exactly_one_run_row(monkeypatch):
         _, recorded = _wire(monkeypatch, **kwargs)
         run(window.run(None, None))
         assert len(recorded) == 1, (kwargs, recorded)
+
+
+# --- aging out must be productive, never a silent disappearance --------------
+def test_expiring_a_stale_candidate_is_reported_in_the_outcome(monkeypatch):
+    """Runda 3: un plan care depășește plafonul de candidatură dispărea
+    tăcut din `window_candidate_plans`, fără nicio urmă — și rămânea
+    permanent fără plan proaspăt, fiindcă `generate_for_kev` refuză să
+    redacteze cât timp unul `validated` există. Expirarea trebuie raportată
+    în rezultatul rulării, nu doar făcută în bază fără ecou."""
+    _, recorded = _wire(monkeypatch, expired=[42], candidates=[])
+
+    outcome = run(window.run(None, None))
+
+    assert outcome.expired == [42]
+    assert "42" in outcome.detail
+    assert "expirat" in outcome.detail.lower()
+    assert "42" in recorded[0]["detail"]
+
+
+def test_expiration_runs_even_when_the_window_is_halted(monkeypatch):
+    """Expirarea e întreținere independentă de zăvor: un plan expirat n-a
+    fost eliberat niciodată, deci n-are nicio legătură cu execuția care a
+    declanșat oprirea. Dacă expirarea ar rula DOAR când fereastra nu e
+    oprită, un plan ar putea îmbătrâni o săptămână în plus de fiecare dată
+    când fereastra e oprită."""
+    _, recorded = _wire(
+        monkeypatch, expired=[7],
+        halt={"plan_id": 3, "execution_id": 9, "status": "failed"})
+
+    outcome = run(window.run(None, None))
+
+    assert outcome.halted is True
+    assert outcome.expired == [7]
+    assert "7" in outcome.detail
+
+
+def test_no_expiration_leaves_the_detail_unchanged(monkeypatch):
+    """Reversul: fără niciun candidat expirat, mesajul nu trebuie să
+    pomenească expirarea deloc."""
+    _wire(monkeypatch, candidates=[], expired=[])
+
+    outcome = run(window.run(None, None))
+
+    assert outcome.expired == []
+    assert "expirat" not in outcome.detail.lower()

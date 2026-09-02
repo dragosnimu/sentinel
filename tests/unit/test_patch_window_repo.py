@@ -138,6 +138,48 @@ async def _capture_sql(fn):
 
 
 # ===========================================================================
+# expire_stale_window_candidates — imbatranirea trebuie sa fie productiva
+# ===========================================================================
+def test_expiring_targets_only_ai_unreleased_validated_plans():
+    db = _FetchDB(fetch_rows=[])
+    run(repo.expire_stale_window_candidates(db, max_age_days=30))
+    sql = db.fetch_sql
+    assert "SET status = 'expired'" in sql
+    assert "status = 'validated'" in sql
+    assert "generated_by = 'ai'" in sql
+    assert "NOT proposed_by_window" in sql
+    assert db.fetch_args == (30,)
+
+
+def test_expiring_executed_only_moves_plans_past_the_bound():
+    """Runda 3: gasit la revizuire ca planurile care depasesc plafonul
+    disparea tacut din candidatura, fara nicio expirare productiva. EXECUTAT
+    peste SQLite: doar planul CHIAR mai vechi decat plafonul trece la
+    'expired' -- un plan proaspat, unul deja eliberat, unul deja rezolvat sau
+    unul non-AI raman neatinse."""
+    sql = run(_capture_sql(
+        lambda db: repo.expire_stale_window_candidates(db, max_age_days=30)))
+    where = _where_and_order(sql).replace("now() - make_interval(days => $1)", "?")
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE patch_plans (id INTEGER, status TEXT, "
+                 "generated_by TEXT, proposed_by_window INTEGER, created_at TEXT)")
+    old_cutoff = "2026-08-01T00:00:00+00:00"
+    conn.executemany("INSERT INTO patch_plans VALUES (?,?,?,?,?)", [
+        (1, "validated", "ai", 0, "2026-01-01T00:00:00+00:00"),   # stale -> expires
+        (2, "validated", "ai", 0, "2026-08-15T00:00:00+00:00"),   # fresh -> stays
+        (3, "validated", "ai", 1, "2026-01-01T00:00:00+00:00"),   # released -> stays
+        (4, "approved", "ai", 0, "2026-01-01T00:00:00+00:00"),    # not validated -> stays
+        (5, "validated", "manual", 0, "2026-01-01T00:00:00+00:00"),  # not AI -> stays
+    ])
+    sql2 = f"UPDATE patch_plans SET status = 'expired' WHERE {where}"
+    conn.execute(sql2, (old_cutoff,))
+    statuses = dict(conn.execute("SELECT id, status FROM patch_plans"))
+    assert statuses == {1: "expired", 2: "validated", 3: "validated",
+                        4: "approved", 5: "validated"}
+
+
+# ===========================================================================
 # outstanding_window_plan
 # ===========================================================================
 def test_outstanding_only_matches_still_pending_window_plans():

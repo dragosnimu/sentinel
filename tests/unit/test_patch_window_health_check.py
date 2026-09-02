@@ -88,13 +88,22 @@ def test_a_recent_run_is_not_flagged_stale(monkeypatch):
     assert all(r.status != "degraded" or "învechit" not in r.title.lower() for r in out)
 
 
-def test_evidence_exactly_at_the_stale_threshold_is_not_flagged():
+def test_evidence_exactly_at_the_stale_threshold_is_not_flagged(monkeypatch):
     """Limita e inclusivă, ca la poarta de eligibilitate — altfel cadența
     reală a timer-ului (o dată pe săptămână, cu `RandomizedDelaySec`) ar
-    declanșa fals chiar la prima întârziere mică."""
+    declanșa fals chiar la prima întârziere mică.
+
+    Runda 3: versiunea dinainte nu chema deloc `check_patch_window` — construia
+    un dicționar local și aserționa `not (X > X)`, o tautologie despre propria
+    aritmetică a testului, nu despre cod. Reintrodus exact defectul pe care
+    docstring-ul pretindea că-l previne (`>` -> `>=`), fișierul țintă rămânea
+    verde. Testul de-acum CHEAMĂ `check_patch_window` cu `age_min` fix la
+    prag și citește rezultatul lui, nu propria aritmetică."""
     from sentinel.selfcheck.checks import PATCH_WINDOW_STALE_DAYS
-    row = {"id": 1, "age_min": float(PATCH_WINDOW_STALE_DAYS) * 24 * 60}
-    assert not (row["age_min"] > PATCH_WINDOW_STALE_DAYS * 24 * 60)
+    _wire(monkeypatch, last_run={"id": 1, "age_min": float(PATCH_WINDOW_STALE_DAYS) * 24 * 60},
+         halt=None, outstanding=None, candidates=[])
+    out = run(checks.check_patch_window(_DB()))
+    assert all(r.status != "degraded" or "învechit" not in r.title.lower() for r in out)
 
 
 def test_a_halted_window_is_reported_loudly(monkeypatch):
