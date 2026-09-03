@@ -963,6 +963,23 @@ def _shown_moments(reply: str) -> list[tuple[int, int, int, int]]:
             for d, mo, h, mi in re.findall(r"(\d{2})\.(\d{2}) (\d{2}):(\d{2})", reply)]
 
 
+def _pauza_de_iarna() -> datetime:
+    """Următorul 24 decembrie, ora 20:30 UTC — mereu strict în viitor.
+
+    `cmd_mute` decide „pauză activă" citind `datetime.now()` inline; semnătura
+    ei e cea cerută de biblioteca Telegram, deci nu poate primi un ceas
+    injectat ca `quiet.evaluate`. O dată de iarnă FIXĂ (`datetime(2026, 12,
+    24, ...)`) ar fi trecut azi și ar fi picat singură, fără nicio schimbare
+    de cod, în ziua în care ceasul real o depășea — exact defectul găsit la
+    revizuire, testat cu suita rulată cu ceasul mutat înainte cu un an.
+    Calculul de aici o ține mereu în față, păstrând totuși luna de iarnă de
+    care are nevoie verificarea UTC+2 față de UTC+3.
+    """
+    acum = datetime.now(UTC)
+    an = acum.year if (acum.month, acum.day) < (12, 24) else acum.year + 1
+    return datetime(an, 12, 24, 20, 30, tzinfo=UTC)
+
+
 def test_an_adhoc_pause_answers_with_the_moment_it_expires(monkeypatch):
     """`/mute 2h` e o forma pe care `_MUTE_HELP` o ofera explicit, si raspunsul ei
     e singurul loc in care operatorul afla PANA CAND a tacut canalul. Fara
@@ -1000,7 +1017,7 @@ def test_the_status_reply_shows_an_active_pause_and_when_it_lifts(monkeypatch):
     Momentul e fixat in decembrie, deci Bucurestiul e UTC+2 si nu UTC+3: un fus
     citit cu offset fix in loc de dupa nume ar da alta ora aici.
     """
-    pause_ends = datetime(2026, 12, 24, 20, 30, tzinfo=UTC)
+    pause_ends = _pauza_de_iarna()
     seen = _run_mute("", monkeypatch, prefs={"muted_until": pause_ends})
 
     assert len(seen.replies) == 1

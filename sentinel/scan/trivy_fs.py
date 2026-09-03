@@ -578,11 +578,19 @@ async def db_status(now: datetime | None = None,
     return described, age_h, None
 
 
-async def scan(paths: list[str]) -> tuple[list[dict[str, Any]], str | None, dict[str, Any]]:
+async def scan(paths: list[str],
+                now: datetime | None = None) -> tuple[list[dict[str, Any]], str | None, dict[str, Any]]:
     """Ruleaza trivy peste `paths`. Intoarce (constatari, eroare, fapte).
 
     `fapte` poarta `db_version` chiar si pe drumurile de eroare, ca randul
     `failed` din `scans` sa spuna pe ce baza de date s-a lucrat.
+
+    `now` se duce mai departe la `db_status`, ca un test să poată îngheța
+    ceasul aici la fel cum poate direct pe `db_status` — fără el, un test care
+    fixează doar `UpdatedAt`-ul bazei trivy compară acea dată împotriva
+    ceasului REAL al mașinii care rulează suita, deci pică singur, fără nicio
+    schimbare de cod, în ziua în care ceasul real depășește pragul de
+    `MAX_DB_AGE_H` față de data fixată.
     """
     facts: dict[str, Any] = {"db_version": None, "paths": [], "total": 0}
 
@@ -673,7 +681,7 @@ async def scan(paths: list[str]) -> tuple[list[dict[str, Any]], str | None, dict
     unique = {f["finding_key"]: f for f in items}
     facts["total"] = len(unique)
 
-    described, age_h, db_error = await db_status(binary=binary)
+    described, age_h, db_error = await db_status(now=now, binary=binary)
     facts["db_version"] = described
     if db_error:
         return [], db_error, facts

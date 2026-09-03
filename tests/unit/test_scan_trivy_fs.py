@@ -642,7 +642,7 @@ def test_the_gate_and_the_command_name_the_same_binary(monkeypatch, tmp_path) ->
     d.mkdir()
     apeluri = _fake_trivy(monkeypatch, [{"SchemaVersion": 2, "Results": None}],
                           binar=str(altundeva))
-    items, eroare, _ = run(trivy_fs.scan([str(d)]))
+    items, eroare, _ = run(trivy_fs.scan([str(d)], now=NOW))
     assert eroare is None and items == []
     assert {a[0] for a in apeluri} == {str(altundeva)}, (
         f"comanda a fost executată cu {sorted({a[0] for a in apeluri})}, nu cu "
@@ -940,9 +940,38 @@ def test_a_clean_scan_returns_nothing_and_no_error(monkeypatch, tmp_path) -> Non
     d = tmp_path / "app"
     d.mkdir()
     _fake_trivy(monkeypatch, [{"SchemaVersion": 2, "Results": None}])
-    items, eroare, fapte = run(trivy_fs.scan([str(d)]))
+    items, eroare, fapte = run(trivy_fs.scan([str(d)], now=NOW))
     assert items == [] and eroare is None
     assert fapte["db_version"] and fapte["paths"] == [str(d)]
+
+
+def test_scan_forwards_its_now_to_db_status(monkeypatch, tmp_path) -> None:
+    """Regresie: `scan()` trebuie să ducă `now` mai departe la `db_status`.
+
+    `db_status` acceptă `now=` tocmai ca un test să-i poată îngheța ceasul.
+    Defectul găsit la revizuire, rulând suita cu ceasul mutat înainte: `scan()`
+    chema `db_status(binary=binary)` FĂRĂ `now`, deci vârsta bazei se calcula
+    din ceasul REAL al mașinii, nu din `NOW` pe care testele de mai sus cred că
+    îl controlează. Trei teste din fișierul ăsta treceau azi și picau singure,
+    fără nicio schimbare de cod, în ziua în care ceasul real depășea pragul de
+    14 zile față de data fixată în `SAMPLE` — adică pe 10 septembrie 2026, la o
+    săptămână de la scrierea acestui test.
+    """
+    d = tmp_path / "app"
+    d.mkdir()
+    _fake_trivy(monkeypatch, [{"SchemaVersion": 2, "Results": None}])
+    primit: dict[str, object] = {}
+
+    async def fake_db_status(now=None, binary=trivy_fs.BINARY):
+        primit["now"] = now
+        return "test", 1.0, None
+
+    monkeypatch.setattr(trivy_fs, "db_status", fake_db_status)
+    run(trivy_fs.scan([str(d)], now=NOW))
+    assert primit.get("now") == NOW, (
+        "scan() nu duce `now` mai departe la db_status() — vârsta bazei s-ar "
+        "calcula din ceasul real al mașinii, nu din ceasul pe care îl "
+        "controlează testul")
 
 
 def test_a_stale_database_refuses_to_produce_findings(monkeypatch, tmp_path) -> None:
@@ -984,7 +1013,7 @@ def test_more_findings_than_the_cap_are_refused_and_not_truncated(monkeypatch, t
              "InstalledVersion": "1.0.0", "FixedVersion": "1.0.1", "Severity": "HIGH"}
             for i in range(trivy_fs.MAX_FINDINGS + 7)]}]}
     _fake_trivy(monkeypatch, [multe])
-    items, eroare, fapte = run(trivy_fs.scan([str(d)]))
+    items, eroare, fapte = run(trivy_fs.scan([str(d)], now=NOW))
     assert items == [], "o listă tăiată ar fi fost ingerată ca listă completă"
     assert eroare and str(trivy_fs.MAX_FINDINGS + 7) in eroare
     assert fapte["total"] == trivy_fs.MAX_FINDINGS + 7
