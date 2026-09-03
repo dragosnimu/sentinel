@@ -1598,6 +1598,107 @@ async def check_ship_lag(db: Database, cfg: Config) -> list[CheckResult]:
     return results
 
 
+#: How many gap hours to keep as a sample in the finding's `detail`/`facts`.
+#: `GapReport.total_hours`/`total_missing` already carry the true size of the
+#: problem regardless of this — the sample is only so a human reading
+#: `/selfcheck` sees WHERE to look first without querying the database.
+ROLLUP_RECONCILE_SAMPLE = 10
+
+
+async def check_rollup_reconcile(db: Database) -> list[CheckResult]:
+    """Does `event_rollup_1h` still agree with `raw_events`, where both exist?
+
+    `maintenance_service.rollup_events` advances a watermark forward and never
+    revisits an hour once it has left it behind (see that module's header). A
+    row ingested with a `ts` inside an hour the watermark has already passed is
+    never rolled up — permanently, no matter how much later it shows up. It
+    happened at scale on 24 August 2026: ingestion fell days behind during a
+    UDP flood, and `event_rollup_1h` ended up short by 3.96 million rows for
+    that single day, silently — anything reading the rollup instead of scanning
+    `raw_events` got a quietly smaller number for exactly that day, with nothing
+    in the answer saying so.
+
+    Two edges have to be right or this either misses the fault or invents one
+    that is not there:
+
+    * **the current hour is not compared.** Its bucket is rewritten on every
+      pass while the hour is still open (see `0025_rollup_watermark.sql`) —
+      comparing it would flag ordinary, still-in-progress aggregation as loss.
+      `upper` is `max(bucket)` from `event_rollup_1h`, hour-truncated:
+      everything at or after it simply has not been reached yet by this run,
+      which is lag, not loss.
+    * **an hour whose raw data has already aged out of `raw_events_days` is not
+      compared either.** `event_rollup_1h` is kept far longer (`rollup_1h_days`)
+      on purpose, so an hour with an aggregate and no raw rows left is
+      retention doing its job, not a gap — comparing there would raise the same
+      false alarm on every single run, forever. `lower` comes from
+      `raw_coverage`, the oldest surviving PARTITION read from the catalog, not
+      from the configured retention, which says what SHOULD be kept, not what
+      IS.
+
+    A run that cannot even establish those two edges — `raw_events` already has
+    data but `event_rollup_1h` has never been written at all — cannot
+    reconcile anything and says so as `unknown` rather than guessing `ok`.
+    """
+    from sentinel.analytics import reports as report_repo
+    from sentinel.db.repo import rollups as rollup_repo
+
+    cov = await report_repo.rollup_coverage(db)
+    lower = await report_repo.raw_coverage(db)
+
+    if cov["never_ran"]:
+        if lower is None:
+            return [CheckResult(
+                "rollup:reconcile", "Reconcilierea agregatului orar", "ok",
+                detail="nicio dată brută încă — nimic de reconciliat",
+                facts={"raw_exists": False, "rollup_exists": False})]
+        return [CheckResult(
+            "rollup:reconcile", "Agregatul orar n-a rulat niciodată", "unknown",
+            detail="raw_events are date, dar event_rollup_1h e gol — mentenanța "
+                   "n-a trecut încă, sau a picat de fiecare dată la acest pas",
+            action="journalctl -u sentinel-maintenance -n 50",
+            facts={"raw_exists": True, "rollup_exists": False})]
+
+    upper = cov["latest"].replace(minute=0, second=0, microsecond=0)
+    if lower is None or lower >= upper:
+        return [CheckResult(
+            "rollup:reconcile", "Reconcilierea agregatului orar", "ok",
+            detail="nicio oră stabilită încă de comparat",
+            facts={"raw_exists": lower is not None, "window_hours": 0})]
+
+    try:
+        report = await rollup_repo.hourly_gaps(
+            db, lower=lower, upper=upper, limit=ROLLUP_RECONCILE_SAMPLE)
+    except Exception as exc:  # noqa: BLE001
+        return [CheckResult(
+            "rollup:reconcile", "Nu pot reconcilia agregatul orar", "unknown",
+            detail=str(exc)[:160],
+            action="journalctl -u sentinel-maintenance -n 50")]
+
+    window_hours = round((upper - lower).total_seconds() / 3600)
+    if report.total_hours == 0:
+        return [CheckResult(
+            "rollup:reconcile", "Agregatul orar de evenimente", "ok",
+            detail=f"la zi cu brutul pe {window_hours}h verificate",
+            facts={"window_hours": window_hours})]
+
+    oldest = report.hours[0]
+    return [CheckResult(
+        "rollup:reconcile", "Agregatul orar de evenimente e sub brut", "degraded",
+        detail=(
+            f"{_numar(report.total_hours, 'oră', 'ore')} din ultimele "
+            f"{window_hours}h lipsesc din event_rollup_1h — "
+            f"{report.total_missing:,} rânduri, cea mai veche la "
+            f"{oldest.bucket.strftime('%d.%m %H:%M')} UTC ({oldest.missing:,} lipsă)"),
+        action="sentinel-maintenance repară automat, plafonat, cele mai vechi ore "
+               "întâi — vezi „rollup gap repair” în jurnal pentru cât a avansat; "
+               "detecția, blocarea și alertarea n-au fost afectate",
+        facts={"window_hours": window_hours, "gap_hours": report.total_hours,
+               "rows_missing": report.total_missing,
+               "oldest_gap": oldest.bucket.isoformat(),
+               "sample_truncated": report.truncated})]
+
+
 async def check_beacon_delivery(db: Database, cfg: Config) -> list[CheckResult]:
     """Is the witness outside this host actually ACCEPTING what we send it?
 
@@ -3614,6 +3715,7 @@ CHECKS: tuple[tuple[str, Callable], ...] = (
     ("resources", check_resources),
     ("code", check_running_code_is_current),
     ("ship", check_ship_lag),
+    ("rollup_reconcile", check_rollup_reconcile),
     ("scan", check_last_scan),
     ("restore_drill", check_restore_drill),
     ("patch_window", check_patch_window),

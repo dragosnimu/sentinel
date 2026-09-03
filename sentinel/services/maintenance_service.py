@@ -31,6 +31,22 @@ Recuperarea e plafonată (`MAX_CATCHUP_HOURS`) fiindcă unitatea are
 lună dintr-o dată e omorâtă la mijloc și nu termină niciodată. Se recuperează
 cât încape, se scrie în jurnal cât a rămas, iar rularea următoare continuă.
 
+## Filigranul merge doar înainte — și acolo e o gaură diferită
+
+„De la ce s-a agregat ultima dată" recuperează o PAUZĂ (mentenanța n-a rulat).
+Nu recuperează un rând care sosește cu `ts` într-o oră pe care filigranul a
+lăsat-o deja în urmă: filigranul e derivat din `max(bucket)`, deci odată trecut
+de o oră nu se mai întoarce la ea de la sine, oricâte rânduri noi ar ajunge cu
+`ts` acolo. Măsurat pe 24 august 2026: ingestia a rămas zile în urmă în timpul
+unui potop UDP, iar `event_rollup_1h` a rămas cu 3,96 milioane de rânduri lipsă
+pentru acea zi — tăcut, fiindcă interogarea rămâne validă și întoarce doar mai
+puțin. `repair_rollup_gaps` e reparația: compară `event_rollup_1h` cu
+`raw_events` pe orele deja stabilite (nu pe cele încă în recuperarea de mai
+sus) și reface, plafonat, cele mai vechi mai întâi — vezi docstring-ul ei
+pentru de ce nu ajunge să reagrege doar ora. Detecția stă separat, în
+`sentinel/selfcheck/checks.py::check_rollup_reconcile`, ca să treacă prin
+canalul de alertare existent, nu printr-unul nou.
+
 ## Un pas care cade nu îi oprește pe ceilalți
 
 Reîmprospătarea fluxurilor de intelligence are nevoie de rețea. Retenția, nu.
@@ -65,6 +81,16 @@ PARTITIONS_AHEAD = 3
 # 48 la un timer orar: recuperează o pană de weekend din prima încercare, dar
 # rămâne mult sub TimeoutStartSec.
 MAX_CATCHUP_HOURS = 48
+
+# Câte ore ÎNGHEȚATE de filigran (deja lăsate în urmă, nu în recuperarea de mai
+# sus) se repară pe rulare. Fiecare oră costă o agregare de minut plus una de
+# oră pe volumul EI — comparabil cu o oră din plafonul de mai sus, deci opt pe
+# rulare rămân mult sub TimeoutStartSec chiar dacă se adună la recuperarea
+# înainte din aceeași trecere. Cele mai vechi ore se repară primele, fiindcă o
+# oră nereparată concurează cu retenția brutului (`raw_events_days`): odată
+# ieșită din fereastră, rămâne greșită definitiv, indiferent ce se întâmplă
+# aici după aceea.
+MAX_GAP_REPAIR_HOURS = 8
 
 # Zile golite din DEFAULT pe rulare. Mutarea unei zile e o singură
 # tranzacție care nu se poate întrerupe; la un timer orar, șase rulări
@@ -223,6 +249,71 @@ async def rollup_events(db: Database) -> tuple[str, dict[str, Any]]:
                         extra={"table": table, "covered_hours": hours,
                                "remaining_hours": remaining})
     return "; ".join(parts), facts
+
+
+async def repair_rollup_gaps(db: Database) -> tuple[str, dict[str, Any]]:
+    """Reagregă orele deja lăsate în urmă de filigran în care au ajuns rânduri
+    brute mai târziu.
+
+    `rollup_events` de mai sus avansează filigranul strict înainte (vezi
+    `_watermark` și antetul modulului): odată ce o oră trece de el, nu se mai
+    recalculează niciodată de la sine, oricâte rânduri noi ar sosi cu `ts` în
+    ea. Pe 24 august 2026 asta a lăsat `event_rollup_1h` cu 3,96 milioane de
+    rânduri lipsă pentru o singură zi, tăcut. Pasul ăsta e reparația: găsește
+    orele deja STABILITE (sub filigranul curent, nu în recuperarea de mai sus,
+    care e încă în desfășurare) unde `event_rollup_1h` numără mai puțin decât
+    `raw_events`, și le reface.
+
+    `event_rollup_1h` nu citește niciodată din `raw_events` — citește din
+    `event_rollup_1m` (`sentinel_rollup_events_1h`, 0017_partition_fixes.sql).
+    Filigranul lui `event_rollup_1m` are exact același defect, pe aceeași cale
+    (aceeași buclă din `rollup_events`, aceeași `_watermark`), deci o oră
+    ratată la nivel de minut rămâne ratată la nivel de oră chiar dacă doar ora
+    e reagregată — cererea ar citi din nou din minutul deja incomplet. De-aia
+    fiecare oră reparată aici reface întâi minutul, apoi ora, exact ca la
+    recuperarea înainte: `sentinel_rollup_events_1m`/`_1h` sunt idempotente
+    prin `ON CONFLICT ... DO UPDATE SET col = EXCLUDED.col` (nu se adună la ce
+    era acolo, se suprascrie), deci refacerea minutului chiar și pe orele unde
+    NU era nimic greșit e ieftină și corectă, nu o dublare.
+    """
+    from sentinel.analytics import reports as report_repo
+    from sentinel.db.repo import rollups as rollup_repo
+
+    cov = await report_repo.rollup_coverage(db)
+    if cov["never_ran"]:
+        return "rollup-ul n-a rulat niciodată; nimic de reparat", {"hours_repaired": 0}
+
+    upper = cov["latest"].replace(minute=0, second=0, microsecond=0)
+    lower = await report_repo.raw_coverage(db)
+    if lower is None or lower >= upper:
+        return "nicio oră stabilită încă de reparat", {"hours_repaired": 0}
+
+    report = await rollup_repo.hourly_gaps(
+        db, lower=lower, upper=upper, limit=MAX_GAP_REPAIR_HOURS)
+    if not report.hours:
+        return "niciun gol între agregat și brut", {"hours_repaired": 0, "hours_left": 0}
+
+    repaired: list[str] = []
+    for gap in report.hours:
+        start = gap.bucket
+        end = start + timedelta(hours=1)
+        await db.fetchval("SELECT sentinel_rollup_events_1m($1, $2)", start, end)
+        await db.fetchval("SELECT sentinel_rollup_events_1h($1, $2)", start, end)
+        repaired.append(start.isoformat())
+        log.info("rollup gap repaired",
+                 extra={"bucket": start.isoformat(), "rows_missing_before": gap.missing})
+
+    left = report.total_hours - len(repaired)
+    if left:
+        # Spus, nu presupus — la fel ca la golirea din DEFAULT. O reparație
+        # plafonată care tace arată identic cu una completă, iar orele
+        # rămase concurează cu retenția brutului.
+        log.warning("rollup gap repair capped; more remain",
+                    extra={"hours_repaired": len(repaired), "hours_left": left,
+                           "rows_missing_total": report.total_missing})
+    return (f"{len(repaired)} ore reagregate" + (f", {left} rămase" if left else ""),
+            {"hours_repaired": len(repaired), "hours_left": left,
+             "rows_missing_total": report.total_missing, "hours": repaired})
 
 
 async def rollup_availability(db: Database) -> tuple[str, dict[str, Any]]:
@@ -491,6 +582,7 @@ async def run(db: Database, cfg: Config) -> Report:
     await _step(rep, "partitions", ensure_partitions(db))
     await _step(rep, "drain_default", drain_default(db))
     await _step(rep, "rollup_events", rollup_events(db))
+    await _step(rep, "repair_rollup_gaps", repair_rollup_gaps(db))
     await _step(rep, "rollup_availability", rollup_availability(db))
     await _step(rep, "retention_partitions", drop_partitions(db, cfg))
     await _step(rep, "retention_rollups", trim_rollups(db, cfg))
