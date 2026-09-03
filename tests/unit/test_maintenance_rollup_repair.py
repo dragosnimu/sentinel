@@ -49,6 +49,25 @@ class _DB:
         return "INSERT 0 1"
 
 
+class _FailingDB(_DB):
+    """Like `_DB`, but a `sentinel_rollup_events_1m` call whose `(start, end)`
+    args satisfy `should_fail` raises `asyncio.TimeoutError` instead of
+    succeeding — the exact exception shape `command_timeout` produces on the
+    real connection (empty `str()`, see `maintenance_service`'s module
+    docstring), used to drive the per-hour isolation and the halve-on-timeout
+    retry without a real, slow Postgres."""
+
+    def __init__(self, should_fail):
+        super().__init__()
+        self._should_fail = should_fail
+
+    async def fetchval(self, sql, *args):
+        self.calls.append((sql, args))
+        if "sentinel_rollup_events_1m" in sql and self._should_fail(args):
+            raise asyncio.TimeoutError()
+        return 1
+
+
 # ---------------------------------------------------------------------------
 # The step is wired into the run, in the right place
 # ---------------------------------------------------------------------------
@@ -111,13 +130,19 @@ def test_no_gap_found_branch_persists_ok(monkeypatch):
 
 
 def _fixed_gap_report(*buckets: datetime, total_hours: int | None = None,
-                      worst_bucket=None, worst_missing=0) -> rollup_repo.GapReport:
-    hours = [rollup_repo.GapHour(b, 10, 1) for b in buckets]
+                      worst_bucket=None, worst_missing=0,
+                      raw_n: int = 10) -> rollup_repo.GapReport:
+    """`raw_n` defaults to a trivially light hour (10 rows) for tests that
+    only care about branching/persistence, not about the per-statement SLICE
+    `_gap_repair_slices` picks — pass a realistic `raw_n` (e.g. the measured
+    4 329 065-row incident hour) for tests that assert on the SIZE of the
+    `sentinel_rollup_events_1m` calls issued."""
+    hours = [rollup_repo.GapHour(b, raw_n, 1) for b in buckets]
     return rollup_repo.GapReport(
         hours=hours, total_hours=total_hours or len(hours),
-        total_missing=9 * len(hours),
+        total_missing=(raw_n - 1) * len(hours),
         worst_bucket=worst_bucket or (buckets[0] if buckets else None),
-        worst_missing=worst_missing or 9)
+        worst_missing=worst_missing or (raw_n - 1))
 
 
 def test_fully_processed_window_persists_ok_not_the_pre_repair_gap_count(monkeypatch):
@@ -169,13 +194,21 @@ def test_truncated_batch_persists_the_pre_repair_totals(monkeypatch):
 # ---------------------------------------------------------------------------
 # The measured, absolute bound this whole design leans on
 # ---------------------------------------------------------------------------
-#: Round 3's verifier measured this on real PostgreSQL 16.14, in
-#: `BEGIN…ROLLBACK` with `SET LOCAL statement_timeout='30s'` as in production:
-#: the incident's worst hour (24.08 14:00, 4 329 065 rows) cost 14 544 ms
-#: sliced at one minute, its single worst slice (14:45) 1 821 ms — both
-#: comfortably under the 30 000 ms connection timeout
-#: (`statement_timeout_ms`, `sentinel/config.py`) that killed the SAME hour
-#: in ONE statement at 67-70s (round 2's blocker). This is a LITERAL, not
+#: Round 3's verifier measured 14 544 ms for the incident's worst hour
+#: (24.08 14:00, 4 329 065 rows) sliced at one minute, worst slice (14:45)
+#: 1 821 ms — WARM: from repeated runs against the same, already-cached
+#: slice. Measured again on 3 September 2026 with real host load and a
+#: single active connection (no contention) — COLD, the regime the timer
+#: actually runs in: the SAME slice (14:45, 549 401 rows) cost
+#: 17 513-30 015+ ms, sometimes literally OVER `statement_timeout_ms`
+#: (30 000 ms) rather than comfortably under it. One minute is therefore
+#: still the FLOOR `sentinel_rollup_events_1m` can be sliced at
+#: (`GAP_REPAIR_SLICE` — going under it overwrites instead of summing, see
+#: that constant's comment in `maintenance_service.py`), but it is not, by
+#: itself, proof of staying under the timeout for every hour — that is why
+#: `repair_rollup_gaps` also isolates a failing hour instead of letting it
+#: block the rest (`test_one_failing_hour_does_not_block_the_rest_of_the_batch`
+#: below) rather than leaning on the slice size alone. This is a LITERAL, not
 #: `ms.GAP_REPAIR_SLICE`, on purpose: round 3 proved that a threshold
 #: measured against the constant it is supposed to police is not a guard —
 #: mutating `GAP_REPAIR_SLICE` from one minute to one hour moved the
@@ -188,14 +221,13 @@ def test_gap_repair_slice_does_not_exceed_the_measured_safe_bound():
     """`GAP_REPAIR_SLICE` itself, checked against the measured fact rather
     than trusted blindly by every other test that imports it. Falsified by
     round 3's own mutation: setting `GAP_REPAIR_SLICE = timedelta(hours=1)`
-    must fail THIS test on its own, with no other test needed — 1 821 ms
-    (worst measured slice) and 30 000 ms (the timeout) are the two fixed
-    points; a slice this test would accept has not been measured against
-    either."""
+    must fail THIS test on its own, with no other test needed — one minute
+    is the floor `event_rollup_1m`'s own grain allows (see the module note
+    above); a slice coarser than that has not been measured against it."""
     assert ms.GAP_REPAIR_SLICE <= _MEASURED_SAFE_SLICE, (
-        f"GAP_REPAIR_SLICE ({ms.GAP_REPAIR_SLICE}) exceeds the measured-safe "
-        f"bound ({_MEASURED_SAFE_SLICE}) — the 1 821 ms worst-slice / "
-        f"30 000 ms timeout measurement no longer backs this constant")
+        f"GAP_REPAIR_SLICE ({ms.GAP_REPAIR_SLICE}) exceeds the one-minute "
+        f"floor ({_MEASURED_SAFE_SLICE}) that `event_rollup_1m`'s own "
+        f"grain allows without corrupting data on overwrite")
 
 
 # ---------------------------------------------------------------------------
@@ -210,13 +242,18 @@ def test_each_gap_hour_reaggregates_every_minute_before_the_hour_call(monkeypatc
     `ms.GAP_REPAIR_SLICE`: a slice count or size derived from the constant
     under test would still look self-consistent if the constant were mutated
     to one hour (a single "slice" spanning the whole gap) — exactly the
-    mutation round 3's verifier caught this test's previous body missing."""
+    mutation round 3's verifier caught this test's previous body missing.
+    `raw_n` is set to the measured incident density (4 329 065) on purpose:
+    `_gap_repair_slices` would otherwise legitimately batch a light hour into
+    fewer, wider calls — see `test_light_hour_batches_into_one_statement`
+    for that behaviour, which this test must NOT exercise."""
     monkeypatch.setattr(report_repo, "rollup_coverage", _async(
         {"never_ran": False, "latest": datetime(2026, 8, 24, 8, 0, tzinfo=timezone.utc)}))
     monkeypatch.setattr(report_repo, "raw_coverage", _async(
         datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)))
     bucket = datetime(2026, 8, 24, 4, 0, tzinfo=timezone.utc)
-    monkeypatch.setattr(rollup_repo, "hourly_gaps", _async(_fixed_gap_report(bucket)))
+    monkeypatch.setattr(rollup_repo, "hourly_gaps", _async(
+        _fixed_gap_report(bucket, raw_n=4_329_065)))
 
     db = _DB()
     detail, facts = run(ms.repair_rollup_gaps(db))
@@ -264,13 +301,16 @@ def test_no_single_sql_statement_gets_a_whole_hour_interval(monkeypatch):
     (`statement_timeout_ms`, `sentinel/config.py`). No `_1m` call issued by
     this step is allowed to span more than the literal one-minute bound
     below; only `_1h` — cheap, bounded by (asset, source, action) pairs per
-    hour, not raw row count — may span a full hour."""
+    hour, not raw row count — may span a full hour. `raw_n` carries the
+    actual measured 4 329 065 rows this time (round 2/3 never needed a
+    realistic count; `_gap_repair_slices` now does)."""
     monkeypatch.setattr(report_repo, "rollup_coverage", _async(
         {"never_ran": False, "latest": datetime(2026, 8, 25, 0, 0, tzinfo=timezone.utc)}))
     monkeypatch.setattr(report_repo, "raw_coverage", _async(
         datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)))
     worst_hour = datetime(2026, 8, 24, 14, 0, tzinfo=timezone.utc)  # the measured 4.3M-row hour
-    monkeypatch.setattr(rollup_repo, "hourly_gaps", _async(_fixed_gap_report(worst_hour)))
+    monkeypatch.setattr(rollup_repo, "hourly_gaps", _async(
+        _fixed_gap_report(worst_hour, raw_n=4_329_065)))
 
     db = _DB()
     run(ms.repair_rollup_gaps(db))
@@ -284,6 +324,175 @@ def test_no_single_sql_statement_gets_a_whole_hour_interval(monkeypatch):
         "a single sentinel_rollup_events_1m call spans more than "
         f"{max_slice} — this is exactly the statement that timed out "
         f"at 30s on the real host's worst hour: {offenders}")
+
+
+# ---------------------------------------------------------------------------
+# The slice adapts to the hour's own density (`raw_n`), not a fixed size
+# picked for the worst hour — see `GAP_REPAIR_ROW_TARGET`'s comment for the
+# two measured facts the threshold sits between.
+# ---------------------------------------------------------------------------
+def test_gap_repair_slices_batches_a_normal_hour_into_one_statement():
+    """An ordinary hour (~14 000 rows, see `maintenance_service`'s module
+    docstring) must not cost 60 database round trips just because the slice
+    picked for the worst hour of an incident was one minute. Literal
+    expected value, not `ms.GAP_REPAIR_ROW_TARGET` — a threshold checked
+    against the constant it polices would stay green if that constant moved."""
+    assert ms._gap_repair_slices(14_000) == 60
+
+
+def test_gap_repair_slices_stays_at_one_minute_for_the_incident_hour():
+    """The measured incident hour (4 329 065 rows) must still get the finest
+    grain the table allows — batching it up would reintroduce the round 2
+    disaster (a multi-million-row statement) through the density estimate
+    instead of through `GAP_REPAIR_SLICE` directly."""
+    assert ms._gap_repair_slices(4_329_065) == 1
+
+
+def test_gap_repair_slices_falls_between_the_two_measured_facts():
+    """A density between the safe slice (13 767 rows/minute, 3 027 ms) and
+    the one that timed out (549 401 rows/minute) must batch a FEW minutes
+    per statement, not 60 and not 1 — proving the threshold actually varies
+    with density instead of being a disguised constant."""
+    assert ms._gap_repair_slices(600_000) == 5
+
+
+def test_light_hour_batches_into_one_statement(monkeypatch):
+    """The other half of `test_no_single_sql_statement_gets_a_whole_hour_interval`:
+    a light hour is legitimately safe to reaggregate in one statement, and
+    failing to batch it would mean every ordinary hourly pass pays 60 round
+    trips for a query that costs milliseconds — see `GAP_REPAIR_ROW_TARGET`."""
+    monkeypatch.setattr(report_repo, "rollup_coverage", _async(
+        {"never_ran": False, "latest": datetime(2026, 8, 24, 8, 0, tzinfo=timezone.utc)}))
+    monkeypatch.setattr(report_repo, "raw_coverage", _async(
+        datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)))
+    bucket = datetime(2026, 8, 24, 4, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(rollup_repo, "hourly_gaps", _async(
+        _fixed_gap_report(bucket, raw_n=14_000)))
+
+    db = _DB()
+    detail, facts = run(ms.repair_rollup_gaps(db))
+
+    minute_slices = [a for sql, a in db.calls if "sentinel_rollup_events_1m" in sql]
+    assert len(minute_slices) == 1, (
+        f"a 14 000-row hour was sliced into {len(minute_slices)} statements "
+        "instead of one — the slice did not adapt to the hour's density")
+    (s, e) = minute_slices[0]
+    assert (s, e) == (bucket, bucket + timedelta(hours=1))
+    assert facts["hours_repaired"] == 1
+
+
+# ---------------------------------------------------------------------------
+# One hour's failure must not block the rest of the sample, and progress
+# must still be persisted — the bug active in production on 3 September 2026:
+# hour 14:00 failed every pass, its `asyncio.TimeoutError` propagated out of
+# `repair_rollup_gaps` before any `_persist_reconcile` call, so the pass
+# looked like it never ran even though 745 000 rows had already been fixed,
+# and the 14 newer hours behind it were never attempted at all.
+# ---------------------------------------------------------------------------
+def test_one_failing_hour_does_not_block_the_rest_of_the_batch(monkeypatch):
+    """A gap hour that cannot be repaired (persistent timeout, e.g. the
+    single-minute density is itself too heavy) must not stop the newer hours
+    in the same sample from being tried — `hourly_gaps` always returns the
+    OLDEST gaps first, so without isolation a permanently-stuck oldest hour
+    would starve every hour behind it, forever."""
+    monkeypatch.setattr(report_repo, "rollup_coverage", _async(
+        {"never_ran": False, "latest": datetime(2026, 8, 25, 0, 0, tzinfo=timezone.utc)}))
+    monkeypatch.setattr(report_repo, "raw_coverage", _async(
+        datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)))
+    bad = datetime(2026, 8, 24, 14, 0, tzinfo=timezone.utc)
+    good = datetime(2026, 8, 24, 15, 0, tzinfo=timezone.utc)
+    report = rollup_repo.GapReport(
+        hours=[rollup_repo.GapHour(bad, 4_329_065, 0), rollup_repo.GapHour(good, 14_000, 0)],
+        total_hours=2, total_missing=4_343_065,
+        worst_bucket=bad, worst_missing=4_329_065)
+    monkeypatch.setattr(rollup_repo, "hourly_gaps", _async(report))
+
+    def _should_fail(args):
+        start, _end = args
+        return bad <= start < bad + timedelta(hours=1)
+
+    db = _FailingDB(_should_fail)
+    detail, facts = run(ms.repair_rollup_gaps(db))
+
+    assert facts["hours_repaired"] == 1, "the good hour must be repaired even though the bad one failed"
+    assert good.isoformat() in facts["hours"]
+    assert facts["hours_failed"], "the failed hour must be named, not silently dropped"
+    assert facts["hours_failed"][0]["bucket"] == bad.isoformat()
+    assert facts["hours_failed"][0]["detail"], (
+        "an asyncio.TimeoutError has an empty str() — the detail must fall "
+        "back to something non-empty, or the log entry is the same blank "
+        "'detail': '' that hid this bug in production")
+    hour_calls = [a for sql, a in db.calls if "sentinel_rollup_events_1h" in sql]
+    assert (good, good + timedelta(hours=1)) in hour_calls
+    assert (bad, bad + timedelta(hours=1)) not in hour_calls, (
+        "_1h must never be called for an hour whose minutes were not all "
+        "written successfully")
+    assert len(db.inserts) == 1, (
+        "a row must still be persisted to rollup_reconcile_runs even though "
+        "one hour failed — this is the exact production bug: zero rows "
+        "persisted despite 745 000 real rows having been repaired")
+    assert db.inserts[0][1][0] == "gaps"
+
+
+def test_a_too_wide_batch_halves_down_to_minutes_and_still_succeeds(monkeypatch):
+    """A wrong density guess (a low hourly average hiding one much heavier
+    minute) must not leave the whole hour unrepaired just because the first
+    statement chosen for it was too wide — halving has to actually recover,
+    not just give up at the first failure."""
+    monkeypatch.setattr(report_repo, "rollup_coverage", _async(
+        {"never_ran": False, "latest": datetime(2026, 8, 24, 8, 0, tzinfo=timezone.utc)}))
+    monkeypatch.setattr(report_repo, "raw_coverage", _async(
+        datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)))
+    bucket = datetime(2026, 8, 24, 4, 0, tzinfo=timezone.utc)
+    # raw_n=100 -> _gap_repair_slices picks a single whole-hour statement.
+    monkeypatch.setattr(rollup_repo, "hourly_gaps", _async(
+        _fixed_gap_report(bucket, raw_n=100)))
+
+    def _should_fail(args):
+        start, end = args
+        return (end - start) > timedelta(minutes=1)  # only the wide attempts fail
+
+    db = _FailingDB(_should_fail)
+    detail, facts = run(ms.repair_rollup_gaps(db))
+
+    assert facts["hours_repaired"] == 1, "halving should have recovered the hour, not abandoned it"
+    minute_slices = [a for sql, a in db.calls if "sentinel_rollup_events_1m" in sql]
+    wide_attempts = [(s, e) for s, e in minute_slices if (e - s) > timedelta(minutes=1)]
+    narrow_calls = [(s, e) for s, e in minute_slices if (e - s) == timedelta(minutes=1)]
+    assert wide_attempts, (
+        "the first attempt must be wider than one minute, or this test does "
+        "not actually exercise the halving path")
+    assert narrow_calls, "halving must eventually reach one-minute statements"
+    assert any("sentinel_rollup_events_1h" in sql for sql, _ in db.calls)
+
+
+def test_a_single_minute_that_never_succeeds_is_not_split_further(monkeypatch):
+    """Below one minute, `sentinel_rollup_events_1m` would overwrite instead
+    of summing (`event_rollup_1m`'s bucket is `date_trunc('minute', ts)`,
+    upserted with `SET n = EXCLUDED.n` — see `GAP_REPAIR_SLICE`'s comment).
+    A minute that fails even alone must therefore stop halving and leave the
+    hour named-unrepaired, not invent a sub-minute slice that would silently
+    drop half its rows."""
+    monkeypatch.setattr(report_repo, "rollup_coverage", _async(
+        {"never_ran": False, "latest": datetime(2026, 8, 25, 0, 0, tzinfo=timezone.utc)}))
+    monkeypatch.setattr(report_repo, "raw_coverage", _async(
+        datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)))
+    bucket = datetime(2026, 8, 24, 14, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(rollup_repo, "hourly_gaps", _async(
+        _fixed_gap_report(bucket, raw_n=4_329_065)))
+
+    db = _FailingDB(lambda args: True)  # every _1m call fails, at any size
+    detail, facts = run(ms.repair_rollup_gaps(db))
+
+    assert facts["hours_repaired"] == 0
+    assert facts["hours_failed"][0]["bucket"] == bucket.isoformat()
+    minute_slices = [a for sql, a in db.calls if "sentinel_rollup_events_1m" in sql]
+    assert len(minute_slices) == 1, (
+        "a minute that fails even alone must not be split further — no "
+        f"retry below the table's own grain, but got {len(minute_slices)} attempts")
+    assert minute_slices[0] == (bucket, bucket + timedelta(minutes=1))
+    assert not any("sentinel_rollup_events_1h" in sql for sql, _ in db.calls), (
+        "_1h must not be called when the hour's minutes were never all written")
 
 
 def test_gap_hours_are_repaired_oldest_first(monkeypatch):
