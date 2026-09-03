@@ -58,8 +58,10 @@ def _compile(sql: str, args: tuple):
 
 class _GapSQLite:
     """Doar `fetch`, care rulează interogarea PRIMITĂ (nu una reconstruită de
-    test) pe SQLite. `bucket` se întoarce ca `datetime`, nu text — asyncpg
-    întoarce `timestamptz`, iar `hourly_gaps` presupune asta (`_as_utc`)."""
+    test) pe SQLite. `bucket`/`worst_bucket` se întorc ca `datetime`, nu text
+    — asyncpg întoarce `timestamptz`, iar `hourly_gaps` presupune asta
+    (`_as_utc`). `self.fetch_calls` numără chemările, ca un test să poată
+    verifica direct — nu doar presupune — că interogarea n-a atins baza."""
 
     def __init__(self, *, rollup=(), raw=()):
         self.con = sqlite3.connect(":memory:")
@@ -70,14 +72,18 @@ class _GapSQLite:
             "INSERT INTO event_rollup_1h (bucket, n) VALUES (?, ?)", list(rollup))
         self.con.executemany(
             "INSERT INTO raw_events (ts) VALUES (?)", [(t,) for t in raw])
+        self.fetch_calls = 0
 
     async def fetch(self, sql, *args):
+        self.fetch_calls += 1
         s, a = _compile(_tradu(sql), args)
         rows = self.con.execute(s, a).fetchall()
         out = []
         for r in rows:
             d = dict(r)
             d["bucket"] = _dt(d["bucket"])
+            if d.get("worst_bucket") is not None:
+                d["worst_bucket"] = _dt(d["worst_bucket"])
             out.append(d)
         return out
 
@@ -104,6 +110,10 @@ def test_late_arriving_hour_is_detected_as_a_gap():
     assert gap.raw_n == 9
     assert gap.rollup_n == 6
     assert gap.missing == 3
+    # Cu o singură gaură, ea e și cea mai gravă — verifică și asta, nu doar
+    # existența câmpurilor.
+    assert report.worst_bucket == _dt("2026-08-24 04:00:00")
+    assert report.worst_missing == 3
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +158,7 @@ def test_hour_whose_raw_data_has_expired_is_not_reported():
     assert report.total_hours == 0, (
         "o oră cu rollup > brut (brut expirat) a fost citită ca o gaură")
     assert report.total_missing == 0
+    assert report.worst_bucket is None
 
 
 # ---------------------------------------------------------------------------
@@ -212,14 +223,56 @@ def test_totals_survive_the_sample_limit():
 
 
 # ---------------------------------------------------------------------------
+# 5b. Cea mai gravă oră NU e neapărat în eșantionul „cele mai vechi" —
+#     regăsită oricum, prin window function calculată înainte de LIMIT
+# ---------------------------------------------------------------------------
+def test_worst_hour_is_found_even_outside_the_oldest_sample():
+    """Geometria raportului: câteva ore lipsă, cele mai multe mici, dar una —
+    la câteva ore de cea mai veche, nu prima — poartă aproape tot deficitul.
+    Un eșantion „cele mai vechi 2" (cum face `repair_rollup_gaps` cu
+    `MAX_GAP_REPAIR_HOURS`) n-ar conține-o deloc; `worst_bucket`/
+    `worst_missing` trebuie s-o găsească oricum, fiindcă vin dintr-o
+    fereastră calculată pe TOT setul, nu pe eșantionul întors."""
+    h4, h5, h6, h7 = (
+        "2026-08-24 04:00:00", "2026-08-24 05:00:00",
+        "2026-08-24 06:00:00", "2026-08-24 07:00:00")
+    rollup = [(h4, 4), (h5, 4), (h6, 6), (h7, 4)]
+    raw = (
+        [f"2026-08-24 04:0{i}:00" for i in range(5)]        # 04:00 -> lipsă 1
+        + [f"2026-08-24 05:0{i}:00" for i in range(5)]       # 05:00 -> lipsă 1
+        # 06:00 -> lipsă mare, ora care CONTEAZĂ
+        + [f"2026-08-24 06:{m:02d}:{s:02d}" for m in range(60) for s in (0, 30)]
+        + [f"2026-08-24 07:0{i}:00" for i in range(5)]       # 07:00 -> lipsă 1
+    )
+    db = _GapSQLite(rollup=rollup, raw=raw)
+
+    report = run(rollup_repo.hourly_gaps(
+        db, lower=_dt("2026-08-24 00:00:00"), upper=_dt("2026-08-24 08:00:00"), limit=2))
+
+    assert report.total_hours == 4
+    assert [g.bucket.hour for g in report.hours] == [4, 5]        # eșantionul, cel mai vechi întâi
+    assert report.worst_bucket == _dt(h6), (
+        "cea mai gravă oră nu a fost găsită — a rămas ascunsă în afara "
+        "eșantionului celor mai vechi")
+    assert report.worst_missing == 120 - 6                        # 120 brut - 6 rollup
+
+
+# ---------------------------------------------------------------------------
 # 6. Fereastră goală — nimic interogat, nimic raportat
 # ---------------------------------------------------------------------------
 def test_empty_window_short_circuits_without_querying():
-    """`lower >= upper` întoarce direct un raport gol, fără să atingă baza —
+    """`lower >= upper` întoarce direct un raport gol, FĂRĂ să atingă baza —
     contractul pe care se sprijină `check_rollup_reconcile`/
-    `repair_rollup_gaps` când încă nu există nicio oră stabilită."""
+    `repair_rollup_gaps` când încă nu există nicio oră stabilită. Verificat
+    prin spionul `fetch_calls`, nu doar prin rezultat: un `hourly_gaps` care
+    ar interoga oricum baza pe o fereastră goală (întorcând tot un raport gol,
+    fiindcă interogarea n-ar găsi nimic) ar trece testul vechi fără să
+    respecte contractul „fără să atingă baza"."""
     db = _GapSQLite(rollup=[], raw=[])
     report = run(rollup_repo.hourly_gaps(
         db, lower=_dt("2026-08-24 06:00:00"), upper=_dt("2026-08-24 06:00:00"), limit=20))
     assert report.total_hours == 0
     assert report.hours == []
+    assert db.fetch_calls == 0, (
+        "hourly_gaps a interogat baza pe o fereastră goală — scurtcircuitul "
+        "`lower >= upper` nu mai oprește apelul înainte de `db.fetch`")

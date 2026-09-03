@@ -43,9 +43,34 @@ pentru acea zi — tăcut, fiindcă interogarea rămâne validă și întoarce d
 puțin. `repair_rollup_gaps` e reparația: compară `event_rollup_1h` cu
 `raw_events` pe orele deja stabilite (nu pe cele încă în recuperarea de mai
 sus) și reface, plafonat, cele mai vechi mai întâi — vezi docstring-ul ei
-pentru de ce nu ajunge să reagrege doar ora. Detecția stă separat, în
-`sentinel/selfcheck/checks.py::check_rollup_reconcile`, ca să treacă prin
-canalul de alertare existent, nu printr-unul nou.
+pentru de ce nu ajunge să reagrege doar ora. Rezultatul se scrie o dată pe
+trecere în `rollup_reconcile_runs` (migrația 0044); detecția — separat, în
+`sentinel/selfcheck/checks.py::check_rollup_reconcile` — CITEȘTE acel rând,
+nu recalculează, ca autoverificarea să nu reproducă asupra ei însăși boala pe
+care o consemnează memoria proiectului: un panou încet fiindcă propria lui
+verificare la 5 minute reface agregări scumpe.
+
+## Unitatea de reparat nu e ora — un test măsurat pe gazdă a demonstrat de ce
+
+Runda 2 repara câte o oră întreagă dintr-o singură instrucțiune SQL
+(`sentinel_rollup_events_1m(ora_început, ora_sfârșit)`). Măsurat pe gazdă, pe
+ora cea mai grea a incidentului (24.08 14:00, 4 329 065 rânduri):
+**67-70 de secunde** — peste `statement_timeout_ms` al conexiunii (30 000 ms,
+`sentinel/db/engine.py`), care omoară INSTRUCȚIUNEA, nu doar rularea.
+Consecința: prima trecere pică exact pe ora aia, iar fiindcă `hourly_gaps`
+alege mereu cea mai veche gaură RĂMASĂ, fiecare trecere următoare reia de la
+ACEEAȘI oră și moare la fel — reparație care raportează că repară fără să
+repare niciodată, pentru totdeauna. Un plafon mai mic de ore pe rulare n-ar
+fi ajutat: o SINGURĂ oră depășea deja limita.
+
+Costul nu crește liniar cu numărul de rânduri — 895 013 rânduri (13:00) au
+durat 2,2 s cald, de 4,8x mai puține decât 14:00 dar de 32x mai rapid, semn că
+`work_mem` (8 MB) e depășit undeva între cele două praguri, iar sortarea
+(`percentile_cont`) trece pe disc. Felierea pe MINUT, granulația proprie a lui
+`event_rollup_1m`, ține fiecare instrucțiune sub acel prag — vezi
+`GAP_REPAIR_SLICE`. Testul obligatoriu pentru asta e
+`test_no_single_sql_statement_gets_a_whole_hour_interval`, în
+`tests/unit/test_maintenance_rollup_repair.py`.
 
 ## Un pas care cade nu îi oprește pe ceilalți
 
@@ -83,14 +108,28 @@ PARTITIONS_AHEAD = 3
 MAX_CATCHUP_HOURS = 48
 
 # Câte ore ÎNGHEȚATE de filigran (deja lăsate în urmă, nu în recuperarea de mai
-# sus) se repară pe rulare. Fiecare oră costă o agregare de minut plus una de
-# oră pe volumul EI — comparabil cu o oră din plafonul de mai sus, deci opt pe
-# rulare rămân mult sub TimeoutStartSec chiar dacă se adună la recuperarea
-# înainte din aceeași trecere. Cele mai vechi ore se repară primele, fiindcă o
+# sus) se repară pe rulare. NU e comparat cu TimeoutStartSec (900 s, al
+# unității) — comparația care conta era cu `statement_timeout_ms` (30 000 ms,
+# per CONEXIUNE, `sentinel/db/engine.py`), iar o oră de incident poate depăși
+# aia singură (vezi docstring-ul modulului). De-aia plafonul de aici nu mai e
+# ce ține reparația sub timeout — `GAP_REPAIR_SLICE` e — ci doar cât progres
+# se face pe rulare: opt ore pe trecere golesc restanța de 15 ore a
+# incidentului măsurat în două-trei treceri, cele mai vechi primele, fiindcă o
 # oră nereparată concurează cu retenția brutului (`raw_events_days`): odată
 # ieșită din fereastră, rămâne greșită definitiv, indiferent ce se întâmplă
 # aici după aceea.
 MAX_GAP_REPAIR_HOURS = 8
+
+# Unitatea de lucru a UNEI instrucțiuni SQL de reagregare pe minut. Măsurat pe
+# gazdă: ora cea mai grea a incidentului (4 329 065 rânduri) a durat 67-70 s
+# ca o SINGURĂ instrucțiune pe ora întreagă — peste `statement_timeout_ms`
+# (30 000 ms) — iar felierea pe minut o ține sub o secundă pe felie (regimul
+# fără depășire de `work_mem`, măsurat la 895 013 rânduri/oră: 2,2 s calde,
+# adică ~36 ms pe minut la volum uniform). `sentinel_rollup_events_1m`
+# primește orice interval, deci felia coboară exact la granulația proprie a
+# tabelei — fiecare felie e un bucket întreg din `event_rollup_1m`, nu o
+# tăietură arbitrară.
+GAP_REPAIR_SLICE = timedelta(minutes=1)
 
 # Zile golite din DEFAULT pe rulare. Mutarea unei zile e o singură
 # tranzacție care nu se poate întrerupe; la un timer orar, șase rulări
@@ -251,6 +290,30 @@ async def rollup_events(db: Database) -> tuple[str, dict[str, Any]]:
     return "; ".join(parts), facts
 
 
+async def _persist_reconcile(
+    db: Database, *, status: str, raw_exists: bool,
+    window_lower: datetime | None = None, window_upper: datetime | None = None,
+    gap_hours: int = 0, rows_missing: int = 0,
+    worst_bucket: datetime | None = None, worst_missing: int = 0,
+    hours_repaired: int = 0,
+) -> None:
+    """Scrie rândul pe care `check_rollup_reconcile` îl citește — vezi
+    `0044_rollup_reconcile_runs.sql`. Se scrie pe FIECARE trecere, chiar și
+    când n-are ce compara, ca autoverificarea să poată deosebi „a fost
+    verificat și e bine" de „n-a fost verificat niciodată" fără să interogheze
+    ea însăși `raw_events`/`event_rollup_1h`."""
+    await db.execute(
+        """
+        INSERT INTO rollup_reconcile_runs
+            (status, raw_exists, window_lower, window_upper,
+             gap_hours, rows_missing, worst_bucket, worst_missing, hours_repaired)
+        VALUES ($1::text, $2::boolean, $3::timestamptz, $4::timestamptz,
+                $5::int, $6::bigint, $7::timestamptz, $8::bigint, $9::int)
+        """,
+        status, raw_exists, window_lower, window_upper,
+        gap_hours, rows_missing, worst_bucket, worst_missing, hours_repaired)
+
+
 async def repair_rollup_gaps(db: Database) -> tuple[str, dict[str, Any]]:
     """Reagregă orele deja lăsate în urmă de filigran în care au ajuns rânduri
     brute mai târziu.
@@ -262,7 +325,8 @@ async def repair_rollup_gaps(db: Database) -> tuple[str, dict[str, Any]]:
     rânduri lipsă pentru o singură zi, tăcut. Pasul ăsta e reparația: găsește
     orele deja STABILITE (sub filigranul curent, nu în recuperarea de mai sus,
     care e încă în desfășurare) unde `event_rollup_1h` numără mai puțin decât
-    `raw_events`, și le reface.
+    `raw_events`, și le reface — vezi antetul modulului pentru unitatea de
+    lucru aleasă (feliere pe minut, nu pe oră) și de ce.
 
     `event_rollup_1h` nu citește niciodată din `raw_events` — citește din
     `event_rollup_1m` (`sentinel_rollup_events_1h`, 0017_partition_fixes.sql).
@@ -270,34 +334,60 @@ async def repair_rollup_gaps(db: Database) -> tuple[str, dict[str, Any]]:
     (aceeași buclă din `rollup_events`, aceeași `_watermark`), deci o oră
     ratată la nivel de minut rămâne ratată la nivel de oră chiar dacă doar ora
     e reagregată — cererea ar citi din nou din minutul deja incomplet. De-aia
-    fiecare oră reparată aici reface întâi minutul, apoi ora, exact ca la
-    recuperarea înainte: `sentinel_rollup_events_1m`/`_1h` sunt idempotente
-    prin `ON CONFLICT ... DO UPDATE SET col = EXCLUDED.col` (nu se adună la ce
-    era acolo, se suprascrie), deci refacerea minutului chiar și pe orele unde
-    NU era nimic greșit e ieftină și corectă, nu o dublare.
+    fiecare oră reparată aici reface întâi TOATE minutele ei, apoi ora, exact
+    ca la recuperarea înainte: `sentinel_rollup_events_1m`/`_1h` sunt
+    idempotente prin `ON CONFLICT ... DO UPDATE SET col = EXCLUDED.col` (nu se
+    adună la ce era acolo, se suprascrie), deci refacerea minutului chiar și
+    pe orele unde NU era nimic greșit e ieftină și corectă, nu o dublare.
+
+    Rândul persistat (`_persist_reconcile`) poartă starea de DUPĂ reparație
+    doar când niciun gol n-a rămas netrimis („left == 0" mai jos): în cazul
+    ăla, fiindcă TOATE golurile din fereastră — nu doar eșantionul plafonat —
+    au fost procesate chiar în trecerea asta, „ok" e o concluzie dovedită, nu
+    o presupunere. Când mai rămân goluri (plafonul a tăiat lista), rândul
+    poartă totalurile DINAINTE de reparație — subestimate cu ce s-a reparat
+    chiar acum, niciodată supraestimate — fiindcă a recalcula exact starea
+    rămasă ar cere o a doua interogare pe toată fereastra, exact rescanarea pe
+    care persistarea asta există s-o evite.
     """
     from sentinel.analytics import reports as report_repo
     from sentinel.db.repo import rollups as rollup_repo
 
     cov = await report_repo.rollup_coverage(db)
     if cov["never_ran"]:
+        raw_exists = (await report_repo.raw_coverage(db)) is not None
+        await _persist_reconcile(db, status="never_ran", raw_exists=raw_exists)
         return "rollup-ul n-a rulat niciodată; nimic de reparat", {"hours_repaired": 0}
 
     upper = cov["latest"].replace(minute=0, second=0, microsecond=0)
     lower = await report_repo.raw_coverage(db)
     if lower is None or lower >= upper:
+        await _persist_reconcile(
+            db, status="empty_window", raw_exists=lower is not None,
+            window_lower=lower, window_upper=upper)
         return "nicio oră stabilită încă de reparat", {"hours_repaired": 0}
 
     report = await rollup_repo.hourly_gaps(
         db, lower=lower, upper=upper, limit=MAX_GAP_REPAIR_HOURS)
     if not report.hours:
+        await _persist_reconcile(
+            db, status="ok", raw_exists=True, window_lower=lower, window_upper=upper)
         return "niciun gol între agregat și brut", {"hours_repaired": 0, "hours_left": 0}
 
     repaired: list[str] = []
     for gap in report.hours:
         start = gap.bucket
         end = start + timedelta(hours=1)
-        await db.fetchval("SELECT sentinel_rollup_events_1m($1, $2)", start, end)
+        # Feliat pe minut — o SINGURĂ instrucțiune pe ora întreagă a depășit
+        # `statement_timeout_ms` pe ora cea mai grea a incidentului (vezi
+        # antetul modulului). `_1h` rămâne o singură chemare: citește
+        # `event_rollup_1m` deja agregat pe grupe (asset, sursă, acțiune), nu
+        # `raw_events` rând cu rând — mărginit de perechi, nu de volum.
+        cursor = start
+        while cursor < end:
+            nxt = min(cursor + GAP_REPAIR_SLICE, end)
+            await db.fetchval("SELECT sentinel_rollup_events_1m($1, $2)", cursor, nxt)
+            cursor = nxt
         await db.fetchval("SELECT sentinel_rollup_events_1h($1, $2)", start, end)
         repaired.append(start.isoformat())
         log.info("rollup gap repaired",
@@ -311,6 +401,16 @@ async def repair_rollup_gaps(db: Database) -> tuple[str, dict[str, Any]]:
         log.warning("rollup gap repair capped; more remain",
                     extra={"hours_repaired": len(repaired), "hours_left": left,
                            "rows_missing_total": report.total_missing})
+        await _persist_reconcile(
+            db, status="gaps", raw_exists=True, window_lower=lower, window_upper=upper,
+            gap_hours=report.total_hours, rows_missing=report.total_missing,
+            worst_bucket=report.worst_bucket, worst_missing=report.worst_missing,
+            hours_repaired=len(repaired))
+    else:
+        # Fereastra întreagă a fost procesată chiar acum — dovedit, nu ghicit.
+        await _persist_reconcile(
+            db, status="ok", raw_exists=True, window_lower=lower, window_upper=upper,
+            hours_repaired=len(repaired))
     return (f"{len(repaired)} ore reagregate" + (f", {left} rămase" if left else ""),
             {"hours_repaired": len(repaired), "hours_left": left,
              "rows_missing_total": report.total_missing, "hours": repaired})

@@ -1598,11 +1598,12 @@ async def check_ship_lag(db: Database, cfg: Config) -> list[CheckResult]:
     return results
 
 
-#: How many gap hours to keep as a sample in the finding's `detail`/`facts`.
-#: `GapReport.total_hours`/`total_missing` already carry the true size of the
-#: problem regardless of this — the sample is only so a human reading
-#: `/selfcheck` sees WHERE to look first without querying the database.
-ROLLUP_RECONCILE_SAMPLE = 10
+#: How stale the persisted reconciliation row can be before this check stops
+#: trusting it. `sentinel-maintenance.timer` runs hourly, so anything past a
+#: couple of missed passes means the timer itself is the problem, not the
+#: rollup — reported as `unknown`, not as a false "ok" carried over from
+#: whenever the row was last written.
+RECONCILE_STALE_HOURS = 3
 
 
 async def check_rollup_reconcile(db: Database) -> list[CheckResult]:
@@ -1618,85 +1619,104 @@ async def check_rollup_reconcile(db: Database) -> list[CheckResult]:
     `raw_events` got a quietly smaller number for exactly that day, with nothing
     in the answer saying so.
 
-    Two edges have to be right or this either misses the fault or invents one
-    that is not there:
+    This does **not** query `raw_events`/`event_rollup_1h` itself. It reads the
+    row `maintenance_service.repair_rollup_gaps` already writes once an hour to
+    `rollup_reconcile_runs` (`0044_rollup_reconcile_runs.sql`). A self-check
+    that reran that comparison on its own five-minute cadence would be exactly
+    the previously measured failure mode repeated on new material: the
+    dashboard went slow because its own frequent check kept re-running
+    expensive aggregates that only a much slower job needed to compute — an
+    answer that can change once an hour does not need to be recomputed 288
+    times a day. See `sentinel/db/repo/rollups.py`'s module docstring for the
+    two edges (the open hour; raw data already aged out of retention) that
+    `hourly_gaps` itself gets right so this check never has to reinvent them.
 
-    * **the current hour is not compared.** Its bucket is rewritten on every
-      pass while the hour is still open (see `0025_rollup_watermark.sql`) —
-      comparing it would flag ordinary, still-in-progress aggregation as loss.
-      `upper` is `max(bucket)` from `event_rollup_1h`, hour-truncated:
-      everything at or after it simply has not been reached yet by this run,
-      which is lag, not loss.
-    * **an hour whose raw data has already aged out of `raw_events_days` is not
-      compared either.** `event_rollup_1h` is kept far longer (`rollup_1h_days`)
-      on purpose, so an hour with an aggregate and no raw rows left is
-      retention doing its job, not a gap — comparing there would raise the same
-      false alarm on every single run, forever. `lower` comes from
-      `raw_coverage`, the oldest surviving PARTITION read from the catalog, not
-      from the configured retention, which says what SHOULD be kept, not what
-      IS.
-
-    A run that cannot even establish those two edges — `raw_events` already has
-    data but `event_rollup_1h` has never been written at all — cannot
-    reconcile anything and says so as `unknown` rather than guessing `ok`.
+    A row too old to trust (`RECONCILE_STALE_HOURS`) is `unknown`, not the
+    status it was last written with — a stopped `sentinel-maintenance.timer`
+    must not read as "still fine" just because the last real answer happened
+    to be `ok`. No row at all — the step has never completed a pass — is
+    `unknown` for the same reason `ship:lag`'s missing-cursor case is: a
+    finding this check withdrew would be reconciled away by the runner, and a
+    step that has simply never run must not look like a withdrawn finding.
     """
-    from sentinel.analytics import reports as report_repo
     from sentinel.db.repo import rollups as rollup_repo
 
-    cov = await report_repo.rollup_coverage(db)
-    lower = await report_repo.raw_coverage(db)
+    try:
+        last = await rollup_repo.latest_reconcile_run(db)
+    except Exception as exc:  # noqa: BLE001
+        return [CheckResult(
+            "rollup:reconcile", "Nu pot citi reconcilierea agregatului orar", "unknown",
+            detail=str(exc)[:160],
+            action="journalctl -u sentinel-maintenance -n 50")]
 
-    if cov["never_ran"]:
-        if lower is None:
+    if last is None:
+        return [CheckResult(
+            "rollup:reconcile", "Agregatul orar n-a fost reconciliat încă", "unknown",
+            detail="niciun rând în rollup_reconcile_runs — mentenanța n-a "
+                   "terminat încă o trecere prin pasul de reparație",
+            action="journalctl -u sentinel-maintenance -n 50")]
+
+    age_h = (datetime.now(timezone.utc) - last.checked_at).total_seconds() / 3600
+    if age_h > RECONCILE_STALE_HOURS:
+        return [CheckResult(
+            "rollup:reconcile", "Reconcilierea agregatului orar e învechită", "unknown",
+            detail=f"ultima verificare acum {age_h:.1f}h ({last.status}) — "
+                   f"sentinel-maintenance.timer nu mai rulează la timp acest pas",
+            action="systemctl list-timers sentinel-maintenance.timer ; "
+                   "journalctl -u sentinel-maintenance -n 50",
+            facts={"age_hours": round(age_h, 1), "last_status": last.status})]
+
+    if last.status == "never_ran":
+        if not last.raw_exists:
             return [CheckResult(
                 "rollup:reconcile", "Reconcilierea agregatului orar", "ok",
                 detail="nicio dată brută încă — nimic de reconciliat",
-                facts={"raw_exists": False, "rollup_exists": False})]
+                facts={"raw_exists": False})]
         return [CheckResult(
             "rollup:reconcile", "Agregatul orar n-a rulat niciodată", "unknown",
             detail="raw_events are date, dar event_rollup_1h e gol — mentenanța "
                    "n-a trecut încă, sau a picat de fiecare dată la acest pas",
             action="journalctl -u sentinel-maintenance -n 50",
-            facts={"raw_exists": True, "rollup_exists": False})]
+            facts={"raw_exists": True})]
 
-    upper = cov["latest"].replace(minute=0, second=0, microsecond=0)
-    if lower is None or lower >= upper:
+    if last.status == "empty_window":
         return [CheckResult(
             "rollup:reconcile", "Reconcilierea agregatului orar", "ok",
             detail="nicio oră stabilită încă de comparat",
-            facts={"raw_exists": lower is not None, "window_hours": 0})]
+            facts={"raw_exists": last.raw_exists})]
 
-    try:
-        report = await rollup_repo.hourly_gaps(
-            db, lower=lower, upper=upper, limit=ROLLUP_RECONCILE_SAMPLE)
-    except Exception as exc:  # noqa: BLE001
-        return [CheckResult(
-            "rollup:reconcile", "Nu pot reconcilia agregatul orar", "unknown",
-            detail=str(exc)[:160],
-            action="journalctl -u sentinel-maintenance -n 50")]
+    window_hours = (
+        round((last.window_upper - last.window_lower).total_seconds() / 3600)
+        if last.window_lower and last.window_upper else None)
 
-    window_hours = round((upper - lower).total_seconds() / 3600)
-    if report.total_hours == 0:
+    if last.status == "ok":
+        detail = (f"la zi cu brutul pe {window_hours}h verificate"
+                   if window_hours is not None else "la zi cu brutul")
         return [CheckResult(
             "rollup:reconcile", "Agregatul orar de evenimente", "ok",
-            detail=f"la zi cu brutul pe {window_hours}h verificate",
-            facts={"window_hours": window_hours})]
+            detail=detail, facts={"window_hours": window_hours})]
 
-    oldest = report.hours[0]
+    # last.status == "gaps" — cea mai gravă oră, nu cea mai veche: prioritatea
+    # de reparare (mai veche întâi, concurează cu retenția) e o decizie
+    # diferită de ce trebuie să vadă operatorul primul.
+    worst = last.worst_bucket.strftime("%d.%m %H:%M") if last.worst_bucket else "necunoscută"
     return [CheckResult(
         "rollup:reconcile", "Agregatul orar de evenimente e sub brut", "degraded",
         detail=(
-            f"{_numar(report.total_hours, 'oră', 'ore')} din ultimele "
-            f"{window_hours}h lipsesc din event_rollup_1h — "
-            f"{report.total_missing:,} rânduri, cea mai veche la "
-            f"{oldest.bucket.strftime('%d.%m %H:%M')} UTC ({oldest.missing:,} lipsă)"),
+            f"{_numar(last.gap_hours, 'oră', 'ore')}"
+            + (f" din ultimele {window_hours}h" if window_hours is not None else "")
+            + f" lipsesc din event_rollup_1h — {last.rows_missing:,} rânduri, "
+            f"cea mai gravă la {worst} UTC ({last.worst_missing:,} lipsă); "
+            f"{last.hours_repaired} reparate la ultima trecere"),
         action="sentinel-maintenance repară automat, plafonat, cele mai vechi ore "
                "întâi — vezi „rollup gap repair” în jurnal pentru cât a avansat; "
                "detecția, blocarea și alertarea n-au fost afectate",
-        facts={"window_hours": window_hours, "gap_hours": report.total_hours,
-               "rows_missing": report.total_missing,
-               "oldest_gap": oldest.bucket.isoformat(),
-               "sample_truncated": report.truncated})]
+        facts={"window_hours": window_hours, "gap_hours": last.gap_hours,
+               "rows_missing": last.rows_missing,
+               "worst_bucket": last.worst_bucket.isoformat() if last.worst_bucket else None,
+               "worst_missing": last.worst_missing,
+               "hours_repaired_last_pass": last.hours_repaired,
+               "checked_at": last.checked_at.isoformat()})]
 
 
 async def check_beacon_delivery(db: Database, cfg: Config) -> list[CheckResult]:
