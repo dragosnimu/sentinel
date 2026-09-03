@@ -202,6 +202,27 @@ def test_a_recent_row_just_inside_the_staleness_window_is_trusted(monkeypatch):
     assert results[0].status == "ok"
 
 
+def test_a_row_exactly_at_the_staleness_boundary_is_still_trusted(monkeypatch):
+    """The exact edge, not just a point safely on either side: at precisely
+    `RECONCILE_STALE_HOURS` (3.0h, no fuzz — `sentinel-maintenance` runs at
+    :03, so a single missed pass ages a row by at most ~2h and two missed
+    passes push it well past 3h; the boundary itself should never be reached
+    in normal operation, which is exactly why nothing else exercises it) the
+    row is still ON TIME, per `age_h > RECONCILE_STALE_HOURS` (strict). A
+    mutation to `>=` would flip only this one point from trusted to
+    `unknown`, and every other staleness test in this file is far enough from
+    the edge to stay green regardless."""
+    now = datetime(2026, 8, 24, 18, 0, tzinfo=timezone.utc)
+    _now(monkeypatch, now)
+    monkeypatch.setattr(rollup_repo, "latest_reconcile_run", _async(_run(
+        status="ok", checked_at=now - timedelta(hours=3))))
+
+    results = run(checks.check_rollup_reconcile(_DB()))
+    assert results[0].status == "ok", (
+        "un rând vechi de exact RECONCILE_STALE_HOURS a fost tratat ca "
+        "învechit — granița e `>`, nu `>=`")
+
+
 # ---------------------------------------------------------------------------
 # The exception branch — reachable whenever the read itself fails
 # ---------------------------------------------------------------------------

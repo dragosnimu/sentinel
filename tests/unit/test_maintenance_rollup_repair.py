@@ -167,6 +167,38 @@ def test_truncated_batch_persists_the_pre_repair_totals(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# The measured, absolute bound this whole design leans on
+# ---------------------------------------------------------------------------
+#: Round 3's verifier measured this on real PostgreSQL 16.14, in
+#: `BEGIN…ROLLBACK` with `SET LOCAL statement_timeout='30s'` as in production:
+#: the incident's worst hour (24.08 14:00, 4 329 065 rows) cost 14 544 ms
+#: sliced at one minute, its single worst slice (14:45) 1 821 ms — both
+#: comfortably under the 30 000 ms connection timeout
+#: (`statement_timeout_ms`, `sentinel/config.py`) that killed the SAME hour
+#: in ONE statement at 67-70s (round 2's blocker). This is a LITERAL, not
+#: `ms.GAP_REPAIR_SLICE`, on purpose: round 3 proved that a threshold
+#: measured against the constant it is supposed to police is not a guard —
+#: mutating `GAP_REPAIR_SLICE` from one minute to one hour moved the
+#: threshold with it, and both tests below stayed green while the code
+#: emitted exactly the whole-hour statement that timed out at 67-70s.
+_MEASURED_SAFE_SLICE = timedelta(minutes=1)
+
+
+def test_gap_repair_slice_does_not_exceed_the_measured_safe_bound():
+    """`GAP_REPAIR_SLICE` itself, checked against the measured fact rather
+    than trusted blindly by every other test that imports it. Falsified by
+    round 3's own mutation: setting `GAP_REPAIR_SLICE = timedelta(hours=1)`
+    must fail THIS test on its own, with no other test needed — 1 821 ms
+    (worst measured slice) and 30 000 ms (the timeout) are the two fixed
+    points; a slice this test would accept has not been measured against
+    either."""
+    assert ms.GAP_REPAIR_SLICE <= _MEASURED_SAFE_SLICE, (
+        f"GAP_REPAIR_SLICE ({ms.GAP_REPAIR_SLICE}) exceeds the measured-safe "
+        f"bound ({_MEASURED_SAFE_SLICE}) — the 1 821 ms worst-slice / "
+        f"30 000 ms timeout measurement no longer backs this constant")
+
+
+# ---------------------------------------------------------------------------
 # The actual repair: minute-sliced, minute before hour, per gap, oldest first
 # ---------------------------------------------------------------------------
 def test_each_gap_hour_reaggregates_every_minute_before_the_hour_call(monkeypatch):
@@ -174,7 +206,11 @@ def test_each_gap_hour_reaggregates_every_minute_before_the_hour_call(monkeypatc
     `raw_events` (0017_partition_fixes.sql) — reaggregating only the hour
     would still read the same incomplete minute data the watermark already
     skipped. Every minute slice must run, and all of them before the hour
-    call."""
+    call — checked against the LITERAL `_MEASURED_SAFE_SLICE`, not
+    `ms.GAP_REPAIR_SLICE`: a slice count or size derived from the constant
+    under test would still look self-consistent if the constant were mutated
+    to one hour (a single "slice" spanning the whole gap) — exactly the
+    mutation round 3's verifier caught this test's previous body missing."""
     monkeypatch.setattr(report_repo, "rollup_coverage", _async(
         {"never_ran": False, "latest": datetime(2026, 8, 24, 8, 0, tzinfo=timezone.utc)}))
     monkeypatch.setattr(report_repo, "raw_coverage", _async(
@@ -189,8 +225,20 @@ def test_each_gap_hour_reaggregates_every_minute_before_the_hour_call(monkeypatc
     minute_slices = [c for c in db.calls if "sentinel_rollup_events_1m" in c[0]]
     hour_calls = [c for c in db.calls if "sentinel_rollup_events_1h" in c[0]]
     assert len(hour_calls) == 1
-    expected_slices = timedelta(hours=1) // ms.GAP_REPAIR_SLICE
-    assert len(minute_slices) == expected_slices
+    # Absolute, not `ms.GAP_REPAIR_SLICE` — see the module note above.
+    for _, (s, e) in minute_slices:
+        assert e - s <= _MEASURED_SAFE_SLICE, (
+            f"slice {s}-{e} ({e - s}) exceeds the measured-safe bound "
+            f"{_MEASURED_SAFE_SLICE}")
+    # A 1-hour gap sliced no coarser than the measured-safe bound needs at
+    # LEAST this many slices — arithmetic on the literal bound, not on the
+    # constant under test, so a `GAP_REPAIR_SLICE` mutated to something
+    # coarser (e.g. one hour, collapsing this to a single slice) is caught
+    # here even if the per-slice duration check above were ever weakened.
+    min_slices = timedelta(hours=1) // _MEASURED_SAFE_SLICE
+    assert len(minute_slices) >= min_slices, (
+        f"only {len(minute_slices)} slices for a 1-hour gap — fewer than the "
+        f"{min_slices} a bound of {_MEASURED_SAFE_SLICE} requires")
     # every minute call before the single hour call
     assert db.calls.index(hour_calls[0]) == len(db.calls) - 1
     # the slices cover the hour, back to back, without gaps or overlap
@@ -204,15 +252,19 @@ def test_each_gap_hour_reaggregates_every_minute_before_the_hour_call(monkeypatc
 
 
 def test_no_single_sql_statement_gets_a_whole_hour_interval(monkeypatch):
-    """The round 2 blocker, made permanent as a test: `sentinel_rollup_events_1m`
-    on a full hour of the incident's worst hour (4 329 065 rows) measured
-    67-70s on the real host, over `statement_timeout_ms` (30 000ms,
-    `sentinel/db/engine.py`) — the connection kills the statement, and because
-    `hourly_gaps` always retries the oldest remaining gap first, every
-    following pass died on the exact same hour, forever. No `_1m` call issued
-    by this step is allowed to span more than `GAP_REPAIR_SLICE`; only `_1h`
-    — cheap, bounded by (asset, source, action) pairs per hour, not raw row
-    count — may span a full hour."""
+    """The round 2 blocker, made permanent as a test — and, after round 3,
+    anchored to a LITERAL rather than to `ms.GAP_REPAIR_SLICE`: measuring a
+    threshold against the constant it is supposed to police means mutating
+    the constant moves the threshold with it, and the test stays green.
+    Round 3's verifier proved this exact failure: `GAP_REPAIR_SLICE` mutated
+    from one minute to one hour made this test's previous body (which
+    compared against `ms.GAP_REPAIR_SLICE`) pass while emitting the one
+    whole-hour statement that costs 67-70s on the real host's worst hour
+    (4 329 065 rows), against a 30 000ms connection timeout
+    (`statement_timeout_ms`, `sentinel/config.py`). No `_1m` call issued by
+    this step is allowed to span more than the literal one-minute bound
+    below; only `_1h` — cheap, bounded by (asset, source, action) pairs per
+    hour, not raw row count — may span a full hour."""
     monkeypatch.setattr(report_repo, "rollup_coverage", _async(
         {"never_ran": False, "latest": datetime(2026, 8, 25, 0, 0, tzinfo=timezone.utc)}))
     monkeypatch.setattr(report_repo, "raw_coverage", _async(
@@ -223,13 +275,14 @@ def test_no_single_sql_statement_gets_a_whole_hour_interval(monkeypatch):
     db = _DB()
     run(ms.repair_rollup_gaps(db))
 
+    max_slice = timedelta(minutes=1)  # literal, on purpose — NOT ms.GAP_REPAIR_SLICE
     offenders = [
         (sql, args) for sql, args in db.calls
-        if "sentinel_rollup_events_1m" in sql and (args[1] - args[0]) > ms.GAP_REPAIR_SLICE
+        if "sentinel_rollup_events_1m" in sql and (args[1] - args[0]) > max_slice
     ]
     assert not offenders, (
         "a single sentinel_rollup_events_1m call spans more than "
-        f"{ms.GAP_REPAIR_SLICE} — this is exactly the statement that timed out "
+        f"{max_slice} — this is exactly the statement that timed out "
         f"at 30s on the real host's worst hour: {offenders}")
 
 
