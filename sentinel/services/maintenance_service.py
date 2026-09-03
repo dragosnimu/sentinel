@@ -261,12 +261,47 @@ async def _watermark(db: Database, table: str, floor_hours: int) -> datetime:
 
 
 async def rollup_events(db: Database) -> tuple[str, dict[str, Any]]:
+    """Recuperarea normală: de la filigran până la acum, plafonat la
+    `MAX_CATCHUP_HOURS`.
+
+    Feliată la aceeași granulație pe care `repair_rollup_gaps` a măsurat-o
+    (vezi antetul modulului): înainte de asta, fereastra întreagă — până la
+    48h — pleca într-o SINGURĂ instrucțiune `sentinel_rollup_events_1m`. Pe
+    volum normal (87 443 rânduri pe 48h) asta a durat 664 ms, nicio problemă —
+    dar fereastra de recuperare nu e mereu volum normal: dacă mentenanța ar fi
+    fost oprită o oră chiar în timpul potopului din 24 august, o SINGURĂ oră
+    de incident (4 329 065 rânduri, 67-70s) ar fi fost de ajuns s-o depășească
+    pe `statement_timeout_ms` (30 000 ms). Iar acolo eșecul nu e curat: nimic
+    nu s-ar fi scris, filigranul (`max(bucket)`, `_watermark`) n-ar fi
+    înaintat deloc, iar rularea următoare ar relua EXACT aceeași fereastră și
+    ar muri identic — `event_rollup_1m`/`_1h` blocate până când partițiile
+    brute ies din retenție.
+    `event_rollup_1m` se feliază la `GAP_REPAIR_SLICE` (un minut) — pragul
+    măsurat: 1 821 ms cea mai grea felie, sub cei 30 000 ms. `event_rollup_1h`
+    se feliază la o oră, nu mai mult: e ieftin per oră (mărginit de perechi
+    asset/sursă/acțiune, nu de volumul brut — 0017_partition_fixes.sql), dar
+    fereastra de recuperare normală e de obicei deja o oră (timerul rulează
+    orar), deci felierea la o oră nu adaugă niciun dus-întors în cazul comun —
+    doar în recuperarea unei pauze mai lungi. O felie la un minut și pentru
+    `_1h` n-ar fi greșită, dar ar transforma fiecare rulare orară normală în
+    60 de apeluri în loc de unul — cost plătit fără măsurătoare care s-o
+    ceară.
+
+    Fiecare felie e propria ei instrucțiune SQL, deci propriul ei commit: un
+    eșec la mijloc (ex. o felie care tot depășește timeout-ul) lasă scrise
+    feliile de dinainte, iar filigranul de la rularea următoare — derivat din
+    `max(bucket)`, nu dintr-un cursor separat (vezi `_watermark`) — pornește
+    de acolo, nu de la începutul ferestrei picate. Progresul parțial e deci
+    real, nu doar sperat.
+    """
     now = datetime.now(timezone.utc)
     facts: dict[str, Any] = {}
     parts: list[str] = []
 
-    for table, fn, step in (("event_rollup_1m", "sentinel_rollup_events_1m", timedelta(minutes=1)),
-                            ("event_rollup_1h", "sentinel_rollup_events_1h", timedelta(hours=1))):
+    for table, fn, slice_size in (
+        ("event_rollup_1m", "sentinel_rollup_events_1m", GAP_REPAIR_SLICE),
+        ("event_rollup_1h", "sentinel_rollup_events_1h", timedelta(hours=1)),
+    ):
         start = await _watermark(db, table, floor_hours=MAX_CATCHUP_HOURS)
         # Bucketul de la watermark se reface: ultima rulare l-a putut prinde
         # incomplet. Funcțiile SQL sunt idempotente prin ON CONFLICT DO UPDATE,
@@ -276,11 +311,18 @@ async def rollup_events(db: Database) -> tuple[str, dict[str, Any]]:
             parts.append(f"{table}: la zi")
             facts[table] = {"rows": 0, "hours": 0}
             continue
-        rows = await db.fetchval(f"SELECT {fn}($1, $2)", start, end)  # noqa: S608
+        # Feliat — vezi docstring-ul funcției pentru de ce nicio instrucțiune
+        # nu are voie să acopere fereastra întreagă dintr-o dată.
+        rows = 0
+        cursor = start
+        while cursor < end:
+            nxt = min(cursor + slice_size, end)
+            rows += int(await db.fetchval(f"SELECT {fn}($1, $2)", cursor, nxt) or 0)  # noqa: S608
+            cursor = nxt
         hours = round((end - start).total_seconds() / 3600, 1)
         remaining = round((now - end).total_seconds() / 3600, 1)
-        parts.append(f"{table}: {rows or 0} rânduri pe {hours}h")
-        facts[table] = {"rows": int(rows or 0), "hours": hours, "remaining_hours": remaining}
+        parts.append(f"{table}: {rows} rânduri pe {hours}h")
+        facts[table] = {"rows": rows, "hours": hours, "remaining_hours": remaining}
         if remaining > 1:
             # Spus explicit. O recuperare plafonată care tace arată identic cu
             # una completă, iar diferența contează.
