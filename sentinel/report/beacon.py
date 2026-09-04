@@ -278,15 +278,31 @@ MAX_LABEL = 64
 # `alerted_kinds.selfcheck = false`, iar martorul alertează pe bună dreptate
 # după ce a citit un semnal corect la momentul lui.
 #
-# Măsurat pe gazdă, 14 zile: 168 de livrări, medie `enqueued → sent` de **8,1
-# secunde**; tranzițiile ok→rău au prima livrare între 0,4 și 15,8 secunde. La
-# un beacon de 60 s asta înseamnă ~2-3% din episoade, adică 1-2 dubluri la 14
-# zile — față de 131 în 7 zile înainte de schimbarea asta.
+# Măsurat pe gazdă, 14 zile, TOATE livrările `selfcheck:` reușite: **225**,
+# medie `enqueued → sent` **4 746 s**, maxim **41 449 s** (11,5 ore). Doar cele
+# sub un minut — 168 din 225 — au media de 8 secunde. Cifra aia singură a fost
+# scrisă aici o dată fără filtrul care o produce, ceea ce o făcea să pară o
+# caracteristică a livrării în general. Nu e.
 #
-# E scris aici ca să nu fie căutat mai târziu ca regresie. Închiderea lui ar
-# cere ca `since` să se scrie DUPĂ confirmarea livrării, ceea ce ar face
-# `selfcheck_state` să depindă de Telegram — un preț mai mare decât cele două
-# mesaje pe care le-ar economisi.
+# Deci sunt DOUĂ reziduuri, nu unul:
+#
+# 1. **Cursa propriu-zisă**, pentru cele 168 de livrări rapide: un tick de
+#    beacon în golul de ~8 secunde. La un beacon de 60 s, ~2-3% din episoade,
+#    adică 1-2 dubluri la 14 zile — față de 131 în 7 zile înainte.
+#
+# 2. **Orele de liniște**, pentru celelalte 57: un `degraded` are severitatea
+#    `high`, deci botul îl ține până dimineața. În tot acel interval semnalul
+#    spune corect „nelivrat", iar martorul — care nu are ore de liniște proprii
+#    (`aggregator/lib/verify.ts`) — alertează. Comportamentul e regula
+#    operatorului aplicată literal, și era la fel înainte de schimbarea asta;
+#    dacă intenția e să nu fie trezit, martorul are nevoie de propriile ore de
+#    liniște, ceea ce e o decizie de politică, nu un defect.
+#
+# Închiderea primului NU cere ca `since` să se scrie după confirmarea livrării
+# — afirmația aia a fost scrisă aici și e falsă. Ar închide-o la fel de bine o
+# histerezie pe două semnale consecutive în `verify.ts`, sau raportarea stării
+# `queued` ca stare intermediară în beacon, niciuna legând `selfcheck_state` de
+# Telegram.
 #
 # ## Limita cunoscută: interogarea nu deosebește PE CE anume
 #
