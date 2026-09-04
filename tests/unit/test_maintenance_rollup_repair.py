@@ -749,6 +749,10 @@ def test_time_budget_defers_remaining_hours_to_the_next_pass(monkeypatch):
         except StopIteration:
             return 400.0
 
+    avertismente: list[dict] = []
+    monkeypatch.setattr(ms.log, "warning",
+                        lambda msg, **kw: avertismente.append(kw.get("extra") or {}))
+
     db = _DB()
     detail, facts = run(ms.repair_rollup_gaps(db, now_monotonic=fake_clock))
 
@@ -762,6 +766,20 @@ def test_time_budget_defers_remaining_hours_to_the_next_pass(monkeypatch):
     hour_calls = [a[0] for sql, a in db.calls if "sentinel_rollup_events_1h" in sql]
     assert hour_calls == [b1], (
         "no _1h call should have been issued for the deferred hours")
+    # Orele amânate sunt încă DE FĂCUT, deci intră în restul raportat prin
+    # `hours_left`. Scăzându-le, restul devine ZERO aici (3 − 1 − 2), `if left:`
+    # nu se mai declanșează, și avertismentul „mai rămân ore" dispare cu totul
+    # — tocmai tăcerea pe care pasul ăsta există ca s-o repare, fiindcă orele
+    # rămase concurează cu retenția brutului.
+    #
+    # Literalul 2, nu `total_hours - hours_repaired`: o aserțiune scrisă cu
+    # aceeași aritmetică pe care o păzește trece indiferent ce face codul.
+    cu_rest = [a for a in avertismente if "hours_left" in a]
+    assert cu_rest, (
+        "cu ore amânate, avertismentul «mai rămân ore» trebuie emis; altfel "
+        f"restul de făcut nu ajunge nicăieri. Avertismente: {avertismente}")
+    assert cu_rest[0]["hours_left"] == 2, (
+        f"restul trebuie să numere orele amânate: {cu_rest[0]}")
 
 
 # ---------------------------------------------------------------------------
