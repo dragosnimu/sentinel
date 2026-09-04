@@ -81,7 +81,7 @@ NOT_A_COLUMN = {
 # which is a better failure than a parser that guesses.
 KEYWORDS = {
     "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "NULL", "IS", "IN", "AS",
-    "ORDER", "GROUP", "BY", "ASC", "DESC", "LIMIT", "OFFSET", "DISTINCT",
+    "LIKE", "ORDER", "GROUP", "BY", "ASC", "DESC", "LIMIT", "OFFSET", "DISTINCT",
     "INSERT", "INTO", "VALUES", "ON", "CONFLICT", "DO", "NOTHING", "UPDATE",
     "SET", "RETURNING", "DELETE", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER",
     "CASE", "WHEN", "THEN", "ELSE", "END", "FOR", "EXCLUDED", "WITH",

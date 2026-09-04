@@ -270,6 +270,24 @@ MAX_LABEL = 64
 # devină EA ancora cât timp ceva rămâne deschis — vezi limita de mai jos
 # pentru ce COALESCE NU rezolvă.
 #
+# ## Rezidual MĂSURAT: cursa dintre `since` și livrare
+#
+# `run_and_alert` (`selfcheck/runner.py:114-123`) scrie `since` ÎNAINTE de a
+# pune mesajul în coadă, iar botul îl livrează în cel mult 15 secunde. Un tick
+# de beacon căzut fix în golul ăla trimite `worst` deja rău cu
+# `alerted_kinds.selfcheck = false`, iar martorul alertează pe bună dreptate
+# după ce a citit un semnal corect la momentul lui.
+#
+# Măsurat pe gazdă, 14 zile: 168 de livrări, medie `enqueued → sent` de **8,1
+# secunde**; tranzițiile ok→rău au prima livrare între 0,4 și 15,8 secunde. La
+# un beacon de 60 s asta înseamnă ~2-3% din episoade, adică 1-2 dubluri la 14
+# zile — față de 131 în 7 zile înainte de schimbarea asta.
+#
+# E scris aici ca să nu fie căutat mai târziu ca regresie. Închiderea lui ar
+# cere ca `since` să se scrie DUPĂ confirmarea livrării, ceea ce ar face
+# `selfcheck_state` să depindă de Telegram — un preț mai mare decât cele două
+# mesaje pe care le-ar economisi.
+#
 # ## Limita cunoscută: interogarea nu deosebește PE CE anume
 #
 # `COALESCE` alege ancora corectă (episodul rău, nu o revenire neînrudită mai
@@ -294,6 +312,22 @@ MAX_LABEL = 64
 # din `bad`, nu și din `recovered`) — o schimbare de mecanism, nu de fereastră,
 # și una pe care runda asta n-o face singură. Scris aici ca să nu fie
 # descoperită ca surpriză, nu ca să fie considerată rezolvată.
+#
+# ## `dedup_key LIKE 'selfcheck:%'` — nu orice rând cu `kind='selfcheck'`
+#
+# `kind` are `DEFAULT 'selfcheck'` (migrația 0026) — orice INSERT care nu
+# numește explicit coloana cade pe valoarea asta, nu doar coada reală de
+# autodiagnostic. `sentinel/services/health_service.py` (inventar retras) și
+# `maintenance_service.py` (gardă de disc) fac exact asta: scriu pe
+# `kind='selfcheck'` din tăcere, cu `dedup_key` de forma `inventory:...` sau
+# `maintenance:disk:...`. Fără filtrul de mai jos, o livrare reușită a UNEIA
+# dintre alertele astea — neînrudită cu autodiagnosticul — trece testul
+# `EXISTS` și suprimă o alertă de `selfcheck` reală, nelivrată. Dovedit pe
+# gazdă: `id 240, dedup_key 'inventory:retired:n8n,…', kind=selfcheck, sent
+# 2026-08-29`. Frecvența măsurată e mică — 1 în 60 de zile — dar reală, iar
+# alerta de disc pleacă drept `critical`, deci trece și peste orele de
+# liniște. `runner.py._announce` scrie mereu `dedup_key=f"selfcheck:{...}"`
+# (vezi mai sus), deci filtrul nu exclude nimic din coada reală.
 #
 # ## Ce NU acoperă, dinadins
 #
@@ -321,7 +355,8 @@ MAX_LABEL = 64
 SELFCHECK_DELIVERED_SQL = """
     SELECT EXISTS (
         SELECT 1 FROM notifications
-        WHERE kind = 'selfcheck' AND state = 'sent' AND sent_at >= (
+        WHERE kind = 'selfcheck' AND dedup_key LIKE 'selfcheck:%'
+          AND state = 'sent' AND sent_at >= (
             SELECT COALESCE(
                 (SELECT max(since) FROM selfcheck_state
                   WHERE status IN ('down', 'degraded')),

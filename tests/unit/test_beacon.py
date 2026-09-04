@@ -327,9 +327,27 @@ def test_the_query_carries_no_external_parameter():
     db = _Recording()
     run(beacon.collect(db, _cfg()))
     assert db.seen_args == [()]
-    assert "now()" not in beacon.SELFCHECK_DELIVERED_SQL, (
-        "interogarea nu mai are voie să depindă de momentul CITIRII — doar de "
-        "reperele scrise în tabele")
+
+    import re
+
+    # Orice funcție de ceas al serverului, nu doar `now()` — o gardă care
+    # caută o singură ortografie a lucrului interzis trece la fel de ușor ca
+    # lipsa gărzii. `clock_timestamp()`, `CURRENT_TIMESTAMP`,
+    # `localtimestamp`... treceau toate testul vechi (`"now()" not in SQL`),
+    # deși oricare dintre ele reintroduce EXACT fereastra aleasă din exterior
+    # pe care runda asta o scoate — verificat pe gazdă, în tranzacție:
+    # `AND sent_at > clock_timestamp() - make_interval(secs => 360)` adăugat
+    # înaintea comparației reale a trecut toată suita cu vechea gardă.
+    CLOCK_FUNCTIONS = (
+        "now", "clock_timestamp", "statement_timestamp", "transaction_timestamp",
+        "current_timestamp", "current_date", "current_time",
+        "localtimestamp", "localtime",
+    )
+    sql_lower = beacon.SELFCHECK_DELIVERED_SQL.lower()
+    hits = [fn for fn in CLOCK_FUNCTIONS if re.search(rf"\b{re.escape(fn)}\b", sql_lower)]
+    assert not hits, (
+        f"interogarea folosește ceasul serverului ({hits}) — ancora trebuie "
+        "să vină doar din reperele scrise în tabele, nu din momentul CITIRII")
     assert "$1" not in beacon.SELFCHECK_DELIVERED_SQL
 
 
@@ -339,10 +357,18 @@ def _episode_delivered(sql: str, notifications: list[dict], selfcheck_state: lis
     interogarea ca TEXT — la fel cum `test_beacon_sql_schema.py` citește
     literalul `AUDIT_HEAD_SQL` în loc să presupună ce coloană cere. Astfel, o
     mutație în `beacon.py` (starea cerută, coloana de timp comparată, seturile
-    de stări din ancoră) schimbă răspunsul interpretorului, nu doar codul
-    aplicației — fără asta, un dublu care „știe" deja răspunsul corect ar
-    trece verde peste o interogare stricată, exact tiparul mascat găsit în
-    sesiunea asta."""
+    de stări din ancoră, ORDINEA ramurilor din `COALESCE`, filtrul pe
+    `dedup_key`) schimbă răspunsul interpretorului, nu doar codul aplicației —
+    fără asta, un dublu care „știe" deja răspunsul corect ar trece verde peste
+    o interogare stricată, exact tiparul mascat găsit în sesiunea asta.
+
+    Ordinea ramurilor din `COALESCE` se citește din POZIȚIA lor în text, nu se
+    presupune „rea, apoi ok". O primă variantă a interpretorului prefera mereu
+    `bad_times` cât timp era nevidă, indiferent de ce scria SQL-ul — o
+    inversare a celor două subinterogări din `beacon.py` a trecut atunci toată
+    suita, fiindcă niciun test nu putea observa diferența. Postgres nu face
+    presupunerea asta: `COALESCE(a, b)` ia PRIMUL argument nenul, în ordinea
+    din text, indiferent care e „rămas bun" semantic."""
     import re
 
     kind_m = re.search(r"kind\s*=\s*'([^']*)'", sql)
@@ -350,6 +376,22 @@ def _episode_delivered(sql: str, notifications: list[dict], selfcheck_state: lis
     col_m = re.search(r"(\w+)\s*>=\s*\(", sql)
     assert kind_m and state_m and col_m, f"interogarea nu mai are forma așteptată:\n{sql}"
     kind, wanted_state, col = kind_m.group(1), state_m.group(1), col_m.group(1)
+
+    # `kind` singur nu ajunge la coada reală: `kind` are `DEFAULT 'selfcheck'`
+    # (migrația 0026), deci orice INSERT care nu-l numește explicit cade pe
+    # aceeași valoare — `health_service.py` (inventar retras) și
+    # `maintenance_service.py` (gardă de disc) fac exact asta. Citit din text,
+    # ca restul: dacă interogarea nu (mai) are filtrul, interpretorul nu-l
+    # cere — testul dedicat pentru narrowing pică atunci pe altă cauză, nu pe
+    # o presupunere de aici.
+    dedup_m = re.search(r"dedup_key\s+LIKE\s+'([^']*)'", sql)
+    dedup_re = None
+    if dedup_m:
+        pattern = dedup_m.group(1)
+        translated = "".join(
+            ".*" if ch == "%" else "." if ch == "_" else re.escape(ch)
+            for ch in pattern)
+        dedup_re = re.compile(f"^{translated}$")
 
     bad_m = re.search(r"FROM selfcheck_state\s+WHERE status IN \(([^)]*)\)", sql)
     ok_m = re.search(r"FROM selfcheck_state\s+WHERE status = '([^']*)'", sql)
@@ -368,13 +410,26 @@ def _episode_delivered(sql: str, notifications: list[dict], selfcheck_state: lis
 
     bad_times = [r["since"] for r in selfcheck_state if r["status"] in bad_statuses]
     ok_times = [r["since"] for r in selfcheck_state if r["status"] == ok_status]
-    anchor = agg_fn(bad_times) if bad_times else (agg_fn(ok_times) if ok_times else None)
+
+    # `COALESCE(prim, al_doilea)` ia primul argument NENUL, în ordinea din
+    # TEXT — nu „ramura rea, mereu, dacă e nevidă". Poziția fiecărei
+    # subinterogări în `sql` (`.start()`) decide ordinea, ca o inversare a
+    # celor două să schimbe și răspunsul interpretorului, nu doar cel al lui
+    # Postgres.
+    branches = sorted([(bad_m.start(), bad_times), (ok_m.start(), ok_times)],
+                       key=lambda b: b[0])
+    anchor = None
+    for _, times in branches:
+        if times:
+            anchor = agg_fn(times)
+            break
     if anchor is None:
         return False
 
     return any(
         n.get("kind") == kind and n.get("state") == wanted_state
         and n.get(col) is not None and n[col] >= anchor
+        and (dedup_re is None or dedup_re.match(n.get("dedup_key") or ""))
         for n in notifications
     )
 
@@ -382,7 +437,7 @@ def _episode_delivered(sql: str, notifications: list[dict], selfcheck_state: lis
 def test_current_bad_episode_is_covered_by_a_delivery_after_it_started():
     since = datetime(2026, 9, 3, 12, 3, 0)
     state = [{"status": "down", "since": since}]
-    delivered = [{"kind": "selfcheck", "state": "sent",
+    delivered = [{"kind": "selfcheck", "state": "sent", "dedup_key": "selfcheck:down",
                   "sent_at": since + timedelta(seconds=8),
                   "enqueued_at": since + timedelta(seconds=7)}]
     assert _episode_delivered(beacon.SELFCHECK_DELIVERED_SQL, delivered, state) is True
@@ -394,7 +449,7 @@ def test_a_leftover_delivery_from_before_the_episode_started_does_not_count():
     ar tace pe baza mesajului despre prima ei apariție."""
     since = datetime(2026, 9, 3, 12, 3, 0)
     state = [{"status": "down", "since": since}]
-    stale = [{"kind": "selfcheck", "state": "sent",
+    stale = [{"kind": "selfcheck", "state": "sent", "dedup_key": "selfcheck:down",
               "sent_at": since - timedelta(minutes=20),
               "enqueued_at": since - timedelta(minutes=20)}]
     assert _episode_delivered(beacon.SELFCHECK_DELIVERED_SQL, stale, state) is False
@@ -407,7 +462,7 @@ def test_two_simultaneously_bad_checks_anchor_on_the_newer_one():
     t1 = datetime(2026, 9, 3, 12, 0, 0)
     t2 = t1 + timedelta(minutes=4)
     state = [{"status": "down", "since": t1}, {"status": "degraded", "since": t2}]
-    notifications = [{"kind": "selfcheck", "state": "sent",
+    notifications = [{"kind": "selfcheck", "state": "sent", "dedup_key": "selfcheck:down",
                        "sent_at": t1 + timedelta(seconds=5),
                        "enqueued_at": t1 + timedelta(seconds=4)}]
     assert _episode_delivered(beacon.SELFCHECK_DELIVERED_SQL, notifications, state) is False, (
@@ -420,7 +475,7 @@ def test_a_delivery_after_the_newer_problem_covers_both():
     t1 = datetime(2026, 9, 3, 12, 0, 0)
     t2 = t1 + timedelta(minutes=4)
     state = [{"status": "down", "since": t1}, {"status": "degraded", "since": t2}]
-    notifications = [{"kind": "selfcheck", "state": "sent",
+    notifications = [{"kind": "selfcheck", "state": "sent", "dedup_key": "selfcheck:degraded",
                        "sent_at": t2 + timedelta(seconds=3),
                        "enqueued_at": t2 + timedelta(seconds=2)}]
     assert _episode_delivered(beacon.SELFCHECK_DELIVERED_SQL, notifications, state) is True
@@ -432,12 +487,12 @@ def test_recovery_is_covered_only_if_the_recovery_itself_was_delivered():
     tacă la revenire."""
     since = datetime(2026, 9, 3, 13, 8, 0)
     state = [{"status": "ok", "since": since}]
-    covered = [{"kind": "selfcheck", "state": "sent",
+    covered = [{"kind": "selfcheck", "state": "sent", "dedup_key": "selfcheck:down",
                 "sent_at": since + timedelta(seconds=6),
                 "enqueued_at": since + timedelta(seconds=5)}]
     assert _episode_delivered(beacon.SELFCHECK_DELIVERED_SQL, covered, state) is True
 
-    uncovered = [{"kind": "selfcheck", "state": "queued",
+    uncovered = [{"kind": "selfcheck", "state": "queued", "dedup_key": "selfcheck:down",
                   "sent_at": None, "enqueued_at": since + timedelta(seconds=5)}]
     assert _episode_delivered(beacon.SELFCHECK_DELIVERED_SQL, uncovered, state) is False
 
@@ -462,18 +517,82 @@ def test_the_delivery_probe_requires_confirmed_sent_state_and_the_delivery_times
     state = [{"status": "down", "since": since}]
 
     # Pus în coadă, NECONFIRMAT livrat — nu are voie să acopere episodul.
-    queued_only = [{"kind": "selfcheck", "state": "queued",
+    queued_only = [{"kind": "selfcheck", "state": "queued", "dedup_key": "selfcheck:down",
                      "sent_at": since + timedelta(seconds=5),
                      "enqueued_at": since + timedelta(seconds=4)}]
     assert _episode_delivered(beacon.SELFCHECK_DELIVERED_SQL, queued_only, state) is False
 
     # Livrat DUPĂ episod, dar PUS ÎN COADĂ cu mult înainte — dovedește că
     # interogarea compară `sent_at`, nu `enqueued_at`.
-    sent_late_queued_early = [{"kind": "selfcheck", "state": "sent",
+    sent_late_queued_early = [{"kind": "selfcheck", "state": "sent", "dedup_key": "selfcheck:down",
                                 "sent_at": since + timedelta(minutes=1),
                                 "enqueued_at": since - timedelta(minutes=5)}]
     assert _episode_delivered(
         beacon.SELFCHECK_DELIVERED_SQL, sent_late_queued_early, state) is True
+
+
+# --- COALESCE: ordinea ramurilor se citește din text, nu se presupune ------
+def test_coalesce_anchors_on_the_bad_branch_even_when_a_newer_ok_row_exists():
+    """Falsificarea care a găsit gaura: inversarea celor două subinterogări
+    din `COALESCE` (ramura `ok` scrisă prima) a trecut TOATĂ suita — 3860
+    passed — pentru că niciun fixture de mai sus nu amestecă un rând `ok` cu
+    unul rău în ACELAȘI `selfcheck_state`. Cu doar rânduri rele, `bad_times`
+    e mereu nevidă și câștigă indiferent de ordinea din text; cu doar rânduri
+    ok, la fel pentru `ok_times`. Niciuna din situațiile alea nu poate observa
+    o inversare.
+
+    Aici, ambele ramuri sunt nevide: o verificare revine (`ok`, livrată), apoi
+    o verificare DIFERITĂ pică (`degraded`, nelivrată). `COALESCE` corect
+    ancorează pe rândul rău — mai vechi textual în interogare, dar mai nou ca
+    timp — nu pe revenirea mai recentă. Exact cazul rulat de verificator în
+    tranzacție pe gazdă: 59 de rânduri `ok`, ancora inversată devenea ultima
+    revenire (13:08:51), iar un `degraded` nou nelivrat era raportat drept
+    livrat.
+
+    Falsificat: inversarea celor două subinterogări în `beacon.py` (ramura
+    `ok` prima) face acest test să pice — interpretorul citește acum poziția
+    din text și alege `ok_times`, mai recentă, ca ancoră."""
+    ok_since = datetime(2026, 9, 3, 13, 8, 51)
+    bad_since = ok_since + timedelta(minutes=5)
+    state = [
+        {"status": "ok", "since": ok_since},
+        {"status": "degraded", "since": bad_since},
+    ]
+    # Livrarea revenirii A REUȘIT — exact ce ar face o ancoră greșită să
+    # citească drept „a acoperit și problema nouă".
+    notifications = [{"kind": "selfcheck", "state": "sent", "dedup_key": "selfcheck:disk",
+                       "sent_at": ok_since + timedelta(seconds=5),
+                       "enqueued_at": ok_since + timedelta(seconds=4)}]
+    assert _episode_delivered(beacon.SELFCHECK_DELIVERED_SQL, notifications, state) is False, (
+        "ancora a citit ramura `ok`, mai nouă, în loc de ramura rea nelivrată")
+
+
+# --- narrowing pe `dedup_key`: `kind='selfcheck'` singur nu e coada reală --
+def test_a_delivery_with_the_default_kind_but_an_unrelated_dedup_key_does_not_count():
+    """`kind` are `DEFAULT 'selfcheck'` (migrația 0026) — orice INSERT care nu
+    numește explicit coloana cade pe valoarea asta, nu doar coada reală de
+    autodiagnostic. `health_service.py` (inventar retras) și
+    `maintenance_service.py` (gardă de disc) scriu exact așa. Dovedit pe
+    gazdă: `id 240, dedup_key 'inventory:retired:n8n,…', kind=selfcheck, sent
+    2026-08-29`. Fără filtrul pe `dedup_key`, livrarea REUȘITĂ a uneia dintre
+    alertele astea ar suprima o alertă de autodiagnostic reală, nelivrată."""
+    since = datetime(2026, 9, 3, 12, 0, 0)
+    state = [{"status": "down", "since": since}]
+
+    unrelated = [{"kind": "selfcheck", "state": "sent",
+                  "dedup_key": "inventory:retired:n8n",
+                  "sent_at": since + timedelta(seconds=5),
+                  "enqueued_at": since + timedelta(seconds=4)}]
+    assert _episode_delivered(beacon.SELFCHECK_DELIVERED_SQL, unrelated, state) is False, (
+        "o livrare neînrudită (dedup_key fără prefixul selfcheck:) a acoperit "
+        "un episod real de autodiagnostic nelivrat")
+
+    real = [{"kind": "selfcheck", "state": "sent", "dedup_key": "selfcheck:disk",
+             "sent_at": since + timedelta(seconds=5),
+             "enqueued_at": since + timedelta(seconds=4)}]
+    assert _episode_delivered(beacon.SELFCHECK_DELIVERED_SQL, real, state) is True
+
+    assert "dedup_key LIKE 'selfcheck:%'" in beacon.SELFCHECK_DELIVERED_SQL
 
 
 def _old_windowed_delivered(sent_at: datetime, now: datetime, window_s: int = 360) -> bool:
@@ -488,26 +607,39 @@ def test_an_episode_that_outlives_the_old_window_does_not_duplicate():
     începutul lui. Vechea fereastră (360 s) expira la 12:09 — orice rundă de
     `/check` de după aia ar fi dublat alerta, cât timp starea era încă rea.
 
-    Interogarea nouă n-are `now()` (vezi testul de mai sus), deci verificată
-    la ORICE moment ulterior tot găsește livrarea, cât timp `since` nu s-a
-    mutat — exact ce face `runner.py._save_state` cât timp statusul rămâne
-    `down`. Bucla de mai jos simulează explicit „la ce minut verific" doar ca
-    să arate, prin contrast, unde vechea fereastră ar fi expirat."""
+    Interogarea nouă n-are `now()` (vezi testul de mai sus): `_episode_delivered`
+    nu primește deloc momentul citirii ca parametru, deci rezultatul ei NU
+    POATE depinde de „la ce minut verific" — o singură verificare e toată
+    dovada asupra interpretorului. (O primă variantă a testului chema
+    `_episode_delivered` de paisprezece ori într-o buclă pe `now`, dar `now`
+    nu ajungea niciodată la funcție: cele paisprezece aserțiuni verificau
+    exact aceeași apelare, repetată — un test care pică la o mutație reală,
+    deci nu era gol, dar afirmația „la fiecare minut" nu era exercitată de
+    nimic.)
+
+    Bucla de mai jos rămâne, dar verifică altceva, real: CONTRASTUL cu vechea
+    fereastră fixă, care depindea de `now` prin `_old_windowed_delivered`.
+    Asta arată de ce schimbarea era necesară, nu doar că interogarea nouă
+    răspunde corect o dată."""
     since = datetime(2026, 9, 3, 12, 3, 0)
     delivered_at = since + timedelta(seconds=8)
     state = [{"status": "down", "since": since}]
-    notifications = [{"kind": "selfcheck", "state": "sent",
+    notifications = [{"kind": "selfcheck", "state": "sent", "dedup_key": "selfcheck:down",
                        "sent_at": delivered_at, "enqueued_at": delivered_at}]
 
+    assert _episode_delivered(beacon.SELFCHECK_DELIVERED_SQL, notifications, state) is True, (
+        "suprimarea a picat — un episod mai lung decât orice fereastră fixă "
+        "nu are voie să dubleze alerta")
+
+    saw_expired_window = False
     for minute in range(0, 66, 5):
         now = since + timedelta(minutes=minute)
-        assert _episode_delivered(beacon.SELFCHECK_DELIVERED_SQL, notifications, state) is True, (
-            f"la minutul {minute} suprimarea a picat — un episod mai lung decât "
-            "orice fereastră fixă nu are voie să dubleze alerta")
         if minute * 60 > 360:
             assert _old_windowed_delivered(delivered_at, now) is False, (
                 "fixtura nu mai reproduce bug-ul măsurat — vechea fereastră de "
                 "360 s ar fi trebuit să fi expirat aici, ca dovadă a contrastului")
+            saw_expired_window = True
+    assert saw_expired_window, "bucla nu a atins niciun minut peste vechea fereastră de 360 s"
 
 
 class _EpisodeAwareDB(_DB):
@@ -534,7 +666,7 @@ def test_collect_reports_the_episode_verdict_through_the_real_wiring():
     t2 = t1 + timedelta(minutes=4)
     db = _EpisodeAwareDB(
         selfcheck_state=[{"status": "down", "since": t1}, {"status": "degraded", "since": t2}],
-        notifications=[{"kind": "selfcheck", "state": "sent",
+        notifications=[{"kind": "selfcheck", "state": "sent", "dedup_key": "selfcheck:down",
                          "sent_at": t1 + timedelta(seconds=5),
                          "enqueued_at": t1 + timedelta(seconds=4)}],
     )
