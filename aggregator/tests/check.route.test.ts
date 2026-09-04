@@ -579,6 +579,26 @@ test("selfcheck livrat CONFIRMAT de principal suprimă mesajul martorului", asyn
   } finally { t.restore(); }
 });
 
+test("`alerted_kinds` cu o valoare stricată nu face toată instanța ilizibilă", async () => {
+  // `alerted_kinds` e un câmp CONSULTATIV: poate doar decide „tac sau nu",
+  // niciodată nu poartă `last_event_id` sau `selfcheck.worst`. Înainte de
+  // reparație, `asInstanceState` respingea TOT fișierul dacă găsea o valoare
+  // non-boolean acolo — deci o instanță reală, cu autodiagnosticul căzut,
+  // devenea `unreadable` (roșu, dar necontat, ne-alertat) în loc de
+  // `selfcheck` (alertat). Un câmp care poate doar decide „nu suprima" nu are
+  // voie să facă martorul să nu mai spună NIMIC despre server.
+  await seed({ aaa111: selfcheckDownState({ selfcheck: "true" as unknown as boolean }) });
+  const t = captureTelegram();
+  try {
+    const body = await bodyOf(await GET(req(CHECK_KEY)));
+    assert.equal(reportFor(body, "aaa111")?.kind, "selfcheck",
+      "o valoare stricată în alerted_kinds a ascuns un selfcheck real căzut");
+    // Și fiindcă valoarea stricată nu e citită ca `true`, nu suprimă nimic:
+    // martorul alertează, exact ca și cum câmpul ar fi lipsit.
+    assert.equal(t.sent.length, 1);
+  } finally { t.restore(); }
+});
+
 test("fără livrare confirmată, selfcheck căzut TOT alertează", async () => {
   await seed({ aaa111: selfcheckDownState({ selfcheck: false }) });
   const t = captureTelegram();

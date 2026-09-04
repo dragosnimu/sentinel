@@ -239,3 +239,44 @@ test("un `kind` gol (null/undefined) nu suprimă nimic", () => {
   assert.equal(principalAlreadyDelivered(null, last), false);
   assert.equal(principalAlreadyDelivered(undefined, last), false);
 });
+
+// Legătura dintre `SUPPRESSIBLE_KINDS` (aici) și cheile pe care `collect()`
+// (sentinel/report/beacon.py) chiar le pune în `alerted_kinds` e ținută pe
+// CUVÂNT, nu de compilator — cele două fișiere sunt în limbaje diferite.
+// Dacă se despart (un fel nou adăugat aici, fără pereche în Python — sau
+// invers), suprimarea pentru felul ăla devine tăcut un no-op și dublurile
+// pe care schimbarea asta există să le închidă revin. Testul nu poate citi
+// `SUPPRESSIBLE_KINDS` direct (nu e exportat — e o decizie internă a
+// modulului, nu o parte a contractului public), deci citește FIȘIERUL, la
+// fel cum `test_the_two_ends_agree_on_the_beat_freshness_ceiling` din
+// `tests/unit/test_beacon.py` citește invers, dinspre Python spre TypeScript.
+test("fiecare fel suprimabil de aici are pereche în ce trimite beacon.py", async () => {
+  const { readFileSync } = await import("node:fs");
+  const path = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const verifySrc = readFileSync(path.join(here, "..", "lib", "verify.ts"), "utf8");
+  const beaconSrc = readFileSync(
+    path.join(here, "..", "..", "sentinel", "report", "beacon.py"), "utf8");
+
+  const suppressibleBlock = verifySrc.match(
+    /const SUPPRESSIBLE_KINDS: Readonly<Record<string, string>> = \{([\s\S]*?)\};/);
+  assert.ok(suppressibleBlock, "SUPPRESSIBLE_KINDS nu mai are forma pe care testul o citește");
+  const suppressibleValues = [...suppressibleBlock[1].matchAll(/:\s*"([^"]+)"/g)]
+    .map((m) => m[1]);
+  assert.ok(suppressibleValues.length > 0,
+    "n-am extras niciun fel din SUPPRESSIBLE_KINDS — testul n-ar mai verifica nimic");
+
+  const alertedKindsBlock = beaconSrc.match(/"alerted_kinds":\s*\{([^}]*)\}/);
+  assert.ok(alertedKindsBlock, "collect() nu mai construiește alerted_kinds cum se aștepta testul");
+  const producedKeys = [...alertedKindsBlock[1].matchAll(/"([^"]+)":/g)].map((m) => m[1]);
+  assert.ok(producedKeys.length > 0,
+    "n-am extras nicio cheie din alerted_kinds al beacon.py");
+
+  for (const kind of suppressibleValues) {
+    assert.ok(producedKeys.includes(kind),
+      `SUPPRESSIBLE_KINDS suprimă „${kind}", dar beacon.py nu-l pune niciodată `
+      + `în alerted_kinds — suprimarea aia e un no-op tăcut`);
+  }
+});

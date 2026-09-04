@@ -15,12 +15,13 @@
 
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 
 import {
   baseEnv, beatPayload, beatRequest, bodyOf, removeState, setEnv, BEACON_KEY,
 } from "./witness-harness";
 import { POST } from "@/app/api/sentinel/beat/route";
-import { readAll } from "@/lib/store";
+import { readAll, instanceFile } from "@/lib/store";
 import { canonical } from "@/lib/verify";
 
 beforeEach(async () => {
@@ -398,6 +399,42 @@ test("un `content-length` peste plafon oprește cererea FĂRĂ să atingă corpu
   assert.equal(req.body?.locked, false,
     `fluxul a fost deschis pentru un corp care se anunța singur peste plafon `
     + `(${trase} bucăți cerute)`);
+});
+
+test("`alerted_kinds` cu o valoare non-boolean e aruncat, nu convertit", async () => {
+  // `readAlertedKinds` există fiindcă un `true` de aici poate tăcea o alertă
+  // reală. Mutația `typeof v === "boolean"` -> `Boolean(v)` trecea verde pe
+  // toată suita agregatorului (1067 teste): nimic nu POSTa vreodată un
+  // `alerted_kinds` cu o valoare care nu era deja boolean, deci nimic nu
+  // observa diferența. Cu `Boolean(v)`, `{selfcheck: "false"}` — un șir
+  // nevid, deci adevărat — ar trece garda.
+  //
+  // Se citește FIȘIERUL DE PE DISC, nu prin `readAll()`: `asInstanceState`
+  // din `lib/store.ts` curăță la CITIRE orice valoare non-boolean rămasă în
+  // `alerted_kinds` (vezi testul dedicat din `check.route.test.ts`), deci un
+  // test care trece prin `readAll()` ar verifica plasa de siguranță de la
+  // capătul celălalt, nu garda de-aici — cele două există separat, dinadins,
+  // și fiecare are nevoie de propriul test.
+  const res = await POST(await beatRequest({
+    payload: beatPayload({ alerted_kinds: { selfcheck: "false" } }),
+  }));
+  assert.equal(res.status, 200);
+
+  const onDisk = JSON.parse(await readFile(instanceFile("default"), "utf8"));
+  assert.deepEqual(onDisk.last.alerted_kinds, {},
+    `o valoare non-boolean a fost SCRISĂ ca și cum ar fi fost boolean: ${JSON.stringify(onDisk.last.alerted_kinds)}`);
+});
+
+test("`alerted_kinds` cu valori boolean amestecate cu altele păstrează doar boolean-ele", async () => {
+  const res = await POST(await beatRequest({
+    payload: beatPayload({
+      alerted_kinds: { selfcheck: true, altceva: 1, mai_mult: null },
+    }),
+  }));
+  assert.equal(res.status, 200);
+
+  const state = await readAll();
+  assert.deepEqual(state.instances.default?.last?.alerted_kinds, { selfcheck: true });
 });
 
 test("un semnal real, cu eticheta și capul de audit la maximum, încape lejer", async () => {

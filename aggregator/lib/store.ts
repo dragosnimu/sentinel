@@ -394,6 +394,17 @@ function isObject(v: unknown): v is Record<string, unknown> {
  * 500 la fiecare cerere. Un martor care nu mai poate răspunde nu mai poate nici
  * să spună de ce. Aici, o înregistrare care nu are forma corectă e respinsă și
  * instanța e raportată drept ILIZIBILĂ, ceea ce e adevărat și e vizibil.
+ *
+ * `alerted_kinds` e o excepție de la „respinge tot fișierul", și dinadins:
+ * e un câmp CONSULTATIV — poate doar decide „tac sau nu", niciodată nu poartă
+ * `last_event_id`, `selfcheck.worst` sau oricare alt fapt de sănătate. O
+ * valoare stricată acolo (un fișier editat de mână, un producător viitor care
+ * scrie altceva decât boolean) nu are voie să scoată din citire TOT restul
+ * semnalului — `last_event_id`, `audit_head`, `selfcheck` rămân la fel de
+ * adevărate indiferent ce conține câmpul ăsta. Deci se ARUNCĂ doar câmpul, nu
+ * instanța: exact ce face `readAlertedKinds` din `beat/route.ts` la intrarea
+ * semnalului, ca cele două cititoare ale aceleiași forme să cadă în aceeași
+ * direcție.
  */
 function asInstanceState(v: unknown): InstanceState | undefined {
   if (!isObject(v)) return undefined;
@@ -409,9 +420,17 @@ function asInstanceState(v: unknown): InstanceState | undefined {
     if (!isObject(b.selfcheck) || typeof b.selfcheck.worst !== "string") return undefined;
     if (b.label !== undefined && typeof b.label !== "string") return undefined;
     if (b.alerted_kinds !== undefined) {
-      if (!isObject(b.alerted_kinds)) return undefined;
-      for (const val of Object.values(b.alerted_kinds)) {
-        if (typeof val !== "boolean") return undefined;
+      if (!isObject(b.alerted_kinds)) {
+        delete (b as Record<string, unknown>).alerted_kinds;
+      } else {
+        // Se păstrează doar cheile boolean, la fel ca `readAlertedKinds`: o
+        // cheie non-boolean amestecată cu altele valide nu are voie să tragă
+        // după ea cele valide.
+        const cleaned: Record<string, boolean> = {};
+        for (const [key, val] of Object.entries(b.alerted_kinds)) {
+          if (typeof val === "boolean") cleaned[key] = val;
+        }
+        (b as Record<string, unknown>).alerted_kinds = cleaned;
       }
     }
   }
