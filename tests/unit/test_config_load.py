@@ -87,6 +87,7 @@ def _render_shipped_template() -> str:
         "@@SURICATA_ENABLED@@": "true",
         "@@AUDITD_ENABLED@@": "true",
         "@@SCAN_CONTAINERS@@": "true",
+        "@@DB_PORT@@": "5432",
         "@@TELEGRAM_CHAT_ID@@": "1",
         "@@EXTRA_ALLOWLIST@@": '"192.0.2.10"',
     }.items():
@@ -107,6 +108,9 @@ def test_the_shipped_template_still_loads(tmp_path):
     cfg = load_config(_write(tmp_path, _render_shipped_template()))
     # And the field this test was written for: cosmetic, empty, and accepted.
     assert cfg.instance_label == ""
+    # database.port is a placeholder now (@@DB_PORT@@), not a literal 5432 —
+    # confirms the rendered value actually reaches Config, round-tripped.
+    assert cfg.database.port == 5432
 
 
 # This is where `test_the_template_skips_the_account_the_installer_actually_creates`

@@ -474,6 +474,52 @@ port_owner_unit() {
     cgroup_unit < "/proc/${pid}/cgroup" 2>/dev/null
 }
 
+# Is whatever is listening on $1 THIS PostgreSQL cluster, or a stranger?
+#
+# A port that is not free is not evidence of which service put it there —
+# on the exact host this exists for, something published from a Docker
+# container was already on 5432 before PostgreSQL ever tried to bind it, and
+# `dpkg -l` showed no postgresql package at all: the port was occupied and the
+# occupant had nothing to do with what this installer manages. The substring
+# match (not an exact unit name) is deliberate: Debian runs each cluster under
+# an instance unit like `postgresql@16-main.service`, not the bare
+# `postgresql.service` the family-level `pg_service` name would suggest.
+pg_port_owned_by_postgres() {
+    local unit; unit="$(port_owner_unit "$1")"
+    [[ "$unit" == *postgresql* ]]
+}
+
+# Poll up to $2 seconds (default 15) for $1 to be bound by THIS PostgreSQL,
+# not merely "not free" — a systemctl exit code of 0 is not proof the server
+# came up, and an occupied port is not proof it is ours. See CLAUDE.md: an
+# exit code is not evidence of effect.
+pg_wait_listening() {
+    local port="$1" timeout="${2:-15}" waited=0
+    while (( waited < timeout )); do
+        if ! port_free "$port" && pg_port_owned_by_postgres "$port"; then
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    return 1
+}
+
+# The next free port after $1, scanning upward. Used only when the port
+# PostgreSQL was configured for turns out to be held by something else — never
+# when the operator gave an explicit --db-port, which is refused outright
+# instead of silently moved.
+pg_pick_free_port() {
+    local start="$1" candidate tries=0
+    candidate=$((start + 1))
+    while (( tries < 20 )); do
+        port_free "$candidate" && { printf '%s\n' "$candidate"; return 0; }
+        candidate=$((candidate + 1))
+        tries=$((tries + 1))
+    done
+    return 1
+}
+
 mem_available_mb() {
     awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo
 }

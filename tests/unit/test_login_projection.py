@@ -1004,6 +1004,7 @@ def _conturi_din_sablon() -> list[str]:
         "@@SURICATA_ENABLED@@": "true",
         "@@AUDITD_ENABLED@@": "true",
         "@@SCAN_CONTAINERS@@": "true",
+        "@@DB_PORT@@": "5432",
         "@@TELEGRAM_CHAT_ID@@": "1",
         "@@EXTRA_ALLOWLIST@@": '"192.0.2.10"',
     }.items():

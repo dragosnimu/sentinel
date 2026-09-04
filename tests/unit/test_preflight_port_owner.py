@@ -40,6 +40,15 @@ CASES = [
     # The negatives matter more than the positives. Something in a container or
     # a login session holding Sentinel's port IS a conflict, and must stay one.
     ("a docker container is not a unit", "0::/docker/9f2c1ab", ""),
+    # Measured on the Ubuntu install target: the process holding 5432 is named
+    # "postgres" (a `postgres:16-alpine` image run with `--network host`), but
+    # under the systemd cgroup driver Docker places it in a `.scope`, not a
+    # `.service` — the PostgreSQL ownership check in
+    # tests/security/test_installer_postgres_port.py is keyed on THIS output,
+    # not on the process name, exactly so this case comes out empty rather
+    # than "ours".
+    ("a docker container under the systemd cgroup driver is not a unit either",
+     "0::/system.slice/docker-4f2a9c1e8b3d6a7e5f0c9b8a7d6e5f4c.scope", ""),
     ("a login session is not a unit",
      "0::/user.slice/user-1000.slice/session-3.scope", ""),
 ]

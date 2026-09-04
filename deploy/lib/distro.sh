@@ -290,6 +290,67 @@ pg_bootstrap() {
     esac
 }
 
+# The port the cluster this installer manages is ACTUALLY configured for —
+# read from the machine, never assumed to be 5432.
+#
+# Debian's own postgresql-common decides the port at package-install time
+# (`pg_createcluster`, which does a real bind test) and can leave the cluster
+# on something other than 5432 with no help from this installer at all — the
+# host this was measured against had a Docker container already publishing
+# 0.0.0.0:5432 for something else entirely, and `dpkg -l` showed no
+# postgresql package, so there was nothing wrong to see before the cluster
+# even started. `pg_lsclusters` is the tool Debian's own cluster manager uses
+# to answer this, so it is asked rather than re-derived by parsing a file it
+# also writes; the config-file grep below is only the fallback for a host
+# missing that tool.
+#
+# RHEL keeps one cluster, initialised by `postgresql-setup --initdb`, and its
+# port line is commented out at the compiled-in default unless something has
+# changed it — which on the one host this installer already manages
+# (AlmaLinux, on 5432 today) is never the case, so the default below keeps
+# that host byte-for-byte where it is.
+pg_configured_port() {
+    local pgconf="$1" port=""
+    # `|| true` on both reads below: no match (a commented-out or entirely
+    # absent `port` line — the AlmaLinux default) is not an error, it is the
+    # normal case that falls through to 5432. Without it, `grep`'s exit 1
+    # propagates through `pipefail` into this assignment and `set -e` kills
+    # the caller outright — measured failing this way on exactly the RHEL
+    # default this function exists to leave unchanged.
+    # `command -v` directly, not the `have` helper from lib/common.sh: every
+    # other function in this file is self-contained, sourceable on its own
+    # (the test suite does exactly that), and this is the first thing here
+    # that would otherwise reach across files for a one-line check.
+    if [[ "$DISTRO_FAMILY" == "debian" ]] && command -v pg_lsclusters >/dev/null 2>&1; then
+        local ver; ver="$(basename "$(dirname "$pgconf")")"
+        port="$(pg_lsclusters -h 2>/dev/null \
+                | awk -v v="$ver" '$1 == v && $2 == "main" {print $3; exit}')" || true
+    fi
+    if [[ -z "$port" ]]; then
+        port="$(grep -E '^[[:space:]]*port[[:space:]]*=' "${pgconf}/postgresql.conf" 2>/dev/null \
+                | tail -1 \
+                | sed -E "s/^[[:space:]]*port[[:space:]]*=[[:space:]]*'?([0-9]+)'?.*/\1/")" || true
+    fi
+    [[ "$port" =~ ^[0-9]+$ ]] || port=5432
+    printf '%s\n' "$port"
+}
+
+# Write `port = N` into postgresql.conf, replacing whatever is there — active
+# or commented-out — or appending it if the key is absent altogether.
+# Postmaster-context, so the caller restarts the cluster afterwards; setting it
+# is not proof it took effect, which is why step_postgres verifies with `ss`
+# and a real connection rather than trusting this function's exit code.
+pg_set_port() {
+    local conf="$1/postgresql.conf" port="$2"
+    if grep -qE '^[[:space:]]*port[[:space:]]*=' "$conf"; then
+        sed -i -E "s/^[[:space:]]*port[[:space:]]*=.*/port = ${port}/" "$conf"
+    elif grep -qE '^[[:space:]]*#[[:space:]]*port[[:space:]]*=' "$conf"; then
+        sed -i -E "s/^[[:space:]]*#[[:space:]]*port[[:space:]]*=.*/port = ${port}/" "$conf"
+    else
+        printf 'port = %s\n' "$port" >> "$conf"
+    fi
+}
+
 # ---------------------------------------------------------------- suricata
 suricata_pkg() { printf 'suricata'; }
 

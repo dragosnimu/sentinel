@@ -140,8 +140,24 @@ for port in "${SENTINEL_PORTS[@]}"; do
         owner="$(port_owner "$port")"
         unit="$(port_owner_unit "$port")"
         if [[ "$port" == "5432" ]]; then
-            warn "port 5432 is in use by ${owner:-unknown} — an existing PostgreSQL. \
-The installer will reuse it and create a separate 'sentinel' database and role."
+            # Occupied does not mean "an existing PostgreSQL" — a host was
+            # measured where nothing from `dpkg -l` was postgresql at all and
+            # 5432 was still bound, published from a Docker container running
+            # something unrelated. The installer never assumes either story:
+            # it reads back the ACTUAL port after installing packages
+            # (deploy/lib/distro.sh:pg_configured_port) and writes THAT into
+            # sentinel.yaml, moving its own cluster off 5432 if it has to.
+            if [[ "$unit" == *postgresql* ]]; then
+                warn "port 5432 is in use by ${owner:-unknown} (${unit}) — an \
+existing PostgreSQL. Sentinel's own cluster may end up sharing it, or may not; \
+the installer determines the actual port after installing packages rather \
+than assuming."
+            else
+                warn "port 5432 is in use by ${owner:-unknown}, and it is NOT \
+PostgreSQL (unit: ${unit:-unknown}) — most likely something published from a \
+container. Sentinel's own PostgreSQL cluster will be moved to a free port \
+automatically; the installer will not connect to whatever this is."
+            fi
         elif [[ "$unit" == sentinel-* ]]; then
             # Preflight has to run identically on a first install and on an
             # upgrade. On an upgrade the port is held by the previous version of

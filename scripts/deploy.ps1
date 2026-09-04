@@ -73,6 +73,12 @@
     With -Rollback, also drop the database. That database is the entire
     security history.
 
+.PARAMETER DbPort
+    Pin PostgreSQL's own port instead of letting step 22 read whatever the
+    cluster actually ended up on. See deploy/install.sh's own --db-port for why
+    5432 is never assumed. Forwarded to install.sh as-is; unset means no
+    override, same as running install.sh without the flag.
+
 .PARAMETER FromStep
     Resume an interrupted install: every step BELOW N is skipped. At or above N
     a completion marker still wins, so this does NOT re-run anything already
@@ -115,6 +121,7 @@ param(
     # address you connected from — which is what you want unless you administer
     # from a different address than you deploy from.
     [string]$AdminIp,
+    [int]$DbPort,
     [int]$FromStep,
     # [string[]], not [string], and that is not a style choice. In argument mode
     # PowerShell reads a bare comma as an ARRAY constructor, so `-ForceStep 22,27`
@@ -529,6 +536,7 @@ $installArgs = @("--nginx-mode $NginxMode", "--web-port $WebPort", "--cert-mode 
 if ($AdminIp)  { $installArgs += "--admin-ip '$AdminIp'" }
 if ($Domain)   { $installArgs += "--domain '$Domain'" }
 if ($Email)    { $installArgs += "--email '$Email'" }
+if ($DbPort)   { $installArgs += "--db-port $DbPort" }
 if ($FromStep) { $installArgs += "--from-step $FromStep" }
 if ($forceStepList) { $installArgs += "--force-step $forceStepList" }
 

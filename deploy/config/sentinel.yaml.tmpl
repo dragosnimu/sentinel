@@ -41,7 +41,10 @@ platform:
 
 database:
   host: 127.0.0.1
-  port: 5432
+  # Măsurat, nu presupus: cluster-ul PostgreSQL propriu al lui Sentinel poate
+  # sfârși pe alt port decât 5432 — vezi pg_configured_port din
+  # deploy/lib/distro.sh și step_postgres/step_configs din deploy/install.sh.
+  port: @@DB_PORT@@
   name: sentinel
   user: sentinel
   pool_min: 2

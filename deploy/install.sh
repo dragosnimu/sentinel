@@ -9,7 +9,8 @@
 #   ./install.sh --domain sentinel.example.com
 #                [--nginx-mode dedicated|shared] [--web-port 8443]
 #                [--cert-mode auto|webroot|dns|selfsigned|none]
-#                [--admin-ip 203.0.113.10] [--from-step N] [--force-step N[,N…]]
+#                [--admin-ip 203.0.113.10] [--db-port 5432]
+#                [--from-step N] [--force-step N[,N…]]
 #                [--skip-preflight]
 #
 #   --from-step N    skips every step BELOW N. At or above N a completion marker
@@ -21,6 +22,13 @@
 #                    SENTINEL_DB_PASSWORD needs 22 (ALTER ROLE) and 27
 #                    (secrets.env) in the SAME pass, since the services are
 #                    restarted at the end of it. See docs/OPERARE.md §11.
+#   --db-port N      pin PostgreSQL's own port instead of letting step 22 read
+#                    whatever the cluster actually ended up on. 5432 is never
+#                    assumed: on a host where something else already publishes
+#                    it (a container, most often) the cluster manager — or, if
+#                    it did not, this installer — moves to a free port on its
+#                    own, and that is what sentinel.yaml gets. This flag is for
+#                    an operator who wants a SPECIFIC port instead.
 #
 # Two ways to expose the dashboard, chosen with --nginx-mode:
 #
@@ -65,6 +73,11 @@ FROM_STEP=""
 FORCE_STEP=""
 SKIP_PREFLIGHT=0
 SURICATA_OK=0
+
+# An explicit port for step 22 to pin PostgreSQL to, instead of reading
+# whatever the cluster actually ended up on. Empty means "no override" — step
+# 22 measures the live cluster rather than guessing 5432. See step_postgres.
+DB_PORT_OVERRIDE=""
 
 # The public HTTPS port for the dashboard. Not 443: this host serves something
 # else there. See deploy/nginx/sentinel.conf.tmpl for the consequences.
@@ -111,6 +124,7 @@ while [[ $# -gt 0 ]]; do
         --admin-ip)       ADMIN_IP="${2:-}"; shift 2 ;;
         --email)          ADMIN_EMAIL="${2:-}"; shift 2 ;;
         --web-port)       PUBLIC_PORT="${2:-}"; shift 2 ;;
+        --db-port)        DB_PORT_OVERRIDE="${2:-}"; shift 2 ;;
         --nginx-mode)     NGINX_MODE="${2:-}"; shift 2 ;;
         --cert-mode)      CERT_MODE="${2:-}"; shift 2 ;;
         --from-step)      FROM_STEP="${2:-}"; shift 2 ;;
@@ -123,7 +137,7 @@ while [[ $# -gt 0 ]]; do
         # description. It is a line count, so it moves when the header does —
         # tests/unit/test_force_step_list.py pins that --help still shows the
         # flags it documents.
-        --help|-h)        sed -n '2,36p' "$0"; exit 0 ;;
+        --help|-h)        sed -n '2,44p' "$0"; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
@@ -150,6 +164,9 @@ skipped rather than re-run. Drop one of the two flags."
 
 if [[ -n "$FROM_STEP" && ! "$FROM_STEP" =~ ^[0-9]+$ ]]; then
     die "--from-step: '${FROM_STEP}' is not a step number"
+fi
+if [[ -n "$DB_PORT_OVERRIDE" && ! "$DB_PORT_OVERRIDE" =~ ^[0-9]+$ ]]; then
+    die "--db-port: '${DB_PORT_OVERRIDE}' is not a port number"
 fi
 parse_force_steps "$FORCE_STEP"
 assert_force_steps_exist "${BASH_SOURCE[0]}"
@@ -1269,7 +1286,110 @@ Vulnerability coverage is not proven for those — see the lines above."
     fi
 }
 
+# The result of a repair, in a global rather than on stdout — deliberately, and
+# for the reason `docker_server_version_as` already documents a few hundred
+# lines up: this function shells out to `systemctl`, whose own chatter (e.g.
+# "Created symlink …" from `enable`) would land inside a captured value the
+# same way DOCKER_PROBE_ERR was corrupted the first time that mistake was
+# made here. A plain global sidesteps the whole class of bug instead of
+# suppressing every external command's stdout by hand and hoping none of them
+# ever adds a line.
+PG_RESOLVED_PORT=""
+
+# Default poll timeout for pg_ensure_listening, in seconds — a variable
+# rather than a literal in the same shape as TOOL_PROBE_TIMEOUT_S above, so a
+# test can shrink it (source the file, set this, call the function) without
+# threading a 4th argument through step_postgres. Production never sets it.
+PG_LISTEN_TIMEOUT_S=15
+
+# Makes PostgreSQL actually listen on $2 (config dir $1), or dies with a
+# diagnostic that names what to run next — never returns having merely tried
+# and hoped. $3 non-empty means $2 came from --db-port: an explicit request is
+# refused outright rather than silently moved to a different port. $4 is the
+# poll timeout in seconds (default $PG_LISTEN_TIMEOUT_S) — only so a test can
+# shrink it; production never passes it. $5, if given, is the port
+# postgresql.conf held before THIS call touched anything — used only to put
+# it back before a die(), see below.
+#
+# `enable --now` / `restart` reporting 0 is not proof the server is up on this
+# port (CLAUDE.md's `systemctl enable --now` row is exactly this bug), so
+# every path below is decided by `pg_wait_listening`, which polls `ss` and
+# checks OWNERSHIP by cgroup — not merely "is the port no longer free". A host
+# has been measured where something published from a Docker container already
+# held 5432 before PostgreSQL ever tried to bind it, with no postgresql
+# package installed at all; "the port is taken" there means "not PostgreSQL",
+# and treating it as "reuse what's on 5432" would point Sentinel at a
+# stranger's database with the wrong credentials.
+#
+# `enable --now` is a no-op on an ALREADY-ACTIVE unit — CLAUDE.md names this
+# exact bug. On Debian/Ubuntu the package postinst starts the cluster during
+# step 20 (pg_bootstrap), so step 22 meets a cluster that is already running
+# on whatever port it started on; `enable --now` alone never notices
+# postgresql.conf changed under it, no matter how many times it is called.
+# The escalation below is conditioned on the TARGET port being free — nobody,
+# us or a stranger, bound to it — because that is the one situation a restart
+# can fix. A port a stranger already holds stays held through a restart; that
+# case is handled further down by moving off it instead.
+pg_ensure_listening() {
+    local pgconf="$1" port="$2" explicit="${3:-}" timeout="${4:-$PG_LISTEN_TIMEOUT_S}" \
+          restore_port="${5:-}"
+    PG_RESOLVED_PORT=""
+
+    systemctl enable --now postgresql >/dev/null 2>&1 || true
+    if pg_wait_listening "$port" "$timeout"; then
+        PG_RESOLVED_PORT="$port"
+        return 0
+    fi
+
+    if port_free "$port"; then
+        systemctl restart postgresql >/dev/null 2>&1 || true
+        if pg_wait_listening "$port" "$timeout"; then
+            PG_RESOLVED_PORT="$port"
+            return 0
+        fi
+    fi
+
+    if [[ -n "$explicit" ]]; then
+        # A die() here must not leave postgresql.conf naming a port the
+        # cluster is not actually on — the live cluster would move there on
+        # its own at the next unrelated restart or reboot while
+        # sentinel.yaml still names the old one. restore_port is a no-op
+        # when nothing was changed, or already matches what's on disk.
+        if [[ -n "$restore_port" && "$restore_port" != "$(pg_configured_port "$pgconf")" ]]; then
+            pg_set_port "$pgconf" "$restore_port"
+        fi
+        die "PostgreSQL did not come up listening on --db-port ${port}. \
+Inspect:  journalctl -u postgresql -n 50 --no-pager"
+    fi
+    if port_free "$port"; then
+        die "PostgreSQL service did not start, and port ${port} is free — \
+this is not a port conflict. Inspect:  journalctl -u postgresql -n 50 --no-pager"
+    fi
+
+    local occupant; occupant="$(port_owner "$port")"
+    warn "port ${port} is held by ${occupant:-something else}, not this \
+PostgreSQL cluster. Moving Sentinel's cluster to a free port instead of \
+connecting to whatever that is."
+    local new_port; new_port="$(pg_pick_free_port "$port")" || \
+        die "no free port found near ${port} for PostgreSQL"
+    pg_set_port "$pgconf" "$new_port"
+    systemctl restart postgresql >/dev/null 2>&1 || true
+    if pg_wait_listening "$new_port" "$timeout"; then
+        PG_RESOLVED_PORT="$new_port"
+        return 0
+    fi
+    if [[ -n "$restore_port" && "$restore_port" != "$(pg_configured_port "$pgconf")" ]]; then
+        pg_set_port "$pgconf" "$restore_port"
+    fi
+    die "PostgreSQL still not listening on ${new_port} after moving off \
+the conflicting port ${occupant:-unknown}. Inspect:  journalctl -u postgresql -n 50 --no-pager"
+}
+
 # --- 22 -------------------------------------------------------------------
+# The port this cluster ends up on is measured after the fact, never assumed.
+# `sentinel.yaml`'s database.port (step 26) reads it back with
+# `pg_configured_port`, from the exact file this step writes — see there for
+# what happens on a host that reaches step 26 without this step ever having run.
 step_postgres() {
     # RHEL keeps configuration inside the data directory; Debian splits it
     # into /etc/postgresql/<version>/main and initialises the cluster in its
@@ -1280,7 +1400,16 @@ step_postgres() {
     install -D -m 0644 -o postgres -g postgres \
         "${SCRIPT_DIR}/postgres/sentinel-tuning.conf" \
         "${pgconf}/conf.d/sentinel-tuning.conf"
-    grep -q "include_dir 'conf.d'" "${pgconf}/postgresql.conf" || \
+    # The guard has to match what gets WRITTEN below, or it never matches and
+    # every --force-step 22 appends another copy — measured on the production
+    # host as four identical `include_dir = 'conf.d'` lines. `grep -q
+    # "include_dir 'conf.d'"` (no `=`) never matched the `include_dir =
+    # 'conf.d'` this line appends; this pattern does, so a rerun converges.
+    # Deliberately NOT touching the duplicates already on disk here: this is a
+    # one-line idempotency guard, not a migration, and editing postgresql.conf
+    # on a live cluster wants its own reviewed change, not a side effect of it.
+    grep -qE "^[[:space:]]*include_dir[[:space:]]*=[[:space:]]*'conf\.d'" \
+        "${pgconf}/postgresql.conf" || \
         echo "include_dir = 'conf.d'" >> "${pgconf}/postgresql.conf"
 
     # Loopback only, scram-sha-256. The database is never reachable off-host.
@@ -1307,8 +1436,30 @@ step_postgres() {
         ok "pg_hba.conf updated (sentinel scram rules before the defaults)"
     fi
 
-    systemctl enable --now postgresql
-    sleep 2
+    # --- port -------------------------------------------------------------
+    # NEVER assumed to be 5432. Debian's own postgresql-common already ran a
+    # real bind test at package-install time (step 20, inside `pg_bootstrap`)
+    # and may have moved this cluster off 5432 on its own; RHEL's default is
+    # whatever `postgresql-setup --initdb` left, which stays 5432 unless
+    # something has changed it. Either way the LIVE configuration file is the
+    # source of truth, not this installer's memory of what port it expected.
+    local pg_port; pg_port="$(pg_configured_port "$pgconf")"
+    local pg_port_explicit="" pg_port_before="$pg_port"
+
+    if [[ -n "$DB_PORT_OVERRIDE" && "$DB_PORT_OVERRIDE" != "$pg_port" ]]; then
+        pg_set_port "$pgconf" "$DB_PORT_OVERRIDE"
+        pg_port="$DB_PORT_OVERRIDE"
+        info "postgresql.conf: port set to ${pg_port} (--db-port)"
+    fi
+    [[ -n "$DB_PORT_OVERRIDE" ]] && pg_port_explicit=1
+
+    # $pg_port_before travels through as pg_ensure_listening's restore_port:
+    # what was on disk before this run touched anything, so a die() there
+    # undoes the rewrite instead of leaving postgresql.conf naming a port the
+    # cluster never actually reached.
+    pg_ensure_listening "$pgconf" "$pg_port" "$pg_port_explicit" "" "$pg_port_before"
+    pg_port="$PG_RESOLVED_PORT"
+    ok "PostgreSQL listening on 127.0.0.1:${pg_port} (verified with ss, owned by postgresql)"
 
     local db_password="${SECRETS[SENTINEL_DB_PASSWORD]:-}"
     [[ -z "$db_password" ]] && die "SENTINEL_DB_PASSWORD was not supplied on stdin"
@@ -1318,21 +1469,52 @@ step_postgres() {
     # server-parsable SQL and passes :'pw' through literally, which the server
     # then rejects with "syntax error at or near :". stdin keeps the password off
     # any command line where `ps` could show it, which was the point of :'pw'.
-    if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='sentinel'" | grep -q 1; then
+    if ! sudo -u postgres psql -p "$pg_port" -tAc "SELECT 1 FROM pg_roles WHERE rolname='sentinel'" | grep -q 1; then
         printf "CREATE ROLE sentinel LOGIN PASSWORD :'pw';\n" \
-            | sudo -u postgres psql -v ON_ERROR_STOP=1 -v pw="$db_password" >/dev/null
+            | sudo -u postgres psql -p "$pg_port" -v ON_ERROR_STOP=1 -v pw="$db_password" >/dev/null
         ok "role sentinel created"
     else
         printf "ALTER ROLE sentinel PASSWORD :'pw';\n" \
-            | sudo -u postgres psql -v ON_ERROR_STOP=1 -v pw="$db_password" >/dev/null
+            | sudo -u postgres psql -p "$pg_port" -v ON_ERROR_STOP=1 -v pw="$db_password" >/dev/null
         ok "role sentinel password updated"
     fi
 
-    if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='sentinel'" | grep -q 1; then
-        sudo -u postgres createdb -O sentinel sentinel
+    if ! sudo -u postgres psql -p "$pg_port" -tAc "SELECT 1 FROM pg_database WHERE datname='sentinel'" | grep -q 1; then
+        sudo -u postgres createdb -p "$pg_port" -O sentinel sentinel
         ok "database sentinel created"
     fi
     systemctl reload postgresql
+
+    # A role created and a service "reloaded" are not proof a client can reach
+    # it — the DSN Sentinel will actually use is host+port+role+password
+    # together, and this is the one point in the install that can prove all
+    # four at once before sentinel.yaml is written.
+    #
+    # stderr is CAPTURED, not discarded: "no pg_hba.conf entry", "password
+    # authentication failed" and "connection refused" are three different
+    # fixes, and journalctl carries none of them — that's the SERVER log, and
+    # this is a CLIENT-side rejection psql reports on its own stderr, before
+    # the server would ever write anything. The password itself never appears
+    # in this text (psql never echoes PGPASSWORD), only PostgreSQL's own
+    # error strings, so nothing secret reaches the die message.
+    local conn_err conn_out
+    conn_err="$(mktemp)"
+    # `|| true`: under `set -e`, a failed command inside a bare assignment
+    # (not inside an `if`) aborts the WHOLE script right here with no message
+    # at all — silently skipping the die() below on exactly the connection
+    # failure this block exists to diagnose. The `if` two lines down is what
+    # actually decides success; this command must be allowed to fail into it.
+    conn_out="$(PGPASSWORD="$db_password" psql -h 127.0.0.1 -p "$pg_port" -U sentinel -d sentinel \
+            -tAc "SELECT 1" 2>"$conn_err")" || true
+    if ! printf '%s\n' "$conn_out" | grep -q 1; then
+        local conn_reason; conn_reason="$(cat "$conn_err")"
+        rm -f "$conn_err"
+        die "role and database exist, but a client connection to \
+127.0.0.1:${pg_port}/sentinel as sentinel failed: ${conn_reason}
+Inspect pg_hba.conf."
+    fi
+    rm -f "$conn_err"
+    ok "psql connects to 127.0.0.1:${pg_port}/sentinel as sentinel (verified)"
 }
 
 # --- 23 -------------------------------------------------------------------
@@ -1460,6 +1642,20 @@ step_configs() {
 scan.containers would be written on a guess"
     fi
 
+    # database.port is measured, never guessed at 5432. Read from the live
+    # cluster config step 22 wrote — not from a variable, so a resume that
+    # skips step 22 (already marked done in an earlier pass) still gets the
+    # port THAT pass actually resolved, and a host that reaches step 26 with
+    # no cluster configured at all is refused rather than handed a default
+    # that happens to be wrong exactly on the host this exists for.
+    local pgconf; pgconf="$(pg_confdir)"
+    if [[ ! -f "${pgconf}/postgresql.conf" ]]; then
+        die "internal: no PostgreSQL configuration at ${pgconf} — step 22 \
+(postgres) must run before step 26 writes sentinel.yaml, or database.port \
+would be written on a guess"
+    fi
+    local db_port; db_port="$(pg_configured_port "$pgconf")"
+
     # NOT a `trap ... RETURN`: without `set -o functrace` a RETURN trap set in a
     # function is not cleared when that function returns, so it fires again on the
     # next function return — run_step's — where $tmp is out of scope and `set -u`
@@ -1516,6 +1712,7 @@ ingest.auditd is written as FALSE rather than pointed at a file that will not ex
         -e "s|@@SURICATA_ENABLED@@|$( (( SURICATA_OK )) && echo true || echo false )|g" \
         -e "s|@@AUDITD_ENABLED@@|${auditd_enabled}|g" \
         -e "s|@@SCAN_CONTAINERS@@|${SCAN_CONTAINERS}|g" \
+        -e "s|@@DB_PORT@@|${db_port}|g" \
         -e "s|@@TELEGRAM_CHAT_ID@@|${SECRETS[TELEGRAM_CHAT_ID]:-0}|g" \
         -e "s|@@EXTRA_ALLOWLIST@@|${extra_allow}|g" \
         "${SCRIPT_DIR}/config/sentinel.yaml.tmpl" > "${tmp}/sentinel.yaml"
