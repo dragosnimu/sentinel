@@ -551,6 +551,142 @@ test("închiderea pleacă O SINGURĂ DATĂ, nu la fiecare rundă de cron", async
   } finally { t.restore(); }
 });
 
+// ---------------------------------------------------------------------------
+// Alertele duble: martorul tace dacă principalul a livrat CONFIRMAT același
+// fel de mesaj recent — cerința operatorului, verificată la nivel de rută
+// (nu doar `principalAlreadyDelivered` izolat), fiindcă efectul care contează
+// e ce se scrie în starea instanței, nu doar valoarea întoarsă de o funcție.
+// ---------------------------------------------------------------------------
+
+/** Semnal proaspăt (fără tăcere, fără conductă oprită) cu autodiagnosticul căzut. */
+function selfcheckDownState(alertedKinds?: Record<string, boolean>) {
+  const base = freshState();
+  const last = { ...(base.last as Record<string, unknown>) };
+  last.selfcheck = { worst: "down", checks: 33, bad: 4, ran_at: last.received_at };
+  if (alertedKinds) last.alerted_kinds = alertedKinds;
+  return { ...base, last };
+}
+
+test("selfcheck livrat CONFIRMAT de principal suprimă mesajul martorului", async () => {
+  await seed({ aaa111: selfcheckDownState({ selfcheck: true }) });
+  const t = captureTelegram();
+  try {
+    const body = await bodyOf(await GET(req(CHECK_KEY)));
+    assert.equal(t.sent.length, 0,
+      "martorul a dublat alerta pe care principalul tocmai a livrat-o");
+    assert.equal(reportFor(body, "aaa111")?.kind, "selfcheck");
+    assert.equal(reportFor(body, "aaa111")?.alerted, false);
+  } finally { t.restore(); }
+});
+
+test("fără livrare confirmată, selfcheck căzut TOT alertează", async () => {
+  await seed({ aaa111: selfcheckDownState({ selfcheck: false }) });
+  const t = captureTelegram();
+  try {
+    await GET(req(CHECK_KEY));
+    assert.equal(t.sent.length, 1, "lipsa livrării confirmate n-a mai alertat");
+  } finally { t.restore(); }
+});
+
+test("`alerted_kinds` LIPSĂ (Sentinel vechi, martor nou) duce la alertă, nu la tăcere", async () => {
+  await seed({ aaa111: selfcheckDownState() }); // fără `alerted_kinds` deloc
+  const t = captureTelegram();
+  try {
+    await GET(req(CHECK_KEY));
+    assert.equal(t.sent.length, 1,
+      "un câmp absent a fost citit ca „a livrat\", deci martorul a tăcut");
+  } finally { t.restore(); }
+});
+
+test("`silent` NU se suprimă niciodată, indiferent ce pretinde beaconul", async () => {
+  const base = silentState();
+  await seed({
+    aaa111: { ...base, last: { ...base.last, alerted_kinds: { selfcheck: true, silent: true } } },
+  });
+  const t = captureTelegram();
+  try {
+    const body = await bodyOf(await GET(req(CHECK_KEY)));
+    assert.equal(t.sent.length, 1,
+      "un `silent` a fost suprimat pe baza unei chei pe care beaconul n-are voie s-o controleze");
+    assert.equal(reportFor(body, "aaa111")?.kind, "silent");
+  } finally { t.restore(); }
+});
+
+test("`stalled` NU se suprimă niciodată, indiferent ce pretinde beaconul", async () => {
+  const base = freshState();
+  await seed({
+    aaa111: {
+      ...base,
+      last: { ...base.last, alerted_kinds: { stalled: true, selfcheck: true } },
+      // Peste STALL_SECONDS (15 min): literal, nu numele constantei.
+      counters_moved_at: new Date(Date.now() - (15 * 60 + 60) * 1000).toISOString(),
+    },
+  });
+  const t = captureTelegram();
+  try {
+    const body = await bodyOf(await GET(req(CHECK_KEY)));
+    assert.equal(t.sent.length, 1, "un `stalled` a fost suprimat");
+    assert.equal(reportFor(body, "aaa111")?.kind, "stalled");
+  } finally { t.restore(); }
+});
+
+test("o alertă SUPRIMATĂ nu produce mai târziu o revenire falsă", async () => {
+  // Testul cel mai important: dacă suprimarea ar marca oricum `alerted`, când
+  // selfcheck-ul revine la „ok" ramura de revenire ar anunța „Sentinel a
+  // revenit" despre o alarmă pe care martorul n-a dat-o NICIODATĂ — a doua
+  // formă de mesaj fals, nu o reparație a primeia.
+  await seed({ aaa111: selfcheckDownState({ selfcheck: true }) });
+  const first = captureTelegram();
+  try {
+    await GET(req(CHECK_KEY));
+    assert.equal(first.sent.length, 0,
+      "prima rundă a alertat, deci testul ăsta nu verifică suprimarea");
+  } finally { first.restore(); }
+
+  const afterFirst = (await readAll()).instances.aaa111;
+  assert.equal(afterFirst?.alerted, undefined,
+    "o alertă suprimată a fost marcată ca alertată oricum");
+
+  // Runda următoare: autodiagnosticul a revenit la „ok".
+  await seed({ aaa111: freshState() });
+  const second = captureTelegram();
+  try {
+    await GET(req(CHECK_KEY));
+    assert.equal(second.sent.length, 0,
+      "martorul a anunțat o „revenire” falsă pentru o alarmă pe care n-a dat-o niciodată");
+  } finally { second.restore(); }
+});
+
+test("revenirea e suprimată când principalul a anunțat-o el, dar starea tot se închide", async () => {
+  // O alarmă REALĂ, deschisă de martor (nu suprimată). La runda următoare
+  // problema s-a rezolvat, iar principalul tocmai a livrat propriul mesaj
+  // `selfcheck` — cerința operatorului spune explicit că și revenirea tace în
+  // cazul ăsta. Starea tot trebuie ștearsă, altfel o recădere REALĂ de același
+  // fel ar fi înghițită ca duplicat în următoarele patru ore.
+  const alerted = { kind: "selfcheck", at: new Date(Date.now() - 60000).toISOString() };
+  const base = freshState({ alerted });
+  await seed({
+    aaa111: { ...base, last: { ...base.last, alerted_kinds: { selfcheck: true } } },
+  });
+  const t = captureTelegram();
+  try {
+    await GET(req(CHECK_KEY));
+    assert.equal(t.sent.length, 0,
+      "martorul a anunțat revenirea deși principalul o anunțase deja");
+  } finally { t.restore(); }
+
+  const after = (await readAll()).instances.aaa111;
+  assert.equal(after?.alerted, undefined,
+    "starea de alertare n-a fost închisă, deci o recădere reală ar fi înghițită ca duplicat");
+
+  // Fără nicio livrare nouă, runda următoare n-are ce anunța din nou.
+  const t2 = captureTelegram();
+  try {
+    await GET(req(CHECK_KEY));
+    assert.equal(t2.sent.length, 0);
+  } finally { t2.restore(); }
+});
+
 test("o identitate retrasă FĂRĂ alarmă deschisă nu produce niciun mesaj",
      async () => {
   // Cazul obișnuit: se retrage ceva care tăcea liniștit, fără să fi alarmat.

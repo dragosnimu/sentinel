@@ -122,6 +122,18 @@ ACTUALIZARE se întâmplă opusul, din aceeași cauză: găleata `default` tace 
 martorul strigă, cu mesajul greșit. Ce ar închide gaura e ca `unknown` să
 alerteze, dar aia e o schimbare de politică pentru toate verificările din
 `selfcheck/checks.py`, nu pentru asta.
+
+## Alertele duble
+
+Sentinel are propriul canal de alertare pe Telegram. Martorul are al lui. Când
+autodiagnosticul cade, ambele pot spune același lucru operatorului, la câteva
+secunde distanță — măsurat, 131 de ori în 7 zile pentru un singur fel de
+mesaj. `collect()` duce acum și faptul care rezolvă asta: ce a livrat
+CONFIRMAT principalul, recent, pe felul pe care martorul îl poate dubla
+(`alerted_kinds`, vezi constanta `ALERT_SUPPRESSION_WINDOW_S` mai jos pentru
+fereastra și raționamentul). Suprimarea propriu-zisă e decizia martorului —
+`aggregator/app/api/sentinel/check/route.ts` — nu a acestui modul, care doar
+raportează faptul.
 """
 
 from __future__ import annotations
@@ -186,6 +198,83 @@ REFUSED_KEY = "beacon:refused"
 # lungime — se taie și aici ca o valoare scăpată de sub control din
 # `sentinel.yaml` să nu umfle FIECARE semnal cu ceva ce martorul aruncă.
 MAX_LABEL = 64
+
+# ---------------------------------------------------------------------------
+# Alertele duble: ce a livrat Sentinel însuși recent, pe felurile pe care
+# martorul le poate dubla
+# ---------------------------------------------------------------------------
+# Măsurat pe gazdă, 7 zile: 131 de notificări `kind='selfcheck'` livrate de
+# Sentinel pe Telegram — și tot atâtea alerte „selfcheck" trimise separat de
+# martorul extern, despre EXACT aceeași defecțiune. Câmpul de mai jos duce un
+# singur fapt în plus, ca `check/route.ts` să poată tăcea a doua voce: a
+# livrat principalul, CONFIRMAT — `state='sent'`, nu doar pus în coadă, vezi
+# `sentinel/telegram/bot.py:1230` — o notificare de felul ăsta în ultimele
+# `ALERT_SUPPRESSION_WINDOW_S` secunde?
+#
+# **Fereastra trebuie să acopere runda de `/check` care observă PRIMA
+# livrarea, nu doar cadențele proprii ale expeditorului.** Varianta inițială
+# (180 s) era prinsă doar între `interval_s` al beaconului (60 s) și cadența
+# autoverificării (300 s) — corectă ca margine de jos, insuficientă ca margine
+# de sus. `docs/DEPLOYMENT.md` §7 documentează, măsurat pe instalarea asta, că
+# `/check` rulează din cronul găzduirii cu **latență de până la 5 minute**
+# (300 s) — e chiar fraza „180 de secunde plus latența cronului (până la 5
+# minute)" de acolo, despre pragul lui `silent`, dar latența cronului e un
+# fapt despre CRON, nu despre `silent`, și se aplică la fel aici. Iar starea pe
+# care o citește `/check` e cea din ULTIMUL semnal primit, care poate fi el
+# însuși cu până la `interval_s` (60 s) în urmă față de momentul citirii —
+# `alerted_kinds` se calculează la TRIMITEREA semnalului, nu la citirea lui.
+# Cu 180 s, o livrare la T devine invizibilă pentru orice rundă de `/check`
+# care ajunge după T+180, iar un cron cu latență de 5 minute ajunge acolo des.
+# Exact dubla pe care mecanismul ăsta există s-o închidă.
+#
+# 360 s = 300 (latența documentată a cronului) + 60 (`interval_s` al
+# beaconului, marja pentru relanseul prin care semnalul ajunge la martor). Nu
+# e o rotunjire de mijloc, e suma a două cifre măsurate.
+#
+# **De ce peste 300 nu mai maschează o defecțiune NOUĂ, cum se temea varianta
+# veche.** O defecțiune chiar nouă (o cheie de `selfcheck` diferită, sau
+# aceeași revenită și căzută din nou) produce o notificare NOUĂ, livrată de
+# `_push_loop` în cel mult 15 s — deci `alerted_kinds.selfcheck` redevine
+# adevărat, despre problema curentă, mult mai repede decât orice fereastră
+# discutată aici. Lărgirea nu ține o livrare veche vie artificial de mult;
+# ea doar acoperă golul dintre o livrare reală și runda de `/check` care ar
+# fi trebuit s-o vadă.
+#
+# **Grija de la capătul celălalt** — martorul tăcând mult după ce principalul
+# a amuțit de tot — rămâne mărginită structural, nu de fereastra asta: dacă
+# Sentinel chiar tace (procesul, nu doar canalul Telegram), beaconul nu mai
+# trimite NIMIC, iar `silent` (declanșat după 180 s de tăcere reală,
+# `MISSED_BEATS_BEFORE_ALARM × interval_s`) nu e NICIODATĂ suprimabil — vezi
+# `SUPPRESSIBLE_KINDS` din `aggregator/lib/verify.ts`. Fereastra asta poate
+# masca o problemă NOUĂ doar în compunerea îngustă în care Sentinel bate
+# normal mai departe ȘI o livrare anterioară a reușit o dată ȘI mecanismul de
+# livrare Telegram s-a stricat exact după aceea, fără să treacă prin
+# `_send_direct` — 360 s lărgește expunerea aia cu 180 s față de varianta
+# veche, nu cu ore.
+#
+# **Nu acoperă `stalled`, dinadins.** Sentinel n-are un fel de notificare
+# propriu pentru „bucla de detecție s-a oprit" — verificarea care ar prinde-o
+# (`check_detection_loop`) scrie tot pe coada `kind='selfcheck'`, amestecată cu
+# ORICE altă verificare căzută (executor, patch, reputație...). A trata „am
+# livrat un selfcheck" ca dovadă că s-a anunțat ANUME blocajul ar suprima un
+# `stalled` real pe baza unui mesaj fără nicio legătură — exact flag-ul
+# grosier pe care martorul nu are voie să-l aibă (vezi granularitatea din
+# `aggregator/lib/verify.ts`). Rămâne nesuprimat.
+ALERT_SUPPRESSION_WINDOW_S = 360
+
+# `EXISTS`, nu `count(*)`: martorul primește un bool peste fir, nu un număr a
+# cărui singură întrebuințare e „zero sau nu". Fereastra intră ca PARAMETRU
+# (`$1`, prin `make_interval`), nu ca literal interpolat în șir — nu fiindcă ar
+# fi injectabilă (e o constantă a codului, nu o intrare externă), ci ca
+# instrucțiunea să rămână un literal Python simplu, pe care
+# `tests/unit/test_beacon_sql_schema.py` chiar îl poate citi static. O
+# interogare asamblată din bucăți (f-string, concatenare) e invizibilă pentru
+# lint-ul ăla — exact felul de gol care a lăsat coloana greșită din
+# `AUDIT_HEAD_SQL` să reziste un an.
+SELFCHECK_DELIVERED_SQL = (
+    "SELECT EXISTS (SELECT 1 FROM notifications WHERE kind = 'selfcheck' "
+    "AND state = 'sent' AND sent_at > now() - make_interval(secs => $1))"
+)
 
 # Capul lanțului de audit, definit exact ca în sentinel/db/repo/audit.py: ultima
 # intrare după `id`, coloana `entry_hash`. Cele două definiții trebuie să rămână
@@ -317,14 +406,21 @@ async def collect(db: Database, cfg: Config) -> dict[str, Any]:
     prin `Number(x || 0)`, deci un eșec de sondă ajunge acolo drept `0` și nu se
     distinge de „încă niciun eveniment". Ca să se distingă, are nevoie de o
     schimbare la martor.
+
+    Pentru `alerted_kinds` valoarea de rezervă e mai simplă, fiindcă merge într-o
+    singură direcție: `False` înseamnă „nu știu dacă a livrat", iar martorul
+    citește `False` ca „nu suprim", niciodată ca „a livrat, deci tac". O sondă
+    eșuată aici nu ascunde nimic — cel mult pierde o suprimare legitimă, ceea ce
+    înseamnă o alertă în plus pe Telegram, nu una lipsă. Vezi „Alertele duble" în
+    capul modulului.
     """
     # Prima linie, înaintea oricărei interogări: fără identitate semnalul nu are
     # unde pleca, deci nu are rost nici măcar strâns.
     instance_id = read_instance_id()
 
-    async def val(sql: str, default: Any = None) -> Any:
+    async def val(sql: str, default: Any = None, *args: Any) -> Any:
         try:
-            out = await db.fetchval(sql)
+            out = await db.fetchval(sql, *args)
         except Exception as exc:  # noqa: BLE001
             n = _probe_failures[sql] = _probe_failures.get(sql, 0) + 1
             log.warning("beacon probe failed",
@@ -347,6 +443,10 @@ async def collect(db: Database, cfg: Config) -> dict[str, Any]:
     blocklist = await val(
         "SELECT count(*) FROM blocklist WHERE unblocked_at IS NULL", 0)
     audit_head = await val(AUDIT_HEAD_SQL, AUDIT_HEAD_UNAVAILABLE)
+    # Implicit `False`, direcția sigură: dacă sonda eșuează, martorul trebuie să
+    # alerteze crezând că nu s-a livrat nimic, nu să tacă crezând că s-a livrat.
+    selfcheck_delivered = await val(
+        SELFCHECK_DELIVERED_SQL, False, ALERT_SUPPRESSION_WINDOW_S)
 
     sc = None
     try:
@@ -386,6 +486,11 @@ async def collect(db: Database, cfg: Config) -> dict[str, Any]:
         # `None` înseamnă jurnal de audit gol, nu sondă eșuată: pe eșec, `val` a
         # întors deja `AUDIT_HEAD_UNAVAILABLE`, care e adevărat și trece de `or`.
         "audit_head": (audit_head or "")[:64],
+        # Ce a livrat CONFIRMAT principalul, recent, pe felurile pe care
+        # martorul le poate dubla. Un expeditor mai vechi nu trimite cheia asta
+        # deloc — martorul cade înapoi pe „nu știu" și alertează ca azi, vezi
+        # `aggregator/app/api/sentinel/beat/route.ts`.
+        "alerted_kinds": {"selfcheck": bool(selfcheck_delivered)},
         "selfcheck": {
             "worst": sc["worst_status"] if sc else "unknown",
             "checks": int(sc["checks_run"]) if sc else 0,

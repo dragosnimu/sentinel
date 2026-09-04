@@ -90,6 +90,13 @@ KEYWORDS = {
     # pe aici a fost raportat drept „`true` nu e o coloană". Nicio instrucțiune
     # de dinainte nu conținea un boolean, deci golul nu era vizibil altfel.
     "TRUE", "FALSE",
+    # Numele parametrului dintr-un apel `make_interval(secs => $1)` — idiomul
+    # folosit peste tot în restul depozitului (`sessions.py`, `blocklist.py`,
+    # `audit.py`...), dar niciodată până acum într-unul din cele două module pe
+    # care lint-ul ăsta le citește. `secs =>` nu e o coloană, e sintaxa de
+    # parametru numit a Postgres; lint-ul n-o recunoaște ca atare și raporta
+    # „`secs` nu e o coloană de notifications" pentru o interogare corectă.
+    "SECS",
 }
 
 TABLE_AFTER = re.compile(r"\b(?:FROM|JOIN|INTO|UPDATE)\s+([a-zA-Z_]\w*)", re.I)

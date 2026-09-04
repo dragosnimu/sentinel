@@ -168,6 +168,14 @@ export type Beat = {
   /** Nume cosmetic trimis de instanță. Niciodată cheie, niciodată de încredere. */
   label?: string;
   selfcheck: { worst: string; checks: number; bad: number; ran_at: string | null };
+  /**
+   * Ce a livrat CONFIRMAT principalul, recent, pe felurile pe care martorul le
+   * poate dubla — vezi `sentinel/report/beacon.py`, secțiunea „Alertele
+   * duble". Opțional: un expeditor mai vechi nu-l trimite deloc, iar absența
+   * lui trebuie citită la fel ca `{}` — adică „nu știu", niciodată „a livrat".
+   * `check/route.ts` e singurul loc care-l citește ca decizie.
+   */
+  alerted_kinds?: Record<string, boolean>;
 };
 
 /** Tot ce știm despre O instanță. Forma pe care o judecă `judge()`. */
@@ -400,6 +408,12 @@ function asInstanceState(v: unknown): InstanceState | undefined {
     }
     if (!isObject(b.selfcheck) || typeof b.selfcheck.worst !== "string") return undefined;
     if (b.label !== undefined && typeof b.label !== "string") return undefined;
+    if (b.alerted_kinds !== undefined) {
+      if (!isObject(b.alerted_kinds)) return undefined;
+      for (const val of Object.values(b.alerted_kinds)) {
+        if (typeof val !== "boolean") return undefined;
+      }
+    }
   }
   if (v.alerted !== undefined) {
     if (!isObject(v.alerted)) return undefined;

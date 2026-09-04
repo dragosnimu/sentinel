@@ -259,6 +259,24 @@ function readMaxAge(raw: unknown): number | null {
  */
 const UNSAFE_LABEL_CHARS = /[\p{Cc}\p{Cs}]/gu;
 
+/**
+ * Ce a livrat CONFIRMAT principalul, recent — vezi `sentinel/report/beacon.py`.
+ *
+ * Lipsă, sau formă greșită (nu e un obiect, sau are valori care nu sunt
+ * `boolean`) → obiect gol, adică „nu știu, deci nu suprim nimic". E geamănul
+ * valorii de rezervă din `collect()`: un expeditor mai vechi nu trimite câmpul
+ * deloc, iar un obiect gol produce EXACT comportamentul de azi la `/check` —
+ * nicio suprimare, alertă ca înainte de schimbarea asta.
+ */
+function readAlertedKinds(raw: unknown): Record<string, boolean> {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: Record<string, boolean> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v === "boolean") out[k] = v;
+  }
+  return out;
+}
+
 export async function POST(req: Request) {
   // Pasul 1. Lipsa antetului NU e o eroare: expeditorul aflat azi în producție
   // nu îl trimite, iar martorul se actualizează înaintea serverului.
@@ -462,6 +480,7 @@ export async function POST(req: Request) {
     selfcheck: (payload.selfcheck as Beat["selfcheck"]) || {
       worst: "unknown", checks: 0, bad: 0, ran_at: null,
     },
+    alerted_kinds: readAlertedKinds(payload.alerted_kinds),
   };
 
   // Se scrie DOAR fișierul instanței ăsteia. Nicio altă instanță nu e citită și

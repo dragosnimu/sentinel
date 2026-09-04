@@ -22,7 +22,7 @@ import { NextResponse } from "next/server";
 import {
   readAll, retiredWithOpenAlert, updateInstance, type InstanceState,
 } from "@/lib/store";
-import { judge, type Verdict } from "@/lib/verify";
+import { judge, principalAlreadyDelivered, type Verdict } from "@/lib/verify";
 import { alert, escapeHtml } from "@/lib/telegram";
 
 export const dynamic = "force-dynamic";
@@ -102,14 +102,23 @@ export async function GET(req: Request) {
       // se închide niciodată lasă operatorul să se întrebe dacă s-a rezolvat.
       let recorded = false;
       if (inst.alerted) {
-        await alert(
-          `✅ <b>${name} — Sentinel a revenit</b>\n\n` +
-          `Semnalul a reînceput. Problema anterioară: ${escapeHtml(inst.alerted.kind)}, ` +
-          `semnalată la ${escapeHtml(inst.alerted.at)}.`,
-        );
-        // Se șterge indiferent dacă mesajul a plecat: o stare „alertat" rămasă
-        // în urmă ar face ca o recădere de același fel, în următoarele patru
-        // ore, să fie înghițită ca duplicat.
+        // Simetric cu suprimarea de la intrare, mai jos: dacă principalul a
+        // anunțat el însuși revenirea pentru FELUL de alertă pe care noi l-am
+        // avut deschis, martorul tace și la revenire — cerința operatorului o
+        // spune explicit. Se verifică felul PĂSTRAT în `inst.alerted` (alerta
+        // pe care AM trimis-o), nu verdictul curent, care e deja `null` aici.
+        const principalAnnouncedRecovery =
+          principalAlreadyDelivered(inst.alerted.kind, inst.last);
+        if (!principalAnnouncedRecovery) {
+          await alert(
+            `✅ <b>${name} — Sentinel a revenit</b>\n\n` +
+            `Semnalul a reînceput. Problema anterioară: ${escapeHtml(inst.alerted.kind)}, ` +
+            `semnalată la ${escapeHtml(inst.alerted.at)}.`,
+          );
+        }
+        // Se șterge indiferent dacă mesajul a plecat SAU a fost suprimat: o
+        // stare „alertat" rămasă în urmă ar face ca o recădere de același fel,
+        // în următoarele patru ore, să fie înghițită ca duplicat.
         //
         // Se scrie prin `updateInstance`, care RECITEȘTE fișierul instanței
         // înainte de scriere: între citirea de la începutul rutei și punctul
@@ -121,6 +130,22 @@ export async function GET(req: Request) {
       reported.push({
         id, label: inst.last.label ?? "", kind: null, severity: null,
         alerted: false, recorded,
+      });
+      continue;
+    }
+
+    if (principalAlreadyDelivered(verdict.kind, inst.last)) {
+      // Regula operatorului: alerta de pe martor pleacă doar dacă principalul
+      // n-a livrat CONFIRMAT același fel de mesaj recent — vezi
+      // `sentinel/report/beacon.py`, „Alertele duble". Martorul tace, dar NU
+      // marchează `alerted`: dacă ar face-o, când verdictul se rezolvă mai
+      // târziu ramura de mai sus ar anunța „a revenit" pentru o alarmă pe care
+      // martorul n-a dat-o niciodată — a doua formă de mesaj fals, nu o
+      // reparație. Fără `alerted` scris, mașina de stări rămâne exact ce era
+      // înainte de rundă: „nimic în picioare aici".
+      reported.push({
+        id, label: inst.last?.label ?? "", kind: verdict.kind, severity: verdict.severity,
+        alerted: false, recorded: false,
       });
       continue;
     }

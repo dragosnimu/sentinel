@@ -279,6 +279,85 @@ def test_collect_never_returns_none_counters():
         assert isinstance(out[key], int)
 
 
+# --- alertele duble: ce a livrat principalul recent -------------------------
+def test_a_confirmed_recent_selfcheck_delivery_is_reported():
+    """Fără faptul ăsta în semnal, martorul dublează exact alerta pe care
+    Sentinel tocmai a trimis-o pe Telegram — cazul măsurat, 131 de ori în 7
+    zile."""
+    db = _DB(vals={"kind = 'selfcheck'": True})
+    out = run(beacon.collect(db, _cfg()))
+    assert out["alerted_kinds"] == {"selfcheck": True}
+
+
+def test_no_recent_delivery_is_false_not_absent():
+    """Pe o instalare curată câmpul trebuie să existe și să spună `False`, nu
+    să lipsească — un martor mai vechi care nu-l citește citește la fel ca
+    unul care primește `False`, dar un câmp lipsă pe un martor NOU ar fi
+    indistinct de „principalul e prea vechi ca să știe", care e alt caz."""
+    out = run(beacon.collect(_DB(), _cfg()))
+    assert out["alerted_kinds"] == {"selfcheck": False}
+
+
+def test_a_failed_delivery_probe_defaults_to_not_delivered():
+    """Toleranța la eșec merge într-o singură direcție aici. O sondă ruptă nu
+    are voie să lase martorul crezând «s-a trimis deja, tac» — ar ascunde
+    exact defecțiunea despre care ar fi trebuit să alerteze. Falsificat:
+    inversarea valorii de rezervă la `True` face testul ăsta să pice."""
+    db = _DB(fail=("kind = 'selfcheck'",))
+    out = run(beacon.collect(db, _cfg()))
+    assert out["alerted_kinds"] == {"selfcheck": False}
+
+
+def test_the_suppression_window_is_a_bound_query_parameter_not_interpolated():
+    """Fereastra nu se scrie în text: dacă ar fi, lint-ul static din
+    `test_beacon_sql_schema.py` n-ar mai putea citi interogarea — exact felul
+    de gol care a lăsat coloana greșită din `AUDIT_HEAD_SQL` să reziste un an
+    fără ca vreun test s-o observe."""
+    class _Recording(_DB):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.seen_args: list[tuple] = []
+
+        async def fetchval(self, sql, *a):
+            if "kind = 'selfcheck'" in sql:
+                self.seen_args.append(a)
+            return await super().fetchval(sql, *a)
+
+    db = _Recording()
+    run(beacon.collect(db, _cfg()))
+    assert db.seen_args == [(beacon.ALERT_SUPPRESSION_WINDOW_S,)]
+    assert str(beacon.ALERT_SUPPRESSION_WINDOW_S) not in beacon.SELFCHECK_DELIVERED_SQL
+
+
+def test_the_suppression_window_survives_the_documented_cron_latency():
+    """Sub pragul ăsta, martorul dublează alerta pe care Sentinel tocmai a
+    livrat-o — exact bug-ul pe care fereastra există să-l închidă.
+
+    `docs/DEPLOYMENT.md` §7 documentează, măsurat pe instalarea asta, că
+    `/check` rulează din cronul găzduirii cu latență de până la 5 minute
+    (300 s). O livrare confirmată la T trebuie să rămână vizibilă cel puțin
+    până la runda de `/check` care ar fi trebuit s-o vadă — plus o marjă
+    pentru `interval_s` al beaconului (60 s), fiindcă `alerted_kinds` se
+    calculează la TRIMITEREA semnalului, nu la citirea lui, iar starea pe
+    care o citește `/check` poate fi cu o rundă de beacon în urmă.
+
+    Literalul e scris aici, nu numele constantei: o gardă care compară
+    constanta cu ea însăși ar trece și dacă cineva o coboară înapoi la 180,
+    reintroducând exact dubla măsurată (131 de notificări `selfcheck`
+    dublate în 7 zile).
+
+    Marginea de sus e păzită la fel de explicit, din motivul opus: o fereastră
+    care se apropie de `REALERT_AFTER` (4h, `sentinel/selfcheck/runner.py`) ar
+    începe să citească drept „livrat recent" o notificare veche de ore —
+    exact cazul în care martorul e singurul care mai poate vorbi."""
+    assert beacon.ALERT_SUPPRESSION_WINDOW_S >= 360, (
+        "fereastra a coborât sub latența documentată a cronului (300 s) plus "
+        "marja de relanseu a beaconului (60 s); vezi docs/DEPLOYMENT.md §7")
+    assert beacon.ALERT_SUPPRESSION_WINDOW_S < 4 * 60 * 60, (
+        "fereastra s-a apropiat de cadența de reanunț a lui Sentinel (4h); "
+        "martorul ar începe să tacă mult după ce principalul a amuțit de tot")
+
+
 # --- trimiterea ------------------------------------------------------------
 def test_an_unreachable_watcher_is_logged_not_raised(monkeypatch):
     """Un martor indisponibil nu are voie să devină o problemă a serverului

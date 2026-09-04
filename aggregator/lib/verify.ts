@@ -336,3 +336,54 @@ export function countersAdvanced(prev: Beat | undefined, next: Beat): boolean {
     next.audit_head !== prev.audit_head
   );
 }
+
+/**
+ * Alertele duble: verdictele pentru care Sentinel ÎNSUȘI are un canal de
+ * alertare pe care martorul îl poate dubla, și cheia din `alerted_kinds`
+ * (`sentinel/report/beacon.py`) care dovedește o livrare CONFIRMATĂ.
+ *
+ * `stalled` NU e aici, dinadins. Sentinel n-are un fel de notificare propriu
+ * pentru „bucla de detecție s-a oprit" — verificarea care ar prinde-o
+ * (`check_detection_loop`) scrie tot pe coada `kind='selfcheck'`, amestecată
+ * cu ORICE altă verificare căzută. A citi „a livrat un selfcheck" ca dovadă
+ * că s-a anunțat ANUME blocajul ar suprima un `stalled` real pe baza unui
+ * mesaj fără nicio legătură — flag-ul grosier pe care martorul nu are voie
+ * să-l aibă.
+ *
+ * `silent` NU e aici, NICIODATĂ, prin construcție — nu printr-un `if` care
+ * poate fi „optimizat" mai târziu. E rostul martorului: dacă principalul
+ * chiar tace, n-a putut livra nimic recent despre tăcerea lui, deci orice
+ * `true` citit de acolo ar fi neapărat despre altceva, dintr-un moment de
+ * dinainte de tăcere. Testul `silent nu se suprimă niciodată, indiferent ce
+ * spune beaconul` din `check.route.test.ts` pică dacă cineva adaugă o
+ * intrare aici pentru el.
+ */
+const SUPPRESSIBLE_KINDS: Readonly<Record<string, string>> = {
+  selfcheck: "selfcheck",
+};
+
+/**
+ * Principalul a livrat CONFIRMAT, recent, propriul mesaj pentru verdictul ăsta?
+ *
+ * „Confirmat" = `state='sent'` la celălalt capăt (`sentinel/telegram/bot.py`),
+ * nu doar pus în coadă — vezi nota despre `login|failed` din instrucțiunile
+ * care au dus la funcția asta: livrarea de pe principal chiar poate eșua, iar
+ * suprimarea pe baza „a pus mesajul în coadă" ar tăia exact alerta pe care
+ * numai martorul o mai poate da atunci.
+ *
+ * Un câmp lipsă (expeditor mai vechi) sau de formă greșită dă `false`: „nu
+ * știu" trebuie să ducă spre alertare, niciodată spre tăcere.
+ *
+ * `kind` primește tipul lat, nu `Verdict["kind"]`: apelanții îl aplică și pe
+ * `alerted.kind`, care e `string` simplu în `InstanceState` — starea salvată
+ * pe disc, nu verdictul proaspăt calculat.
+ */
+export function principalAlreadyDelivered(
+  kind: string | null | undefined,
+  last: Beat | undefined,
+): boolean {
+  if (!kind) return false;
+  const key = SUPPRESSIBLE_KINDS[kind];
+  if (!key) return false;
+  return last?.alerted_kinds?.[key] === true;
+}

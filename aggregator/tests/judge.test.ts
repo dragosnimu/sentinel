@@ -14,7 +14,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { judge, countersAdvanced, MISSED_BEATS_BEFORE_ALARM, STALL_SECONDS } from "@/lib/verify";
+import {
+  judge, countersAdvanced, principalAlreadyDelivered,
+  MISSED_BEATS_BEFORE_ALARM, STALL_SECONDS,
+} from "@/lib/verify";
 import type { Beat } from "@/lib/store";
 
 // Legat de semnătura reală a funcției: `judge` primește azi `State`, iar după
@@ -184,4 +187,55 @@ test("capul de audit se compară prin schimbare, nu prin creștere", () => {
   const prev = beat({ audit_head: "c".repeat(64) });
   assert.equal(countersAdvanced(prev, beat({ audit_head: "" })), true);
   assert.equal(countersAdvanced(prev, beat({ audit_head: "unavailable" })), true);
+});
+
+// ---------------------------------------------------------------------------
+// principalAlreadyDelivered — alertele duble
+//
+// Eșecul pe care îl previn testele astea: martorul dublează o alertă pe care
+// Sentinel tocmai a trimis-o pe Telegram, la câteva secunde distanță — 131 de
+// ori în 7 zile, măsurat, pentru `selfcheck`. Cerința operatorului e explicit
+// direcțională: „de pe martorul extern se trimite mesaj doar dacă nu am primit
+// același tip de mesaj de pe serverul principal" — deci orice incertitudine
+// trebuie să cadă spre ALERTĂ, niciodată spre tăcere.
+
+test("un `selfcheck` livrat CONFIRMAT de principal e citit ca suprimabil", () => {
+  const last = beat({ alerted_kinds: { selfcheck: true } });
+  assert.equal(principalAlreadyDelivered("selfcheck", last), true);
+});
+
+test("`selfcheck` marcat explicit `false` NU se suprimă", () => {
+  // „Nu știu dacă a livrat" trebuie să ducă spre alertă. `false` explicit
+  // (sonda a rulat și n-a găsit o livrare recentă) nu e altceva decât asta.
+  const last = beat({ alerted_kinds: { selfcheck: false } });
+  assert.equal(principalAlreadyDelivered("selfcheck", last), false);
+});
+
+test("`silent` nu e niciodată suprimabil, indiferent ce spune beaconul", () => {
+  // Chiar dacă un beacon compromis sau cu bug ar trimite `alerted_kinds:
+  // {silent: true}`, `SUPPRESSIBLE_KINDS` nu are cheie pentru `silent` — e
+  // rostul martorului, iar principalul, dacă tace cu adevărat, n-a putut livra
+  // nimic RECENT despre propria tăcere.
+  const last = beat({ alerted_kinds: { silent: true, selfcheck: true } });
+  assert.equal(principalAlreadyDelivered("silent", last), false);
+});
+
+test("`stalled` nu e niciodată suprimabil, indiferent ce spune beaconul", () => {
+  const last = beat({ alerted_kinds: { stalled: true, selfcheck: true } });
+  assert.equal(principalAlreadyDelivered("stalled", last), false);
+});
+
+test("`alerted_kinds` LIPSĂ (expeditor mai vechi decât martorul) nu suprimă nimic", () => {
+  const last = beat(); // fără câmpul `alerted_kinds` deloc
+  assert.equal(principalAlreadyDelivered("selfcheck", last), false);
+});
+
+test("semnalul LIPSĂ CU TOTUL (`last` nedefinit) nu suprimă nimic", () => {
+  assert.equal(principalAlreadyDelivered("selfcheck", undefined), false);
+});
+
+test("un `kind` gol (null/undefined) nu suprimă nimic", () => {
+  const last = beat({ alerted_kinds: { selfcheck: true } });
+  assert.equal(principalAlreadyDelivered(null, last), false);
+  assert.equal(principalAlreadyDelivered(undefined, last), false);
 });

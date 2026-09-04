@@ -1654,6 +1654,21 @@ RECEIVER_ONLY = {
                                  "încălca — el doar tace sau nu",
     "STALL_SECONDS": "cât pot sta contoarele pe loc cu semnalul sosind normal, "
                      "tot o decizie a receptorului despre când sună telefonul",
+    "SUPPRESSIBLE_KINDS": "pentru care verdicte ale receptorului există un mesaj "
+                          "gemene pe principal, deci martorul tace dacă acela a "
+                          "livrat. Nu mărginește ce poate trimite expeditorul: "
+                          "`readAlertedKinds` din beat/route.ts acceptă orice "
+                          "cheie boolean în `alerted_kinds`, fără să verifice "
+                          "apartenența la lista asta — un beacon poate trimite "
+                          "`{\"orice\": true}` fără să fie refuzat. E o decizie a "
+                          "receptorului despre CE verdict al LUI poate tăcea, nu "
+                          "un plafon pe corp: o valoare greșită aici nu oprește "
+                          "fluxul, cel mult pierde o suprimare legitimă — o "
+                          "alertă în plus pe Telegram, nu un lot respins. Dacă "
+                          "numele cheii diverge de la `beacon.py` (`selfcheck`), "
+                          "`principalAlreadyDelivered` nu găsește cheia și cade "
+                          "pe implicitul `false` — spre alertă, direcția sigură, "
+                          "nu spre tăcere",
     "EXPLAIN": "textele care explică fiecare verdict pe pagina publică a "
                "martorului; interfață, nu protocol",
     "HEADLINE": "titlul arătat pentru fiecare verdict pe aceeași pagină",
