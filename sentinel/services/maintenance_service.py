@@ -655,7 +655,7 @@ async def repair_rollup_gaps(
                            "hours_failed": len(failed),
                            "rows_missing_total": report.total_missing})
         await _persist_reconcile(
-            db, status="ok" if deferred else "gaps", raw_exists=True, window_lower=lower, window_upper=upper,
+            db, status="gaps", raw_exists=True, window_lower=lower, window_upper=upper,
             gap_hours=report.total_hours, rows_missing=report.total_missing,
             worst_bucket=report.worst_bucket, worst_missing=report.worst_missing,
             hours_repaired=len(repaired))

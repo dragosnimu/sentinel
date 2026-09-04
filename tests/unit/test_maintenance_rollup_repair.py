@@ -781,6 +781,17 @@ def test_time_budget_defers_remaining_hours_to_the_next_pass(monkeypatch):
     assert cu_rest[0]["hours_left"] == 2, (
         f"restul trebuie să numere orele amânate: {cu_rest[0]}")
 
+    # Și RÂNDUL persistat, nu doar jurnalul. Verificarea din `/selfcheck` citește
+    # rândul ăsta, nu `log.warning` — un `status='ok'` scris cu ore încă
+    # nereparate arată reconcilierea sănătoasă exact când nu e, și taie singurul
+    # semnal care spune că munca rămasă concurează cu retenția brutului.
+    assert len(db.inserts) == 1, "trecerea trebuie să persiste exact un rând"
+    _, argumente = db.inserts[0]
+    assert argumente[0] == "gaps", (
+        f"cu ore amânate, rândul persistat rămâne «gaps», nu «ok»: {argumente[0]}")
+    assert argumente[8] == 1, (
+        f"rândul trebuie să poarte orele chiar reparate, aici una: {argumente[8]}")
+
 
 # ---------------------------------------------------------------------------
 # The persisted row's columns match the migration that defines them
