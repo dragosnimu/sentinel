@@ -14,6 +14,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import asyncpg
 import pytest
 
 from sentinel.analytics import reports as report_repo
@@ -65,6 +66,30 @@ class _FailingDB(_DB):
         self.calls.append((sql, args))
         if "sentinel_rollup_events_1m" in sql and self._should_fail(args):
             raise asyncio.TimeoutError()
+        return 1
+
+
+class _QueryCanceledDB(_FailingDB):
+    """Like `_FailingDB`, but raises `asyncpg.exceptions.QueryCanceledError`
+    instead of `asyncio.TimeoutError` — the OTHER shape a cancelled statement
+    can take on the real connection, when the kernel answers the cancel
+    before asyncio's own `command_timeout` fires (`_repair_minutes`'s
+    docstring). Every other test in this file only ever raises
+    `asyncio.TimeoutError`, so a mutation that drops `QueryCanceledError`
+    from `_repair_minutes`'s `except` tuple would leave this repository
+    green everywhere else while silently losing the halve-and-retry for
+    this exact failure mode in production."""
+
+    async def fetchval(self, sql, *args):
+        self.calls.append((sql, args))
+        if "sentinel_rollup_events_1m" in sql and self._should_fail(args):
+            # A real QueryCanceledError from the server always carries a
+            # message (e.g. "canceling statement due to statement timeout");
+            # an empty one would make `str(exc)` itself raise inside
+            # asyncpg, which is not the failure mode this class exists to
+            # reproduce.
+            raise asyncpg.exceptions.QueryCanceledError(
+                "canceling statement due to statement timeout")
         return 1
 
 
@@ -438,7 +463,22 @@ def test_a_too_wide_batch_halves_down_to_minutes_and_still_succeeds(monkeypatch)
     """A wrong density guess (a low hourly average hiding one much heavier
     minute) must not leave the whole hour unrepaired just because the first
     statement chosen for it was too wide — halving has to actually recover,
-    not just give up at the first failure."""
+    not just give up at the first failure.
+
+    Coverage gap closed here (a real mutation on 4 September 2026 defeated
+    the test's previous body): deleting the SECOND recursive call in
+    `_repair_minutes` (`maintenance_service.py`, the
+    `await _repair_minutes(db, mid, end, n_slices - half)` line) makes
+    halving repair only the LEFT half of every split it takes, converging on
+    a single leading minute while abandoning the rest of the hour. That still
+    produces wide attempts, still produces at least one narrow (successful)
+    call, and still calls `_1h` and counts the hour as `hours_repaired` — so
+    a test that only checks THAT halving happened, never WHAT it covered,
+    stays green while `event_rollup_1m` is left with 59 of 60 minutes
+    unrepaired and `_1h` is aggregated over that hole. The fix mirrors
+    `test_each_gap_hour_reaggregates_every_minute_before_the_hour_call`'s own
+    coverage check, applied only to the successful (narrow) calls — a failed
+    wide attempt wrote nothing, so it must not count as coverage."""
     monkeypatch.setattr(report_repo, "rollup_coverage", _async(
         {"never_ran": False, "latest": datetime(2026, 8, 24, 8, 0, tzinfo=timezone.utc)}))
     monkeypatch.setattr(report_repo, "raw_coverage", _async(
@@ -464,6 +504,21 @@ def test_a_too_wide_batch_halves_down_to_minutes_and_still_succeeds(monkeypatch)
         "not actually exercise the halving path")
     assert narrow_calls, "halving must eventually reach one-minute statements"
     assert any("sentinel_rollup_events_1h" in sql for sql, _ in db.calls)
+    # THE gap this test now closes: not just that narrow calls happened, but
+    # that they cover the ENTIRE hour, back to back, without gaps. Only the
+    # successful (narrow, one-minute) calls count as coverage — a wide
+    # attempt that raised wrote nothing to `event_rollup_1m`.
+    starts = sorted(s for s, _ in narrow_calls)
+    ends = sorted(e for _, e in narrow_calls)
+    assert starts[0] == bucket, (
+        "the successful minute slices must start at the hour's own first minute")
+    assert ends[-1] == bucket + timedelta(hours=1), (
+        "the successful minute slices stop short of the end of the hour — "
+        "halving repaired only part of it while `_1h` was still called and "
+        "the hour was still counted as repaired")
+    assert starts[1:] == ends[:-1], (
+        "the successful minute slices must tile the hour back to back, "
+        "without gaps or overlaps between them")
 
 
 def test_a_single_minute_that_never_succeeds_is_not_split_further(monkeypatch):
@@ -541,6 +596,172 @@ def test_repair_reports_how_many_gap_hours_are_still_left(monkeypatch):
     assert facts["hours_repaired"] == 1
     assert facts["hours_left"] == 24
     assert "rămase" in detail
+
+
+def test_query_canceled_error_triggers_the_same_halving_as_timeout(monkeypatch):
+    """`asyncpg.exceptions.QueryCanceledError` is the OTHER exception shape a
+    cancelled statement can raise on the real connection (see
+    `_repair_minutes`'s docstring) — every other test in this file only ever
+    raises `asyncio.TimeoutError`. A mutation dropping `QueryCanceledError`
+    from `_repair_minutes`'s `except` tuple leaves the rest of the suite
+    green while this exact failure mode skips halving entirely: the
+    exception propagates straight out of `_repair_hour` and the per-hour
+    `try/except` in `repair_rollup_gaps` marks a RECOVERABLE hour as failed
+    instead of repairing it."""
+    monkeypatch.setattr(report_repo, "rollup_coverage", _async(
+        {"never_ran": False, "latest": datetime(2026, 8, 24, 8, 0, tzinfo=timezone.utc)}))
+    monkeypatch.setattr(report_repo, "raw_coverage", _async(
+        datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)))
+    bucket = datetime(2026, 8, 24, 4, 0, tzinfo=timezone.utc)
+    # raw_n=100 -> _gap_repair_slices picks a single whole-hour statement,
+    # same setup as the TimeoutError halving test above.
+    monkeypatch.setattr(rollup_repo, "hourly_gaps", _async(
+        _fixed_gap_report(bucket, raw_n=100)))
+
+    def _should_fail(args):
+        start, end = args
+        return (end - start) > timedelta(minutes=1)
+
+    db = _QueryCanceledDB(_should_fail)
+    detail, facts = run(ms.repair_rollup_gaps(db))
+
+    assert facts["hours_repaired"] == 1, (
+        "QueryCanceledError must trigger the same halve-and-retry as "
+        "asyncio.TimeoutError — a recoverable hour was marked failed instead")
+    assert not facts["hours_failed"]
+
+
+# ---------------------------------------------------------------------------
+# Nothing repaired is not success — operator decision, 4 September 2026. A
+# pass where every sampled hour failed used to report `ok: true` at the step
+# level, the failure visible only as a `WARNING` log line. Before per-hour
+# isolation existed, the same collapse exited the step non-zero and systemd
+# showed the unit `failed` in `systemctl` — the signal regressed exactly when
+# the isolation that fixed the OTHER production bug was added.
+# ---------------------------------------------------------------------------
+def test_step_reports_failure_when_nothing_was_repaired_but_something_failed(monkeypatch):
+    """Prevents the unit going quiet on a total failure: with every gap hour
+    in the sample failing, the pass must not exit as `ok`, or an operator
+    reading `systemctl status` sees a healthy unit while zero rows got
+    fixed and the gap keeps racing raw retention."""
+    monkeypatch.setattr(report_repo, "rollup_coverage", _async(
+        {"never_ran": False, "latest": datetime(2026, 8, 25, 0, 0, tzinfo=timezone.utc)}))
+    monkeypatch.setattr(report_repo, "raw_coverage", _async(
+        datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)))
+    b1 = datetime(2026, 8, 24, 14, 0, tzinfo=timezone.utc)
+    b2 = datetime(2026, 8, 24, 15, 0, tzinfo=timezone.utc)
+    report = rollup_repo.GapReport(
+        hours=[rollup_repo.GapHour(b1, 4_329_065, 0), rollup_repo.GapHour(b2, 4_329_065, 0)],
+        total_hours=2, total_missing=8_658_130,
+        worst_bucket=b1, worst_missing=4_329_065)
+    monkeypatch.setattr(rollup_repo, "hourly_gaps", _async(report))
+
+    db = _FailingDB(lambda args: True)  # every _1m call fails, at any size
+    step_report = ms.Report()
+    result = run(ms._step(step_report, "repair_rollup_gaps", ms.repair_rollup_gaps(db)))
+
+    assert result.ok is False, (
+        "a pass that repaired zero hours out of a fully-failed sample must "
+        "not report ok=True at the step level")
+    assert step_report.failed, "Report.failed must be non-empty so `_main` exits 1"
+    assert "ok" not in result.facts, (
+        "\"ok\" must be consumed by _step, not leak into the stored facts "
+        "next to StepResult.ok")
+
+
+def test_step_stays_ok_when_at_least_one_hour_was_repaired(monkeypatch):
+    """The new failure signal must not fire on a PARTIAL success — that is
+    exactly the isolation behaviour decision 2 keeps unchanged. Reusing the
+    production bug's own scenario (one stuck hour, one good hour behind it)."""
+    monkeypatch.setattr(report_repo, "rollup_coverage", _async(
+        {"never_ran": False, "latest": datetime(2026, 8, 25, 0, 0, tzinfo=timezone.utc)}))
+    monkeypatch.setattr(report_repo, "raw_coverage", _async(
+        datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)))
+    bad = datetime(2026, 8, 24, 14, 0, tzinfo=timezone.utc)
+    good = datetime(2026, 8, 24, 15, 0, tzinfo=timezone.utc)
+    report = rollup_repo.GapReport(
+        hours=[rollup_repo.GapHour(bad, 4_329_065, 0), rollup_repo.GapHour(good, 14_000, 0)],
+        total_hours=2, total_missing=4_343_065,
+        worst_bucket=bad, worst_missing=4_329_065)
+    monkeypatch.setattr(rollup_repo, "hourly_gaps", _async(report))
+
+    def _should_fail(args):
+        start, _end = args
+        return bad <= start < bad + timedelta(hours=1)
+
+    db = _FailingDB(_should_fail)
+    step_report = ms.Report()
+    result = run(ms._step(step_report, "repair_rollup_gaps", ms.repair_rollup_gaps(db)))
+
+    assert result.ok is True, "a partial success must not be reported as a failed step"
+    assert not step_report.failed
+
+
+def test_step_stays_ok_when_there_is_nothing_to_repair(monkeypatch):
+    """The new failure signal must not fire when there was simply nothing
+    wrong — a healthy gapless pass must not start showing up as `failed`."""
+    monkeypatch.setattr(report_repo, "rollup_coverage", _async(
+        {"never_ran": False, "latest": datetime(2026, 8, 24, 6, 0, tzinfo=timezone.utc)}))
+    monkeypatch.setattr(report_repo, "raw_coverage", _async(
+        datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)))
+    monkeypatch.setattr(rollup_repo, "hourly_gaps", _async(rollup_repo.GapReport()))
+
+    db = _DB()
+    step_report = ms.Report()
+    result = run(ms._step(step_report, "repair_rollup_gaps", ms.repair_rollup_gaps(db)))
+
+    assert result.ok is True
+    assert not step_report.failed
+
+
+# ---------------------------------------------------------------------------
+# Time budget on the sample — operator decision, 4 September 2026. A low
+# hourly average hiding one much heavier minute can cost up to seven
+# halvings (~30s each) for a SINGLE hour; eight such hours would outrun the
+# unit's own TimeoutStartSec (900s, `deploy/systemd/sentinel-maintenance.service`)
+# before `_persist_reconcile` ever runs — see `GAP_REPAIR_TIME_BUDGET_S`'s
+# comment for the full arithmetic. The clock is injected so this does not
+# depend on real elapsed time.
+# ---------------------------------------------------------------------------
+def test_time_budget_defers_remaining_hours_to_the_next_pass(monkeypatch):
+    """Prevents the unit being killed mid-repair: without a budget on the
+    sample, a run of slow hours can keep going past `TimeoutStartSec` before
+    writing anything to `rollup_reconcile_runs` — the exact defect this step
+    exists to fix, reintroduced through the SAMPLE instead of through a
+    single SQL statement. Hours past the budget must be named as deferred,
+    not silently dropped, and picked up oldest-first on the next pass."""
+    monkeypatch.setattr(report_repo, "rollup_coverage", _async(
+        {"never_ran": False, "latest": datetime(2026, 8, 27, 0, 0, tzinfo=timezone.utc)}))
+    monkeypatch.setattr(report_repo, "raw_coverage", _async(
+        datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)))
+    b1 = datetime(2026, 8, 24, 4, 0, tzinfo=timezone.utc)
+    b2 = datetime(2026, 8, 24, 5, 0, tzinfo=timezone.utc)
+    b3 = datetime(2026, 8, 24, 6, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(rollup_repo, "hourly_gaps", _async(_fixed_gap_report(b1, b2, b3)))
+
+    # started_at=0.0; check before b1: 0.0 (within budget); check before b2:
+    # 400.0 (300s literal budget already spent) -> b2 and b3 deferred.
+    clock_readings = iter([0.0, 0.0, 400.0])
+
+    def fake_clock():
+        try:
+            return next(clock_readings)
+        except StopIteration:
+            return 400.0
+
+    db = _DB()
+    detail, facts = run(ms.repair_rollup_gaps(db, now_monotonic=fake_clock))
+
+    assert facts["hours_repaired"] == 1, (
+        "only the hour whose turn came before the time budget ran out "
+        "should have been attempted")
+    assert facts["hours_deferred"] == [b2.isoformat(), b3.isoformat()], (
+        "hours past the time budget must be named as deferred, not "
+        "silently dropped from the count")
+    assert "amânate de plafonul de timp" in detail
+    hour_calls = [a[0] for sql, a in db.calls if "sentinel_rollup_events_1h" in sql]
+    assert hour_calls == [b1], (
+        "no _1h call should have been issued for the deferred hours")
 
 
 # ---------------------------------------------------------------------------

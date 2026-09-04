@@ -64,11 +64,20 @@ repare niciodată, pentru totdeauna. Un plafon mai mic de ore pe rulare n-ar
 fi ajutat: o SINGURĂ oră depășea deja limita.
 
 Costul nu crește liniar cu numărul de rânduri — 895 013 rânduri (13:00) au
-durat 2,2 s cald, de 4,8x mai puține decât 14:00 dar de 32x mai rapid, semn că
-`work_mem` (8 MB) e depășit undeva între cele două praguri, iar sortarea
-(`percentile_cont`) trece pe disc. Felierea pe MINUT, granulația proprie a lui
-`event_rollup_1m`, ține fiecare instrucțiune sub acel prag — vezi
-`GAP_REPAIR_SLICE`. Testul obligatoriu pentru asta e
+durat 2,2 s cald, de 4,8x mai puține decât 14:00 dar de 32x mai rapid. Prima
+explicație scrisă aici — `work_mem` (8 MB) depășit între cele două praguri,
+sortarea (`percentile_cont`) trecută pe disc — a fost măsurată greșit.
+Verificat pe gazdă cu `EXPLAIN (ANALYZE, BUFFERS)` și `track_io_timing`, pe
+ferestre proaspete, neatinse de nicio rulare anterioară: revărsarea de
+`work_mem` chiar există, dar apare abia între 75 000 și 107 000 de rânduri și
+costă ~13 ms din total — nesemnificativ. Neliniaritatea reală e CACHE-ul:
+între ferestre de mărime similară, diferența e de 10-40x, iar costul e
+~0,13-0,16 ms per rând, aproape integral citiri de pagini de heap (55 527
+rânduri → 7 314 ms, din care 6 802 ms I/O de heap; 75 578 → 12 092 ms, din
+care 11 428 ms I/O de heap; 107 437 → 13 568 ms, cu o revărsare externă de
+doar 5 MB pe disc și 13 ms de I/O temporar). Felierea pe MINUT, granulația
+proprie a lui `event_rollup_1m`, ține fiecare instrucțiune sub acel prag —
+vezi `GAP_REPAIR_SLICE`. Testul obligatoriu pentru asta e
 `test_no_single_sql_statement_gets_a_whole_hour_interval`, în
 `tests/unit/test_maintenance_rollup_repair.py`.
 
@@ -78,6 +87,30 @@ Reîmprospătarea fluxurilor de intelligence are nevoie de rețea. Retenția, nu
 Dacă ar fi în aceeași încercare, o cădere de DNS ar opri curățarea discului —
 adică o problemă de rețea ar deveni, câteva săptămâni mai târziu, o problemă de
 disc plin. Fiecare pas e izolat și raportează separat.
+
+## Nimic reparat nu e „ok" — decizie a operatorului, 4 septembrie 2026
+
+Până acum, o trecere în care TOATE orele eșantionului eșuau tot raporta
+`ok: true`, cu detaliul „0 ore reagregate; N eșuate" scris doar la nivel de
+`WARNING`. Înainte de izolarea pe oră, aceeași cădere ar fi ieșit din pas
+nenulă și unitatea ar fi apărut `failed` în `systemctl` — semnalul a coborât
+odată cu reparația care l-a adus. Acum: `repaired` gol ȘI `failed` nenul
+înseamnă pasul e un eșec (`facts["ok"] = False`, citit de `_step`). Izolarea
+PE ORĂ rămâne neschimbată — o oră picată tot nu le oprește pe celelalte — dar
+o trecere în care nimic n-a reușit nu se mai poate ascunde într-o linie de
+jurnal.
+
+## Plafonul de timp pe eșantion — a doua decizie, aceeași zi
+
+Aritmetica: o oră cu media joasă și un minut ascuns de peste 200 000 de
+rânduri costă până la 7 înjumătățiri (60→30→15→8→4→2→1) a câte ~30 s fiecare
+— aproape 210 s pentru o singură oră. `MAX_GAP_REPAIR_HOURS` (8) pe o
+asemenea coadă ar depăși singur cele 900 s din `TimeoutStartSec` al unității
+(`deploy/systemd/sentinel-maintenance.service`) — iar systemd omoară procesul
+înainte de orice `_persist_reconcile`, adică exact forma de defect pe care
+pasul ăsta o repară. `GAP_REPAIR_TIME_BUDGET_S` (300 s, literă, nu o fracțiune
+din 900 scrisă în cod — vezi comentariul constantei) oprește eșantionul la
+timp, cu ce a mai rămas NUMIT ca amânat, nu tăcut.
 """
 
 from __future__ import annotations
@@ -85,7 +118,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import shutil
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -147,15 +181,41 @@ GAP_REPAIR_SLICE = timedelta(minutes=1)
 
 # Pragul de rânduri BRUTE per instrucțiune sub care mai multe minute merg
 # batute într-o SINGURĂ chemare, în loc de una pe minut — vezi
-# `repair_rollup_gaps`. Prins între cele două fapte măsurate mai sus, cu
-# marjă generoasă pe fiecare parte: de aproape 4x peste felia sigură (13 767
-# rânduri, 3 027 ms) și de aproape 11x sub felia care a depășit plafonul
-# (549 401 rânduri). O oră obișnuită (~14 000 rânduri, vezi antetul
-# modulului) intră astfel într-o singură instrucțiune pe toată ora, nu 60 —
-# fără să se apropie vreodată de felia care a picat pe gazdă. Numărul de
-# rânduri al orei (`raw_n`) vine gratis din `hourly_gaps` — deja calculat de
-# interogarea care a găsit gaura, nu e nevoie de o numărare separată.
+# `repair_rollup_gaps`. Comentariul de aici a citat cândva „13 767 rânduri →
+# 3 027 ms" ca felie sigură; verificat din nou, pe 57 284 de rânduri PROASPETE
+# (neatinse de nicio rulare anterioară), costul a fost tot ~3 031 ms — numărul
+# de rânduri nu determină costul singur, paginile calde o fac (vezi antetul
+# modulului pentru neliniaritatea reală, de cache, nu de `work_mem`). Marja
+# de aici stă pe faptele măsurate RECI: 55 527 rânduri → 7 314 ms,
+# 75 578 → 12 092 ms, 107 437 → 13 568 ms, adică ~0,13-0,16 ms/rând. Un buget
+# de 30 s (`statement_timeout_ms`) pe cache rece acoperă deci aproximativ
+# 190 000-230 000 de rânduri, iar pragul de aici stă la ~7-8 s din bugetul
+# ăla — marjă de patru ori, nu de 4x/11x calculat pe cifra veche și greșită.
+# O oră obișnuită (~14 000 rânduri, vezi antetul modulului) intră astfel
+# într-o singură instrucțiune pe toată ora, nu 60 — fără să se apropie
+# vreodată de felia care a picat pe gazdă. Numărul de rânduri al orei
+# (`raw_n`) vine gratis din `hourly_gaps` — deja calculat de interogarea care
+# a găsit gaura, nu e nevoie de o numărare separată.
 GAP_REPAIR_ROW_TARGET = 50_000
+
+# Plafon de timp PE EȘANTION (toate orele dintr-o trecere a `repair_rollup_gaps`),
+# decizie a operatorului din 4 septembrie 2026 — vezi antetul modulului
+# pentru aritmetica ce l-a cerut. Literă absolută, măsurată față de cele
+# 900 s din `TimeoutStartSec` al unității
+# (`deploy/systemd/sentinel-maintenance.service`), NU o fracțiune din acea
+# valoare scrisă în cod: o gardă exprimată relativ la constanta pe care o
+# păzește s-a dovedit deja greșită o dată în sesiunea asta — mutarea
+# constantei mută garda odată cu ea. 300 s lasă cel puțin 600 din cele 900
+# pentru celelalte unsprezece trepte ale trecerii (partiții, drenaj DEFAULT,
+# catch-up înainte, disponibilitate, retenția partițiilor și a agregatelor,
+# garda de disc, intelligence, backup-uri, incidente și campanii tăcute) plus
+# scrierea finală a `_persist_reconcile` — de peste două ori cât ar consuma
+# acest pas singur chiar și pe aritmetica patologică (opt ore a ~210 s
+# fiecare ar depăși oricum unitatea; plafonul opreşte eșantionul ORDONAT,
+# mult înainte ca systemd s-o omoare la mijloc). Ceea ce rămâne neîncercat la
+# atingerea lui se NUMEȘTE amânat, nu se scade tăcut — vezi
+# `repair_rollup_gaps`.
+GAP_REPAIR_TIME_BUDGET_S = 300.0
 
 # Zile golite din DEFAULT pe rulare. Mutarea unei zile e o singură
 # tranzacție care nu se poate întrerupe; la un timer orar, șase rulări
@@ -204,10 +264,18 @@ async def _step(report: Report, name: str, coro) -> StepResult:
 
     O excepție aici e raportată și mersul continuă. Singurul lucru care nu are
     voie să se întâmple e ca o cădere într-un pas să lase discul necurățat.
+
+    Un pas poate eșua și FĂRĂ excepție — vezi `repair_rollup_gaps`, unde o
+    trecere în care fiecare oră din eșantion a picat nu ridică nimic, doar
+    întoarce un detaliu descriptiv. Cheia `"ok"` din `facts`, dacă e prezentă,
+    suprascrie prezumția de succes de mai jos; scoasă din `facts` înainte de
+    stocare, ca `Report.as_dict()` să nu o mai vadă a doua oară alături de
+    `StepResult.ok`.
     """
     try:
         detail, facts = await coro
-        return report.add(StepResult(name, True, detail, facts))
+        ok = facts.pop("ok", True)
+        return report.add(StepResult(name, ok, detail, facts))
     except Exception as exc:  # noqa: BLE001 - izolarea e chiar scopul
         log.error("maintenance step failed", extra={"step": name, "detail": str(exc)})
         return report.add(StepResult(name, False, str(exc)))
@@ -452,7 +520,9 @@ async def _repair_hour(db: Database, gap: Any) -> None:
     await db.fetchval("SELECT sentinel_rollup_events_1h($1, $2)", start, end)
 
 
-async def repair_rollup_gaps(db: Database) -> tuple[str, dict[str, Any]]:
+async def repair_rollup_gaps(
+    db: Database, *, now_monotonic: Callable[[], float] = time.monotonic,
+) -> tuple[str, dict[str, Any]]:
     """Reagregă orele deja lăsate în urmă de filigran în care au ajuns rânduri
     brute mai târziu.
 
@@ -501,6 +571,24 @@ async def repair_rollup_gaps(db: Database) -> tuple[str, dict[str, Any]]:
     o a doua interogare pe toată fereastra, exact rescanarea pe care
     persistarea asta există s-o evite. Rândul se scrie ORICUM, indiferent câte
     ore au eșuat — asta e chiar reparația bug-ului de mai sus.
+
+    Decizie a operatorului, 4 septembrie 2026: `facts["ok"]` (citit de `_step`,
+    scos din `facts` înainte de stocare) e `False` când `repaired` a ieșit gol
+    ȘI `failed` nu — adică trecerea n-a reparat NIMIC, dar a și încercat.
+    Înainte de asta, o trecere în care toate orele eșantionului picau tot
+    raporta succes la nivel de pas, cu detaliul scris doar la `WARNING`;
+    izolarea PE ORĂ (paragraful anterior) rămâne neschimbată — nu se renunță
+    la ea, doar nu mai are voie să mascheze un eșantion întreg picat.
+
+    A doua decizie, aceeași zi: eșantionul e plafonat și în TIMP
+    (`GAP_REPAIR_TIME_BUDGET_S`, vezi comentariul constantei), nu doar în
+    numărul de ore (`MAX_GAP_REPAIR_HOURS`). O oră cu media joasă dar un minut
+    ascuns foarte greu poate cere până la 7 înjumătățiri a ~30 s fiecare — opt
+    asemenea ore ar depăși singure `TimeoutStartSec` al unității. Bugetul
+    oprește bucla ORDONAT, cu `_persist_reconcile` scris pentru ce s-a apucat
+    să facă, iar orele neîncercate din cauza lui apar NUMITE în
+    `facts["hours_deferred"]`, nu scăzute tăcut — rularea următoare le reia,
+    tot cele mai vechi întâi (`hourly_gaps`).
     """
     from sentinel.analytics import reports as report_repo
     from sentinel.db.repo import rollups as rollup_repo
@@ -528,7 +616,20 @@ async def repair_rollup_gaps(db: Database) -> tuple[str, dict[str, Any]]:
 
     repaired: list[str] = []
     failed: list[dict[str, str]] = []
-    for gap in report.hours:
+    deferred: list[str] = []
+    started_at = now_monotonic()
+    for i, gap in enumerate(report.hours):
+        if now_monotonic() - started_at >= GAP_REPAIR_TIME_BUDGET_S:
+            # Bugetul de timp al eșantionului s-a scurs — vezi
+            # `GAP_REPAIR_TIME_BUDGET_S`. Orele rămase, NUMITE, nu tăcute:
+            # rularea următoare le reia, tot cele mai vechi întâi.
+            deferred = [g.bucket.isoformat() for g in report.hours[i:]]
+            log.warning(
+                "rollup gap repair stopped on its time budget; the rest is "
+                "deferred to the next pass",
+                extra={"hours_deferred": len(deferred),
+                       "budget_s": GAP_REPAIR_TIME_BUDGET_S})
+            break
         start = gap.bucket
         try:
             await _repair_hour(db, gap)
@@ -568,12 +669,22 @@ async def repair_rollup_gaps(db: Database) -> tuple[str, dict[str, Any]]:
     parts = [f"{len(repaired)} ore reagregate"]
     if failed:
         parts.append(f"{len(failed)} eșuate ({', '.join(f['bucket'] for f in failed)})")
+    if deferred:
+        parts.append(f"{len(deferred)} amânate de plafonul de timp")
     sample_missed = report.total_hours - len(report.hours)
     if sample_missed:
         parts.append(f"{sample_missed} rămase în afara eșantionului")
-    return ("; ".join(parts),
-            {"hours_repaired": len(repaired), "hours_left": left, "hours_failed": failed,
-             "rows_missing_total": report.total_missing, "hours": repaired})
+    facts: dict[str, Any] = {
+        "hours_repaired": len(repaired), "hours_left": left, "hours_failed": failed,
+        "hours_deferred": deferred,
+        "rows_missing_total": report.total_missing, "hours": repaired,
+    }
+    if not repaired and failed:
+        # Decizie a operatorului, 4 septembrie 2026 — vezi docstring-ul de mai
+        # sus. Nimic reparat, dar ceva încercat și picat: pasul e un eșec, nu
+        # doar o linie de WARNING.
+        facts["ok"] = False
+    return ("; ".join(parts), facts)
 
 
 async def rollup_availability(db: Database) -> tuple[str, dict[str, Any]]:
