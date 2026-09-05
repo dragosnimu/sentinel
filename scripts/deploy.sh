@@ -40,6 +40,27 @@
 #                  One number, or a comma-separated list: --force-step 22,27
 #                  re-runs both in the SAME pass, which is what rotating a
 #                  secret requires — see docs/OPERARE.md §11
+#   --secrets P    path to the secrets file. Omitted, this is exactly today's
+#                  behaviour: secrets/.env.local, including the fall-through
+#                  to scripts/secrets-init.sh when that default is missing.
+#                  Given and missing, it is a hard stop instead — no fresh
+#                  secrets are generated under a name the operator chose on
+#                  purpose. See secrets/.gitkeep for the incident this exists
+#                  to close: a mixed file installed one host's bot token next
+#                  to another's database password, and a stale fallback would
+#                  have rotated SENTINEL_BEACON_SECRET, silencing the one
+#                  component whose job is to notice Sentinel going quiet.
+#   --allow-rotation
+#                  explicit consent for the secret rotation compare_secrets_
+#                  with_host below is about to warn about. Applies to every
+#                  key that would change. --yes does NOT imply this — see the
+#                  note on --yes.
+#   --allow-rotation-keys L
+#                  same consent as --allow-rotation, but only for the
+#                  comma-separated key names in L. A bare --allow-rotation
+#                  cannot take a list value of its own — it cannot tell "no
+#                  value" from "the next flag" apart — so a per-key rotation
+#                  uses this separate flag instead.
 #   --purge        with --rollback, also drop the database
 #
 # This script is deliberately thin. All the real logic lives in
@@ -49,13 +70,29 @@
 # Secrets go over the SSH channel on stdin. Never argv (where `ps` on the
 # server would show them), never a file in the tarball, never an environment
 # variable that lingers in a shell.
+#
+# Before any of that, the local file is compared against /etc/sentinel/
+# secrets.env already on the host — by key name and a SHA-256 prefix of the
+# value, never the value itself. This runs on a --dry-run too, report-only:
+# a rehearsal is exactly where "these six keys would change value" belongs,
+# and it tolerates a missing local file so a first install can still
+# rehearse. A key that would change is not automatically wrong (rotation is a
+# real, documented operation — docs/OPERARE.md §11), so on a real run it is a
+# warning and a confirmation — interactive by default, or --allow-rotation
+# for a scripted one. --yes answers the OTHER prompts this script already
+# asked before this change existed; it does not, by itself, wave a rotation
+# through — see compare_secrets_with_host below for why.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SECRETS_FILE="${REPO_ROOT}/secrets/.env.local"
 
-HOST=""; KEY=""; DOMAIN=""; EMAIL=""; ADMIN_IP=""; DB_PORT=""
+HOST=""; KEY=""; DOMAIN=""; EMAIL=""; ADMIN_IP=""; DB_PORT=""; SECRETS_ARG=""
+# Rotation consent, separate from ASSUME_YES on purpose — see the --yes note
+# in the header comment and compare_secrets_with_host below.
+ALLOW_ROTATION_ALL=0
+ALLOW_ROTATION_KEYS=""
 # The account this deploys AS, and the reason it has a default at all.
 #
 # Until 25 August 2026 this was empty and --user was required, so every
@@ -122,6 +159,18 @@ normalize_step_list() {
     printf '%s' "${raw//[[:space:]]/}"
 }
 
+# Same shape check as normalize_step_list, for --allow-rotation-keys: refuse a
+# malformed list rather than silently matching nothing (which would look
+# identical to "no key allowed" and refuse a rotation the operator thought
+# they had just authorised).
+normalize_key_list() {
+    local raw="$1" flag="$2"
+    if [[ ! "$raw" =~ ^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*([[:space:]]*,[[:space:]]*[A-Za-z_][A-Za-z0-9_]*)*[[:space:]]*$ ]]; then
+        die "${flag}: '${raw}' is not a KEY_NAME or a comma-separated list of them (e.g. SENTINEL_DB_PASSWORD or SENTINEL_DB_PASSWORD,TELEGRAM_BOT_TOKEN)"
+    fi
+    printf '%s' "${raw//[[:space:]]/}"
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --host)      HOST="${2:-}"; shift 2 ;;
@@ -135,6 +184,9 @@ while [[ $# -gt 0 ]]; do
         --admin-ip)  ADMIN_IP="${2:-}"; shift 2 ;;
         --cert-mode) CERT_MODE="${2:-}"; shift 2 ;;
         --db-port)   DB_PORT="${2:-}"; shift 2 ;;
+        --secrets)   SECRETS_ARG="${2:-}"; shift 2 ;;
+        --allow-rotation) ALLOW_ROTATION_ALL=1; shift ;;
+        --allow-rotation-keys) ALLOW_ROTATION_KEYS="${2:-}"; shift 2 ;;
         --from-step) FROM_STEP="${2:-}"; shift 2 ;;
         # install.sh has always had this; deploy.sh could not pass it
         # through, so the only way to re-run one step was to ssh in and run
@@ -159,11 +211,21 @@ done
 # local username — the failure this default exists to remove.
 [[ -n "$USER" ]] || die "--user was given an empty value"
 
+# An explicit --secrets replaces the default path outright. Left as a check on
+# $SECRETS_ARG rather than folded into a second SECRETS_FILE assignment,
+# because what matters further down is not just WHICH path is in use but
+# whether the operator NAMED it — that is what decides whether a missing file
+# dies here or falls through to secrets-init.sh.
+[[ -n "$SECRETS_ARG" ]] && SECRETS_FILE="$SECRETS_ARG"
+
 # Refused here, before a tarball is built or an SSH session opened. The
 # installer checks it again on the server — it is the authority — but a typo
 # should cost a second, not a round trip.
 if [[ -n "$FORCE_STEP" ]]; then
     FORCE_STEP="$(normalize_step_list "$FORCE_STEP" --force-step)" || exit 1
+fi
+if [[ -n "$ALLOW_ROTATION_KEYS" ]]; then
+    ALLOW_ROTATION_KEYS="$(normalize_key_list "$ALLOW_ROTATION_KEYS" --allow-rotation-keys)" || exit 1
 fi
 
 # ---------------------------------------------------------------------------
@@ -255,6 +317,219 @@ ssh_run()  { ssh "${SSH_OPTS[@]}" "${USER}@${HOST}" "$@"; }
 # Call it once per command, or wrap the chain in `sh -c` yourself.
 ssh_sudo() { ssh -t "${SSH_OPTS[@]}" "${USER}@${HOST}" "sudo -p 'sudo password: ' $*"; }
 
+# Shared by the secrets comparison below and by the install step further down:
+# both need sudo to answer without a prompt, because both feed one end of the
+# SSH connection with something that is not a human typing a password —
+# structured output here, the secrets file on stdin there. Idempotent: once
+# credentials are cached, this is a single `sudo -n true` and nothing more, so
+# calling it twice in one run costs one cheap round trip, not a second prompt.
+prime_sudo() {
+    if ! ssh_run "sudo -n true" 2>/dev/null; then
+        info "caching sudo credentials (you will be asked once)"
+        ssh -t "${SSH_OPTS[@]}" "${USER}@${HOST}" "sudo -v" \
+            || die "sudo is not usable non-interactively. Either add a NOPASSWD rule for \
+${USER}, or run sudo -v in your second SSH session and retry within the timeout."
+    fi
+}
+
+# Runs ON THE HOST, under `sudo -n bash` fed by a pipe — never interpolated
+# into a quoted command string, and never given a value to echo. It reads
+# /etc/sentinel/secrets.env itself, hashes each value with sha256sum ON THAT
+# MACHINE, and prints only KEY and a hash. The value that produced the hash
+# never leaves the process that read it.
+#
+# Written with single quotes nowhere in it on purpose: it travels to the host
+# base64-encoded, so nothing about its own quoting has to survive being
+# embedded inside ssh's command string, and there is no escaping to get wrong.
+REMOTE_SECRETS_SCRIPT="$(cat <<'REMOTE_SCRIPT'
+F=/etc/sentinel/secrets.env
+if [ ! -e "$F" ]; then
+    printf 'ABSENT'
+    exit 0
+fi
+CR=$(printf '\r')
+while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$CR}"
+    stripped="${line#"${line%%[![:space:]]*}"}"
+    case "$stripped" in
+        ''|'#'*) continue ;;
+    esac
+    case "$stripped" in
+        [A-Za-z_]*=*) ;;
+        *) continue ;;
+    esac
+    key="${stripped%%=*}"
+    value="${stripped#*=}"
+    # Same single trailing-then-leading double-quote strip as the LOCAL side
+    # of this comparison (compare_secrets_with_host / Compare-SecretsWithHost)
+    # and install.sh's stdin reader (read_stdin_secrets). Skipped, a value
+    # install.sh once wrote with quotes and now carries forward VERBATIM
+    # (existing_secret, deploy/install.sh, never strips) would hash
+    # differently here than the same value typed unquoted into
+    # secrets/.env.local — a secret that never actually changed would report
+    # as "changed" forever.
+    value="${value%\"}"; value="${value#\"}"
+    hash="$(printf '%s' "$value" | sha256sum | cut -c1-16)"
+    printf '%s %s\n' "$key" "$hash"
+done < "$F"
+REMOTE_SCRIPT
+)"
+REMOTE_SECRETS_SCRIPT_B64="$(printf '%s' "$REMOTE_SECRETS_SCRIPT" | base64 | tr -d '\n')"
+
+# The half that matters: refuse to rotate a secret without saying so. Compares
+# by KEY NAME plus the hash computed above — never a value, on either side —
+# and reports three groups: what would CHANGE (a real rotation risk), what
+# exists only locally (about to be added), what exists only on the host
+# (untouched by this run; step 27 on the server carries forward any key not
+# supplied on stdin).
+#
+# A host with no secrets.env yet is a first install: nothing to compare, and
+# nothing here says otherwise.
+#
+# Consent to actually SEND a rotation is decided by ALLOW_ROTATION_ALL /
+# ALLOW_ROTATION_KEYS, not by ASSUME_YES — see the --yes note in the header
+# comment. On a --dry-run this function only reports; it never gates,
+# because a dry run sends nothing to gate.
+rotation_allowed() {
+    local k="$1" list_k
+    (( ALLOW_ROTATION_ALL )) && return 0
+    [[ -n "$ALLOW_ROTATION_KEYS" ]] || return 1
+    local IFS=,
+    for list_k in $ALLOW_ROTATION_KEYS; do
+        [[ "$list_k" == "$k" ]] && return 0
+    done
+    return 1
+}
+
+compare_secrets_with_host() {
+    local -A local_hash=() remote_hash=()
+    local -a changed=() local_only=() host_only=()
+    local raw_line stripped k v remote_out remote_rc line key hash answer
+    local ssh_err_file remote_err
+
+    while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+        raw_line="${raw_line%$'\r'}"
+        stripped="${raw_line#"${raw_line%%[![:space:]]*}"}"
+        [[ -z "$stripped" || "$stripped" == \#* ]] && continue
+        [[ "$stripped" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+        k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]}"
+        # The same single trailing-then-leading quote strip install.sh's own
+        # stdin reader applies (deploy/install.sh, read_stdin_secrets). Skipped,
+        # a hand-quoted value in secrets/.env.local would hash differently here
+        # than the unquoted value the installer actually writes to the host —
+        # and a perfectly ordinary rotation would report as "changed" forever.
+        v="${v%\"}"; v="${v#\"}"
+        local_hash["$k"]="$(printf '%s' "$v" | sha256sum | cut -c1-16)"
+    done < "$SECRETS_FILE"
+
+    # ssh's OWN stderr (this OpenSSH build prints a three-line PQ-key-exchange
+    # warning on every connection to this host) goes to a FILE, never merged
+    # with 2>&1 into $remote_out — merged, it lands inside the text this
+    # function parses as KEY HASH lines and produces a bogus key, silently
+    # losing ABSENT detection.
+    #
+    # The assignment is the CONDITION of this if, not a bare statement: under
+    # this script's `set -euo pipefail`, a bare `remote_out="$(...)"` that
+    # fails exits the shell right there, before `remote_rc=$?` is ever
+    # reached — sudo -n failing on the host would abort with no message at
+    # all. As the test of an if it is exempt from -e, so remote_rc below is
+    # real and reachable.
+    ssh_err_file="$(mktemp)"
+    if remote_out="$(ssh_run "printf '%s' '${REMOTE_SECRETS_SCRIPT_B64}' | base64 -d | sudo -n bash" 2>"$ssh_err_file")"; then
+        remote_rc=0
+    else
+        remote_rc=$?
+    fi
+    remote_err="$(cat "$ssh_err_file" 2>/dev/null)"
+    rm -f "$ssh_err_file"
+    if (( remote_rc != 0 )); then
+        die "could not read /etc/sentinel/secrets.env on ${HOST} to compare secrets \
+(sudo -n failed: ${remote_err}). This refuses rather than deploying unchecked — cache \
+sudo credentials (sudo -v in your second SSH session) and retry."
+    fi
+
+    if [[ "$remote_out" == "ABSENT" ]]; then
+        info "${HOST} has no /etc/sentinel/secrets.env yet — first install, nothing to compare."
+        return 0
+    fi
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" ]] && continue
+        key="${line%% *}"; hash="${line#* }"
+        remote_hash["$key"]="$hash"
+    done <<< "$remote_out"
+
+    for k in "${!local_hash[@]}"; do
+        if [[ -v "remote_hash[$k]" ]]; then
+            [[ "${local_hash[$k]}" != "${remote_hash[$k]}" ]] && changed+=("$k")
+        else
+            local_only+=("$k")
+        fi
+    done
+    for k in "${!remote_hash[@]}"; do
+        [[ -v "local_hash[$k]" ]] || host_only+=("$k")
+    done
+    (( ${#changed[@]} ))     && mapfile -t changed     < <(printf '%s\n' "${changed[@]}"     | sort)
+    (( ${#local_only[@]} ))  && mapfile -t local_only  < <(printf '%s\n' "${local_only[@]}"  | sort)
+    (( ${#host_only[@]} ))   && mapfile -t host_only   < <(printf '%s\n' "${host_only[@]}"   | sort)
+
+    (( ${#local_only[@]} )) && info "only in the local file (will be added): ${local_only[*]}"
+    (( ${#host_only[@]} )) && info "only on the host (not sent, left untouched): ${host_only[*]}"
+
+    if (( ${#changed[@]} == 0 )); then
+        ok "secrets: no existing key would change value"
+        return 0
+    fi
+
+    warn "these EXISTING keys on the host would get a NEW value: ${changed[*]}"
+    for k in "${changed[@]}"; do
+        if [[ "$k" == "SENTINEL_BEACON_SECRET" ]]; then
+            warn "SENTINEL_BEACON_SECRET is the key shared with the external watcher — a \
+new value here alone means the watcher rejects every signal as a bad signature, which \
+looks exactly like a host that has gone silent. Only rotate it together with the \
+watcher's copy (docs/OPERARE.md §11)."
+        fi
+    done
+
+    # A dry run reports and stops here — it sends nothing, so there is
+    # nothing left to gate. This is the rehearsal the incident this check
+    # closes never got: --dry-run used to skip this whole comparison.
+    if (( DRY_RUN )); then
+        warn "dry run: reporting only. A real run either asks interactively or needs \
+--allow-rotation for these keys — see docs/OPERARE.md §11."
+        return 0
+    fi
+
+    warn "if this is a rotation you meant to run (docs/OPERARE.md §11), continue. If you \
+did not expect any of these to change, stop — the local file may be the wrong one."
+
+    local -a unallowed=()
+    for k in "${changed[@]}"; do
+        rotation_allowed "$k" || unallowed+=("$k")
+    done
+
+    if (( ${#unallowed[@]} == 0 )); then
+        ok "secrets: rotation of ${changed[*]} explicitly allowed by --allow-rotation"
+        return 0
+    fi
+
+    # --yes does NOT reach here as consent. It answers the OTHER prompts this
+    # script asks (the "did you open a second session" one, the missing-keys
+    # one); a secret rotation needs its own explicit flag, because "answer
+    # every prompt so the run doesn't stop" was exactly how a stale fallback
+    # file would have rotated SENTINEL_BEACON_SECRET without anyone reading a
+    # word of this warning.
+    if (( ASSUME_YES )); then
+        die "--yes does not authorise a secret rotation by itself: ${unallowed[*]} would \
+change and --allow-rotation was not given for them. Re-run with --allow-rotation (or \
+--allow-rotation-keys ${unallowed[*]// /,}) once you have confirmed this is the rotation \
+you meant, or without --yes to be asked interactively."
+    fi
+
+    read -r -p "Continui rotirea? [da/NU] " answer
+    [[ "$answer" == "da" ]] || die "aborted — nothing was sent to the host"
+}
+
 cleanup() {
     [[ "$MUX" == "yes" ]] &&
         ssh -O exit "${SSH_OPTS[@]}" "${USER}@${HOST}" 2>/dev/null || true
@@ -305,13 +580,34 @@ fi
 # ---------------------------------------------------------------------------
 # Secrets
 # ---------------------------------------------------------------------------
-if (( ! DRY_RUN )); then
-    if [[ ! -f "$SECRETS_FILE" ]]; then
+# The --secrets existence check runs whether or not this is a dry run: a
+# misspelled path must fail preflight, not "pass" it and only die on the real
+# run that follows — the exact gap a --dry-run rehearsal exists to close.
+if [[ -n "$SECRETS_ARG" && ! -f "$SECRETS_FILE" ]]; then
+    # Named explicitly: the operator meant THIS file. Generating a fresh one
+    # under its name is exactly the failure mode this flag exists to close —
+    # see the --secrets doc at the top of this file.
+    die "--secrets ${SECRETS_FILE}: file not found. Not running \
+secrets-init.sh for it — a name you chose does not get a freshly generated \
+replacement, that would silently rotate whatever it invented."
+fi
+
+if [[ ! -f "$SECRETS_FILE" ]]; then
+    if (( DRY_RUN )); then
+        # No name was given (checked above) — the ordinary default-missing
+        # case. Tolerated here so a first install can still rehearse: there
+        # is nothing to compare yet, and secrets-init.sh has not run to
+        # invent something a dry run must not act as though it had.
+        warn "no ${SECRETS_FILE} — dry run continues without a secrets comparison; a real \
+run will need it (scripts/secrets-init.sh) or the path you pass with --secrets."
+    else
         warn "no ${SECRETS_FILE}"
         info "running scripts/secrets-init.sh"
         "${REPO_ROOT}/scripts/secrets-init.sh" || die "secret initialisation failed"
     fi
+fi
 
+if [[ -f "$SECRETS_FILE" ]]; then
     missing=()
     for key in SENTINEL_DB_PASSWORD ANTHROPIC_API_KEY TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID; do
         grep -qE "^${key}=.+" "$SECRETS_FILE" || missing+=("$key")
@@ -319,11 +615,15 @@ if (( ! DRY_RUN )); then
     if (( ${#missing[@]} > 0 )); then
         warn "missing or empty in ${SECRETS_FILE}: ${missing[*]}"
         warn "Sentinel will install but the corresponding feature will be inert."
-        if (( ! ASSUME_YES )); then
+        if (( ! DRY_RUN )) && (( ! ASSUME_YES )); then
             read -r -p "Continui oricum? [da/NU] " answer
             [[ "$answer" == "da" ]] || die "aborted; run scripts/secrets-init.sh"
         fi
     fi
+
+    # Runs on a dry run too — report-only, see compare_secrets_with_host.
+    prime_sudo
+    compare_secrets_with_host
 fi
 
 # ---------------------------------------------------------------------------
@@ -479,14 +779,12 @@ fi
 info "installing (secrets go over stdin, never argv)"
 
 # stdin carries the secrets, so it cannot also be a TTY — which means sudo must
-# not prompt. Prime the credential cache over a separate interactive connection
-# first; the ControlMaster keeps it warm for the real run.
-if ! ssh_run "sudo -n true" 2>/dev/null; then
-    info "caching sudo credentials (you will be asked once)"
-    ssh -t "${SSH_OPTS[@]}" "${USER}@${HOST}" "sudo -v" \
-        || die "sudo is not usable non-interactively. Either add a NOPASSWD rule for \
-${USER}, or run sudo -v in your second SSH session and retry within the timeout."
-fi
+# not prompt. Credentials were already primed once for the secrets comparison
+# above; the ControlMaster keeps that warm, so this is normally a single
+# `sudo -n true` and nothing more. Called again anyway: packaging and the
+# line-ending check run in between, and a slow one of those is exactly the
+# gap a cached credential can expire in.
+prime_sudo
 
 # install.sh is executed as a file that already exists on the server, not piped
 # in as a script — `bash -s` would consume stdin and the secrets would never

@@ -92,6 +92,34 @@
     and the services are restarted at the end of that same run. See
     docs/OPERARE.md §11.
 
+.PARAMETER Secrets
+    Path to the secrets file. Omitted, this is exactly today's behaviour:
+    secrets\.env.local — including that a missing default file is a hard stop
+    telling the operator to run scripts/secrets-init.sh from Git Bash, not a
+    fallback that generates one here.
+
+    Given and missing, it is still a hard stop, but for a different reason: a
+    path the operator named on purpose does not get replaced by a freshly
+    generated file under that name. That substitution is exactly how a
+    database password and a beacon secret got rotated by accident — see
+    secrets/.gitkeep.
+
+    Checked on -DryRun too: a misspelled path must fail the rehearsal, not
+    "pass" it and only die on the real run that follows.
+
+.PARAMETER AllowRotation
+    Explicit consent to send a secret that Compare-SecretsWithHost found would
+    change an existing value on the host. Allows all of them. -AssumeYes does
+    NOT imply this — it answers the OTHER prompts this script already asked
+    before this flag existed; a rotation needs its own, because "answer every
+    prompt" was exactly how a stale fallback file would have rotated
+    SENTINEL_BEACON_SECRET without anyone reading the warning.
+
+.PARAMETER AllowRotationKeys
+    Like -AllowRotation but for only the named keys (comma-separated, same
+    four forms -ForceStep accepts). Any changed key not in the list is still
+    gated — interactively, or refused outright under -AssumeYes.
+
 .EXAMPLE
     .\scripts\deploy.ps1 -HostName 203.0.113.10 `
         -Domain sentinel.exemplu.ro -DryRun
@@ -131,6 +159,9 @@ param(
     # all four forms the operator might type (22,27 / '22,27' / 22, 27 /
     # '22, 27') produce the same 22,27. Measured on Windows PowerShell 5.1.
     [string[]]$ForceStep,
+    [string]$Secrets,
+    [switch]$AllowRotation,
+    [string[]]$AllowRotationKeys,
     [switch]$DryRun,
     [switch]$Rollback,
     [switch]$Purge,
@@ -141,7 +172,11 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $RepoRoot    = Split-Path -Parent $PSScriptRoot
-$SecretsFile = Join-Path $RepoRoot 'secrets\.env.local'
+# -Secrets replaces the default path outright. Kept as a check on $Secrets
+# further down (not folded away here) because what matters there is not just
+# which path is in use, but whether the OPERATOR named it — that is what
+# decides whether a missing file just dies, or dies with a different message.
+$SecretsFile = if ($Secrets) { $Secrets } else { Join-Path $RepoRoot 'secrets\.env.local' }
 
 function Write-Info { param($m) Write-Host "[.] $m" -ForegroundColor Blue }
 function Write-Ok   { param($m) Write-Host "[+] $m" -ForegroundColor Green }
@@ -165,11 +200,27 @@ function Get-StepList {
     return ($raw -replace '\s', '')
 }
 
+function Get-KeyList {
+    <# Same shape check as Get-StepList, for -AllowRotationKeys: refuse a
+       malformed list rather than silently matching nothing, which would look
+       identical to "no key allowed" and refuse a rotation the operator
+       thought they had just authorised. #>
+    param([string[]]$Value, [string]$Flag)
+    $raw = $Value -join ','
+    if ($raw -notmatch '^\s*[A-Za-z_][A-Za-z0-9_]*(\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*\s*$') {
+        Die "${Flag}: '$raw' is not a KEY_NAME or a comma-separated list of them (e.g. SENTINEL_DB_PASSWORD or SENTINEL_DB_PASSWORD,TELEGRAM_BOT_TOKEN)"
+    }
+    return ($raw -replace '\s', '')
+}
+
 # Resolved before anything is packaged or transferred: a typo should cost a
 # second, not a round trip. install.sh checks it again on the server, where it
 # remains the authority on which numbers are real steps.
 $forceStepList = ''
 if ($ForceStep) { $forceStepList = Get-StepList -Value $ForceStep -Flag '-ForceStep' }
+
+$allowRotationKeysList = ''
+if ($AllowRotationKeys) { $allowRotationKeysList = Get-KeyList -Value $AllowRotationKeys -Flag '-AllowRotationKeys' }
 
 # ---------------------------------------------------------------------------
 # Tooling
@@ -252,8 +303,9 @@ $keyArg    = ''
 if ($Key) { $keyArg = " -Key `"$Key`"" }
 $resumeCmd = ".\scripts\deploy.ps1 -HostName $HostName -User $User$keyArg"
 
-# Two helpers, not one, because "return the exit code" and "let the operator
-# watch and type a password" cannot both be done by the same function.
+# Three helpers, not one, because "return the exit code", "let the operator
+# watch and type a password" and "return the output" cannot all be done by
+# the same function.
 #
 # A PowerShell function returns EVERYTHING written to its output stream. A
 # single helper that ran ssh and then `return $LASTEXITCODE` returned an ARRAY
@@ -261,30 +313,55 @@ $resumeCmd = ".\scripts\deploy.ps1 -HostName $HostName -User $User$keyArg"
 # array and was truthy whenever the remote command printed anything. The
 # connectivity probe failed precisely because `echo connected` had worked.
 
+function Invoke-SshCapture {
+    <# The ONE place in this file that redirects ssh's stderr, and therefore
+       the one place that has to fight a Windows PowerShell 5.1 bug: under
+       this script's own $ErrorActionPreference = 'Stop', a native command
+       whose stderr is redirected — even `2>$null`, with nothing merged into
+       the success stream — has each stderr line promoted to a terminating
+       NativeCommandError. `2>$null` alone is not enough; the preference has
+       to be lowered around the call too.
+
+       This is not theoretical against this host: production's sshd (OpenSSH
+       8.7, no post-quantum key exchange) writes three such lines to stderr
+       on EVERY connection from this machine's client (OpenSSH 10.2p1, which
+       warns about exactly that). Measured directly: a nested powershell.exe
+       that writes those three lines throws out of a bare `2>$null` call, in
+       both -Command and -File invocation, and stops doing so once wrapped
+       exactly as below.
+
+       Test-Ssh and Get-SshOutput used to each carry their OWN copy of
+       `& $ssh ... 2>$null` plus their own lowered-preference guard — Test-Ssh
+       had it, Get-SshOutput did not, which is exactly the shape CLAUDE.md
+       warns about: a guard copied into one call site and missing from the
+       next one added later. This is now the only function that touches `2>`,
+       so there is nothing left to copy or to forget.
+
+       Returns a PSCustomObject: Output (whatever the native call produced —
+       $null, a scalar string, or a string[], unchanged from what `& $ssh`
+       would have handed either caller directly) and ExitCode (read from
+       $LASTEXITCODE immediately after the call, before anything else here
+       can reset it). #>
+    param([string[]]$Arguments, [string]$Target, [string]$Command)
+    $savedEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+    try   { $out = & $ssh @Arguments $Target $Command 2>$null }
+    finally { $ErrorActionPreference = $savedEAP }
+    return [pscustomobject]@{ Output = $out; ExitCode = $LASTEXITCODE }
+}
+
 function Test-Ssh {
     <# Runs a command for its exit code only. Output is discarded, so the return
-       value is a plain int and safe to capture.
-
-       stderr is sent to $null at the OS level, NOT merged with 2>&1. Under the
-       script's $ErrorActionPreference='Stop', a native command that writes to
-       stderr has its output promoted to a terminating error — and this helper's
-       whole job is to run probes that are SUPPOSED to fail, like `sudo -n true`
-       when credentials are not cached. Merging stderr would kill the run before
-       the caller could read the exit code it asked for. #>
+       value is a plain int and safe to capture. See Invoke-SshCapture for why
+       stderr has to be handled the way it is — this helper's whole job is to
+       run probes that are SUPPOSED to fail, like `sudo -n true` when
+       credentials are not cached, and a promoted NativeCommandError would
+       kill the run before the caller could read the exit code it asked for. #>
     [OutputType([int])]
     param([string]$Command, [switch]$Tty)
     $a = $sshArgs.Clone()
     if ($Tty) { $a += '-t' }
-    # 2>$null alone is not enough on PowerShell 5.1: under $ErrorActionPreference
-    # 'Stop' a native command that writes to stderr still throws a terminating
-    # NativeCommandError. Lower the preference for the duration of the call so an
-    # expected probe failure (e.g. `sudo -n true` with no cached creds) returns
-    # its exit code instead of aborting the whole deploy.
-    $savedEAP = $ErrorActionPreference
-    $ErrorActionPreference = 'SilentlyContinue'
-    try   { & $ssh @a $target $Command 2>$null | Out-Null }
-    finally { $ErrorActionPreference = $savedEAP }
-    return $LASTEXITCODE
+    return (Invoke-SshCapture -Arguments $a -Target $target -Command $Command).ExitCode
 }
 
 function Invoke-SshLive {
@@ -292,7 +369,16 @@ function Invoke-SshLive {
        can prompt for a password and output appears as it happens rather than
        being buffered into lines. Returns nothing on purpose — capturing a
        return value is what would force PowerShell to redirect the output and
-       destroy both properties. Read $LASTEXITCODE after the call. #>
+       destroy both properties. Read $LASTEXITCODE after the call.
+
+       Deliberately does NOT go through Invoke-SshCapture: that helper exists
+       to survive a REDIRECTED stderr, and this call has no redirection at
+       all — stderr goes straight to the inherited console, same as stdout.
+       Measured: a bare `& $ssh ...` with no `2>` and no capture does not
+       throw under $ErrorActionPreference = 'Stop' even when the child writes
+       to stderr, on this same PowerShell 5.1. Routing it through the other
+       helper would add a redirection that is not wanted here — it would
+       swallow the very prompt this function exists to show. #>
     param([string]$Command, [switch]$Tty)
     $a = $sshArgs.Clone()
     if ($Tty) { $a += '-t' }
@@ -302,10 +388,205 @@ function Invoke-SshLive {
 function Get-SshOutput {
     <# Runs a command and RETURNS its stdout as a single trimmed string. Distinct
        from Test-Ssh (which discards output for the exit code) — here the output
-       is the point. #>
+       is the point. See Invoke-SshCapture for the stderr handling shared with
+       Test-Ssh.
+
+       The captured output is an ARRAY of already-clean lines (native-command
+       capture handles both LF and CRLF transports without leaving a residual
+       `\r` per line). Joined with "`n" explicitly here — NOT with
+       `Out-String`, which on Windows PowerShell 5.1 inserts
+       [Environment]::NewLine, i.e. CRLF. That CR then rides along inside every
+       line but the last once a caller (Compare-SecretsWithHost) splits the
+       result back apart on "`n" alone, so a value that was identical on both
+       sides compared unequal for every key except the last. Measured: a
+       four-key remote reply where only the last line's hash matched. #>
     param([string]$Command)
-    $out = & $ssh @sshArgs $target $Command 2>$null
-    return ($out | Out-String).Trim()
+    $result = Invoke-SshCapture -Arguments $sshArgs -Target $target -Command $Command
+    $out = $result.Output
+    if ($null -eq $out) { return '' }
+    return (($out -join "`n")).Trim()
+}
+
+function Confirm-SudoCached {
+    <# Shared by Compare-SecretsWithHost and by the install step further down:
+       both feed the connection with something that cannot also be a human
+       typing a password — structured output here, the secrets file on stdin
+       there. Idempotent: once credentials are cached, a second call is a
+       single `sudo -n true` and nothing more, so calling it twice in one run
+       costs a cheap round trip, not a second prompt. #>
+    if ((Test-Ssh -Command 'sudo -n true') -ne 0) {
+        Write-Info 'caching sudo credentials (you will be asked once)'
+        Invoke-SshLive -Tty -Command 'sudo -v'
+        if ($LASTEXITCODE -ne 0) {
+            Die "sudo is not usable non-interactively. Add a NOPASSWD rule for $User, or run 'sudo -v' in your second SSH session and retry within the timeout."
+        }
+    }
+}
+
+function Get-ValueHash {
+    <# SHA-256 of the value's raw UTF-8 bytes, no added newline — matching
+       `printf '%s' "$value" | sha256sum` on the host side of every comparison
+       Compare-SecretsWithHost makes. First 16 hex characters: enough to tell
+       two values apart, never enough to be the value. #>
+    param([string]$Value)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Value))
+    } finally { $sha.Dispose() }
+    return ([BitConverter]::ToString($bytes) -replace '-', '').Substring(0, 16).ToLower()
+}
+
+# Runs ON THE HOST under `sudo -n bash`, fed by a base64 pipe rather than an
+# interpolated command string — same technique, same reason, as the identical
+# script in deploy.sh's $REMOTE_SECRETS_SCRIPT: it reads /etc/sentinel/
+# secrets.env itself, hashes each value with sha256sum ON THAT MACHINE, and
+# prints only a key and a hash. The value that produced the hash never leaves
+# the process that read it. Kept as the same shell text as deploy.sh's copy —
+# tests/unit/test_deploy_secrets_flag.py checks the two have not drifted.
+$RemoteSecretsScript = (@'
+F=/etc/sentinel/secrets.env
+if [ ! -e "$F" ]; then
+    printf 'ABSENT'
+    exit 0
+fi
+CR=$(printf '\r')
+while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$CR}"
+    stripped="${line#"${line%%[![:space:]]*}"}"
+    case "$stripped" in
+        ''|'#'*) continue ;;
+    esac
+    case "$stripped" in
+        [A-Za-z_]*=*) ;;
+        *) continue ;;
+    esac
+    key="${stripped%%=*}"
+    value="${stripped#*=}"
+    # Same single trailing-then-leading double-quote strip as the LOCAL side
+    # of this comparison (compare_secrets_with_host / Compare-SecretsWithHost)
+    # and install.sh's stdin reader (read_stdin_secrets). Skipped, a value
+    # install.sh once wrote with quotes and now carries forward VERBATIM
+    # (existing_secret, deploy/install.sh, never strips) would hash
+    # differently here than the same value typed unquoted into
+    # secrets/.env.local — a secret that never actually changed would report
+    # as "changed" forever.
+    value="${value%\"}"; value="${value#\"}"
+    hash="$(printf '%s' "$value" | sha256sum | cut -c1-16)"
+    printf '%s %s\n' "$key" "$hash"
+done < "$F"
+'@) -replace "`r`n", "`n"
+
+function Test-RotationAllowed {
+    <# Twin of rotation_allowed in deploy.sh. Consent to actually SEND a
+       rotation is decided by -AllowRotation / -AllowRotationKeys, never by
+       -AssumeYes — see the -AssumeYes note in Compare-SecretsWithHost. #>
+    param([string]$Key)
+    if ($AllowRotation) { return $true }
+    if (-not $allowRotationKeysList) { return $false }
+    return ($allowRotationKeysList -split ',') -contains $Key
+}
+
+function Compare-SecretsWithHost {
+    <# The half that matters: refuse to rotate a secret without saying so.
+       Compares by KEY NAME plus the hash above — never a value, on either
+       side — and reports three groups: what would CHANGE (a real rotation
+       risk), what exists only locally (about to be added), what exists only
+       on the host (untouched by this run; step 27 on the server carries
+       forward any key not supplied on stdin).
+
+       A host with no secrets.env yet is a first install: nothing to compare,
+       and nothing here says otherwise. On -DryRun this reports only and
+       never gates — nothing is sent to gate. Twin of compare_secrets_with_host
+       in deploy.sh — read the reasoning there; this follows it exactly. #>
+    $localHash = @{}
+    foreach ($rawLine in (Get-Content -LiteralPath $SecretsFile)) {
+        $stripped = $rawLine.TrimStart()
+        if (-not $stripped -or $stripped.StartsWith('#')) { continue }
+        if ($stripped -notmatch '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') { continue }
+        $k = $Matches[1]; $v = $Matches[2]
+        # Same single trailing-then-leading quote strip as deploy.sh and as
+        # install.sh's own stdin reader (read_stdin_secrets). Skipped, a
+        # hand-quoted value in secrets\.env.local would hash differently here
+        # than the unquoted value the installer actually writes to the host.
+        if ($v.EndsWith('"'))   { $v = $v.Substring(0, $v.Length - 1) }
+        if ($v.StartsWith('"')) { $v = $v.Substring(1) }
+        $localHash[$k] = Get-ValueHash $v
+    }
+
+    $b64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($RemoteSecretsScript))
+    $remoteOut = Get-SshOutput "printf '%s' '$b64' | base64 -d | sudo -n bash 2>&1"
+    if ($LASTEXITCODE -ne 0) {
+        Die "could not read /etc/sentinel/secrets.env on $HostName to compare secrets (sudo -n failed: $remoteOut). This refuses rather than deploying unchecked — cache sudo credentials (sudo -v in your second SSH session) and retry."
+    }
+
+    if ($remoteOut -eq 'ABSENT') {
+        Write-Info "$HostName has no /etc/sentinel/secrets.env yet — first install, nothing to compare."
+        return
+    }
+
+    $remoteHash = @{}
+    foreach ($line in ($remoteOut -split "`n")) {
+        if (-not $line) { continue }
+        $parts = $line -split ' ', 2
+        if ($parts.Count -eq 2) { $remoteHash[$parts[0]] = $parts[1] }
+    }
+
+    $changed = @(); $localOnly = @(); $hostOnly = @()
+    foreach ($k in $localHash.Keys) {
+        if ($remoteHash.ContainsKey($k)) {
+            if ($localHash[$k] -ne $remoteHash[$k]) { $changed += $k }
+        } else {
+            $localOnly += $k
+        }
+    }
+    foreach ($k in $remoteHash.Keys) {
+        if (-not $localHash.ContainsKey($k)) { $hostOnly += $k }
+    }
+    $changed = @($changed | Sort-Object)
+    $localOnly = @($localOnly | Sort-Object)
+    $hostOnly = @($hostOnly | Sort-Object)
+
+    if ($localOnly) { Write-Info ("only in the local file (will be added): " + ($localOnly -join ' ')) }
+    if ($hostOnly)  { Write-Info ("only on the host (not sent, left untouched): " + ($hostOnly -join ' ')) }
+
+    if (-not $changed) {
+        Write-Ok 'secrets: no existing key would change value'
+        return
+    }
+
+    Write-Warn ("these EXISTING keys on the host would get a NEW value: " + ($changed -join ' '))
+    foreach ($k in $changed) {
+        if ($k -eq 'SENTINEL_BEACON_SECRET') {
+            Write-Warn "SENTINEL_BEACON_SECRET is the key shared with the external watcher — a new value here alone means the watcher rejects every signal as a bad signature, which looks exactly like a host that has gone silent. Only rotate it together with the watcher's copy (docs/OPERARE.md §11)."
+        }
+    }
+
+    # A dry run reports and stops here — it sends nothing, so there is
+    # nothing left to gate. This is the rehearsal the incident this check
+    # closes never got: -DryRun used to skip this whole comparison.
+    if ($DryRun) {
+        Write-Warn "dry run: reporting only. A real run either asks interactively or needs -AllowRotation for these keys — see docs/OPERARE.md §11."
+        return
+    }
+
+    Write-Warn "if this is a rotation you meant to run (docs/OPERARE.md §11), continue. If you did not expect any of these to change, stop — the local file may be the wrong one."
+
+    $unallowed = @($changed | Where-Object { -not (Test-RotationAllowed $_) })
+    if (-not $unallowed) {
+        Write-Ok ("secrets: rotation of " + ($changed -join ' ') + " explicitly allowed by -AllowRotation")
+        return
+    }
+
+    # -AssumeYes does NOT reach here as consent. It answers the OTHER prompts
+    # this script asks; a secret rotation needs its own explicit flag, because
+    # "answer every prompt so the run doesn't stop" was exactly how a stale
+    # fallback file would have rotated SENTINEL_BEACON_SECRET without anyone
+    # reading a word of this warning.
+    if ($AssumeYes) {
+        Die "-AssumeYes does not authorise a secret rotation by itself: $($unallowed -join ' ') would change and -AllowRotation was not given for them. Re-run with -AllowRotation (or -AllowRotationKeys $($unallowed -join ',')) once you have confirmed this is the rotation you meant, or without -AssumeYes to be asked interactively."
+    }
+
+    if ((Read-Host "Continui rotirea? [da/NU]") -ne 'da') { Die 'aborted — nothing was sent to the host' }
 }
 
 # ---------------------------------------------------------------------------
@@ -361,8 +642,24 @@ if ($Rollback) {
 # ---------------------------------------------------------------------------
 # Secrets
 # ---------------------------------------------------------------------------
-if (-not $DryRun) {
-    if (-not (Test-Path $SecretsFile)) {
+# The -Secrets existence check runs whether or not this is a dry run: a
+# misspelled path must fail preflight, not "pass" it and only die on the real
+# run that follows — the exact gap a -DryRun rehearsal exists to close.
+if ($Secrets -and -not (Test-Path $SecretsFile)) {
+    # Named explicitly: the operator meant THIS file. No suggestion to run
+    # secrets-init.sh here — that would write a DIFFERENT file
+    # (secrets\.env.local) and leave the one just asked for still missing,
+    # which is not the fix it would look like.
+    Die "-Secrets $SecretsFile`: file not found. Not treating this as the default-missing case — a path you named does not get replaced by a freshly generated file under that name."
+}
+
+if (-not (Test-Path $SecretsFile)) {
+    if ($DryRun) {
+        # No name was given (checked above) — the ordinary default-missing
+        # case. Tolerated here so a first install can still rehearse: there
+        # is nothing to compare yet.
+        Write-Warn "no $SecretsFile — dry run continues without a secrets comparison; a real run will need it (scripts/secrets-init.sh) or the path you pass with -Secrets."
+    } else {
         Die @"
 No $SecretsFile.
 
@@ -374,12 +671,19 @@ cannot reproduce without briefly materialising the value in memory as plain text
 Rather than do a worse job of it here, use the bash one — it is a one-off.)
 "@
     }
+}
+
+if (Test-Path $SecretsFile) {
     $content = Get-Content $SecretsFile -Raw
     foreach ($k in @('SENTINEL_DB_PASSWORD', 'ANTHROPIC_API_KEY', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID')) {
         if ($content -notmatch "(?m)^$k=.+") {
             Write-Warn "$k is missing or empty in $SecretsFile — the matching feature will be inert."
         }
     }
+
+    # Runs on a dry run too — report-only, see Compare-SecretsWithHost.
+    Confirm-SudoCached
+    Compare-SecretsWithHost
 }
 
 # ---------------------------------------------------------------------------
@@ -523,14 +827,11 @@ if (-not $AssumeYes) {
 }
 
 # stdin carries the secrets, so it cannot also be a TTY and sudo must not
-# prompt. Prime the credential cache over a separate interactive connection.
-if ((Test-Ssh -Command 'sudo -n true') -ne 0) {
-    Write-Info 'caching sudo credentials (you will be asked once)'
-    Invoke-SshLive -Tty -Command 'sudo -v'
-    if ($LASTEXITCODE -ne 0) {
-        Die "sudo is not usable non-interactively. Add a NOPASSWD rule for $User, or run 'sudo -v' in your second SSH session and retry within the timeout."
-    }
-}
+# prompt. Credentials were already primed once for Compare-SecretsWithHost
+# above; called again because packaging and the line-ending check run in
+# between, and a slow one of those is exactly the gap a cached credential can
+# expire in.
+Confirm-SudoCached
 
 $installArgs = @("--nginx-mode $NginxMode", "--web-port $WebPort", "--cert-mode $CertMode")
 if ($AdminIp)  { $installArgs += "--admin-ip '$AdminIp'" }

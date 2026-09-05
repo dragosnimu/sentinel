@@ -347,16 +347,28 @@ VECHEA=$(ssh ... "sudo sed -n 's/^SENTINEL_DB_PASSWORD=//p' /etc/sentinel/secret
 ssh ... "sudo grep -oE '^[A-Za-z_][A-Za-z0-9_]*' /etc/sentinel/secrets.env | sort" \
     > /tmp/chei-inainte.txt
 
-# 4. O singură rulare, ambii pași:
+# 4. O singură rulare, ambii pași. Comanda de mai jos SCHIMBĂ o cheie
+#    existentă pe gazdă (SENTINEL_DB_PASSWORD) — deploy.sh o vede la
+#    compararea cu secrets.env de pe gazdă și o cere explicit, nu se
+#    mulțumește cu --yes: adaugă --allow-rotation (toate cheile) sau
+#    --allow-rotation-keys SENTINEL_DB_PASSWORD (doar asta).
 ./scripts/deploy.sh --host ... --user ... --key ... --domain ... \
-    --force-step 22,27
+    --force-step 22,27 --allow-rotation
 ```
 
 Din PowerShell, identic:
 
 ```powershell
-.\scripts\deploy.ps1 -HostName ... -User ... -Key ... -Domain ... -ForceStep 22,27
+.\scripts\deploy.ps1 -HostName ... -User ... -Key ... -Domain ... -ForceStep 22,27 -AllowRotation
 ```
+
+Fără `--allow-rotation`/`-AllowRotation`, rularea reală se oprește și întreabă
+la consolă (`Continui rotirea? [da/NU]`) — sau, sub `--yes`/`-AssumeYes`,
+refuză direct, cerând explicit unul dintre cele două. `--yes` răspunde la
+celelalte confirmări din script; NU autorizează singur o rotire de secret —
+tocmai asta a fost eșecul care a dus la acest paragraf. Pe `--dry-run`/
+`-DryRun`, comparația rulează și cheile care s-ar schimba apar în jurnal, dar
+nimic nu se trimite și nimic nu se cere — un preflight raportează, nu decide.
 
 Instalatorul refuză din start o listă care nu e formată din numere și una care
 conține un pas inexistent, refuză combinația `--force-step N` sub
