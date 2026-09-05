@@ -37,9 +37,21 @@ există) și generează o linie de log pe oră.
 | `operator` | Blocare, deblocare, scanare. **Nu** aplicare de patch-uri, **nu** config |
 | `viewer` | Doar citire |
 
-Grupurile sunt respinse dacă id-ul grupului nu e explicit în allowlist **și**
-expeditorul nu e și el permis — apartenența la un grup Telegram nu este
-autentificare.
+**Într-un grup, autorizarea e a grupului, nu a persoanei.** `_authorized`
+compară doar `chat.id` cu `allowed_chat_ids`; expeditorul nu e verificat
+niciodată — `update.effective_user` nu e citit nicăieri pe calea de autorizare.
+Dacă id-ul unui grup e în allowlist, **orice membru al grupului** poate da
+comenzi. Dacă grupul e și `owner_chat_id`, orice membru are drepturi de owner,
+inclusiv blocare de adrese pe o instalare cu auto-block activ.
+
+Consecința practică: a adăuga pe cineva în grup înseamnă a-i da drepturile
+grupului. Nu există un nivel „doar vede alertele" — rolurile din tabelul de mai
+sus se aplică pe chat, iar într-un grup chatul e unul singur pentru toți.
+
+Paragraful ăsta spunea până pe 5 septembrie 2026 exact pe dos: că expeditorul e
+verificat și el, și că apartenența la grup nu e autentificare. În cod nu a fost
+adevărat niciodată. Corectat după ce documentul a fost citit ca să se scrie
+procedura pentru mai multe instanțe.
 
 ---
 
@@ -240,3 +252,123 @@ Ca apărare în adâncime, dacă telefonul poate fi pierdut sau furat: setează
 `TELEGRAM_APPLY_PIN` în `secrets.env` și `telegram.require_pin_for_apply: true`.
 Aplicarea patch-urilor și modificarea allowlist-ului vor cere un PIN — ceva ce
 hoțul nu are.
+
+---
+
+## 8. Mai multe instanțe pe același Telegram
+
+### De ce nu merge pur și simplu cu același bot
+
+Telegram acceptă **un singur cititor de actualizări per token**. Două instanțe
+Sentinel configurate cu același `TELEGRAM_BOT_TOKEN` intră amândouă în
+`getUpdates` și primesc:
+
+```
+Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+```
+
+Nu e tranzitoriu — se repetă la fiecare ciclu, iar canalul de comandă al
+**ambelor** instanțe devine nefiabil. Măsurat pe 4 septembrie 2026: 32 de erori
+în 30 de minute pe instanța de producție, imediat după ce a doua gazdă a pornit
+cu tokenul copiat.
+
+**Trimiterea nu are limita asta.** Restricția e doar pe `getUpdates`; oricâte
+instanțe pot trimite prin același token. Dar expeditorul lui Sentinel trăiește
+înăuntrul demonului care interoghează: `run_polling` cheamă `post_init`, iar
+`post_init` pornește bucla care golește coada `notifications`. Fără interogare nu
+pleacă nicio alertă. „Trimite dar nu asculta" **nu există** ca opțiune de
+configurare, și de-asta soluția nu e un token comun.
+
+### Soluția: un grup, un bot per instanță
+
+- fiecare instanță are botul și tokenul ei → niciun conflict;
+- toate boturile sunt membre ale aceluiași grup → un singur fir de citit;
+- boturile pot purta **același nume afișat** — BotFather cere username unic, nu
+  nume unic, deci în grup arată ca un singur expeditor;
+- **butoanele se rutează singure.** Un `callback_query` se întoarce la botul care
+  a trimis acel mesaj, deci apăsarea pe o alertă venită de la instanța A ajunge
+  la A. Nu e nevoie nici de identitate de instanță în payload, nici de vreun
+  canal de control între gazde.
+
+### Procedura
+
+1. `/newbot` la BotFather pentru fiecare instanță nouă. Cu `/setname` le dai
+   tuturor același nume afișat.
+2. Creezi un grup și adaugi toate boturile. Nu au nevoie de drepturi de
+   administrator; membru simplu e de ajuns.
+3. Trimiți `/start@<username>` în grup pentru fiecare bot nou — altfel coada lui
+   de actualizări poate fi goală la pasul următor.
+4. Afli id-ul grupului, interogând **botul instanței noi**, cu serviciul ei încă
+   oprit ca să nu existe conflict:
+
+```bash
+sudo -n python3 - <<'PY'
+import json, socket, urllib.request
+_o = socket.getaddrinfo
+socket.getaddrinfo = lambda *a, **k: [x for x in _o(*a, **k) if x[0] == socket.AF_INET]
+tok = [l.split('=', 1)[1].strip() for l in open('/etc/sentinel/secrets.env')
+       if l.startswith('TELEGRAM_BOT_TOKEN=')][0]
+d = json.load(urllib.request.urlopen(
+    f'https://api.telegram.org/bot{tok}/getUpdates?timeout=0', timeout=15))
+for u in d.get('result', []):
+    c = (u.get('message') or u.get('my_chat_member') or {}).get('chat')
+    if c: print(c['id'], c.get('type'), c.get('title'))
+PY
+```
+
+   Tokenul e citit din fișier, nu dat pe linia de comandă — altfel ajunge în
+   `ps` și în istoricul shell-ului. IPv4 e forțat fiindcă o gazdă cu rută IPv6
+   nefuncțională blochează cererea la `connect`, iar `timeout` o face să
+   eșueze în loc să atârne.
+
+5. Pe fiecare gazdă, în `/etc/sentinel/secrets.env`: token propriu,
+   `TELEGRAM_CHAT_ID` = id-ul grupului, și **`TELEGRAM_CALLBACK_HMAC_KEY`
+   propriu** (`openssl rand -hex 32`). Cheia aia nu are voie să fie comună — cu
+   ea comună, un buton emis de o instanță e acceptat ca valid de cealaltă, care
+   îl execută pe propriile date.
+6. În `sentinel.yaml`: `instance_label` distinct, id-ul grupului în
+   `allowed_chat_ids` și în `owner_chat_id`. Grupul **trebuie** să fie owner sau
+   operator, altfel butoanele apăsate acolo nu fac nimic.
+7. `sentinel config-check`, apoi repornire și dovada:
+
+```bash
+sudo -u sentinel /opt/sentinel/bin/sentinel telegram --send-test
+```
+
+   Răspunsul util e `delivered (message_id=N)`. Un cod HTTP 200 fără
+   `message_id` nu e livrare.
+
+### Verificarea, prin efect
+
+Pe **fiecare** gazdă, după repornire:
+
+```bash
+sudo journalctl -u sentinel-telegram --since '10 min ago' | grep -c Conflict
+```
+
+Zero pe toate. Apoi apeși un buton pe o alertă reală venită de la fiecare
+instanță — ăsta e singurul test care dovedește rutarea, fiindcă livrarea
+mesajului și rutarea callback-ului sunt lucruri diferite.
+
+### Capcane
+
+**Apartenența la grup e autoritate.** Vezi §2: autorizarea se face pe `chat.id`,
+nu pe expeditor. Oricine e în grup are drepturile grupului, pe toate instanțele
+deodată, inclusiv blocare de adrese acolo unde auto-block e activ.
+
+**Conversia în supergrup schimbă id-ul.** Se întâmplă automat la anumite acțiuni
+— membri mulți, grup făcut public, istoric activat pentru membri noi. Id-ul sare
+din `-5xxxxxxxxxx` în `-100xxxxxxxxxx`, iar alertele **tac pe toate gazdele fără
+nicio eroare vizibilă**. Dacă alertele dispar după ce ai umblat prin setările
+grupului, asta e prima ipoteză.
+
+**Nu adăuga o a doua secțiune `telegram:` în `sentinel.yaml`.** YAML acceptă
+cheia duplicată tăcut și câștigă ultima; o secțiune nouă pusă în capul
+fișierului e ignorată complet în favoarea celei originale de mai jos, iar
+simptomul e că mesajele pleacă spre chat-ul vechi. `config-check` nu semnalează
+duplicatul. Caută secțiunea existentă și modific-o pe ea.
+
+**Păstrează chat-ul privat în `allowed_chat_ids`** dacă îl vrei în continuare;
+doar `owner_chat_id` se mută pe grup. Cu ambele în listă, `--send-test` livrează
+în amândouă.
+

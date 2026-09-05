@@ -30,9 +30,13 @@ care wizard-ul ți le pune și ce faci când ceva nu merge.
 | `sentinel-watchdog` | Deadman anti-lockout, la fiecare 60s, independent de restul |
 | timere | Scanare nocturnă, probe de disponibilitate, mentenanță orară |
 
-Porturi noi ocupate: **8443** (nginx, public — configurabil), **8787** și
-**5432**, ambele legate pe `127.0.0.1`. Porturile 80 și 443 rămân ale
-serviciilor tale; detaliile mai jos.
+Porturi noi ocupate: **8443** (nginx, public — configurabil), **8787** legat pe
+`127.0.0.1`, și portul PostgreSQL: **5432 dacă e liber**, altfel primul port
+liber de deasupra lui. Instalatorul îl citește de la cluster după instalare și
+îl scrie în `sentinel.yaml` — nu îl presupune. Motivul e o gazdă reală pe care
+`0.0.0.0:5432` era deja ținut de un PostgreSQL dintr-un container cu
+`network_mode: host`: presupunerea ar fi legat Sentinel la baza altcuiva.
+Porturile 80 și 443 rămân ale serviciilor tale; detaliile mai jos.
 
 ### Două moduri de expunere — alege înainte de deploy
 
@@ -112,7 +116,7 @@ fișierele noastre, care e undo-ul complet și corect acolo.
 |---|---|---|
 | `8443/tcp` | public | Dashboard-ul (nginx, TLS). Configurabil cu `--web-port` |
 | `8787/tcp` | `127.0.0.1` | Aplicația (uvicorn) |
-| `5432/tcp` | `127.0.0.1` | PostgreSQL |
+| `5432/tcp` *(sau primul liber)* | `127.0.0.1` | PostgreSQL. Fixabil cu `--db-port` |
 
 **80 și 443 rămân ale serviciilor tale.** Sentinel nu le atinge: un agent de
 monitorizare care înlocuiește serviciul pe care îl monitorizează și-a inversat
