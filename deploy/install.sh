@@ -1464,18 +1464,27 @@ step_postgres() {
     local db_password="${SECRETS[SENTINEL_DB_PASSWORD]:-}"
     [[ -z "$db_password" ]] && die "SENTINEL_DB_PASSWORD was not supplied on stdin"
 
-    # The statement is fed on stdin, NOT via -c. psql only interpolates :'pw' for
+    # The statement is fed on stdin, NOT via -c: psql only interpolates :'pw' for
     # input read from stdin or a file; with -c it treats the string as
     # server-parsable SQL and passes :'pw' through literally, which the server
-    # then rejects with "syntax error at or near :". stdin keeps the password off
-    # any command line where `ps` could show it, which was the point of :'pw'.
+    # then rejects with "syntax error at or near :". The password itself is fed
+    # the SAME way — a `\set pw '...'` line on that same stdin, NOT `-v
+    # pw="$db_password"`, which puts it on psql's argv where `ps` and every
+    # execve audit rule can read it. That was the actual bug here: the comment
+    # already claimed the property this line now has, while `-v` quietly
+    # undid it — measured on the production host as 7 execve audit rules
+    # loaded, so every deploy wrote the password to audit.log.
+    # pg_psql_set_escape (deploy/lib/common.sh) does the quoting `\set`'s own
+    # argument grammar needs; see it for why the escaping order matters and
+    # how it was checked against a real server, not assumed.
+    local db_password_set; db_password_set="$(pg_psql_set_escape "$db_password")"
     if ! sudo -u postgres psql -p "$pg_port" -tAc "SELECT 1 FROM pg_roles WHERE rolname='sentinel'" | grep -q 1; then
-        printf "CREATE ROLE sentinel LOGIN PASSWORD :'pw';\n" \
-            | sudo -u postgres psql -p "$pg_port" -v ON_ERROR_STOP=1 -v pw="$db_password" >/dev/null
+        printf "%s\n" "\\set pw '${db_password_set}'" "CREATE ROLE sentinel LOGIN PASSWORD :'pw';" \
+            | sudo -u postgres psql -p "$pg_port" -v ON_ERROR_STOP=1 >/dev/null
         ok "role sentinel created"
     else
-        printf "ALTER ROLE sentinel PASSWORD :'pw';\n" \
-            | sudo -u postgres psql -p "$pg_port" -v ON_ERROR_STOP=1 -v pw="$db_password" >/dev/null
+        printf "%s\n" "\\set pw '${db_password_set}'" "ALTER ROLE sentinel PASSWORD :'pw';" \
+            | sudo -u postgres psql -p "$pg_port" -v ON_ERROR_STOP=1 >/dev/null
         ok "role sentinel password updated"
     fi
 

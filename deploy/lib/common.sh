@@ -520,6 +520,39 @@ pg_pick_free_port() {
     return 1
 }
 
+# Escapes a value for embedding as the argument of a psql `\set` meta-command,
+# so it can be fed on stdin instead of via `-v name=value` — which puts it on
+# psql's argv, where `ps` and every execve audit rule can read it. See
+# step_postgres in install.sh for why this exists.
+#
+# `\set` parses its own argument the way psql's meta-commands always do:
+# inside a single-quoted argument, backslash is itself the escape character,
+# so both a literal backslash and a literal quote need escaping — and the
+# ORDER matters whenever the value already has a backslash sitting right
+# before a quote (say, a password of `a\'b`). Escape the quote first and that
+# backslash-quote pair becomes backslash-backslash-quote, i.e. TWO backslashes
+# psql reads as one escaped backslash, followed by a now-UNESCAPED quote that
+# closes the argument early — everything after it (the rest of the password,
+# the closing quote this function's caller adds) is read as leftover text,
+# not part of pw. Doubling backslash FIRST avoids this: the pre-existing
+# backslash is already a doubled, self-contained pair before the quote-escape
+# step ever looks at the string, so it has nothing left to interact with.
+#
+# Verified against a running PostgreSQL server (not assumed): passwords
+# containing a single quote, a backslash and a dollar sign — including one
+# with a backslash immediately before a quote — round-trip byte for byte
+# through `\set` + `:'pw'` with this ordering. A DELIBERATELY broken version
+# (quote escaped before backslash was doubled) created the role with psql
+# reporting success while the actual stored password was silently wrong for
+# exactly that backslash-quote case — proof that a passing exit code here is
+# not proof of the right password, only a connection with the exact value is.
+pg_psql_set_escape() {
+    local v=$1
+    v=${v//\\/\\\\}
+    v=${v//\'/\\\'}
+    printf '%s' "$v"
+}
+
 mem_available_mb() {
     awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo
 }
