@@ -165,8 +165,74 @@ skipped rather than re-run. Drop one of the two flags."
 if [[ -n "$FROM_STEP" && ! "$FROM_STEP" =~ ^[0-9]+$ ]]; then
     die "--from-step: '${FROM_STEP}' is not a step number"
 fi
-if [[ -n "$DB_PORT_OVERRIDE" && ! "$DB_PORT_OVERRIDE" =~ ^[0-9]+$ ]]; then
-    die "--db-port: '${DB_PORT_OVERRIDE}' is not a port number"
+# 1024, not 1: PostgreSQL's own unit runs as the unprivileged `postgres`
+# user (see step_postgres's loopback-only pg_hba rules below), and binding
+# anything under 1024 needs CAP_NET_BIND_SERVICE or root — neither of which
+# that unit has. A port down there would never bind no matter how many
+# times step 22 retries, and the failure would only surface after
+# postgresql.conf had already been rewritten to it. Refusing it here, before
+# anything is touched, is cheaper than the restore-and-recover path
+# pg_ensure_listening has to run for every OTHER way this can fail.
+#
+# The regex requires the FIRST digit to be 1-9 and bounds the total length
+# to 4-5 digits — two separate traps, not one. A leading zero (`05432`)
+# would pass a plain [0-9]+ digit class and the range check both, but
+# step_postgres writes it into postgresql.conf verbatim and pg_wait_listening
+# hands it to `ss` verbatim too — both compare it as a STRING, and "05432"
+# never equals what a real cluster or a real socket reports as "5432". A
+# perfectly usable port would take the restore-and-recover path for nothing.
+# Separately, an unbounded digit string overflows bash's 64-bit `(( ))`
+# silently and can wrap back inside 1..65535 (measured: the 20-digit
+# 18446744073709557048 evaluates as 5432 under `(( ))` — "in range", not the
+# refusal its length deserves). Either bug would wave through a value nobody
+# could ever have meant.
+# Two more traps, found on the production host, in the two things above:
+# ASCII digits only, and acceptance as the narrow path instead of rejection.
+#
+# Measured on that host (bash 5.1.8 / glibc 2.34, LANG=en_US.UTF-8 — what
+# `sudo -n install.sh` actually runs under there): `[0-9]` inside `[[ =~ ]]`
+# is a regex BRACKET EXPRESSION, and glibc's regex engine treats it as a
+# locale COLLATING CLASS under a UTF-8 locale, not a literal byte range — it
+# matches fullwidth digits (U+FF10-FF19) and Arabic-Indic digits (U+0660-
+# 0669) too, because those collate as "digit" there. `[[:digit:]]` was
+# measured NOT to have this hole on that one glibc/locale combination, but it
+# is defined by the exact same locale tables — "didn't match today, here" is
+# a measurement of one host, not a guarantee for a different distro, a
+# different glibc, or this same host after a locale-data update, and this
+# file has already shipped one --db-port gate that was correct for every
+# input someone thought to try. LC_ALL=C is not a measurement: POSIX
+# requires the C locale to define bracket expressions and classes as literal
+# ASCII, unconditionally. It is scoped to a subshell — not `export` — so
+# nothing past this line runs under a changed locale.
+#
+# The accept path is also now the narrow one. This is the second guard, and
+# its scope is exact: it catches the collating-class hole — any glyph that a
+# locale collates as a digit still makes `10#` ERROR — but NOT arbitrary
+# text. With the character check widened to `.+`, "5432 || 1" is ACCEPTED,
+# because arithmetic precedence makes `10#5432 || 1` true. Measured on the
+# host and locally. So the load-bearing guard is LC_ALL=C above; the chain
+# below is the net for exactly the class LC_ALL=C is meant to exclude. The old shape was `[[ bad ]] || (( out_of_range )); then die` — and
+# a fullwidth digit that survives the character check does not make
+# `(( 10#$v ... ))` cleanly false, it makes bash ERROR ("invalid integer
+# constant"). That error still returns exit status 1, IDENTICAL to a clean
+# false, so `||` cannot tell them apart and reads "not out of range" — the
+# value is waved through. Measured on the host: rc=0, ACCEPTED, continued.
+# Below, acceptance requires the WHOLE `&&` chain to succeed on purpose: a
+# regex match AND a clean in-range comparison. A value that makes the
+# arithmetic error out is now indistinguishable from one that is cleanly out
+# of range — both land in the `else`, which is `die` — instead of both
+# looking like success.
+_db_port_is_usable() {
+    local v="$1"
+    ( LC_ALL=C
+      [[ "$v" =~ ^[1-9][0-9]{3,4}$ ]] && (( 10#$v >= 1024 && 10#$v <= 65535 )) )
+}
+if [[ -n "$DB_PORT_OVERRIDE" ]]; then
+    if ! _db_port_is_usable "$DB_PORT_OVERRIDE"; then
+        die "--db-port: '${DB_PORT_OVERRIDE}' is not a usable PostgreSQL port — needs to be \
+1024-65535, ASCII digits only, no leading zero (below 1024 needs root; PostgreSQL's own unit \
+does not run as root)"
+    fi
 fi
 parse_force_steps "$FORCE_STEP"
 assert_force_steps_exist "${BASH_SOURCE[0]}"
@@ -1302,6 +1368,50 @@ PG_RESOLVED_PORT=""
 # threading a 4th argument through step_postgres. Production never sets it.
 PG_LISTEN_TIMEOUT_S=15
 
+# Restoring postgresql.conf to the port it held before this run touched it is
+# not restoring the database — a live cluster does not re-read its config
+# file on its own, and CLAUDE.md's own `systemctl reload nginx` row is exactly
+# this: the signal reported success while the thing it was meant to change
+# never took effect. This is what puts the cluster BACK: rewrite the config
+# (a no-op if it already matches), restart, and wait for a REAL bind on
+# $2 — the same `pg_wait_listening` every other path here is judged by, never
+# the restart's own exit code.
+#
+# Returns 0 only once $2 is confirmed listening again. Returns 1, and prints
+# nothing itself, when it is not — the caller decides how loud to be about
+# that, because "the previous port came back" and "PostgreSQL is now down and
+# nothing brought it back" are different die() messages, not the same one
+# with a config line quietly wrong underneath it.
+#
+# The restart itself is skipped, not the config write, when restore_port is
+# already confirmed listening: when the port this run was actually asked
+# for was held by a stranger, pg_ensure_listening's own primary path never
+# restarts the cluster (a stranger holding the port stays held through a
+# restart, see the comment above pg_ensure_listening) — so by the time a
+# die() path calls this, the cluster can already be sitting exactly on
+# restore_port, untouched. Restarting it anyway would be the same
+# production-database downtime CLAUDE.md warns about, spent confirming a
+# fact that was already true. The config line still gets fixed either way —
+# see below — because that mismatch is possible independently of whether
+# the cluster itself ever moved.
+pg_restore_to() {
+    local pgconf="$1" restore_port="$2" timeout="$3"
+    # The config write happens regardless of what is already listening: a
+    # cluster that never left restore_port does not excuse postgresql.conf
+    # still naming the port this run tried and failed on — that mismatch is
+    # exactly the time-bomb the comment above pg_ensure_listening warns
+    # about, waiting for the next unrelated restart to act on it.
+    [[ "$restore_port" == "$(pg_configured_port "$pgconf")" ]] || \
+        pg_set_port "$pgconf" "$restore_port"
+    # Only the restart is conditional: skip it when the cluster is already
+    # confirmed listening on restore_port, so a stranger holding the
+    # explicitly requested port (which pg_ensure_listening's primary path
+    # never restarts for) does not cost a second restart here for nothing.
+    pg_wait_listening "$restore_port" 1 && return 0
+    systemctl restart postgresql >/dev/null 2>&1 || true
+    pg_wait_listening "$restore_port" "$timeout"
+}
+
 # Makes PostgreSQL actually listen on $2 (config dir $1), or dies with a
 # diagnostic that names what to run next — never returns having merely tried
 # and hoped. $3 non-empty means $2 came from --db-port: an explicit request is
@@ -1353,13 +1463,22 @@ pg_ensure_listening() {
         # A die() here must not leave postgresql.conf naming a port the
         # cluster is not actually on — the live cluster would move there on
         # its own at the next unrelated restart or reboot while
-        # sentinel.yaml still names the old one. restore_port is a no-op
-        # when nothing was changed, or already matches what's on disk.
-        if [[ -n "$restore_port" && "$restore_port" != "$(pg_configured_port "$pgconf")" ]]; then
-            pg_set_port "$pgconf" "$restore_port"
+        # sentinel.yaml still names the old one. But rewriting the file is
+        # not enough either (see pg_restore_to): a typo'd --db-port on a host
+        # where the cluster was already up and running must not leave it
+        # DOWN just because the config line looks right again.
+        local tail="Inspect:  journalctl -u postgresql -n 50 --no-pager"
+        if [[ -n "$restore_port" ]]; then
+            if pg_restore_to "$pgconf" "$restore_port" "$timeout"; then
+                tail="postgresql.conf and the running cluster are both back on the \
+previous port ${restore_port}. ${tail}"
+            else
+                tail="restoring postgresql.conf to the previous port ${restore_port} did \
+NOT bring the cluster back up — PostgreSQL is DOWN. Inspect immediately:  \
+journalctl -u postgresql -n 50 --no-pager"
+            fi
         fi
-        die "PostgreSQL did not come up listening on --db-port ${port}. \
-Inspect:  journalctl -u postgresql -n 50 --no-pager"
+        die "PostgreSQL did not come up listening on --db-port ${port}. ${tail}"
     fi
     if port_free "$port"; then
         die "PostgreSQL service did not start, and port ${port} is free — \
@@ -1378,11 +1497,19 @@ connecting to whatever that is."
         PG_RESOLVED_PORT="$new_port"
         return 0
     fi
-    if [[ -n "$restore_port" && "$restore_port" != "$(pg_configured_port "$pgconf")" ]]; then
-        pg_set_port "$pgconf" "$restore_port"
+    local tail="Inspect:  journalctl -u postgresql -n 50 --no-pager"
+    if [[ -n "$restore_port" ]]; then
+        if pg_restore_to "$pgconf" "$restore_port" "$timeout"; then
+            tail="postgresql.conf and the running cluster are both back on the \
+previous port ${restore_port}. ${tail}"
+        else
+            tail="restoring postgresql.conf to the previous port ${restore_port} did NOT \
+bring the cluster back up — PostgreSQL is DOWN. Inspect immediately:  \
+journalctl -u postgresql -n 50 --no-pager"
+        fi
     fi
     die "PostgreSQL still not listening on ${new_port} after moving off \
-the conflicting port ${occupant:-unknown}. Inspect:  journalctl -u postgresql -n 50 --no-pager"
+the conflicting port ${occupant:-unknown}. ${tail}"
 }
 
 # --- 22 -------------------------------------------------------------------

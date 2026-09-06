@@ -149,6 +149,15 @@ param(
     # address you connected from — which is what you want unless you administer
     # from a different address than you deploy from.
     [string]$AdminIp,
+    # 1024-65535, matching deploy/install.sh's own --db-port validation
+    # exactly: below 1024 needs root, and PostgreSQL's own unit does not run
+    # as root. Bound only when the operator actually passes -DbPort — the
+    # unset default of 0 never reaches this attribute, so a run that omits
+    # the flag is unaffected. -DbPort 0 used to slip past `if ($DbPort)`
+    # silently (0 is falsy) and the run proceeded as if nothing had been
+    # asked for; ValidateRange now refuses it the same way install.sh does,
+    # before anything on the host is touched.
+    [ValidateRange(1024, 65535)]
     [int]$DbPort,
     [int]$FromStep,
     # [string[]], not [string], and that is not a style choice. In argument mode

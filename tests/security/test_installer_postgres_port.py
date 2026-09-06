@@ -136,6 +136,189 @@ def _conn_check_snippet() -> str:
 
 
 # ---------------------------------------------------------------------------
+# --db-port — refuzat înainte ca postgresql.conf să fie atins
+#
+# Vechiul regex, `^[0-9]+$`, accepta orice șir de cifre: 0, 70000, un port
+# sub 1024 (PostgreSQL nu rulează ca root, deci n-ar lega-o niciodată) — toate
+# treceau de validare, iar eșecul apărea abia în step_postgres, DUPĂ ce
+# postgresql.conf fusese deja rescris. Verificatorul a măsurat exact asta cu
+# `DB_PORT_OVERRIDE=70000`: portul scris în fișier, clusterul oprit, nimic
+# repornit pe portul vechi.
+#
+# Runda 2 a verificatorului a găsit ALTE două găuri, tot cu dovadă măsurată:
+# `^[0-9]{1,5}$` accepta zerouri la stânga — "05432" trece de validare, dar
+# step_postgres și pg_wait_listening îl compară ca ȘIR cu ce raportează `ss`
+# ("5432", niciodată "05432"), deci un port perfect valid ar fi luat drumul
+# de restore-and-recover degeaba (măsurat cu `iproute2-6.17.0`: `ss -tlnH
+# "sport = :05432"` nu potrivește un socket real ascultând pe 5432). Și
+# limita de 5 cifre, luată separat de verificarea de interval, nu era
+# niciodată exercitată de o valoare care chiar dă peste cap — testul vechi
+# folosea un șir de 20 de nouă care rămâne în afara intervalului și după ce
+# `(( ))` îl evaluează, deci era refuzat oricum de verificarea de interval,
+# nu de limita de lungime.
+#
+# Runda 4 a verificatorului a găsit a treia gaură, MĂSURATĂ pe gazda de
+# producție (bash 5.1.8 / glibc 2.34 / LANG=en_US.UTF-8): `[0-9]` într-un
+# `[[ =~ ]]` acolo e o clasă de colaționare pe LOCALE, nu un interval de
+# octeți — admite cifre fullwidth (１２３ …) și indo-arabe (١٢٣ …). Regexul
+# le lăsa să treacă, iar `(( 10#$v ... ))` arunca o eroare de sintaxă
+# aritmetică pe ele — eroare pe care `||` o citea IDENTIC cu "fals", deci ca
+# "nu-i în afara intervalului": ACCEPTED, măsurat cu rc=0 pe gazdă. Blocul
+# livrat acum: (1) rulează comparația sub LC_ALL=C într-un subshell, ca
+# regexul să însemne exact octeții ASCII, indiferent de LANG-ul procesului
+# care pornește instalarea; (2) inversează lanțul — acceptarea cere TOATĂ
+# conjuncția `&&` (regex ȘI aritmetică), nu doar absența unui refuz `||` — ca
+# o eroare aritmetică să nu mai poată fi confundată cu un "fals" curat.
+# Testele de mai jos verifică ambele, separat: seria de valori bune/rele de
+# mai jos rulează blocul livrat neatins; cea de sub, cu regexul deliberat
+# lărgit ca să simuleze exact gaura de colaționare măsurată pe gazdă, verifică
+# doar conjuncția `&&` — proprietatea care nu depinde de locale-ul cu care
+# rulează pytest aici (msys), unde cifrele fullwidth oricum n-ar trece de
+# `[0-9]`, deci n-ar dovedi nimic despre gazdă.
+# ---------------------------------------------------------------------------
+def _db_port_validation_snippet() -> str:
+    """Extrage blocul de validare LIVRAT din install.sh — funcția
+    `_db_port_is_usable` plus `if`-ul care o apelează — nu o retranscriere.
+    Poziția lui în fișier (înaintea lui need_root și a pasului 22) e dovedită
+    separat, prin index, în
+    test_db_port_validation_runs_before_need_root_and_before_step_22."""
+    start = INSTALL.index("_db_port_is_usable() {")
+    end = INSTALL.index("\nfi\n", start) + len("\nfi")
+    snippet = INSTALL[start:end]
+    assert "1024" in snippet and "65535" in snippet and "LC_ALL=C" in snippet
+    return snippet
+
+
+@pytest.mark.parametrize("bad_port", [
+    "0",                       # cerința explicită: zero nu e niciodată o cerere validă
+    "80",                      # sub 1024 — PostgreSQL nu rulează ca root
+    "1023",                    # limita de jos, exclusă
+    "70000",                   # EXACT valoarea cu care a lucrat verificatorul
+    "65536",                   # limita de sus, cu unu peste
+    "abc",                     # nenumeric — comportamentul vechi, păstrat
+    "05432",                   # zero la stânga — 5432 e valid, dar STRING-ul nu e "5432"
+    "01024",                   # aceeași gaură la limita de jos a intervalului
+    "99999999999999999999",    # foarte lung — refuzat oricum de verificarea de interval
+    "18446744073709557048",    # măsurat: `(( ))` îl evaluează la 5432 — ÎN interval, tăcut
+])
+def test_db_port_validation_refuses_unusable_values_before_anything_is_written(tmp_path, bad_port):
+    """Niciuna dintre valorile astea n-are cum să asculte vreodată pe gazda
+    reală. Rulează blocul LIVRAT (nu o reimplementare): dacă refuză, `die` a
+    fost apelat înainte ca vreo comandă din script să fi atins un fișier —
+    blocul de mai jos nu conține nicio scriere, deci un refuz aici e prin
+    construcție un refuz dinainte de orice atingere a lui postgresql.conf."""
+    script = (
+        'die() { printf "DIE:%s\\n" "$*" >&2; exit 1; }\n'
+        f'DB_PORT_OVERRIDE="{bad_port}"\n'
+        + _db_port_validation_snippet() + "\n"
+        "echo ACCEPTED\n"
+    )
+    proc = _run(script, tmp_path)
+    assert proc.returncode != 0, proc.stdout
+    assert "ACCEPTED" not in proc.stdout
+    assert "DIE:" in proc.stderr, proc.stderr
+
+
+@pytest.mark.parametrize("good_port", ["1024", "5432", "5433", "65535"])
+def test_db_port_validation_accepts_the_usable_range(tmp_path, good_port):
+    """Nicio schimbare de comportament pentru un port pe care clusterul chiar
+    poate să-l lege — 5432 și 5433 sunt valorile reale văzute pe gazdele
+    existente."""
+    script = (
+        'die() { printf "DIE:%s\\n" "$*" >&2; exit 1; }\n'
+        f'DB_PORT_OVERRIDE="{good_port}"\n'
+        + _db_port_validation_snippet() + "\n"
+        "echo ACCEPTED\n"
+    )
+    proc = _run(script, tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert "ACCEPTED" in proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# Runda 4: conjuncția `&&` refuză, nu doar absența unui refuz `||`.
+#
+# Nu se poate reproduce local (msys) gaura de colaționare pe care a măsurat-o
+# verificatorul pe gazdă: acolo, cifrele fullwidth/indo-arabe NU trec de
+# `[0-9]` sub NICIUN locale disponibil aici, deci un test parametrizat cu
+# "５４３２" ar ieși verde din motivul GREȘIT — n-ar dovedi nimic despre
+# gazdă, exact avertismentul din raport. Ce SE poate dovedi local, și e
+# proprietatea care contează independent de locale: dacă o valoare reușește
+# totuși să treacă de verificarea de caracter, aritmetica tot refuză, nu
+# acceptă tăcut o eroare ca pe un "fals" curat.
+#
+# `_db_port_is_usable_WIDENED_REGEX` ia funcția LIVRATĂ și-i lărgește DOAR
+# regexul (`^[1-9][0-9]{3,4}$` → `^.+$`) — simulează exact gaura măsurată pe
+# gazdă, unde caracterul de netrecut ajunge oricum la `(( ))`. Restul
+# funcției (LC_ALL=C, subshell-ul, conjuncția `&&`) rămâne NEATINS. Dacă
+# blocul livrat ar fi tot cu vechiul `||`, testul ăsta ar arăta ACCEPTED —
+# vezi falsificarea din raport, unde exact asta s-a văzut cu forma veche.
+# ---------------------------------------------------------------------------
+def _db_port_is_usable_widened_regex() -> str:
+    """Funcția LIVRATĂ `_db_port_is_usable`, cu regexul de caractere înlocuit
+    cu `.+` — simulează gaura de colaționare măsurată pe gazdă (un caracter
+    care nu e cifră ASCII, dar trece de verificarea de caracter), ca să
+    izoleze proprietatea care nu depinde de locale-ul de aici: conjuncția
+    `&&` refuză o valoare pe care aritmetica n-o poate evalua curat."""
+    func = _func(INSTALL, "_db_port_is_usable")
+    original = '[[ "$v" =~ ^[1-9][0-9]{3,4}$ ]]'
+    widened = '[[ "$v" =~ ^.+$ ]]'
+    assert original in func, "regexul de caractere nu mai are forma așteptată"
+    widened_func = func.replace(original, widened)
+    assert widened_func != func and widened in widened_func
+    return widened_func
+
+
+@pytest.mark.parametrize("hole_value", [
+    "५४३२",   # cifre Devanagari — orice glif ne-ASCII care ar trece de un `.+`
+    "----",   # orice altceva care nu e deloc numeric
+])
+def test_db_port_arithmetic_rejects_a_value_that_survives_a_widened_character_check(
+        tmp_path, hole_value):
+    """Dacă VREUN caracter din afara ASCII 0-9 ar reuși cumva să treacă de
+    verificarea de caracter (regexul lărgit de mai sus simulează exact asta),
+    conjuncția `&&` LIVRATĂ tot refuză: `(( 10#$v ... ))` nu poate evalua
+    curat un caracter care nu e cifră, eroarea iese pe stderr, iar funcția
+    întoarce fals. Cu forma VECHE (`||`), aceeași eroare era citită ca „nu-i
+    în afara intervalului" și valoarea trecea — asta e bug-ul măsurat pe
+    gazdă, reprodus aici prin regexul lărgit, nu prin locale."""
+    script = (
+        'die() { printf "DIE:%s\\n" "$*" >&2; exit 1; }\n'
+        + _db_port_is_usable_widened_regex() + "\n"
+        f'if _db_port_is_usable "{hole_value}"; then echo ACCEPTED; else echo REJECTED; fi\n'
+    )
+    proc = _run(script, tmp_path)
+    assert "REJECTED" in proc.stdout, \
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    assert "ACCEPTED" not in proc.stdout
+
+
+def test_db_port_arithmetic_still_accepts_a_real_port_through_the_widened_check(tmp_path):
+    """Contra-proba: regexul lărgit nu trebuie să strice și cazul bun — un
+    port ASCII real tot trece, fiindcă aritmetica pe el chiar e curată. Fără
+    testul ăsta, un `&&` scris greșit ar putea refuza TOTUL, nu doar gaura,
+    și n-ar fi prins."""
+    script = (
+        'die() { printf "DIE:%s\\n" "$*" >&2; exit 1; }\n'
+        + _db_port_is_usable_widened_regex() + "\n"
+        'if _db_port_is_usable "5432"; then echo ACCEPTED; else echo REJECTED; fi\n'
+    )
+    proc = _run(script, tmp_path)
+    assert "ACCEPTED" in proc.stdout, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+
+
+def test_db_port_validation_runs_before_need_root_and_before_step_22():
+    """Nu doar comportamentul, ci și LOCUL lui în fișier: un refuz care ar
+    ajunge după `need_root` sau după pasul 22 ar însemna că instalarea a
+    apucat deja să ceară privilegii de root sau să scrie ceva pe gazdă
+    înainte de a descoperi că portul cerut e inutilizabil."""
+    start = INSTALL.index("_db_port_is_usable() {")
+    need_root_at = INSTALL.index("\nneed_root\n")
+    step22_at = INSTALL.index("run_step 22 postgres")
+    assert start < need_root_at < step22_at
+
+
+# ---------------------------------------------------------------------------
 # pg_configured_port — citit de pe mașină, nu presupus
 # ---------------------------------------------------------------------------
 def test_debian_asks_pg_lsclusters_not_the_config_file(tmp_path):
@@ -375,6 +558,136 @@ def test_wait_listening_times_out_when_the_port_stays_free(tmp_path):
 # "varianta stricată" trăiește doar în acest fișier. Falsificarea reală a
 # proprietății e deja `test_wait_listening_does_not_mistake_a_strangers_port_
 # for_success` de mai sus, care rulează `pg_wait_listening` LIVRATĂ.
+
+
+# ---------------------------------------------------------------------------
+# pg_restore_to — un fișier restaurat nu e o bază de date restaurată
+#
+# Rundele anterioare rescriau postgresql.conf înapoi pe portul vechi la un
+# eșec și se opreau acolo — dovada era o LINIE din fișier, niciodată un socket
+# ascultat. Un cluster care nu mai pornea din NICIUN motiv (nu doar portul
+# cerut) rămânea oprit sub o configurație care „arăta" corectă. Testele de
+# mai jos rulează `pg_restore_to` LIVRATĂ, cu o momeală `systemctl` ONESTĂ:
+# `restart` OPREȘTE întâi legarea curentă (fișierul `bound` e golit), apoi o
+# reface DOAR dacă portul din postgresql.conf e cel pe care clusterul chiar
+# poate să-l lege — spre deosebire de vechea momeală optimistă din alte
+# teste ale acestui fișier, care lăsa legarea veche neatinsă indiferent de
+# ce se cerea și ar fi ascuns exact defectul ăsta.
+# ---------------------------------------------------------------------------
+def _honest_restart_stub(binpath: Path, calls: Path, bound: Path, pgconf_posix: str,
+                          bindable_port: str) -> None:
+    """`restart` OPREȘTE (bound golit) apoi PORNEȘTE doar dacă postgresql.conf
+    cere exact `bindable_port` — un restart real nu lasă legarea veche pe loc
+    doar pentru că cea nouă a eșuat."""
+    _stub(binpath, "systemctl", f"""
+printf '%s\\n' "$*" >> "{calls.as_posix()}"
+cur="$(grep -E '^port' "{pgconf_posix}/postgresql.conf" | tail -1 | grep -oE '[0-9]+')"
+case "$1" in
+    enable)
+        [ -s "{bound.as_posix()}" ] && exit 0
+        [ "$cur" = "{bindable_port}" ] && printf '%s\\n' "$cur" > "{bound.as_posix()}"
+        ;;
+    restart)
+        : > "{bound.as_posix()}"
+        [ "$cur" = "{bindable_port}" ] && printf '%s\\n' "$cur" > "{bound.as_posix()}"
+        ;;
+esac
+exit 0
+""")
+
+
+def _pg_restore_to_harness(tmp_path: Path, *, written_port: str, bindable_port: str
+                           ) -> tuple[subprocess.CompletedProcess, Path, Path]:
+    pgconf = tmp_path / "pgdata"
+    _write_conf(pgconf, f"port = {written_port}")
+    pgconf_posix = str(pgconf).replace("\\", "/")
+    binpath = tmp_path / "bin"
+    calls = tmp_path / "systemctl-calls.log"
+    bound = tmp_path / "bound-port"
+    calls.write_text("", encoding="utf-8", newline="\n")
+    bound.write_text("", encoding="utf-8", newline="\n")
+    _honest_restart_stub(binpath, calls, bound, pgconf_posix, bindable_port)
+
+    script = (
+        "set -euo pipefail\n"
+        "source ./lib/common.sh\n"
+        "source ./lib/distro.sh\n"
+        f'BOUND_FILE="{bound.as_posix()}"\n'
+        'port_free() { [[ "$(cat "$BOUND_FILE")" == "$1" ]] && return 1; return 0; }\n'
+        'port_owner_unit() { [[ "$(cat "$BOUND_FILE")" == "$1" ]] && printf "postgresql@16-main.service"; }\n'
+        + _func(INSTALL, "pg_restore_to") + "\n"
+        f'pg_restore_to "{pgconf_posix}" 5433 1 && echo RECOVERED || echo FAILED\n'
+    )
+    proc = _run(script, tmp_path, extra_path=binpath)
+    return proc, pgconf, bound
+
+
+def test_pg_restore_to_confirms_a_real_bind_not_just_the_config_write(tmp_path):
+    """5433 e chiar portul pe care clusterul ONEST poate să-l lege — restart
+    real, legare reală. Dovada nu e doar `port = 5433` în fișier, ci fișierul
+    `bound` (socketul simulat) arătând, la final, chiar 5433."""
+    proc, pgconf, bound = _pg_restore_to_harness(
+        tmp_path, written_port="5440", bindable_port="5433")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "RECOVERED" in proc.stdout, proc.stdout
+    assert (pgconf / "postgresql.conf").read_text(encoding="utf-8").count("port = 5433") == 1
+    assert bound.read_text(encoding="utf-8").strip() == "5433"
+
+
+def test_pg_restore_to_reports_failure_when_the_restart_does_not_rebind(tmp_path):
+    """Clusterul e stricat pentru un motiv NELEGAT de port (WAL corupt, disc
+    plin) — nici portul vechi nu se mai leagă. `pg_restore_to` trebuie să
+    întoarcă eșec, nu succes doar fiindcă a scris fișierul corect: config-ul
+    corect și serviciul oprit sunt DOUĂ fapte diferite, iar apelantul are
+    nevoie să le distingă ca să nu raporteze o recuperare care n-a avut loc."""
+    proc, pgconf, bound = _pg_restore_to_harness(
+        tmp_path, written_port="5440", bindable_port="")  # nimic nu se leagă, niciodată
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "FAILED" in proc.stdout, proc.stdout
+    assert (pgconf / "postgresql.conf").read_text(encoding="utf-8").count("port = 5433") == 1, \
+        "fișierul trebuie restaurat chiar dacă legarea reală eșuează"
+    assert bound.read_text(encoding="utf-8").strip() == "", \
+        "pg_restore_to a raportat succes fără niciun socket ascultat pe portul restaurat"
+
+
+def test_pg_restore_to_is_a_noop_when_the_cluster_never_left_the_previous_port(tmp_path):
+    """Cerința „worth fixing" a raportului rundei 2: când portul cerut
+    EXPLICIT era ținut de un străin, calea principală din pg_ensure_listening
+    refuză corect să repornească (un străin ține portul și după un restart) —
+    deci clusterul nostru poate fi tot timpul, neatins, pe restore_port când
+    ajunge aici. `pg_restore_to` nu are voie să-l repornească doar ca să
+    confirme ce e deja adevărat: măsurat, o repornire aici înseamnă câteva
+    secunde de indisponibilitate a bazei de producție pentru nimic. Momeala e
+    ONESTĂ (`_honest_restart_stub`), deci un `restart` care CHIAR a avut loc
+    ar apărea în jurnalul `calls` la fel ca în celelalte teste din secțiunea
+    asta — absența lui e dovada, nu o presupunere."""
+    pgconf = tmp_path / "pgdata"
+    _write_conf(pgconf, "port = 5440")  # step_postgres scrisese deja ținta cerută explicit
+    pgconf_posix = str(pgconf).replace("\\", "/")
+    binpath = tmp_path / "bin"
+    calls = tmp_path / "systemctl-calls.log"
+    bound = tmp_path / "bound-port"
+    calls.write_text("", encoding="utf-8", newline="\n")
+    bound.write_text("5433", encoding="utf-8", newline="\n")  # clusterul, NEATINS, tot pe 5433
+    _honest_restart_stub(binpath, calls, bound, pgconf_posix, bindable_port="5433")
+
+    script = (
+        "set -euo pipefail\n"
+        "source ./lib/common.sh\n"
+        "source ./lib/distro.sh\n"
+        f'BOUND_FILE="{bound.as_posix()}"\n'
+        'port_free() { [[ "$(cat "$BOUND_FILE")" == "$1" ]] && return 1; return 0; }\n'
+        'port_owner_unit() { [[ "$(cat "$BOUND_FILE")" == "$1" ]] && printf "postgresql@16-main.service"; }\n'
+        + _func(INSTALL, "pg_restore_to") + "\n"
+        f'pg_restore_to "{pgconf_posix}" 5433 1 && echo RECOVERED || echo FAILED\n'
+    )
+    proc = _run(script, tmp_path, extra_path=binpath)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "RECOVERED" in proc.stdout, proc.stdout
+    assert "restart" not in calls.read_text(encoding="utf-8"), \
+        "clusterul era deja pe portul vechi — o repornire aici e indisponibilitate degeaba"
+    assert bound.read_text(encoding="utf-8").strip() == "5433"
+    assert (pgconf / "postgresql.conf").read_text(encoding="utf-8").count("port = 5433") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -621,6 +934,7 @@ def test_explicit_db_port_failure_restores_the_previous_port_line(tmp_path):
         'port_free() { return 0; }\n'          # 5440 rămâne mereu liber — nimic nu pornește
         'port_owner_unit() { printf ""; }\n'
         'port_owner() { printf ""; }\n'
+        + _func(INSTALL, "pg_restore_to") + "\n"
         + _func(INSTALL, "pg_ensure_listening") + "\n"
         f'pg_set_port "{pgconf_posix}" 5440\n'
         'pg_ensure_listening '
@@ -632,6 +946,188 @@ def test_explicit_db_port_failure_restores_the_previous_port_line(tmp_path):
     assert "port = 5433" in text, \
         f"portul vechi n-a fost restaurat după eșec: {text!r}"
     assert text.count("port =") == 1, f"linie duplicată după restaurare: {text!r}"
+    assert "PostgreSQL is DOWN" in proc.stderr, \
+        "port_free() întoarce mereu adevărat aici — restaurarea nu poate lega nimic, " \
+        "deci mesajul trebuie să spună răspicat că baza a rămas oprită, nu doar că " \
+        "fișierul a fost pus înapoi"
+
+
+# ---------------------------------------------------------------------------
+# Cerința 2 a acestei rapoarte: un fișier restaurat nu e o bază repornită.
+# Aceleași două scenarii ca mai sus (pg_restore_to), dar prin
+# `pg_ensure_listening` ÎNTREGĂ — dovada care contează pentru operator e
+# mesajul die() pe care-l vede, nu funcția izolată.
+# ---------------------------------------------------------------------------
+def test_explicit_db_port_failure_recovers_the_cluster_onto_the_previous_port(tmp_path):
+    """Scenariul din raportul verificatorului, cu o momeală `systemctl` ONESTĂ
+    (restart chiar oprește legarea veche înainte s-o refacă — spre deosebire
+    de test_step_postgres_die_restores_the_port_when_the_cluster_never_
+    rebinds, a cărei momeală ține 5433 legat orice s-ar chema): clusterul e
+    deja activ pe 5433, operatorul tastează greșit --db-port 5440, portul nou
+    nu se leagă NICIODATĂ, dar 5433 tot poate — deci baza trebuie să rămână
+    (sau să redevină) ACCESIBILĂ, nu doar cu fișierul pus la loc."""
+    pgconf = tmp_path / "pgdata"
+    _write_conf(pgconf, "port = 5440")  # step_postgres a rescris-o deja când apelează
+    pgconf_posix = str(pgconf).replace("\\", "/")
+    binpath = tmp_path / "bin"
+    calls = tmp_path / "systemctl-calls.log"
+    bound = tmp_path / "bound-port"
+    calls.write_text("", encoding="utf-8", newline="\n")
+    bound.write_text("5433", encoding="utf-8", newline="\n")  # activ pe 5433 înainte de acest apel
+    _honest_restart_stub(binpath, calls, bound, pgconf_posix, bindable_port="5433")
+
+    script = (
+        "set -euo pipefail\n"
+        "source ./lib/common.sh\n"
+        "source ./lib/distro.sh\n"
+        f'BOUND_FILE="{bound.as_posix()}"\n'
+        'port_free() { [[ "$(cat "$BOUND_FILE")" == "$1" ]] && return 1; return 0; }\n'
+        'port_owner_unit() { [[ "$(cat "$BOUND_FILE")" == "$1" ]] && printf "postgresql@16-main.service"; }\n'
+        'port_owner() { printf "postgres"; }\n'
+        + _func(INSTALL, "pg_restore_to") + "\n"
+        + _func(INSTALL, "pg_ensure_listening") + "\n"
+        f'pg_ensure_listening "{pgconf_posix}" 5440 "1" 1 5433 || true\n'
+    )
+    proc = _run(script, tmp_path, extra_path=binpath)
+    assert proc.returncode != 0, proc.stdout  # cererea EXPLICITĂ tot eșuează — 5440 n-a mers
+    assert "back on the previous port 5433" in proc.stderr, proc.stderr
+    assert "DOWN" not in proc.stderr, proc.stderr
+    assert bound.read_text(encoding="utf-8").strip() == "5433", \
+        "cererea a eșuat, dar clusterul trebuia să rămână ascultat pe portul vechi — " \
+        "dovada e un socket, nu doar o linie din postgresql.conf"
+    assert (pgconf / "postgresql.conf").read_text(encoding="utf-8").count("port = 5433") == 1
+
+
+def test_explicit_db_port_failure_and_recovery_both_fail_says_database_is_down(tmp_path):
+    """Contra-exemplul: clusterul nu mai pornește pe NICIUN port — un motiv
+    nelegat de --db-port (WAL corupt, disc plin). Mesajul nu are voie să
+    sugereze că portul vechi a revenit doar fiindcă fișierul arată corect;
+    asta e exact confuzia pe care CLAUDE.md o numește „confirmarea intenției
+    în locul efectului"."""
+    pgconf = tmp_path / "pgdata"
+    _write_conf(pgconf, "port = 5440")
+    pgconf_posix = str(pgconf).replace("\\", "/")
+    binpath = tmp_path / "bin"
+    calls = tmp_path / "systemctl-calls.log"
+    bound = tmp_path / "bound-port"
+    calls.write_text("", encoding="utf-8", newline="\n")
+    bound.write_text("5433", encoding="utf-8", newline="\n")
+    _honest_restart_stub(binpath, calls, bound, pgconf_posix, bindable_port="")  # nimic nu se leagă
+
+    script = (
+        "set -euo pipefail\n"
+        "source ./lib/common.sh\n"
+        "source ./lib/distro.sh\n"
+        f'BOUND_FILE="{bound.as_posix()}"\n'
+        'port_free() { [[ "$(cat "$BOUND_FILE")" == "$1" ]] && return 1; return 0; }\n'
+        'port_owner_unit() { [[ "$(cat "$BOUND_FILE")" == "$1" ]] && printf "postgresql@16-main.service"; }\n'
+        'port_owner() { printf "postgres"; }\n'
+        + _func(INSTALL, "pg_restore_to") + "\n"
+        + _func(INSTALL, "pg_ensure_listening") + "\n"
+        f'pg_ensure_listening "{pgconf_posix}" 5440 "1" 1 5433 || true\n'
+    )
+    proc = _run(script, tmp_path, extra_path=binpath)
+    assert proc.returncode != 0, proc.stdout
+    assert "PostgreSQL is DOWN" in proc.stderr, proc.stderr
+    # Fapta observabilă contează, iar aici sunt DOUĂ fapte diferite: fișierul
+    # e corect, socketul nu există. Mesajul trebuie să le distingă, nu doar
+    # fișierul.
+    assert (pgconf / "postgresql.conf").read_text(encoding="utf-8").count("port = 5433") == 1
+
+
+# ---------------------------------------------------------------------------
+# Cerința 3 a raportului rundei 2: al DOILEA drum de moarte din
+# pg_ensure_listening — cel fără --db-port explicit, când portul ȚINTĂ e al
+# unui străin și pg_pick_free_port mută clusterul singur — apelează
+# pg_restore_to la fel ca primul, dar nimic din testele de mai sus nu-l
+# rulează: un `test_pg_restore_to_is_wired_into_both_die_paths` bazat pe
+# regex vede APELUL, nu dacă REZULTATUL lui ajunge în mesajul die().
+# Aceleași două scenarii ca la calea explicită, pe acest drum.
+# ---------------------------------------------------------------------------
+def _auto_move_failure_harness(tmp_path: Path, *, recovers: bool
+                               ) -> tuple[subprocess.CompletedProcess, Path, Path]:
+    """5432 e ținut PERMANENT de un străin — un container fără niciun pachet
+    postgresql instalat, nu clusterul nostru — deci `pg_pick_free_port` alege
+    automat 5433. Clusterul nu poate lega NICIUN port nou (WAL corupt, disc
+    plin): 5433 nu se leagă niciodată, indiferent de `recovers`. 5544 e portul
+    pe care clusterul chiar rula, sănătos, ÎNAINTE ca acest apel să atingă
+    ceva; `recovers` alege dacă acel port vechi mai poate fi legat la
+    restaurare sau dacă e stricat și el."""
+    pgconf = tmp_path / "pgdata"
+    _write_conf(pgconf, "port = 5432")  # ținta pe care step_postgres o dorea
+    pgconf_posix = str(pgconf).replace("\\", "/")
+    binpath = tmp_path / "bin"
+    calls = tmp_path / "systemctl-calls.log"
+    bound = tmp_path / "bound-port"
+    calls.write_text("", encoding="utf-8", newline="\n")
+    bound.write_text("5544", encoding="utf-8", newline="\n")  # activ, sănătos, ÎNAINTE de acest apel
+    bindable_port = "5544" if recovers else ""
+    _honest_restart_stub(binpath, calls, bound, pgconf_posix, bindable_port)
+
+    script = (
+        "set -euo pipefail\n"
+        "source ./lib/common.sh\n"
+        "source ./lib/distro.sh\n"
+        f'BOUND_FILE="{bound.as_posix()}"\n'
+        'port_free() {\n'
+        '    [[ "$1" == "5432" ]] && return 1\n'   # străinul ține 5432, PERMANENT
+        '    [[ "$(cat "$BOUND_FILE")" == "$1" ]] && return 1\n'
+        '    return 0\n'
+        '}\n'
+        'port_owner_unit() {\n'
+        '    [[ "$1" == "5432" ]] && { printf "docker.service"; return; }\n'
+        '    [[ "$(cat "$BOUND_FILE")" == "$1" ]] && printf "postgresql@16-main.service"\n'
+        '}\n'
+        'port_owner() { printf "container/other"; }\n'
+        + _func(INSTALL, "pg_restore_to") + "\n"
+        + _func(INSTALL, "pg_ensure_listening") + "\n"
+        f'pg_ensure_listening "{pgconf_posix}" 5432 "" 1 5544 || true\n'
+    )
+    proc = _run(script, tmp_path, extra_path=binpath)
+    return proc, calls, bound
+
+
+def test_auto_move_failure_recovers_the_cluster_onto_the_previous_port(tmp_path):
+    """Mutarea automată (fără --db-port) poate eșua la fel de bine ca cea
+    explicită — 5432 e al unui străin, 5433 (portul ales automat de
+    pg_pick_free_port) nu se leagă NICIODATĂ — iar acest al doilea die()
+    trebuie să încerce ACELAȘI drum de recuperare ca primul, nu doar să
+    scrie fișierul înapoi și să declare victorie fără niciun socket."""
+    proc, calls, bound = _auto_move_failure_harness(tmp_path, recovers=True)
+    assert proc.returncode != 0, proc.stdout  # mutarea automată tot a eșuat
+    assert "back on the previous port 5544" in proc.stderr, proc.stderr
+    assert "DOWN" not in proc.stderr, proc.stderr
+    assert bound.read_text(encoding="utf-8").strip() == "5544", \
+        "clusterul trebuia să rămână (sau să redevină) ascultat pe portul vechi — " \
+        "dovada e un socket, nu doar o linie din postgresql.conf"
+    pgconf_text = (tmp_path / "pgdata" / "postgresql.conf").read_text(encoding="utf-8")
+    assert pgconf_text.count("port = 5544") == 1, pgconf_text
+
+
+def test_auto_move_failure_and_recovery_both_fail_says_database_is_down(tmp_path):
+    """Contra-exemplul pe același drum: nici portul vechi nu se mai leagă —
+    mesajul trebuie să spună răspicat că baza a rămas oprită, nu să sugereze
+    o recuperare care n-a avut loc doar fiindcă fișierul arată corect."""
+    proc, calls, bound = _auto_move_failure_harness(tmp_path, recovers=False)
+    assert proc.returncode != 0, proc.stdout
+    assert "PostgreSQL is DOWN" in proc.stderr, proc.stderr
+    assert bound.read_text(encoding="utf-8").strip() == "", \
+        "niciun socket n-a rămas ascultat — mesajul n-are voie să pretindă recuperare"
+    assert bound.read_text(encoding="utf-8").strip() == "", \
+        "niciun socket real n-a rămas ascultat, dar testul a găsit unul"
+
+
+def test_pg_restore_to_is_wired_into_both_die_paths_of_pg_ensure_listening():
+    """Firul, nu doar comportamentul dintr-un singur scenariu: `pg_ensure_
+    listening` are DOUĂ locuri unde poate muri cu un `restore_port` în mână
+    — cererea explicită respinsă, și mutarea automată pe un port liber care
+    nici ea nu ajunge să asculte. Ambele trebuie să treacă prin recuperarea
+    reală, nu doar unul dintre ele."""
+    body = _func(INSTALL, "pg_ensure_listening")
+    calls = re.findall(r'pg_restore_to "', body)
+    assert len(calls) == 2, \
+        f"pg_restore_to e CHEMATĂ de {len(calls)} ori, nu 2 — " \
+        "una dintre cele două căi de eșec a rămas cu restaurare doar de fișier"
 
 
 # ---------------------------------------------------------------------------
@@ -885,6 +1381,7 @@ exit 0
         'port_owner_unit() { [[ "$(cat "$BOUND_FILE")" == "$1" ]] && printf "postgresql@16-main.service"; }\n'
         'port_owner() { printf "postgres"; }\n'
         f'pg_confdir() {{ printf "%s\\n" "{pgconf_posix}"; }}\n'
+        + _func(INSTALL, "pg_restore_to") + "\n"
         + _func(INSTALL, "pg_ensure_listening") + "\n"
         + _func(INSTALL, "step_postgres") + "\n"
         "step_postgres\n"
@@ -895,6 +1392,14 @@ exit 0
     conf_text = (pgconf / "postgresql.conf").read_text(encoding="utf-8")
     assert conf_text == "port = 5433\ninclude_dir = 'conf.d'\n", \
         f"portul dinainte de acest run n-a fost restaurat la eșec: {conf_text!r}"
+    # Momeala asta ține 5433 „legat" indiferent ce cheamă systemctl — deci
+    # pg_restore_to găsește clusterul deja acolo și raportează recuperare
+    # reușită, nu bomba din CLAUDE.md. Cazul „nici portul vechi nu mai
+    # revine" e dovedit separat, cu o momeală ONESTĂ (restart chiar oprește
+    # legarea veche), de test_pg_restore_to_reports_failure_when_the_
+    # restart_does_not_rebind și de test_explicit_db_port_failure_restores_
+    # the_previous_port_line de mai sus.
+    assert "back on the previous port 5433" in proc.stderr, proc.stderr
 
 
 def test_connection_check_surfaces_psql_stderr_without_leaking_the_password(tmp_path):
@@ -928,3 +1433,74 @@ exit 1
     assert "password authentication failed" in proc.stderr, proc.stderr
     assert "s3cr3t-test-only-not-a-real-secret" not in proc.stdout
     assert "s3cr3t-test-only-not-a-real-secret" not in proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# -DbPort 0 / --db-port 0 — cei doi wrapperi, aceeași soartă
+#
+# `[int]$DbPort` implicit 0, iar `if ($DbPort)` e fals pe 0: `-DbPort 0` era
+# scăpat tăcut, iar rularea continua ca și cum niciun port n-ar fi fost cerut
+# — spre deosebire de deploy.sh, care trimite "0" mai departe și lasă
+# install.sh (vezi testele de validare din capul acestui fișier) să-l
+# refuze. Zero nu e niciodată o cerere validă, deci ambii wrapperi trebuie
+# să REFUZE, nu doar unul.
+# ---------------------------------------------------------------------------
+DEPLOY_PS1 = REPO / "scripts" / "deploy.ps1"
+DEPLOY_SH = REPO / "scripts" / "deploy.sh"
+PS = shutil.which("pwsh") or shutil.which("powershell.exe")
+
+
+@pytest.mark.skipif(PS is None, reason="no PowerShell available")
+@pytest.mark.parametrize("bad_port", ["0", "80", "70000"])
+def test_deploy_ps1_refuses_a_bad_db_port_before_touching_anything(bad_port):
+    """Rulează SCRIPTUL livrat, nu o reimplementare a lui `param()`.
+    Validarea PowerShell se întâmplă la LEGAREA parametrilor — înainte ca
+    orice linie din corpul scriptului (ssh, sudo, tar) să ruleze — deci un
+    -HostName inexistent nu contează aici: niciun apel de rețea nu are cum
+    să pornească înaintea refuzului."""
+    proc = subprocess.run(
+        [PS, "-NoProfile", "-File", str(DEPLOY_PS1), "-HostName", "unused.invalid.example",
+         "-DbPort", bad_port],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode != 0, proc.stdout
+    assert "DbPort" in proc.stderr, proc.stderr
+
+
+def test_deploy_ps1_declares_db_port_with_installs_own_range():
+    """Verificare structurală, separată de comportament: intervalul din
+    `ValidateRange` trebuie să fie EXACT 1024-65535 — cel din blocul de
+    validare al lui install.sh (vezi testele de la începutul acestui
+    fișier) — ca refuzul lui deploy.ps1 să cadă pe aceleași valori, nu pe un
+    interval apropiat dar diferit."""
+    text = DEPLOY_PS1.read_text(encoding="utf-8-sig")
+    assert re.search(r"\[ValidateRange\(1024,\s*65535\)\]\s*\r?\n\s*\[int\]\$DbPort", text), \
+        "ValidateRange lipsește sau nu mai poartă 1024-65535 lângă [int]$DbPort"
+
+
+def _db_port_forward_line() -> str:
+    """Linia LIVRATĂ din deploy.sh care construiește INSTALL_ARGS din
+    --db-port — nu o retranscriere."""
+    text = DEPLOY_SH.read_text(encoding="utf-8")
+    match = re.search(
+        r'^\[\[ -n "\$DB_PORT"\s*\]\] && INSTALL_ARGS\+=\(--db-port "\$DB_PORT"\)$',
+        text, re.M)
+    assert match, "linia de forward a --db-port nu mai arată așa în deploy.sh"
+    return match.group(0)
+
+
+def test_deploy_sh_forwards_db_port_zero_unfiltered_for_install_sh_to_refuse():
+    """Spre deosebire de vechiul deploy.ps1 (`if ($DbPort)` fals pe 0, cerere
+    scăpată tăcut), deploy.sh verifică doar absența șirului (`-n`) — "0" e
+    un șir nevid și AJUNGE la install.sh, care acum îl refuză (vezi
+    test_db_port_validation_refuses_unusable_values_before_anything_is_
+    written[0] mai sus în acest fișier). Rulează linia LIVRATĂ, nu o
+    retranscriere, ca dovadă că deploy.sh nu îl scapă tăcut înainte de asta."""
+    line = _db_port_forward_line()
+    proc = subprocess.run(
+        [BASH, "-c", f'DB_PORT="0"; INSTALL_ARGS=(); {line}; '
+                      'printf "%s\\n" "${INSTALL_ARGS[@]}"'],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.splitlines() == ["--db-port", "0"], proc.stdout
