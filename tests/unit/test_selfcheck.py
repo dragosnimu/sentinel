@@ -128,6 +128,116 @@ def test_a_quiet_night_is_not_an_outage():
     assert any(r.key == "ingest:all" and r.status == "down" for r in results)
 
 
+def test_a_short_pause_does_not_declare_the_host_down():
+    """18 alerte «toate sursele au amuțit» în două zile pe o gazdă sănătoasă,
+    fiecare urmată de «nu se mai raportează» — măsurat pe o gazdă Docker unde
+    activitatea trăiește mai ales în containere: golul cel mai mare din 24h era
+    exact 5 minute, cadența naturală a gazdei, nu o pană. Vechiul prag de 5
+    minute confunda pauza asta cu tăcerea totală."""
+    db = _DB(rows=[_source("auditd", 6), _source("sshd", 6), _source("nginx", 6)])
+    results = run(checks.check_ingest_sources(db, _cfg()))
+    assert not any(r.key == "ingest:all" for r in results), (
+        "o pauză de 6 minute pe o gazdă altfel sănătoasă a fost raportată ca "
+        "«toate sursele au amuțit»")
+
+
+def test_silence_past_the_chattiest_sources_own_limit_is_down():
+    """Peste pragul celei mai vorbărețe surse urmărite (azi 60 de minute, de la
+    auditd), tăcerea încetează să fie o pauză normală — și tot acolo prinde
+    pana reală de 21 de ore, de douăzeci de ori mai repede decât ea."""
+    limit = checks.ALL_QUIET_DOWN_MIN
+    db = _DB(rows=[_source("auditd", limit + 1), _source("sshd", limit + 30),
+                   _source("nginx", limit + 60)])
+    results = run(checks.check_ingest_sources(db, _cfg()))
+    all_quiet = next(r for r in results if r.key == "ingest:all")
+    assert all_quiet.status == "down"
+    assert "amuțit" in all_quiet.title
+
+
+def test_silence_exactly_at_the_limit_is_not_yet_down():
+    """Limita e o graniță, nu o presupunere: la exact pragul celei mai
+    vorbărețe surse, gazda poate fi încă într-o pauză legitimă."""
+    limit = checks.ALL_QUIET_DOWN_MIN
+    db = _DB(rows=[_source("auditd", limit), _source("sshd", limit),
+                   _source("nginx", limit)])
+    results = run(checks.check_ingest_sources(db, _cfg()))
+    assert not any(r.key == "ingest:all" for r in results)
+
+
+def test_one_source_past_its_own_limit_is_blamed_even_if_others_are_merely_quiet():
+    """`auditd` la 70 de minute (peste limita lui proprie de 60) trebuie acuzat
+    NOMINAL — chiar dacă nimic n-a scris în ultimele 5 minute — pentru că
+    verdictul pe sursă și verdictul colectiv folosesc acum ACELAȘI prag. Cu
+    două praguri diferite (5 pentru acuzarea individuală, 60 pentru cel
+    colectiv), fereastra 5–60 nu producea NICIUN verdict pentru auditd: nici
+    acuzat pe nume, nici acoperit de `ingest:all` — o pană reală dispărea de
+    pe panou."""
+    db = _DB(rows=[_source("auditd", 70), _source("nginx", 10), _source("sshd", 15)])
+    results = run(checks.check_ingest_sources(db, _cfg()))
+    auditd = next(r for r in results if r.key == "ingest:auditd")
+    assert auditd.status == "down", (
+        "auditd (70 min, peste limita lui de 60) trebuia acuzat individual — "
+        "nginx (10) și sshd (15) încă scriu, deci gazda nu e liniștită")
+    assert "amuțit" in auditd.title
+    per_source = [r for r in results if r.key.startswith("ingest:")
+                  and r.key not in ("ingest:all", "ingest:auditd")]
+    assert all(not r.bad for r in per_source)
+    assert not any(r.key == "ingest:all" for r in results), (
+        "auditd e deja acuzat pe nume — «ingest:all» ar fi un al doilea "
+        "verdict pentru aceeași pană")
+
+
+def test_a_real_fault_is_never_withdrawn_by_a_single_sudo_keystroke():
+    """Pana de 21 de ore cu un `sudo` tastat la ora 20 nu mai trece prin
+    fereastra 5–60: cu un singur prag, `sudo` la 30 de minute ține
+    `ingest:auditd/nginx/sshd` acuzate pe nume în tot restul penei — niciodată
+    nu dispar de pe panou, care ar fi anunțat operatorului 55 de minute de
+    recuperare în mijlocul unei pene totale."""
+    db = _DB(rows=[_source("auditd", 1260), _source("nginx", 1260),
+                   _source("sshd", 1260), _source("sudo", 30)])
+    results = run(checks.check_ingest_sources(db, _cfg()))
+    for source in ("auditd", "nginx", "sshd"):
+        r = next((x for x in results if x.key == f"ingest:{source}"), None)
+        assert r is not None and r.status == "down", (
+            f"ingest:{source} a dispărut de pe panou — o pană de 21h ascunsă "
+            f"de un singur «sudo» la 30 de minute")
+    sudo = next(r for r in results if r.key == "ingest:sudo")
+    assert sudo.status == "ok" and not sudo.bad
+
+
+def test_a_dead_journald_reader_is_blamed_even_beside_a_live_cursor_source():
+    """`journald` (auditd, sshd) mort de 4 ore lângă un rând `suricata` vechi
+    de 20 de minute nu mai dispare în `ingest:all`: cu un singur prag, rândul
+    suricata ține pragul comun jos, iar auditd/nginx/sshd rămân acuzate pe
+    nume — nu se pierd sub «ingest:all», care pe gazda de producție ar fi
+    ascuns exact colectorul mort."""
+    db = _DB(rows=[_source("auditd", 240), _source("nginx", 240),
+                   _source("sshd", 240), _source("suricata", 20)])
+    results = run(checks.check_ingest_sources(db, _cfg()))
+    for source in ("auditd", "nginx", "sshd"):
+        r = next((x for x in results if x.key == f"ingest:{source}"), None)
+        assert r is not None and r.status == "down", (
+            f"ingest:{source} nu a fost acuzat lângă un rând suricata recent")
+    assert not any(r.key == "ingest:all" for r in results), (
+        "fiecare colector mort e deja acuzat pe nume — «ingest:all» n-ar "
+        "adăuga nimic, ar dubla verdictul")
+
+
+def test_all_quiet_threshold_is_pinned_to_the_smallest_per_source_limit():
+    """`ALL_QUIET_DOWN_MIN` trebuie SĂ RĂMÂNĂ derivat din pragurile per-sursă,
+    nu înlocuit cu o constantă coincidentă: o mutație care schimbă `min` în
+    `max` (prag 180, de trei ori mai permisiv) sau care-l înlocuiește cu 10 —
+    chiar valoarea care a produs 18 alerte «toate au amuțit» în ~45 de ore pe o
+    gazdă sănătoasă — trecea neobservată prin toate cele 18 fișiere de test
+    care importă `sentinel.selfcheck`, fiindcă nimic nu lega constanta de
+    sursa ei."""
+    assert checks.ALL_QUIET_DOWN_MIN == min(checks.SOURCE_MAX_SILENCE_MIN.values())
+    assert checks.ALL_QUIET_DOWN_MIN >= 30, (
+        "sub 30 de minute pragul se apropie de cadența naturală măsurată pe "
+        "gazda Docker (goluri de până la 5.02 minute) — flapping-ul de 18 "
+        "alerte în ~45 de ore poate reveni fără ca vreun test s-o observe")
+
+
 def test_a_human_driven_source_is_never_an_alert():
     """`sudo` and `su` produce events only when a person acts. A server nobody
     logged into for a day emits zero sudo events, and that is the healthy state.

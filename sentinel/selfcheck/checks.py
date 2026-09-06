@@ -216,6 +216,45 @@ SOURCE_MAX_SILENCE_MIN: dict[str, int] = {
 }
 DEFAULT_MAX_SILENCE_MIN = 180
 
+# `check_ingest_sources` asks one comparison — "how long since ANY source last
+# wrote?" — to decide, for EVERY source past its own limit, whether it is
+# blamed by name or folded into "everything is quiet". One number, one floor:
+# a second, shorter one used to answer this for individual blame while this one
+# answered it for the collective verdict, and the gap between them (5 minutes
+# to 60) was a band in which a source past its own limit got neither — the
+# per-source `continue` fired because something else was still "recent", and
+# the collective verdict did not fire because the host was not "recent-quiet"
+# either. A key that a run does not emit is withdrawn (see the module
+# docstring), so that band announced recovery during a real outage. There is
+# no safe place to split this comparison in two; it answers one question and
+# every state must reach a verdict.
+#
+# The floor is the SMALLEST patience granted to any per-source collector above
+# (today 60, from auditd): below it, even the source we expect to hear from
+# most often could still be legitimately silent, so blaming ANYONE — by name or
+# collectively — would assert a fault nothing here measured. Above it, at least
+# one tracked source has individually outlasted its own limit, which is still
+# twenty times sooner than the 21-hour blind spot this check exists to catch
+# (see its docstring).
+#
+# It was 5 minutes once, shared by both questions, and that number was never a
+# measurement — on a Docker host whose traffic lives mostly inside containers
+# (measured 6 September 2026, `raw_events` over the last 7 days: max gap
+# between ANY two collected events 5.02 minutes, p99 5.00 minutes, zero gaps
+# over 15/30/60 minutes), the host's own natural poll cadence sits right on 5
+# minutes. `ingest:all` fired `down` 18 times in ~45 hours, each cleared within
+# minutes by "nu se mai raportează" — a healthy host reported as an outage
+# every time it took its normal breath. The production host in the same window
+# never gets near 5 minutes at all (max gap 2.83 min over 7 days), so the old
+# number never once had to prove itself there. Twelve times the largest gap
+# measured on the host that was flapping.
+#
+# Derived, not restated: a mutation that swapped `min` for `max` here (floor
+# 180) or replaced it outright with the old flapping value (10) passed every
+# test file that imports this module, because nothing pinned the relationship.
+# See `test_all_quiet_threshold_is_pinned_to_the_smallest_per_source_limit`.
+ALL_QUIET_DOWN_MIN = min(SOURCE_MAX_SILENCE_MIN.values())
+
 # Sources whose rows are NOT proportional to traffic, so the arrival of rows
 # cannot be read as proof that their collector is alive. They are judged on the
 # reader's own cursor instead; see `_suricata_reader` below.
@@ -512,6 +551,12 @@ async def check_ingest_sources(db: Database, cfg: Config) -> list[CheckResult]:
     and only for those. The sources listed in `CURSOR_BACKED_SOURCES` are judged
     on their reader's cursor instead, and their verdict is produced here — not
     skipped — so the `ingest:*` namespace still has exactly one author.
+
+    One floor, `ALL_QUIET_DOWN_MIN`, decides both "is this source blamed by
+    name?" and "has everyone gone quiet?" — see the comment above the constant
+    for why a second, shorter number used for the first question opened a band
+    in which a source past its own limit got neither verdict, and a real fault
+    disappeared from the panel instead of being reported under either name.
     """
     rows = await db.fetch(
         """
@@ -538,8 +583,21 @@ async def check_ingest_sources(db: Database, cfg: Config) -> list[CheckResult]:
     # The discriminator: is ANY source still writing? If none is, the host is
     # quiet (or the whole daemon is down, which check_units reports) — and
     # blaming each collector individually would be six alerts for one fault.
+    # `others_are_live` answers this for BOTH verdicts below, on the same
+    # floor: below it, a source past its own limit is blamed by name because
+    # something else is still recent; above it, nothing is recent enough to
+    # call it "someone else is live", so the fault becomes `ingest:all`
+    # instead. See `ALL_QUIET_DOWN_MIN` above for why this must be one number.
+    #
+    # `ages` — and therefore `freshest` — includes CURSOR_BACKED_SOURCES and
+    # HUMAN_DRIVEN sources too, unfiltered. Left alone deliberately: their row
+    # age can still make `others_are_live` true, but the only consequence now
+    # is which verdict names the fault (a specific collector vs. `ingest:all`)
+    # — never whether one is emitted, since every branch below reaches a
+    # verdict either way. Narrowing this to "judged" sources only would be
+    # unrequested scope; it would not change whether a fault is reported.
     freshest = min(ages.values())
-    others_are_live = freshest <= 5
+    others_are_live = freshest <= ALL_QUIET_DOWN_MIN
 
     results: list[CheckResult] = list(cursor_backed)
     for source, minutes in sorted(ages.items()):
@@ -573,10 +631,19 @@ async def check_ingest_sources(db: Database, cfg: Config) -> list[CheckResult]:
             action="systemctl restart sentinel-ingest",
             facts={"minutes_silent": int(minutes), "limit_min": limit}))
 
+    # The collective verdict: fires exactly when `others_are_live` above was
+    # false, i.e. once the freshest source has outlasted the same floor used to
+    # decide per-source blame. Below that floor this emits nothing: a host
+    # whose sources are merely between polls is the healthy state this check
+    # exists to tell apart from a dead ingest daemon, and asserting "not a
+    # quiet night" without measuring one would be exactly the kind of claim
+    # this file's module docstring warns against.
     if not others_are_live:
         results.append(CheckResult(
             "ingest:all", "Toate sursele au amuțit", "down",
-            detail=f"cea mai recentă acum {int(freshest)} min — nu e o noapte liniștită",
+            detail=(f"nicio sursă n-a mai scris de {_ago(freshest)} — peste "
+                    f"pragul de {_ago(ALL_QUIET_DOWN_MIN)} al celei mai "
+                    f"vorbărețe surse urmărite"),
             action="systemctl status sentinel-ingest; journalctl -u sentinel-ingest -n 100"))
     return results
 
