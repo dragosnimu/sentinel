@@ -44,6 +44,39 @@ RATE_MULTIPLE = 4.0
 RATE_MIN_NEW = 3
 
 
+async def _process_hint(db: Database, dim: bh.Dimension, key: str) -> dict[str, Any] | None:
+    """What `raw_events` already knows about who opened this connection —
+    populated only by `collectors/conntrack.py`, so a query is only worth
+    running for a dimension actually sourced from it.
+
+    Without this, `unseen_before`'s own summary text ("dacă e o schimbare,
+    confirm-o; dacă nu, verifică cine a făcut-o") had nothing an operator
+    could act on for `outbound_dst`: `process` and `process_status` sit on
+    every `raw_events` row `conntrack.py` writes, entirely unused by the one
+    rule that alerts on them. `key` here is the destination address (see
+    `outbound_dst`'s `key_of`) — the most recent row for it is a best-effort
+    hint, not a claim about which exact connection created the novelty
+    record (several could match the same destination within one `observe()`
+    pass).
+    """
+    if dim.source != "conntrack":
+        return None
+    row = await db.fetchrow(
+        """
+        SELECT process, pid, raw->>'process_status' AS process_status,
+               raw->>'user' AS user
+        FROM raw_events
+        WHERE source = $1 AND action = $2 AND dst_ip = $3
+        ORDER BY ts DESC
+        LIMIT 1
+        """,
+        dim.source, dim.action, key)
+    if row is None:
+        return None
+    return {"process": row["process"], "pid": row["pid"],
+            "process_status": row["process_status"], "user": row["user"]}
+
+
 async def _fresh_keys(db: Database, dimension: str, limit: int = 20) -> list[Any]:
     """Cheile inserate în ultima trecere, cu contextul lor.
 
@@ -73,6 +106,12 @@ async def unseen_before(db: Database, cursor: int) -> list[DetectionSpec]:
     diferența între o unealtă folosibilă și una care se ignoră: în prima zi,
     fără poartă, ar produce o alertă pentru fiecare utilizator, fiecare rețea și
     fiecare binar de pe server.
+
+    Pentru `outbound_dst`, `_process_hint` mai citește din `raw_events` ce a
+    scris deja `collectors/conntrack.py` (`process`, `process_status`,
+    uid-ul din `raw`) — fără el, textul de mai jos spunea „verifică cine a
+    făcut-o" despre o adresă IP goală, cu nimic de verificat. Absent pentru
+    orice altă dimensiune (nu e sursa `conntrack`), nu doar tăcut.
     """
     out: list[DetectionSpec] = []
     for dim in bh.DIMENSIONS:
@@ -80,6 +119,36 @@ async def unseen_before(db: Database, cursor: int) -> list[DetectionSpec]:
             continue
         for row in await _fresh_keys(db, dim.name):
             key = row["key"]
+            hint = await _process_hint(db, dim, key)
+
+            summary = (f"`{key}` nu a mai apărut niciodată ca {dim.label} pe "
+                       f"serverul ăsta. Profilul e activ de "
+                       f"{await _profile_age_days(db, dim.name):.0f} zile. ")
+            if hint and hint.get("process"):
+                summary += f"Proces: `{hint['process']}`"
+                if hint.get("pid"):
+                    summary += f" (pid {hint['pid']})"
+                if hint.get("user"):
+                    summary += f", utilizator `{hint['user']}`"
+                summary += ". "
+            elif hint and hint.get("process_status") and hint["process_status"] != "found":
+                # Un status explicit ("container_egress",
+                # "not_attributable" etc.) tot spune ceva — nu ascunde
+                # faptul că s-a încercat și de ce n-a mers.
+                summary += (f"Procesul nu a putut fi identificat "
+                            f"({hint['process_status']}). ")
+            summary += ("Dacă e o schimbare făcută de tine, confirm-o ca să nu "
+                        "mai alerteze; dacă nu, verifică cine a făcut-o.")
+
+            evidence: dict[str, Any] = {
+                "dimension": dim.name, "key": key,
+                "first_seen": row["first_seen"].isoformat(),
+                "observations": row["observations"],
+                "known_keys": await _known_count(db, dim.name),
+            }
+            if hint:
+                evidence["process_hint"] = hint
+
             out.append(DetectionSpec(
                 rule_id=f"novelty.{dim.name}",
                 rule_family="novelty",
@@ -90,17 +159,8 @@ async def unseen_before(db: Database, cursor: int) -> list[DetectionSpec]:
                 # incidente, nu unul actualizat.
                 fingerprint=f"novelty.{dim.name}:{key}",
                 title=f"{dim.novel_title}: {key}",
-                summary=(f"`{key}` nu a mai apărut niciodată ca {dim.label} pe "
-                         f"serverul ăsta. Profilul e activ de "
-                         f"{await _profile_age_days(db, dim.name):.0f} zile. "
-                         f"Dacă e o schimbare făcută de tine, confirm-o ca să nu "
-                         f"mai alerteze; dacă nu, verifică cine a făcut-o."),
-                evidence={
-                    "dimension": dim.name, "key": key,
-                    "first_seen": row["first_seen"].isoformat(),
-                    "observations": row["observations"],
-                    "known_keys": await _known_count(db, dim.name),
-                },
+                summary=summary,
+                evidence=evidence,
                 event_ids=[],
             ))
     return out

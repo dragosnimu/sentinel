@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import os
 import textwrap
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -164,6 +165,25 @@ def _line(proto: str, src: str, dst: str, sport: int, dport: int) -> str:
         f"src={dst} dst={src} sport={dport} dport={sport} "
         f"[ASSURED] mark=0 use=1"
     )
+
+
+# /proc/net/tcp's own header — column positions matter (`_parse_proc_net_tcp`
+# reads local/remote address by fixed index, and inode by index 9), the exact
+# text does not.
+_TCP_HEADER = ("  sl  local_address rem_address   st tx_queue rx_queue tr "
+               "tm->when retrnsmt   uid  timeout inode")
+
+
+def _tcp_row(local_ip: str, local_port: int, remote_ip: str, remote_port: int,
+             inode: str, st: str = "01") -> str:
+    """One `/proc/net/tcp` data row. Address encoding reuses `_ip_to_route_hex`
+    — /proc/net/route and /proc/net/tcp print a raw IPv4 the same way, the
+    same convention `_hex_to_ipv4`'s own docstring describes. Port is plain
+    big-endian hex, unlike the address — not reversed."""
+    local = f"{_ip_to_route_hex(local_ip)}:{local_port:04X}"
+    remote = f"{_ip_to_route_hex(remote_ip)}:{remote_port:04X}"
+    return (f"   0: {local} {remote} {st} 00000000:00000000 "
+            f"00:00000000 00000000  1000        0 {inode} 1 0000000000000000 100 0 0 10 0")
 
 
 def _identity(ips=(), networks=()) -> ct.HostIdentity:
@@ -571,6 +591,13 @@ def _sampler(tmp_path, monkeypatch, lines: list[str]) -> ct.ConntrackSampler:
     path = tmp_path / "nf_conntrack"
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     monkeypatch.setattr(ct, "discover_host_identity", lambda: _identity(ips={_HOST_IP}))
+    # Attribution defaults to "found nothing, table readable" here, not the
+    # real /proc — a test built to exercise direction/dedup/cap logic has no
+    # reason to also depend on THIS machine's actual process table, on
+    # whichever OS runs the suite. Tests that care about attribution itself
+    # override these explicitly, after this call.
+    monkeypatch.setattr(ct, "_build_tcp_socket_index", lambda: ({}, True))
+    monkeypatch.setattr(ct, "_scan_fd_sockets", lambda: ({}, 0, 0))
     return ct.ConntrackSampler(str(path))
 
 
@@ -604,17 +631,42 @@ def test_sampler_end_to_end_inbound_is_dropped_outbound_kept(tmp_path, monkeypat
 def test_sampler_end_to_end_recognizes_container_egress(tmp_path, monkeypatch):
     """A container's outbound connection, sampled through the whole pipeline
     (file -> parse -> direction -> event), not just `is_outbound` in
-    isolation."""
+    isolation. Also THE regression proof for the production bug: even
+    though `_build_tcp_socket_index` returns an index that WOULD have
+    matched this exact tuple (an inode is right there), the event must
+    report `"container_egress"`, never `"closed_before_scan"` — the source
+    is only owned via `HostIdentity.networks`, and the host's own
+    `/proc/net/tcp` was never going to contain a container's socket
+    regardless of what that index holds."""
     path = tmp_path / "nf_conntrack"
     path.write_text(_line("tcp", _CONTAINER_IP, _PUBLIC_DST, 1, 443) + "\n", encoding="utf-8")
     monkeypatch.setattr(ct, "discover_host_identity",
                         lambda: _identity(ips={_HOST_IP}, networks=[_BRIDGE_NET]))
+    monkeypatch.setattr(ct, "_build_tcp_socket_index",
+                         lambda: ({(_CONTAINER_IP, 1, _PUBLIC_DST, 443): ("999", "1000")}, True))
+    monkeypatch.setattr(ct, "_scan_fd_sockets", lambda: ({"999": "777"}, 1, 0))
     s = ct.ConntrackSampler(str(path))
 
     events = s.maybe_sample(now=1000.0)
 
     assert len(events) == 1
     assert events[0].src_ip == _CONTAINER_IP and events[0].dst_ip == _PUBLIC_DST
+    assert events[0].raw["process_status"] == "container_egress"
+    assert events[0].process is None
+
+
+def test_sampler_end_to_end_reports_host_tcp_unreadable_not_closed(tmp_path, monkeypatch):
+    """THE other half of the same production bug: `/proc/net/tcp` itself
+    unreadable must not make a HOST-owned connection look identical to
+    "the connection closed before this sampler looked"."""
+    s = _sampler(tmp_path, monkeypatch, [_line("tcp", _HOST_IP, _PUBLIC_DST, 51234, 443)])
+    monkeypatch.setattr(ct, "_build_tcp_socket_index", lambda: ({}, False))
+    monkeypatch.setattr(ct, "_scan_fd_sockets", lambda: ({}, 0, 0))
+
+    events = s.maybe_sample(now=1000.0)
+
+    assert len(events) == 1
+    assert events[0].raw["process_status"] == "host_tcp_unreadable"
 
 
 def test_sampler_does_not_sample_before_its_interval_elapses(tmp_path, monkeypatch):
@@ -878,3 +930,575 @@ def test_ingest_setup_constructs_the_sampler_when_enabled(monkeypatch, tmp_path)
     asyncio.run(ingest.setup())
     assert ingest._conntrack is not None
     assert isinstance(ingest._conntrack, ingest_service.ConntrackSampler)
+
+
+# ---------------------------------------------------------------------------
+# _hex_to_ipv6: the four-native-endian-words shape /proc/net/tcp6 documents
+# itself as using — checked against a literal kernel-formatted row, not an
+# independent encoder (see the test's own docstring for why the mirror
+# encoder this file used to check against was itself the circular part).
+# ---------------------------------------------------------------------------
+def test_hex_to_ipv6_decodes_a_literal_kernel_row_for_loopback():
+    """NOT checked against a mirror encoder (a test written independently but
+    by the same hand can still share the same wrong assumption about byte
+    order — the exact trap this file's own docstring names for
+    `_hex_to_ipv4`'s route-hex helper). This is the literal `/proc/net/tcp6`
+    field for `::1`, decoded independently of anything in this module.
+
+    Written as four space-separated 32-bit words, not one unbroken run of
+    32 hex characters: `bytes.fromhex` treats the two identically (spaces
+    between byte pairs are ignored), and an unbroken 32-hex-char literal is
+    exactly the shape `tests/security/test_repo_is_sanitised.py` flags as a
+    possible planted secret — measured directly: it did, before this."""
+    assert ct._hex_to_ipv6("00000000 00000000 00000000 01000000") == "::1"
+
+
+def test_hex_to_ipv6_rejects_a_field_that_is_not_16_bytes():
+    with pytest.raises(ValueError):
+        ct._hex_to_ipv6("AB")
+
+
+# ---------------------------------------------------------------------------
+# _parse_proc_net_tcp: the 4-tuple -> inode index a live TCP table gives up
+# ---------------------------------------------------------------------------
+def test_parse_proc_net_tcp_maps_the_4_tuple_to_its_inode_and_uid():
+    """`_tcp_row`'s fixed uid column ("1000", see its own docstring) must
+    come back alongside the inode — the uid is what still names an owner on
+    a row this process cannot resolve a pid for (see `_uid_to_name`,
+    `attribute_process`'s `"not_attributable"` case)."""
+    text = "\n".join([_TCP_HEADER,
+                       _tcp_row(_HOST_IP, 51234, _PUBLIC_DST, 443, "999888")]) + "\n"
+    index = ct._parse_proc_net_tcp(text, v6=False)
+    assert index[(_HOST_IP, 51234, _PUBLIC_DST, 443)] == ("999888", "1000")
+
+
+def test_parse_proc_net_tcp_skips_a_zero_inode_row():
+    """TIME_WAIT and similar transient rows report inode 0. Matching against
+    one can never resolve to a process — keeping it would only plant false
+    confidence that a lookup might still succeed."""
+    text = "\n".join([_TCP_HEADER, _tcp_row(_HOST_IP, 1, _PUBLIC_DST, 443, "0")]) + "\n"
+    assert ct._parse_proc_net_tcp(text, v6=False) == {}
+
+
+def test_parse_proc_net_tcp_skips_unparseable_lines_without_raising():
+    text = "\n".join([_TCP_HEADER, "not a proc net tcp line at all"]) + "\n"
+    assert ct._parse_proc_net_tcp(text, v6=False) == {}
+
+
+def test_build_tcp_socket_index_combines_both_tables_and_tolerates_a_missing_tcp6(
+        tmp_path, monkeypatch):
+    """A missing `/proc/net/tcp6` is the EXPECTED, permanent shape on a host
+    with IPv6 disabled (see the module docstring) — it must not flip
+    `tcp_v4_readable` to False, which would misreport every host-owned
+    connection as `"host_tcp_unreadable"` instead of actually looking them up."""
+    tcp_path = tmp_path / "tcp"
+    tcp6_path = tmp_path / "tcp6"  # deliberately never created
+    tcp_path.write_text(
+        "\n".join([_TCP_HEADER, _tcp_row(_HOST_IP, 1, _PUBLIC_DST, 443, "42")]) + "\n",
+        encoding="ascii")
+    monkeypatch.setattr(ct, "_PROC_NET_TCP_PATH", str(tcp_path))
+    monkeypatch.setattr(ct, "_PROC_NET_TCP6_PATH", str(tcp6_path))
+
+    index, tcp_v4_readable = ct._build_tcp_socket_index()
+
+    assert index[(_HOST_IP, 1, _PUBLIC_DST, 443)] == ("42", "1000")
+    assert tcp_v4_readable is True
+
+
+def test_build_tcp_socket_index_reports_unreadable_when_tcp_itself_fails(
+        tmp_path, monkeypatch):
+    """THE regression this flag exists for: `/proc/net/tcp` itself
+    unreadable must be told apart from "read fine, connection just wasn't in
+    it" — collapsing the two, before this fix, turned a real regression into
+    every host-owned row silently reporting `"closed_before_scan"`."""
+    monkeypatch.setattr(ct, "_PROC_NET_TCP_PATH", str(tmp_path / "does_not_exist_tcp"))
+    monkeypatch.setattr(ct, "_PROC_NET_TCP6_PATH", str(tmp_path / "does_not_exist_tcp6"))
+
+    index, tcp_v4_readable = ct._build_tcp_socket_index()
+
+    assert index == {}
+    assert tcp_v4_readable is False
+
+
+# ---------------------------------------------------------------------------
+# _scan_fd_sockets: the ptrace ceiling, measured on the production host —
+# os.listdir on another user's fd directory succeeds (CAP_DAC_READ_SEARCH),
+# os.readlink on an entry inside it does not (ptrace_may_access).
+# ---------------------------------------------------------------------------
+def test_scan_fd_sockets_distinguishes_found_denied_and_non_socket(monkeypatch):
+    """Regression for the discovery that CAP_DAC_READ_SEARCH lets `listdir`
+    traverse another user's fd directory while `readlink` on an entry inside
+    it still needs ptrace access — measured on the production host at 3,030
+    attempts, 2,953 (97.5%) denied. Collapsing 'denied' into 'not found'
+    would make a falling attribution rate look identical to nobody having
+    tried, which is exactly the distinction the module docstring exists to
+    keep visible."""
+    real_listdir, real_readlink = os.listdir, os.readlink
+    listings = {"/proc": ["1", "2", "notapid"],
+                "/proc/1/fd": ["0", "1"],
+                "/proc/2/fd": ["5"]}
+    targets = {"/proc/1/fd/0": "socket:[111]",
+               "/proc/1/fd/1": "/dev/null"}  # a real fd, just not a socket
+
+    def fake_listdir(path):
+        return listings[path] if path in listings else real_listdir(path)
+
+    def fake_readlink(path):
+        if path in targets:
+            return targets[path]
+        if path == "/proc/2/fd/5":
+            raise PermissionError(path)  # another user's socket
+        return real_readlink(path)
+
+    monkeypatch.setattr(ct.os, "listdir", fake_listdir)
+    monkeypatch.setattr(ct.os, "readlink", fake_readlink)
+    monkeypatch.setattr(ct, "_PROC_ROOT", "/proc")
+
+    inode_to_pid, attempted, denied = ct._scan_fd_sockets()
+
+    assert inode_to_pid == {"111": "1"}
+    assert attempted == 3
+    assert denied == 1
+
+
+def test_scan_fd_sockets_skips_a_pid_that_exited_mid_walk(monkeypatch):
+    """A pid can vanish between listing /proc and listing its own fd
+    directory — this must degrade the same as a genuine permission denial,
+    not raise and abort the whole scan."""
+    real_listdir = os.listdir
+
+    def fake_listdir(path):
+        if path == "/proc":
+            return ["1"]
+        if path == "/proc/1/fd":
+            raise FileNotFoundError(path)
+        return real_listdir(path)
+
+    monkeypatch.setattr(ct.os, "listdir", fake_listdir)
+    monkeypatch.setattr(ct, "_PROC_ROOT", "/proc")
+
+    inode_to_pid, attempted, denied = ct._scan_fd_sockets()
+    assert inode_to_pid == {} and attempted == 0 and denied == 0
+
+
+# ---------------------------------------------------------------------------
+# _process_info: comm/exe for a pid attribution already proved readable
+# ---------------------------------------------------------------------------
+def test_process_info_reads_comm_and_exe(monkeypatch):
+    import io
+    real_open, real_readlink = open, os.readlink
+
+    def fake_open(path, *a, **kw):
+        if path == "/proc/123/comm":
+            return io.StringIO("python3.12\n")
+        return real_open(path, *a, **kw)
+
+    def fake_readlink(path):
+        if path == "/proc/123/exe":
+            return "/usr/bin/python3.12"
+        return real_readlink(path)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    monkeypatch.setattr(ct.os, "readlink", fake_readlink)
+    monkeypatch.setattr(ct, "_PROC_ROOT", "/proc")
+
+    comm, exe = ct._process_info("123")
+    assert comm == "python3.12"
+    assert exe == "/usr/bin/python3.12"
+
+
+def test_process_info_degrades_to_none_when_the_pid_is_already_gone(monkeypatch):
+    def _raise(*a, **kw):
+        raise FileNotFoundError("gone")
+
+    monkeypatch.setattr("builtins.open", _raise)
+    monkeypatch.setattr(ct.os, "readlink", _raise)
+    monkeypatch.setattr(ct, "_PROC_ROOT", "/proc")
+
+    comm, exe = ct._process_info("999")
+    assert comm is None and exe is None
+
+
+# ---------------------------------------------------------------------------
+# attribute_process: the six honest outcomes, and only six
+# ---------------------------------------------------------------------------
+def test_attribute_process_udp_is_never_attempted():
+    """No per-connection fd table for UDP on the path this module was asked
+    to use — a UDP row must say so, not silently look identical to a TCP
+    row nobody could attribute."""
+    tup = ct.ConnTuple(proto="udp", src=_HOST_IP, dst=_PUBLIC_DST, sport=1, dport=53)
+    attr = ct.attribute_process(tup, {}, {}, is_host_src=True, tcp_readable=True)
+    assert attr.status == "udp_unsupported"
+    assert attr.process is None and attr.pid is None
+
+
+def test_attribute_process_reports_container_egress_before_ever_looking_at_the_table():
+    """THE fix for the collapse measured on production: a container-owned
+    source (only in `HostIdentity.networks`, never `.ips`) must never fall
+    through to `"closed_before_scan"` just because the HOST's own
+    `/proc/net/tcp` structurally cannot list it. Proven here with a
+    `tcp_index` that WOULD have matched, had the container check not run
+    first — anything other than `"container_egress"` means the miss was
+    misread as a closed connection."""
+    tup = ct.ConnTuple(proto="tcp", src="172.20.0.5", dst=_PUBLIC_DST, sport=1, dport=443)
+    tcp_index = {("172.20.0.5", 1, _PUBLIC_DST, 443): ("999", "1000")}
+    attr = ct.attribute_process(tup, tcp_index, {"999": "777"},
+                                 is_host_src=False, tcp_readable=True)
+    assert attr.status == "container_egress"
+    assert attr.process is None and attr.uid is None
+
+
+def test_attribute_process_container_egress_outranks_an_unreadable_table():
+    """A container-owned source reports `"container_egress"` even when the
+    table ALSO could not be read — the table's readability changes nothing
+    about a connection it could never have shown anyway, so this must not
+    become `"host_tcp_unreadable"` instead."""
+    tup = ct.ConnTuple(proto="tcp", src="172.20.0.5", dst=_PUBLIC_DST, sport=1, dport=443)
+    attr = ct.attribute_process(tup, {}, {}, is_host_src=False, tcp_readable=False)
+    assert attr.status == "container_egress"
+
+
+def test_attribute_process_reports_host_tcp_unreadable_not_closed(monkeypatch):
+    """THE other fix for the same collapse: `/proc/net/tcp` itself failing
+    to read must not look like every host-owned connection having closed —
+    that is a real regression (the file needs no capability this unit
+    lacks) with its own distinct status."""
+    tup = ct.ConnTuple(proto="tcp", src=_HOST_IP, dst=_PUBLIC_DST, sport=1, dport=443)
+    attr = ct.attribute_process(tup, {}, {}, is_host_src=True, tcp_readable=False)
+    assert attr.status == "host_tcp_unreadable"
+
+
+def test_attribute_process_reports_closed_before_scan_when_never_in_the_tcp_table():
+    tup = ct.ConnTuple(proto="tcp", src=_HOST_IP, dst=_PUBLIC_DST, sport=1, dport=443)
+    attr = ct.attribute_process(tup, {}, {"999": "123"}, is_host_src=True, tcp_readable=True)
+    assert attr.status == "closed_before_scan"
+
+
+def test_attribute_process_reports_not_attributable_when_the_owner_could_not_be_read():
+    """The socket exists (it is in the TCP table) but this process could not
+    read whose fd it was — the measured 97.5% case, not the same fact as
+    'the connection was already gone'."""
+    tup = ct.ConnTuple(proto="tcp", src=_HOST_IP, dst=_PUBLIC_DST, sport=1, dport=443)
+    tcp_index = {(_HOST_IP, 1, _PUBLIC_DST, 443): ("42", "1000")}
+    attr = ct.attribute_process(tup, tcp_index, {}, is_host_src=True, tcp_readable=True)
+    assert attr.status == "not_attributable"
+
+
+def test_attribute_process_not_attributable_still_carries_the_uid(monkeypatch):
+    """The whole point of parsing `uid` at all: it names an owner for free
+    even on a row this process could never resolve a pid for — the 97.5%
+    case, and the one `process_status` alone cannot help an operator with."""
+    tup = ct.ConnTuple(proto="tcp", src=_HOST_IP, dst=_PUBLIC_DST, sport=1, dport=443)
+    tcp_index = {(_HOST_IP, 1, _PUBLIC_DST, 443): ("42", "116")}
+    monkeypatch.setattr(ct, "_uid_to_name", lambda uid: "postgres" if uid == "116" else None)
+
+    attr = ct.attribute_process(tup, tcp_index, {}, is_host_src=True, tcp_readable=True)
+
+    assert attr.status == "not_attributable"
+    assert attr.uid == "116"
+    assert attr.user == "postgres"
+
+
+def test_attribute_process_found_carries_process_pid_exe_and_uid(monkeypatch):
+    tup = ct.ConnTuple(proto="tcp", src=_HOST_IP, dst=_PUBLIC_DST, sport=1, dport=443)
+    tcp_index = {(_HOST_IP, 1, _PUBLIC_DST, 443): ("42", "1000")}
+    inode_to_pid = {"42": "777"}
+    monkeypatch.setattr(ct, "_process_info", lambda pid: ("curl", "/usr/bin/curl"))
+    monkeypatch.setattr(ct, "_uid_to_name", lambda uid: "sentinel")
+
+    attr = ct.attribute_process(tup, tcp_index, inode_to_pid,
+                                 is_host_src=True, tcp_readable=True)
+
+    assert attr.status == "found"
+    assert attr.process == "curl"
+    assert attr.pid == 777
+    assert attr.exe == "/usr/bin/curl"
+    assert attr.uid == "1000"
+    assert attr.user == "sentinel"
+
+
+def test_attribute_process_does_not_report_a_pid_with_no_name(monkeypatch):
+    """The race window between `_scan_fd_sockets` and reading `comm`: a pid
+    was briefly known but the process exited before a name could be read.
+    A pid without a process name is not 'found' — it must fall back to the
+    same 'not_attributable' as never having resolved a pid at all, not leak
+    a number the operator cannot act on either."""
+    tup = ct.ConnTuple(proto="tcp", src=_HOST_IP, dst=_PUBLIC_DST, sport=1, dport=443)
+    tcp_index = {(_HOST_IP, 1, _PUBLIC_DST, 443): ("42", "1000")}
+    inode_to_pid = {"42": "777"}
+    monkeypatch.setattr(ct, "_process_info", lambda pid: (None, None))
+
+    attr = ct.attribute_process(tup, tcp_index, inode_to_pid,
+                                 is_host_src=True, tcp_readable=True)
+
+    assert attr.status == "not_attributable"
+    assert attr.pid is None
+
+
+# ---------------------------------------------------------------------------
+# _uid_to_name: resolves via the local passwd database, never guesses
+# ---------------------------------------------------------------------------
+def test_uid_to_name_resolves_a_known_uid(monkeypatch):
+    """`pwd` is stubbed via `sys.modules`, not relied upon to exist — this
+    must pass on the Windows dev box this suite also runs on, where the real
+    `pwd` module does not exist at all (see `_uid_to_name`'s own `except
+    ImportError` branch, and `sentinel/collectors/auditd.py`'s identical
+    pattern)."""
+    import sys
+    import types
+    fake_pwd = types.SimpleNamespace(
+        getpwuid=lambda u: types.SimpleNamespace(pw_name="postgres"))
+    monkeypatch.setitem(sys.modules, "pwd", fake_pwd)
+    assert ct._uid_to_name("116") == "postgres"
+
+
+def test_uid_to_name_returns_none_for_an_unmapped_uid(monkeypatch):
+    import sys
+    import types
+
+    def _no_such_uid(u):
+        raise KeyError(u)
+
+    fake_pwd = types.SimpleNamespace(getpwuid=_no_such_uid)
+    monkeypatch.setitem(sys.modules, "pwd", fake_pwd)
+    assert ct._uid_to_name("999999") is None
+
+
+def test_uid_to_name_returns_none_for_a_uid_that_is_not_a_number():
+    """Platform-independent on purpose: a uid string that fails `int()`
+    never reaches `pwd` at all, so this passes whether or not the real `pwd`
+    module exists on the machine running the suite."""
+    assert ct._uid_to_name("not-a-number") is None
+
+
+# ---------------------------------------------------------------------------
+# ConntrackSampler wiring: attribution reaches the emitted Event, costs
+# nothing when there is nothing new to attribute, and never touches TCP
+# machinery for an all-UDP sample
+# ---------------------------------------------------------------------------
+def test_sampler_end_to_end_attributes_a_kept_connection(tmp_path, monkeypatch):
+    """THE operator-facing fix: 'new destination X' must be able to say what
+    opened it, not just the bare IP the original incident could never be
+    triaged from."""
+    s = _sampler(tmp_path, monkeypatch, [_line("tcp", _HOST_IP, _PUBLIC_DST, 51234, 443)])
+    monkeypatch.setattr(ct, "_build_tcp_socket_index",
+                         lambda: ({(_HOST_IP, 51234, _PUBLIC_DST, 443): ("999", "1000")}, True))
+    monkeypatch.setattr(ct, "_scan_fd_sockets", lambda: ({"999": "777"}, 10, 5))
+    monkeypatch.setattr(ct, "_process_info", lambda pid: ("curl", "/usr/bin/curl"))
+    monkeypatch.setattr(ct, "_uid_to_name", lambda uid: "sentinel")
+
+    events = s.maybe_sample(now=1000.0)
+
+    assert len(events) == 1
+    ev = events[0]
+    assert ev.process == "curl" and ev.pid == 777
+    assert ev.raw["process_status"] == "found"
+    assert ev.raw["exe"] == "/usr/bin/curl"
+    assert ev.raw["uid"] == "1000" and ev.raw["user"] == "sentinel"
+
+
+def test_sampler_records_unknown_distinctly_from_never_collected(tmp_path, monkeypatch):
+    """CLAUDE.md's core distinction, at the row level: a connection this
+    sampler genuinely could not attribute must say so explicitly
+    (`process_status` present, `process` NULL) — never a bare NULL `process`
+    indistinguishable from a row written before attribution existed."""
+    s = _sampler(tmp_path, monkeypatch, [_line("tcp", _HOST_IP, _PUBLIC_DST, 51234, 443)])
+    monkeypatch.setattr(ct, "_build_tcp_socket_index", lambda: ({}, True))
+    monkeypatch.setattr(ct, "_scan_fd_sockets", lambda: ({}, 0, 0))
+
+    events = s.maybe_sample(now=1000.0)
+
+    assert events[0].process is None
+    assert events[0].raw["process_status"] == "closed_before_scan"
+
+
+def test_every_emitted_event_carries_an_explicit_process_status(tmp_path, monkeypatch):
+    """A code path that forgot to set `process_status` would silently
+    reintroduce 'nobody can tell if attribution was ever attempted' — the
+    exact ambiguity this whole feature exists to remove."""
+    s = _sampler(tmp_path, monkeypatch, [_line("tcp", _HOST_IP, _PUBLIC_DST, 1, 443)])
+    events = s.maybe_sample(now=1000.0)
+    assert "process_status" in events[0].raw
+
+
+def test_sampler_skips_attribution_scans_for_a_sample_with_nothing_new(tmp_path, monkeypatch):
+    """Attribution costs real syscalls — a full `/proc` walk. A sample where
+    everything is already deduplicated must not pay that cost for zero
+    benefit: nothing new is being emitted for it to attribute."""
+    s = _sampler(tmp_path, monkeypatch, [_line("tcp", _HOST_IP, _PUBLIC_DST, 1, 443)])
+    s.maybe_sample(now=0.0)  # primes the dedup cache
+
+    def _must_not_run():
+        raise AssertionError("attribution scan ran for a sample with nothing new to emit")
+
+    monkeypatch.setattr(ct, "_build_tcp_socket_index", lambda: _must_not_run())
+    monkeypatch.setattr(ct, "_scan_fd_sockets", lambda: _must_not_run())
+
+    # Same destination, past SAMPLE_INTERVAL_S (so the file IS read again)
+    # but well inside DEDUP_WINDOW_S (so nothing new is kept).
+    events = s.maybe_sample(now=float(ct.SAMPLE_INTERVAL_S + 1))
+    assert events == []
+
+
+def test_sampler_skips_tcp_scans_for_an_all_udp_sample(tmp_path, monkeypatch):
+    """UDP has no per-connection fd table on the path this module uses —
+    scanning `/proc` for it would cost real syscalls for an outcome that is
+    always `udp_unsupported` regardless of what the scan finds."""
+    s = _sampler(tmp_path, monkeypatch, [_line("udp", _HOST_IP, _PUBLIC_DST, 51234, 53)])
+
+    def _must_not_run():
+        raise AssertionError("a TCP socket scan ran for an all-UDP sample")
+
+    monkeypatch.setattr(ct, "_build_tcp_socket_index", lambda: _must_not_run())
+    monkeypatch.setattr(ct, "_scan_fd_sockets", lambda: _must_not_run())
+
+    events = s.maybe_sample(now=1000.0)
+
+    assert len(events) == 1
+    assert events[0].raw["process_status"] == "udp_unsupported"
+
+
+# ---------------------------------------------------------------------------
+# _log_attribution_state: attempted/denied are LOGGED now, not discarded —
+# but only on a change of bucket, the same anti-spam shape _log_state_change
+# already uses for the conntrack source itself.
+# ---------------------------------------------------------------------------
+def test_attribution_counts_are_logged_on_the_first_scan(tmp_path, monkeypatch, caplog):
+    """Before this fix, `_attempted`/`_denied` were assigned and immediately
+    discarded (`_attempted, _denied = ...`) — a real regression (attribution
+    suddenly finding 0 candidates to check, say) had nowhere to show up
+    short of a full production incident. This proves the counts reach the
+    log at all."""
+    s = _sampler(tmp_path, monkeypatch, [_line("tcp", _HOST_IP, _PUBLIC_DST, 1, 443)])
+    monkeypatch.setattr(ct, "_scan_fd_sockets", lambda: ({}, 42, 41))
+
+    with caplog.at_level("INFO", logger="sentinel.collectors.conntrack"):
+        s.maybe_sample(now=1000.0)
+
+    records = [r for r in caplog.records if getattr(r, "attempted", None) == 42]
+    assert len(records) == 1
+    assert records[0].denied == 41
+    assert records[0].bucket == "partially_denied"
+
+
+def test_attribution_state_is_not_logged_again_when_the_bucket_does_not_change(
+        tmp_path, monkeypatch, caplog):
+    """The anti-spam half of the same fix: a host in the EXPECTED steady
+    state (see the module docstring's 97.5% measurement) must not write a
+    fresh log line every single sample forever, even though the exact
+    counts drift a little each time. First sample happens BEFORE `caplog`
+    starts capturing INFO (default threshold is WARNING), so only the
+    second, same-bucket sample's silence is what this actually checks."""
+    s = _sampler(tmp_path, monkeypatch, [_line("tcp", _HOST_IP, _PUBLIC_DST, 1, 443)])
+    monkeypatch.setattr(ct, "_scan_fd_sockets", lambda: ({}, 100, 100))  # fully_denied
+    s.maybe_sample(now=0.0)
+
+    monkeypatch.setattr(ct, "_scan_fd_sockets", lambda: ({}, 97, 97))  # still fully_denied
+    second_dst = "8.8.8.8"
+    path = tmp_path / "nf_conntrack"
+    path.write_text(_line("tcp", _HOST_IP, second_dst, 2, 443) + "\n", encoding="utf-8")
+    with caplog.at_level("INFO", logger="sentinel.collectors.conntrack"):
+        s.maybe_sample(now=float(ct.SAMPLE_INTERVAL_S + 1))
+
+    assert not any(hasattr(r, "bucket") for r in caplog.records), (
+        "same bucket twice in a row must not log a second time")
+
+
+def test_attribution_state_logs_again_when_the_bucket_actually_changes(
+        tmp_path, monkeypatch, caplog):
+    """The regression this exists to catch: denied dropping to 0 — either a
+    capability change or every match this round happening to be sentinel's
+    own process — is a real state change and must be visible, not folded
+    into "a few connections got attributed this minute"."""
+    s = _sampler(tmp_path, monkeypatch, [_line("tcp", _HOST_IP, _PUBLIC_DST, 1, 443)])
+    monkeypatch.setattr(ct, "_scan_fd_sockets", lambda: ({}, 100, 100))
+    s.maybe_sample(now=0.0)
+
+    monkeypatch.setattr(ct, "_scan_fd_sockets", lambda: ({}, 100, 0))  # denied -> 0
+    second_dst = "8.8.8.8"
+    path = tmp_path / "nf_conntrack"
+    path.write_text(_line("tcp", _HOST_IP, second_dst, 2, 443) + "\n", encoding="utf-8")
+    with caplog.at_level("INFO", logger="sentinel.collectors.conntrack"):
+        s.maybe_sample(now=float(ct.SAMPLE_INTERVAL_S + 1))
+
+    matches = [r for r in caplog.records if getattr(r, "bucket", None) == "none_denied"]
+    assert len(matches) == 1
+
+
+# ---------------------------------------------------------------------------
+# _conntrack_module_loaded: /proc/modules -> is nf_conntrack a LOADED
+# module, distinct from "compiled directly into the kernel" (which this
+# cannot see either way) and from "cannot tell at all"
+# ---------------------------------------------------------------------------
+def test_conntrack_module_loaded_true_when_listed(tmp_path, monkeypatch):
+    modules_path = tmp_path / "modules"
+    modules_path.write_text(
+        "nf_conntrack 172032 3 nf_conntrack_ipv4, Live 0x0000000000000000\n"
+        "ip_tables 32768 1 - Live 0x0000000000000000\n",
+        encoding="ascii")
+    monkeypatch.setattr(ct, "_PROC_MODULES_PATH", str(modules_path))
+    assert ct._conntrack_module_loaded() is True
+
+
+def test_conntrack_module_loaded_false_when_not_listed(tmp_path, monkeypatch):
+    modules_path = tmp_path / "modules"
+    modules_path.write_text(
+        "ip_tables 32768 1 - Live 0x0000000000000000\n", encoding="ascii")
+    monkeypatch.setattr(ct, "_PROC_MODULES_PATH", str(modules_path))
+    assert ct._conntrack_module_loaded() is False
+
+
+def test_conntrack_module_loaded_none_when_proc_modules_is_unreadable(tmp_path, monkeypatch):
+    monkeypatch.setattr(ct, "_PROC_MODULES_PATH", str(tmp_path / "does_not_exist"))
+    assert ct._conntrack_module_loaded() is None
+
+
+# ---------------------------------------------------------------------------
+# The "absent" log message: which of two different problems it names
+# ---------------------------------------------------------------------------
+def test_absent_message_blames_procfs_not_the_module_when_the_module_is_loaded(
+        tmp_path, monkeypatch, caplog):
+    """THE misdiagnosis this fixes: a kernel with `nf_conntrack` genuinely
+    loaded but `CONFIG_NF_CONNTRACK_PROCFS` compiled out must not be told
+    'the module seems unloaded' — that sends an operator to reload a module
+    that is already there, for a problem reloading it cannot fix."""
+    monkeypatch.setattr(ct, "discover_host_identity", lambda: _identity(ips={_HOST_IP}))
+    monkeypatch.setattr(ct, "_conntrack_module_loaded", lambda: True)
+    s = ct.ConntrackSampler(str(tmp_path / "does_not_exist_nf_conntrack"))
+
+    with caplog.at_level("WARNING", logger="sentinel.collectors.conntrack"):
+        s.maybe_sample(now=1000.0)
+
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "CONFIG_NF_CONNTRACK_PROCFS" in messages
+    assert "pare neîncărcat" not in messages
+
+
+def test_absent_message_says_module_when_proc_modules_does_not_list_it(
+        tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(ct, "discover_host_identity", lambda: _identity(ips={_HOST_IP}))
+    monkeypatch.setattr(ct, "_conntrack_module_loaded", lambda: False)
+    s = ct.ConntrackSampler(str(tmp_path / "does_not_exist_nf_conntrack"))
+
+    with caplog.at_level("WARNING", logger="sentinel.collectors.conntrack"):
+        s.maybe_sample(now=1000.0)
+
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "CONFIG_NF_CONNTRACK_PROCFS" not in messages
+    assert "modul separat" in messages
+
+
+def test_absent_message_admits_it_cannot_tell_when_proc_modules_is_also_unreadable(
+        tmp_path, monkeypatch, caplog):
+    """The third, honest state: neither 'the module is loaded' nor 'it is
+    not' — /proc/modules itself could not be read, which must not be
+    silently folded into either claim."""
+    monkeypatch.setattr(ct, "discover_host_identity", lambda: _identity(ips={_HOST_IP}))
+    monkeypatch.setattr(ct, "_conntrack_module_loaded", lambda: None)
+    s = ct.ConntrackSampler(str(tmp_path / "does_not_exist_nf_conntrack"))
+
+    with caplog.at_level("WARNING", logger="sentinel.collectors.conntrack"):
+        s.maybe_sample(now=1000.0)
+
+    messages = " ".join(r.getMessage() for r in caplog.records)
+    assert "necunoscută" in messages or "nu s-a putut citi" in messages

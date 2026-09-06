@@ -36,6 +36,29 @@ def test_outbound_dst_key_is_none_without_a_destination():
     assert dim.key_of({"dst_ip": None}) is None
 
 
+def test_outbound_dst_is_not_high_severity_on_the_default_three_day_warmup():
+    """Locks in the 6 Sep 2026 measurement in `collectors/conntrack.py`'s
+    module docstring: on the production host, `outbound_dst` was still
+    reporting new destinations (671, 355, 59, 19, 7, 4/day across its first
+    six days) two days after it went "warm" under the shared 3-day default,
+    and had already raised 16 unactionable HIGH incidents by then. A silent
+    revert of either field back to the shared defaults (e.g. someone
+    "simplifying" this Dimension to match the others) would reproduce
+    exactly that — this test is what makes such a revert fail loudly instead
+    of waiting for the next flood of bare-IP HIGH alerts to notice."""
+    dim = bh.BY_NAME["outbound_dst"]
+    assert dim.severity == "medium"
+    # Pinned to the exact measured value, not `> 3`: a mutation that lowered
+    # this to 4 (still "> 3", still wrong — day six of the measurement was
+    # still nonzero) left this assertion green before this fix, which is
+    # exactly the kind of silent regression `warmup_days` existing at all is
+    # supposed to prevent.
+    assert dim.warmup_days == 14, (
+        "14 is RATE_LOOKBACK_HOURS/24 from detect/novelty.py, the same "
+        "'enough history' constant this rule family already trusts — "
+        "any other value needs its own measurement, not a guess")
+
+
 # ---------------------------------------------------------------------------
 # observe(): the decision, not the source text
 # ---------------------------------------------------------------------------

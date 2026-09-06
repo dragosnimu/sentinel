@@ -151,11 +151,191 @@ a port scanner run from the host, or a burst of outbound connection attempts
 to random addresses, can put thousands of distinct destinations in one
 sample. `MAX_NEW_PER_SAMPLE` bounds that case explicitly; see its own comment
 for the worst-case math and why hitting it is logged every time, not once.
+
+## What opened it — and the wall this hits almost immediately
+
+Before this section existed, `process` and `pid` were NULL on every row this
+collector ever wrote — not because nobody asked, but because nobody tried.
+An operator looking at "new destination: 203.0.113.9" had no way to tell
+"a cron job I wrote" from "something that got in", and the `novelty.
+outbound_dst` alert text (`detect/novelty.py`) says exactly that: confirm it
+yourself if you recognise it, otherwise find out who did this — advice that
+is impossible to follow from a bare IP.
+
+The path available without a new dependency or a wider capability grant:
+`/proc/net/tcp` and `/proc/net/tcp6` map a live TCP 4-tuple to a socket
+inode AND to the uid that owns it (world-readable, `-r--r--r-- root:root` —
+no capability needed, see `_build_tcp_socket_index`); `/proc/<pid>/fd/*`
+symlinks named `socket:[<inode>]` map that inode to a owning pid (see
+`_scan_fd_sockets`); `/proc/<pid>/comm` and `/proc/<pid>/exe` name the
+process once the pid is known. All of it plain file reads — nothing this
+collector's unit does not already have.
+
+**Measured on the production host, under the EXACT capability set
+`sentinel-ingest.service` is granted (`CAP_DAC_READ_SEARCH`, no
+`CAP_SYS_PTRACE`), not a bare shell:** `os.listdir("/proc/<pid>/fd")` on a
+process owned by a DIFFERENT user succeeds — `CAP_DAC_READ_SEARCH` bypasses
+the directory permission bits, confirmed with `setpriv
+--ambient-caps=+dac_read_search` reproducing the unit's own grant exactly.
+But `os.readlink("/proc/<pid>/fd/<n>")` on that same directory's entries —
+the one call that turns an fd NUMBER into the inode it points at — fails
+with `PermissionError` regardless: naming a socket's target is gated by
+`ptrace_may_access`, a check `CAP_DAC_READ_SEARCH` was never meant to
+satisfy and does not. Measured at scale on the same host: of 3,030 fd
+entries across 216 processes, 2,953 (97.5%) were denied this way; every one
+of the 77 that succeeded belonged to a process running as the SAME user as
+the collector.
+
+**The consequence, stated plainly so it is not discovered by someone
+reading a "found" rate near zero and assuming the code is broken:**
+attribution below can only ever succeed for a connection opened by a
+process running as `sentinel` itself — the AI worker calling the Anthropic
+API, the Telegram bot's long poll, the shipper posting to the external
+aggregator. A connection opened by nginx, php-fpm, a cron job, a container,
+or an attacker's process running as literally any other user — root
+included — is invisible to this mechanism by kernel design, not by a gap in
+this code. Verified positively, not just by absence: on the production
+host, an established connection genuinely opened by `sentinel`'s own
+Telegram bot process resolved correctly to that process's pid, comm and
+exe through this exact path; two other live connections on unrelated
+ports, opened by another user's process, resolved to nothing, as the math
+above predicts.
+
+Full pid-level attribution (a compromised web app or container actually
+phoning home — the case this whole collector exists for) still needs one of
+two things this file does not decide on its own: granting `CAP_SYS_PTRACE`
+to `sentinel-ingest.service` (this process parses the least-trusted input
+in the system — see `ARHITECTURA.md` §5 — and that capability would let a
+compromised instance of it read the memory-mapped fds of any process on the
+host), or a narrowly-scoped read-only lookup added to `sentinel-executor`
+(the one root component, and adding to it is exactly the kind of scope
+`ARHITECTURA.md` §3.4 says to watch). Both are real trade-offs an operator
+should pick, not a default this module reaches for quietly.
+
+Two paths are open WITHOUT either of those, neither implemented here — left
+as a decision, not a gap silently closed:
+
+* The `uid` column of `/proc/net/tcp` (`cols[7]`) is parsed and kept for
+  every row with a matching inode, `"not_attributable"` included — the
+  kernel hands it out with the exact same permission as the rest of the
+  table, no `CAP_SYS_PTRACE` needed. `_uid_to_name` resolves it to a
+  username where the local passwd database has an entry; an unmapped uid
+  (a container's own UID namespace, most often) stays a bare number, not a
+  guess.
+* `/proc/<pid>/net/tcp` is scoped to THAT pid's network namespace, and is
+  as world-readable as the host's own `/proc/net/tcp` — measured directly:
+  reading it for a representative pid of each of several docker network
+  namespaces succeeded under the unit's own capability set with zero
+  denials, and a live container connection checked against it matched.
+  That would name the CONTAINER a connection came from, not a pid — the
+  question an operator triaging container egress actually asks — but
+  deciding which pids to check per namespace, and turning a matched netns
+  back into a container id via `/proc/<pid>/cgroup`, is a second piece of
+  work this change does not take on.
+
+Container egress is a SECOND, independent ceiling on top of the ptrace one
+above: a container's socket lives in its own network namespace, with its
+own `/proc/net/tcp`. The HOST's own `/proc/net/tcp` — the only one
+`_build_tcp_socket_index` reads today — structurally never lists it,
+whatever the capability set; the exact motivating case from §3.18 of
+`ARHITECTURA.md` (a container's egress, visible here only through its
+pre-NAT bridge address) is invisible to THIS lookup for that reason. That is
+narrower than "unattributable regardless of privilege" — this paragraph's
+previous wording, corrected after measurement showed a container-scoped
+`/proc/<pid>/net/tcp` read succeeds cleanly (see above): it is a namespace
+question this module does not currently answer, not a wall no amount of
+code could ever cross. `HostIdentity.ips` (exact host addresses) versus
+`HostIdentity.networks` (bridge/private subnets) is what tells the two
+cases apart BEFORE any lookup runs — `attribute_process` uses exactly that
+to assign `"container_egress"` instead of misreading an inevitable miss in
+the host's own table as "the connection closed".
+
+None of this makes the attempt worthless. What it cannot attribute, it
+records as exactly that — an explicit `process_status` in `raw`, never a
+silently-NULL `process` column that looks identical to "nobody asked":
+`"found"` (a name was read), `"closed_before_scan"` (a HOST-owned
+connection was gone from `/proc/net/tcp{,6}` by the time this sampler
+looked — the already-documented short-lived-connection gap, now visible
+per-row instead of only in this docstring), `"not_attributable"` (the
+socket was still open, but this process could not read whose it was — the
+97.5% case above; `uid`/`user` may still be populated here, since the
+kernel hands those out on the same terms as the rest of the row),
+`"container_egress"` (the source is owned only via `HostIdentity.networks`,
+never `.ips` — a container's or other NAT'd bridge's address, which the
+HOST's own `/proc/net/tcp` cannot show by namespace design, decided BEFORE
+the lookup runs instead of discovered afterwards as a false "closed"),
+`"host_tcp_unreadable"` (`/proc/net/tcp` itself could not be read this
+round — a real regression, since that file needs no capability beyond what
+this unit already has, and must never collapse into "closed": the two mean
+different things to an operator), `"udp_unsupported"` (conntrack tracks
+UDP; `/proc/net/udp` was not in the path this was asked to use, so a UDP
+row is never even attempted). Absence of the `process_status` key entirely
+— any row written before this section existed — means the collector never
+tried at all, a state distinct from all of the above.
+
+## Destination hostnames: reachable, not built here
+
+A CDN address rotates, so raising "never seen before" forever on the IP
+alone is a standing false-positive generator the operator explicitly asked
+about. Investigated, not assumed: Suricata already writes `dns` records to
+`eve.json` on this host — `event_type=dns`, `dns.type=answer` entries carry
+`rrname` and each answer's `rdata`, measured directly against the live file
+(real `rrname` -> `rdata` pairs observed, at roughly 4% of eve.json's line
+volume, alongside `flow`/`stats`/`tls` that `collectors/suricata_eve.py`
+already drops before the database for the same volume reason — see that
+module's docstring). No packet capture beyond what already runs would be
+needed.
+
+Building the correlation is a second collector's work, not this file's: it
+needs `suricata_eve.py` to stop discarding `dns` records (a decision with
+its own volume cost, on a module that discards non-alert records
+specifically to protect partitions), a place to hold recent answers long
+enough to be useful (a persisted table, so it survives an ingest restart
+and both collectors can read it; or an in-process cache, cheaper but gone
+every restart and shared awkwardly between two collectors that do not
+otherwise know about each other), and a decision about which of those two
+shapes is worth the cost. That is a second collector's design, not a
+one-file fix riding along in this one — left explicitly undone, not
+silently dropped.
+
+## Severity: revisited with a measurement, not a hunch
+
+`predict/behaviour.py`'s `outbound_dst` dimension used the shared defaults
+(`severity="high"`, `warmup_days=3`) sized for dimensions with a handful of
+stable values (which admin logs in). Measured on the production host across
+its first six days: daily NEW destinations (not total — total stayed
+~650-920/day throughout) ran 671, 355, 59, 19, 7, 4 — still nonzero on day
+six, the last day measured, the same day the dimension had already been
+"warm" for two days and HAD ALREADY raised 16 HIGH incidents. A destination
+space that has not finished decaying by the day it starts alerting at HIGH
+is not the same shape as `login_user`. `severity` is now `medium` and
+`warmup_days` is 14 (the same constant `RATE_LOOKBACK_HOURS` already treats
+as "enough history to mean something" for this rule family, in
+`detect/novelty.py`) — not a number picked to make the graph prettier, but
+not proven correct past day six either, since six days is all that was
+measured; see `predict/behaviour.py` for the same note kept where the
+constant lives.
+
+**Stated plainly, because it is easy to believe the opposite from the diff
+alone: `warmup_days=14` is a NO-OP on the host that motivated it.**
+`outbound_dst.warm_at` was already set on that host — two days after
+`started_at`, under the previous `warmup_days=3` — and `_promote_warm` in
+`predict/behaviour.py` skips any row where `warm_at IS NOT NULL`, by its own
+documented invariant: a dimension that has gone warm may never go cold
+again. Raising the threshold in code does not touch an already-warm row;
+only `severity` (read live from `DIMENSIONS` at alert time, never cached)
+takes effect immediately, and only for alerts from this point forward — the
+16 HIGH incidents already open do not become MEDIUM retroactively.
+Resetting `warm_at` for `outbound_dst` on that host would make
+`warmup_days=14` matter there too, but doing that quietly, from this
+module, would be exactly the kind of unilateral fix `ARHITECTURA.md` warns
+against for a written invariant: it is the operator's call, not made here.
 """
 
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import socket
 import time
@@ -206,7 +386,21 @@ MAX_NEW_PER_SAMPLE = 50
 _ROUTE_PATH = "/proc/net/route"
 _FIB_TRIE_PATH = "/proc/net/fib_trie"
 
+# Where a live TCP socket's local/remote 4-tuple maps to its inode — see the
+# module docstring's "What opened it" section for what this can and cannot
+# attribute, measured, before anyone reads a near-zero "found" rate and
+# assumes the code is broken rather than the kernel's own ptrace check.
+_PROC_NET_TCP_PATH = "/proc/net/tcp"
+_PROC_NET_TCP6_PATH = "/proc/net/tcp6"
+_PROC_ROOT = "/proc"
+
+# Where a LOADED kernel module (as opposed to one built directly into the
+# kernel) shows up — used only to tell apart the two different reasons
+# `/proc/net/nf_conntrack` can be absent, see `_conntrack_module_loaded`.
+_PROC_MODULES_PATH = "/proc/modules"
+
 _KV = re.compile(r"\b(?P<key>src|dst|sport|dport)=(?P<val>\S+)")
+_FD_SOCKET_RE = re.compile(r"^socket:\[(\d+)\]$")
 
 
 @dataclass(frozen=True)
@@ -357,6 +551,291 @@ def is_outbound(tup: ConnTuple, identity: HostIdentity) -> bool:
     return bool(dst.is_global)
 
 
+# ---------------------------------------------------------------------------
+# Process attribution — see the module docstring's "What opened it" section
+# for the measured ceiling this runs into and why it is a kernel property,
+# not a bug here.
+# ---------------------------------------------------------------------------
+def _hex_to_ipv6(field: str) -> str:
+    """One 32-hex-char address field of `/proc/net/tcp6` -> its text form.
+
+    The kernel prints an IPv6 address as four 32-bit words, each in the
+    machine's native byte order — the same convention `_hex_to_ipv4` decodes
+    for a single 32-bit field, applied per word here. Decode format confirmed
+    against a literal kernel-formatted `/proc/net/tcp6` field for loopback
+    (the four 32-bit words `00000000 00000000 00000000 01000000` -> `::1`,
+    see this module's own tests — written here with a space between words
+    for readability; `bytes.fromhex` treats that identically to the
+    unbroken string the kernel actually prints) — no longer "written from
+    the documented format and never checked". Still UNPROVEN end-to-end on
+    the production host this collector actually runs on: IPv6 is disabled
+    there (zero entries in either conntrack or this table — see the module
+    and `HostIdentity` docstrings), so the decoder itself is right, but
+    nothing here has ever matched a real v6 tuple against a real v6 socket
+    on THIS host. Kept as
+    its own function, not folded into `_hex_to_ipv4`, so that remaining gap
+    stays visible at the call site instead of borrowing v4's fully
+    end-to-end-tested confidence.
+    """
+    raw = bytes.fromhex(field)
+    if len(raw) != 16:
+        raise ValueError(f"not a 16-byte IPv6 address field: {field!r}")
+    words = b"".join(raw[i:i + 4][::-1] for i in range(0, 16, 4))
+    return str(ipaddress.IPv6Address(words))
+
+
+def _parse_proc_net_tcp(text: str, *, v6: bool) -> dict[tuple[str, int, str, int], tuple[str, str]]:
+    """One `/proc/net/tcp` or `/proc/net/tcp6` table -> {(local_ip,
+    local_port, remote_ip, remote_port): (inode, uid)}.
+
+    Columns are `sl local_address rem_address st tx_queue:rx_queue tr:tm->when
+    retrnsmt uid timeout inode`, whitespace-separated, one header line first.
+    `uid` (`cols[7]`) is kept alongside the inode — the kernel hands it out
+    on the same terms as everything else in the row, no capability beyond
+    what reads the table at all, and it is the one thing that can still name
+    an owner on a `"not_attributable"` row (see `_uid_to_name`,
+    `attribute_process`). A row whose inode is `"0"` (TIME_WAIT and similar
+    transient states report no owning fd) is skipped — matching against it
+    could never resolve to a process, so keeping it would only plant false
+    confidence that a lookup MIGHT still succeed. A line this cannot parse
+    is skipped, not guessed at, the same standard `parse_line` holds itself
+    to for conntrack's own lines.
+    """
+    to_ip = _hex_to_ipv6 if v6 else _hex_to_ipv4
+    index: dict[tuple[str, int, str, int], tuple[str, str]] = {}
+    for line in text.splitlines()[1:]:
+        cols = line.split()
+        if len(cols) < 10:
+            continue
+        inode = cols[9]
+        if inode == "0":
+            continue
+        uid = cols[7]
+        try:
+            l_ip_hex, l_port_hex = cols[1].split(":")
+            r_ip_hex, r_port_hex = cols[2].split(":")
+            key = (to_ip(l_ip_hex), int(l_port_hex, 16),
+                   to_ip(r_ip_hex), int(r_port_hex, 16))
+        except ValueError:
+            continue
+        index[key] = (inode, uid)
+    return index
+
+
+def _build_tcp_socket_index() -> tuple[dict[tuple[str, int, str, int], tuple[str, str]], bool]:
+    """Both TCP tables -> ({4-tuple: (inode, uid)}, tcp_v4_readable).
+
+    World-readable (`-r--r--r-- root:root`, measured) — no capability the
+    unit does not already have.
+
+    `tcp_v4_readable` is False only when `/proc/net/tcp` ITSELF could not be
+    opened — a real regression worth its own `process_status`
+    (`"host_tcp_unreadable"`, see `attribute_process`), since that file needs
+    no capability this unit lacks. `/proc/net/tcp6` failing on its own is
+    NOT the same signal and does not affect this flag: IPv6 is disabled on
+    every host this module was measured against (see the module and
+    `HostIdentity` docstrings), so `/proc/net/tcp6` being absent there is the
+    expected, permanent case, not a regression to flag every sample.
+    """
+    index: dict[tuple[str, int, str, int], tuple[str, str]] = {}
+    tcp_v4_readable = False
+    for path, v6 in ((_PROC_NET_TCP_PATH, False), (_PROC_NET_TCP6_PATH, True)):
+        try:
+            with open(path, "r", encoding="ascii", errors="strict") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        if not v6:
+            tcp_v4_readable = True
+        index.update(_parse_proc_net_tcp(text, v6=v6))
+    return index, tcp_v4_readable
+
+
+def _uid_to_name(uid: str) -> str | None:
+    """A socket's owning uid (`/proc/net/tcp`'s own `cols[7]`, parsed for
+    free alongside the inode in `_parse_proc_net_tcp`) -> a username, via the
+    local passwd database.
+
+    Works for ANY live socket this process matched an inode for —
+    `"not_attributable"` rows included — since the kernel hands `uid` out on
+    the same terms as the rest of the row, unlike the pid this function does
+    not try to find. `None` for a uid with no local passwd entry (most often
+    a container's own UID namespace, which this host's NSS cannot resolve)
+    is an unmapped uid, not a resolution failure to hide; the numeric `uid`
+    stays on `ProcessAttribution` either way.
+    """
+    try:
+        import pwd
+
+        return pwd.getpwuid(int(uid)).pw_name
+    except (ImportError, KeyError, ValueError, OverflowError):
+        # ImportError on Windows, where this test suite also runs (see
+        # sentinel/collectors/auditd.py's own uid resolver for the same
+        # pattern); the rest for a uid string that is not a number, or a
+        # number with no passwd entry. All of it means "cannot tell", never
+        # a fabricated name.
+        return None
+
+
+def _scan_fd_sockets() -> tuple[dict[str, str], int, int]:
+    """Walk every `/proc/<pid>/fd` entry this process is ALLOWED to read,
+    mapping socket inode -> pid.
+
+    Measured on the production host, under the exact capability set
+    `sentinel-ingest.service` is granted: `os.listdir` on another user's fd
+    directory succeeds (`CAP_DAC_READ_SEARCH` bypasses the directory
+    permission bits), but `os.readlink` on an individual entry — the call
+    that actually names the inode a fd points at — fails with
+    `PermissionError` unless the target process runs as the SAME user as
+    this one; `ptrace_may_access` gates it, and `CAP_DAC_READ_SEARCH` was
+    never meant to satisfy that check. See the module docstring for the
+    97.5%-denied measurement this produced at scale.
+
+    Returns (inode_to_pid, attempted, denied) rather than swallowing the
+    counts — a "found" rate near zero is expected and correct given the
+    above, not a sign this function is broken, and the counts are what let
+    that be told apart from an actual regression later.
+    """
+    inode_to_pid: dict[str, str] = {}
+    attempted = 0
+    denied = 0
+    try:
+        pids = [p for p in os.listdir(_PROC_ROOT) if p.isdigit()]
+    except OSError:
+        return {}, 0, 0
+    for pid in pids:
+        fd_dir = f"{_PROC_ROOT}/{pid}/fd"
+        try:
+            names = os.listdir(fd_dir)
+        except OSError:
+            # Gone since the pid listing, or (the common case for another
+            # user's process — see docstring) simply not ours to enumerate.
+            continue
+        for name in names:
+            attempted += 1
+            try:
+                target = os.readlink(f"{fd_dir}/{name}")
+            except PermissionError:
+                denied += 1
+                continue
+            except OSError:
+                continue  # the fd closed between listing it and reading it
+            m = _FD_SOCKET_RE.match(target)
+            if m:
+                inode_to_pid.setdefault(m.group(1), pid)
+    return inode_to_pid, attempted, denied
+
+
+def _process_info(pid: str) -> tuple[str | None, str | None]:
+    """(comm, exe) for a pid `_scan_fd_sockets` already proved this process
+    can read an fd of. `comm` is world-readable regardless of the target's
+    owner; `exe` needs the same same-uid access the fd symlink itself did,
+    so if the caller got this far, `exe` reliably succeeds too — a failure
+    here means the process exited in the race window between the two
+    `/proc` reads, not a permission gap this collector could still close.
+    """
+    comm: str | None = None
+    exe: str | None = None
+    try:
+        with open(f"{_PROC_ROOT}/{pid}/comm", "r", encoding="utf-8", errors="replace") as fh:
+            comm = fh.read().strip() or None
+    except OSError:
+        pass
+    try:
+        exe = os.readlink(f"{_PROC_ROOT}/{pid}/exe")
+    except OSError:
+        pass
+    return comm, exe
+
+
+@dataclass(frozen=True)
+class ProcessAttribution:
+    """The outcome of trying to name what opened one connection.
+
+    `status` is written to every emitted event's `raw["process_status"]` —
+    never collapsed into a bare NULL `process` column, which would be
+    indistinguishable from a row written before this existed at all (see the
+    module docstring): `"found"` (a name was read), `"closed_before_scan"` (a
+    HOST-owned connection was already gone from `/proc/net/tcp{,6}` — the
+    documented short-lived-connection gap, now visible per-row),
+    `"not_attributable"` (the socket was still open, but this process could
+    not read whose it was — the measured 97.5% case), `"container_egress"`
+    (the source is owned only via `HostIdentity.networks`, never `.ips` — the
+    HOST's own `/proc/net/tcp` cannot show it by namespace design, decided
+    BEFORE any lookup runs), `"host_tcp_unreadable"` (`/proc/net/tcp` itself
+    could not be read this round — a real regression, never the same fact as
+    "closed"), `"udp_unsupported"` (conntrack tracks UDP; there is no
+    per-connection fd table for it on the path this module was asked to use,
+    so it is never attempted).
+
+    `uid`/`user`: the owning uid of the matched socket, and its resolved
+    username, populated whenever `tcp_index` had a matching inode — even for
+    `"not_attributable"` rows, which is the point: the kernel hands out `uid`
+    on the same terms as the rest of the row, no ptrace involved. Both are
+    `None` for `"udp_unsupported"`, `"container_egress"`,
+    `"host_tcp_unreadable"` and `"closed_before_scan"`, none of which ever
+    reach a matched table row.
+    """
+
+    process: str | None
+    pid: int | None
+    exe: str | None
+    status: str
+    uid: str | None = None
+    user: str | None = None
+
+
+def attribute_process(
+    tup: ConnTuple,
+    tcp_index: dict[tuple[str, int, str, int], tuple[str, str]],
+    inode_to_pid: dict[str, str],
+    *,
+    is_host_src: bool,
+    tcp_readable: bool,
+) -> ProcessAttribution:
+    """One `ConnTuple` -> what (if anything) could be learned about the
+    process that opened it, given a socket index and pid map already built
+    for this sample (see `_build_tcp_socket_index`, `_scan_fd_sockets`) —
+    built once per sample, not once per connection, since both cost real
+    syscalls.
+
+    `is_host_src` and `tcp_readable` are decided by the CALLER before this
+    function ever looks at `tcp_index` — see the module docstring's
+    "Container egress is a SECOND..." paragraph. A container's connection
+    must never be allowed to fall through to `"closed_before_scan"`: the
+    host's own `/proc/net/tcp` structurally cannot ever contain it, whether
+    or not the read itself succeeded, so treating a miss there as "the
+    process closed it" would be exactly the intention-instead-of-effect
+    substitution this repository was built to stop shipping. Checked in
+    that order — a container-owned source reports `"container_egress"` even
+    when `tcp_readable` is also False, since the table being unreadable
+    changes nothing about a connection it could never have shown anyway.
+    """
+    if tup.proto != "tcp":
+        return ProcessAttribution(None, None, None, "udp_unsupported")
+    if not is_host_src:
+        return ProcessAttribution(None, None, None, "container_egress")
+    if not tcp_readable:
+        return ProcessAttribution(None, None, None, "host_tcp_unreadable")
+    entry = tcp_index.get((tup.src, tup.sport, tup.dst, tup.dport))
+    if entry is None:
+        return ProcessAttribution(None, None, None, "closed_before_scan")
+    inode, uid = entry
+    user = _uid_to_name(uid)
+    pid = inode_to_pid.get(inode)
+    if pid is None:
+        return ProcessAttribution(None, None, None, "not_attributable", uid=uid, user=user)
+    comm, exe = _process_info(pid)
+    if comm is None:
+        # The pid vanished between _scan_fd_sockets and here — a real name
+        # could not be produced, so this is not "found" even though a pid
+        # was briefly known. uid/user survive this fallback: the kernel
+        # gave those up from the table row itself, not from the pid lookup
+        # that just failed.
+        return ProcessAttribution(None, None, None, "not_attributable", uid=uid, user=user)
+    return ProcessAttribution(comm, int(pid), exe, "found", uid=uid, user=user)
+
+
 def _hex_to_ipv4(field: str) -> str:
     """One 8-hex-char column of `/proc/net/route` -> dotted-decimal.
 
@@ -484,6 +963,32 @@ def discover_host_identity() -> HostIdentity:
         return HostIdentity(frozenset(), ())
 
 
+def _conntrack_module_loaded() -> bool | None:
+    """Best-effort: is `nf_conntrack` a LOADED module, per `/proc/modules`?
+
+    Used only to make the "absent" branch of `_log_state_change` name the
+    right one of two different problems: "the module was never loaded" (an
+    operator can fix that by loading it) versus "it IS loaded, but this
+    kernel's procfs interface for it is compiled out" (loading it again does
+    nothing, and the message must not send anyone to try). Returns True/False
+    when `/proc/modules` itself is readable and does/does not list a
+    `nf_conntrack` line; `None` when even that could not be read — its own
+    honest "cannot tell", not a guess in either direction.
+
+    A module compiled directly INTO the kernel (`CONFIG_NF_CONNTRACK=y`, not
+    `=m`) never appears in `/proc/modules` regardless of whether it is
+    active. This check cannot rule that shape out and does not claim to —
+    the `False` message says exactly that, rather than asserting the module
+    is absent.
+    """
+    try:
+        with open(_PROC_MODULES_PATH, "r", encoding="ascii", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    return any(line.split(" ", 1)[0] == "nf_conntrack" for line in text.splitlines())
+
+
 @dataclass(frozen=True)
 class _SampleOutcome:
     status: str                      # "ok" | "absent" | "denied" | "error"
@@ -529,6 +1034,10 @@ class ConntrackSampler:
         self._last_sample_at: float | None = None
         self._last_emitted: dict[tuple[str, str, int], float] = {}
         self._last_status: str | None = None
+        # (bucket, tcp_v4_readable) from the last _attribute() call — see
+        # _log_attribution_state. None until the first TCP attribution scan
+        # actually runs.
+        self._last_attribution_state: tuple[str, bool] | None = None
         if not self._identity:
             log.error(
                 "adresele IP ale gazdei nu s-au putut afla la pornirea "
@@ -593,22 +1102,91 @@ class ConntrackSampler:
                 extra={"seen": len(new_candidates), "kept": MAX_NEW_PER_SAMPLE})
             kept = new_candidates[:MAX_NEW_PER_SAMPLE]
 
+        attributions = self._attribute(kept)
+
         ts = datetime.now(timezone.utc)
         events: list[Event] = []
         for tup in kept:
             key = (tup.proto, tup.dst, tup.dport)
             self._last_emitted[key] = now
+            attr = attributions[tup]
+            raw: dict[str, object] = {"sampled": True, "process_status": attr.status}
+            if attr.exe:
+                raw["exe"] = attr.exe
+            if attr.uid is not None:
+                raw["uid"] = attr.uid
+            if attr.user:
+                raw["user"] = attr.user
             events.append(Event(
                 ts=ts, source="conntrack", action="connect",
                 src_ip=tup.src, src_port=tup.sport,
                 dst_ip=tup.dst, dst_port=tup.dport, proto=tup.proto,
-                raw={"sampled": True},
+                process=attr.process, pid=attr.pid,
+                raw=raw,
             ))
         return events
+
+    def _attribute(self, kept: list[ConnTuple]) -> dict[ConnTuple, ProcessAttribution]:
+        """Attribution for exactly the tuples about to be emitted — never
+        for the ones dedup or the per-sample cap already dropped, since
+        those cost real syscalls (see `_build_tcp_socket_index`,
+        `_scan_fd_sockets`) that a connection nobody will see this round
+        gains nothing from paying.
+
+        `is_host_src` is decided HERE, from `HostIdentity.ips` — never
+        inferred from a lookup miss — so a container's connection is
+        reported as `"container_egress"`, not misread as `"closed_before_scan"`
+        just because the host's own `/proc/net/tcp` was never going to list
+        it. See the module docstring's "Container egress" section.
+        """
+        if not kept:
+            return {}
+        if not any(tup.proto == "tcp" for tup in kept):
+            return {tup: ProcessAttribution(None, None, None, "udp_unsupported")
+                    for tup in kept}
+        tcp_index, tcp_readable = _build_tcp_socket_index()
+        inode_to_pid, attempted, denied = _scan_fd_sockets()
+        self._log_attribution_state(attempted, denied, tcp_readable)
+        return {tup: attribute_process(
+                    tup, tcp_index, inode_to_pid,
+                    is_host_src=tup.src in self._identity.ips,
+                    tcp_readable=tcp_readable)
+                for tup in kept}
 
     def _prune_cache(self, now: float) -> None:
         cutoff = now - _CACHE_TTL_S
         self._last_emitted = {k: v for k, v in self._last_emitted.items() if v >= cutoff}
+
+    def _log_attribution_state(self, attempted: int, denied: int, tcp_readable: bool) -> None:
+        """Log ATTEMPTED/DENIED from `_scan_fd_sockets`, and whether
+        `/proc/net/tcp` itself was readable, only when the bucket changes —
+        the same anti-spam shape as `_log_state_change`.
+
+        A near-total denial rate is the EXPECTED steady state (see the
+        module docstring's 97.5% measurement); this does not warn about
+        that. It exists so that a state which stops matching that
+        expectation — `attempted` staying at 0 (the `/proc` walk itself
+        broke), or `denied` dropping to 0 (either a capability change, or
+        every match this round happening to be `sentinel`'s own process) —
+        is visible, instead of being silently discarded the way `_attempted`/
+        `_denied` were before this existed.
+        """
+        if attempted == 0:
+            bucket = "no_attempt"
+        elif denied == 0:
+            bucket = "none_denied"
+        elif denied == attempted:
+            bucket = "fully_denied"
+        else:
+            bucket = "partially_denied"
+        state = (bucket, tcp_readable)
+        if state == self._last_attribution_state:
+            return
+        self._last_attribution_state = state
+        log.info(
+            "stare atribuire proces la eșantionarea conntrack",
+            extra={"bucket": bucket, "attempted": attempted, "denied": denied,
+                   "tcp_v4_readable": tcp_readable})
 
     def _log_state_change(self, outcome: _SampleOutcome) -> None:
         """Log only on a CHANGE of status — loud enough to be seen once,
@@ -618,10 +1196,37 @@ class ConntrackSampler:
             return
         self._last_status = outcome.status
         if outcome.status == "absent":
-            log.warning(
-                "nf_conntrack indisponibil (modulul de kernel pare neîncărcat); "
-                "eșantionarea traficului de ieșire e oprită",
-                extra={"path": self._path})
+            # /proc/net/nf_conntrack missing has two different causes an
+            # operator would act on differently — "the module was never
+            # loaded" (load it) vs. "it IS loaded, but this kernel's procfs
+            # interface for it is compiled out" (loading it again does
+            # nothing) — collapsing them into one guess is exactly the
+            # mistake this message existed to avoid making about CAP_NET_ADMIN
+            # vs CAP_DAC_READ_SEARCH just below. See `_conntrack_module_loaded`
+            # for what it can and cannot tell.
+            loaded = _conntrack_module_loaded()
+            if loaded is True:
+                log.warning(
+                    "nf_conntrack apare ÎNCĂRCAT ca modul (listat în "
+                    "/proc/modules), dar /proc/net/nf_conntrack lipsește — "
+                    "kernelul e probabil compilat fără "
+                    "CONFIG_NF_CONNTRACK_PROCFS; NU se rezolvă reîncărcând "
+                    "modulul. Eșantionarea traficului de ieșire e oprită",
+                    extra={"path": self._path})
+            elif loaded is False:
+                log.warning(
+                    "nf_conntrack nu apare încărcat ca modul separat "
+                    "(verificat în /proc/modules) — dacă e compilat direct în "
+                    "kernel (fără CONFIG_NF_CONNTRACK=m), verificarea asta nu "
+                    "îl vede. Eșantionarea traficului de ieșire e oprită",
+                    extra={"path": self._path})
+            else:
+                log.warning(
+                    "nf_conntrack indisponibil, iar /proc/modules nu s-a "
+                    "putut citi ca să spună dacă modulul e încărcat sau nu — "
+                    "cauza rămâne necunoscută. Eșantionarea traficului de "
+                    "ieșire e oprită",
+                    extra={"path": self._path})
         elif outcome.status == "denied":
             log.error(
                 "nf_conntrack ilizibil (permisiune refuzată); sentinel-ingest "

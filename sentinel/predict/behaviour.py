@@ -124,14 +124,46 @@ DIMENSIONS: tuple[Dimension, ...] = (
     # lentă) și ce ratează (o conexiune scurtă între două eșantioane).
     #
     # Volum mult sub cel al logărilor SSH — eșantionare o dată pe minut, cu
-    # deduplicare pe oră, nu jurnal complet — deci pragul de încălzire e cel
+    # deduplicare pe oră, nu jurnal complet — deci pragul de OBSERVAȚII e cel
     # folosit și pentru `exec_binary`/`webroot_writer`, dimensiuni la fel de
     # rare, nu cel implicit de 40 gândit pentru autentificări.
+    #
+    # `severity` și `warmup_days` NU sunt implicitele — au fost coborâte/
+    # urcate pe 6 septembrie 2026, pe măsurătoare, nu pe presupunere: pe
+    # gazda de producție, în primele șase zile de profil, „chei noi pe zi"
+    # pentru dimensiunea asta a fost 671, 355, 59, 19, 7, 4 — încă nenul în a
+    # șasea zi, ultima măsurată, zi în care profilul era deja „cald" de două
+    # zile (implicitul de 3) și ridicase deja 16 incidente HIGH, fiecare cu un
+    # IP gol în text („dacă e o schimbare, confirm-o; dacă nu, verifică cine")
+    # pe care nimeni nu-l putea tria — vezi `collectors/conntrack.py`, secțiunea
+    # „Severity" din docstring, pentru șirul complet și sursa cifrelor.
+    # `login_user`/`login_asn` au câteva valori STABILE; `outbound_dst` are
+    # peste o mie și încă adaugă — nu e aceeași formă de dimensiune, deci nu
+    # merită aceeași poartă. 14 zile nu e ales să arate bine pe grafic: e
+    # ACELAȘI 14 pe care `RATE_LOOKBACK_HOURS` din `detect/novelty.py` îl
+    # tratează deja drept „destul istoric ca să însemne ceva" pentru familia
+    # asta de reguli — și nici el nu e dovedit corect după ziua șase, fiindcă
+    # atât s-a măsurat până acum.
+    #
+    # ATENȚIE, ca să nu se creadă din diff că amândouă schimbările au avut
+    # efect: `warmup_days=14` e FĂRĂ EFECT pe gazda de producție chiar acum.
+    # `outbound_dst.warm_at` era deja setat acolo, la două zile după
+    # `started_at`, sub vechiul `warmup_days=3` — iar `_promote_warm` mai jos
+    # sare peste orice rând cu `warm_at IS NOT NULL`, pe propriul ei invariant
+    # documentat: o dimensiune devenită caldă n-are voie să redevină rece.
+    # Pragul nou nu atinge un rând deja cald; doar `severity` (citit live din
+    # DIMENSIONS la fiecare alertă, niciodată cache-uit) se aplică imediat, și
+    # doar pentru alertele de-acum-încolo — cele 16 incidente HIGH deja
+    # deschise nu devin MEDIUM retroactiv. Resetarea lui `warm_at` pentru
+    # `outbound_dst` pe gazda asta ar face `warmup_days=14` să conteze și
+    # acolo, dar asta contrazice invariantul scris mai sus în cod — e decizia
+    # operatorului, nu una luată tăcut din acest modul.
     Dimension(
         "outbound_dst", "conntrack", "connect", lambda r: _s(r["dst_ip"]),
         label="destinație de ieșire contactată de gazdă",
         novel_title="Conexiune de ieșire către o destinație nouă",
-        severity="high",
+        severity="medium",
+        warmup_days=14,
         min_observations=15),
 )
 
