@@ -214,6 +214,16 @@ telegram:
   owner_chat_id: @@TELEGRAM_CHAT_ID@@
   operator_chat_ids: []
   viewer_chat_ids: []
+  # `allowed_chat_ids` names a CHAT, not a person — in a private chat those are
+  # the same thing, but in a GROUP every member shares whatever role the
+  # group's chat id holds. Left empty (the default this installer writes),
+  # nothing changes here: a single admin talking to the bot from their own
+  # chat needs none of this. If `owner_chat_id` above is ever pointed at a
+  # GROUP (see docs/TELEGRAM.md §8, multiple instances sharing one alert
+  # group), list the Telegram user ids that are actually allowed to act in it
+  # here — anyone else in that group is then refused, even though the group
+  # itself is on the allowlist. See docs/TELEGRAM.md §2.
+  allowed_user_ids: []
 
   # Deployment-wide quiet window, in local time, e.g. "22:00-06:00". Each chat
   # can set its own from the phone with /mute, which overrides this.

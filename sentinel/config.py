@@ -409,6 +409,16 @@ class TelegramConfig:
     owner_chat_id: int | None = None
     operator_chat_ids: list[int] = field(default_factory=list)
     viewer_chat_ids: list[int] = field(default_factory=list)
+    # `allowed_chat_ids` names a CHAT, not a person. In a private chat those are
+    # the same thing; in a group they are not — every member of an allowed
+    # group shares whatever role the group's chat id holds, which is how a
+    # group added for alerts turned into owner rights for anyone in it (see
+    # docs/TELEGRAM.md §2 and §8). Empty (the default) means "chat check only",
+    # exactly the behaviour every install had before this field existed — an
+    # operator who upgrades and does not set this loses nothing. Non-empty adds
+    # a second requirement, checked only for a non-private chat: the sender
+    # (`update.effective_user.id`) must also be in this list.
+    allowed_user_ids: list[int] = field(default_factory=list)
     # Deployment-wide default window, "22:00-06:00". A chat that sets its own
     # with /mute overrides this. Critical alerts, PANIC, the watchdog and patch
     # failures ignore it entirely — see telegram/quiet.py.

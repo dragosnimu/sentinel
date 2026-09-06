@@ -84,8 +84,41 @@ def _esc(text: Any) -> str:
 
 
 def _authorized(cfg: Config, update: Update) -> bool:
+    """The chat check, and — when configured and it applies — the sender check.
+
+    `chat.id` and a person are the same thing only in a PRIVATE chat: there,
+    the chat IS the user, so the allowlist above already names a person. In a
+    group or channel the chat id is shared by everyone who can read it, so an
+    allowed group id has always meant "anyone in this group" — measured on
+    2026-09-05, that group also held owner rights on two production hosts at
+    once (docs/TELEGRAM.md §2, §8).
+
+    `telegram.allowed_user_ids` narrows a non-private chat to specific senders,
+    ON TOP OF the chat check, never instead of it. Left empty (the default),
+    this function does exactly what it always did — an install that upgrades
+    without touching the new key keeps its current access, including a group
+    that holds owner rights. Filling it in is what closes that door, and it is
+    the operator's call to make, not this function's to force.
+
+    A private chat is exempt from the sender list even if one is configured:
+    forcing an operator to also list their own private chat's id, on pain of
+    being locked out of their own bot for forgetting to, is the exact kind of
+    upgrade-breaks-the-install this repository does not ship (CLAUDE.md).
+    """
     chat = update.effective_chat
-    return chat is not None and chat.id in set(cfg.telegram.allowed_chat_ids)
+    if chat is None or chat.id not in set(cfg.telegram.allowed_chat_ids):
+        return False
+    allowed_users = set(getattr(cfg.telegram, "allowed_user_ids", None) or [])
+    if not allowed_users or getattr(chat, "type", "private") == "private":
+        return True
+    # No sender check where python-telegram-bot did not attach a sender: a
+    # channel post is the ordinary case (Telegram never gives a channel post's
+    # author to the bot, only the channel it came from as `sender_chat`), but
+    # the rule is general — an update this function cannot name a person for
+    # is refused, not defaulted open. That is a decision, not an oversight: an
+    # action nobody can be named for is not one a control channel performs.
+    user = update.effective_user
+    return user is not None and user.id in allowed_users
 
 
 def _can_act(cfg: Config, chat_id: int) -> bool:
@@ -931,7 +964,13 @@ async def on_flush_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     cfg: Config = context.bot_data["cfg"]
     query = update.callback_query
     await query.answer()
-    if not _can_act(cfg, update.effective_chat.id):
+    # `_authorized` too, not just `_can_act`: unlike `on_callback` and
+    # `on_patch_callback`, this handler had only ever checked the role, never
+    # the chat-and-sender gate — the one place the new sender check
+    # (`telegram.allowed_user_ids`) lives. Left as it was, PANIC/flush would
+    # have been the one button a non-listed group member could still press
+    # after every other path in this file was closed to them.
+    if not _authorized(cfg, update) or not _can_act(cfg, update.effective_chat.id):
         await query.edit_message_text("Neautorizat.")
         return
     db: Database = context.bot_data["db"]

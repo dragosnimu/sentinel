@@ -26,7 +26,8 @@ Scrie-i botului `/start` după instalare.
 Doar chat id-urile din `allowed_chat_ids` sunt procesate. Verificarea se face ca
 middleware, **pe fiecare tip de update** — `message`, `callback_query`,
 `edited_message`, `my_chat_member`. Bug-ul clasic e să verifici doar `message` și
-să lași callback-urile deschise; există un test pentru asta.
+să lași callback-urile deschise; §2.1 detaliază de ce verificarea rămâne
+aceeași pe toate patru, și unde exact a picat asta o dată.
 
 Un chat nepermis primește **zero răspuns** (nu confirmăm nici măcar că botul
 există) și generează o linie de log pe oră.
@@ -37,21 +38,72 @@ există) și generează o linie de log pe oră.
 | `operator` | Blocare, deblocare, scanare. **Nu** aplicare de patch-uri, **nu** config |
 | `viewer` | Doar citire |
 
-**Într-un grup, autorizarea e a grupului, nu a persoanei.** `_authorized`
-compară doar `chat.id` cu `allowed_chat_ids`; expeditorul nu e verificat
-niciodată — `update.effective_user` nu e citit nicăieri pe calea de autorizare.
-Dacă id-ul unui grup e în allowlist, **orice membru al grupului** poate da
-comenzi. Dacă grupul e și `owner_chat_id`, orice membru are drepturi de owner,
-inclusiv blocare de adrese pe o instalare cu auto-block activ.
-
-Consecința practică: a adăuga pe cineva în grup înseamnă a-i da drepturile
-grupului. Nu există un nivel „doar vede alertele" — rolurile din tabelul de mai
-sus se aplică pe chat, iar într-un grup chatul e unul singur pentru toți.
+**Într-un grup, autorizarea de bază e a grupului, nu a persoanei.**
+`_authorized` compară `chat.id` cu `allowed_chat_ids` — dacă id-ul unui grup e
+în allowlist, **orice membru al grupului** poate trece de acest prim pas. Dacă
+grupul e și `owner_chat_id`, orice membru moștenește rolul de owner, inclusiv
+blocare de adrese pe o instalare cu auto-block activ. Măsurat pe 5 septembrie
+2026: două instanțe Sentinel, un singur grup partajat drept `owner_chat_id` pe
+amândouă — a adăuga o persoană în grup îi dădea drepturi de owner pe două
+servere de producție deodată.
 
 Paragraful ăsta spunea până pe 5 septembrie 2026 exact pe dos: că expeditorul e
-verificat și el, și că apartenența la grup nu e autentificare. În cod nu a fost
-adevărat niciodată. Corectat după ce documentul a fost citit ca să se scrie
-procedura pentru mai multe instanțe.
+verificat întotdeauna, și că apartenența la grup nu e autentificare. Nu a fost
+niciodată adevărat în cod. Corectat, și completat acum cu mecanismul care chiar
+există:
+
+### 2.1 `telegram.allowed_user_ids` — restrângerea opțională pe expeditor
+
+`allowed_user_ids` e o listă de id-uri Telegram de UTILIZATOR (nu de chat),
+verificată **în plus** față de `allowed_chat_ids`, **doar** pentru un chat care
+nu e privat. Într-un chat privat `chat.id` chiar este id-ul persoanei, deci
+verificarea de expeditor n-ar adăuga nimic — și ar putea strica singurul acces
+al operatorului dacă acesta uită să-și adauge propriul id privat pe lista de
+utilizatori. De asta un chat privat e scutit, chiar dacă lista e completată.
+
+> **Ordinea contează: mai întâi codul, apoi configurația.** `config.py` respinge
+> orice cheie pe care n-o cunoaște, cu `ConfigError: unknown configuration key`.
+> Dacă scrii `allowed_user_ids` în `sentinel.yaml` **înainte** ca versiunea asta
+> să fie livrată pe gazdă, fiecare unitate care încarcă configurația —
+> `sentinel-health`, `-maintenance`, `-selfcheck`, `-watchdog` — începe să pice,
+> iar o repornire a lui `sentinel-telegram` în fereastra aia oprește chiar
+> canalul prin care ai fi aflat. Configurațiile gazdelor sunt scrise de mână și
+> nu se regenerează la livrare, deci nimic nu te oprește să faci pașii în
+> ordinea greșită. Livrează întâi, editează pe urmă.
+
+> **Pe o instanță unde grupul e singurul chat permis**, o listă de utilizatori
+> greșită te încuie afară complet: nu mai există chat privat prin care să intri.
+> Verifică id-ul înainte, nu după.
+
+**Implicit, lista e goală, și asta înseamnă exact comportamentul de dinainte de
+5 septembrie 2026** — doar verificarea de chat. O instalare care actualizează
+codul fără să atingă `allowed_user_ids` nu pierde niciun acces, inclusiv unul
+în care grupul e `owner_chat_id`. Completarea listei e alegerea operatorului,
+nu ceva impus la actualizare.
+
+Când lista e completată și chatul e un grup (sau un canal): expeditorul
+(`update.effective_user.id`) trebuie să fie și el pe listă. Un update pentru
+care Telegram nu dă niciun expeditor — o postare de canal, de exemplu, unde
+autorul nu e niciodată expus botului, doar canalul ca `sender_chat` — e
+**refuzat**, nu acceptat implicit: o acțiune pe care nimeni nu poate fi numit
+responsabil nu e una pe care acest bot o face.
+
+Verificarea se face ca middleware, **pe fiecare tip de update** — `message`,
+`callback_query`, `edited_message`, `my_chat_member` — fiindcă citește doar
+`update.effective_chat` și `update.effective_user`, aceleași două proprietăți
+pe care python-telegram-bot le completează identic indiferent de tipul real al
+update-ului. Bug-ul clasic e să verifici doar `message` și să lași
+callback-urile deschise; `on_flush_callback` (butonul PANIC) chiar avea acest
+bug — verifica doar rolul (`_can_act`), nu și `_authorized` — până pe 6
+septembrie 2026, și era singurul buton pe care un membru neautorizat al
+grupului tot îl putea apăsa după ce toate celelalte căi fuseseră închise.
+`tests/security/test_telegram_group_sender_check.py` acoperă toate patru.
+
+Consecința practică, dincolo de `allowed_user_ids`: a adăuga pe cineva într-un
+grup din allowlist tot înseamnă a-i da drepturile chatului, dacă lista de
+utilizatori nu e completată. Nu există un nivel „doar vede alertele" separat de
+asta — rolurile din tabelul de mai sus se aplică pe chat, iar restrângerea pe
+persoană e un mecanism suplimentar, nu unul implicit.
 
 ---
 
@@ -352,9 +404,14 @@ mesajului și rutarea callback-ului sunt lucruri diferite.
 
 ### Capcane
 
-**Apartenența la grup e autoritate.** Vezi §2: autorizarea se face pe `chat.id`,
-nu pe expeditor. Oricine e în grup are drepturile grupului, pe toate instanțele
-deodată, inclusiv blocare de adrese acolo unde auto-block e activ.
+**Apartenența la grup e autoritate, dacă `allowed_user_ids` rămâne gol.** Vezi
+§2.1: fără acea listă, autorizarea de bază se face pe `chat.id`, nu pe
+expeditor, deci oricine e în grup are drepturile grupului, pe toate instanțele
+deodată, inclusiv blocare de adrese acolo unde auto-block e activ. Cu grupul ăsta
+partajat între mai multe instanțe, aici e locul unde completarea listei
+contează cel mai mult: fiecare instanță își citește propriul
+`allowed_user_ids` din `sentinel.yaml`, deci restrângerea poate diferi de la o
+gazdă la alta chiar dacă grupul e același.
 
 **Conversia în supergrup schimbă id-ul.** Se întâmplă automat la anumite acțiuni
 — membri mulți, grup făcut public, istoric activat pentru membri noi. Id-ul sare
