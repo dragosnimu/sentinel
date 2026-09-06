@@ -924,14 +924,154 @@ def test_ps1_test_ssh_survives_real_production_stderr_noise(tmp_path, mode):
 # Every native ssh invocation goes through the one place that knows how
 # (round-4 design requirement)
 # ---------------------------------------------------------------------------
+def _strip_powershell_comments(text: str) -> str:
+    """Removes `<# ... #>` block comments and `#`-to-end-of-line comments from
+    a PowerShell source, leaving code (including string literals) intact.
+
+    A count of the literal `& $ssh` that does not strip comments cannot tell
+    a real bypass from a sentence describing one — a round of this guard
+    proved both directions of that wrong: a real bypassing call landing while
+    a comment was reworded away left the count unchanged and green, and
+    rewording a comment alone (no code touched) turned it red. Comments have
+    to come out before anything is counted.
+
+    A `#` INSIDE A STRING LITERAL is not a comment — `Write-Host 'issue #1'`
+    must keep its `#`, not have the rest of the line silently discarded. This
+    walks the line character by character tracking single- and double-quoted
+    strings (with the doubled-quote and backtick escapes each uses) plus
+    PowerShell's multi-line here-strings (`@'...'@`, `@"..."@`, whose closing
+    delimiter must open the line, matching this file's own `$RemoteSecretsScript`
+    block), so a `#` or a `<#`/`#>` sequence inside any of those never ends a
+    string early or gets mistaken for a comment marker.
+
+    What a simpler rule (bare `re.sub(r'#.*', '', line)` before counting)
+    would miss: exactly this file's `$RemoteSecretsScript` here-string, which
+    is bash source FULL of `#` — bash comments (`'#'*`), and shell parameter
+    expansions (`${line%$CR}`) that contain no `#` here but could. A naive
+    per-line strip has no notion of a here-string spanning many lines, so it
+    would happily mangle that block without changing this test's verdict
+    either way (it contains no `& $ssh`) — but the same naive rule would also
+    mishandle a single-quoted PowerShell string containing `#` earlier on a
+    line that later holds a real `& $ssh` call, silently deleting the call
+    from the count instead of flagging it. That is the direction that
+    matters: a guard that can be fooled into under-counting is a guard a
+    bypass can hide behind.
+
+    Not handled, and not needed for this file: nested `<# #>` block comments
+    (PowerShell's own parser does not nest them either) and a `#` that is
+    itself inside a here-string's own embedded quotes (the here-string state
+    below ignores quote characters entirely once inside, by design — the
+    whole point of a here-string is that nothing inside it is parsed)."""
+    lines = text.split("\n")
+    out_lines: list[str] = []
+    state = "NONE"  # NONE, BLOCK_COMMENT, HERE_SINGLE, HERE_DOUBLE
+    for line in lines:
+        if state == "BLOCK_COMMENT":
+            idx = line.find("#>")
+            if idx == -1:
+                out_lines.append("")
+                continue
+            line = line[idx + 2:]
+            state = "NONE"
+        elif state == "HERE_SINGLE":
+            if line.startswith("'@"):
+                line = line[2:]
+                state = "NONE"
+            else:
+                out_lines.append("")
+                continue
+        elif state == "HERE_DOUBLE":
+            if line.startswith('"@'):
+                line = line[2:]
+                state = "NONE"
+            else:
+                out_lines.append("")
+                continue
+
+        out_chars: list[str] = []
+        j, n = 0, len(line)
+        in_squote = in_dquote = False
+        while j < n:
+            ch = line[j]
+            two = line[j:j + 2]
+            if in_squote:
+                out_chars.append(ch)
+                if ch == "'":
+                    if line[j + 1:j + 2] == "'":
+                        out_chars.append("'")
+                        j += 2
+                        continue
+                    in_squote = False
+                j += 1
+                continue
+            if in_dquote:
+                if ch == "`" and j + 1 < n:
+                    out_chars.append(ch)
+                    out_chars.append(line[j + 1])
+                    j += 2
+                    continue
+                out_chars.append(ch)
+                if ch == '"':
+                    if line[j + 1:j + 2] == '"':
+                        out_chars.append('"')
+                        j += 2
+                        continue
+                    in_dquote = False
+                j += 1
+                continue
+            # not inside any string literal
+            if two == "@'" and line[j + 2:].strip() == "":
+                out_chars.append(two)
+                state = "HERE_SINGLE"
+                j = n
+                break
+            if two == '@"' and line[j + 2:].strip() == "":
+                out_chars.append(two)
+                state = "HERE_DOUBLE"
+                j = n
+                break
+            if two == "<#":
+                remainder = line[j:]
+                idx = remainder.find("#>")
+                if idx != -1:
+                    j = j + idx + 2
+                    continue
+                state = "BLOCK_COMMENT"
+                j = n
+                break
+            if ch == "'":
+                in_squote = True
+                out_chars.append(ch)
+                j += 1
+                continue
+            if ch == '"':
+                in_dquote = True
+                out_chars.append(ch)
+                j += 1
+                continue
+            if ch == "#":
+                break
+            out_chars.append(ch)
+            j += 1
+        out_lines.append("".join(out_chars))
+    return "\n".join(out_lines)
+
+
 def test_every_native_ssh_call_site_is_accounted_for():
-    """Pins the count and location of every `& $ssh` in deploy.ps1, so a
-    fourth call site added later (that bypasses Invoke-SshCapture and
+    """Pins the count and location of every REAL `& $ssh` call in deploy.ps1,
+    so a fourth call site added later (that bypasses Invoke-SshCapture and
     reintroduces the redirected-stderr bug one call at a time) fails this
     test rather than shipping silently.
 
-    Exactly three real invocations exist today, plus three comment mentions
-    of them (six total occurrences of the literal text):
+    Comments are stripped first (see _strip_powershell_comments): a version
+    of this test that counted the raw literal text, including comments, was
+    proven wrong in both directions — a real bypassing call landing while one
+    comment mention was reworded away kept the raw count unchanged and green,
+    and rewording or adding a comment alone (no code touched) changed the raw
+    count and went red on a non-defect. Counting only code fixes both: the
+    assertion below tracks code, and a comment can say whatever it wants.
+
+    Exactly three real invocations exist today:
       * inside Invoke-SshCapture — the only place that redirects stderr, and
         therefore the only place needing the lowered-$ErrorActionPreference
         guard;
@@ -944,10 +1084,11 @@ def test_every_native_ssh_call_site_is_accounted_for():
         by test_ps1_piped_bare_ssh_call_survives_stderr_noise below.
     """
     text = DEPLOY_PS1.read_text(encoding="utf-8-sig")
-    occurrences = [m.start() for m in re.finditer(r"& \$ssh\b", text)]
-    assert len(occurrences) == 6, (
-        f"expected 3 real & $ssh invocations plus 3 comment mentions of "
-        f"them (6 total); found {len(occurrences)}. A new ssh call site was "
+    code = _strip_powershell_comments(text)
+    occurrences = [m.start() for m in re.finditer(r"& \$ssh\b", code)]
+    assert len(occurrences) == 3, (
+        f"expected exactly 3 real & $ssh invocations in code (comments "
+        f"excluded); found {len(occurrences)}. A new ssh call site was "
         f"added — route it through Invoke-SshCapture if it redirects "
         f"stderr, or explain here why it does not need to."
     )

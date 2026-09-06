@@ -131,3 +131,110 @@ def test_assume_yes_still_skips_the_prompt_on_a_real_run(tmp_path):
     proc = _run(tmp_path, dry_run=0, assume_yes=1, stdin="")
     assert proc.returncode == 0, out(proc)
     assert "REACHED_END" in proc.stdout, out(proc)
+
+
+# ---------------------------------------------------------------------------
+# PowerShell twin — deploy.ps1 used to warn per-key and never gate at all,
+# the asymmetry a 2026-09-06 review flagged: deploy.sh's .DESCRIPTION says the
+# two wrappers "cannot drift apart in behaviour", and a real run through
+# deploy.ps1 was proceeding with an inert feature nobody had agreed to.
+# ---------------------------------------------------------------------------
+DEPLOY_PS1 = REPO / "scripts" / "deploy.ps1"
+PS = shutil.which("powershell.exe") or shutil.which("pwsh")
+
+
+def _missing_keys_fragment_ps() -> str:
+    """The `$content = Get-Content ...` through the matching close of
+    `if ($missingKeys.Count -gt 0) { ... }`, cut by brace depth — a plain
+    "first `}` at column 0" search would stop at the foreach loop's own
+    closing brace, which sits at the same indentation, and silently test only
+    half the block."""
+    text = DEPLOY_PS1.read_text(encoding="utf-8-sig")
+    start_marker = "    $content = Get-Content $SecretsFile -Raw\n"
+    start = text.index(start_marker)
+    if_marker = "    if ($missingKeys.Count -gt 0) {"
+    if_start = text.index(if_marker, start)
+    depth = 0
+    i = if_start + len(if_marker) - 1  # position of the opening '{'
+    while i < len(text):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    assert depth == 0, "if ($missingKeys.Count -gt 0) block never closes"
+    fragment = text[start:i + 1]
+    # Sanity-checks the EXTRACTION, same reasoning as _missing_keys_fragment
+    # above: not asserting on $DryRun/$AssumeYes, since a mutation removing
+    # the guard removes exactly those tokens from this block.
+    assert "Continui oricum" in fragment
+    assert "Read-Host" in fragment
+    return fragment
+
+
+HARNESS_PS = """
+$ErrorActionPreference = 'Stop'
+function Write-Warn {{ param($m) Write-Host "WARN $m" }}
+function Die {{ param($m) Write-Host "ERR $m"; exit 9 }}
+$SecretsFile = '{secrets_file}'
+$DryRun = {dry_run}
+$AssumeYes = {assume_yes}
+{fragment}
+Write-Host 'REACHED_END'
+"""
+
+
+def _run_ps(tmp_path: Path, *, dry_run: str, assume_yes: str,
+           stdin: str = "") -> subprocess.CompletedProcess:
+    fragment = _missing_keys_fragment_ps()
+    secrets_file = tmp_path / "secrets.env"
+    # All four keys absent, so $missingKeys is never empty — the branch this
+    # test is about always fires.
+    secrets_file.write_text("SOME_OTHER_KEY=x\n", encoding="utf-8", newline="\n")
+    script = HARNESS_PS.format(
+        secrets_file=secrets_file.as_posix(),
+        dry_run=dry_run,
+        assume_yes=assume_yes,
+        fragment=fragment,
+    )
+    return subprocess.run([PS, "-NoProfile", "-Command", script],
+                          capture_output=True, text=True,
+                          input=stdin, cwd=tmp_path)
+
+
+def out_ps(proc: subprocess.CompletedProcess) -> str:
+    return proc.stdout + proc.stderr
+
+
+@pytest.mark.skipif(PS is None, reason="no PowerShell available")
+def test_ps1_dry_run_never_prompts_even_with_nothing_on_stdin(tmp_path):
+    """Twin of test_dry_run_never_prompts_even_with_nothing_on_stdin: -DryRun
+    with an incomplete secrets file must reach the end WITHOUT reading from
+    stdin — a Read-Host here would hang an unattended rehearsal."""
+    proc = _run_ps(tmp_path, dry_run="$true", assume_yes="$false", stdin="")
+    text = out_ps(proc)
+    assert "REACHED_END" in text, text
+    assert "missing or empty" in text
+
+
+@pytest.mark.skipif(PS is None, reason="no PowerShell available")
+def test_ps1_a_real_run_still_prompts_and_a_decline_stops_it(tmp_path):
+    """Twin of test_a_real_run_still_prompts_and_a_decline_stops_it: a real
+    run with missing keys and neither -AssumeYes nor an operator's "da" must
+    stop before REACHED_END — this is the behaviour deploy.ps1 was missing
+    entirely before this change."""
+    proc = _run_ps(tmp_path, dry_run="$false", assume_yes="$false", stdin="NU\n")
+    text = out_ps(proc)
+    assert "REACHED_END" not in text, text
+    assert "aborted" in text
+
+
+@pytest.mark.skipif(PS is None, reason="no PowerShell available")
+def test_ps1_assume_yes_still_skips_the_prompt_on_a_real_run(tmp_path):
+    """Twin of test_assume_yes_still_skips_the_prompt_on_a_real_run:
+    -AssumeYes must still answer this prompt on a real run."""
+    proc = _run_ps(tmp_path, dry_run="$false", assume_yes="$true", stdin="")
+    text = out_ps(proc)
+    assert "REACHED_END" in text, text

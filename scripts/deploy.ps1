@@ -322,13 +322,13 @@ function Invoke-SshCapture {
        NativeCommandError. `2>$null` alone is not enough; the preference has
        to be lowered around the call too.
 
-       This is not theoretical against this host: production's sshd (OpenSSH
-       8.7, no post-quantum key exchange) writes three such lines to stderr
-       on EVERY connection from this machine's client (OpenSSH 10.2p1, which
-       warns about exactly that). Measured directly: a nested powershell.exe
-       that writes those three lines throws out of a bare `2>$null` call, in
-       both -Command and -File invocation, and stops doing so once wrapped
-       exactly as below.
+       This is not theoretical against this host: production's sshd
+       (openssh-server-9.9p1-9.el9_8, no post-quantum key exchange) writes
+       three such lines to stderr on EVERY connection from this machine's
+       client (OpenSSH 10.2p1, which warns about exactly that). Measured
+       directly: a nested powershell.exe that writes those three lines throws
+       out of a bare `2>$null` call, in both -Command and -File invocation,
+       and stops doing so once wrapped exactly as below.
 
        Test-Ssh and Get-SshOutput used to each carry their OWN copy of
        `& $ssh ... 2>$null` plus their own lowered-preference guard — Test-Ssh
@@ -675,9 +675,24 @@ Rather than do a worse job of it here, use the bash one — it is a one-off.)
 
 if (Test-Path $SecretsFile) {
     $content = Get-Content $SecretsFile -Raw
+    $missingKeys = @()
     foreach ($k in @('SENTINEL_DB_PASSWORD', 'ANTHROPIC_API_KEY', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID')) {
-        if ($content -notmatch "(?m)^$k=.+") {
-            Write-Warn "$k is missing or empty in $SecretsFile — the matching feature will be inert."
+        if ($content -notmatch "(?m)^$k=.+") { $missingKeys += $k }
+    }
+    if ($missingKeys.Count -gt 0) {
+        Write-Warn "missing or empty in $SecretsFile`: $($missingKeys -join ' ')"
+        Write-Warn "Sentinel will install but the corresponding feature will be inert."
+        # Twin of deploy.sh's `(( ! DRY_RUN )) && (( ! ASSUME_YES ))` gate: a
+        # dry run must never block on stdin (an unattended rehearsal has
+        # none to give), and -AssumeYes answers this prompt exactly as it
+        # answers deploy.sh's --yes. Without this, the two wrappers this
+        # file's own .DESCRIPTION says "cannot drift apart in behaviour" did
+        # exactly that — deploy.sh stopped for confirmation here and this
+        # script silently proceeded with an inert feature nobody agreed to.
+        if (-not $DryRun -and -not $AssumeYes) {
+            if ((Read-Host "Continui oricum? [da/NU]") -ne 'da') {
+                Die 'aborted; run scripts/secrets-init.sh'
+            }
         }
     }
 
