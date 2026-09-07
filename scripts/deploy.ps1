@@ -234,6 +234,86 @@ function Get-KeyList {
     return ($raw -replace '\s', '')
 }
 
+function Get-IpFamily {
+    <# Which nftables allowlist set an address belongs in: 'v4', 'v6' or 'invalid'.
+
+       This used to be `-match '^\d{1,3}(\.\d{1,3}){3}$'`, which called every
+       IPv6 address a malformed capture and threw it away. On a host where the
+       operator only ever reaches the server over IPv6 that discarded the one
+       address which could have been allowlisted — and then warned that the
+       allowlist might end up empty, which it certainly would.
+
+       It has to give the same answers as `ip_family` in deploy/lib/common.sh,
+       which is what preflight and the installer use: a wrapper that refuses
+       what the server accepts sends the operator off to fix a working argument,
+       and one that accepts more produces a failure halfway through a run.
+       tests/unit/test_allowlist_v6.py runs both over the same table.
+
+       TryParse rather than a hand-written IPv6 grammar — .NET already has the
+       one that matters. Four decisions on top of it, all about the parser being
+       kinder than nft is:
+
+         * a zone id — fe80::1%%17 — names an interface on THIS machine. It
+           means nothing on the server and nft's ipv6_addr has nowhere to put
+           it, so it is refused rather than silently truncated into a different
+           address.
+         * for IPv4 the text has to round-trip: .NET Framework's parser accepts
+           "10.1" as 10.0.0.1, and reads an octet written with a leading zero as
+           OCTAL, so "203.0.113.010" is not the host that was typed. An address
+           that means one thing here and another to nft is worse than one that
+           is refused. IPv6 is NOT round-tripped:
+           there the canonical form legitimately differs from what an operator
+           types, and 2001:0db8::1 and 2001:db8::1 are the same address to nft.
+         * a prefix is allowed, because install.sh accepts one on --admin-ip and
+           both allowlist sets carry `flags interval`.
+         * ::ffff:a.b.c.d is reported as v4. It is an IPv4 address in IPv6
+           clothing and that is the set it ends up in, so saying "IPv6" here
+           would name a set the address never reaches. #>
+    param([string]$Value)
+    if (-not $Value) { return 'invalid' }
+    if ($Value.Contains('%')) { return 'invalid' }
+
+    $addr = $Value
+    $prefix = -1
+    if ($Value.Contains('/')) {
+        $bits = $Value.Split('/')
+        if ($bits.Count -ne 2) { return 'invalid' }
+        $addr = $bits[0]
+        # No leading zeros, at most three digits — the same shape common.sh
+        # accepts, so "/024" is refused by both rather than by one of them.
+        if ($bits[1] -notmatch '^(0|[1-9][0-9]{0,2})$') { return 'invalid' }
+        $prefix = [int]$bits[1]
+    }
+
+    $parsed = $null
+    if (-not [System.Net.IPAddress]::TryParse($addr, [ref]$parsed)) { return 'invalid' }
+    switch ($parsed.AddressFamily) {
+        'InterNetwork' {
+            if ($parsed.ToString() -ne $addr) { return 'invalid' }
+            if ($prefix -gt 32) { return 'invalid' }
+            return 'v4'
+        }
+        'InterNetworkV6' {
+            if ($prefix -gt 128) { return 'invalid' }
+            # An embedded dotted quad, only in the two shapes nft itself takes.
+            # TryParse follows RFC 4291 and accepts a quad in the last two
+            # groups of ANY address; nft 1.0.9 on production refuses
+            # 1:2:3:4:5:6:192.0.2.1/128 ("set is not a map") while it accepts
+            # ::192.0.2.1/128. deploy/lib/common.sh draws the line in the same
+            # place and for the same reason, and the two have to agree: a
+            # wrapper that accepts what the server refuses fails the run
+            # halfway through, after the tarball has gone over.
+            if ($addr.Contains('.')) {
+                $lead = $addr.Substring(0, $addr.LastIndexOf(':') + 1)
+                if ($lead -ne '::' -and $lead.ToLowerInvariant() -ne '::ffff:') { return 'invalid' }
+            }
+            if ($addr -like '::ffff:*.*.*.*' -and ($prefix -lt 0 -or $prefix -ge 96)) { return 'v4' }
+            return 'v6'
+        }
+        default { return 'invalid' }
+    }
+}
+
 # Resolved before anything is packaged or transferred: a typo should cost a
 # second, not a round trip. install.sh checks it again on the server, where it
 # remains the authority on which numbers are real steps.
@@ -635,13 +715,22 @@ if (-not $AdminIp) {
 # Never allowlist something that is not an address: a malformed capture that slips
 # through would put garbage in the nftables set, and the real address would be
 # left out — the exact lockout the allowlist exists to prevent.
-if ($AdminIp -notmatch '^\d{1,3}(\.\d{1,3}){3}$') {
-    Write-Warn "captured admin address '$AdminIp' is not an IPv4 address; ignoring it."
-    $AdminIp = ''
-}
+#
+# An IPv6 peer is an address, not a malformation. The family is reported because
+# it decides which set the address goes into, and because an operator whose only
+# route to the host is IPv6 has to be able to see that it went into the set that
+# can hold it.
 if ($AdminIp) {
-    Write-Ok "admin address (for the allowlist): $AdminIp"
-} else {
+    switch (Get-IpFamily $AdminIp) {
+        'v4' { Write-Ok "admin address (for the allowlist): $AdminIp — IPv4, goes into allowlist_v4" }
+        'v6' { Write-Ok "admin address (for the allowlist): $AdminIp — IPv6, goes into allowlist_v6" }
+        default {
+            Write-Warn "captured admin address '$AdminIp' is not an IPv4 or IPv6 address; ignoring it."
+            $AdminIp = ''
+        }
+    }
+}
+if (-not $AdminIp) {
     Write-Warn 'could not determine your address; the allowlist may end up empty. Pass -AdminIp <your-ip>.'
 }
 

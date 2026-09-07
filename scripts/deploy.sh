@@ -183,6 +183,28 @@ normalize_key_list() {
     printf '%s' "${raw//[[:space:]]/}"
 }
 
+# Which allowlist set an address belongs in: prints v4, v6, invalid — or
+# unknown, when the question could not be asked at all.
+#
+# The classifier itself is deploy/lib/common.sh's `ip_family`, so this wrapper,
+# preflight and the installer all answer it the same way; a second
+# implementation here would be a second thing to keep in step, and the two ends
+# disagreeing about what an address is is how a wrapper discards the only
+# address that could have been allowlisted.
+#
+# Loaded in a SUBSHELL rather than sourced. common.sh also defines die/info/ok/
+# warn and a set of SENTINEL_* defaults, and pulling those into this script
+# would quietly change every message it prints and every default it applies.
+ip_family_of() {
+    local lib="${REPO_ROOT}/deploy/lib/common.sh" out
+    [[ -f "$lib" ]] || { printf 'unknown\n'; return 0; }
+    out="$(bash -c 'source "$1"; ip_family "$2"' _ "$lib" "$1" 2>/dev/null || true)"
+    case "$out" in
+        v4|v6|invalid) printf '%s\n' "$out" ;;
+        *)             printf 'unknown\n' ;;
+    esac
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --host)      HOST="${2:-}"; shift 2 ;;
@@ -566,9 +588,29 @@ ok "SSH working"
 if [[ -z "${ADMIN_IP:-}" ]]; then
     ADMIN_IP="$(ssh_run 'echo $SSH_CONNECTION' 2>/dev/null | awk '{print $1}')"
 fi
+# Never allowlist something that is not an address: a malformed capture put
+# straight through would land as garbage in the nftables set while the real
+# address stayed out — the exact lockout the allowlist exists to prevent.
+#
+# An IPv6 peer is a real answer here, not a malformation. On a host where every
+# login arrives over IPv6 it is the ONLY address that can be allowlisted, and
+# the family is printed because it decides which set it goes into.
 if [[ -n "$ADMIN_IP" ]]; then
-    ok "admin address (for the allowlist): ${ADMIN_IP}"
-else
+    case "$(ip_family_of "$ADMIN_IP")" in
+        v4) ok "admin address (for the allowlist): ${ADMIN_IP} — IPv4, goes into allowlist_v4" ;;
+        v6) ok "admin address (for the allowlist): ${ADMIN_IP} — IPv6, goes into allowlist_v6" ;;
+        invalid)
+            warn "captured admin address '${ADMIN_IP}' is not an IPv4 or IPv6 address; ignoring it."
+            ADMIN_IP="" ;;
+        *)  # "I could not check" is not "it is fine". The installer runs the
+            # same classifier server-side and refuses it by name if it is wrong,
+            # so the value is passed on rather than dropped on a failed check.
+            warn "could not validate '${ADMIN_IP}' here (deploy/lib/common.sh unreadable); \
+passing it on unchecked — the installer will name it if it is not an address."
+            ok "admin address (for the allowlist): ${ADMIN_IP}" ;;
+    esac
+fi
+if [[ -z "$ADMIN_IP" ]]; then
     warn "could not determine your address; the allowlist may end up empty. \
 Pass --admin-ip <your-ip> explicitly."
 fi

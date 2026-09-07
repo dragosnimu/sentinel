@@ -40,12 +40,23 @@
 table inet sentinel {
 
     # -- Allowlist ---------------------------------------------------------
-    # Populated by install.sh BEFORE the chains below exist, with: the
-    # operator's SSH peer address, RFC1918, loopback, this host's own public
-    # addresses, the resolved addresses of api.telegram.org and
+    # Populated by install.sh immediately AFTER this file is loaded — sets and
+    # chains arrive together, in one `nft -f` transaction, so there is no window
+    # in which the allowlist exists and the chains do not. What makes that
+    # harmless is point 1 above plus the fact that the blocklist sets come up
+    # empty: the drop rules exist from the first instant but have nothing to
+    # match until something is blocked, which happens long after step 29.
+    #
+    # The contents: the operator's SSH peer address, RFC1918 and loopback,
+    # ::1/128, fc00::/7 and fe80::/10 on the v6 side, this host's own public
+    # addresses in BOTH families, the resolved addresses of api.telegram.org and
     # api.anthropic.com (blocking those would silently remove Sentinel's own
     # alerting and analysis — a failure with no symptom), and everything in
     # `response.extra_allowlist` from the config.
+    #
+    # `flags interval` on BOTH sets is what lets a prefix — 203.0.113.0/24,
+    # 2001:db8:1::/48 — be an element rather than an error. Removing it turns
+    # every range in extra_allowlist into an entry the kernel refuses.
     #
     # The authoritative never-block list is hard-coded in executor/policy.py.
     # These sets are the enforcement; that file is the decision.

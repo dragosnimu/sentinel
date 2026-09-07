@@ -301,41 +301,133 @@ def allowlist_refresher() -> None:
             log("warning", "allowlist refresh failed", detail=str(exc))
 
 
+def _yaml_unwrap_item(item: str) -> str:
+    """One `extra_allowlist` value, unwrapped the way install.sh unwraps it.
+
+    The quotes are resolved FIRST and a comment only afterwards, on what is left
+    outside them. The other order turns `"203.0.113.5 # not a comment"` into the
+    unbalanced `"203.0.113.5`. An unterminated quote is handed back whole rather
+    than repaired into something that reads like an address, because the caller
+    can name a value it does not recognise and cannot un-mangle one.
+    """
+    text = item.strip()
+    if text[:1] in ('"', "'"):
+        quote = text[0]
+        end = text.find(quote, 1)
+        if end != -1:
+            return text[1:end]
+        return text
+    return text.split("#", 1)[0].strip()
+
+
+def _yaml_flow_close(text: str) -> int:
+    """Index of the first `]` that is not inside quotes, or -1.
+
+    Not `endswith("]")`: `extra_allowlist: ["203.0.113.5"]  # nota` ends in a
+    comment, and the reader that required the line to end in a bracket returned
+    NOTHING for it while install.sh returned the entry — so the executor and the
+    firewall disagreed about who was allowlisted.
+    """
+    quote = ""
+    for index, char in enumerate(text):
+        if quote:
+            if char == quote:
+                quote = ""
+        elif char in ('"', "'"):
+            quote = char
+        elif char == "]":
+            return index
+    return -1
+
+
+def _yaml_flow_items(text: str) -> list[str]:
+    """Split on commas that are not inside quotes."""
+    items: list[str] = []
+    current = ""
+    quote = ""
+    for char in text:
+        if quote:
+            current += char
+            if char == quote:
+                quote = ""
+        elif char in ('"', "'"):
+            current += char
+            quote = char
+        elif char == ",":
+            items.append(current)
+            current = ""
+        else:
+            current += char
+    items.append(current)
+    return items
+
+
 def _operator_allowlist(config_path: str = "/etc/sentinel/sentinel.yaml") -> list[str]:
     """Read response.extra_allowlist without a YAML parser.
 
     Deliberately crude: pulling in PyYAML would mean a third-party dependency
     inside the root process, for one list of strings. (config_path is a parameter
     only so the parser can be unit-tested against both YAML styles.)
+
+    Crude, but not DIFFERENT from the installer. deploy/install.sh reads the same
+    key out of the same file in awk, and the two used to disagree: a trailing
+    `# nota` after a flow list made this one return an empty list while the
+    installer returned the entries, so the executor treated as blockable an
+    address the firewall had allowlisted. tests/unit/test_allowlist_v6.py runs
+    both readers over one fixture table and asserts they agree; the helpers above
+    are this side of that contract.
+
+    Anchored under a top-level `response:` for the same reason as the installer:
+    sentinel.yaml already carries an unrelated `ip_allowlist` under `web:`, and
+    an `extra_allowlist:` added there some day must not silently become firewall
+    policy.
     """
     config = Path(config_path)
     if not config.exists():
         return []
     entries: list[str] = []
+    in_response = False
     in_section = False
     try:
         for raw in config.read_text(encoding="utf-8").splitlines():
+            if raw[:1] not in ("", " ", "\t", "#"):
+                # A line beginning in column 0 closes whatever top-level block
+                # was open and opens another. `raw.split()[0]` is awk's `$1`, so
+                # `response:` and `response:  # x` are the block and
+                # `responses:` is not.
+                fields = raw.split()
+                in_response = bool(fields) and fields[0] == "response:"
+                in_section = False
+                continue
             stripped = raw.strip()
-            if stripped.startswith("extra_allowlist:"):
-                # Two YAML styles must both work. The installer writes the inline
-                # flow list `extra_allowlist: ["203.0.113.4"]`; an operator editing by
-                # hand may use the block style with `- ` items below. Parsing only
-                # the block style silently dropped the admin address the installer
-                # seeds inline — and a dropped allowlist entry is a lockout risk.
+            if in_response and stripped.startswith("extra_allowlist:"):
                 rest = stripped[len("extra_allowlist:"):].strip()
-                if rest.startswith("[") and rest.endswith("]"):
-                    for item in rest[1:-1].split(","):
-                        cleaned = item.strip().strip("\"'")
-                        if cleaned:
-                            entries.append(cleaned)
-                    continue          # inline list is complete on this line
+                if rest.startswith("["):
+                    close = _yaml_flow_close(rest[1:])
+                    if close >= 0:
+                        for item in _yaml_flow_items(rest[1:1 + close]):
+                            value = _yaml_unwrap_item(item)
+                            if value:
+                                entries.append(value)
+                    # No unquoted "]" on this line: the flow sequence continues
+                    # where neither reader follows. Nothing is taken from it,
+                    # which is what install.sh does too — it also warns, and it
+                    # can, because it has an operator watching it run.
+                    in_section = False
+                    continue
                 in_section = True
                 continue
             if in_section:
-                if stripped.startswith("- "):
-                    entries.append(stripped[2:].strip().strip("\"'"))
-                elif stripped and not stripped.startswith("#"):
-                    break
+                if stripped.startswith("#"):
+                    # A commented-out entry stays out, and does not end the
+                    # block either: that is how an operator parks one.
+                    continue
+                if stripped.startswith("-") and stripped[1:2] in (" ", "\t"):
+                    value = _yaml_unwrap_item(stripped[1:])
+                    if value:
+                        entries.append(value)
+                elif stripped:
+                    in_section = False
     except OSError:
         pass
     return entries

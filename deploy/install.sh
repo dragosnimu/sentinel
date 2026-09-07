@@ -2281,45 +2281,383 @@ step_migrate() {
 }
 
 # --- 29 -------------------------------------------------------------------
+# Prints the entries of `response.extra_allowlist`, one per line, from a
+# sentinel.yaml. Exit status 3 means "the key is there and I could not read it";
+# any other non-zero status means awk itself failed.
+#
+# BOTH YAML forms, because both of them are on disk. This installer WRITES the
+# flow form — `extra_allowlist: [@@EXTRA_ALLOWLIST@@]` in
+# deploy/config/sentinel.yaml.tmpl — while the comment above that key invites
+# the operator to add block-form entries by hand. The reader here understood
+# only the block form, so on every host this installer has ever configured the
+# loop below ran ZERO times: the admin address seeded into the list at step 26
+# and every address added afterwards reached nftables not at all, and the step
+# still printed a green line with a count that never included them.
+#
+# awk and nothing else. This step runs before the venv exists, so there is no
+# python and no yq to fall back on, and adding a dependency to read six lines of
+# configuration would be a new way for the install to fail. That also means this
+# is a reader for the two shapes this one key is written in, not a YAML parser —
+# which is why every entry it produces is still passed through
+# allowlist_element, and why anything it cannot read comes out as nothing rather
+# than as a guess.
+#
+# executor/sentinel_executor.py has to read the same key out of the same file
+# and get the same answers, and tests/unit/test_allowlist_v6.py runs the two
+# readers over one fixture table. The shapes below are the contract between
+# them; changing one side alone is how the executor and the firewall end up
+# disagreeing about who is allowlisted.
+extra_allowlist_entries() {
+    local yaml="${1:-}"
+    [[ -n "$yaml" && -f "$yaml" ]] || return 0
+    # No `2>/dev/null` and no `|| true` on the awk below.
+    #
+    # A broken awk program prints its complaint and then matches nothing, which
+    # on stdout is indistinguishable from an empty list — and a reader that
+    # silently matched nothing is precisely the defect being repaired here, so
+    # hiding its successor would be absurd. `set -e` does not need the `|| true`
+    # either: the one caller takes this through a command substitution and
+    # inspects the status itself, which is how status 3 reaches the operator.
+    awk '
+        BEGIN { Q = "\047"; f = 0; in_response = 0; unread = 0 }
+
+        # ONE place where a value is unwrapped, so the flow form, the block form
+        # and the executor cannot drift into three ideas of what a quote is.
+        #
+        # The order is the opposite of the obvious one: the quotes are resolved
+        # FIRST and a comment only afterwards, on what is left outside them.
+        # Stripping the comment first turned
+        #     - "203.0.113.5 # not a comment"
+        # into the unbalanced `"203.0.113.5`, which was then passed on as an
+        # address. A closing quote that is missing is NOT invented: the value
+        # goes on whole, so allowlist_element names it, rather than being
+        # trimmed into something that reads like an address.
+        function emit(s,   c, j) {
+            sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s)
+            c = substr(s, 1, 1)
+            if (c == "\"" || c == Q) {
+                j = index(substr(s, 2), c)
+                if (j > 0) s = substr(s, 2, j - 1)
+            } else {
+                sub(/#.*$/, "", s)
+                sub(/[ \t]+$/, "", s)
+            }
+            # An empty slot — "[]", or the gap left by a trailing comma — is not
+            # an entry. Passed on it would become a warn about a value the
+            # operator never wrote, on every single install.
+            if (s != "") print s
+        }
+
+        # Position of the first ] that is NOT inside quotes, or 0. Quote-aware
+        # because an entry may contain one, and because the comment that may
+        # close this line lives after it: ["203.0.113.5"]  # nota.
+        function flow_close(s,   i, ch, q, L) {
+            q = ""; L = length(s)
+            for (i = 1; i <= L; i++) {
+                ch = substr(s, i, 1)
+                if (q != "") { if (ch == q) q = "" }
+                else if (ch == "\"" || ch == Q) q = ch
+                else if (ch == "]") return i
+            }
+            return 0
+        }
+
+        # Split on commas that are not inside quotes. Returns the count and
+        # fills out[1..n]; awk passes arrays by reference and scalars by value,
+        # which is the only reason this is shaped like that.
+        function flow_items(s, out,   i, ch, q, cur, n, L) {
+            q = ""; cur = ""; n = 0; L = length(s)
+            for (i = 1; i <= L; i++) {
+                ch = substr(s, i, 1)
+                if (q != "") { cur = cur ch; if (ch == q) q = "" }
+                else if (ch == "\"" || ch == Q) { cur = cur ch; q = ch }
+                else if (ch == ",") { n++; out[n] = cur; cur = "" }
+                else cur = cur ch
+            }
+            n++; out[n] = cur
+            return n
+        }
+
+        # ANCHORED UNDER `response:`, not merely at the start of a line.
+        #
+        # A line that begins in column 0 and is not a comment closes whatever
+        # top-level block was open and opens another. Only inside `response:` is
+        # `extra_allowlist:` the firewall allowlist. sentinel.yaml already
+        # carries an unrelated `ip_allowlist` under `web:`, and the day someone
+        # gives `web:` an `extra_allowlist:` of its own, a reader anchored only
+        # at the start of the line would quietly turn addresses scoped to the
+        # dashboard into firewall allowlist entries — the widest possible
+        # reading of a setting written to be narrow.
+        #
+        # NO APOSTROPHES anywhere in this awk program. It is a single-quoted
+        # shell word, so one in a comment closes the quote, hands the rest of
+        # the program to the shell, and leaves an awk that parses and matches
+        # nothing. `bash -n` accepts it; only running it shows anything.
+        /^[^ \t#]/ {
+            in_response = ($1 == "response:")
+            f = 0
+            next
+        }
+
+        in_response && /^[ \t]*extra_allowlist:/ {
+            rest = $0
+            sub(/^[ \t]*extra_allowlist:[ \t]*/, "", rest)
+            if (substr(rest, 1, 1) == "[") {
+                close_at = flow_close(substr(rest, 2))
+                if (close_at > 0) {
+                    n = flow_items(substr(rest, 2, close_at - 1), item)
+                    for (i = 1; i <= n; i++) emit(item[i])
+                } else {
+                    # No unquoted "]" on this line: the flow sequence continues
+                    # somewhere this reader does not follow. Nothing is emitted,
+                    # because a half-read list would allowlist some entries and
+                    # drop the rest without saying which — and the caller is
+                    # told, through the exit status, so that "I could not read
+                    # it" does not arrive looking like "it was empty".
+                    unread = 1
+                }
+                f = 0
+                next
+            }
+            f = 1
+            next
+        }
+
+        # Inside the block form. A commented-out entry stays commented out, and
+        # does not end the block either — that is how an operator parks one.
+        f && /^[ \t]*#/ { next }
+        f && /^[ \t]*-[ \t]/ {
+            line = $0
+            sub(/^[ \t]*-[ \t]*/, "", line)
+            emit(line)
+            next
+        }
+        f && NF { f = 0 }
+
+        END { if (unread) exit 3 }
+    ' "$yaml"
+}
+
+# Routes one collected entry into ALLOW_V4 or ALLOW_V6, or names it and drops it.
+#
+# The arrays are step_nftables' locals; bash scopes dynamically, so they are
+# visible here and nowhere else in the installer. Named in capitals to say that
+# this function reaches out of itself for them.
+#
+# The refusal is printed WITH THE VALUE. A malformed extra_allowlist entry used
+# to be appended to the v4 list, rejected by the kernel and swallowed by
+# `2>/dev/null`, which left the operator reading a green line about an entry
+# that did not exist.
+allowlist_collect() {
+    local raw="$1" origin="$2" parsed element
+    if ! parsed="$(allowlist_element "$raw")"; then
+        warn "${origin}: '${raw}' is not an IP address or CIDR; it was NOT allowlisted"
+        return 0
+    fi
+    element="${parsed#* }"
+    # A /0 is every address there is. It stays — an operator who means it (a lab,
+    # a host behind a filtering front end) is allowed to mean it, and refusing it
+    # here would be a behaviour change nobody asked for — but it turns "never
+    # block anything on this family" into a line that otherwise reads like any
+    # other entry in the count. Said by value, once, where it can still be undone.
+    if [[ "$element" == */0 ]]; then
+        warn "${origin}: '${raw}' has a /0 prefix — this allowlists the ENTIRE internet on \
+its family, so nothing there can ever be blocked. It was added; remove it unless you meant it."
+    fi
+    # De-duplicated on the way in. Step 26 seeds ADMIN_IP into
+    # response.extra_allowlist, so now that that list is actually read the admin
+    # address arrives here twice on every run — once from --admin-ip and once
+    # from the config — and a host that answers on an address it also lists in
+    # extra_allowlist repeats it a third time. A repeat is not an error, but
+    # without this the second add comes back EEXIST, is counted as accepted, and
+    # the "N/M accepted" line stops matching the set it is describing.
+    case "${parsed%% *}" in
+        v4) in_list "$element" "${ALLOW_V4[@]}" || ALLOW_V4+=("$element") ;;
+        v6) in_list "$element" "${ALLOW_V6[@]}" || ALLOW_V6+=("$element") ;;
+    esac
+    return 0
+}
+
+# Adds elements to one allowlist set and reports what the KERNEL did with them.
+#
+# The old form was `nft add element … 2>/dev/null || true`, which counted every
+# entry as installed whether nft had taken it or not — including the IPv6
+# address it was pushing at an ipv4_addr set. A failure is still not fatal (a
+# re-run re-adds elements that are already there, and that must not stop an
+# install), but it is no longer silent: the element and nft's own words are
+# printed. The accepted count lands in NFT_ALLOWLIST_ADDED rather than on
+# stdout, so `warn` runs in this shell and the run's warning counter sees it.
+#
+# NFT_ALLOWLIST_ACCEPTED carries the elements the kernel actually took, in
+# order, and it is the list the persisted file is written from. The step used to
+# persist everything it had COLLECTED, refusals included; executor/commands.py
+# reloads that file with one `nft -f`, which is one transaction, so a single
+# refused line meant nothing at all came back after a reboot — including the
+# admin address, which inverts "rebooting is always a way out of a self-
+# inflicted block" into "rebooting removes your allowlist".
+NFT_ALLOWLIST_ADDED=0
+NFT_ALLOWLIST_ACCEPTED=()
+nft_allowlist_add() {
+    local set_name="$1"; shift
+    local cidr err n=0
+    NFT_ALLOWLIST_ACCEPTED=()
+    for cidr in "$@"; do
+        if err="$(nft add element inet sentinel "$set_name" "{ ${cidr} }" 2>&1)"; then
+            n=$(( n + 1 ))
+            NFT_ALLOWLIST_ACCEPTED+=("$cidr")
+        elif [[ "$err" == *"File exists"* ]]; then
+            # Already in the set from an earlier run: `nft -f` on the table file
+            # adds to an existing table rather than replacing it, so a forced
+            # re-run of this step meets its own elements. Present is present.
+            #
+            # "File exists" is nft's wording for EEXIST. If a future nft says it
+            # differently the only cost is a warn line per element on a re-run —
+            # noise, not silence, which is the direction to err in here. A type
+            # mismatch (a v6 element pushed at allowlist_v4, the bug this step
+            # was fixed for) is a parse error and reads nothing like it.
+            #
+            # Persisted as well, and that is the point of telling EEXIST apart
+            # from a refusal: the element IS in the set, so it belongs in the
+            # file that puts it back after a reboot.
+            n=$(( n + 1 ))
+            NFT_ALLOWLIST_ACCEPTED+=("$cidr")
+        else
+            warn "nft refused ${cidr} for ${set_name}: ${err//$'\n'/ }"
+        fi
+    done
+    NFT_ALLOWLIST_ADDED=$n
+}
+
 step_nftables() {
-    # ORDERING IS THE SAFETY PROPERTY HERE.
+    # ORDERING, AND WHAT ACTUALLY MAKES IT SAFE.
     #
-    # The allowlist set is created and populated with the operator's address
-    # BEFORE the chain containing the drop rules exists. If this script were
-    # interrupted between the two, the worst case is a table with an allowlist
-    # and no drops — which blocks nobody.
+    # `nft -f sentinel-table.nft` is ONE transaction and that file holds both
+    # the sets and the chains, so the allowlist is NOT created before the drop
+    # rules exist — an earlier version of this comment said it was, and was
+    # wrong about the file it was describing.
     #
-    # The base chain is `policy accept`. Sentinel is a deny-lister, not a
-    # firewall. It cannot lock anyone out by failing; only by explicitly
-    # blocking them.
+    # Two other facts do the protecting, and they are the ones to preserve. The
+    # base chains are `policy accept`, so Sentinel drops only what it has been
+    # explicitly told to drop; and the blocklist sets come up EMPTY, so between
+    # the load and the moment the allowlist is filled there is no drop rule with
+    # anything to match. Nothing is dropped until something is added to a
+    # blocklist, and nothing is added to one before this step finishes.
+    #
+    # Inside each chain the allowlist rules do precede the blocklist rules, so
+    # an address in both is accepted. That is a property of the file's contents,
+    # not of the order in which things were loaded.
     nft -f "${SCRIPT_DIR}/nftables/sentinel-table.nft" || die "failed to load the nftables table"
 
-    local -a allow=("127.0.0.0/8" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16")
-    [[ -n "$ADMIN_IP" ]] && allow+=("${ADMIN_IP}/32")
+    # Two sets, because nftables types them: an element of allowlist_v4 is an
+    # ipv4_addr and the kernel refuses anything else. Everything below is routed
+    # by family through allowlist_element.
+    local -a ALLOW_V4=("127.0.0.0/8" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16")
+
+    # The v6 defaults are the counterparts of the v4 ones: loopback, and ULA
+    # (fc00::/7), which is what RFC1918 is on this family.
+    #
+    # fe80::/10 is in DELIBERATELY. Link-local is where IPv6 keeps neighbour
+    # discovery and router advertisements: a block landing on a fe80:: source —
+    # a scanner seen on the local segment, a detector misfiring — would not drop
+    # one peer, it would take the host off IPv6 altogether, which is the lockout
+    # this list exists to prevent. It is also unroutable off-link. The price is
+    # real and is paid knowingly: on a VPS the IPv4 segment is public, so a v4
+    # neighbour stays blockable, while every fe80:: source on the segment is
+    # permanently unblockable. Losing the host's IPv6 outright is worse than
+    # not being able to block one same-segment tenant.
+    local -a ALLOW_V6=("::1/128" "fc00::/7" "fe80::/10")
+
+    if [[ -n "${ADMIN_IP:-}" ]]; then
+        allowlist_collect "$ADMIN_IP" "--admin-ip"
+    fi
 
     # Operator-supplied entries from the config: uptime monitors, CI runners,
     # office ranges, any high-volume source that must not be cut off.
+    local cidr ip host db raw_extra extra_rc n_extra=0
     if [[ -f "${SENTINEL_CONFIG_DIR}/sentinel.yaml" ]]; then
+        # Read into a variable rather than through `< <(...)`: a process
+        # substitution throws the reader's exit status away, and that status is
+        # the only thing that tells this step apart "the list was empty" from
+        # "the list was there and I could not read it".
+        extra_rc=0
+        raw_extra="$(extra_allowlist_entries "${SENTINEL_CONFIG_DIR}/sentinel.yaml")" || extra_rc=$?
+        if (( extra_rc == 3 )); then
+            warn "extra_allowlist found but could not be read: flow list is not on one line. \
+NOTHING from response.extra_allowlist was allowlisted. Put the whole [ ... ] on the \
+extra_allowlist line, or use the block form with one \"- entry\" per line."
+        elif (( extra_rc != 0 )); then
+            warn "extra_allowlist could not be read (the reader exited ${extra_rc}); nothing \
+from response.extra_allowlist was allowlisted"
+        fi
         while read -r cidr; do
-            [[ -n "$cidr" ]] && allow+=("$cidr")
-        done < <(awk '/extra_allowlist:/{f=1;next} f&&/^ *- /{gsub(/^ *- *|["\x27]/,"");print;next} f&&NF&&!/^ *#/{exit}' \
-                 "${SENTINEL_CONFIG_DIR}/sentinel.yaml" 2>/dev/null || true)
+            if [[ -n "$cidr" ]]; then
+                n_extra=$(( n_extra + 1 ))
+                allowlist_collect "$cidr" "response.extra_allowlist"
+            fi
+        done <<< "$raw_extra"
     fi
 
+    # The host's own addresses, BOTH families. This loop used to skip anything
+    # containing a colon, so a host reached over IPv6 allowlisted none of the
+    # addresses it answers on.
     while read -r ip; do
-        [[ "$ip" == *:* ]] || allow+=("${ip}/32")
+        if [[ -n "$ip" ]]; then allowlist_collect "$ip" "local address"; fi
     done < <(public_ips)
 
+    # Blocking Telegram or Anthropic silently removes Sentinel's own alerting
+    # and analysis — a failure with no symptom — so both names are resolved on
+    # BOTH families.
+    #
+    # What `getent ahostsv6` actually does here was measured on both production
+    # hosts, including the one running with net.ipv6.conf.all.disable_ipv6=1: it
+    # exits 0 and prints three duplicate lines of a NATIVE IPv6 address. Not
+    # nothing, and not ::ffff: mapped — the resolver answers out of DNS and does
+    # not care whether this host can reach what it answered. So `sort -u` folds
+    # the duplicates, and the addresses go into allowlist_v6 even on a host that
+    # will never send a packet to them: an allowlist element that matches no
+    # traffic costs nothing, while a missing one costs the alerting channel.
+    #
+    # The ::ffff: shape is still handled — allowlist_element folds it back to v4
+    # — because it is what a glibc resolving with AI_V4MAPPED returns, and such
+    # an element in allowlist_v6 could never match a packet. It is simply not
+    # what these two hosts returned. Neither shape is an error and neither warns.
     for host in api.telegram.org api.anthropic.com; do
-        while read -r ip; do
-            [[ -n "$ip" ]] && allow+=("${ip}/32")
-        done < <(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u)
+        for db in ahostsv4 ahostsv6; do
+            while read -r ip; do
+                if [[ -n "$ip" ]]; then allowlist_collect "$ip" "$host"; fi
+            done < <(getent "$db" "$host" 2>/dev/null | awk '{print $1}' | sort -u)
+        done
     done
 
-    for cidr in "${allow[@]}"; do
-        nft add element inet sentinel allowlist_v4 "{ ${cidr} }" 2>/dev/null || true
-    done
-    ok "nftables table loaded; ${#allow[@]} allowlist entries, blocklist empty"
+    # ACCEPTED_* are what the kernel took, and they are what gets persisted.
+    # ALLOW_* are what was offered, and they are only the denominator below.
+    local n_v4 n_v6
+    local -a ACCEPTED_V4=() ACCEPTED_V6=()
+    nft_allowlist_add allowlist_v4 "${ALLOW_V4[@]}"
+    n_v4=$NFT_ALLOWLIST_ADDED; ACCEPTED_V4=("${NFT_ALLOWLIST_ACCEPTED[@]}")
+    nft_allowlist_add allowlist_v6 "${ALLOW_V6[@]}"
+    n_v6=$NFT_ALLOWLIST_ADDED; ACCEPTED_V6=("${NFT_ALLOWLIST_ACCEPTED[@]}")
+    # Counted per family, because that is the number an operator on an IPv6-only
+    # path has to be able to read. A single total hid an allowlist_v6 that was
+    # empty on every host this installer had ever touched.
+    #
+    # The extra_allowlist count is next to them because it is the one an
+    # operator can act on directly: it is the list they edit, and "0 entries"
+    # there next to a warn about an unreadable list is a different problem from
+    # "3 entries" of which one was refused.
+    ok "nftables table loaded; allowlist ${n_v4}/${#ALLOW_V4[@]} IPv4 and \
+${n_v6}/${#ALLOW_V6[@]} IPv6 entries accepted by the kernel, blocklist empty; \
+response.extra_allowlist supplied ${n_extra} entries"
+
+    # Both sets carry `auto-merge`, so the kernel COALESCES elements that overlap
+    # or abut: on production 17 persisted lines are 9 live elements. Said out
+    # loud, because "I added seventeen and the listing shows nine" is exactly
+    # what the silent-refusal bug this step was rewritten for looked like, and
+    # an operator who cannot tell the two apart has to treat every install as
+    # suspect.
+    info "the allowlist sets carry auto-merge: overlapping or adjacent entries \
+are coalesced by the kernel, so the listing below can show FEWER elements than \
+the numbers above without anything having been refused"
 
     # -- Persist the RULESET and the ALLOWLIST, but never the blocklist -------
     #
@@ -2333,20 +2671,78 @@ step_nftables() {
     # own address. Blocks must NOT come back, because "rebooting is always a way
     # out of a self-inflicted block" is a guarantee this design makes and the
     # operator has been told to rely on.
+    #
+    # executor/commands.py appends to this same file in this same syntax when
+    # `/allow` adds an address, already routing by family, so a v6 entry added
+    # by hand later comes back with the rest.
+    #
+    # ONLY THE ELEMENTS THE KERNEL TOOK. The executor reloads this file with a
+    # single `nft -f`, which is a single transaction: one line the kernel
+    # refuses and the whole file is rolled back, so a host that had ONE bad
+    # entry in extra_allowlist came back from a reboot with an empty allowlist
+    # and a full set of drop rules. Writing what was offered rather than what
+    # was accepted turned "rebooting is always a way out" into its opposite.
     install -d -m 0755 -o root -g root "${SENTINEL_PREFIX}/libexec"
     install -m 0644 -o root -g root "${SCRIPT_DIR}/nftables/sentinel-table.nft"         "${SENTINEL_PREFIX}/libexec/sentinel-table.nft"
     {
         echo "# Generated by install.sh. Loaded by the executor when the table"
         echo "# is missing at startup. Blocks are deliberately NOT persisted."
-        for cidr in "${allow[@]}"; do
+        echo "# Only elements the kernel accepted are listed: the executor loads"
+        echo "# this file as ONE transaction, so one refused line would restore"
+        echo "# nothing at all."
+        for cidr in "${ACCEPTED_V4[@]}"; do
             echo "add element inet sentinel allowlist_v4 { ${cidr} }"
+        done
+        for cidr in "${ACCEPTED_V6[@]}"; do
+            echo "add element inet sentinel allowlist_v6 { ${cidr} }"
         done
     } > "${SENTINEL_PREFIX}/libexec/sentinel-allowlist.nft"
     chown root:root "${SENTINEL_PREFIX}/libexec/sentinel-allowlist.nft"
     chmod 0644 "${SENTINEL_PREFIX}/libexec/sentinel-allowlist.nft"
-    ok "allowlist persisted for restart (${#allow[@]} entries)"
 
-    nft list set inet sentinel allowlist_v4 | sed 's/^/    /'
+    # And the file is CHECK-LOADED, because a file on disk is not proof that
+    # anything can load it. `nft -c -f` runs the same parse and the same
+    # evaluation the executor's `nft -f` will run at startup, and stops before
+    # the commit.
+    #
+    # Measured on nft 1.0.9 (both production hosts, 7 September 2026): check
+    # mode on a file whose every element is already in the running kernel exits
+    # 0 with no output, and a refused line anywhere in the file fails the whole
+    # check whatever precedes it. So exit 0 is the proof wanted here. The
+    # "File exists" branch below was never observed on that version; it stays
+    # as a fallback for an nft build that does surface EEXIST in check mode,
+    # where it would also mean every line parsed and every set name resolved.
+    # Anything else is a defect in what was just written, and it
+    # stops the install: carrying on would hand the operator a host whose next
+    # reboot silently drops the allowlist, which is the one thing this file
+    # exists to prevent. Stopping here is safe — the chains are `policy accept`
+    # and the blocklist sets are empty, so nothing is being dropped.
+    local check_out
+    if check_out="$(nft -c -f "${SENTINEL_PREFIX}/libexec/sentinel-allowlist.nft" 2>&1)"; then
+        ok "allowlist persisted for restart (${#ACCEPTED_V4[@]} IPv4, ${#ACCEPTED_V6[@]} IPv6); \
+the file passes \`nft -c -f\`"
+    elif [[ "$check_out" == *"File exists"* ]]; then
+        ok "allowlist persisted for restart (${#ACCEPTED_V4[@]} IPv4, ${#ACCEPTED_V6[@]} IPv6); \
+it parses, and the kernel reports its elements already present — which is what it should say"
+    else
+        die "the persisted allowlist ${SENTINEL_PREFIX}/libexec/sentinel-allowlist.nft does not \
+load: ${check_out//$'\n'/ } — after a reboot the executor loads this file in ONE transaction, so \
+NOTHING would come back, including your own address."
+    fi
+
+    # BOTH sets, always. Printing only v4 is what let an empty allowlist_v6 pass
+    # unnoticed on a host where every login arrives over IPv6: the operator read
+    # a list that could not contain their address and saw nothing wrong. A set
+    # that cannot be read back is reported as UNKNOWN, never as empty.
+    local set_name listed
+    for set_name in allowlist_v4 allowlist_v6; do
+        if listed="$(nft list set inet sentinel "$set_name" 2>&1)"; then
+            printf '%s\n' "$listed" | sed 's/^/    /'
+        else
+            warn "cannot read ${set_name} back from the kernel: ${listed//$'\n'/ } \
+— its contents are UNKNOWN, not empty"
+        fi
+    done
 }
 
 # --- 30 -------------------------------------------------------------------

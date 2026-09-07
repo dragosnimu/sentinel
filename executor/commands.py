@@ -303,9 +303,15 @@ def ensure_table() -> dict[str, Any]:
             log("error", "table loaded but the allowlist did NOT",
                 error=allow["stderr"])
         else:
+            # `add element` lines only. Counting every non-blank line counted
+            # the generated header comments too, so the number logged after a
+            # reboot was several higher than the number of entries actually
+            # restored — and that log line is what an operator checks when they
+            # are wondering whether their own address came back.
             allow_count = sum(
                 1 for line in Path(NFT_ALLOWLIST_FILE).read_text(
-                    encoding="utf-8").splitlines() if line.strip())
+                    encoding="utf-8").splitlines()
+                if line.strip().startswith("add element"))
 
     log("warning", "nftables table was missing and has been recreated",
         allowlist_entries=allow_count)

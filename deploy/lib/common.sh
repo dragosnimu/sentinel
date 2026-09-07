@@ -689,6 +689,269 @@ public_ips() {
         | awk '{print $4}' | cut -d/ -f1 | sort -u
 }
 
+# --------------------------------------------------------------------------
+# Which allowlist set an address belongs in
+# --------------------------------------------------------------------------
+# `inet sentinel` has two allowlist sets because nftables types them: an
+# element of `allowlist_v4` is an ipv4_addr and the kernel refuses anything
+# else. The installer used to append "/32" to every address it had collected
+# and push the lot into allowlist_v4 under `2>/dev/null || true`, so on a host
+# reached only over IPv6 the operator's own address was rejected by the kernel,
+# the rejection went to /dev/null, and the run reported the entry as installed.
+# allowlist_v6 stayed empty and auto_block had to be left off.
+#
+# These helpers answer "which set", and they are strict on purpose: whatever
+# they call an address is handed straight to `nft add element`, and the bug
+# being repaired here is exactly a value accepted by one layer and refused in
+# silence by the next.
+#
+# Every one of them pins LC_ALL=C and spells digit and hex classes out element
+# by element rather than as [0-9] / [0-9a-f]. Inside [[ =~ ]] a bracket RANGE
+# is a collation range: under a UTF-8 locale [0-9] also matches fullwidth and
+# Arabic-Indic digits, which nft does not parse and which would therefore reach
+# it as an "address" this code had already approved.
+#
+# REDUNDANT GUARDS ARE MARKED. Every `return 1` below was falsified one at a
+# time — loosened or removed, tests run — on 7 Sep 2026. Twenty-two of them
+# turned a test red. Seven did not, because a later and more general rule
+# refuses the same shapes; each of those carries a "(redundant with …)" note
+# saying which rule that is, so nobody spends an afternoon hunting for the input
+# it catches. They stay because every one of them fails CLOSED — the redundancy
+# can only refuse, never accept — and because each states a rule at the place a
+# reader looks for it. What they must not do is give anyone the impression they
+# are load-bearing.
+
+_ip_octet_ok() {
+    local o="$1"
+    local LC_ALL=C
+    [[ "$o" =~ ^[0123456789]{1,3}$ ]] || return 1
+    # A leading zero is octal to some parsers and decimal to others. "010.0.0.1"
+    # must not mean two different hosts depending on which one reads it. "0" by
+    # itself is not a leading zero: 0.0.0.0 has to stay readable.
+    if [[ "$o" != "0" && "$o" == 0* ]]; then return 1; fi
+    # An arithmetic error also yields 1 here, i.e. "not an octet" — the failure
+    # direction that refuses the value rather than passing it on.
+    (( 10#$o <= 255 )) || return 1
+    return 0
+}
+
+_ip_is_v4() {
+    local addr="$1" a b c d
+    local LC_ALL=C
+    # The four fields are cut out of the STRING with a regex anchored at both
+    # ends, NOT with `read -r -a` under IFS='.'. `read` drops a trailing
+    # delimiter, so "192.0.2.1." came back as four clean octets, and it stops at
+    # the first newline, so $'192.0.2.1\ngarbage' came back as four clean octets
+    # too — and allowlist_element then printed the value back WHOLE as an nft
+    # element. `[^.]+` rather than a digit class on purpose: what an octet is
+    # said once, in _ip_octet_ok, and this regex only says how many there are.
+    [[ "$addr" =~ ^([^.]+)\.([^.]+)\.([^.]+)\.([^.]+)$ ]] || return 1
+    # All four copied out BEFORE the first _ip_octet_ok call. BASH_REMATCH is a
+    # single global, and _ip_octet_ok runs a [[ =~ ]] of its own, which replaces
+    # it: reading BASH_REMATCH[2] after that call gets the octet regex's groups.
+    # Under `set -u` that is an "unbound variable" abort in the middle of the
+    # installer; without it, it is an empty octet and a valid address reported
+    # as invalid — which is the operator's own address thrown away.
+    a="${BASH_REMATCH[1]}"; b="${BASH_REMATCH[2]}"
+    c="${BASH_REMATCH[3]}"; d="${BASH_REMATCH[4]}"
+    _ip_octet_ok "$a" || return 1
+    _ip_octet_ok "$b" || return 1
+    _ip_octet_ok "$c" || return 1
+    _ip_octet_ok "$d" || return 1
+    return 0
+}
+
+_ip6_group_ok() {
+    local g="$1"
+    local LC_ALL=C
+    [[ "$g" =~ ^[0123456789abcdefABCDEF]{1,4}$ ]] || return 1
+    return 0
+}
+
+# _ip6_count FRAG -- prints how many 16-bit groups one side of a "::" split
+# holds, or returns 1 if that side is not a run of groups. An empty side is
+# zero groups, which is what makes "::" and "::1" addresses at all.
+#
+# Walked with parameter expansion rather than `read -r -a` under IFS=':', for
+# the reason spelled out in _ip_is_v4: `read` stops at the first newline, so the
+# tail of $'2001:db8::1\ngarbage' counted as one clean group and the whole
+# string came out a valid address.
+#
+# No dotted quad is handled HERE. The embedded-IPv4 forms are recognised in
+# _ip_is_v6 as whole-address shapes, because which of them is legal is a fact
+# about the whole address and not about one side of the "::".
+_ip6_count() {
+    local frag="$1" rest total=0
+    local LC_ALL=C
+    if [[ -z "$frag" ]]; then printf '0\n'; return 0; fi
+    rest="$frag"
+    while :; do
+        _ip6_group_ok "${rest%%:*}" || return 1
+        total=$(( total + 1 ))
+        [[ "$rest" == *:* ]] || break
+        rest="${rest#*:}"
+    done
+    printf '%d\n' "$total"
+    return 0
+}
+
+_ip_is_v6() {
+    local addr="$1" head tail nh nt lead
+    local LC_ALL=C
+
+    # (redundant with _ip6_count: a single token counts one group and nh == 8
+    # refuses it). A dispatch, not a test: it keeps the dotted-quad branch
+    # below from being walked for every plain IPv4 address.
+    case "$addr" in *:*) ;; *) return 1 ;; esac
+    # One colon at either end is a typo, not "::" — ":1:2:3", "1:2:3:".
+    # (redundant with _ip6_group_ok: a colon at an end leaves an EMPTY group,
+    # and an empty group is not a group. That is also what refuses ":::" and
+    # a second "::" further down.) Kept because the shape has a name and this
+    # is where a reader looks for it.
+    if [[ "$addr" == :* && "$addr" != ::* ]]; then return 1; fi
+    if [[ "$addr" == *: && "$addr" != *:: ]]; then return 1; fi
+
+    # -- The embedded IPv4 forms, and only the two the kernel takes ---------
+    #
+    # DECISION (7 Sep 2026), and it is a deliberate narrowing of RFC 4291.
+    # RFC 4291 lets a dotted quad stand for the last two groups of ANY address;
+    # nft does not. On production (nft 1.0.9)
+    #     nft add element inet sentinel allowlist_v6 { 1:2:3:4:5:6:192.0.2.1/128 }
+    # is refused — "netlink: Error: set is not a map" — while ::192.0.2.1/128 is
+    # accepted. nft is the layer that decides, so this is where the line is
+    # drawn. A classifier that is liberal where the kernel is strict IS the bug
+    # this file exists to remove: an address approved here, refused there, and
+    # an operator reading that their address went in.
+    #
+    # ::a.b.c.d because the kernel was measured taking it, and ::ffff:a.b.c.d
+    # because allowlist_element folds that one back to v4 before nft ever sees
+    # it. Anything else with a dot in it is refused BY NAME by the caller, which
+    # is a far better outcome than an element the kernel drops in silence.
+    if [[ "$addr" == *.* ]]; then
+        lead="${addr%:*}:"
+        case "${lead,,}" in
+            "::"|"::ffff:") ;;
+            *) return 1 ;;
+        esac
+        _ip_is_v4 "${addr##*:}" || return 1
+        return 0
+    fi
+
+    if [[ "$addr" == *::* ]]; then
+        head="${addr%%::*}"
+        tail="${addr#*::}"
+        # Two "::" leave the number of omitted zero groups undecidable, so the
+        # string does not denote one address.
+        # (redundant with _ip6_group_ok: the second "::" leaves an empty group
+        # in the tail, which is refused when the tail is walked.)
+        case "$tail" in *::*) return 1 ;; esac
+        nh="$(_ip6_count "$head")" || return 1
+        nt="$(_ip6_count "$tail")" || return 1
+        # "::" stands for at least one omitted group, so the written ones cannot
+        # already be eight.
+        (( nh + nt <= 7 )) || return 1
+        return 0
+    fi
+
+    nh="$(_ip6_count "$addr")" || return 1
+    (( nh == 8 )) || return 1
+    return 0
+}
+
+# ip_family ENTRY -- prints "v4", "v6" or "invalid"; returns 0 for the first
+# two and 1 for the third, so a caller may branch on either.
+#
+# Used by the wrappers and by preflight to TELL the operator which set their
+# address is going into. Callers that need the element itself use
+# allowlist_element below, which also normalises the prefix.
+ip_family() {
+    local entry="${1-}"
+    local out
+    out="$(allowlist_element "$entry")" || { printf 'invalid\n'; return 1; }
+    printf '%s\n' "${out%% *}"
+    return 0
+}
+
+# allowlist_element ENTRY -- prints "<family> <element>", e.g.
+#
+#   198.51.100.7      -> "v4 198.51.100.7/32"
+#   203.0.113.0/24    -> "v4 203.0.113.0/24"
+#   2001:db8::1       -> "v6 2001:db8::1/128"
+#   2001:db8:1::/48   -> "v6 2001:db8:1::/48"
+#
+# and returns 0. Prints nothing and returns 1 when the entry is not an address:
+# the caller warns BY VALUE and skips it, because an entry dropped in silence is
+# an operator who believes they are allowlisted and is not.
+#
+# A bare address gets the full-length prefix; an explicit prefix is kept as
+# written. Both sets carry `flags interval`, so a prefix is a legal element in
+# either of them — that is why no caller has to special-case ranges.
+#
+# ::ffff:a.b.c.d is mapped back to a.b.c.d and routed to v4. glibc's
+# `getent ahostsv6` returns that form on a host with no IPv6, and an
+# IPv4-mapped address sitting in an ipv6_addr set can never match a packet:
+# in an inet table an IPv4 packet is matched by `ip saddr` against the v4 set,
+# and no IPv6 packet on the wire carries ::ffff:. Keeping it as v6 would put an
+# element in the set that looks right and accepts nothing — the same species of
+# lie this whole change exists to remove. The mapping is textual (the dotted
+# form glibc emits) and only applies when the prefix covers the mapped /96 or
+# more; ::ffff:0:0/64 is a genuine v6 range and stays one.
+allowlist_element() {
+    local entry="${1-}" addr prefix rest
+    local LC_ALL=C
+
+    # (redundant with _ip_is_v4 and _ip_is_v6, which both refuse "".)
+    if [[ -z "$entry" ]]; then return 1; fi
+    # A zone id names an interface on the machine that produced the address —
+    # "fe80::1%%eth0" is the operator's laptop, not this host, and nft's
+    # ipv6_addr has nowhere to put a scope. Refused, not truncated into a
+    # different address.
+    # (redundant with _ip6_group_ok / _ip_octet_ok: "%" is in neither class,
+    # so the group or octet carrying it is refused anyway.)
+    case "$entry" in *%*) return 1 ;; esac
+
+    addr="${entry%%/*}"
+    prefix=""
+    if [[ "$entry" == */* ]]; then
+        rest="${entry#*/}"
+        # (redundant with the prefix regex below: "/24" is not 1-3 digits.)
+        case "$rest" in */*) return 1 ;; esac
+        [[ "$rest" =~ ^[0123456789]{1,3}$ ]] || return 1
+        if [[ "$rest" != "0" && "$rest" == 0* ]]; then return 1; fi
+        prefix="$rest"
+    fi
+
+    if _ip_is_v4 "$addr"; then
+        [[ -n "$prefix" ]] || prefix=32
+        (( 10#$prefix <= 32 )) || return 1
+        printf 'v4 %s/%s\n' "$addr" "$((10#$prefix))"
+        return 0
+    fi
+
+    if _ip_is_v6 "$addr"; then
+        [[ -n "$prefix" ]] || prefix=128
+        (( 10#$prefix <= 128 )) || return 1
+        # _ip_is_v6 has already vouched for the shape, so a dot in $addr means
+        # ::a.b.c.d or ::ffff:a.b.c.d and nothing else, with a quad that has
+        # already been through _ip_is_v4. The re-check that used to sit here
+        # could not be made to fail by any input and was removed rather than
+        # kept as decoration.
+        #
+        # The /96 floor is the mapped block: ::ffff:0:0/96 IS the whole of IPv4,
+        # so a prefix shorter than that does not describe an IPv4 range at all
+        # and the subtraction below would produce a negative one. ::ffff:x/95
+        # stays a v6 range, which is what it is.
+        if [[ "${addr,,}" == ::ffff:*.*.*.* ]] && (( 10#$prefix >= 96 )); then
+            printf 'v4 %s/%s\n' "${addr##*:}" "$(( 10#$prefix - 96 ))"
+            return 0
+        fi
+        printf 'v6 %s/%s\n' "$addr" "$((10#$prefix))"
+        return 0
+    fi
+
+    return 1
+}
+
 lockout_warning() {
     cat <<'EOF'
 
