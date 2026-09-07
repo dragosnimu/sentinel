@@ -195,6 +195,11 @@ ensure_instance_id() {{ printf 'ENSURED\\n' >> "$CALLS"; : > "$CFG/instance_id";
 # tests/security/test_installer_docker_access.py.
 ensure_docker_access() {{ printf 'DOCKER_ACCESS\\n' >> "$CALLS"; }}
 
+# A treia funcție necondiționată din secvență. Aici doar se înregistrează, ca
+# secvența livrată să ruleze fără `install`/`systemd-tmpfiles` reale; comportamentul
+# ei propriu e probat în tests/security/test_installer_tmpfiles_reapplied.py.
+ensure_tmpfiles_applied() {{ printf 'TMPFILES_APPLIED\\n' >> "$CALLS"; }}
+
 mkdir -p "$STATE_MARKERS"
 {markers}
 

@@ -55,6 +55,7 @@ from sentinel.constants import SYSTEMD_UNITS
 from sentinel.db.engine import Database
 from sentinel.db.repo import assets as assets_repo
 from sentinel.db.repo.logins import REAL_TTY_SQL
+from sentinel.respond import watchdog as _watchdog
 from sentinel.scan import inventory
 from sentinel.logging_setup import get_logger
 from sentinel.util import tz
@@ -199,6 +200,132 @@ async def check_timers(cfg: Config) -> list[CheckResult]:
         results.append(CheckResult(f"timer:{unit}", f"Timerul {unit}", "ok",
                                    detail="programat"))
     return results
+
+
+# ---------------------------------------------------------------------------
+# Watchdog state persistence
+# ---------------------------------------------------------------------------
+#
+# `check_timers` above only proves the timer keeps firing — it said "active"
+# throughout the real outage this check exists for. Measured on production,
+# 4–7 September 2026: the watchdog's state directory was unwritable to root
+# (no CAP_DAC_OVERRIDE into a directory it did not own), so `save_state`
+# logged a warning and returned on every single run. `web_down_since` reset to
+# `now()` every minute, `down_for` stayed ~0 forever, and the anti-lockout
+# flush for a dead dashboard (`decide()` in `sentinel/respond/watchdog.py`)
+# became mathematically unreachable — while the unit, and the timer, both
+# stayed `active`. See `deploy/tmpfiles/sentinel.conf` for the fix.
+#
+# Path kept in sync with the module it checks, not re-declared from the env
+# var: reading `watchdog._DEFAULT_STATE_FILE` means a change to one is a
+# change to both, and `test_tmpfiles_line_agrees_with_watchdog_default_path`
+# pins the tmpfiles line itself against that same constant.
+WATCHDOG_STATE_PATH = Path(_watchdog._DEFAULT_STATE_FILE)
+
+# The timer fires every 60s (`OnUnitActiveSec=60` in
+# deploy/systemd/sentinel-watchdog.timer). Five missed periods — five real
+# minutes with nothing written — is long enough that one slow run (a stalled
+# `systemctl`, a busy host) cannot trip this, and short enough that the state
+# file is unmistakably rewritten between one selfcheck pass and the next.
+WATCHDOG_STATE_STALE_AFTER_MIN = 5
+
+# Both `sentinel-watchdog.timer` and `sentinel-selfcheck.timer` carry
+# `OnBootSec=90` — they can fire within moments of each other right after a
+# reboot. The on-disk state file survives the reboot too, so right after boot
+# it can be hours old (from before the host went down), not just a few
+# minutes: the watchdog has not necessarily had its first post-boot run yet
+# when the selfcheck asks. Without this grace, a normal reboot after any
+# downtime longer than the stale threshold produces a Telegram "down" alert
+# immediately followed by a "recovered" — noise on every restart, for a
+# component that was never actually broken.
+WATCHDOG_BOOT_GRACE_MIN = 2
+
+
+def _stat_mtime(path: Path) -> float | None:
+    """Last-modified time of `path`, or `None` if it cannot be read.
+
+    `None` means "could not look", never "just written": the caller turns it
+    into `unknown` or `down` depending on whether the timer itself is even
+    supposed to be running — never into a silent `ok`.
+    """
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _uptime_seconds() -> float | None:
+    """Seconds since boot, or `None` if `/proc/uptime` cannot be read.
+
+    Used only to widen the stale-state grace window right after boot. A host
+    where this cannot be read (no /proc/uptime — not Linux) gets no grace: the
+    plain staleness threshold below applies unchanged, which is the same
+    behaviour this check had before the grace window existed.
+    """
+    try:
+        with open("/proc/uptime", encoding="ascii") as fh:
+            return float(fh.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+async def check_watchdog_state() -> list[CheckResult]:
+    """Does the anti-lockout deadman's memory actually survive between runs?
+
+    A missing or stale state file is reported only while the timer is
+    ACTIVE — mirrors `check_timers` exactly, on the same unit, so a
+    deliberately stopped or never-installed watchdog gets exactly one finding
+    (`timer:sentinel-watchdog.timer`, down), not a second, differently-worded
+    alarm about a directory that was never going to be written to anyway.
+    """
+    state = await asyncio.to_thread(_systemctl, "is-active", "sentinel-watchdog.timer")
+    if not state:
+        return [CheckResult(
+            "watchdog:state", "Nu pot citi persistența watchdog-ului", "unknown",
+            detail="systemctl nu a răspuns la interogarea timerului "
+                   "sentinel-watchdog.timer",
+            action="systemctl status sentinel-watchdog.timer")]
+    if state != "active":
+        # Stopped, failed, or never installed. `check_timers` already reports
+        # this exact unit under its own key; nothing here to add.
+        return []
+
+    mtime = await asyncio.to_thread(_stat_mtime, WATCHDOG_STATE_PATH)
+    age_min = None if mtime is None else (time.time() - mtime) / 60
+    stale = age_min is None or age_min > WATCHDOG_STATE_STALE_AFTER_MIN
+
+    if stale:
+        uptime_s = await asyncio.to_thread(_uptime_seconds)
+        grace_s = (WATCHDOG_STATE_STALE_AFTER_MIN + WATCHDOG_BOOT_GRACE_MIN) * 60
+        if uptime_s is not None and uptime_s < grace_s:
+            return [CheckResult(
+                "watchdog:state", "Watchdog-ul e încă în fereastra de pornire",
+                "unknown",
+                detail=f"gazda a pornit acum {int(uptime_s)}s — timerul are "
+                       "OnBootSec=90 și poate să nu fi apucat încă prima "
+                       f"rulare de după boot; nu raportez o cădere înainte de "
+                       f"{grace_s}s de la pornire",
+                action="journalctl -u sentinel-watchdog -n 20")]
+        if mtime is None:
+            return [CheckResult(
+                "watchdog:state", "Starea watchdog-ului nu există", "down",
+                detail=f"{WATCHDOG_STATE_PATH} lipsește, deși timerul e activ — "
+                       "watchdog-ul repornește «web e jos de 0 secunde» la fiecare "
+                       "rulare, iar pragul de 5 minute pentru dashboard picat nu se "
+                       "poate atinge niciodată",
+                action="systemd-tmpfiles --create /usr/lib/tmpfiles.d/sentinel.conf; "
+                       "journalctl -u sentinel-watchdog -n 20")]
+        return [CheckResult(
+            "watchdog:state", "Watchdog-ul nu-și mai scrie starea", "down",
+            detail=f"{WATCHDOG_STATE_PATH} nu s-a mai schimbat de "
+                   f"{int(age_min)} minute, deși timerul rulează la fiecare 60s "
+                   "— probabil directorul nu mai e scriibil de root",
+            action="journalctl -u sentinel-watchdog -n 20")]
+
+    return [CheckResult(
+        "watchdog:state", "Starea watchdog-ului", "ok",
+        detail=f"scrisă acum {int(age_min)} min",
+        facts={"age_min": round(age_min, 1)})]
 
 
 # ---------------------------------------------------------------------------
@@ -3793,6 +3920,7 @@ async def check_inventory(db: Database) -> list[CheckResult]:
 CHECKS: tuple[tuple[str, Callable], ...] = (
     ("units", check_units),
     ("timers", check_timers),
+    ("watchdog_state", check_watchdog_state),
     ("ingest", check_ingest_sources),
     ("detect", check_detection_loop),
     ("enforcement", check_enforcement),

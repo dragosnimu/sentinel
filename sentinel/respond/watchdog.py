@@ -53,7 +53,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from sentinel.respond.executor_client import ExecutorClient  # noqa: E402
 
 PANIC_FILE = Path(os.environ.get("SENTINEL_PANIC_FILE", "/etc/sentinel/PANIC"))
-STATE_FILE = Path(os.environ.get("SENTINEL_WATCHDOG_STATE", "/var/lib/sentinel/watchdog.json"))
+
+# A SIBLING of /var/lib/sentinel, not a child of it. This unit runs as root
+# with CapabilityBoundingSet=CAP_NET_ADMIN only — no CAP_DAC_OVERRIDE / no
+# CAP_DAC_READ_SEARCH — and /var/lib/sentinel is 0750 sentinel:sentinel.
+# Without those capabilities root is an ORDINARY uid for every DAC permission
+# check, including directory TRAVERSAL: it cannot even `stat` a path under
+# /var/lib/sentinel, so a root-owned child directory placed inside it (the
+# first attempt at this fix) is still unreachable — ownership of the leaf
+# never comes into play when an ancestor denies the `x` bit. Measured on
+# production from 4 Sep 2026, every single run logged "[Errno 13] Permission
+# denied" and never persisted anything; reproduced in a container with
+# `setpriv --bounding-set=-all` for the corrected path below.
+# /var/lib/sentinel-watchdog hangs off /var/lib (0755 root:root, always
+# traversable) instead, root:sentinel, setgid, declared in
+# deploy/tmpfiles/sentinel.conf — kept as a separate constant, not inlined,
+# because test_watchdog.py pins the two against each other; changing one
+# without the other is exactly the failure mode this exists to catch.
+_DEFAULT_STATE_FILE = "/var/lib/sentinel-watchdog/state.json"
+STATE_FILE = Path(os.environ.get("SENTINEL_WATCHDOG_STATE", _DEFAULT_STATE_FILE))
 EXECUTOR_SOCKET = os.environ.get("SENTINEL_EXECUTOR_SOCKET", "/run/sentinel/executor.sock")
 HEALTH_URL = os.environ.get("SENTINEL_HEALTH_URL", "http://127.0.0.1:8787/healthz")
 
@@ -89,13 +107,45 @@ def load_state() -> dict[str, object]:
 
 
 def save_state(state: dict[str, object]) -> None:
+    # The `.is_dir()` check has to be INSIDE the try, not before it. On an
+    # untraversable parent — an ancestor directory missing the `x` bit for
+    # this uid — `Path.is_dir()` only swallows ENOENT/ENOTDIR/EBADF/ELOOP; a
+    # bare EACCES propagates as `PermissionError`. Outside the try, that raise
+    # went straight out of `save_state`, `main()` caught it as "watchdog
+    # raised — no flush decision was made" and returned 1 — false: the flush
+    # decision HAD already been made (in `run_once`, before this call); only
+    # remembering it for next time failed. This module's one hard contract is
+    # "never raises", and a state-persistence hiccup must never be promoted
+    # into looking like the decision logic itself broke.
     try:
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if not STATE_FILE.parent.is_dir():
+            # Deliberately NOT `mkdir(parents=True)`. A directory this process
+            # created itself would be owned by root with no group access, which
+            # the unprivileged selfcheck could never read — trading a loud
+            # failure for a quiet, wrong one. A missing directory means the
+            # installer's tmpfiles step never ran (or ran before this directory
+            # existed in the repo), and that fact — not a workaround — is what
+            # the operator needs.
+            log(
+                "warning",
+                "could not persist watchdog state: state directory is missing",
+                directory=str(STATE_FILE.parent),
+                hint="run: systemd-tmpfiles --create /usr/lib/tmpfiles.d/sentinel.conf "
+                     "(expects a line for this directory, owner root, in "
+                     "deploy/tmpfiles/sentinel.conf)",
+            )
+            return
         # Written via a temporary file and renamed: a power loss mid-write must
         # not leave a truncated file that the next run cannot parse.
         tmp = STATE_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(state, default=str), encoding="utf-8")
         tmp.replace(STATE_FILE)
+        # Root's default create mode (644 minus umask) would let any local user
+        # read web_down_since / last_flush_reason. The directory's setgid bit
+        # gives the file group `sentinel` for free; this only tightens the
+        # permission bits so the selfcheck (which runs as `sentinel`) can read
+        # it and nobody else can.
+        STATE_FILE.chmod(0o640)
     except OSError as exc:
         log("warning", "could not persist watchdog state", detail=str(exc))
 

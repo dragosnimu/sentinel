@@ -211,6 +211,7 @@ Rulează automat la 5 minute și la 90 de secunde după boot. Alertează pe Tele
 | Grup | Ce dovedește |
 |---|---|
 | `unit:*` | Procesul există. Cea mai slabă dovadă din listă, și e prima doar fiindcă e cea așteptată |
+| `watchdog:state` | Watchdog-ul anti-lockout chiar își scrie starea, nu doar rulează. Fără ea, „web-ul e jos de câte secunde" repornește de la zero la fiecare minut și flush-ul de siguranță la 5 minute nu se poate declanșa niciodată — s-a întâmplat pe gazda de producție 4-7 septembrie 2026, cu timerul „activ" tot timpul |
 | `ingest:*` | Fiecare colector a scris un rând recent. **Asta prinde orbirea** |
 | `detect:cursor` | Detectorul consumă ce scriu colectorii. Ingestia într-o tabelă pe care n-o citește nimeni e o imitație convingătoare de funcționare |
 | `nft:table`, `nft:count` | Kernelul chiar are tabela, iar baza spune același lucru ca el |
@@ -219,6 +220,23 @@ Rulează automat la 5 minute și la 90 de secunde după boot. Alertează pe Tele
 | `alert:telegram` | Canalul care duce toate celelalte alerte chiar livrează |
 | `identity:instance` | Gazda mai are identitatea cu care a fost instalată — vezi §12 |
 | `db:*`, `res:*` | Fundațiile: bază accesibilă, schemă la zi, disc și memorie |
+
+**Dacă `watchdog:state` se aprinde:** de obicei directorul de stare
+(`/var/lib/sentinel-watchdog` — deliberat NU sub `/var/lib/sentinel`, care e
+0750 sentinel:sentinel și pe care root, fără CAP_DAC_OVERRIDE, nu-l poate nici
+traversa) lipsește sau are proprietarul greșit — pasul de instalare care îl
+creează n-a rulat pe gazda asta. `journalctl -u sentinel-watchdog -n 20` arată
+eroarea exactă; dacă e „Permission denied", rulează `systemd-tmpfiles --create
+/usr/lib/tmpfiles.d/sentinel.conf` și repetă verificarea. Cât timp constatarea
+e roșie, watchdog-ul rulează, dar nu-și amintește nimic între rulări —
+flush-ul de siguranță pentru un dashboard picat nu se poate declanșa, deci nu
+te baza pe el să te scoată dintr-un blocaj.
+
+Imediat după un reboot, `watchdog:state` poate arăta `unknown` („încă în
+fereastra de pornire") câteva minute în loc de `down`, chiar dacă fișierul de
+stare e vechi de ore — ambele timere pornesc la `OnBootSec=90`, iar watchdog-ul
+poate să nu fi apucat prima rulare. E de așteptat; dacă rămâne așa mult peste
+câteva minute, constatarea devine `down` și atunci chiar e o problemă.
 
 ### O sursă tăcută nu e mereu un defect
 

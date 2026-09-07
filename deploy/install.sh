@@ -520,8 +520,7 @@ step_user_and_dirs() {
     install -d -m 0700 -o root -g root                          "$SENTINEL_BACKUP_DIR"
     install -d -m 0755 -o "$SENTINEL_USER" -g "$SENTINEL_USER"  "$SENTINEL_PREFIX/claude-workspace"
 
-    install -D -m 0644 "${SCRIPT_DIR}/tmpfiles/sentinel.conf" /usr/lib/tmpfiles.d/sentinel.conf
-    systemd-tmpfiles --create /usr/lib/tmpfiles.d/sentinel.conf
+    ensure_tmpfiles_applied
 
     # Read-only access to logs the collectors tail. Group membership rather than
     # a sudo rule: the collectors never need to run anything privileged.
@@ -531,6 +530,31 @@ step_user_and_dirs() {
     # The docker group is deliberately NOT granted here — see
     # `ensure_docker_access` below. This step is marker-gated, and docker can
     # appear on a host long after the day it was installed.
+}
+
+# Necondiționat, la fiecare rulare — NU un pas, exact ca `resolve_config` și
+# `ensure_instance_id` mai jos. `deploy/tmpfiles/sentinel.conf` poartă conținut
+# de repo, care se schimbă între versiuni — vezi linia directorului
+# watchdog-ului, adăugată pe 7 septembrie 2026, mult după ce pasul 19 era demult
+# marcat făcut pe gazda de producție. Fără reaplicare necondiționată, o gazdă
+# existentă n-ar primi niciodată linia nouă, `sentinel-watchdog.service` ar găsi
+# directorul lipsă la nesfârșit, iar flush-ul anti-lockout pentru un dashboard
+# picat n-ar mai putea porni vreodată — exact bug-ul care a produs funcția asta.
+#
+# De ce nu în `ALWAYS_STEPS`: ar reface și restul pasului 19 (creare user/grup,
+# `install -d` pe tot arborele /opt/sentinel) la fiecare deploy, nu doar partea
+# care chiar are nevoie de asta. De ce nu un pas numerotat nou: ar muta numerele
+# tuturor pașilor de după el, adică ar invalida fiecare `--force-step N` din
+# documentație și din istoricul comenzilor operatorului — motivul exact scris
+# la `ensure_instance_id`.
+#
+# Sigur de rulat oricând: `systemd-tmpfiles --create` pe o linie `d` ajustează
+# proprietarul și modul unui director EXISTENT la valorile declarate — de asta
+# se rulează la fiecare boot pentru /run — deci o gazdă unde directorul a fost
+# creat greșit de o rulare veche se corectează, nu doar una unde lipsește.
+ensure_tmpfiles_applied() {
+    install -D -m 0644 "${SCRIPT_DIR}/tmpfiles/sentinel.conf" /usr/lib/tmpfiles.d/sentinel.conf
+    systemd-tmpfiles --create /usr/lib/tmpfiles.d/sentinel.conf
 }
 
 # ---------------------------------------------------------------------------
@@ -4564,6 +4588,10 @@ main() {
 
     run_step 18 snapshot          step_snapshot
     run_step 19 user_and_dirs     step_user_and_dirs
+
+    # Necondiționat — vezi comentariul de la definiția funcției, lângă
+    # `step_user_and_dirs`.
+    ensure_tmpfiles_applied
 
     # Necondiționat, la fiecare rulare — NU un pas, exact ca `resolve_config` și
     # `ensure_instance_id`. Motivele, pe larg, la definiția funcției: pasul 26

@@ -1685,6 +1685,191 @@ def test_a_timer_whose_state_cannot_be_read_stays_on_the_list(monkeypatch):
     assert "nu am putut citi" in results[0].detail
 
 
+# --- watchdog:state -----------------------------------------------------
+#
+# `check_timers` above proves the timer keeps firing — it said "active"
+# throughout the real outage this exists for. Measured on production,
+# 4-7 September 2026: sentinel-watchdog.service ran every minute, the timer
+# stayed active, and `save_state` still failed on every single pass because
+# root had no write access into the state directory. Nothing here asked
+# whether the state actually got written.
+def test_uptime_seconds_reads_the_first_column_of_proc_uptime(monkeypatch):
+    """Every test in this file that touches the boot-grace branch monkeypatches
+    `_uptime_seconds()` itself, so a defect in its own body — reading the
+    wrong column of `/proc/uptime` (column 1 is uptime, column 2 is idle
+    time), or the wrong index entirely — would pass every one of them
+    untouched. This is the one test against the function's real body: a fake
+    two-column `/proc/uptime` line, asserting the value returned is uptime,
+    not idle time."""
+    import builtins
+    import io
+
+    real_open = builtins.open
+
+    def _fake_open(path, *a, **k):
+        if str(path) == "/proc/uptime":
+            return io.StringIO("13291.52 26000.10\n")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", _fake_open)
+
+    assert checks._uptime_seconds() == 13291.52
+
+
+def test_watchdog_state_ok_when_fresh(tmp_path, monkeypatch):
+    """A state file the watchdog just wrote must read back healthy — this is
+    what a working anti-lockout deadman looks like from the outside."""
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "active")
+    state = tmp_path / "state.json"
+    state.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(checks, "WATCHDOG_STATE_PATH", state)
+
+    result = run(checks.check_watchdog_state())[0]
+    assert result.status == "ok"
+
+
+def test_watchdog_state_down_when_stale(tmp_path, monkeypatch):
+    """A state file that has stopped changing while the timer keeps firing
+    every 60s means `save_state` is failing on every run — the exact
+    production defect, where the journal warning scrolled by for three days
+    unread and nothing on the panel said so."""
+    import os as _os
+    import time as _time
+
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "active")
+    # A long-booted host: rules out the boot-grace branch below so this test
+    # is exercising the ordinary staleness path, not a coincidence of
+    # whatever uptime the machine running the suite happens to have.
+    monkeypatch.setattr(checks, "_uptime_seconds", lambda: 999_999.0)
+    state = tmp_path / "state.json"
+    state.write_text("{}", encoding="utf-8")
+    old = _time.time() - (checks.WATCHDOG_STATE_STALE_AFTER_MIN + 20) * 60
+    _os.utime(state, (old, old))
+    monkeypatch.setattr(checks, "WATCHDOG_STATE_PATH", state)
+
+    result = run(checks.check_watchdog_state())[0]
+    assert result.status == "down"
+    assert "sentinel-watchdog" in result.action
+
+
+def test_watchdog_state_down_when_missing_but_timer_active(tmp_path, monkeypatch):
+    """A missing state file while the timer is active is the literal
+    production shape: the installer's tmpfiles step never created (or never
+    re-created, on an upgraded host) the directory root needs to write into."""
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "active")
+    monkeypatch.setattr(checks, "_uptime_seconds", lambda: 999_999.0)
+    monkeypatch.setattr(checks, "WATCHDOG_STATE_PATH", tmp_path / "missing" / "state.json")
+
+    result = run(checks.check_watchdog_state())[0]
+    assert result.status == "down"
+    assert "tmpfiles" in result.action
+
+
+def test_watchdog_state_says_nothing_when_the_timer_is_not_active(tmp_path, monkeypatch):
+    """An uninstalled, stopped, or failed watchdog timer already has its own
+    finding under `timer:sentinel-watchdog.timer` (`check_timers`, which reads
+    the same `is-active` this check does) — this check has nothing to add
+    about a unit that is not currently running, and must not invent a second,
+    confusingly-worded alarm about a directory that was never going to be
+    written to anyway.
+
+    Falsifies the old `is-enabled` check: an operator can deliberately stop
+    the timer (`systemctl stop sentinel-watchdog.timer`) while leaving it
+    enabled for the next boot. `is-enabled` would still answer "enabled" and
+    this check would report a misleading "directory probably not writable"
+    for a watchdog that is simply not running right now on purpose.
+    """
+    def _fake_systemctl(*args):
+        if args[0] == "is-enabled":
+            return "enabled"
+        if args[0] == "is-active":
+            return "inactive"
+        return ""
+
+    monkeypatch.setattr(checks, "_systemctl", _fake_systemctl)
+    monkeypatch.setattr(checks, "WATCHDOG_STATE_PATH", tmp_path / "missing" / "state.json")
+
+    assert run(checks.check_watchdog_state()) == []
+
+
+def test_watchdog_state_unknown_when_systemctl_does_not_answer(monkeypatch):
+    """`systemctl` answering nothing is not evidence the watchdog is fine —
+    the same discrimination `check_timers` already makes for this exact unit."""
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "")
+
+    result = run(checks.check_watchdog_state())[0]
+    assert result.status == "unknown"
+
+
+def test_watchdog_state_path_is_read_from_the_watchdog_module_not_duplicated():
+    """A path copied here by hand could drift from `watchdog.py`'s own
+    default and nobody would notice until a real deploy disagreed with
+    itself — the check would watch a file the watchdog never writes."""
+    from pathlib import Path
+
+    from sentinel.respond import watchdog
+
+    assert checks.WATCHDOG_STATE_PATH == Path(watchdog._DEFAULT_STATE_FILE)
+
+
+def test_watchdog_state_registered_in_the_run():
+    """O verificare care nu e în `CHECKS` nu rulează niciodată — vezi
+    `test_the_history_check_is_registered_in_the_run` pentru precedent.
+    Fără ea, `check_watchdog_state` poate rămâne corect și testat, dar
+    `sentinel selfcheck` nu-l cheamă niciodată, iar panoul nu vede tăcerea
+    watchdog-ului nici măcar o dată."""
+    assert "watchdog_state" in [nume for nume, _ in checks.CHECKS]
+
+
+def test_watchdog_state_stays_unknown_freshly_after_boot_even_when_stale(tmp_path, monkeypatch):
+    """A reboot after any downtime longer than the stale threshold leaves a
+    state file that is genuinely old (from before the host went down) at the
+    exact moment the first post-boot selfcheck runs — both timers share
+    `OnBootSec=90`, so the watchdog may not have written yet. Reporting `down`
+    here means every reboot pages the operator with a false alarm immediately
+    followed by a recovery. Falsify by deleting the uptime read: the stale
+    branch alone (proven by `test_watchdog_state_down_when_stale`) would fire
+    unconditionally and this test would go red."""
+    import os as _os
+    import time as _time
+
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "active")
+    monkeypatch.setattr(checks, "_uptime_seconds", lambda: 45.0)  # well before OnBootSec=90
+    state = tmp_path / "state.json"
+    state.write_text("{}", encoding="utf-8")
+    old = _time.time() - 3 * 60 * 60  # 3 hours old: from before a long downtime
+    _os.utime(state, (old, old))
+    monkeypatch.setattr(checks, "WATCHDOG_STATE_PATH", state)
+
+    result = run(checks.check_watchdog_state())[0]
+    assert result.status != "down", (
+        "a stale state file within the post-boot grace window must not page "
+        "the operator — the watchdog simply has not run yet"
+    )
+
+
+def test_watchdog_state_reports_down_once_past_the_boot_grace(tmp_path, monkeypatch):
+    """The other half of the grace window: once the host has been up long
+    enough that the watchdog has certainly had its chance to run
+    (`WATCHDOG_STATE_STALE_AFTER_MIN + WATCHDOG_BOOT_GRACE_MIN` minutes), a
+    stale file is a real fault again — the grace window must not swallow the
+    production defect it exists next to."""
+    import os as _os
+    import time as _time
+
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "active")
+    grace_s = (checks.WATCHDOG_STATE_STALE_AFTER_MIN + checks.WATCHDOG_BOOT_GRACE_MIN) * 60
+    monkeypatch.setattr(checks, "_uptime_seconds", lambda: grace_s + 60)
+    state = tmp_path / "state.json"
+    state.write_text("{}", encoding="utf-8")
+    old = _time.time() - (checks.WATCHDOG_STATE_STALE_AFTER_MIN + 20) * 60
+    _os.utime(state, (old, old))
+    monkeypatch.setattr(checks, "WATCHDOG_STATE_PATH", state)
+
+    result = run(checks.check_watchdog_state())[0]
+    assert result.status == "down"
+
+
 # --- the unit ---------------------------------------------------------------
 def test_the_timer_starts_soon_after_boot():
     """Both real outages were post-reboot states. Waiting five minutes to learn

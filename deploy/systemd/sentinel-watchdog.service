@@ -34,7 +34,14 @@ NoNewPrivileges=false
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/var/lib/sentinel /etc/sentinel
+# The leading `-` on sentinel-watchdog is load-bearing, not decorative:
+# without it, systemd 252 refuses to even START this unit when the directory
+# is absent ("Failed at step NAMESPACE ... No such file or directory"), which
+# turns the one component that must survive everything else failing into one
+# that cannot survive its own tmpfiles step not having run yet. The `-`
+# makes a missing directory something `save_state()` reports as a warning
+# instead — the state is optional, the flush is not.
+ReadWritePaths=/var/lib/sentinel -/var/lib/sentinel-watchdog /etc/sentinel
 RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
 IPAddressAllow=localhost
 IPAddressDeny=any
