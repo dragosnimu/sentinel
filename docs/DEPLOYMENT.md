@@ -145,9 +145,22 @@ Preflight verifică întâi că portul cerut e liber și raportează ce deține 
 | RAM disponibil | ≥ 2,5 GB | Sub 2,5 GB → Suricata e sărită (mod log-only, în continuare util). **Sub 1,5 GB → abort**: OOM killer-ul alege cel mai mare proces, de obicei aplicația ta |
 | Disc liber | ≥ 10 GB pe `/`, ≥ 8 GB pe `/var` | Preflight oprește |
 | Portul public al panoului | liber (implicit 8443) | Preflight oprește |
-| `firewalld` | inactiv | Preflight oprește (poți forța cu `--allow-firewalld`) |
+| `firewalld` | inactiv, sau cu portul permis | Preflight oprește (poți forța cu `--allow-firewalld`) |
+| `ufw` (Debian/Ubuntu) | inactiv, sau cu portul permis | Preflight oprește (poți forța cu `--allow-ufw`) |
 | Servicii existente | funcționale | Preflight le înregistrează; instalarea face rollback automat dacă vreunul se oprește |
 | sudo | funcțional | Ți se cere parola o dată |
+
+**`--allow-ufw` și `--allow-firewalld`** nu deschid nimic — doar spun preflight-ului
+că știi ce faci și lași verificarea să treacă mai departe. Alegerea corectă
+depinde de cum ajungi la panou: dacă vrei portul deschis către internet,
+deschide-l tu (`sudo ufw allow 8443/tcp`) și n-ai nevoie de steag. Dacă
+panoul e gândit să fie accesat DOAR printr-un tunel ssh (`ssh -L
+8443:127.0.0.1:8443 ...`), portul public trebuie să RĂMÂNĂ închis — și atunci
+steagul e răspunsul corect, nu o gaură lăsată deschisă: firewall-ul își face
+treaba lui mai departe, doar preflight-ul nu mai insistă să vadă o regulă care
+n-ar trebui să existe. Ambele steaguri sunt transmise de `scripts/deploy.sh` și
+`scripts/deploy.ps1` atât către verificarea `--dry-run`, cât și către
+`install.sh`.
 
 **O distribuție nesuportată e refuzată, nu instalată pe jumătate.** O mașină
 care *pare* protejată și nu e, e mai rea decât una la care instalarea a eșuat

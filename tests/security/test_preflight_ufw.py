@@ -242,3 +242,138 @@ def test_the_installer_can_pass_the_escape_hatch_through(tmp_path):
     install = (REPO / "deploy" / "install.sh").read_text(encoding="utf-8")
     assert "--allow-ufw)" in install
     assert "export ALLOW_UFW=1" in install
+
+
+# ---------------------------------------------------------------------------
+# --allow-ufw ca ARGUMENT de linie de comandă, nu doar ca variabilă de mediu
+# deja setată.
+#
+# Testele de mai sus, cu `allow_ufw="1"` trecut prin ALLOW_UFW în mediu,
+# acoperă drumul pe care îl folosește install.sh (exportă variabila înainte
+# să cheme acest script, în același proces shell). Măsurat pe gazda a doua
+# (7 sep 2026): scripts/deploy.sh și scripts/deploy.ps1 rulează preflight-ul
+# de sine stătător, pe --dry-run, printr-un `sudo` NOU — care nu moștenește
+# o variabilă de shell, doar argumentele. Un preflight.sh care citește doar
+# ALLOW_UFW din mediu ar accepta steagul pe hârtie (--help l-ar lista) și l-ar
+# ignora tăcut pe singurul drum prin care un operator îl poate folosi de fapt.
+# ---------------------------------------------------------------------------
+def _arg_parse_block() -> str:
+    """Bucla `while [[ $# -gt 0 ]]; do ... done` de parsare a argumentelor,
+    octeții livrați. Extrasă separat de `_ufw_block()`, ca să poată fi rulată
+    ÎNAINTE de el, cu argumente reale în `$@` — exact ordinea în care rulează
+    scriptul livrat."""
+    lines = PREFLIGHT.splitlines()
+    start = next(i for i, l in enumerate(lines)
+                 if l.strip() == "while [[ $# -gt 0 ]]; do")
+    end = next(i for i in range(start + 1, len(lines)) if lines[i] == "done")
+    block = "\n".join(lines[start:end + 1])
+    assert "--allow-ufw" in block, "extragerea a ratat parsarea --allow-ufw"
+    assert "--allow-firewalld" in block
+    return block + "\n"
+
+
+def _run_cli(tmp_path: Path, *, status: str | None, cli_args: str,
+            port: str = "8443", mode: str = "dedicated") -> tuple[int, int, str]:
+    """La fel ca `_run`, dar consimțământul vine dintr-un argument de linie de
+    comandă parsat de bucla livrată (`$@`), nu dintr-o variabilă de mediu
+    pre-setată de test."""
+    binpath = tmp_path / "bin"
+    binpath.mkdir(exist_ok=True)
+    fixture = tmp_path / "ufw-status.txt"
+    fixture.write_text(status or "", encoding="utf-8", newline="\n")
+    body = ("exit 1\n" if status is None
+            else f'cat "{str(fixture).replace(chr(92), "/")}"\n')
+    stub = binpath / "ufw"
+    stub.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8", newline="\n")
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    script = tmp_path / "harness.sh"
+    script.write_text(
+        "set -euo pipefail\n"
+        "source ./lib/common.sh\n"
+        'DOMAIN=""\n'
+        f'NGINX_MODE="{mode}"\n'
+        'ADMIN_IP=""\n'
+        f'SENTINEL_PUBLIC_PORT="{port}"\n'
+        f'set -- {cli_args}\n'
+        + _arg_parse_block()
+        + _ufw_block()
+        + 'printf "COUNTS %d %d\\n" "$FAIL_COUNT" "$WARN_COUNT"\n',
+        encoding="utf-8", newline="\n")
+
+    env = {**os.environ, "NO_COLOR": "1",
+           "PATH": str(binpath).replace("\\", "/") + os.pathsep + os.environ.get("PATH", "")}
+    proc = subprocess.run([BASH, str(script).replace("\\", "/")],
+                          cwd=REPO / "deploy", capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", env=env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    counts = next(l for l in proc.stdout.splitlines() if l.startswith("COUNTS"))
+    _, fails, warns = counts.split()
+    return int(fails), int(warns), proc.stdout + proc.stderr
+
+
+def test_the_allow_ufw_flag_is_reachable_from_the_command_line(tmp_path):
+    """Defectul măsurat pe gazda a doua: `--allow-ufw` exista în `--help` și
+    era ignorat pe singurul drum prin care scripts/deploy.sh și deploy.ps1 îl
+    pot transmite — un `sudo` nou, care nu moștenește ALLOW_UFW din mediu."""
+    fails, warns, out = _run_cli(tmp_path, status=UFW_ACTIVE_ONLY_SSH,
+                                 cli_args="--allow-ufw")
+    assert fails == 0, out
+    assert warns > 0, out
+    assert "ufw allow 8443/tcp" in out
+
+
+def test_without_the_cli_flag_an_active_ufw_still_blocks(tmp_path):
+    """Comportamentul de azi, neschimbat: fără steag, un ufw activ care nu
+    permite portul tot oprește deploy-ul — altfel steagul ar deveni implicit."""
+    fails, _, out = _run_cli(tmp_path, status=UFW_ACTIVE_ONLY_SSH, cli_args="")
+    assert fails > 0, out
+
+
+def test_the_web_port_flag_and_the_allow_ufw_flag_compose(tmp_path):
+    """Ambele argumente vin din același `$@` — `--web-port` trebuie să
+    schimbe și portul verificat de ramura ufw când `--allow-ufw` e prezent
+    tot acolo, nu doar când e singurul argument."""
+    fails, warns, out = _run_cli(
+        tmp_path, status=UFW_ACTIVE_ONLY_SSH,
+        cli_args="--web-port 9443 --nginx-mode dedicated --allow-ufw",
+        port="9443")
+    assert fails == 0, out
+    assert warns > 0, out
+    assert "9443/tcp" in out
+
+
+# ---------------------------------------------------------------------------
+# `bash deploy/preflight.sh --help` chiar arată steagul, nu doar acceptă
+# argumentul.
+#
+# Măsurat înainte de reparație: `--help` tipărea un interval fix `sed -n
+# '2,15p'`, scris când singurele argumente erau --domain și --web-port —
+# `--admin-ip`, `--allow-ufw` și `--allow-firewalld` au fost adăugate mai
+# târziu fără să mute intervalul. Un operator care rulează `--help` ca să
+# afle ce poate transmite prin `scripts/deploy.sh` nu vedea niciunul dintre
+# cele trei. Aceeași precauție ca `test_help_still_prints_the_flags_it_documents`
+# din tests/unit/test_force_step_list.py, pentru install.sh.
+# ---------------------------------------------------------------------------
+def test_help_output_actually_shows_the_new_flags():
+    """Dacă intervalul `sed -n 'N,Mp'` din antet redevine prea îngust — de
+    exemplu fiindcă un paragraf nou a fost adăugat deasupra fără să mute M —
+    `--help` ar tăcea din nou despre `--admin-ip`/`--allow-ufw`/
+    `--allow-firewalld`, exact cum a tăcut prima dată.
+
+    Cele trei nume apar deja în linia de sinopsis de sus (`[--allow-ufw]
+    [--allow-firewalld]`), care intra oricum în vechiul interval `2,15p` —
+    deci o simplă căutare a numelor n-ar fi picat la vechea tăiere. Ce nu
+    intra în vechiul interval e explicația de la `--allow-firewalld`, ultima
+    linie din bloc; aceea e ce dovedește că intervalul chiar a fost mutat, nu
+    doar că cele trei nume există undeva mai sus."""
+    import re
+    match = re.search(r"--help\|-h\)\s*sed -n '(\d+),(\d+)p'", PREFLIGHT)
+    assert match, "handler-ul --help nu mai e un interval sed peste antet"
+    first, last = int(match.group(1)), int(match.group(2))
+    shown = "\n".join(PREFLIGHT.splitlines()[first - 1:last])
+    assert "--admin-ip" in shown
+    assert "--allow-ufw" in shown
+    assert "--allow-firewalld" in shown
+    assert "same consent, for firewalld." in shown, \
+        "intervalul e prea scurt — taie explicația lui --allow-firewalld"

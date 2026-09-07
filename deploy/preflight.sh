@@ -6,7 +6,17 @@
 # `scripts/deploy.sh --dry-run`.
 #
 #   ./preflight.sh [--domain sentinel.exemplu.ro] [--web-port 8443]
-#                  [--nginx-mode dedicated|shared]
+#                  [--nginx-mode dedicated|shared] [--admin-ip A.B.C.D]
+#                  [--allow-ufw] [--allow-firewalld]
+#
+#   --admin-ip A.B.C.D  the operator's address, captured before sudo strips
+#                       SSH_CLIENT. Passed by the deploy wrapper; harmless to
+#                       set by hand.
+#   --allow-ufw         ufw is active with no rule for the public port: proceed
+#                       anyway. Right when the port will be opened right after,
+#                       or when the dashboard is meant to stay reachable only
+#                       through an ssh tunnel and the port SHOULD stay closed.
+#   --allow-firewalld   same consent, for firewalld.
 #
 # Exit codes:
 #   0  clear to deploy
@@ -31,10 +41,23 @@ while [[ $# -gt 0 ]]; do
         # by the time this script runs the variable is gone and the peer looks
         # local. The deploy wrapper reads it over a plain SSH call and passes it in.
         --admin-ip) ADMIN_IP="${2:-}"; shift 2 ;;
-        --help|-h)  sed -n '2,15p' "$0"; exit 0 ;;
+        # install.sh has always set these as exported env vars before calling
+        # this script (they must keep working that way — install.sh:330 calls
+        # preflight with no flags at all and relies on the export). The flags
+        # exist for the OTHER caller: scripts/deploy.sh's standalone --dry-run
+        # invokes this script over a fresh sudo session, which does not inherit
+        # a shell variable — only an argument survives that hop.
+        --allow-ufw)       ALLOW_UFW=1; shift ;;
+        --allow-firewalld) ALLOW_FIREWALLD=1; shift ;;
+        --help|-h)  sed -n '2,24p' "$0"; exit 0 ;;
         *) die "unknown argument: $1" ;;
     esac
 done
+
+# Where install.sh writes Sentinel's own vhost in dedicated mode (see
+# step_nginx in deploy/install.sh, around `local conf=/etc/nginx/conf.d/sentinel.conf`).
+# Overridable so a test can point it at a fixture instead of a real path.
+SENTINEL_VHOST_CONF="${SENTINEL_VHOST_CONF:-/etc/nginx/conf.d/sentinel.conf}"
 
 case "$NGINX_MODE" in
     dedicated) ;;
@@ -158,6 +181,34 @@ PostgreSQL (unit: ${unit:-unknown}) — most likely something published from a \
 container. Sentinel's own PostgreSQL cluster will be moved to a free port \
 automatically; the installer will not connect to whatever this is."
             fi
+        elif [[ "$port" == "$SENTINEL_PUBLIC_PORT" && "$unit" == "nginx.service" ]] && \
+             [[ -r "$SENTINEL_VHOST_CONF" ]] && \
+             grep -qE '^[[:space:]]*listen[[:space:]]+([0-9.]+:|\[::\]:)?'"${port}"'([^0-9]|$)' \
+                 "$SENTINEL_VHOST_CONF"; then
+            # Same upgrade problem as the sentinel-* branch below, one layer
+            # down: in --nginx-mode dedicated the public port is held by
+            # nginx.service, not by a sentinel-* unit, because nginx is what
+            # actually listens — Sentinel's dashboard is proxied behind it on
+            # 127.0.0.1:8787. Without this, every dedicated-mode upgrade told
+            # the operator to stop Sentinel's own nginx vhost in order to
+            # redeploy Sentinel. Checked against the vhost FILE (not just "is
+            # nginx running"), so a stranger's site on the same port still
+            # falls through to the generic `fail` below. A containerised nginx
+            # (docker/podman) reports an EMPTY unit here — port_owner_unit
+            # cannot name a unit for a PID in a container's own cgroup — so it
+            # never satisfies "$unit" == "nginx.service" and falls through to
+            # `fail` too; that is closed on purpose, not a gap this misses.
+            #
+            # A single anchored `grep -qE` straight on the file, not a
+            # `grep -v '^[[:space:]]*#' | grep -qE '^...'` pipeline: the first
+            # stage was dead (the second regex already anchors to line start,
+            # so it never matches inside a comment either way) and, worse,
+            # under `set -o pipefail` a `grep -v` that finds nothing to filter
+            # on a large enough vhost dies of SIGPIPE (128+13=141) the moment
+            # the second grep is satisfied and closes its end of the pipe
+            # early — which `[[ ... ]] && ... && grep ...; then` would read as
+            # "false" and re-block the exact upgrade this branch exists for.
+            ok "port ${port} held by nginx serving Sentinel's own vhost (${SENTINEL_VHOST_CONF}) — the running Sentinel; the installer rewrites it and reloads"
         elif [[ "$unit" == sentinel-* ]]; then
             # Preflight has to run identically on a first install and on an
             # upgrade. On an upgrade the port is held by the previous version of
@@ -298,9 +349,13 @@ fi
 #     N` shows up as an ALLOW line just like a global one — so an operator who
 #     does not want the port open to the internet is not blocked by it.
 #
-# The escape hatch is --allow-ufw, which mirrors --allow-firewalld. Note that
-# scripts/deploy.sh forwards NEITHER flag: through that path the way past this
-# check is to open the port, which is also the right thing to do.
+# The escape hatch is --allow-ufw, which mirrors --allow-firewalld. Both flags
+# reach this script two ways: install.sh exports ALLOW_UFW=1 / ALLOW_FIREWALLD=1
+# and never passes the flag itself (its own call at install.sh:330 has none —
+# the exported variable is enough, because it runs in the same shell tree);
+# scripts/deploy.sh and scripts/deploy.ps1 forward the literal flag on their
+# standalone --dry-run preflight call, because that call goes through a fresh
+# `sudo`, which does not inherit a shell variable.
 if have ufw; then
     ufw_state="$(ufw status verbose 2>/dev/null || true)"
     if [[ -z "$ufw_state" ]]; then
@@ -330,7 +385,9 @@ nftables table cannot undo that — netfilter runs every chain on the hook and a
 so the install would report success at every step and the dashboard would answer nothing."
         fail "Open it first:            sudo ufw allow ${SENTINEL_PUBLIC_PORT}/tcp"
         fail "Or, only for your address: sudo ufw allow from <your-ip> to any port ${SENTINEL_PUBLIC_PORT} proto tcp"
-        fail "Or re-run with --allow-ufw if you will open it yourself afterwards."
+        fail "Or re-run with --allow-ufw if you will open it yourself afterwards — or if the \
+dashboard is meant to be reached only through an ssh tunnel, in which case the port SHOULD \
+stay closed and this is the right answer, not a workaround."
     fi
 fi
 

@@ -120,6 +120,16 @@
     four forms -ForceStep accepts). Any changed key not in the list is still
     gated — interactively, or refused outright under -AssumeYes.
 
+.PARAMETER AllowUfw
+    ufw is active on the server with no rule for -WebPort: forward consent to
+    preflight and to install.sh so the run proceeds anyway. Right either when
+    you will open the port yourself right after, or when the dashboard is
+    meant to be reached ONLY through an ssh tunnel and the port should stay
+    closed — see docs/DEPLOYMENT.md §2.1.
+
+.PARAMETER AllowFirewalld
+    Same consent as -AllowUfw, for firewalld.
+
 .EXAMPLE
     .\scripts\deploy.ps1 -HostName 203.0.113.10 `
         -Domain sentinel.exemplu.ro -DryRun
@@ -171,6 +181,8 @@ param(
     [string]$Secrets,
     [switch]$AllowRotation,
     [string[]]$AllowRotationKeys,
+    [switch]$AllowUfw,
+    [switch]$AllowFirewalld,
     [switch]$DryRun,
     [switch]$Rollback,
     [switch]$Purge,
@@ -310,7 +322,11 @@ $target = "$User@$HostName"
 # subexpression does not parse on PowerShell 5.1.
 $keyArg    = ''
 if ($Key) { $keyArg = " -Key `"$Key`"" }
-$resumeCmd = ".\scripts\deploy.ps1 -HostName $HostName -User $User$keyArg"
+$ufwResumeArg = ''
+if ($AllowUfw) { $ufwResumeArg = ' -AllowUfw' }
+$firewalldResumeArg = ''
+if ($AllowFirewalld) { $firewalldResumeArg = ' -AllowFirewalld' }
+$resumeCmd = ".\scripts\deploy.ps1 -HostName $HostName -User $User$keyArg$ufwResumeArg$firewalldResumeArg"
 
 # Three helpers, not one, because "return the exit code", "let the operator
 # watch and type a password" and "return the output" cannot all be done by
@@ -820,7 +836,9 @@ if ($DryRun) {
     Write-Info 'preflight only — nothing on the server will be changed'
     $domainArg = if ($Domain) { "--domain '$Domain'" } else { '' }
     $adminArg  = if ($AdminIp) { "--admin-ip '$AdminIp'" } else { '' }
-    Invoke-SshLive -Tty -Command "sudo '$remoteDir/deploy/preflight.sh' $domainArg --web-port $WebPort --nginx-mode $NginxMode $adminArg"
+    $ufwArg    = if ($AllowUfw) { '--allow-ufw' } else { '' }
+    $firewalldArg = if ($AllowFirewalld) { '--allow-firewalld' } else { '' }
+    Invoke-SshLive -Tty -Command "sudo '$remoteDir/deploy/preflight.sh' $domainArg --web-port $WebPort --nginx-mode $NginxMode $adminArg $ufwArg $firewalldArg"
     $rc = $LASTEXITCODE
     Test-Ssh -Command "rm -rf '$remoteDir'" | Out-Null
     exit $rc
@@ -864,6 +882,8 @@ if ($Email)    { $installArgs += "--email '$Email'" }
 if ($DbPort)   { $installArgs += "--db-port $DbPort" }
 if ($FromStep) { $installArgs += "--from-step $FromStep" }
 if ($forceStepList) { $installArgs += "--force-step $forceStepList" }
+if ($AllowUfw) { $installArgs += '--allow-ufw' }
+if ($AllowFirewalld) { $installArgs += '--allow-firewalld' }
 
 Write-Info 'installing (secrets go over stdin, never argv)'
 

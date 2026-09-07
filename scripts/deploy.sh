@@ -62,6 +62,14 @@
 #                  value" from "the next flag" apart — so a per-key rotation
 #                  uses this separate flag instead.
 #   --purge        with --rollback, also drop the database
+#   --allow-ufw    ufw is active on the server with no rule for --web-port:
+#                  forward consent to preflight and to install.sh so the run
+#                  proceeds anyway. The right answer either when you will open
+#                  the port yourself right after, or when the dashboard is
+#                  meant to be reached ONLY through an ssh tunnel and the port
+#                  should stay closed — see docs/DEPLOYMENT.md §2.1.
+#   --allow-firewalld
+#                  same consent, for firewalld.
 #
 # This script is deliberately thin. All the real logic lives in
 # deploy/install.sh on the server, so there is one implementation to test and
@@ -123,6 +131,10 @@ USER="$DEPLOY_USER_DEFAULT"
 # are wrong".
 DEPLOY_KEY_DEFAULT="${HOME}/.ssh/sentinel_deploy"
 DRY_RUN=0; ROLLBACK=0; PURGE=0; FROM_STEP=""; FORCE_STEP=""; ASSUME_YES=0
+# Empty means "not given" (like DOMAIN/ADMIN_IP above), not "false" — a plain
+# 0/1 would need its own truthiness check at every use site instead of the
+# ${VAR:+...}/[[ -n ]] pattern the rest of this script already uses.
+ALLOW_UFW=""; ALLOW_FIREWALLD=""
 SSH_PORT=22
 # The dashboard's public HTTPS port. Not 443 — this host serves something else
 # there. Must also be open in the provider's firewall.
@@ -199,6 +211,8 @@ while [[ $# -gt 0 ]]; do
         --dry-run)   DRY_RUN=1; shift ;;
         --rollback)  ROLLBACK=1; shift ;;
         --purge)     PURGE=1; shift ;;
+        --allow-ufw)       ALLOW_UFW=1; shift ;;
+        --allow-firewalld) ALLOW_FIREWALLD=1; shift ;;
         --yes|-y)    ASSUME_YES=1; shift ;;
         --help|-h)   usage ;;
         *) die "unknown argument: $1" ;;
@@ -748,7 +762,7 @@ ok "package extracted"
 if (( DRY_RUN )); then
     printf '\n'
     info "preflight only — nothing on the server will be changed"
-    ssh_sudo "'${REMOTE_DIR}/deploy/preflight.sh' ${DOMAIN:+--domain '${DOMAIN}'} --web-port '${WEB_PORT}' --nginx-mode '${NGINX_MODE}' ${ADMIN_IP:+--admin-ip '${ADMIN_IP}'}"
+    ssh_sudo "'${REMOTE_DIR}/deploy/preflight.sh' ${DOMAIN:+--domain '${DOMAIN}'} --web-port '${WEB_PORT}' --nginx-mode '${NGINX_MODE}' ${ADMIN_IP:+--admin-ip '${ADMIN_IP}'} ${ALLOW_UFW:+--allow-ufw} ${ALLOW_FIREWALLD:+--allow-firewalld}"
     rc=$?
     ssh_run "rm -rf '${REMOTE_DIR}'"
     exit $rc
@@ -800,6 +814,8 @@ INSTALL_ARGS=(--nginx-mode "$NGINX_MODE" --web-port "$WEB_PORT" --cert-mode "$CE
 [[ -n "$DB_PORT"   ]] && INSTALL_ARGS+=(--db-port "$DB_PORT")
 [[ -n "$FROM_STEP" ]] && INSTALL_ARGS+=(--from-step "$FROM_STEP")
 [[ -n "$FORCE_STEP" ]] && INSTALL_ARGS+=(--force-step "$FORCE_STEP")
+[[ -n "$ALLOW_UFW" ]] && INSTALL_ARGS+=(--allow-ufw)
+[[ -n "$ALLOW_FIREWALLD" ]] && INSTALL_ARGS+=(--allow-firewalld)
 (( ASSUME_YES )) && INSTALL_ARGS+=(--yes)
 
 if ! ssh "${SSH_OPTS[@]}" "${USER}@${HOST}" \
@@ -809,7 +825,7 @@ if ! ssh "${SSH_OPTS[@]}" "${USER}@${HOST}" \
     warn "installation failed"
     warn "The installer is step-numbered and idempotent. Fix the cause, then resume:"
     warn "    ./scripts/deploy.sh --host ${HOST} --user ${USER} ${KEY:+--key ${KEY}} \\"
-    warn "        ${DOMAIN:+--domain ${DOMAIN}} --from-step <N>"
+    warn "        ${DOMAIN:+--domain ${DOMAIN}} ${ALLOW_UFW:+--allow-ufw} ${ALLOW_FIREWALLD:+--allow-firewalld} --from-step <N>"
     warn "Or undo everything:"
     warn "    ./scripts/deploy.sh --host ${HOST} --user ${USER} ${KEY:+--key ${KEY}} --rollback"
     exit 1
