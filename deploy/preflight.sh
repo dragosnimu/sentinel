@@ -335,7 +335,22 @@ section "Rețea și acces"
 PEER="${ADMIN_IP:-$(ssh_peer_ip)}"
 [[ -z "$PEER" ]] && PEER="${SENTINEL_ADMIN_IP:-}"
 if [[ -n "$PEER" ]]; then
-    ok "admin address for the allowlist: ${PEER} — it goes in before any drop rule"
+    # Which SET it lands in, not just that it lands somewhere. On a host where
+    # every login arrives over IPv6 the operator needs to read "allowlist_v6"
+    # here, because that is the set that used to stay empty while this line
+    # still said the address was going in.
+    # `|| true` only because ip_family returns 1 on "invalid"; the word it
+    # printed is what the case below decides on.
+    PEER_FAMILY="$(ip_family "$PEER" || true)"
+    case "$PEER_FAMILY" in
+        v4) ok "admin address for the allowlist: ${PEER} (IPv4) — it goes into \
+allowlist_v4 before any drop rule" ;;
+        v6) ok "admin address for the allowlist: ${PEER} (IPv6) — it goes into \
+allowlist_v6 before any drop rule" ;;
+        *)  warn "admin address '${PEER}' is not an IP address or CIDR. The \
+installer will refuse it, so you would have NO allowlisted address of your own. \
+Re-run with --admin-ip <your-ip>." ;;
+    esac
 else
     warn "cannot determine your admin address. sudo strips SSH_CLIENT, so if you \
 ran this over plain SSH the wrapper should have passed --admin-ip. Set \

@@ -11,9 +11,12 @@ Testele care contează, și cum să le faci fără să te blochezi singur.
 1. **Două sesiuni SSH deschise**, una de pe **altă rețea** (hotspot mobil).
 2. **Acces la consola VPS de la provider — testat efectiv**, nu presupus.
 3. `touch /etc/sentinel/PANIC` repetat mental. Watchdog-ul golește în ≤60s.
-4. IP-ul tău verificat în allowlist:
+4. IP-ul tău verificat în allowlist, **în setul familiei lui**. Sunt două
+   seturi, iar dacă ajungi la server pe IPv6 `allowlist_v4` nu are cum să te
+   conțină — uită-te în amândouă:
    ```bash
    sudo nft list set inet sentinel allowlist_v4
+   sudo nft list set inet sentinel allowlist_v6
    ```
 5. **Niciodată nu testa brute-force de pe IP-ul de pe care administrezi.**
    Folosește un hotspot sau un al doilea VPS ieftin.
@@ -420,10 +423,11 @@ crăpat e o verificare stricată transformată într-un buletin de sănătate cu
 sudo nft delete table inet sentinel      # simulează repornirea
 sudo systemctl restart sentinel-executor
 sudo nft list set inet sentinel allowlist_v4
+sudo nft list set inet sentinel allowlist_v6
 ```
 
-Trece dacă: tabela e recreată, allowlistul e complet, și **adresa ta de
-administrare e în el**. Asta e invariantul anti-lockout; verifică-l cu ochii,
+Trece dacă: tabela e recreată, **ambele** allowlisturi sunt complete, și
+**adresa ta de administrare e în setul familiei ei**. Asta e invariantul anti-lockout; verifică-l cu ochii,
 nu presupune.
 
 ```bash

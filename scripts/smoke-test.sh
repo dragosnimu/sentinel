@@ -111,11 +111,78 @@ r() { ssh "${SSH_OPTS[@]}" "${USER}@${HOST}" "$@" 2>/dev/null; }
 #
 # Întoarce "?" când nft nu a răspuns deloc, ca apelantul să poată deosebi „setul
 # e gol" de „nu am putut citi". Confuzia dintre cele două a produs eșecul fals.
+#
+# `|| true`, nu `|| printf '0'`: pe intrare goală `grep -c .` tipărește deja "0"
+# ȘI iese cu 1, deci varianta veche întorcea "0\n0". Pe un set gol, `(( ))` nu
+# putea citi valoarea, dădea eroare de sintaxă pe stderr și cădea pe ramura
+# else — răspunsul corect, din greșeală. Cu al doilea set de raportat, acelaşi
+# accident ar fi tipărit gunoiul.
+#
+# Un răspuns care NU conține antetul setului nu e o listare — un sudo care cere
+# parola, un mesaj de eroare, o sesiune ssh tăiată la mijloc. După `sed` arată
+# exact ca un set gol, fiindcă un set gol chiar nu are linia `elements = {`; iar
+# „gol" e raportat ca FAIL, cu o frază despre faptul că nu te apără nimic. Deci
+# antetul se cere înainte de a numi zero: „n-am înțeles răspunsul" e „?".
 count_set_elements() {
     local raw; raw="$(r "sudo nft list set inet sentinel $1" || true)"
     [[ -z "$raw" ]] && { printf '?'; return; }
+    [[ "$raw" == *"set $1 {"* ]] || { printf '?'; return; }
     printf '%s' "$raw" | tr -d '\n' | sed -n 's/.*elements = {\([^}]*\)}.*/\1/p' \
-        | tr ',' '\n' | sed 's/[[:space:]]//g' | grep -c . || printf '0'
+        | tr ',' '\n' | sed 's/[[:space:]]//g' | grep -c . || true
+}
+
+# E adresa asta membră a setului, după NUCLEU? Întoarce yes / no / ?.
+#
+# Nu un grep peste listare: elementele sunt intervale (192.168.0.0/16, fc00::/7,
+# orice /24 din extra_allowlist), iar o adresă acoperită de un interval nu apare
+# ca text în el. Un grep ar fi răspuns „nu ești în lista albă" fiecărui operator
+# care administrează dintr-o rețea privată — exact alarma falsă care te învață
+# să nu mai citești raportul.
+#
+# „?" e o stare separată de „no": un nft care nu cunoaște `get element`, un sudo
+# care refuză, un ssh care n-a răspuns — niciunul nu e dovadă că adresa lipsește.
+#
+# Cele trei răspunsuri ale lui nft 1.0.9, măsurate pe gazdă, fiindcă două dintre
+# ele conțin aceleași cuvinte și numai al treilea e „nu e acolo":
+#
+#   e în set   -> stdout conține `elements = { ... }`, cod 0
+#   nu e în set-> stderr `Error: Could not process rule: No such file or directory`
+#   set lipsă  -> stderr `Error: No such file or directory; did you mean set '...'`
+#
+# De aceea ramura „no" cere fraza ÎNTREAGĂ, cu `Could not process rule`. Un
+# `*"No such file or directory"*` prindea și setul inexistent și răspundea „nu
+# ești în lista albă" pentru un set care nici nu există — o alarmă falsă care
+# trimite operatorul să-și adauge o adresă într-un set inexistent, în loc să-i
+# spună că tabela e stricată.
+set_has_address() {
+    local set_name="$1" addr="$2" out
+    out="$(r "sudo nft get element inet sentinel ${set_name} '{ ${addr} }' 2>&1" || true)"
+    if [[ "$out" == *"elements = "* ]]; then
+        printf 'yes'
+    elif [[ "$out" == *"Could not process rule: No such file or directory"* ]]; then
+        printf 'no'
+    else
+        printf '?'
+    fi
+}
+
+# Raportează o adresă față de setul familiei ei, sau spune că n-a putut.
+#
+# Nu raportează NIMIC dacă interogarea n-a fost calibrată (CAN_QUERY_*): o linie
+# verde sau una galbenă bazată pe o întrebare care n-a primit răspuns e mai rea
+# decât tăcerea, iar motivul a fost deja spus o dată, la calibrare.
+check_in_set() {
+    local set_name="$1" addr="$2" label="$3" can
+    case "$set_name" in
+        allowlist_v4) can=$CAN_QUERY_V4 ;;
+        *)            can=$CAN_QUERY_V6 ;;
+    esac
+    (( can )) || return 0
+    case "$(set_has_address "$set_name" "$addr")" in
+        yes) pass "${label} (${addr}) e în ${set_name}" ;;
+        no)  warn "${label} (${addr}) NU e în ${set_name} — un block acolo ar trece" ;;
+        *)   warn "${label} (${addr}): nu am putut întreba ${set_name} — stare necunoscută" ;;
+    esac
 }
 
 printf '%sSentinel smoke test — %s%s\n' "$_B" "$HOST" "$_0"
@@ -363,25 +430,96 @@ if r "sudo nft list table inet sentinel" | grep -q 'table inet sentinel'; then
 policy here means a bug or a manual edit, and it CAN lock you out."
     fi
 
-    allow_n="$(count_set_elements allowlist_v4)"
-    if [[ "$allow_n" == "?" ]]; then
-        warn "nu am putut citi allowlist_v4 — stare necunoscută, nu o raportez ca goală"
-    elif (( allow_n > 0 )); then
-        pass "allowlist has ${allow_n} entries"
-    else
-        fail "allowlist is EMPTY — nothing protects you from a bad block"
+    # AMBELE seturi. Blocul ăsta număra doar allowlist_v4, iar un operator care
+    # ajunge la gazdă numai pe IPv6 citea „allowlist has 9 entries" în timp ce
+    # setul care putea să-i conțină adresa era gol: raportul îi confirma exact
+    # starea pe care ar fi trebuit s-o semnaleze.
+    for fam in v4 v6; do
+        allow_n="$(count_set_elements "allowlist_${fam}")"
+        if [[ "$allow_n" == "?" ]]; then
+            warn "nu am putut citi allowlist_${fam} — stare necunoscută, nu o raportez ca goală"
+        elif (( allow_n > 0 )); then
+            pass "allowlist_${fam} has ${allow_n} entries"
+        else
+            fail "allowlist_${fam} is EMPTY — nothing protects you from a bad block on IPv${fam#v}"
+        fi
+    done
+
+    printf '    blocklist: %s IPv4, %s IPv6\n' \
+        "$(count_set_elements blocklist_v4)" "$(count_set_elements blocklist_v6)"
+
+    # Calibrarea interogării de apartenență, ÎNAINTE de a o crede.
+    #
+    # Instalatorul pune întotdeauna 127.0.0.0/8 în allowlist_v4 și ::1/128 în
+    # allowlist_v6, deci 127.0.0.1 și ::1 TREBUIE să fie membre. Dacă întrebarea
+    # nu confirmă nici măcar asta, atunci `nft get element` n-a răspuns — nu
+    # adresele lipsesc. O verificare care nu poate răspunde nu are voie să
+    # raporteze nici „în regulă", nici „lipsă", pentru nimic de mai jos.
+    CAN_QUERY_V4=0; CAN_QUERY_V6=0
+    if [[ "$(set_has_address allowlist_v4 127.0.0.1)" == "yes" ]]; then CAN_QUERY_V4=1; fi
+    if [[ "$(set_has_address allowlist_v6 ::1)" == "yes" ]]; then CAN_QUERY_V6=1; fi
+    if (( ! CAN_QUERY_V4 || ! CAN_QUERY_V6 )); then
+        warn "nu pot interoga apartenența la seturi (\`nft get element\` nu confirmă \
+nici adresele implicite: v4=${CAN_QUERY_V4}, v6=${CAN_QUERY_V6}) — verificările de \
+mai jos sunt SĂRITE, nu trecute"
     fi
 
-    printf '    blocklist: %s entries\n' "$(count_set_elements blocklist_v4)"
+    # Adresa de pe care rulează chiar acest smoke test, așa cum o vede serverul.
+    # smoke-test.sh nu primește --admin-ip, dar peer-ul conexiunii curente e
+    # adresa care trebuie să fie în lista albă ca să nu te blochezi singur — și e
+    # în familia pe care o folosești cu adevărat, nu în cea presupusă de script.
+    peer="$(r "echo \$SSH_CONNECTION" | awk '{print $1}' || true)"
+    if [[ -z "$peer" ]]; then
+        warn "nu am putut afla adresa de pe care sunt conectat (SSH_CONNECTION gol) — \
+nu pot verifica dacă e în lista albă"
+    else
+        case "$peer" in
+            *:*) check_in_set allowlist_v6 "$peer" "adresa ta" ;;
+            *.*) check_in_set allowlist_v4 "$peer" "adresa ta" ;;
+            *)   warn "peer-ul raportat de server ('${peer}') nu arată a adresă IP — nu îl verific" ;;
+        esac
+    fi
+
+    # Adresele proprii ale gazdei, pe IPv6. „Gazda nu are IPv6 global" nu e o
+    # problemă: allowlist_v6 rămâne cu cele trei intrări implicite și nu are ce
+    # altceva să conțină. Spus, nu avertizat — un avertisment care apare la
+    # fiecare rulare pe fiecare gazdă fără IPv6 e unul pe care operatorul se
+    # învață să nu-l mai citească.
+    #
+    # Ieșirea lui `ip` e prinsă ÎNTÂI, și abia apoi filtrată. Într-o conductă,
+    # `||` se uită la codul ULTIMEI comenzi — al lui `sort` — deci varianta
+    # `ip ... | awk | cut | sort || echo '?'` nu putea tipări niciodată „?": un
+    # `ip` care există dar cade (fără IPv6 în nucleu, permisiuni) dădea o
+    # conductă goală și cod 0, adică „gazda nu are IPv6", care e un fapt pe care
+    # nimeni nu l-a observat. `sed` în loc de `awk` doar ca să nu treacă un `$4`
+    # prin trei niveluri de citate.
+    host_v6="$(r 'command -v ip >/dev/null 2>&1 || { echo "?"; exit 0; }
+out=$(ip -6 -o addr show scope global 2>/dev/null) || { echo "?"; exit 0; }
+[ -z "$out" ] && exit 0
+printf "%s\n" "$out" | sed -n "s#.*inet6 \([^ /]*\).*#\1#p" | sort -u' || echo '?')"
+    if [[ "$host_v6" == "?" ]]; then
+        warn "nu am putut afla adresele IPv6 globale ale gazdei — necunoscut, nu «niciuna»"
+    elif [[ -z "$host_v6" ]]; then
+        printf '    gazda nu are adresă IPv6 globală; allowlist_v6 rămâne cu intrările implicite\n'
+    else
+        while read -r addr; do
+            if [[ -n "$addr" ]]; then
+                check_in_set allowlist_v6 "$addr" "adresa proprie a gazdei"
+            fi
+        done <<< "$host_v6"
+    fi
 
     # Blocking Sentinel's own alerting or analysis endpoints would be silent:
     # no error, no alert, just a system that has stopped telling anyone anything.
+    #
+    # Ambele familii. Verificat doar pe ahostsv4, un api.telegram.org atins pe
+    # IPv6 putea lipsi din allowlist_v6 fără ca nimic să spună asta.
     for endpoint in api.telegram.org api.anthropic.com; do
-        ip="$(r "getent ahostsv4 ${endpoint} | awk 'NR==1{print \$1}'" || true)"
-        [[ -z "$ip" ]] && continue
-        r "sudo nft list set inet sentinel allowlist_v4" | grep -q "$ip" \
-            && pass "${endpoint} (${ip}) allowlisted" \
-            || warn "${endpoint} (${ip}) not in the allowlist — a block there would silence alerting"
+        for fam in 4 6; do
+            ip="$(r "getent ahostsv${fam} ${endpoint} 2>/dev/null | awk 'NR==1{print \$1}'" || true)"
+            [[ -z "$ip" ]] && continue
+            check_in_set "allowlist_v${fam}" "$ip" "${endpoint} (IPv${fam})"
+        done
     done
 else
     fail "nftables table not loaded"

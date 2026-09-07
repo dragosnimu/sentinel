@@ -401,10 +401,13 @@ sudo -u postgres psql -d sentinel -P pager=off -c \
   "select actor_key, count(*) from incidents where status='open' and severity in ('high','critical') group by 1 order by 2 desc limit 15;"
 ```
 
-Și confirmă că adresa de pe care administrezi e în allowlist:
+Și confirmă că adresa de pe care administrezi e în allowlist — în setul
+familiei ei. Dacă ajungi la server pe IPv6, `allowlist_v4` nu poate să te
+conțină, oricât de plin ar fi:
 
 ```bash
 sudo nft list set inet sentinel allowlist_v4
+sudo nft list set inet sentinel allowlist_v6
 ```
 
 **Dacă nu e acolo, nu porni auto-block.** Verificarea automată care ar fi trebuit
