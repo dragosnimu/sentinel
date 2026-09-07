@@ -2546,7 +2546,133 @@ step_nftables() {
     # Inside each chain the allowlist rules do precede the blocklist rules, so
     # an address in both is accepted. That is a property of the file's contents,
     # not of the order in which things were loaded.
-    nft -f "${SCRIPT_DIR}/nftables/sentinel-table.nft" || die "failed to load the nftables table"
+    #
+    # RE-RUNNING THIS STEP OVER A TABLE THAT IS ALREADY THERE.
+    #
+    # `nft -f` does not replace a table that exists — it ADDS to it. Declaring
+    # a set again is a no-op and its elements survive, which is what keeps a
+    # live block and an allowlist entry in place across `--force-step 29`. But
+    # declaring a CHAIN again appends every rule in the file on top of what is
+    # already there. Measured on both production hosts after this step ran
+    # twice over the same table: `input` carried 12 `saddr` rules where the
+    # file holds 6, the second copy sitting at `counter packets 0`; `forward`
+    # the same. accept/drop decisions did not change — the first matching
+    # terminal rule still wins — but the non-terminating `counter` rule on the
+    # watchlist counts every packet once per copy, so a hit count read back is
+    # a multiple of the truth; the ruleset grows without bound on every
+    # further re-run; and `nft list`, what an operator reads when checking the
+    # host, stops matching this file.
+    #
+    # The fix is to FLUSH both chains' RULES before the reload, but only when
+    # the table already exists: `flush chain` on a table that is not there
+    # yet is an error, and on first install there is nothing to flush. A
+    # flush empties a chain of its rules — it does not touch the sets — so
+    # allowlist entries and live blocks are untouched by it; that is the
+    # point, and it is why this is a flush of the two CHAINS and not a
+    # `delete table`. Deleting the table would also drop every live block
+    # until blocklist.py re-applies the non-expired ones from the database on
+    # its own schedule, opening exactly the gap this step exists to close for
+    # the allowlist. Say it once, plainly: allowlist entries stay, live blocks
+    # stay, only the doubled RULES are removed.
+    #
+    # The flush also zeroes every rule's packet/byte counters. That is a real
+    # loss — `nft list`'s own running history — but not one anything under
+    # `sentinel/` desyncs from: nothing here reads a live nft counter at
+    # runtime.
+    #
+    # The flush and the reload are ONE `nft -f` transaction — a generated temp
+    # file holding `flush chain inet sentinel input`, `flush chain inet
+    # sentinel forward`, then the table definition, fed to a single `nft -f`.
+    # nft batches a whole `-f` file into one netlink transaction (the same
+    # property the comment above already relies on for the sets-before-chains
+    # ordering), so a rejected file commits nothing: the running table is left
+    # exactly as it was, not half-flushed. Two separate commands would have
+    # worked too — a flushed chain is `policy accept` with no rules, which
+    # still drops nothing, so even an interruption between them could not lock
+    # anyone out — but one transaction removes the question rather than
+    # reasoning about it.
+    local table_file="${SCRIPT_DIR}/nftables/sentinel-table.nft"
+    if nft list table inet sentinel >/dev/null 2>&1; then
+        local load_file
+        load_file="$(mktemp)" || die "could not create a temp file to reload the nftables table"
+        # `cat` is the last command in the group, so its exit status is the
+        # group's — and it is checked explicitly rather than left to `set -e`.
+        # Under errexit an unchecked failure here would abort the whole script
+        # mid-function, with no [FATAL] line, no step name, and $load_file
+        # left behind by mktemp: exactly the "confirmed intent, not effect"
+        # failure this file warns about elsewhere, just one step earlier —
+        # `$table_file` missing or unreadable would otherwise be reported as
+        # nothing at all.
+        if ! {
+            echo "flush chain inet sentinel input"
+            echo "flush chain inet sentinel forward"
+            cat "$table_file"
+        } > "$load_file"; then
+            rm -f "$load_file"
+            die "could not read ${table_file} while building the flush+reload file — nft was \
+never invoked, and the running table is unchanged"
+        fi
+        if ! nft -f "$load_file"; then
+            rm -f "$load_file"
+            die "failed to reload the nftables table over the existing one (flush + load, one \
+transaction) — the running table is UNCHANGED, because a rejected \`nft -f\` file commits nothing"
+        fi
+        rm -f "$load_file"
+    else
+        nft -f "$table_file" || die "failed to load the nftables table"
+    fi
+
+    # -- Prove the load was not doubled, rather than assume it -----------------
+    #
+    # The flush above is what stops a re-run from appending; checking that the
+    # flush RAN would still be confirming intent, not effect — the mistake
+    # this repository keeps shipping. So the live rule count is read back from
+    # the kernel and compared against what the shipped file actually defines,
+    # not against what this step assumes it defines.
+    #
+    # Counted by occurrences of '@' rather than 'saddr @': `forward` matches
+    # the blocklist sets on BOTH `saddr` and `daddr` (see this file's own
+    # comment on why), so a saddr-only count would read `forward` as half of
+    # what it holds and never notice it doubling. The expected numbers are
+    # pinned here, not derived from the file at runtime — tests/unit/
+    # test_nftables_idempotent.py guards deploy/nftables/sentinel-table.nft
+    # against drifting away from them unnoticed.
+    local -A nft_expected_rules=( [input]=6 [forward]=6 )
+    local nft_chain nft_listing nft_rule_count nft_expected
+    for nft_chain in input forward; do
+        nft_expected="${nft_expected_rules[$nft_chain]}"
+        if nft_listing="$(nft list chain inet sentinel "$nft_chain" 2>&1)"; then
+            nft_rule_count="$(printf '%s\n' "$nft_listing" | grep -c '@' || true)"
+            if [[ "$nft_rule_count" == "$nft_expected" ]]; then
+                ok "chain ${nft_chain}: ${nft_rule_count} rules, matches \
+deploy/nftables/sentinel-table.nft"
+            elif (( nft_rule_count > nft_expected )); then
+                # More rules than the file defines: the flush above did not
+                # prevent an append, most likely because this step ran again
+                # over a table it had already loaded. Nothing is dropped that
+                # should not be — the first matching terminal rule still
+                # wins — but hit counts read back are inflated and the table
+                # keeps growing on every further re-run.
+                warn "chain ${nft_chain} has ${nft_rule_count} rules but \
+deploy/nftables/sentinel-table.nft defines ${nft_expected} — DUPLICATED rules, most likely from \
+this step re-running over a table it had already loaded; compare \`nft list chain inet sentinel \
+${nft_chain}\` with the file by hand before trusting any block or watchlist count on this host"
+            else
+                # Fewer rules than the file defines: this is the dangerous
+                # direction. A missing blocklist rule means a blocked address
+                # is NOT being dropped, silently, which is the one failure
+                # this whole table exists to prevent.
+                warn "chain ${nft_chain} has only ${nft_rule_count} rules but \
+deploy/nftables/sentinel-table.nft defines ${nft_expected} — rules are MISSING, which means \
+blocked addresses may NOT be dropped on this host; reload the table with \`nft -f \
+deploy/nftables/sentinel-table.nft\` and compare \`nft list chain inet sentinel ${nft_chain}\` \
+with the file"
+            fi
+        else
+            warn "cannot read chain ${nft_chain} back from the kernel: ${nft_listing//$'\n'/ } — \
+its rule count is UNKNOWN, not confirmed correct"
+        fi
+    done
 
     # Two sets, because nftables types them: an element of allowlist_v4 is an
     # ipv4_addr and the kernel refuses anything else. Everything below is routed

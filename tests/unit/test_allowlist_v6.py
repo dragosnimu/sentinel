@@ -186,6 +186,46 @@ nft() {
                 printf 'Error: No such file or directory\n' >&2
                 return 1
             fi
+            if [[ "${2:-}" == "chain" ]]; then
+                # step_nftables now reads each chain back after the load and
+                # compares its rule count with the shipped file (six rules
+                # per chain, see test_nftables_idempotent.py — including
+                # forward's `daddr` rules, which a stub built only out of
+                # `saddr` lines would not exercise). This file's tests are
+                # not about that check, so the stub answers with a
+                # correctly-sized, un-doubled chain shaped like the REAL
+                # `nft list chain inet sentinel <input|forward>` output —
+                # otherwise every test here would pick up a spurious
+                # "rules are MISSING" or "may have doubled" warning that has
+                # nothing to do with what it is testing.
+                local __chain="${5:-?}" __i
+                local -a __rules
+                if [[ "$__chain" == "input" ]]; then
+                    __rules=(
+                        'ip saddr @allowlist_v4 accept'
+                        'ip6 saddr @allowlist_v6 accept'
+                        'ip saddr @watchlist_v4 counter packets 0 bytes 0'
+                        'ip6 saddr @watchlist_v6 counter packets 0 bytes 0'
+                        'ip saddr @blocklist_v4 counter packets 0 bytes 0 drop'
+                        'ip6 saddr @blocklist_v6 counter packets 0 bytes 0 drop'
+                    )
+                else
+                    __rules=(
+                        'ip saddr @allowlist_v4 accept'
+                        'ip6 saddr @allowlist_v6 accept'
+                        'ip saddr @blocklist_v4 counter packets 0 bytes 0 drop'
+                        'ip daddr @blocklist_v4 counter packets 0 bytes 0 drop'
+                        'ip6 saddr @blocklist_v6 counter packets 0 bytes 0 drop'
+                        'ip6 daddr @blocklist_v6 counter packets 0 bytes 0 drop'
+                    )
+                fi
+                printf 'table inet sentinel {\n\tchain %s {\n' "$__chain"
+                for ((__i = 0; __i < 6; __i++)); do
+                    printf '\t\t%s\n' "${__rules[__i]}"
+                done
+                printf '\t}\n}\n'
+                return 0
+            fi
             printf 'table inet sentinel {\n    set %s {\n    }\n}\n' "${5:-?}"
             ;;
         add)
