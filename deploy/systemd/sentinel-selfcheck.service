@@ -29,11 +29,16 @@ Group=sentinel
 WorkingDirectory=/opt/sentinel
 ExecStart=/opt/sentinel/bin/sentinel selfcheck
 
-# Short by design. Every check is a local query, a socket round-trip or a
-# systemctl call; if this has not finished in a minute, something it is trying
-# to reach is hanging, and a hung self-check is itself a fault worth surfacing
-# rather than waiting out.
-TimeoutStartSec=60
+# Short by design, but not THIS short: measured on production, the DB connect
+# alone took 14s once, and one check (`check_ingest_sources`, before S9 bound
+# it to a 48-hour window instead of the full 30-day retention window) was
+# scanning a table measured at 4.7 GB. A one-minute ceiling on a oneshot that
+# opens a fresh connection pool AND runs several dozen queries sequentially
+# left too little margin for an ordinary slow moment — a checkpoint, a
+# vacuum, a burst of concurrent load from another daemon — to be told apart
+# from an actual hang. Three minutes keeps the same intent (a hung self-check
+# is itself a fault worth surfacing) without mistaking normal jitter for one.
+TimeoutStartSec=180
 
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=/opt/sentinel/lib

@@ -14,6 +14,7 @@ live in `sentinel.constants`.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
@@ -711,7 +712,7 @@ def _coerce(target_type: Any, value: Any, path: str) -> Any:
     if origin is list:
         if not isinstance(value, list):
             raise ConfigError(f"{path}: expected a list, got {type(value).__name__}")
-        return value
+        return _coerce_list_items(target_type, value, path)
     if target_type is bool and not isinstance(value, bool):
         raise ConfigError(f"{path}: expected true/false, got {value!r}")
     if _wants_int(target_type):
@@ -742,6 +743,39 @@ def _coerce(target_type: Any, value: Any, path: str) -> Any:
                     f"guessing which way to round it is not the config loader's "
                     f"call.")
             return int(value)
+        if not isinstance(value, int):
+            # S8: this branch used to not exist, so a string like `pool_min:
+            # '5'` sailed straight through `_coerce` unchanged and hit
+            # asyncpg (or whatever else does arithmetic on it) at runtime,
+            # not at load — `config-check` printed OK on a config that would
+            # crash the daemon every time it touched the field.
+            raise ConfigError(
+                f"{path}: expected an integer, got {value!r} ({type(value).__name__})")
+    elif _wants_float(target_type):
+        # S8 confirmed: `ai.daily_budget_usd: '5'` (a YAML string, quoted or
+        # not — 'true'/'no' style ambiguity is common enough that operators
+        # quote numbers defensively) reached `budget.py`'s arithmetic
+        # unchanged and raised `TypeError` on every single budget check,
+        # forever, until an operator noticed the daemon was in a restart loop.
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ConfigError(
+                f"{path}: expected a number, got {value!r} ({type(value).__name__})")
+        as_float = float(value)
+        # S8 (round 2): YAML's `.nan`/`.inf`/`-.inf` parse straight into a real
+        # Python float — `isinstance(value, (int, float))` above is TRUE for
+        # them, so they sailed through unchanged. `ai.daily_budget_usd: .nan`
+        # then reaches `budget.py`'s `spent >= cap` comparison, where `x >=
+        # nan` is always False — the cap silently never applies, ever, no
+        # matter how much is spent. `.inf` has the opposite failure: any real
+        # spend compares as "under budget" forever, which is the same "never
+        # applies" outcome from the other direction.
+        if not math.isfinite(as_float):
+            raise ConfigError(
+                f"{path}: expected a finite number, got {value!r} — nan and "
+                f"inf compare false (or true) against every real number, so "
+                f"a budget cap or threshold using one would never actually "
+                f"apply.")
+        return as_float
     return value
 
 
@@ -756,6 +790,49 @@ def _wants_int(target_type: Any) -> bool:
         return True
     args = getattr(target_type, "__args__", ())
     return bool(args) and set(args) == {int, type(None)}
+
+
+def _wants_float(target_type: Any) -> bool:
+    """`float`, or `float | None` — the same reasoning as `_wants_int` above,
+    for the one other numeric scalar type this config actually declares."""
+    if target_type is float:
+        return True
+    args = getattr(target_type, "__args__", ())
+    return bool(args) and set(args) == {float, type(None)}
+
+
+def _coerce_list_items(target_type: Any, value: list[Any], path: str) -> list[Any]:
+    """S8 confirmed: `allowed_chat_ids: ['abc']` was accepted outright —
+    `_coerce` checked only that the VALUE was a list, never what was inside
+    it. A chat id compared against `update.effective_chat.id` (always an
+    int) would then never match anything, silently: the allowlist would look
+    populated in `config-check` while rejecting every command.
+
+    Only `list[int]` and `list[str]` exist in this config today (see the
+    fields above) — anything else is returned unchanged rather than guessed
+    at, so a future `list[SomeDataclass]` field does not hit a rule written
+    for a shape it does not have.
+    """
+    args = getattr(target_type, "__args__", ())
+    elem_type = args[0] if len(args) == 1 else None
+    if elem_type not in (int, str, float):
+        return value
+    out: list[Any] = []
+    for i, item in enumerate(value):
+        item_path = f"{path}[{i}]"
+        if elem_type is int:
+            if isinstance(item, bool) or not isinstance(item, int):
+                raise ConfigError(f"{item_path}: expected an integer, got {item!r}")
+            out.append(item)
+        elif elem_type is float:
+            if isinstance(item, bool) or not isinstance(item, (int, float)):
+                raise ConfigError(f"{item_path}: expected a number, got {item!r}")
+            out.append(float(item))
+        else:  # str
+            if not isinstance(item, str):
+                raise ConfigError(f"{item_path}: expected a string, got {item!r}")
+            out.append(item)
+    return out
 
 
 def _build(cls: type[T], data: dict[str, Any], path: str = "") -> T:
@@ -997,6 +1074,88 @@ def _validate(cfg: Config) -> None:
             raise ConfigError(
                 f"response.extra_allowlist entry {cidr!r} is not a valid network: {exc}"
             ) from None
+
+    # ------------------------------------------------------------------
+    # S8: values that pass `_coerce`'s type check (a number, a string, a
+    # bool — the right shape) but are individually nonsensical, and were
+    # confirmed to reach a daemon at runtime instead of `config-check`.
+    # ------------------------------------------------------------------
+    if cfg.database.pool_min < 1:
+        raise ConfigError("database.pool_min must be at least 1")
+    if cfg.database.pool_max < cfg.database.pool_min:
+        raise ConfigError(
+            f"database.pool_max ({cfg.database.pool_max}) is below "
+            f"database.pool_min ({cfg.database.pool_min}) — asyncpg's own pool "
+            f"raises ValueError for this at connect time, which every one of "
+            f"the seven-odd daemons that opens a pool hits on every restart, "
+            f"forever, until an operator reads the crash loop and works "
+            f"backwards to the config.")
+    if cfg.database.statement_timeout_ms <= 0:
+        raise ConfigError(
+            f"database.statement_timeout_ms is {cfg.database.statement_timeout_ms}; "
+            f"it must be positive. Zero (or negative) disables Postgres's own "
+            f"statement_timeout, so a single stuck query — a lock wait, a bad "
+            f"plan on a large partition — never times out and holds a "
+            f"connection out of an already small pool forever.")
+
+    # `ZoneInfo`, not a name-format check: `timezone: Mars/Olympus` looks like
+    # a plausible IANA zone and is exactly the shape that must be caught here,
+    # not three services later where `util/tz.py` degrades noisily per-call
+    # (§3.10b of ARHITECTURA.md) instead of refusing to start.
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    for label, holder, attr in (("timezone", cfg, "timezone"),
+                               ("telegram.timezone", cfg.telegram, "timezone")):
+        value = getattr(holder, attr)
+        if value is None:
+            continue
+        # S8 (round 2) confirmed on Windows, and not guaranteed better
+        # elsewhere: `ZoneInfo("  ")` does not raise `ZoneInfoNotFoundError`
+        # or `ValueError` — it tries to open a zoneinfo path built from the
+        # blank string and raises `PermissionError`, which this except
+        # clause did not catch, so a blank-but-not-empty `timezone: "  "`
+        # crashed `load_config` with an unhandled exception instead of the
+        # clean refusal every other bad value here gets. Stripped first, so
+        # whitespace PADDING around a real zone name (`" Europe/Bucharest "`)
+        # is not refused either — only whitespace-ONLY collapses to "blank".
+        stripped = value.strip()
+        if not stripped:
+            raise ConfigError(f"{label} is blank — not a known IANA zone.")
+        try:
+            ZoneInfo(stripped)
+        except (ZoneInfoNotFoundError, ValueError, OSError) as exc:
+            raise ConfigError(f"{label} {value!r} is not a known IANA zone: {exc}") from None
+        # Written back, not just validated: `util/tz.py:zone()` calls
+        # `ZoneInfo(cfg.timezone)` directly, with whatever this holds — if
+        # the padding stayed on the stored value, `config-check` would say
+        # "fine" while every actual window evaluation still hit the same
+        # `ZoneInfo` failure this loop just proved would happen, and quietly
+        # fell back to the host's zone instead (`zone()`'s own "falls back
+        # loudly, never silently to UTC" contract, but still not the zone
+        # the operator configured).
+        setattr(holder, attr, stripped)
+
+    if cfg.ai.enabled:
+        if cfg.ai.daily_budget_usd < 0:
+            raise ConfigError(
+                f"ai.daily_budget_usd is {cfg.ai.daily_budget_usd}; a negative "
+                f"budget was observed to turn the AI layer silently off instead "
+                f"of raising — the same outcome as ai.enabled: false, but "
+                f"reached by a typo instead of a decision. Use ai.enabled: "
+                f"false to turn it off; a budget stays a non-negative number.")
+        if cfg.ai.monthly_budget_usd < 0:
+            raise ConfigError(
+                f"ai.monthly_budget_usd is {cfg.ai.monthly_budget_usd}; it must "
+                f"not be negative, for the same reason as daily_budget_usd.")
+        for label, name in (("ai.model_fast", cfg.ai.model_fast),
+                            ("ai.model_main", cfg.ai.model_main),
+                            ("ai.model_patch", cfg.ai.model_patch)):
+            if not name.strip():
+                raise ConfigError(
+                    f"{label} is empty. Every AI call names a model explicitly; "
+                    f"an empty string reaches the Messages API as a request "
+                    f"with no model, which fails every call, not just the ones "
+                    f"that would have used this tier.")
 
 
 _cached: Config | None = None

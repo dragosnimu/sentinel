@@ -16,6 +16,8 @@ not the server. Two defences:
 
 from __future__ import annotations
 
+import re
+
 TRIAGE_SYSTEM = """\
 Ești analistul SOC al agentului Sentinel care apără un server Linux. Primești un
 incident ridicat de reguli deterministe și dovezile lui. Sarcina ta: judecă
@@ -35,10 +37,20 @@ severitatea, dar nici nu minimiza un atac real. Dacă dovezile sunt slabe, spune
 și scade încrederea."""
 
 
+# S7b: matched case-sensitively before, so `</DATE_NEINCREZUTE>` or
+# `</Date_Neincrezute>` in attacker-controlled evidence passed straight
+# through unneutralised and could close the untrusted block early — exactly
+# the escape the fence exists to prevent. Models are not case-sensitive
+# readers of XML-ish delimiters; a filter that is loses to an attacker who
+# just changes case.
+_CLOSE_TAG_RE = re.compile(r"</date_neincrezute>", re.IGNORECASE)
+
+
 def wrap_untrusted(label: str, content: str, *, max_len: int = 4000) -> str:
     """Fence one piece of attacker-controlled evidence. Any stray closing marker
-    inside the content is neutralised so it cannot end the block early."""
-    safe = (content or "").replace("</date_neincrezute>", "<­/date_neincrezute>")
+    inside the content is neutralised, in any case, so it cannot end the block
+    early."""
+    safe = _CLOSE_TAG_RE.sub("<­/date_neincrezute>", content or "")
     if len(safe) > max_len:
         safe = safe[:max_len] + " …[trunchiat]"
     return f"<date_neincrezute tip=\"{label}\">\n{safe}\n</date_neincrezute>"

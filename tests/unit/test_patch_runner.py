@@ -144,8 +144,8 @@ class _FakeDB:
         if "INSERT INTO patch_executions" in sql:
             self.executions.append({"id": self._next_id, "mode": a[1]})
         if "INSERT INTO patch_steps" in sql:
-            self.steps.append({"id": self._next_id, "phase": a[1], "step_id": a[2],
-                               "argv": a[4], "status": "running"})
+            self.steps.append({"id": self._next_id, "execution_id": a[0], "phase": a[1],
+                               "step_id": a[2], "argv": a[4], "status": "running"})
         return self._next_id
 
     async def execute(self, sql, *a):
@@ -187,6 +187,13 @@ def _final(db: _FakeDB) -> str | None:
     return None
 
 
+def _steps_for(db: _FakeDB, execution_id: int) -> list[dict[str, Any]]:
+    """Steps belonging to one execution — needed once `apply` is always
+    preceded by its own dry-run execution (S3): `db.steps` otherwise mixes
+    the pre-check's steps in with the real run's."""
+    return [s for s in db.steps if s["execution_id"] == execution_id]
+
+
 # --- refusals before anything runs ------------------------------------------
 def test_missing_plan_is_refused_without_creating_an_execution():
     class Empty(_FakeDB):
@@ -226,9 +233,12 @@ def test_apply_runs_every_forward_phase_in_order(_fake_executor):
     db = _FakeDB(_plan())
     res = run(runner.run_plan(db, None, 1, mode="apply"))
     assert res.status == "succeeded"
-    # de-duplicated, since a phase may contain several checks
+    # de-duplicated, since a phase may contain several checks. Filtered to the
+    # real apply's own execution: S3 means a full dry-run pass now precedes it
+    # as a SEPARATE recorded execution, which would otherwise double every
+    # phase in db.steps (a global log across every execution the fake ever saw).
     seen: list[str] = []
-    for st in db.steps:
+    for st in _steps_for(db, res.execution_id):
         if not seen or seen[-1] != st["phase"]:
             seen.append(st["phase"])
     assert seen == ["preflight", "backup", "apply", "health_check", "post_verification"]
@@ -298,6 +308,127 @@ def test_a_phase_stops_at_its_first_failure(_fake_executor):
     ]
     _fake_executor.fail_on = {"dnf"}
     db = _FakeDB(plan)
-    run(runner.run_plan(db, None, 1, mode="apply"))
-    applied = [s["step_id"] for s in db.steps if s["phase"] == "apply"]
+    res = run(runner.run_plan(db, None, 1, mode="apply"))
+    applied = [s["step_id"] for s in _steps_for(db, res.execution_id) if s["phase"] == "apply"]
     assert applied == ["a1"]            # a2 never ran
+
+
+# --- S3: an apply is actually preceded by a dry-run pass, not just claimed --
+def test_apply_creates_a_dry_run_execution_before_the_real_one(_fake_executor):
+    """The module docstring has always said 'dry run first, always'; before
+    this fix `mode='apply'` went straight to the real commands and nothing
+    ever exercised the dry-run path first. A real pre-check must leave its
+    own execution row, distinct from the applied one."""
+    db = _FakeDB(_plan())
+    res = run(runner.run_plan(db, None, 1, mode="apply"))
+    assert res.status == "succeeded"
+    modes = [e["mode"] for e in db.executions if "mode" in e]
+    assert modes == ["dry_run", "apply"]
+
+
+def test_apply_is_refused_before_touching_anything_if_the_dry_run_fails(_fake_executor):
+    """A crash in the executor is exactly the case the dry-run pass exists to
+    catch before real commands run. Without an actual pre-apply dry-run pass,
+    `run_plan` went straight into applying and only discovered the executor
+    could not run `dnf` after the real apply had already started (and then
+    had to roll back a real `dnf downgrade`, itself liable to fail the same
+    way). With the pass wired in, the failure surfaces before any 'applying'
+    execution is even created."""
+    _fake_executor.raise_on = {"dnf"}
+    db = _FakeDB(_plan())
+    with pytest.raises(runner.PatchRefused, match="proba uscată"):
+        run(runner.run_plan(db, None, 1, mode="apply"))
+    assert "applying" not in db.plan_statuses
+    # Only the failed dry-run pre-check execution exists — never the apply.
+    modes = [e["mode"] for e in db.executions if "mode" in e]
+    assert modes == ["dry_run"]
+
+
+# --- S3b: a crash before `apply` starts must not trigger a rollback --------
+class _CrashOnRealApplyStepInsertDB(_FakeDB):
+    """Raises the moment `begin_step` is called for a given phase, but ONLY
+    for the step belonging to the execution created with mode='apply' — the
+    dry-run pre-check (S3) runs the very same phases first and must not be
+    the one that trips the injected crash, or the test would never reach the
+    real apply at all."""
+
+    def __init__(self, *a, crash_phase: str, **kw):
+        super().__init__(*a, **kw)
+        self.crash_phase = crash_phase
+        self._apply_execution_id: int | None = None
+
+    async def fetchval(self, sql, *a):
+        if "INSERT INTO patch_executions" in sql and a[1] == "apply":
+            eid = await super().fetchval(sql, *a)
+            self._apply_execution_id = eid
+            return eid
+        if ("INSERT INTO patch_steps" in sql and a[1] == self.crash_phase
+                and a[0] == self._apply_execution_id):
+            raise RuntimeError("baza a picat chiar acum")
+        return await super().fetchval(sql, *a)
+
+
+def test_crash_before_apply_starts_does_not_roll_back(_fake_executor):
+    """A crash while still validating preflight — nothing on the machine has
+    changed — must not run the plan's rollback steps against an untouched
+    system. Before this fix, ANY unhandled exception inside run_plan(mode=
+    'apply') triggered a rollback attempt regardless of how far the run had
+    actually gotten."""
+    db = _CrashOnRealApplyStepInsertDB(_plan(), crash_phase="preflight")
+    res = run(runner.run_plan(db, None, 1, mode="apply"))
+    assert res.status == "aborted"
+    assert not any(s["phase"] == "rollback" for s in db.steps)
+
+
+def test_crash_after_apply_starts_still_rolls_back(_fake_executor):
+    """The flip side of the test above: apply_started must not be so
+    conservative that a REAL crash after changes were made goes unrolled."""
+    plan = _plan()
+    plan["rollback"] = [_step("rb1", ["systemctl", "restart", "nginx"], on_failure="abort")]
+    db = _CrashOnRealApplyStepInsertDB(plan, crash_phase="health_check")
+    res = run(runner.run_plan(db, None, 1, mode="apply"))
+    assert res.status in ("rolled_back", "rollback_failed")
+    assert any(s["phase"] == "rollback" for s in db.steps)
+
+
+# --- S1c: cfg.platform.family must reach checks.evaluate --------------------
+def test_platform_family_from_cfg_reaches_checks_evaluate(_fake_executor, monkeypatch):
+    """`checks.evaluate` needs `platform.family` to know which package
+    manager `pkg_version` speaks (rpm vs dpkg-query). Before this fix,
+    `runner.py:_run_check` called `checks.evaluate(db, check)` with no
+    `family` at all — which silently defaults to `rhel` regardless of what
+    `cfg.platform.family` actually says, so a debian host's `pkg_version`
+    checks ran through the rpm path (a binary that host does not have)
+    instead of the debian-specific query, or the debian-specific "cannot
+    evaluate" refusal.
+
+    Driven with a spy on `checks.evaluate` rather than asserting on the
+    outcome, so this fails for the right reason (the value was never
+    threaded through) rather than an incidental side effect of what the fake
+    executor happens to answer for `dpkg-query`.
+    """
+    from types import SimpleNamespace
+
+    from sentinel.patch import checks as checks_mod
+
+    seen_family: list[str] = []
+    real_evaluate = checks_mod.evaluate
+
+    async def spy(db_arg, check, *, family="rhel"):
+        seen_family.append(family)
+        return await real_evaluate(db_arg, check, family=family)
+
+    monkeypatch.setattr(checks_mod, "evaluate", spy)
+
+    plan = _plan()
+    plan["preflight"].append(
+        _check("pf_pkg", {"kind": "pkg_version", "name": "nginx", "at_least": "1.0"},
+              blocking=False))
+    db = _FakeDB(plan)
+    cfg = SimpleNamespace(platform=SimpleNamespace(family="debian"))
+
+    run(runner.run_plan(db, cfg, 1, mode="apply"))
+
+    assert seen_family, "checks.evaluate was never called"
+    assert "debian" in seen_family, (
+        f"cfg.platform.family='debian' never reached checks.evaluate — saw {seen_family}")

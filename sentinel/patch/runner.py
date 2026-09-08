@@ -36,7 +36,7 @@ from sentinel.db.repo import patches as repo
 from sentinel.logging_setup import get_logger
 from sentinel.patch import backup, checks
 from sentinel.patch.validator import plan_hash, validate_plan
-from sentinel.respond.executor_client import ExecutorClient
+from sentinel.respond.executor_client import TIMEOUT_MARGIN_S, ExecutorClient
 
 log = get_logger(__name__)
 
@@ -90,9 +90,15 @@ async def _exec_step(db: Database, execution_id: int, phase: str, seq: int,
     row_id = await repo.begin_step(db, execution_id, phase=phase, step_id=step_id,
                                    seq=seq, argv=argv, cwd=cwd)
     try:
+        # socket_timeout_s covers the step's OWN timeout_s (up to 3600s,
+        # executor/commands.py op_patch_step_exec) plus margin — the client's
+        # default of 30s would otherwise give up on a long-running step while
+        # it is still executing as root, and rollback could start concurrently
+        # with the step it is rolling back.
         result = await asyncio.to_thread(
             _client.call, "patch_step_exec",
-            argv=argv, cwd=cwd, timeout_s=timeout, dry_run=dry_run)
+            argv=argv, cwd=cwd, timeout_s=timeout, dry_run=dry_run,
+            socket_timeout_s=timeout + TIMEOUT_MARGIN_S)
     except Exception as exc:  # noqa: BLE001 - executor refused or unreachable
         await repo.end_step(db, row_id, status="failed", stderr=str(exc)[:2000])
         return StepOutcome(False, phase, step_id, stderr=str(exc)[:2000])
@@ -118,7 +124,7 @@ async def _exec_step(db: Database, execution_id: int, phase: str, seq: int,
 
 
 async def _run_check(db: Database, execution_id: int, phase: str, seq: int,
-                     item: dict[str, Any], *, dry_run: bool) -> StepOutcome:
+                     item: dict[str, Any], *, dry_run: bool, family: str) -> StepOutcome:
     """Evaluate one structured check and record it like any other step.
 
     A NON-blocking check that fails is recorded and tolerated: the plan author
@@ -137,7 +143,7 @@ async def _run_check(db: Database, execution_id: int, phase: str, seq: int,
                             stdout=f"(dry-run) verificare {kind}")
         return StepOutcome(True, phase, step_id, exit_code=0)
 
-    outcome = await checks.evaluate(db, check)
+    outcome = await checks.evaluate(db, check, family=family)
     blocking = bool(item.get("blocking", True))
     await repo.end_step(db, row_id, status="ok" if outcome.ok else "failed",
                         exit_code=0 if outcome.ok else 1, stdout=outcome.detail)
@@ -147,17 +153,27 @@ async def _run_check(db: Database, execution_id: int, phase: str, seq: int,
 
 
 async def _run_phase(db: Database, execution_id: int, plan: dict[str, Any], phase: str,
-                     seq_start: int, *, dry_run: bool) -> tuple[list[StepOutcome], int]:
+                     seq_start: int, *, dry_run: bool, family: str = "rhel"
+                     ) -> tuple[list[StepOutcome], int]:
     """Run one phase. Check phases evaluate typed checks; apply and rollback run
     argv steps. A failure is tolerated only when the plan says so — a
-    non-blocking check, or `on_failure: continue` on a step."""
+    non-blocking check, or `on_failure: continue` on a step.
+
+    `family` only matters for `phase in CHECK_PHASES` (it reaches
+    `checks.evaluate` via `_run_check`) — `apply`, `backup` and `rollback`
+    are always argv steps (`_exec_step`) and never touch it. Defaulted the
+    same way `checks.evaluate` defaults it, so a caller running a phase that
+    cannot possibly need it (`_rollback`, below) is not forced to plumb a
+    value through for no reason.
+    """
     outcomes: list[StepOutcome] = []
     seq = seq_start
     is_checks = phase in CHECK_PHASES
 
     for item in plan.get(phase, []) or []:
         if is_checks:
-            outcome = await _run_check(db, execution_id, phase, seq, item, dry_run=dry_run)
+            outcome = await _run_check(db, execution_id, phase, seq, item,
+                                       dry_run=dry_run, family=family)
         else:
             outcome = await _exec_step(db, execution_id, phase, seq, item, dry_run=dry_run)
             if not outcome.ok and item.get("on_failure") == "continue":
@@ -213,7 +229,12 @@ async def _run_backup(db: Database, execution_id: int, plan: dict[str, Any],
 async def _rollback(db: Database, execution_id: int, plan: dict[str, Any],
                     seq_start: int, reason: str) -> tuple[bool, list[StepOutcome]]:
     """Run the rollback steps. Always attempted with dry_run=False — a rollback
-    that only pretends to work is worse than none, because it reports success."""
+    that only pretends to work is worse than none, because it reports success.
+
+    No `family` to plumb through: `rollback` is not in `CHECK_PHASES`, so
+    `_run_phase` never reaches `checks.evaluate` for it — see `_run_phase`'s
+    own docstring.
+    """
     log.error("patch rollback starting", extra={"execution_id": execution_id, "reason": reason})
     outcomes, _ = await _run_phase(db, execution_id, plan, "rollback", seq_start, dry_run=False)
     ok = bool(outcomes) and all(o.ok for o in outcomes)
@@ -257,6 +278,21 @@ async def run_plan(db: Database, cfg: Config, plan_db_id: int, *,
     if mode == "apply" and row.status != "approved":
         raise PatchRefused(f"planul nu este aprobat (stare: {row.status})")
 
+    # Guard 4 — S3: "dry run first, always" was a claim in this docstring that
+    # the code never carried out; `apply` went straight to the real commands.
+    # An apply is now actually preceded by a full dry-run pass through the
+    # executor, as its own recorded execution, and a failing pass aborts the
+    # apply BEFORE an execution row for it is even opened — nothing has been
+    # touched yet, so there is nothing to roll back either.
+    if mode == "apply":
+        pre_check = await run_plan(db, cfg, plan_db_id, mode="dry_run",
+                                   triggered_by=f"{triggered_by}:pre-apply-dry-run")
+        if pre_check.status != "succeeded":
+            raise PatchRefused(
+                f"proba uscată dinaintea aplicării nu a reușit (execuția "
+                f"#{pre_check.execution_id}, stare {pre_check.status}): "
+                f"{pre_check.error or 'vezi pașii execuției'}")
+
     execution_id = await repo.start_execution(db, plan_db_id, mode=mode,
                                               triggered_by=triggered_by)
     log.warning("patch execution started",
@@ -266,8 +302,27 @@ async def run_plan(db: Database, cfg: Config, plan_db_id: int, *,
         await repo.set_plan_status(db, plan_db_id, "applying")
 
     dry = mode == "dry_run"
+    # S1c: `checks.evaluate` needs to know which package manager / version
+    # syntax `pkg_version` speaks — it used to run with no `family` at all,
+    # which defaults to `rhel` (see `evaluate`'s own docstring) regardless of
+    # what the host actually is, silently mis-evaluating every debian check
+    # as if `rpm` existed there. `cfg` is `None` in tests that never reach a
+    # `pkg_version` check (same reason `evaluate`'s own default exists); a
+    # real caller always supplies a real `Config`.
+    family = cfg.platform.family if cfg is not None else "rhel"
     all_steps: list[StepOutcome] = []
     seq = 1
+    # S3b: a crash is not automatically a reason to roll back. Preflight and
+    # backup do not change anything on the target — the existing failure path
+    # a few lines down already treats a FAILED step in either of them as
+    # "abort, nothing to undo" rather than a rollback. An unhandled exception
+    # (a DB write that fails mid-preflight, say) used to skip that distinction
+    # entirely and always attempt a rollback whenever `not dry`, which means
+    # running the plan's rollback steps against a machine nothing had touched
+    # yet. This flag is set the moment the loop actually reaches `apply`, so
+    # the crash handler below can tell the two situations apart the same way
+    # the normal failure path already does.
+    apply_started = False
     try:
         for phase in FORWARD_PHASES:
             if phase == "backup":
@@ -284,7 +339,10 @@ async def run_plan(db: Database, cfg: Config, plan_db_id: int, *,
                     return RunResult("aborted", execution_id, all_steps, error=reason)
                 continue
 
-            outcomes, seq = await _run_phase(db, execution_id, plan, phase, seq, dry_run=dry)
+            if phase == "apply":
+                apply_started = True
+            outcomes, seq = await _run_phase(db, execution_id, plan, phase, seq,
+                                             dry_run=dry, family=family)
             all_steps.extend(outcomes)
             failed = next((o for o in outcomes if not o.ok and not o.tolerated), None)
             if failed is None:
@@ -326,13 +384,17 @@ async def run_plan(db: Database, cfg: Config, plan_db_id: int, *,
     except Exception as exc:  # noqa: BLE001 - never leave an execution 'running'
         detail = f"{type(exc).__name__}: {exc}"
         log.error("patch runner crashed", extra={"execution_id": execution_id, "detail": detail})
-        if not dry:
+        # S3b: only roll back if `apply` had actually started. A crash during
+        # preflight or backup — nothing on the machine changed — must abort
+        # the same way a normal failure there does, not run rollback steps
+        # against an untouched system.
+        if not dry and apply_started:
             rolled_ok, rb_steps = await _rollback(db, execution_id, plan, seq + 100, detail)
             all_steps.extend(rb_steps)
             status = "rolled_back" if rolled_ok else "rollback_failed"
         else:
             status = "aborted"
         await repo.finish_execution(db, execution_id, status=status, error=detail,
-                                    rollback_reason=detail if not dry else None)
+                                    rollback_reason=detail if (not dry and apply_started) else None)
         await repo.set_plan_status(db, plan_db_id, "failed")
         return RunResult(status, execution_id, all_steps, error=detail)

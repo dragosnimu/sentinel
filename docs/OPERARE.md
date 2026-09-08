@@ -868,3 +868,65 @@ vechi decât o editare care a schimbat mărimea momelii, nu mai există nicio
 mărime de comparat, și direcția de eșec rămâne cea veche: avertisment,
 urmărire scoasă din nucleu, niciodată o citire tăcută ca să recupereze
 clasificarea — vizibil în ieșirea deploy-ului, nu tăcut.
+
+## 17. `require_pin_for_apply` — jumătate cablat, deliberat, deocamdată
+
+8 septembrie 2026: opțiunea nu citea niciodată nimic — al doilea tap aproba și
+aplica planul indiferent de valoarea ei, adică apărarea „telefon pierdut" nu
+exista deloc, doar arăta ca și cum ar exista. Reparat parțial în
+`sentinel/telegram/patch_flow.py`:
+
+* `on_stage2` citește acum `cfg.telegram.require_pin_for_apply`. Dacă e pornit
+  și `TELEGRAM_APPLY_PIN` există în `secrets.env`, planul NU se aprobă încă —
+  se ține minte cererea (în procesul botului, nu în bază) și se cere PIN-ul ca
+  răspuns la mesaj.
+* `on_pin_reply` verifică PIN-ul (comparație `hmac.compare_digest`, plafon de
+  încercări per chat, expirare) și abia atunci aprobă și aplică.
+
+**Ce lipsește, și de ce nu s-a adăugat aici**: nimic din `bot.py` nu cheamă
+`on_pin_reply` — botul n-are azi niciun handler pentru mesaje text simple,
+doar butoane. `bot.py` e al altui scriitor pentru schimbarea asta (regula
+fișierelor disjuncte). Linia care lipsește, de adăugat lângă înregistrarea
+existentă a lui `on_patch_callback` în `build_application`:
+
+```python
+from telegram.ext import MessageHandler, filters
+app.add_handler(MessageHandler(
+    filters.TEXT & filters.REPLY & ~filters.COMMAND, patch_flow.on_pin_reply))
+```
+
+**Starea până atunci, spusă direct**: pornirea `require_pin_for_apply` NU mai
+aplică patch-uri fără PIN (defect închis), dar nici nu mai poate aplica NICIUN
+patch prin Telegram — al doilea tap rămâne blocat cerând un PIN pe care nimic
+nu-l poate livra. E alegerea sigură dintre două: eșec închis (nimic nu se
+aplică) în loc de eșec deschis (orice se aplica oricum), dar tot înseamnă că
+opțiunea, pornită azi, oprește fluxul normal de aprobare din Telegram — și
+panoul web nu e o alternativă: conform §3.5 din ARHITECTURA.md, dashboard-ul
+n-are nicio cale spre executor, doar `/dry-run` și `/reject`. **Nu porni
+`require_pin_for_apply` până nu se adaugă linia de mai sus** — altfel niciun
+patch nu se mai poate aplica prin niciun canal.
+
+**Ce s-a reparat în runda a doua (8 septembrie 2026), în `on_pin_reply`:**
+
+* PIN-ul e comparat pe octeți UTF-8 (`typed.encode("utf-8")` vs
+  `expected.encode("utf-8")`), nu ca `str` — `hmac.compare_digest` ridică
+  `TypeError` pe un `str` cu orice caracter în afara ASCII, deci un PIN cu
+  diacritic (configurat sau tastat) ar fi crăpat handler-ul în loc să spună
+  pur și simplu „PIN greșit".
+* Răspunsul trebuie să fie o REPLICĂ la mesajul-prompt exact (`reply_to_message`
+  cu `message_id`-ul prompt-ului) ȘI să vină din același chat care a atins
+  „Aplică…" (`telegram:{chat_id}`) — altfel mesajul nu e tratat deloc ca o
+  încercare de PIN și trece mai departe, spre orice alt handler ar fi
+  procesat-o oricum. Fără verificarea asta, orice mesaj text trimis în chat
+  cât timp un PIN e în așteptare (o replică la altceva, o comandă complet
+  diferită) ar fi fost înghițit ca „PIN greșit" — trei din astea din
+  întâmplare epuizează `PIN_MAX_ATTEMPTS` și blochează exact aprobarea pe
+  care operatorul voia s-o facă.
+
+**Notă operațională: PIN-ul rămâne în istoricul conversației.** Telegram nu
+șterge mesajele — PIN-ul tastat ca răspuns e un mesaj text obișnuit, vizibil
+oricui are acces la istoricul acelui chat (export, telefon partajat, cont
+compromis ulterior). Un PIN static, ca apărare „telefon pierdut sau furat",
+oferă protecție doar cât timp istoricul conversației e la fel de bine păzit
+ca telefonul însuși — nu e o parolă de unică folosință și nu se comportă ca
+una.

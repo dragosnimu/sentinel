@@ -115,6 +115,39 @@ def test_a_collector_that_stopped_while_others_write_is_down():
     assert "alte surse scriu" in sshd.detail
 
 
+# --- S9: this check must not scan the whole raw_events retention window ----
+def test_ingest_sources_query_is_bounded_not_a_full_retention_scan():
+    """Measured: `raw_events` at 4.7 GB, this check on a 5-minute selfcheck
+    timer, and the query used to read `WHERE ts > now() - interval '30
+    days'` — the entire default retention window, every single pass. No
+    verdict here needs data older than a few hours (`DEFAULT_MAX_SILENCE_MIN`
+    is 180 minutes); the window must be bounded to something on that order,
+    not the retention period."""
+    db = _DB(rows=[_source("sshd", 5)])
+    run(checks.check_ingest_sources(db, _cfg()))
+    assert db.sql, "verificarea n-a interogat deloc raw_events"
+    sql = " ".join(db.sql[0].split())
+    assert "raw_events" in sql
+    assert "30 days" not in sql, (
+        "interogarea tot citește toată fereastra de retenție de 30 de zile")
+    assert "make_interval(hours" in sql or "interval" in sql.lower(), (
+        "fereastra de scanare nu mai e mărginită deloc")
+
+
+def test_ingest_sources_scan_window_is_bounded_to_hours_not_days():
+    """The bound itself must stay small — a regression back to a many-day
+    window would pass the string check above (still "an interval") while
+    reintroducing the same full-table scan under a different unit."""
+    margin = checks.DEFAULT_MAX_SILENCE_MIN * 2
+    assert checks.RAW_EVENTS_INGEST_SCAN_HOURS <= 72, (
+        f"fereastra de scanare a crescut la {checks.RAW_EVENTS_INGEST_SCAN_HOURS}h "
+        f"— înapoi spre o scanare pe zile întregi din raw_events")
+    assert checks.RAW_EVENTS_INGEST_SCAN_HOURS * 60 >= margin, (
+        "fereastra e mai mică decât marja necesară peste cel mai lung prag "
+        "per-sursă — un colector legitim de tăcut ar ieși din interogare "
+        "înainte să apuce să fie evaluat pe pragul lui")
+
+
 def test_a_quiet_night_is_not_an_outage():
     """Everything quiet together is a quiet host. Blaming each collector
     individually would be six alerts for one non-problem — and six false alerts

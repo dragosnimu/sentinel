@@ -6,7 +6,12 @@ One probe per asset per tick. The probe method follows the asset's kind:
                response with >=400 is degraded (reachable but unhealthy), no
                response is down.
 * **tcp**    — a plain TCP connect; connected is up, refused/timeout is down.
-* **systemd**— `systemctl is-active`; active is up, anything else down.
+* **systemd**— `systemctl is-active`; active is up. A socket-activated unit
+               (its OWN unit reporting `inactive` between connections) falls
+               back to `<name>.socket`, then to a raw TCP connect if the
+               asset declares a port, before being called down. See S5 in
+               the module's history: `sshd` on Ubuntu is socket-activated and
+               reported down for days under the plain check.
 * **docker** — `docker inspect` running state.
 
 A run of `down_after_failures` down samples opens an outage record; the first up
@@ -96,16 +101,70 @@ async def _probe_tcp(asset: assets_repo.Asset, timeout_s: int) -> ProbeResult:
                 await writer.wait_closed()
 
 
-async def _probe_systemd(asset: assets_repo.Asset, timeout_s: int) -> ProbeResult:
+# S5: `sshd` is the unit AND the package name on RHEL, but the Debian/Ubuntu
+# openssh-server package names its unit `ssh`, not `sshd` — an inventory entry
+# written against one family's convention must still resolve on the other.
+_DEBIAN_UNIT_ALIASES: dict[str, str] = {"sshd": "ssh", "sshd.service": "ssh.service"}
+
+
+async def _probe_systemd(asset: assets_repo.Asset, timeout_s: int, family: str) -> ProbeResult:
+    """`systemctl is-active` on the declared unit — with two escape hatches for
+    a socket-activated service, which is exactly the ssh case that reported
+    down for days on the Ubuntu host.
+
+    A socket-activated service's OWN unit reports `inactive` whenever nothing
+    is currently connected — that is what "activate on demand" means — so
+    `systemctl is-active sshd` alone cannot tell "genuinely down" from
+    "waiting for a connection". `<name>.socket` is what is actually listening,
+    and a raw TCP probe of the declared port is checked last: it is ground
+    truth regardless of what any systemd unit currently reports, and costs
+    nothing extra when the asset does not declare a port.
+
+    S5 (round 2): `failed` is not `inactive`. A socket-activated unit that is
+    merely idle (`inactive`) genuinely will start on the next connection —
+    the socket being `active` is real evidence for that. A unit that is
+    `failed` already TRIED to start (systemd spawned it on a connection, or
+    it crashed on its own) and the start itself did not work — the socket
+    still accepting connections in that state only means systemd is still
+    listening for the NEXT attempt, which is not evidence anything will
+    answer it. Measured: a `failed` service with an `active` socket and a
+    refused TCP connect used to read as `up`, on the strength of the socket
+    alone. `failed` now requires the TCP probe itself to succeed before this
+    reports up — the socket's own state cannot vouch for it.
+    """
     unit = asset.systemd_unit
     if not unit:
         return ProbeResult(status="unknown", probe="systemd", error="no unit")
+    if family == "debian":
+        unit = _DEBIAN_UNIT_ALIASES.get(unit, unit)
+
     res = await shellsafe.run_async(["systemctl", "is-active", unit], timeout_s=timeout_s)
     state = res.stdout.strip()
     if state == "active":
         return ProbeResult(status="up", probe="systemd")
     if state in ("activating", "reloading"):
         return ProbeResult(status="degraded", probe="systemd", error=state)
+
+    base = unit[: -len(".service")] if unit.endswith(".service") else unit
+    socket_res = await shellsafe.run_async(
+        ["systemctl", "is-active", f"{base}.socket"], timeout_s=timeout_s)
+    socket_active = socket_res.stdout.strip() == "active"
+
+    if socket_active and state != "failed":
+        return ProbeResult(status="up", probe="systemd")
+
+    if asset.port:
+        tcp = await _probe_tcp(asset, timeout_s)
+        if tcp.status == "up":
+            detail = (f"unit failed, but port {asset.port} answers" if state == "failed"
+                      else f"unit {state or 'inactive'}, socket inactive, "
+                           f"but port {asset.port} answers")
+            return ProbeResult(status="up", probe="systemd", error=detail)
+        if state == "failed" and socket_active:
+            return ProbeResult(
+                status="down", probe="systemd",
+                error=f"unit failed, socket activ dar portul {asset.port} refuză conexiunea")
+
     return ProbeResult(status="down", probe="systemd", error=state or "inactive")
 
 
@@ -134,7 +193,7 @@ async def probe(asset: assets_repo.Asset, cfg: Config) -> ProbeResult:
         if kind == "http":
             return await _probe_http(asset, timeout)
         if kind == "systemd":
-            return await _probe_systemd(asset, timeout)
+            return await _probe_systemd(asset, timeout, cfg.platform.family)
         if kind == "docker":
             return await _probe_docker(asset, timeout)
         if kind == "tcp":

@@ -45,6 +45,7 @@ potrivesc regulile e vorba.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -68,6 +69,7 @@ class FakeDB:
         self.rows: list[dict] = []
         self.statements: list[str] = []
         self.notifications: list[dict] = []
+        self.outage_closes: list[list[int]] = []
         self._next_id = 1
         self.clock = T0
 
@@ -136,7 +138,9 @@ class FakeDB:
                    if r["retired_at"] is None and r["name"] not in keep]
             for r in hit:
                 r["retired_at"] = self.clock
-            return [{"name": r["name"]} for r in hit]
+            # S6: retire_missing also closes any open outage for what it just
+            # retired, and reads back `id` (not just `name`) to do it.
+            return [{"id": r["id"], "name": r["name"]} for r in hit]
 
         if "FROM assets" in sql:
             rows = list(self.rows)
@@ -157,8 +161,24 @@ class FakeDB:
             rows = [r for r in rows if r["retired_at"] is None]
         return dict(rows[0]) if rows else None
 
+    # -- S6: retire_missing rulează cele două UPDATE-uri într-o tranzacție -
+    @contextlib.asynccontextmanager
+    async def transaction(self):
+        # Niciun rollback modelat aici: dublul ăsta ține rânduri în memorie și
+        # niciun test din fișier nu falsifică o eroare la jumătatea tranzacției.
+        yield self
+
     async def execute(self, sql: str, *args):
         self.statements.append(sql)
+        if "UPDATE outages" in sql:
+            # Închiderea outage-urilor la retragere are propriile teste, cu
+            # propriul dublu, în test_asset_retirement_closes_open_outages.py
+            # — aici contează doar că `retire_missing` nu se prăbușește
+            # încercând s-o emită.
+            assert "asset_id = ANY($1::bigint[])" in sql, sql
+            assert "ended_at IS NULL" in sql, sql
+            self.outage_closes.append(list(args[0]))
+            return "OK"
         assert "INSERT INTO notifications" in sql, f"execute neașteptat:\n{sql}"
         # Pozițiile se citesc din CHIAR textul instrucțiunii, ca restul dublului:
         # dacă lista de coloane se schimbă și argumentele nu, testul o vede în

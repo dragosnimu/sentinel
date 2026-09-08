@@ -12,7 +12,30 @@ AccuracySec=60
 # the 1st is not "observe the present a minute later", it is a whole month
 # with nothing proven. Persistent means a missed run fires at the next boot
 # instead of waiting for the 1st of the following month.
+#
+# Persistent=true is NOT enough on its own: it catches up on a run MISSED
+# because the host was off, using a stamp file systemd writes the first time
+# this unit ever fires. On a fresh install there is no stamp yet — nothing was
+# "missed", the timer simply has never run — so a brand-new host would wait up
+# to a month for OnCalendar to come around before the very first drill, and
+# `check_restore_drill` (see selfcheck/checks.py) has no arché with which to
+# distinguish "this deployment is a day old" from "the drill has been silently
+# broken for a month".
+#
+# OnActiveSec fires ~30 minutes after every ACTIVATION of this timer unit —
+# corrected here after round 2 read the previous wording as "once, ever",
+# which is not what systemd does: activation happens at every boot (the timer
+# is WantedBy=timers.target, so it starts on every boot the host has), and
+# again on any `systemctl restart sentinel-restore-drill.timer` (a redeploy,
+# a manual restart). So this genuinely fires more than once over a host's
+# life — install.sh only guarantees the FIRST one, ~30 minutes after install,
+# which is the property this exists for (proof within the hour, not the
+# month). The extra runs on later boots are harmless: `restore_drill.run`
+# picks whatever point is due and is cheap (checksum + extraction, not a
+# real restore), so an occasional unscheduled run costs nothing worth a
+# second unit just to prevent it.
 Persistent=true
+OnActiveSec=30min
 Unit=sentinel-restore-drill.service
 
 [Install]

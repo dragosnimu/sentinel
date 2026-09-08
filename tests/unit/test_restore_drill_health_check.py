@@ -27,26 +27,43 @@ def run(coro):
 
 
 class _DB:
-    """Întoarce exact rândurile date lui `fetch`, indiferent de SQL.
+    """`check_restore_drill` face acum DOUĂ interogări: cea a depozitului
+    (`live_restore_points_with_last_drill`, cu `restore_drills` în ea — vezi
+    S4 din checks.py) și una proprie, doar pentru vârsta punctelor (fără
+    `restore_drills`). Ciotul le distinge după conținutul SQL-ului, nu le
+    parsează.
 
-    `live_restore_points_with_last_drill` face o singură interogare; ciotul nu
-    o parsează, doar o memorează pentru asertare separată.
+    `ages` implicit se DERIVĂ din `created_at`-ul fiecărui rând din `rows`,
+    față de `NOW` — așa încât un test care nu-i pasă de vârsta „niciodată
+    testat" nu trebuie s-o specifice de două ori.
     """
 
-    def __init__(self, rows=None):
+    def __init__(self, rows=None, ages=None):
         self.rows = list(rows or [])
-        self.fetch_sql: str | None = None
+        self.ages = list(ages) if ages is not None else [
+            {"id": r["id"], "age_days": (NOW - r["created_at"]).total_seconds() / 86400}
+            for r in self.rows
+        ]
+        self.fetch_calls: list[str] = []
 
     async def fetch(self, sql, *args):
-        self.fetch_sql = sql
-        return self.rows
+        self.fetch_calls.append(sql)
+        if "restore_drills" in sql:
+            return self.rows
+        return self.ages
+
+    @property
+    def fetch_sql(self) -> str | None:
+        """Compat cu testele scrise înainte de a doua interogare: SQL-ul
+        depozitului, indiferent de ordinea în care au fost făcute apelurile."""
+        return next((s for s in self.fetch_calls if "restore_drills" in s), None)
 
 
 def _point(id_=1, asset_name="blog", *, drill=True, age_days=5.0,
            succeeded=True, notes="1 artefact(e) dovedite restaurabile",
-           result=None):
+           result=None, created_at=None):
     row = {
-        "id": id_, "asset_id": 10, "created_at": NOW - timedelta(days=90),
+        "id": id_, "asset_id": 10, "created_at": created_at or (NOW - timedelta(days=90)),
         "asset_name": asset_name,
         "drill_id": (100 + id_) if drill else None,
         "performed_at": (NOW - timedelta(days=age_days)) if drill else None,
@@ -75,17 +92,91 @@ def test_no_restore_points_at_all_is_ok_not_unknown() -> None:
     assert "nimic de testat" in r.detail
 
 
-def test_a_point_never_drilled_is_unknown_not_ok() -> None:
-    """«N-a rulat niciodată» nu e «e bine».
-
-    Cazul măsurat pe gazdă, exact: un punct de restaurare există, dar
-    exercițiul automat nu a rulat niciodată pentru el.
+def test_a_point_never_drilled_but_not_yet_due_is_unknown_not_ok() -> None:
+    """«N-a rulat niciodată» nu e «e bine» — dar nici nu e încă `down` cât
+    timp punctul e prea proaspăt ca exercițiul lunar să fi apucat un tur.
     """
-    r = run(checks.check_restore_drill(_DB([_point(drill=False)])))[0]
+    r = run(checks.check_restore_drill(_DB([
+        _point(drill=False, created_at=NOW - timedelta(days=5))])))[0]
     assert r.status == "unknown", (
-        f"un punct niciodată testat a ieșit ca {r.status}, nu «unknown»")
+        f"un punct proaspăt, niciodată testat, a ieșit ca {r.status}, nu «unknown»")
     assert r.action, "operatorul nu află cum să pornească exercițiul"
     assert "netestat" in r.title.lower() or "niciodată" in r.detail
+
+
+# --- S4: «nu e încă scadent» vs «n-a rulat niciodată, și trebuia» ----------
+def test_a_never_drilled_point_older_than_a_cycle_is_degraded_not_unknown() -> None:
+    """Un punct care există de mai mult de o lună și tot n-a fost testat
+    niciodată nu mai e «poate n-a apucat» — timer-ul chiar nu funcționează.
+
+    Eșecul pe care îl previne: `unknown` la nesfârșit, indiferent de vârstă,
+    arăta identic pentru un punct vechi de cinci minute și unul vechi de cinci
+    luni — exact confuzia pe care operatorul nu are cum s-o rezolve din panou.
+
+    NU `down`: vezi `test_no_verdict_from_this_check_is_ever_down` — rămâne o
+    decizie deliberată ca acest control să nu poată trece runda la `critical`
+    și să treacă peste orele de liniște.
+    """
+    r = run(checks.check_restore_drill(_DB([_point(
+        drill=False,
+        created_at=NOW - timedelta(days=checks.RESTORE_DRILL_NEVER_RAN_GRACE_DAYS + 5))
+    ])))[0]
+    assert r.status == "degraded", (
+        f"un punct netestat de peste o lună a ieșit ca {r.status}, nu «degraded»")
+    assert r.facts.get("never_ran") is True
+    assert "niciodată" in r.title.lower() or "niciodată" in r.detail.lower()
+
+
+def test_two_points_created_the_same_month_the_undrilled_one_is_not_a_false_alarm() -> None:
+    """S4 (round 2): the picker (`pick_restore_point_for_drill`) tests ONE
+    point per run — a deliberate monthly rotation, not a bug. Two patches
+    applied close together create two restore points; the drill gets to one
+    of them on schedule and the other waits its turn. Before this fix, the
+    second point was judged purely by ITS OWN age and read `degraded` —
+    "NEVER RAN" — even though the FIRST point's successful drill is direct
+    proof the timer works. That is backlog, not breakage, and must not
+    read as the same alarm a genuinely dead timer produces.
+    """
+    old_but_drilled = _point(
+        id_=1, asset_name="blog", drill=True, age_days=10.0, succeeded=True,
+        created_at=NOW - timedelta(days=60))
+    never_drilled_but_covered = _point(
+        id_=2, asset_name="crm", drill=False,
+        created_at=NOW - timedelta(days=checks.RESTORE_DRILL_NEVER_RAN_GRACE_DAYS + 5))
+    results = run(checks.check_restore_drill(_DB([old_but_drilled, never_drilled_but_covered])))
+    by_key = _by_key(results)
+
+    r2 = by_key["restore_drill:2"]
+    assert r2.status != "degraded", (
+        f"an undrilled point read as {r2.status!r} even though another point "
+        f"on the same host proves the drill mechanism works — a one-point-a-"
+        f"month backlog must not look like a broken timer")
+    assert r2.facts.get("never_drilled_count") == 1
+
+
+def test_a_never_drilled_point_older_than_a_cycle_with_no_other_evidence_stays_degraded() -> None:
+    """The other side of the same fix: with a SINGLE point on the host (no
+    other point to prove the mechanism), overdue-and-never-drilled must
+    still be `degraded` — this is exactly
+    `test_a_never_drilled_point_older_than_a_cycle_is_degraded_not_unknown`
+    restated to make sure the round-2 change did not soften the single-point
+    case while fixing the multi-point one."""
+    r = run(checks.check_restore_drill(_DB([_point(
+        drill=False,
+        created_at=NOW - timedelta(days=checks.RESTORE_DRILL_NEVER_RAN_GRACE_DAYS + 5))
+    ])))[0]
+    assert r.status == "degraded"
+
+
+def test_a_never_drilled_point_just_under_the_grace_period_is_still_unknown() -> None:
+    """Chiar sub prag rămâne «unknown» — pragul are răgaz pentru
+    `RandomizedDelaySec` și pentru faptul că timer-ul rulează pe 1 ale lunii,
+    nu în ziua creării punctului."""
+    r = run(checks.check_restore_drill(_DB([_point(
+        drill=False,
+        created_at=NOW - timedelta(days=checks.RESTORE_DRILL_NEVER_RAN_GRACE_DAYS - 1))
+    ])))[0]
+    assert r.status == "unknown"
 
 
 def test_a_recent_successful_drill_is_ok() -> None:
@@ -200,7 +291,10 @@ def test_no_verdict_from_this_check_is_ever_down() -> None:
     genul care se repară la 3 dimineața."""
     scenarii = {
         "gol": _DB([]),
-        "netestat": _DB([_point(drill=False)]),
+        "netestat, nu e scadent": _DB([_point(drill=False, created_at=NOW - timedelta(days=5))]),
+        "netestat, niciodată, scadent": _DB([_point(
+            drill=False,
+            created_at=NOW - timedelta(days=checks.RESTORE_DRILL_NEVER_RAN_GRACE_DAYS + 5))]),
         "picat": _DB([_point(succeeded=False, notes="coruptă")]),
         "nimic de dovedit": _DB([_point(succeeded=False,
                                         result={"informational_only": 1})]),

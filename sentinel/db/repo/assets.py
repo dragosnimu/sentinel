@@ -254,14 +254,40 @@ async def retire_missing(db: Database, keep: list[str]) -> list[str]:
         raise ValueError(
             "retire_missing refuses an empty keep list: it would retire every asset"
         )
-    rows = await db.fetch(
-        """
-        UPDATE assets
-           SET retired_at = now()
-         WHERE retired_at IS NULL
-           AND name <> ALL($1::text[])
-        RETURNING name
-        """,
-        list(keep),
-    )
+    # S6: retirement used to stop here, and that left a real gap — `list_all`
+    # excludes retired assets, so the prober never probes one again, and
+    # `close_outage` (called only from the prober's probe loop) never runs
+    # for it either. An asset that happened to be DOWN at the moment it was
+    # removed from inventory.yaml kept an outage open in the database
+    # forever: `/services`'s uptime math and any query counting open outages
+    # would carry it indefinitely, for a service nobody is watching anymore.
+    # Both statements run in one transaction so a crash between them cannot
+    # retire an asset while leaving its outage dangling.
+    async with db.transaction() as conn:
+        rows = await conn.fetch(
+            """
+            UPDATE assets
+               SET retired_at = now()
+             WHERE retired_at IS NULL
+               AND name <> ALL($1::text[])
+            RETURNING id, name
+            """,
+            list(keep),
+        )
+        if rows:
+            # Preserve the original probe error (what was actually wrong)
+            # rather than overwrite it: retirement is why the outage is being
+            # CLOSED, not what caused it. An outage with no cause yet (open
+            # but never diagnosed) gets 'retired' outright.
+            await conn.execute(
+                """
+                UPDATE outages
+                   SET ended_at = now(),
+                       duration_s = GREATEST(0, EXTRACT(EPOCH FROM (now() - started_at))::int),
+                       cause = CASE WHEN cause IS NULL OR cause = '' THEN 'retired'
+                                    ELSE cause || ' (asset retired)' END
+                 WHERE asset_id = ANY($1::bigint[]) AND ended_at IS NULL
+                """,
+                [r["id"] for r in rows],
+            )
     return [r["name"] for r in rows]

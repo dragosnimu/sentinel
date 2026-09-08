@@ -123,19 +123,25 @@ def test_stage1_refuses_when_the_plan_changed_underneath():
 
 
 def test_approval_passes_the_hash_to_the_repo():
-    body = _func(FLOW, "on_stage2")
-    assert "expected_hash=second.plan_hash" in body
+    # The actual approve_plan() call now lives in the shared `_approve_and_run`
+    # helper (S2: both the plain second tap and the PIN-success path in
+    # `on_pin_reply` must approve and run identically) — on_stage2 hands it
+    # `second.plan_hash`, and the helper forwards it as `expected_hash`.
+    stage2 = _func(FLOW, "on_stage2")
+    assert "plan_hash=second.plan_hash" in stage2
+    helper = _func(FLOW, "_approve_and_run")
+    assert "expected_hash=plan_hash" in helper
 
 
 def test_applying_revokes_every_other_button():
-    body = _func(FLOW, "on_stage2")
-    assert "revoke_for_plan" in body
+    helper = _func(FLOW, "_approve_and_run")
+    assert "revoke_for_plan" in helper
 
 
 def test_rollback_failure_is_shouted_not_summarised():
-    body = _func(FLOW, "on_stage2")
-    assert "ROLLBACK-UL A EȘUAT" in body
-    assert "restore.sh" in body                 # and tells them the way back
+    helper = _func(FLOW, "_approve_and_run")
+    assert "ROLLBACK-UL A EȘUAT" in helper
+    assert "restore.sh" in helper                 # and tells them the way back
 
 
 def test_dry_run_needs_no_token_but_still_needs_a_role():
@@ -152,9 +158,15 @@ def test_dry_run_needs_no_token_but_still_needs_a_role():
 
 def test_patch_buttons_are_routed_before_the_generic_handler():
     """A token must never fall through to the block handler, which would treat
-    it as an address."""
+    it as an address.
+
+    The generic pattern grew a `nteu:` alternative (T1 in the 8 September
+    2026 audit — that button was registered nowhere at all before), so the
+    literal string this test looks for changed too; the property being
+    guarded — patch buttons registered first — did not.
+    """
     patch_at = BOT.index('pattern=r"^(pap1:|pap2:|pdry:|prej:)"')
-    generic_at = BOT.index('pattern=r"^(blk:|unblk:|cancel$)"')
+    generic_at = BOT.index('pattern=r"^(blk:|unblk:|nteu:|cancel$)"')
     assert patch_at < generic_at
 
 

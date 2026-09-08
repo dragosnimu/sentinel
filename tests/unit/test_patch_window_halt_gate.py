@@ -47,7 +47,13 @@ def _update_and_edits(chat_id: int = 42):
 
 
 def _ctx():
-    return SimpleNamespace(bot_data={"db": object(), "cfg": SimpleNamespace()})
+    # `telegram.require_pin_for_apply` e citit DIRECT de `on_stage2` (S2) —
+    # la fel ca restul dublurilor de `cfg` din acest fișier de teste, un
+    # `SimpleNamespace` fără secțiunea asta ar pica pe ceva ce n-are nicio
+    # legătură cu oprirea la primul eșec, proprietatea pe care fișierul
+    # ăsta chiar o testează.
+    cfg = SimpleNamespace(telegram=SimpleNamespace(require_pin_for_apply=False))
+    return SimpleNamespace(bot_data={"db": object(), "cfg": cfg})
 
 
 def _wire_common(monkeypatch, *, plan_row, halt, approved=True, run_plan_calls):

@@ -30,8 +30,10 @@ look*. A check that returns nothing because a probe failed would have its own
 previous finding deleted, and the operator would be shown a recovery that never
 happened. When a check cannot read what it needs, it emits `unknown`; it does
 not fall silent. (`ingest:{source}` has one honest gap left: a ROW-judged source
-that goes quiet for more than the 30-day window drops out of the query
-altogether. Worth knowing about before extending that window's use. It no longer
+that goes quiet for more than `RAW_EVENTS_INGEST_SCAN_HOURS` (S9: narrowed from
+a 30-day scan to 48 hours, to stop this check reading the whole retention
+window of `raw_events` every five minutes) drops out of the query altogether.
+Worth knowing about before extending that window's use. It no longer
 applies to `CURSOR_BACKED_SOURCES`, whose verdict comes from the reader's own
 cursor and is therefore produced whether or not a row exists.)
 """
@@ -342,6 +344,26 @@ SOURCE_MAX_SILENCE_MIN: dict[str, int] = {
     "sshd": 180,       # ditto, though in practice never is
 }
 DEFAULT_MAX_SILENCE_MIN = 180
+
+# S9: `check_ingest_sources`'s query used to scan `raw_events` over the last
+# 30 DAYS — `retention.raw_events_days`'s own default — to compute one
+# `max(ts)` per source, on a table measured at 4.7 GB and growing, from a
+# selfcheck timer that runs every five minutes. No verdict here ever needs
+# data older than `DEFAULT_MAX_SILENCE_MIN` (180 minutes, the longest patience
+# any tracked source gets before being named); a source that HAS a row
+# anywhere inside a window this wide is judged on its own limit exactly as
+# before. 48 hours keeps sixteen times that margin — enough slack for a quiet
+# weekend on a low-traffic site — while pruning to roughly 2 of the table's
+# daily partitions instead of 30.
+#
+# The cost, stated rather than hidden: a source with genuinely ZERO rows for
+# more than this window drops out of the query and its absence is read as
+# withdrawn, not down (see the module docstring's note on this same gap,
+# previously sized at 30 days). A collector actually breaking is still caught
+# within hours by the per-source silence threshold while it still has a row
+# inside the window; what changes is only how long a source can be truly,
+# continuously silent before this specific check stops naming it.
+RAW_EVENTS_INGEST_SCAN_HOURS = 48
 
 # `check_ingest_sources` asks one comparison — "how long since ANY source last
 # wrote?" — to decide, for EVERY source past its own limit, whether it is
@@ -691,9 +713,10 @@ async def check_ingest_sources(db: Database, cfg: Config) -> list[CheckResult]:
                max(ts) AS ultim,
                EXTRACT(EPOCH FROM (now() - max(ts)))/60 AS minute_tacere
         FROM raw_events
-        WHERE ts > now() - interval '30 days'
+        WHERE ts > now() - make_interval(hours => $1)
         GROUP BY source
-        """)
+        """,
+        RAW_EVENTS_INGEST_SCAN_HOURS)
     ages = {r["source"]: float(r["minute_tacere"] or 0) for r in rows}
     # Judged on the cursor, so it is asked BEFORE the "no rows at all" branch and
     # survives it: a host where Suricata has matched nothing for a month has no
@@ -2999,6 +3022,18 @@ async def check_last_scan(db: Database, cfg: Config) -> list[CheckResult]:
 # un timer oprit de-a binelea să treacă neobservat un sezon întreg.
 RESTORE_DRILL_STALE_DAYS = 45
 
+# S4: a restore point that has NEVER been drilled used to report `unknown`
+# forever, at any age — a point five minutes old and one five months old read
+# identically. That collapses two different facts operators need told apart:
+# "the monthly timer has not had a turn yet" (fine, wait) and "the timer is
+# not doing its job at all" (`sentinel-restore-drill.timer` disabled, masked,
+# or crashing before it ever writes a `restore_drills` row — none of which
+# `check_restore_drill` could previously distinguish from "just installed").
+# One period plus slack: the timer runs on the 1st of the month, so a point
+# created on the 2nd waits nearly a full cycle for its first legitimate shot
+# — 35 days is the shortest bound that does not fire on that ordinary case.
+RESTORE_DRILL_NEVER_RAN_GRACE_DAYS = 35
+
 
 def _drill_had_nothing_to_prove(counts: dict) -> bool:
     """Un punct fără nicio arhivă în el nu are ce extrage — deci exercițiul,
@@ -3052,6 +3087,16 @@ async def check_restore_drill(db: Database) -> list[CheckResult]:
         extragere izolată, checksum și potrivire de căi că cel puțin o
         arhivă chiar se reface.
 
+    Runda a doua a adăugat o a cincea nuanță, nu o a cincea stare: un punct
+    NICIODATĂ testat și scadent (peste `RESTORE_DRILL_NEVER_RAN_GRACE_DAYS`)
+    e `degraded` DOAR când NICIUN punct de pe gazdă n-a fost vreodată testat
+    — `pick_restore_point_for_drill` alege UN singur punct pe lună, deliberat
+    (Funcționalitatea 07), deci două puncte create în aceeași lună lasă unul
+    din ele netestat câteva săptămâni fără ca mecanismul să fie stricat. Dacă
+    ALT punct de pe aceeași gazdă a fost testat, punctul ăsta rămâne `ok` —
+    dovada că temporizatorul chiar rulează e chiar acel alt punct — cu
+    `facts.never_drilled_count` numind câte așteaptă rândul.
+
     O gazdă fără niciun punct de restaurare încă (instalare proaspătă, nimic
     de patch-uit) e `ok`, la fel ca `scan:last` cu `scan.enabled: false` —
     e o stare validă, nu o măsurătoare lipsă.
@@ -3065,20 +3110,101 @@ async def check_restore_drill(db: Database) -> list[CheckResult]:
             detail="niciun punct de restaurare pe gazdă — nimic de testat încă",
             facts={"points": 0})]
 
+    # S4: vârsta se citește AICI, cu ceasul bazei — nu în Python — din același
+    # motiv ca `drill_age_min` de mai sus (§3.13 din ARHITECTURA.md): un decalaj
+    # de ceas ar apărea ca o vechime inventată. O interogare separată, nu o
+    # extindere a `live_restore_points_with_last_drill`, ca să nu treacă prin
+    # `db/repo/patches.py`.
+    age_rows = await db.fetch(
+        "SELECT id, EXTRACT(EPOCH FROM (now() - created_at)) / 60 / 60 / 24 "
+        "       AS age_days "
+        "FROM restore_points WHERE deleted_at IS NULL")
+    point_age_days = {r["id"]: float(r["age_days"]) for r in age_rows}
+
+    # S4 (round 2): `pick_restore_point_for_drill` runs the exercise on ONE
+    # point per month — a deliberate choice (Funcționalitatea 07's own
+    # docstring), not a bug on its own. But this loop used to judge each
+    # point purely by ITS OWN age, so two patches applied in the same month
+    # (two new restore points) meant the second one sat "never ran" for
+    # weeks even though the mechanism was proven working — the FIRST point
+    # got drilled right on schedule. That read as "the timer is broken" when
+    # the truth was "the timer works and has a one-point-a-month backlog".
+    #
+    # `has_any_drill_ever` is evidence, from THIS host's live points, that
+    # `sentinel-restore-drill.timer` actually runs and writes rows — scoped
+    # to live points (not the full `restore_drills` history) on purpose, the
+    # same "only what this check can currently see" honesty every other
+    # verdict here already applies; a point later deleted is not visible
+    # either way. With that evidence in hand, a single still-undrilled point
+    # is backlog, not breakage, and reads `ok`, not `degraded` — the
+    # `degraded` "NEVER RAN" verdict is now reserved for the genuinely
+    # alarming case: NOTHING on this host has ever been drilled, and the
+    # oldest untested point has already waited longer than a cycle.
+    has_any_drill_ever = any(p.get("drill_id") is not None for p in points)
+    never_drilled_count = sum(1 for p in points if p.get("drill_id") is None)
+
     results: list[CheckResult] = []
     for p in points:
         label = p.get("asset_name") or f"punct {p['id']}"
         key = f"restore_drill:{p['id']}"
 
         if p.get("drill_id") is None:
-            results.append(CheckResult(
-                key, f"Restaurare netestată — {label}", "unknown",
-                detail="niciun exercițiu automat rulat încă pentru acest punct de "
-                       "restaurare — «are un backup» și «se poate restaura» nu sunt "
-                       "același fapt",
-                action="systemctl start sentinel-restore-drill ; "
-                       "journalctl -u sentinel-restore-drill -n 50",
-                facts={"restore_point_id": p["id"], "asset": label}))
+            point_age = point_age_days.get(p["id"])
+            # Vârsta punctului n-a putut fi citită (rândul a dispărut între
+            # cele două interogări, sau ceva la fel de neobișnuit) — nu se
+            # presupune nici „scadent", nici „nu încă"; starea rămâne
+            # `unknown`, ca peste tot în fișierul ăsta.
+            overdue = point_age is not None and point_age > RESTORE_DRILL_NEVER_RAN_GRACE_DAYS
+            if overdue and not has_any_drill_ever:
+                # NU `down`: `test_no_verdict_from_this_check_is_ever_down`
+                # ține în loc o decizie deliberată — `down` face runda
+                # `critical`, care trece peste orele de liniște, iar un
+                # exercițiu de restaurare netestat nu e genul de lucru care
+                # se repară la 3 dimineața. `degraded` e deja starea folosită
+                # mai jos pentru „a rulat, dar e învechit" — același regim de
+                # urgență i se potrivește și lui „n-a rulat niciodată, deși
+                # trebuia să fi apucat un tur".
+                results.append(CheckResult(
+                    key, f"Exercițiul de restaurare NU a rulat NICIODATĂ — {label}",
+                    "degraded",
+                    detail=f"punctul există de {int(point_age)} zile, mai mult decât "
+                           f"un ciclu lunar, și n-a fost testat niciodată — nici "
+                           f"ACEST punct, nici altul de pe gazdă — "
+                           f"sentinel-restore-drill.timer nu rulează, e mascat, sau "
+                           f"pică înainte să scrie vreun rând în restore_drills",
+                    action="systemctl status sentinel-restore-drill.timer ; "
+                           "systemctl start sentinel-restore-drill ; "
+                           "journalctl -u sentinel-restore-drill -n 50",
+                    facts={"restore_point_id": p["id"], "asset": label,
+                           "age_days": int(point_age), "never_ran": True}))
+            elif overdue:
+                # Overdue on its OWN age, but at least one other point on
+                # this host HAS been drilled — the mechanism runs, it just
+                # has not gotten to this one yet (one drill per month).
+                results.append(CheckResult(
+                    key, f"Restaurare netestată încă — {label}", "ok",
+                    detail=f"punctul există de {int(point_age)} zile fără exercițiu "
+                           f"propriu, dar mecanismul e dovedit funcțional pe gazdă "
+                           f"(alt punct a fost testat) — {never_drilled_count} "
+                           f"punct(e) netestate încă așteaptă rândul lor, câte unul "
+                           f"pe lună",
+                    action="scripts/sentinel_query.py restore_drill_items "
+                           "--format table  # vezi ce a testat deja mecanismul",
+                    facts={"restore_point_id": p["id"], "asset": label,
+                           "age_days": int(point_age), "never_ran": True,
+                           "never_drilled_count": never_drilled_count,
+                           "mechanism_proven_elsewhere": True}))
+            else:
+                results.append(CheckResult(
+                    key, f"Restaurare netestată — {label}", "unknown",
+                    detail="niciun exercițiu automat rulat încă pentru acest punct de "
+                           "restaurare, dar nu e încă scadent (rulează lunar) — "
+                           "«are un backup» și «se poate restaura» nu sunt "
+                           "același fapt",
+                    action="systemctl start sentinel-restore-drill ; "
+                           "journalctl -u sentinel-restore-drill -n 50",
+                    facts={"restore_point_id": p["id"], "asset": label,
+                           "age_days": (int(point_age) if point_age is not None else None)}))
             continue
 
         age_min = p.get("drill_age_min")

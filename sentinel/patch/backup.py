@@ -25,7 +25,7 @@ from typing import Any
 from sentinel.db.engine import Database
 from sentinel.db.repo import patches as repo
 from sentinel.logging_setup import get_logger
-from sentinel.respond.executor_client import ExecutorClient
+from sentinel.respond.executor_client import TIMEOUT_MARGIN_S, ExecutorClient
 
 log = get_logger(__name__)
 
@@ -34,6 +34,12 @@ _client = ExecutorClient()
 # Refuse to back up unless the filesystem has this multiple of the estimate
 # free. Filling the disk while making a safety copy turns one problem into two.
 DEFAULT_SPACE_MULTIPLIER = 3
+
+#: The executor's own cap on a `path`-kind backup's tar invocation
+#: (executor/commands.py, op_backup_create). The client's socket timeout for
+#: that call must exceed it, or a large archive gets reported as a backup
+#: failure while it is still being written as root.
+_BACKUP_CREATE_TAR_TIMEOUT_S = 1800
 
 
 class BackupRefused(Exception):
@@ -84,7 +90,8 @@ async def create(db: Database, *, plan_db_id: int | None, asset_id: int | None,
         try:
             res = await asyncio.to_thread(
                 _client.call, "backup_create",
-                kind=item.get("kind", "path"), source=source, restore_point_id=rp_id)
+                kind=item.get("kind", "path"), source=source, restore_point_id=rp_id,
+                socket_timeout_s=_BACKUP_CREATE_TAR_TIMEOUT_S + TIMEOUT_MARGIN_S)
         except Exception as exc:  # noqa: BLE001
             raise BackupRefused(f"backup eșuat pentru {source}: {exc}") from exc
         if not res.get("ok", True):

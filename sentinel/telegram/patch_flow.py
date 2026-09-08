@@ -14,10 +14,17 @@ is built to be hard to do by accident and impossible to do by replay:
     the hash, so once the bytes change, an old button matches nothing.
   * **Dry run needs no approval.** Seeing what WOULD happen is not a change, and
     requiring ceremony for it just trains people to skip ceremony.
+  * **A PIN, if configured, gates the approval itself.** `require_pin_for_apply`
+    is defence in depth for a lost or stolen phone: `approve_plan` is not
+    called until the correct PIN is typed back, compared constant-time, with a
+    per-chat attempt cap. See `on_pin_reply`.
 """
 
 from __future__ import annotations
 
+import hmac
+import time
+from dataclasses import dataclass
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -207,27 +214,61 @@ async def on_stage2(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 f"până la o decizie a operatorului.")
             return
 
-    approved = await patches.approve_plan(db, second.plan_id or 0, by=by,
-                                          expected_hash=second.plan_hash or "")
+    # S2: `require_pin_for_apply` used to be read nowhere — the second tap
+    # approved and ran the plan regardless of the setting, which is not
+    # "defence in depth", it is a config key that does nothing. The PIN now
+    # actually gates `approve_plan`: it is not called until the correct PIN
+    # is typed. See `on_pin_reply` for why submitting it needs one more line
+    # in `bot.py` that this file cannot add on its own.
+    if cfg.telegram.require_pin_for_apply:
+        pin = _configured_pin()
+        if pin is None:
+            await query.edit_message_text(
+                "⛔ telegram.require_pin_for_apply este activat, dar "
+                "TELEGRAM_APPLY_PIN nu e setat în secrets.env — aplicarea e "
+                "refuzată, nu trecută cu vederea.")
+            return
+        prompt = await query.edit_message_text(
+            f"🔒 <b>Răspunde la acest mesaj cu PIN-ul</b> ca să confirmi aplicarea "
+            f"— ai {PIN_TTL_S // 60} minute.", parse_mode=ParseMode.HTML)
+        # S2 (round 2): the prompt's own message_id is recorded so
+        # `on_pin_reply` can require the reply to be a reply TO THIS MESSAGE
+        # — see the comment there for why a wired-up text handler cannot
+        # simply trust "some text arrived while a PIN is pending".
+        _pending_pins[chat_id] = _PendingPin(
+            plan_id=second.plan_id or 0, plan_hash=second.plan_hash or "", by=by,
+            expires_at=time.monotonic() + PIN_TTL_S,
+            prompt_message_id=getattr(prompt, "message_id", None))
+        return
+
+    await _approve_and_run(db, cfg, query.edit_message_text,
+                           plan_id=second.plan_id or 0,
+                           plan_hash=second.plan_hash or "", by=by)
+
+
+async def _approve_and_run(db: Database, cfg: Any, edit: Any, *,
+                           plan_id: int, plan_hash: str, by: str) -> None:
+    """Approve the exact bytes, then run. Shared by the plain second-tap path
+    and the PIN-success path in `on_pin_reply` — `edit` is whichever of
+    `CallbackQuery.edit_message_text` or `Message.edit_text` fits the caller,
+    both taking the text as their first positional argument."""
+    approved = await patches.approve_plan(db, plan_id, by=by, expected_hash=plan_hash)
     if not approved:
-        await query.edit_message_text(
+        await edit(
             "⛔ Planul nu a putut fi aprobat — s-a schimbat sau nu mai e în starea "
             "'validated'.")
         return
     # Any other button for this plan dies now, including ones in other chats.
-    await approvals.revoke_for_plan(db, second.plan_id or 0)
+    await approvals.revoke_for_plan(db, plan_id)
 
-    await query.edit_message_text("⏳ Aplic planul… primești rezultatul aici.",
-                                  parse_mode=ParseMode.HTML)
-    log.warning("patch approved from telegram",
-                extra={"plan": second.plan_id, "chat": chat_id})
+    await edit("⏳ Aplic planul… primești rezultatul aici.", parse_mode=ParseMode.HTML)
+    log.warning("patch approved from telegram", extra={"plan": plan_id, "by": by})
 
     from sentinel.patch import runner
     try:
-        result = await runner.run_plan(db, cfg, second.plan_id or 0,
-                                       mode="apply", triggered_by=by)
+        result = await runner.run_plan(db, cfg, plan_id, mode="apply", triggered_by=by)
     except runner.PatchRefused as exc:
-        await query.edit_message_text(f"⛔ Refuzat înainte de execuție: {_esc(exc)}")
+        await edit(f"⛔ Refuzat înainte de execuție: {_esc(exc)}")
         return
 
     icon = {"succeeded": "✅", "rolled_back": "↩️", "rollback_failed": "🔴",
@@ -241,7 +282,144 @@ async def on_stage2(update: Update, context: ContextTypes.DEFAULT_TYPE,
                     "<code>restore.sh</code>.")
     ok = sum(1 for s in result.steps if s.ok)
     body.append(f"\nPași: {ok}/{len(result.steps)} reușiți")
-    await query.edit_message_text("\n".join(body), parse_mode=ParseMode.HTML)
+    await edit("\n".join(body), parse_mode=ParseMode.HTML)
+
+
+# ---------------------------------------------------------------------------
+# S2 — the PIN itself
+# ---------------------------------------------------------------------------
+# A pending PIN wait, in-process only, keyed by chat_id. A restart drops it —
+# the operator just taps "Aplică…" again. Persisting it would need a schema
+# change for a "static PIN, defence in depth if a phone is lost" feature;
+# worth revisiting if that trade stops being obviously right, not decided
+# here (see docs/PATCHING.md).
+PIN_TTL_S = 300              # same window as the stage-2 confirmation itself
+PIN_MAX_ATTEMPTS = 3
+
+
+@dataclass
+class _PendingPin:
+    plan_id: int
+    plan_hash: str
+    by: str
+    expires_at: float
+    # The prompt message's own id — `on_pin_reply` requires the reply to
+    # point AT THIS MESSAGE, not just "some text arrived in this chat while
+    # a PIN was pending". `None` (a prompt the send call failed to report an
+    # id for) never matches a real message_id, which is fail-closed on the
+    # same reasoning as `expected is None` a few lines down.
+    prompt_message_id: int | None = None
+    attempts: int = 0
+
+
+_pending_pins: dict[int, _PendingPin] = {}
+
+
+def _configured_pin() -> str | None:
+    """The operator's PIN, or `None` if it is not set. A blank secret must
+    never be treated as "any reply matches" — `on_pin_reply` refuses outright
+    rather than comparing against an empty string."""
+    from sentinel.config import get_secrets
+    pin = get_secrets().get("TELEGRAM_APPLY_PIN")
+    return pin if pin else None
+
+
+async def on_pin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Consume a text reply as a PIN attempt, if one is pending for this chat.
+
+    Returns `True` if the message was handled as a PIN attempt (right, wrong,
+    or expired) and `False` if there is no pending PIN for this chat, so a
+    caller wiring this into a generic text handler knows whether to also try
+    treating the message as something else.
+
+    NOT YET WIRED to anything: `bot.py` has no text-message handler today —
+    every interaction in this flow is an inline-button callback. This
+    function is complete and covered by its own tests, but until one line is
+    added to `sentinel/telegram/bot.py:build_application`, next to the
+    existing `CallbackQueryHandler(on_patch_callback, ...)` registration —
+
+        from telegram.ext import MessageHandler, filters
+        app.add_handler(MessageHandler(
+            filters.TEXT & filters.REPLY & ~filters.COMMAND, on_pin_reply))
+
+    — no PIN can ever reach it. `bot.py` belongs to a different writer for
+    this change. Until that line exists, turning `require_pin_for_apply` on
+    makes stage 2 stop and wait for a PIN that cannot be delivered, which is
+    deliberate: failing CLOSED (no apply happens) is the same rule this
+    codebase applies to every other check it cannot evaluate — the option
+    used to fail OPEN instead (it approved and ran regardless), which is the
+    defect this fix closes even before the handler is wired.
+
+    Round 2 adds two checks BEFORE anything is treated as a PIN attempt:
+
+    * **The message must be a reply to the PIN prompt itself.** The filter
+      in the (not yet wired) handler above is `filters.TEXT & filters.REPLY`
+      — any text reply, to ANY message, while a PIN happens to be pending.
+      Without pinning it to the prompt's own `message_id`, an unrelated
+      message the operator sends to the same chat during the 5-minute
+      window (a reply to something else entirely) would be swallowed as a
+      WRONG PIN attempt instead of reaching whatever handler it was actually
+      meant for — three of those by accident burns all `PIN_MAX_ATTEMPTS`
+      and locks out the real approval. A mismatch here returns `False`,
+      the same as "no pending PIN", so the message falls through to
+      whatever else the caller's dispatcher would have done with it.
+    * **The replier must be who tapped stage 2.** Reconstructed the same
+      way `by` is built everywhere else in this file — `telegram:{chat_id}`,
+      chat-scoped, matching `_can_act`'s own model in `bot.py` (a private
+      chat IS the person; a group's members share one allowlist entry).
+      This cannot fail today while `_pending_pins` stays keyed by chat_id —
+      the lookup above already guarantees it — but it is the same
+      belt-and-suspenders this file already applies to `expected is None`:
+      if the keying ever changes, THIS is what still refuses instead of
+      silently trusting a dict key that no longer means what it used to.
+    """
+    chat_id = update.effective_chat.id
+    pending = _pending_pins.get(chat_id)
+    if pending is None:
+        return False
+
+    reply_to = update.message.reply_to_message if update.message else None
+    if reply_to is None or reply_to.message_id != pending.prompt_message_id:
+        return False
+
+    replier = f"telegram:{chat_id}"
+    if replier != pending.by:
+        return False
+
+    if time.monotonic() > pending.expires_at:
+        del _pending_pins[chat_id]
+        await update.message.reply_text("⛔ PIN-ul a expirat. Cere planul din nou.")
+        return True
+
+    expected = _configured_pin()
+    typed = (update.message.text or "").strip()
+    # S2 (round 2): `hmac.compare_digest` raises `TypeError` on a `str`
+    # containing anything outside ASCII — a typed PIN like "ă1234" or a
+    # configured PIN with a diacritic ("parolă") would crash this handler
+    # instead of comparing it. Encoding both sides to bytes first is what
+    # every other constant-time comparison in this codebase already does;
+    # `compare_digest` itself is constant-time on bytes regardless of what
+    # they decode to.
+    if expected is None or not hmac.compare_digest(
+        typed.encode("utf-8"), expected.encode("utf-8")
+    ):
+        pending.attempts += 1
+        if pending.attempts >= PIN_MAX_ATTEMPTS:
+            del _pending_pins[chat_id]
+            await update.message.reply_text(
+                "⛔ Prea multe încercări greșite. Cere planul din nou.")
+        else:
+            await update.message.reply_text(
+                f"⛔ PIN greșit ({pending.attempts}/{PIN_MAX_ATTEMPTS}).")
+        return True
+
+    del _pending_pins[chat_id]
+    db: Database = context.bot_data["db"]
+    cfg = context.bot_data["cfg"]
+    progress = await update.message.reply_text("⏳ Aplic planul… primești rezultatul aici.")
+    await _approve_and_run(db, cfg, progress.edit_text, plan_id=pending.plan_id,
+                           plan_hash=pending.plan_hash, by=pending.by)
+    return True
 
 
 async def on_dry_run(update: Update, context: ContextTypes.DEFAULT_TYPE,

@@ -402,3 +402,239 @@ telegram:
     assert cfg.ship.url == ""
     assert cfg.ship.max_rows_per_batch == 2000
     assert cfg.ship.max_backfill_days == 7
+
+
+# --- S8: values that read as valid and kill a daemon at runtime ------------
+def test_a_quoted_ai_budget_is_refused_instead_of_crashing_every_30s(tmp_path):
+    """Confirmed on production: `ai.daily_budget_usd: '5'` reached the budget
+    arithmetic unchanged and raised TypeError every single check, forever."""
+    with pytest.raises(ConfigError, match="daily_budget_usd"):
+        load_config(_write(tmp_path, """
+ai:
+  daily_budget_usd: '5'
+telegram:
+  enabled: false
+"""))
+
+
+def test_a_negative_ai_budget_is_refused_instead_of_silently_disabling_ai(tmp_path):
+    """Confirmed on production: -1 turned the AI layer off with no error and
+    no distinction from `ai.enabled: false` — a typo reads as a decision."""
+    with pytest.raises(ConfigError, match="daily_budget_usd"):
+        load_config(_write(tmp_path, """
+ai:
+  daily_budget_usd: -1
+telegram:
+  enabled: false
+"""))
+
+
+def test_a_nan_ai_budget_is_refused_not_a_cap_that_never_applies(tmp_path):
+    """S8 (round 2): YAML's `.nan` parses straight into a real Python float,
+    so `isinstance(value, (int, float))` was TRUE for it and it sailed
+    through unchanged — `spent >= .nan` is always False in `budget.py`, so
+    the cap silently never applied, no matter how much was spent."""
+    with pytest.raises(ConfigError, match="daily_budget_usd"):
+        load_config(_write(tmp_path, """
+ai:
+  daily_budget_usd: .nan
+telegram:
+  enabled: false
+"""))
+
+
+def test_an_infinite_ai_budget_is_refused(tmp_path):
+    """The other direction of the same bug: `.inf` compares as "always under
+    budget", which is the same "the cap never applies" outcome."""
+    with pytest.raises(ConfigError, match="daily_budget_usd"):
+        load_config(_write(tmp_path, """
+ai:
+  daily_budget_usd: .inf
+telegram:
+  enabled: false
+"""))
+
+
+def test_a_negative_monthly_ai_budget_is_refused(tmp_path):
+    with pytest.raises(ConfigError, match="monthly_budget_usd"):
+        load_config(_write(tmp_path, """
+ai:
+  monthly_budget_usd: -50
+telegram:
+  enabled: false
+"""))
+
+
+def test_an_empty_model_name_is_refused(tmp_path):
+    """An empty model name reaches the Messages API as a request naming no
+    model — every call on that tier fails, not just the unusual ones."""
+    with pytest.raises(ConfigError, match="model_fast"):
+        load_config(_write(tmp_path, """
+ai:
+  model_fast: ''
+telegram:
+  enabled: false
+"""))
+
+
+def test_ai_checks_are_skipped_while_ai_is_disabled(tmp_path):
+    """A disabled AI layer must not refuse to start over budget or model
+    fields nobody is going to read."""
+    cfg = load_config(_write(tmp_path, """
+ai:
+  enabled: false
+  daily_budget_usd: -1
+  model_fast: ''
+telegram:
+  enabled: false
+"""))
+    assert cfg.ai.enabled is False
+
+
+def test_pool_max_below_pool_min_is_refused_not_left_for_asyncpg(tmp_path):
+    """Confirmed on production: `pool_min: 20, pool_max: 2` reaches asyncpg's
+    own pool constructor, which raises ValueError — every one of the daemons
+    that opens a pool then exits 1 and restart-loops."""
+    with pytest.raises(ConfigError, match="pool_max"):
+        load_config(_write(tmp_path, """
+database:
+  pool_min: 20
+  pool_max: 2
+telegram:
+  enabled: false
+"""))
+
+
+def test_zero_pool_min_is_refused(tmp_path):
+    with pytest.raises(ConfigError, match="pool_min"):
+        load_config(_write(tmp_path, """
+database:
+  pool_min: 0
+  pool_max: 5
+telegram:
+  enabled: false
+"""))
+
+
+def test_zero_statement_timeout_is_refused(tmp_path):
+    """Zero disables Postgres's own statement_timeout — a single stuck query
+    then holds a connection out of an already small pool forever."""
+    with pytest.raises(ConfigError, match="statement_timeout_ms"):
+        load_config(_write(tmp_path, """
+database:
+  statement_timeout_ms: 0
+telegram:
+  enabled: false
+"""))
+
+
+def test_an_unknown_timezone_is_refused(tmp_path):
+    """`timezone: Mars/Olympus` reads as a plausible IANA name and is exactly
+    the shape that must be caught at load, not three services later where
+    util/tz.py degrades noisily per call instead of refusing to start."""
+    with pytest.raises(ConfigError, match="timezone"):
+        load_config(_write(tmp_path, """
+timezone: Mars/Olympus
+telegram:
+  enabled: false
+"""))
+
+
+def test_an_unknown_telegram_timezone_is_also_refused(tmp_path):
+    with pytest.raises(ConfigError, match="telegram.timezone"):
+        load_config(_write(tmp_path, """
+telegram:
+  enabled: false
+  timezone: Mars/Olympus
+"""))
+
+
+def test_a_whitespace_only_timezone_is_refused_not_a_crash(tmp_path):
+    """S8 (round 2), confirmed with Python's own `zoneinfo` on this machine:
+    `ZoneInfo("  ")` does not raise `ZoneInfoNotFoundError` or `ValueError`
+    — it raises `PermissionError` trying to open a path built from the blank
+    string, which the old `except (ZoneInfoNotFoundError, ValueError)` did
+    not catch. `load_config` crashed with an unhandled exception instead of
+    the clean `ConfigError` every other bad value here gets."""
+    with pytest.raises(ConfigError, match="timezone"):
+        load_config(_write(tmp_path, """
+timezone: "  "
+telegram:
+  enabled: false
+"""))
+
+
+def test_a_timezone_padded_with_whitespace_still_loads(tmp_path):
+    """The fix strips before validating — padding around a REAL zone name
+    must not be refused, only whitespace-only collapsing to blank. The
+    STORED value must be stripped too, not just the copy validation looked
+    at: `util/tz.py:zone()` calls `ZoneInfo(cfg.timezone)` directly with
+    whatever `load_config` left on the object, so a config-check that
+    passes while the stored value still has padding would still fail at
+    every actual window evaluation, silently degrading to the host zone."""
+    cfg = load_config(_write(tmp_path, """
+timezone: "  Europe/Bucharest  "
+telegram:
+  enabled: false
+"""))
+    assert cfg.timezone == "Europe/Bucharest", (
+        f"cfg.timezone is {cfg.timezone!r} — the stored value still carries "
+        f"whitespace, not just the string it was validated against")
+
+
+def test_a_real_timezone_still_loads(tmp_path):
+    cfg = load_config(_write(tmp_path, """
+timezone: Europe/Bucharest
+telegram:
+  enabled: false
+  timezone: America/New_York
+"""))
+    assert cfg.timezone == "Europe/Bucharest"
+    assert cfg.telegram.timezone == "America/New_York"
+
+
+def test_non_integer_chat_ids_are_refused(tmp_path):
+    """Confirmed on production: `allowed_chat_ids: ['abc']` was accepted
+    outright. A chat id compared against `update.effective_chat.id` (always
+    an int) would then never match anything — the allowlist looks populated
+    in config-check while rejecting every command."""
+    with pytest.raises(ConfigError, match=r"allowed_chat_ids\[0\]"):
+        load_config(_write(tmp_path, """
+telegram:
+  enabled: true
+  allowed_chat_ids: ['abc']
+"""))
+
+
+def test_a_bool_disguised_as_a_chat_id_is_refused(tmp_path):
+    """`bool` is a subclass of `int` in Python; YAML's `true`/`false` must
+    not slip through a `list[int]` check that only asks `isinstance(x, int)`."""
+    with pytest.raises(ConfigError, match=r"allowed_chat_ids\[0\]"):
+        load_config(_write(tmp_path, """
+telegram:
+  enabled: true
+  allowed_chat_ids: [true]
+"""))
+
+
+def test_a_non_string_entry_in_a_list_str_field_is_refused(tmp_path):
+    with pytest.raises(ConfigError, match=r"nginx_log_paths\[0\]"):
+        load_config(_write(tmp_path, """
+ingest:
+  nginx_log_paths: [123]
+telegram:
+  enabled: false
+"""))
+
+
+def test_a_quoted_pool_min_is_refused_not_silently_accepted(tmp_path):
+    """The int-coercion gap was not specific to floats: a string int (`'5'`)
+    passed through `_coerce` unchanged before this fix, for every int field,
+    not only the ones this audit happened to measure."""
+    with pytest.raises(ConfigError, match="pool_min"):
+        load_config(_write(tmp_path, """
+database:
+  pool_min: '5'
+telegram:
+  enabled: false
+"""))

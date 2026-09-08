@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Callable, Sequence
+from typing import Any
 
 from sentinel import __version__
 from sentinel.errors import ConfigError, SentinelError
@@ -65,6 +66,87 @@ def _run_service(name: str, args: argparse.Namespace,
     return entry(list(extra))
 
 
+async def _read_max_connections(cfg: Any) -> int | None:
+    """The server's own `max_connections`, or `None` if it cannot be read —
+    which must not read as "no limit"; the caller says so explicitly."""
+    from sentinel.db.engine import Database
+
+    db = Database(cfg)
+    try:
+        await db.connect()
+        value = await db.fetchval("SHOW max_connections")
+        return int(value) if value is not None else None
+    except Exception:  # noqa: BLE001 - config-check must not crash over this
+        return None
+    finally:
+        await db.close()
+
+
+# S8 (round 2): `len(SERVICES)` — 14 entries — was never a count of what
+# actually holds a pool open continuously. It counted `restoredrill` and
+# `patchwindow` (a monthly and a periodic job, not a resident daemon) and
+# `scan`, `health`, `maintenance`, `selfcheck`, `reconcile` (systemd-timer
+# oneshots that connect, do one pass, and exit) right alongside the seven
+# processes that actually sit there holding a pool 24/7. The old docstring
+# even SAID restoredrill/patchwindow ran "briefly, not continuously" while
+# the code counted them anyway — the number (`14 × pool_max`) was never
+# believable on inspection, which is its own failure: a warning line an
+# operator cannot mentally check is a warning line they stop reading.
+#
+# These seven are the ones actually worth multiplying: each is started once
+# by systemd and stays up, holding its own pool, for the life of the host.
+_PERSISTENT_POOL_SERVICES = ("ingest", "detect", "ai", "web", "beacon", "ship", "telegram")
+
+
+def _connection_budget_line(cfg: Any) -> str:
+    """S8: `pool_max` reads as sane in isolation while the PRODUCT across
+    every daemon that opens a pool is what actually competes for the
+    server's `max_connections` — confirmed on both production hosts, where
+    the server allows 40. `_PERSISTENT_POOL_SERVICES` counts only the
+    processes that hold a pool open continuously (the executor and watchdog
+    do not use asyncpg at all and are excluded by construction); the timer
+    oneshots (`health` every 30s, `selfcheck` every 5min, and the rest of
+    `SERVICES` not in this list) each add a SHORT, non-overlapping spike on
+    top of the number below, not a standing consumer — worth knowing about
+    but not worth inflating the headline number past what an operator can
+    sanity-check by eye.
+
+    On the shipped defaults (`database.pool_min=2`/`pool_max=10`,
+    `max_connections=40`) this still warns — 7 × 10 = 70 > 40 — which is
+    correct: those defaults really do not fit the server's own default limit
+    without the operator either raising `max_connections` or lowering
+    `pool_max`, and this line exists so that gets noticed at `config-check`
+    time, not the first time a timer oneshot cannot get a connection.
+
+    Reads the server's real limit if it is reachable; says plainly that it
+    could not if not, rather than silently skipping the check — "could not
+    tell" and "fine" must not look the same here either.
+    """
+    import asyncio
+
+    n = len(_PERSISTENT_POOL_SERVICES)
+    budget = n * cfg.database.pool_max
+    oneshots = [s for s in SERVICES if s not in _PERSISTENT_POOL_SERVICES]
+    note = (f" (plus {len(oneshots)} sarcini pe temporizator — health la 30s, "
+            f"selfcheck la 5min ș.a. — care se conectează pe scurt, nu permanent)")
+    try:
+        limit = asyncio.run(_read_max_connections(cfg))
+    except Exception:  # noqa: BLE001 - never let this be why config-check crashes
+        limit = None
+
+    if limit is None:
+        return (f"conexiuni:  plafon teoretic {budget} ({n} servicii permanente "
+                f"× database.pool_max={cfg.database.pool_max}){note}; "
+                f"max_connections al serverului nu a putut fi citit — verifică "
+                f"manual că serverul îl acceptă")
+    if budget > limit:
+        return (f"conexiuni:  ATENȚIE — plafonul teoretic {budget} "
+                f"({n} servicii permanente × database.pool_max="
+                f"{cfg.database.pool_max}) depășește max_connections="
+                f"{limit} al serverului PostgreSQL{note}")
+    return f"conexiuni:  plafon teoretic {budget}, sub max_connections={limit}{note}"
+
+
 def _config_check(args: argparse.Namespace) -> int:
     from sentinel.config import get_config, get_secrets
 
@@ -104,6 +186,7 @@ def _config_check(args: argparse.Namespace) -> int:
     if args.verbose:
         print(f"\nweb:      https://{cfg.web.domain or '<no domain>'} → {cfg.web.bind}:{cfg.web.port}")
         print(f"database: {cfg.database.user}@{cfg.database.host}:{cfg.database.port}/{cfg.database.name}")
+        print(_connection_budget_line(cfg))
         if cfg.web.ip_allowlist:
             print(f"web ip allowlist: {', '.join(cfg.web.ip_allowlist)}")
         else:
