@@ -64,6 +64,42 @@ Proprietățile care fac blocarea automată acceptabilă:
    >5 min, `sentinel-detect` e în restart loop, sau s-a depășit plafonul.
 6. **Buton de deblocare pe fiecare mesaj de auto-block.**
 7. **Auto-block dezactivat la instalare**, 72h de mod observă.
+8. **Rezolverul DNS al gazdei nu se blochează niciodată**, oricât de sever ar fi
+   motivul propus. `respond/decider.py` citește `/etc/resolv.conf` (memorat în
+   cache; se încarcă la prima decizie luată de proces, indiferent de uptime-ul
+   gazdei, și se reîmprospătează cel mult din oră în oră după aceea) și refuză
+   orice propunere de blocare pe o adresă de-acolo, înaintea severității și
+   reputației — spre deosebire de `api.telegram.org`/`api.anthropic.com` de
+   mai sus, rezolverul e specific gazdei și nu poate fi înscris în cod
+   dinainte.
+9. **O alertă Suricata fără dovadă TCP printre protocoale nu armează singură
+   un auto-block.** Sursa unui pachet UDP, ICMP, GRE, IP-in-IP sau SCTP se
+   poate falsifica fără niciun răspuns necesar de la victimă, deci garda
+   acceptă drept dovadă pozitivă de autenticitate doar prezența TCP printre
+   protocoalele văzute; orice altceva (inclusiv un protocol necunoscut sau
+   lista goală) rămâne nedovedit. O alertă de severitate 1 pe DNS-ul propriu
+   al gazdei (UDP) și alerte de severitate 2 pe GRE/IP-in-IP au produs acest
+   scenariu în producție. Fără dovadă TCP, `decider.py` cere o corroborare
+   reală din aceeași fereastră — o cerere nginx sau o linie sshd, singurele
+   surse care dovedesc azi ceva pentru un actor din afară, fiindcă ambele
+   protocoale nu pot exista fără un handshake complet — înainte să lase
+   alerta să blocheze; fără ea, decizia e `skipped:spoofable_source`, vizibilă
+   în alertă, nu o tăcere.
+
+   **Limită cunoscută, nu (încă) închisă:** un SYN TCP izolat se falsifică la
+   fel de ușor ca un pachet UDP — nimic nu obligă sursa unui SYN să fie
+   contactabilă la adresa aceea (exact ce face un SYN-flood sau un decoy
+   scan), iar `evidence["protocols"]` reține doar transportul semnalat de
+   Suricata, nu dacă schimbul s-a și încheiat. O semnătură fără stare care
+   declanșează pe un singur SYN e marcată "TCP" identic cu una declanșată
+   adânc într-o conexiune stabilită, și garda de azi nu le distinge. A face
+   distincția ar cere starea `flow` (established/nu) din Suricata în evidence,
+   ceva ce nimic de aici nu consumă încă — rămâne pentru o schimbare viitoare.
+   În producție garda tot închide gaura reală care s-a manifestat până acum:
+   273 din 274 de evenimente Suricata pe 7 zile au fost TCP (măsurat pe
+   8 septembrie 2026, pe gazda de producție), deci linia
+   TCP/non-TCP acoperă traficul care contează, chiar dacă nu distinge încă un
+   SYN izolat de un schimb complet în interiorul lui.
 
 ---
 
@@ -77,7 +113,8 @@ Publicul e o alegere deliberată a operatorului. Ce o susține:
 | Argon2id | Hash de parolă lent, sărat |
 | TOTP obligatoriu | Al doilea factor; secretul e criptat la rest, deci un dump al bazei nu dă factori funcționali |
 | `limit_req` | 5/min pe `/login`, 60/min pe `/api` |
-| Lockout | 5 încercări → 15 minute, persistat în bază (supraviețuiește restartului) |
+| Lockout la parolă | Scopat pe (cont, sursă), nu pe cont: o sursă cu 5 eșecuri reale contra unui cont e refuzată, dar o sursă curată intră cu parola corectă indiferent câte eșecuri a scris altcineva pe același nume. Un răspuns identic pentru "blocat, parolă greșită" și "blocat, parolă corectă" — altfel lockout-ul devine el însuși un oracol. Numărătoarea stă în `login_attempts`, nu pe cont; `sentinel web --unlock` și `--set-password` marchează momentul (`lock_reset_at`) de la care contează eșecurile, deci deblocarea e reală de la următoarea autentificare, nu doar raportată |
+| Lockout la TOTP | Rămâne per cont, în bază (`failed_attempts`/`locked_until`, supraviețuiește restartului): un cod de șase cifre chiar se poate ghici, iar cine a ajuns aici are deja parola. Verificat înainte de a deschide etapa TOTP, nu doar acolo: un cont deja blocat e refuzat cu numărul de minute rămase direct la parolă, în loc să ajungă la `/totp` și să primească un „sesiune invalidă" fără explicație |
 | CSP strict | `script-src 'self'`, fără `unsafe-inline`, fără CDN |
 | `IPAddressDeny=any` | Procesul web nu are rețea în afară de loopback. Un SSRF sau un RCE acolo nu are unde pivota |
 | Nu vorbește cu executorul | Nu poate bloca, debloca, aplica patch-uri sau reporni |

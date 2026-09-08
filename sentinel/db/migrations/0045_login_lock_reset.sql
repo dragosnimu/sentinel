@@ -1,0 +1,26 @@
+-- 0045_login_lock_reset: `sentinel web --unlock` deblochează AMBELE etape,
+-- nu doar cea de TOTP.
+--
+-- Blocarea la etapa de parolă nu trăiește pe rândul din `users`
+-- (`failed_attempts`/`locked_until` sunt etapa de TOTP) -- trăiește în
+-- `login_attempts`, numărată de `recent_failures_for_account_from_ip` peste
+-- o fereastră de timp glisantă (vezi `db/repo/users.py`). Înainte de coloana
+-- asta, `unlock` (și `set_password`) resetau doar coloanele de pe `users`,
+-- raportau succes, iar contul rămânea refuzat la etapa de parolă până
+-- expira fereastra -- operatorul rula comanda documentată, i se spunea că
+-- blocarea a fost eliminată, și tot nu putea intra (W-F1, 8 sep 2026).
+--
+-- `lock_reset_at` marchează momentul ultimei resetări manuale. Interogarea
+-- care numără eșecurile ignoră orice rând mai vechi decât acest marcaj --
+-- rândurile rămân în `login_attempts` (istoricul de audit e intact), doar nu
+-- mai contează spre fereastra curentă. NULL implicit înseamnă „niciodată
+-- resetat manual", deci comportamentul existent nu se schimbă pentru un cont
+-- care n-a trecut niciodată prin --unlock/--set-password.
+--
+-- Coloana e comparată cu ceasul serverului de baze de date, nu cu unul
+-- propriu. Dacă acel ceas dă înapoi după un --unlock (NTP, o restaurare de
+-- VM), `lock_reset_at` poate rămâne în viitor față de ceasul curent -- iar
+-- blocarea (cont, sursă) rămâne dezactivată, nu până la o resetare reală, ci
+-- până ceasul ajunge din urmă marcajul.
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS lock_reset_at timestamptz;

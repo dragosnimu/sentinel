@@ -61,7 +61,55 @@ _ERROR_MESSAGES = {
         "serverului s-a schimbat. Reînrolează pe server: "
         "sudo sentinel web --enroll-totp --username <utilizator>"
     ),
+    # "locked" is NOT here: its message needs the minute count carried in the
+    # `m` query param, which a fixed string in this dict cannot hold. See
+    # `_login_error` below.
 }
+
+# Bounds for the `m` query param a `locked` redirect carries. It is this
+# server that puts the value there, one redirect earlier -- but the browser
+# hands it back on the follow-up GET, so by the time `_login_error` reads it,
+# it is untrusted input like any other query param and gets validated like
+# one rather than interpolated straight into the page.
+_MIN_LOCK_MINUTES = 1
+_MAX_LOCK_MINUTES = 1440  # a day; real lockouts (`cfg.web.lockout_minutes`) are far below this
+
+
+def _lock_minutes_from_query(raw: str | None) -> int | None:
+    """Parse and bound-check the `m` param on `/login?e=locked&m=N`.
+
+    None (not an exception) for anything not a small positive integer -- a
+    missing, tampered or absurd value falls back to a generic phrase in
+    `_login_error` rather than showing "None minute" or blowing up the page.
+    """
+    if raw is None or len(raw) > 6:
+        return None
+    try:
+        minutes = int(raw)
+    except ValueError:
+        return None
+    return minutes if _MIN_LOCK_MINUTES <= minutes <= _MAX_LOCK_MINUTES else None
+
+
+def _lock_minutes(retry_after_s: int | None) -> int:
+    """Seconds to whole minutes, rounded up -- the same conversion
+    `security.py` uses for `detail_ro`, so the number this redirect's `m=`
+    carries is the number the operator would have been told had the session
+    survived long enough to render the message directly instead of via a
+    redirect.
+    """
+    if not retry_after_s or retry_after_s <= 0:
+        return _MIN_LOCK_MINUTES
+    return min((retry_after_s // 60) + 1, _MAX_LOCK_MINUTES)
+
+
+def _login_error(request: Request) -> str | None:
+    code = request.query_params.get("e", "")
+    if code == "locked":
+        minutes = _lock_minutes_from_query(request.query_params.get("m"))
+        phrase = f"{minutes} minute" if minutes is not None else "câteva minute"
+        return f"Cont blocat temporar. Reîncearcă în {phrase}."
+    return _ERROR_MESSAGES.get(code)
 
 
 def _render(request: Request, name: str, status_code: int = 200, **context: object) -> Response:
@@ -130,9 +178,7 @@ async def login_form(
         if existing and existing.pending_totp:
             return RedirectResponse("/totp", status_code=status.HTTP_303_SEE_OTHER)
 
-    return _login_page(
-        request, cfg, error=_ERROR_MESSAGES.get(request.query_params.get("e", ""))
-    )
+    return _login_page(request, cfg, error=_login_error(request))
 
 
 @router.post("/login")
@@ -218,7 +264,31 @@ async def totp_submit(
     )
 
     if not result.ok:
-        # A lockout revokes the session. If that happened, back to /login.
+        if result.outcome == "locked":
+            # `verify_second_factor` already revoked the session for both
+            # ways a `locked` outcome can happen here -- a lock inherited
+            # from another session's wrong codes, or this session's own 5th
+            # wrong code just tripping it. Route straight to the locked
+            # message instead of falling into the "is the session still
+            # there?" check below: that check cannot tell a lock from an
+            # ordinary expiry, since both leave no valid session behind, and
+            # answering "expired" for a lock is what sent a locked-out
+            # operator round the retry loop with no idea how long to wait
+            # (S1). `retry_after_s` is always set on this outcome (both
+            # branches in `security.py` set it) -- `_lock_minutes` degrading
+            # to 1 is defensive, not something this path is expected to hit.
+            minutes = _lock_minutes(result.retry_after_s)
+            response = RedirectResponse(
+                f"/login?e=locked&m={minutes}", status_code=status.HTTP_303_SEE_OTHER
+            )
+            if result.retry_after_s:
+                response.headers["Retry-After"] = str(result.retry_after_s)
+            response.delete_cookie(COOKIE_NAME, path="/")
+            return response
+
+        # The remaining failure paths revoke the session too (an
+        # undecryptable secret, or the session being gone/for the wrong user
+        # already) -- if that happened, back to /login.
         still_valid = await sessions_repo.get_by_token(
             db, request.cookies.get(COOKIE_NAME) or ""
         )

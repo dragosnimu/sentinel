@@ -42,6 +42,21 @@ class User:
         return self.role in roles
 
 
+def lockout_remaining(user: User) -> timedelta | None:
+    """Time left on a TOTP-stage lock, or None if the account is not locked.
+
+    Used to phrase "reîncearcă în N minute" and to set `Retry-After` on the
+    `locked` outcome. A lock without either leaves the person it affects
+    guessing when to try again -- which is what happened when this helper (and
+    the check that used it) was dropped from `Authenticator.login` while
+    scoping the password-stage lock to (account, source): the TOTP-stage lock
+    stopped being reported at all (W-F4).
+    """
+    if not user.is_locked:
+        return None
+    return user.locked_until - datetime.now(timezone.utc)  # type: ignore[operator]
+
+
 _COLUMNS = """
     id, username, password_hash, password_algo, totp_secret, totp_confirmed,
     totp_last_counter, role, failed_attempts, locked_until, disabled
@@ -98,11 +113,22 @@ async def create(
 
 
 async def set_password(db: Database, user_id: int, password_hash: str) -> None:
+    """Set a new password hash and clear BOTH lockout stages.
+
+    Called both from the CLI reset (`sentinel web --set-password`) and from
+    `Authenticator.login` when a password's Argon2 parameters need upgrading
+    -- in that second case the caller already verified the password, so
+    clearing a lock here is a side-effect of a legitimate login, not a
+    bypass. `lock_reset_at` is bumped for the same reason `unlock` bumps it
+    (see there): the password-stage window reads `login_attempts` directly,
+    and resetting only `failed_attempts`/`locked_until` leaves that window
+    untouched (W-F1).
+    """
     await db.execute(
         """
         UPDATE users
            SET password_hash = $2, password_changed_at = now(),
-               failed_attempts = 0, locked_until = NULL
+               failed_attempts = 0, locked_until = NULL, lock_reset_at = now()
          WHERE id = $1
         """,
         user_id,
@@ -254,16 +280,80 @@ async def recent_failures_from_ip(db: Database, ip: str | None, window_minutes: 
     )
 
 
+async def recent_failures_for_account_from_ip(
+    db: Database, username: str, ip: str | None, window_minutes: int
+) -> int:
+    """Failures against ONE account from ONE source, in the window.
+
+    This is the scope that makes lockout safe against a known-username DoS: a
+    guesser hammering `username` from their own address accumulates failures
+    here and gets refused for that account, while the owner logging in
+    correctly from a clean address sees zero, no matter how many failures
+    other sources have piled up against the same account in the meantime.
+
+    Counts real, verified wrong-password rows only (`result = 'bad_password'`,
+    `stage = 'password'`) — never a refusal. A refusal produced by this same
+    check is not logged in the first place (see `security.py`), so there is
+    nothing here for the check to feed back into; a counter that counted its
+    own refusals would renew its own window forever on one request every few
+    minutes, which is the exact defect this scoping exists to avoid.
+
+    The join against `users` adds one more exclusion: rows older than the
+    account's `lock_reset_at` never count, no matter how recent the window.
+    That column only ever moves forward, on `unlock`/`set_password`, so this
+    is the read side of the escape hatch — without it, the CLI could report a
+    lockout cleared while this exact count kept refusing the next login for
+    the rest of the window (W-F1).
+    """
+    if not ip:
+        return 0
+    return int(
+        await db.fetchval(
+            """
+            SELECT count(*)
+              FROM login_attempts la
+              JOIN users u ON u.username = la.username
+             WHERE la.username = $1 AND la.ip = $2::inet
+               AND la.stage = 'password' AND la.result = 'bad_password'
+               AND la.at >= now() - make_interval(mins => $3)
+               AND la.at >= COALESCE(u.lock_reset_at, '-infinity')
+            """,
+            username,
+            ip,
+            window_minutes,
+        )
+        or 0
+    )
+
+
 async def unlock(db: Database, username: str) -> bool:
-    """Clear a lockout. The operator's escape hatch when locked out of the UI."""
+    """Clear a lockout — BOTH stages. The operator's escape hatch.
+
+    Two independent locks exist. The TOTP-stage one lives on this row
+    (`failed_attempts`/`locked_until`) and clearing it is what this used to
+    do, in full. The password-stage one lives entirely in `login_attempts`,
+    counted over a time window by `recent_failures_for_account_from_ip` —
+    there is no per-user counter on this table to reset. Before
+    `lock_reset_at`, this function only ever touched the first: the CLI
+    printed "blocarea a fost eliminată" while the second stage kept refusing
+    the account for up to the rest of the window (W-F1). Bumping
+    `lock_reset_at` here is what makes that count ignore every failure
+    logged before this moment — the rows themselves stay, so the audit trail
+    of what happened is untouched.
+
+    That comparison trusts the database server's clock. If it steps backward
+    after this call (NTP correction, a restored VM snapshot), `lock_reset_at`
+    can end up in the future relative to the clock the next query runs
+    against — the (account, source) lock stays disabled the whole time, not
+    because it was cleared again but because the marker has not been caught
+    up to yet.
+    """
     result = await db.execute(
-        "UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE username = $1",
+        """
+        UPDATE users
+           SET failed_attempts = 0, locked_until = NULL, lock_reset_at = now()
+         WHERE username = $1
+        """,
         username,
     )
     return result.endswith("1")
-
-
-def lockout_remaining(user: User) -> timedelta | None:
-    if not user.is_locked or user.locked_until is None:
-        return None
-    return user.locked_until - datetime.now(timezone.utc)

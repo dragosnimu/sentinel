@@ -346,7 +346,10 @@ async def _unlock(cfg: Config, username: str | None) -> int:
             db, actor="cli", source="web", operation="unlock",
             target=username, result="ok",
         )
-        print(f"Blocarea contului {username!r} a fost eliminată.")
+        print(
+            f"Blocarea contului {username!r} a fost eliminată, la ambele etape "
+            "(parolă și TOTP)."
+        )
         return 0
     finally:
         await db.close()

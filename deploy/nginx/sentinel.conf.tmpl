@@ -142,6 +142,12 @@ server {
     location /static/ {
         alias /opt/sentinel/lib/sentinel/web/static/;
         expires 7d;
+        # `add_header` in a location is not additive with the parent context —
+        # defining ONE here cancels every `add_header` inherited from the
+        # server block above, silently dropping CSP/HSTS/frame-options on
+        # every file this location serves. Re-including the same file inside
+        # the location re-establishes them alongside Cache-Control.
+        include /etc/nginx/sentinel/security-headers.conf;
         add_header Cache-Control "public, immutable";
         access_log off;
     }

@@ -63,6 +63,65 @@ def test_unknown_user_still_does_the_work():
     )
 
 
+def test_unknown_user_phantom_hash_timing_closely_tracks_a_real_verification():
+    """The dummy-hash path must cost close to what a real one costs, not just
+    "not suspiciously fast".
+
+    `test_unknown_user_still_does_the_work` above only guards against the
+    dummy path being skipped outright (a floor of 0.3x). That leaves room for
+    a "fix" that still runs the dummy hash but with cheaper parameters, or
+    caches it — either would leave a gap an attacker can recover by averaging
+    enough requests, which is exactly the enumeration channel this design
+    exists to close.
+
+    Failed once in a full-suite run (8 Sep 2026): Argon2 at 64 MiB is enough
+    to notice memory pressure from whatever else is running on the box at the
+    same moment, and that run's outlier was under 20% on medians of 5 —
+    tight enough that one slow tick decided the result. Two changes here:
+
+      * samples for the two arms are INTERLEAVED (known, unknown, known,
+        unknown, ...) rather than taken as two separate blocks, so a
+        transient stall lands in both arms' samples instead of skewing only
+        whichever arm happened to be running through it;
+      * the summary statistic is a trimmed mean over 9 samples (drop the
+        single highest and lowest), not a median of 5 — one real outlier no
+        longer decides the result on its own, but the bulk of the
+        distribution still has to agree.
+
+    The bound is widened to 35% to match: it is deliberately looser than the
+    20% used before, in exchange for being robust to the exact failure that
+    was actually observed, rather than tighter and re-flaky.
+    """
+    real_hash = security.hash_password("a genuine password used only for timing")
+
+    known_samples: list[float] = []
+    unknown_samples: list[float] = []
+    n = 9
+    for _ in range(n):
+        t0 = time.perf_counter()
+        security.verify_password(real_hash, "wrong guess entirely")
+        known_samples.append(time.perf_counter() - t0)
+
+        t0 = time.perf_counter()
+        security.verify_password(None, "wrong guess entirely")
+        unknown_samples.append(time.perf_counter() - t0)
+
+    def _trimmed_mean(samples: list[float]) -> float:
+        ordered = sorted(samples)
+        trimmed = ordered[1:-1]  # drop the single highest and lowest
+        return sum(trimmed) / len(trimmed)
+
+    known = _trimmed_mean(known_samples)
+    unknown = _trimmed_mean(unknown_samples)
+
+    ratio = abs(known - unknown) / known
+    assert ratio < 0.35, (
+        f"known-user verification took {known:.4f}s, unknown-user (dummy hash) "
+        f"took {unknown:.4f}s — a {ratio:.0%} gap is enough for an attacker "
+        "averaging requests to tell which usernames exist"
+    )
+
+
 @pytest.mark.parametrize("password", ["", "short", "elevenchars"])
 def test_short_passwords_are_refused(password):
     with pytest.raises(ValueError, match="at least"):

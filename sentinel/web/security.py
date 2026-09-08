@@ -23,9 +23,17 @@ Five properties worth understanding before changing anything:
 4. **Two-stage login is a database state**, not a cookie flag. A password-only
    session can reach `/totp` and nothing else.
 
-5. **Lockout is per-user AND per-source.** Per-user alone is a denial-of-service
-   vector against a known username; per-source alone lets a distributed attempt
-   through.
+5. **Password-stage lockout is scoped to (account, source), never to the
+   account alone.** A per-account counter is a password oracle and a cheap
+   denial of service: anyone who knows the username can lock the owner out
+   with a handful of requests, from anywhere, and "locked, correct password"
+   vs. "locked, wrong password" told an attacker which one they had. So a
+   source that has not itself failed against an account is never refused
+   because some other source has — the owner logging in from a clean address
+   always gets a real answer, while the guesser's own address accumulates the
+   failures and gets throttled. The one hard, per-account cap that remains is
+   at the **TOTP stage**, where a fixed six-digit code makes brute force
+   actually feasible and the attacker already had the password.
 """
 
 from __future__ import annotations
@@ -35,6 +43,7 @@ import hmac
 import secrets
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Literal
 
 import pyotp
@@ -91,7 +100,13 @@ TOTP_INTERVAL = 30
 # a code as it rolls over should not be told their password is wrong.
 TOTP_VALID_WINDOW = 1
 
-# Per-source failure ceiling, independent of per-user lockout.
+# Per-source failure ceiling. Not scoped to a username at all, so it catches
+# one address working through many accounts, which a per-account window
+# cannot see. `IP_FAILURE_WINDOW_MINUTES` (not the limit) is reused below for
+# the per-(account, source) check, which is capped by `cfg.web.max_failed_logins`
+# instead — a source that has failed against ONE account that many times is
+# refused for that account, regardless of what the submitted password actually
+# is. See `Authenticator.login`.
 IP_FAILURE_WINDOW_MINUTES = 15
 IP_FAILURE_LIMIT = 20
 
@@ -262,15 +277,18 @@ class Authenticator:
         username = (username or "").strip()[:64]
 
         # Per-source throttle first, before any expensive work. A distributed
-        # attempt against many usernames never trips a per-user lockout.
+        # attempt against many usernames never trips the per-account window
+        # below, and this one is not scoped to a username at all.
         ip_failures = await users.recent_failures_from_ip(
             self.db, ip, IP_FAILURE_WINDOW_MINUTES
         )
         if ip_failures >= IP_FAILURE_LIMIT:
-            await users.log_attempt(
-                self.db, username=username, ip=ip, user_agent=user_agent,
-                result="locked", stage="password", detail="ip throttled",
-            )
+            # NOT logged to `login_attempts`: that table is what this very
+            # count reads (W2). A row here would let one request every few
+            # seconds keep the source throttled forever with no password ever
+            # checked. The process log is where a refusal that verified
+            # nothing goes; it does not feed anything back.
+            log.warning("login refused: source throttled", extra={"ip": ip})
             return LoginResult(
                 "ip_throttled",
                 detail_ro="Prea multe încercări din această rețea. Reîncearcă mai târziu.",
@@ -284,27 +302,49 @@ class Authenticator:
             user.password_hash if user else None, password
         )
 
-        if user is None or not password_ok:
-            if user is not None:
-                attempts, locked_until = await users.record_failure(
-                    self.db,
-                    user.id,
-                    max_attempts=self.cfg.web.max_failed_logins,
-                    lockout_minutes=self.cfg.web.lockout_minutes,
-                )
-                detail = f"attempt {attempts}/{self.cfg.web.max_failed_logins}"
-                if locked_until is not None:
-                    detail += " (locked)"
-            else:
-                detail = "unknown user"
-
-            await users.log_attempt(
-                self.db, username=username, ip=ip, user_agent=user_agent,
-                result="bad_password" if user else "unknown_user",
-                stage="password", detail=detail,
+        # Lockout scoped to (account, source): count THIS source's own failures
+        # against THIS account, not the account's failures from anywhere. A
+        # source with none is never refused because someone else has been
+        # guessing — which is what let a known username lock its owner out
+        # from their own address with five POSTs (W1).
+        source_failures = 0
+        if user is not None:
+            source_failures = await users.recent_failures_for_account_from_ip(
+                self.db, username, ip, IP_FAILURE_WINDOW_MINUTES
             )
-            # One message for both cases. "No such user" would give away the
-            # username list one guess at a time.
+        source_locked = (
+            user is not None and source_failures >= self.cfg.web.max_failed_logins
+        )
+
+        if user is None or not password_ok or source_locked:
+            if source_locked:
+                # Refused WITHOUT writing a row and WITHOUT branching on
+                # `password_ok`: this arm runs whether the password just
+                # verified as correct or not, and the two must be
+                # indistinguishable to the caller (W1) — a "locked, right
+                # password" message is exactly the oracle this closes. Not
+                # logging here also keeps this window from renewing itself
+                # the way the IP throttle above used to (W2): only a REAL
+                # wrong-password row (below) ever feeds it.
+                log.warning(
+                    "login refused: source throttled against this account",
+                    extra={"user": username},
+                )
+            elif user is not None:
+                await users.log_attempt(
+                    self.db, username=username, ip=ip, user_agent=user_agent,
+                    result="bad_password", stage="password",
+                    detail=f"attempt {source_failures + 1}/{self.cfg.web.max_failed_logins}",
+                )
+            else:
+                await users.log_attempt(
+                    self.db, username=username, ip=ip, user_agent=user_agent,
+                    result="unknown_user", stage="password", detail="unknown user",
+                )
+            # One message for every case above — unknown user, wrong password,
+            # or a correct password from a throttled source. Any difference
+            # between them hands an attacker either the username list or a
+            # working password, one guess at a time.
             return LoginResult(
                 "bad_credentials", detail_ro="Utilizator sau parolă incorectă."
             )
@@ -317,11 +357,19 @@ class Authenticator:
             return LoginResult("disabled", detail_ro="Cont dezactivat.")
 
         if user.is_locked:
+            # The TOTP-stage lock (`users.failed_attempts`/`locked_until`),
+            # checked only now: the caller already proved the password, so
+            # telling them "locked" here is not an oracle the way it would be
+            # before that point. Checked BEFORE the TOTP block below creates a
+            # pending session — refusing here instead of at /totp means a
+            # locked owner is told immediately, in one round trip, and does
+            # not accumulate a fresh pending session on every retry of their
+            # (correct) password while still locked (W-F4).
             remaining = users.lockout_remaining(user)
             minutes = int((remaining.total_seconds() // 60) + 1) if remaining else 1
             await users.log_attempt(
                 self.db, username=username, ip=ip, user_agent=user_agent,
-                result="locked", stage="password", detail="locked out",
+                result="locked", stage="password", detail="totp stage locked",
             )
             return LoginResult(
                 "locked",
@@ -388,9 +436,29 @@ class Authenticator:
     ) -> LoginResult:
         """Stage two: the TOTP code."""
         user = await users.get_by_id(self.db, session.user_id)
-        if user is None or not user.can_log_in:
+        if user is None or user.disabled:
             await sessions.revoke(self.db, session.id)
             return LoginResult("bad_credentials", detail_ro="Sesiune invalidă.")
+
+        if user.is_locked:
+            # A pending session can reach here even though `login()` now
+            # refuses to mint one for an already-locked account (above): this
+            # one predates the lock — it was created while the account was
+            # still open, and the account was locked afterwards from a
+            # DIFFERENT pending session's wrong codes. `user.can_log_in`
+            # folded this into "Sesiune invalidă." with no Retry-After, which
+            # is a real lock hidden behind a generic message (W-F4). No
+            # oracle here either: reaching this call already required a
+            # correct password. The session is revoked either way — it is not
+            # going to become usable again before the lock itself expires.
+            remaining = users.lockout_remaining(user)
+            minutes = int((remaining.total_seconds() // 60) + 1) if remaining else 1
+            await sessions.revoke(self.db, session.id)
+            return LoginResult(
+                "locked",
+                detail_ro=f"Cont blocat temporar. Reîncearcă în {minutes} minute.",
+                retry_after_s=int(remaining.total_seconds()) if remaining else 60,
+            )
 
         secret = self.cipher.decrypt(user.totp_secret) if user.totp_secret else None
         if secret is None:
@@ -420,8 +488,23 @@ class Authenticator:
                 session_id=session.id,
             )
             if locked_until is not None:
+                # Same phrasing as the `user.is_locked` branch above, and the
+                # same reason: a `locked` outcome with no retry time is a
+                # message that tells the operator "come back never". `user`
+                # here still holds the PRE-`record_failure` row, so the
+                # remaining time is computed from `locked_until` directly
+                # rather than through `users.lockout_remaining(user)`, which
+                # would read the stale (unlocked) value.
+                remaining_s = max(
+                    int((locked_until - datetime.now(timezone.utc)).total_seconds()), 1
+                )
+                minutes = (remaining_s // 60) + 1
                 await sessions.revoke(self.db, session.id)
-                return LoginResult("locked", detail_ro="Cont blocat temporar.")
+                return LoginResult(
+                    "locked",
+                    detail_ro=f"Cont blocat temporar. Reîncearcă în {minutes} minute.",
+                    retry_after_s=remaining_s,
+                )
             return LoginResult("bad_credentials", detail_ro="Cod incorect.")
 
         # Consume the counter. If this fails the code was already used — a
