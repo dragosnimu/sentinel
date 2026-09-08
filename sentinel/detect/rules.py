@@ -144,7 +144,13 @@ SURICATA_MIN_HITS = {1: 1, 2: 4}
 async def suricata_alert(db: Database, cursor: int) -> list[DetectionSpec]:
     """Group fresh Suricata alerts by source IP into one incident per attacker.
     Severity is the worst (lowest-numbered) signature seen. Informational
-    (severity 3) alerts are recorded as events but never raise an incident."""
+    (severity 3) alerts are recorded as events but never raise an incident.
+
+    `evidence["protocols"]` carries every distinct transport `e.proto` seen for
+    this source in the window — the decider's `source_is_authentic` guard reads
+    it to tell a UDP/ICMP-only alert (source is trivially spoofable: no
+    handshake, no reply needed) from one corroborated by a real TCP exchange.
+    See `respond/decider.py`'s module docstring, guard on F3."""
     rows = await db.fetch(
         """
         WITH fresh AS (
@@ -156,6 +162,7 @@ async def suricata_alert(db: Database, cursor: int) -> list[DetectionSpec]:
                min((e.raw->>'severity')::int) AS min_sev,
                array_agg(DISTINCT e.raw->>'signature')
                    FILTER (WHERE e.raw->>'signature' IS NOT NULL) AS sigs,
+               array_agg(DISTINCT e.proto) FILTER (WHERE e.proto IS NOT NULL) AS protocols,
                array_agg(e.id ORDER BY e.id DESC) AS event_ids,
                max(e.dst_port) AS dport
         FROM raw_events e
@@ -182,7 +189,8 @@ async def suricata_alert(db: Database, cursor: int) -> list[DetectionSpec]:
             title=f"Alertă IDS de la {r['ip']}",
             summary=(f"{r['hits']} alerte Suricata (severitate max {r['min_sev']}): "
                      f"{', '.join(s for s in sigs if s) or '—'}"),
-            evidence={"hits": r["hits"], "min_severity": r["min_sev"], "signatures": sigs},
+            evidence={"hits": r["hits"], "min_severity": r["min_sev"], "signatures": sigs,
+                      "protocols": r["protocols"] or [], "window_min": SURICATA_WINDOW_MIN},
             event_ids=list(r["event_ids"])[:200],
         ))
     return specs
