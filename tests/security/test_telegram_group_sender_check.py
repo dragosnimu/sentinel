@@ -173,10 +173,12 @@ class _StubQuery:
         self.message = None
         self._chat_id = chat_id
         self.edits: list[str] = []
+        self.answers: list[tuple] = []
         self.answered = False
 
-    async def answer(self, *_a, **_kw):
+    async def answer(self, *a, **kw):
         self.answered = True
+        self.answers.append((a, kw))
 
     async def edit_message_text(self, text, **_kw):
         self.edits.append(text)
@@ -192,7 +194,12 @@ def test_flush_refuses_a_group_member_outside_the_list(monkeypatch):
     reparatie — `_can_act` se uita numai la chat_id, nu la expeditor, deci
     PANIC/golirea blocklistului ramanea singurul buton pe care un membru
     neautorizat al grupului tot il putea apasa dupa ce restul fusesera
-    inchise. Testul verifica efectul: `actions.flush` nu trebuie chemat."""
+    inchise. Testul verifica efectul: `actions.flush` nu trebuie chemat.
+
+    Refuzul e un `answer(show_alert=True)`, NU o editare a mesajului: o
+    editare ar schimba mesajul PANIC în "Neautorizat." pentru toată lumea din
+    chat, inclusiv pentru cine chiar are dreptul să-l apese — vezi T5 din
+    audit, `bot.py:973-975` înainte de reparație."""
     from types import SimpleNamespace
 
     from sentinel.telegram import bot as bot_mod
@@ -212,7 +219,11 @@ def test_flush_refuses_a_group_member_outside_the_list(monkeypatch):
 
     asyncio.run(bot_mod.on_flush_callback(update, context))
 
-    assert query.edits == ["Neautorizat."]
+    assert query.edits == [], "mesajul PANIC nu trebuia editat pentru toată lumea"
+    assert query.answers, "trebuia să răspundă la tap cu o alertă"
+    args, kwargs = query.answers[0]
+    assert "eautorizat" in (args[0] if args else kwargs.get("text", ""))
+    assert kwargs.get("show_alert") is True
 
 
 def test_flush_still_works_for_a_listed_owner_in_the_group(monkeypatch):

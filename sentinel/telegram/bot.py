@@ -32,9 +32,11 @@ indistinguishable — see `sentinel/telegram/identity.py`.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import html
 import ipaddress
 import json
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -48,12 +50,15 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
+from telegram.error import RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ExtBot,
+    MessageHandler,
+    filters,
 )
 from telegram.request import HTTPXRequest
 
@@ -69,7 +74,7 @@ from sentinel.db.repo import incidents as inc_repo
 from sentinel.errors import ExecutorRejected, ExecutorUnavailable
 from sentinel.logging_setup import get_logger
 from sentinel.respond import actions
-from sentinel.telegram import views
+from sentinel.telegram import callback_sign, views
 from sentinel.util import tz
 from sentinel.telegram.identity import current_tag, stamp
 
@@ -238,6 +243,199 @@ def _guard(handler):
     return wrapper
 
 
+def _pin_guard(handler):
+    """Wraps `patch_flow.on_pin_reply` — deliberately NOT `_guard`.
+
+    Round 3: `_guard` logs the accepted message's own text at INFO
+    (`"command": text[:200]`) and calls `chats_repo.record_command` — right
+    for a typed command, wrong for a PIN reply. Routed through `_guard`, the
+    operator's PIN — right OR wrong — landed verbatim in journald, readable
+    by the `sentinel` uid on both hosts (`adm`, `systemd-journal`).
+    `redact()` (`sentinel/util/shellsafe.py`) does not help: it matches
+    `password=`/token/URL-credential/PEM shapes, not "whatever six digits
+    arrived while a PIN happened to be pending". A PIN reply is not a
+    command, so it does not go through the command journal or the command
+    counter at all.
+
+    This wrapper NEVER logs message text and NEVER calls `record_command`.
+    It logs exactly one line, `"pin attempt"`, carrying only an `outcome` —
+    `ok`, `wrong`, `expired`, or `ignored` (chat failed `_authorized`) — and
+    `chat_id`.
+
+    The PTB filter this is registered under (`filters.TEXT & ~filters.COMMAND
+    & filters.REPLY`) cannot see `patch_flow`'s pending-PIN state at match
+    time, so it also matches an ORDINARY human reply to some other bot
+    message — someone answering an incident alert while, by coincidence, a
+    PIN happens to be pending in the same chat. `on_pin_reply` already tells
+    the two apart: it returns `False` unless the reply targets its own
+    prompt's `message_id` (`patch_flow._pending_pins[chat_id]
+    .prompt_message_id`), from the chat that opened the wait. This wrapper
+    trusts that boolean — a `False` return logs NOTHING, not even
+    `"ignored"`: an ordinary reply is not a PIN attempt, and counting it as
+    one (even silently, even without its text) is the same
+    swallow-anything-that-arrives bug the prompt-id check in `on_pin_reply`
+    exists to close.
+
+    `ok`/`wrong`/`expired` are computed HERE, independently of what
+    `on_pin_reply` does with the PIN, by reading the same `_pending_pins`
+    entry it reads — never by inferring the outcome from `on_pin_reply`'s
+    side effects (whether the entry still exists afterwards), because a
+    wrong attempt that also happens to exhaust `PIN_MAX_ATTEMPTS` clears the
+    entry exactly like a correct one does: "is it still pending" cannot tell
+    those two apart. `patch_flow.py` is read-only from this file — it gains
+    no outcome return — so the comparison is repeated, not reused; it is the
+    same constant-time, encode-to-bytes-first comparison `on_pin_reply`
+    itself uses, for the same non-ASCII-PIN reason (see its docstring).
+    """
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        cfg: Config = context.bot_data["cfg"]
+        chat = update.effective_chat
+        chat_id = chat.id if chat else None
+        if not _authorized(cfg, update):
+            # Silent to the user, exactly like `_guard`'s own unauthorized
+            # branch — no edit, no reply beyond what `on_pin_reply` itself
+            # would send. Logged anyway, at the same minimum `_guard` logs
+            # its own unauthorized case with: chat_id only, never text.
+            log.warning("pin attempt", extra={"outcome": "ignored", "chat_id": chat_id})
+            return
+
+        from sentinel.telegram import patch_flow
+        message = update.effective_message
+        pending = patch_flow._pending_pins.get(chat_id) if chat_id is not None else None
+        outcome: str | None = None
+        if pending is not None:
+            if time.monotonic() > pending.expires_at:
+                outcome = "expired"
+            else:
+                expected = patch_flow._configured_pin()
+                typed = (message.text or "").strip() if message else ""
+                if expected is not None and hmac.compare_digest(
+                    typed.encode("utf-8"), expected.encode("utf-8")
+                ):
+                    outcome = "ok"
+                else:
+                    outcome = "wrong"
+
+        try:
+            handled = await handler(update, context)
+        except Exception as exc:  # noqa: BLE001 - a broken PIN check must not kill the bot
+            log.error(
+                "pin handler failed", exc_info=exc,
+                extra={"chat_id": chat_id, "detail": f"{type(exc).__name__}: {exc}"},
+            )
+            if message is not None:
+                await message.reply_text("A apărut o eroare la procesarea PIN-ului.")
+            return
+
+        if not handled or outcome is None:
+            # `on_pin_reply` decided this was not a PIN attempt at all (no
+            # pending PIN, wrong prompt, or wrong replier) — see the
+            # docstring above. Nothing about an ordinary reply belongs in
+            # the journal, not even a record that it happened.
+            return
+        log.info("pin attempt", extra={"outcome": outcome, "chat_id": chat_id})
+    return wrapper
+
+
+def _guard_callback(handler):
+    """Same idea as `_guard`, for callback-query handlers.
+
+    `on_flush_callback` and `on_patch_callback` already answer the tap and log
+    per branch when something goes wrong; `on_callback` did not, and its
+    `blk:`/`unblk:` parsing used to be `data.split(':', 2)` — a plain
+    `ValueError` on the first IPv6 address it ever saw, since a compressed
+    IPv6 text form has more than two colons. Uncaught there, the operator's
+    tap just sat on a spinner forever: no reply, no log line, nothing to
+    diagnose from. This is the safety net for that case and for any future
+    one shaped the same way — it does not replace validating the callback
+    payload itself, it catches what validation does not anticipate.
+    """
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        try:
+            await handler(update, context)
+        except Exception as exc:  # noqa: BLE001 - a broken button must not kill the bot
+            chat = update.effective_chat
+            log.error(
+                "telegram callback failed", exc_info=exc,
+                extra={
+                    "handler": getattr(handler, "__name__", repr(handler)),
+                    "chat_id": chat.id if chat else None,
+                    "data": (query.data or "")[:200] if query else None,
+                    "detail": f"{type(exc).__name__}: {exc}",
+                },
+            )
+            if query is not None:
+                try:
+                    await query.answer(
+                        "A apărut o eroare la procesarea butonului.", show_alert=True)
+                except Exception:  # noqa: BLE001 - answering must never raise a second failure
+                    pass
+    return wrapper
+
+
+def _require_mention_in_group(handler, name: str):
+    """Cere `@username` pentru o comandă STATE-CHANGING într-un chat care nu
+    e privat.
+
+    §8 din docs/TELEGRAM.md: mai multe instanțe Sentinel pot împărți un
+    singur grup, un bot fiecare. Un `/block` scris FĂRĂ mențiune ajunge la
+    toate boturile din grup deodată — fiecare citește din același fir —, deci
+    fără gardă asta ar însemna blocarea aceleiași adrese pe două gazde
+    diferite dintr-o singură comandă tastată o dată. Comenzile doar-citire
+    (`READ_ONLY`) NU trec prin asta: ambele boturi răspunzând la `/status` e
+    zgomot dublu, nu o acțiune dublă — decizia e documentată în §8, nu doar
+    luată aici tăcut.
+
+    Verificarea citește username-ul PROPRIU al botului
+    (`context.bot.username`, populat de PTB la `initialize()`), nu un nume
+    scris în configurație: botul își cunoaște mereu corect propriul nume.
+    Dacă username-ul nu e încă disponibil (n-ar trebui să se întâmple în
+    producție, unde `run_polling` inițializează botul înaintea oricărui
+    update), comportamentul vechi rămâne: comanda trece — o gardă de
+    comoditate care nu poate decide n-are voie să refuze o comandă legitimă.
+    """
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat = update.effective_chat
+        if chat is not None and getattr(chat, "type", "private") != "private":
+            username = getattr(context.bot, "username", None)
+            message = update.effective_message
+            if username and message is not None:
+                text = message.text or message.caption or ""
+                first_word = text.split()[0] if text.split() else ""
+                if f"@{username.lower()}" not in first_word.lower():
+                    await message.reply_text(
+                        "Într-un grup cu mai multe instanțe, comanda asta cere "
+                        f"mențiunea botului: <code>/{name}@{username}</code> — "
+                        "altfel îi răspund toți deodată.",
+                        parse_mode=ParseMode.HTML)
+                    return
+        await handler(update, context)
+    return wrapper
+
+
+async def _on_telegram_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ultima plasă: PTB cheamă asta pentru orice excepție pe care niciun
+    handler înregistrat n-a prins-o. `_guard`/`_guard_callback` acoperă deja
+    comenzile și cele două callback-uri generice, iar `on_patch_callback`
+    are propria ei încercare — asta există pentru orice cale viitoare care nu
+    trece prin niciuna, ca un bug de-acolo să lase o linie diagnosticabilă în
+    jurnal, nu tăcere. Tipul update-ului e numit explicit: „ce fel de
+    actualizare a picat" e prima întrebare la diagnosticare, iar PTB nu-l pune
+    singur pe linia de eroare.
+    """
+    log.error(
+        "unhandled telegram update error", exc_info=context.error,
+        extra={"update_type": type(update).__name__ if update is not None else None,
+               "detail": f"{type(context.error).__name__}: {context.error}"})
+    if isinstance(update, Update) and update.callback_query is not None:
+        try:
+            await update.callback_query.answer(
+                "A apărut o eroare neașteptată.", show_alert=True)
+        except Exception:  # noqa: BLE001 - a failing answer must not raise again
+            pass
+
+
 # --- formatting ------------------------------------------------------------
 def format_incident(inc: inc_repo.IncidentRow, *, header: str = "INCIDENT") -> str:
     # An IDS rule is named after what it detects, so the CVE is usually sitting
@@ -279,6 +477,12 @@ _SKIP_REASON_RO = {
     "max_active_cidrs": "plafon de intervale active atins",
     "refused_client": "refuzat la validare",
     "executor_error": "executor indisponibil",
+    # Emise de `sentinel/respond/decider.py` — fără intrare aici, cheia
+    # brută (`configured_resolver`, `spoofable_source`) ajungea direct în
+    # alertă, netradusă, exact tiparul de defect din docstring-ul
+    # `test_cidr_skip_reasons_are_translated_not_shown_raw`.
+    "configured_resolver": "resolver DNS configurat pe gazdă",
+    "spoofable_source": "sursă falsificabilă, fără conexiune TCP coroborantă",
 }
 
 
@@ -329,24 +533,60 @@ def _kb_from_row(row: Any) -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup(randuri) if randuri[0] else None
 
 
-def _incident_block_kb(inc: inc_repo.IncidentRow, cfg: Config) -> InlineKeyboardMarkup | None:
+# Mărginirea unui TTL de blocare cerut manual — vezi `cmd_block`. Aceeași
+# limită bugetează și `callback_sign.sign_ip_action`: un TTL nemărginit ar
+# putea depăși cei 64 de octeți ai unui `callback_data` (vezi docstring-ul
+# modulului `callback_sign`), iar afișarea trebuie să spună aceeași valoare
+# pe care o și face — un TTL retezat tăcut ar însemna „a zis o oră, a blocat
+# alta".
+MIN_BLOCK_TTL_S = 60
+MAX_BLOCK_TTL_S = 30 * 86_400  # 30 de zile — cifra din docs/TELEGRAM.md §5.
+
+# TTL-ul de verificare pentru butonul „Nu sunt eu" (`nteu:`) — nu e purtat în
+# payload, spre deosebire de `blk:`/`unblk:` (vezi
+# `callback_sign.sign_session_action`), ci ales aici, la verificare. Lung
+# dinadins: spre deosebire de un `blk:` de pe o alertă pe care operatorul o
+# citește imediat, butonul ăsta stă pe o logare care poate fi observată abia
+# ore mai târziu — un TTL de 600s (implicitul lui `callback_ttl_s`) ar fi
+# expirat exact butoanele pe care cineva le apasă a doua zi dimineața.
+NTEU_TTL_S = 7 * 86_400  # 7 zile
+
+
+def _incident_block_kb(inc: inc_repo.IncidentRow, cfg: Config,
+                       hmac_key: bytes) -> InlineKeyboardMarkup | None:
     """The one-tap action on the alert. If the decider already blocked the actor
     (armed mode), offer UNBLOCK; otherwise offer BLOCK. Either way on_callback
     re-checks the role and the executor re-checks never-block, so a viewer's tap
-    is refused and the admin address is never firewalled even if pressed."""
+    is refused and the admin address is never firewalled even if pressed.
+
+    `callback_data` carries the INCIDENT id and the moment this button was
+    issued, signed with `hmac_key` — see `sentinel/telegram/callback_sign.py`.
+    Before this, the payload was the raw IP with no binding to the incident or
+    an issue time at all: any authorised sender could hand-craft `blk:<any
+    ip>:<any ttl>` and the bot would act on it, and a button from a week-old
+    message worked exactly the same as one sent a second ago.
+    """
     ip = _incident_ip(inc)
     if ip is None:
         return None
     if inc.auto_action == "blocked":
         return InlineKeyboardMarkup([[
-            InlineKeyboardButton(f"↩️ Deblochează {ip}", callback_data=f"unblk:{ip}"),
+            InlineKeyboardButton(
+                f"↩️ Deblochează {ip}",
+                callback_data=callback_sign.sign_ip_action(
+                    "unblk", hmac_key, ip, 0, ref=inc.id)),
             InlineKeyboardButton("✔️ OK, lasă blocat", callback_data="cancel"),
         ]])
     ttl = cfg.response.auto_block.default_ttl_s
+    # Config, nu intrare de operator — dar tot mărginit, ca eticheta afișată
+    # (calculată din aceeași valoare mărginită) să nu poată diverge vreodată
+    # de TTL-ul chiar semnat în buton.
+    ttl = max(0, min(ttl, MAX_BLOCK_TTL_S)) if ttl else 0
     hours = ttl // 3600
     label = f"🚫 Blochează {ip}" + (f" ({hours}h)" if ttl else " (permanent)")
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton(label, callback_data=f"blk:{ip}:{ttl}"),
+        InlineKeyboardButton(label, callback_data=callback_sign.sign_ip_action(
+            "blk", hmac_key, ip, ttl, ref=inc.id)),
         InlineKeyboardButton("❌ Ignoră", callback_data="cancel"),
     ]])
 
@@ -700,13 +940,39 @@ async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             parse_mode=ParseMode.HTML)
         return
     ip = context.args[0]
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        # Validat AICI, nu doar mai târziu la apăsarea butonului:
+        # `callback_sign.sign_ip_action` codează adresa ca octeți bruți
+        # (`ip.packed`), deci un șir care nu e o adresă ar ridica un
+        # `ValueError` netratat exact la construirea confirmării, iar
+        # operatorul ar vedea „A apărut o eroare" în loc de motivul real.
+        await update.message.reply_text(
+            f"<code>{_esc(ip)}</code> nu e o adresă IP validă.",
+            parse_mode=ParseMode.HTML)
+        return
     ttl = _parse_ttl(context.args[1] if len(context.args) > 1 else None)
+    if ttl is not None and not (MIN_BLOCK_TTL_S <= ttl <= MAX_BLOCK_TTL_S):
+        # Mărginit ÎNAINTE de a semna: fără asta, un TTL foarte mare ar putea
+        # face `callback_data`-ul semnat să depășească limita de 64 de octeți
+        # a Telegram — vezi `callback_sign` — iar mesajul ar refuza tăcut la
+        # trimitere, mult după ce operatorul a crezut că a confirmat blocarea.
+        await update.message.reply_text(
+            "Durata trebuie să fie între 60s și 30 de zile, sau "
+            "<code>perm</code> pentru permanent.", parse_mode=ParseMode.HTML)
+        return
     ttl_label = "permanent" if ttl is None else (f"{ttl // 3600}h" if ttl >= 3600 else f"{ttl}s")
 
     # Confirm before acting. A block is reversible, but a fat-fingered address is
     # still an outage for whoever is behind it, so it gets a second tap.
+    #
+    # ref=0: nu vine dintr-un incident, e o comandă manuală. Semnat oricum —
+    # vezi `callback_sign` pentru de ce un `blk:` nesemnat era exploatabil.
+    key: bytes = context.bot_data["callback_hmac_key"]
+    data = callback_sign.sign_ip_action("blk", key, ip, ttl or 0, ref=0)
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"✅ Blochează {ip} ({ttl_label})", callback_data=f"blk:{ip}:{ttl if ttl is not None else 0}"),
+        InlineKeyboardButton(f"✅ Blochează {ip} ({ttl_label})", callback_data=data),
         InlineKeyboardButton("❌ Anulează", callback_data="cancel"),
     ]])
     await update.message.reply_text(
@@ -714,13 +980,20 @@ async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
+def _callback_ttl_s(cfg: Config) -> int:
+    return getattr(cfg.telegram, "callback_ttl_s", 600)
+
+
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Config = context.bot_data["cfg"]
     query = update.callback_query
-    await query.answer()
     if not _authorized(cfg, update) or not _can_act(cfg, update.effective_chat.id):
-        await query.edit_message_text("Neautorizat.")
+        # Alertă, nu editare: o editare ar șterge mesajul (și butoanele lui)
+        # pentru TOATĂ lumea din chat doar fiindcă un singur tap neautorizat
+        # l-a atins — vezi `on_patch_callback`, care face deja asta corect.
+        await query.answer("Neautorizat.", show_alert=True)
         return
+    await query.answer()
     data = query.data or ""
     if data == "cancel":
         await query.edit_message_text("Anulat.")
@@ -731,12 +1004,30 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # Butonul poartă identificatorul SESIUNII, nu adresa. Adresa se citește
         # ACUM din rândul sesiunii — un buton care ar purta-o ar putea fi apăsat
         # peste trei ore, când de pe adresa aia e conectat altcineva.
-        session_id = data.split(":", 1)[1]
+        #
+        # Semnat ca blk:/unblk: (vezi `logins._buttons` și
+        # `callback_sign.sign_session_action`) — fără semnătură, orice membru
+        # `_can_act` al chatului putea trimite manual `nteu:<id secvențial>`
+        # și acțiunea de mai jos rula pe orice sesiune ghicită, inclusiv una
+        # de pe o adresă din allowlist (închide singur propriul SSH).
+        key: bytes = context.bot_data.get("callback_hmac_key")
+        try:
+            session_id, _issued_at = callback_sign.verify_session_action(
+                data, key, ttl_s=NTEU_TTL_S)
+        except callback_sign.Expired:
+            await query.edit_message_text("⛔ Buton expirat.")
+            return
+        except callback_sign.CallbackError as exc:
+            log.warning("telegram nteu callback rejected",
+                       extra={"chat_id": update.effective_chat.id,
+                              "detail": f"{type(exc).__name__}: {exc}"})
+            await query.edit_message_text("⛔ Buton nevalid sau modificat.")
+            return
         db = context.bot_data["db"]
         row = await db.fetchrow(
             "SELECT session_key, host(src_ip) AS ip, username, closed_at "
             "FROM login_sessions WHERE id = $1::bigint",
-            int(session_id) if session_id.isdigit() else -1)
+            session_id)
         if row is None or not row["ip"]:
             await query.edit_message_text("Sesiunea nu mai există în evidență.")
             return
@@ -767,31 +1058,56 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         linii.append("Deblocarea readuce accesul, nu și sesiunea.")
         kb = None
         if rezultat["blocked"]:
+            key: bytes = context.bot_data["callback_hmac_key"]
             kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton(f"↩️ Deblochează {row['ip']}",
-                                     callback_data=f"unblk:{row['ip']}"),
+                InlineKeyboardButton(
+                    f"↩️ Deblochează {row['ip']}",
+                    callback_data=callback_sign.sign_ip_action(
+                        "unblk", key, row["ip"], 0, ref=0)),
             ]])
         await query.edit_message_text("\n".join(linii),
                                       parse_mode=ParseMode.HTML, reply_markup=kb)
         return
 
-    if data.startswith("unblk:"):
-        ip = data.split(":", 1)[1]
-        db = context.bot_data["db"]
+    if data.startswith("unblk:") or data.startswith("blk:"):
+        action = "unblk" if data.startswith("unblk:") else "blk"
+        key: bytes = context.bot_data.get("callback_hmac_key")
         try:
-            await actions.unblock(db, ip, by=f"telegram:{update.effective_chat.id}")
-            await query.edit_message_text(
-                f"↩️ Deblocat <code>{_esc(ip)}</code>.", parse_mode=ParseMode.HTML)
-        except Exception as exc:  # noqa: BLE001
-            await query.edit_message_text(f"Nu am putut debloca: {_esc(exc)}")
-        return
-    if data.startswith("blk:"):
-        _, ip, ttl_s = data.split(":", 2)
-        ttl = int(ttl_s) or None
+            ip, ttl_s, ref, _issued_at = callback_sign.verify_ip_action(
+                data, key, ttl_s=_callback_ttl_s(cfg))
+        except callback_sign.Expired:
+            hint = "/unblock" if action == "unblk" else "/block"
+            await query.edit_message_text(f"⛔ Buton expirat, folosește {hint}.")
+            return
+        except callback_sign.CallbackError as exc:
+            # Falsificat, trunchiat sau altfel nevalid: NU se acționează, și
+            # se loghează ce s-a respins — un membru autorizat al chatului
+            # care poate construi manual un `callback_data` arbitrar nu are
+            # voie să blocheze/deblocheze o adresă pe care botul n-a oferit-o
+            # niciodată (vezi docstring-ul `callback_sign`).
+            log.warning("telegram callback rejected",
+                       extra={"chat_id": update.effective_chat.id,
+                              "action": action,
+                              "detail": f"{type(exc).__name__}: {exc}"})
+            await query.edit_message_text("⛔ Buton nevalid sau modificat.")
+            return
+
         db: Database = context.bot_data["db"]
         by = f"telegram:{update.effective_chat.id}"
+        if action == "unblk":
+            try:
+                await actions.unblock(db, ip, by=by)
+                await query.edit_message_text(
+                    f"↩️ Deblocat <code>{_esc(ip)}</code>.", parse_mode=ParseMode.HTML)
+            except Exception as exc:  # noqa: BLE001
+                await query.edit_message_text(f"Nu am putut debloca: {_esc(exc)}")
+            return
+
+        ttl = ttl_s or None
+        reason = f"blocare manuală Telegram (incident #{ref})" if ref \
+            else "blocare manuală Telegram"
         try:
-            await actions.block(db, ip, ttl=ttl, reason="blocare manuală Telegram", by=by)
+            await actions.block(db, ip, ttl=ttl, reason=reason, by=by)
             await query.edit_message_text(f"🛡️ Blocat <code>{_esc(ip)}</code>.", parse_mode=ParseMode.HTML)
         except actions.BlockRefused as exc:
             await query.edit_message_text(f"Refuzat: {_esc(exc)}")
@@ -963,7 +1279,6 @@ async def cmd_panic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def on_flush_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Config = context.bot_data["cfg"]
     query = update.callback_query
-    await query.answer()
     # `_authorized` too, not just `_can_act`: unlike `on_callback` and
     # `on_patch_callback`, this handler had only ever checked the role, never
     # the chat-and-sender gate — the one place the new sender check
@@ -971,8 +1286,14 @@ async def on_flush_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     # have been the one button a non-listed group member could still press
     # after every other path in this file was closed to them.
     if not _authorized(cfg, update) or not _can_act(cfg, update.effective_chat.id):
-        await query.edit_message_text("Neautorizat.")
+        # Alertă, nu editare a mesajului: o editare l-ar schimba în
+        # "Neautorizat." pentru TOATĂ lumea din chat, doar fiindcă un singur
+        # tap neautorizat l-a atins — inclusiv ștergând butonul PANIC pentru
+        # cine chiar are dreptul să-l apese. `on_patch_callback` face deja
+        # asta corect; asta aliniază `on_flush_callback` la același model.
+        await query.answer("Neautorizat.", show_alert=True)
         return
+    await query.answer()
     db: Database = context.bot_data["db"]
     try:
         await actions.flush(db, by=f"telegram:{update.effective_chat.id}", reason="panic Telegram")
@@ -1050,6 +1371,24 @@ async def _broadcast(app: Application, cfg: Config, text: str,
     """
     from sentinel.telegram.quiet import passes_anyway
 
+    # Telegram folosește un cod HTTP obișnuit (429) pentru limitarea de rată,
+    # dar python-telegram-bot îl ridică drept `RetryAfter`, cu numărul EXACT
+    # de secunde de așteptat — singurul caz din bucla asta în care eșecul vine
+    # cu propria lui rețetă de reîncercare, nu doar cu un motiv. Tratat la fel
+    # ca orice altă excepție (cum era), un rând respins la 429 pierdea exact
+    # șansa pe care Telegram i-o oferise. Mărginit la 30s: o gazdă care cere
+    # o așteptare nerezonabilă nu are voie să blocheze pentru atâta timp
+    # celelalte surse ale aceleiași bucle de push (`_push_loop` le rulează pe
+    # rând, nu concurent).
+    #
+    # Cazul cel mai rău, spus în cifre: `_push_incidents` cheamă funcția asta
+    # o dată per incident, câte unul din cel mult `inc_repo.unnotified`'s
+    # implicit de 20 pe trecere, iar aici așteptarea de 30s e per CHAT, nu per
+    # apel — deci o trecere a lui `_push_loop` poate sta, în cel mai rău caz,
+    # până la `20 × len(allowed_chat_ids) × 30s` înăuntrul funcției ăsteia
+    # înainte ca următoarea sursă din buclă (notificările generice) să mai
+    # apuce să ruleze. Motivul pentru care plafonul de 30s există: fără el,
+    # numărul de mai sus n-ar avea limită superioară.
     urgent = passes_anyway(severity, kind)
     sent = 0
     for chat_id in cfg.telegram.allowed_chat_ids:
@@ -1059,6 +1398,18 @@ async def _broadcast(app: Application, cfg: Config, text: str,
             await app.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML,
                                        reply_markup=kb)
             sent += 1
+        except RetryAfter as exc:
+            wait_s = min(float(exc.retry_after), 30.0)
+            log.warning("push send rate-limited; waiting once before retrying",
+                       extra={"chat_id": chat_id, "wait_s": wait_s})
+            await asyncio.sleep(wait_s)
+            try:
+                await app.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML,
+                                           reply_markup=kb)
+                sent += 1
+            except Exception as exc2:  # noqa: BLE001
+                log.warning("push send failed after rate-limit wait",
+                           extra={"chat_id": chat_id, "detail": str(exc2)})
         except Exception as exc:  # noqa: BLE001
             log.warning("push send failed", extra={"chat_id": chat_id, "detail": str(exc)})
     return sent
@@ -1091,12 +1442,22 @@ async def _push_incidents(app: Application, cfg: Config, db: Database,
         await _push_incident_digest(app, cfg, db, pending, quiet_chats)
         return
 
+    key: bytes = app.bot_data["callback_hmac_key"]
     for inc in pending:
         text = "🚨 " + format_incident(inc, header="INCIDENT NOU")
-        await _broadcast(app, cfg, text, _incident_block_kb(inc, cfg),
-                         quiet_chats=quiet_chats, severity=inc.severity)
-        await inc_repo.mark_notified(db, inc.id)
-        log.info("incident pushed", extra={"incident_id": inc.id, "severity": inc.severity})
+        sent = await _broadcast(app, cfg, text, _incident_block_kb(inc, cfg, key),
+                                quiet_chats=quiet_chats, severity=inc.severity)
+        # Marcat notificat DOAR dacă a chiar ajuns undeva — ca la `_push_plans`.
+        # Înainte, `mark_notified` se chema necondiționat, indiferent cât a
+        # întors `_broadcast`: un incident pentru care TOATE trimiterile
+        # eșuau tot dispărea din coadă, fără nicio a doua șansă și fără nicio
+        # urmă a eșecului în afara jurnalului.
+        if sent:
+            await inc_repo.mark_notified(db, inc.id)
+            log.info("incident pushed", extra={"incident_id": inc.id, "severity": inc.severity})
+        else:
+            log.error("incident reached nobody — will retry next cycle",
+                      extra={"incident_id": inc.id, "severity": inc.severity})
 
 
 async def _push_incident_digest(app: Application, cfg: Config, db: Database,
@@ -1114,11 +1475,18 @@ async def _push_incident_digest(app: Application, cfg: Config, db: Database,
         lines.append(f"<i>…și încă {len(pending) - 10}.</i>")
     lines.append("\nDeschide unul: <code>/incident &lt;id&gt;</code>")
 
-    await _broadcast(app, cfg, "\n".join(lines), quiet_chats=quiet_chats,
-                     severity=max((i.severity for i in pending), key=_sev_rank, default=None))
-    for inc in pending:
-        await inc_repo.mark_notified(db, inc.id)
-    log.warning("incident digest pushed", extra={"n": len(pending)})
+    sent = await _broadcast(app, cfg, "\n".join(lines), quiet_chats=quiet_chats,
+                            severity=max((i.severity for i in pending), key=_sev_rank, default=None))
+    # Același principiu ca mai sus, pe tot lotul deodată: digestul e UN singur
+    # mesaj pentru toate incidentele din el, deci fie ajunge undeva și toate
+    # se marchează, fie nu ajunge nicăieri și toate rămân pentru ciclul următor.
+    if sent:
+        for inc in pending:
+            await inc_repo.mark_notified(db, inc.id)
+        log.warning("incident digest pushed", extra={"n": len(pending)})
+    else:
+        log.error("incident digest reached nobody — will retry next cycle",
+                  extra={"n": len(pending)})
 
 
 def _sev_rank(sev: str) -> int:
@@ -1223,6 +1591,37 @@ async def _push_executions(app: Application, cfg: Config, db: Database,
                  extra={"execution_id": row["id"], "status": row["status"]})
 
 
+# Un rând de notificare care eșuează de MAX_NOTIFICATION_ATTEMPTS ori e
+# marcat `failed`, nu mai devreme. Măsurat pe o gazdă de producție pe 5
+# septembrie 2026: 20 de rânduri, 13 critice, marcate `failed` după O
+# SINGURĂ încercare — `_push_loop` rulează la fiecare 15s, deci fără prag
+# ratarea unui singur ciclu (o repornire, un 429, o pană scurtă de rețea)
+# arunca definitiv o notificare pe care coada ar fi putut-o livra 15 secunde
+# mai târziu.
+MAX_NOTIFICATION_ATTEMPTS = 5
+
+#: Baza ritmului de reîncercare — vezi `_notification_due`. Aceeași valoare
+#: cu intervalul buclei (`_push_loop`), fiindcă n-are sens un ritm mai fin
+#: decât frecvența cu care coada e oricum verificată.
+NOTIFICATION_RETRY_BASE_S = 15
+
+
+def _notification_due(enqueued_at: datetime, attempts: int) -> bool:
+    """Ritm exponențial calculat din `enqueued_at` și `attempts`, fără o
+    coloană nouă pentru „ultima încercare": la 0 încercări e mereu scadentă;
+    fiecare încercare în plus dublează așteptarea cumulată de la înscriere,
+    ca o pană scurtă să nu fie lovită la fiecare 15 secunde cât mai are
+    încercări.
+    """
+    if attempts <= 0:
+        return True
+    from datetime import datetime as _dt, timezone as _tz
+
+    threshold_s = NOTIFICATION_RETRY_BASE_S * (2 ** attempts - 1)
+    now = _dt.now(_tz.utc) if enqueued_at.tzinfo else _dt.now()
+    return (now - enqueued_at).total_seconds() >= threshold_s
+
+
 async def _push_notifications(app: Application, cfg: Config, db: Database,
                               quiet_chats: set[int]) -> None:
     """Drain the generic notification queue.
@@ -1232,8 +1631,8 @@ async def _push_notifications(app: Application, cfg: Config, db: Database,
     token itself, writes a row here.
     """
     rows = await db.fetch(
-        "SELECT id, severity, title, body, kind, buttons FROM notifications "
-        "WHERE state = 'queued' AND channel = 'telegram' "
+        "SELECT id, severity, title, body, kind, buttons, enqueued_at, attempts "
+        "FROM notifications WHERE state = 'queued' AND channel = 'telegram' "
         "ORDER BY enqueued_at LIMIT 5")
     from sentinel.telegram.quiet import all_silent, passes_anyway
 
@@ -1258,6 +1657,8 @@ async def _push_notifications(app: Application, cfg: Config, db: Database,
             log.info("notification held for quiet hours",
                      extra={"id": row["id"], "severity": row["severity"]})
             continue
+        if not _notification_due(row["enqueued_at"], row["attempts"]):
+            continue
 
         # Ce se ține și ce nu se decide din SEVERITATE și din FEL: vezi nota
         # lungă din `telegram/quiet.py` despre jumătatea care a fost scoasă din
@@ -1265,12 +1666,30 @@ async def _push_notifications(app: Application, cfg: Config, db: Database,
         sent = await _broadcast(app, cfg, row["body"], _kb_from_row(row),
                                 quiet_chats=quiet_chats,
                                 severity=row["severity"], kind=kind)
-        await db.execute(
-            "UPDATE notifications SET state = $2::text, sent_at = now(), "
-            "attempts = attempts + 1 WHERE id = $1",
-            row["id"], "sent" if sent else "failed")
-        log.warning("notification pushed",
-                    extra={"id": row["id"], "severity": row["severity"], "chats": sent})
+        if sent:
+            await db.execute(
+                "UPDATE notifications SET state = 'sent', sent_at = now(), "
+                "attempts = attempts + 1 WHERE id = $1", row["id"])
+            log.warning("notification pushed",
+                        extra={"id": row["id"], "severity": row["severity"], "chats": sent})
+            continue
+
+        new_attempts = row["attempts"] + 1
+        if new_attempts >= MAX_NOTIFICATION_ATTEMPTS:
+            await db.execute(
+                "UPDATE notifications SET state = 'failed', attempts = $2, "
+                "error = $3 WHERE id = $1", row["id"], new_attempts,
+                f"toate cele {new_attempts} încercări au eșuat — niciun chat n-a primit-o")
+            log.error("notification gave up after repeated failures",
+                      extra={"id": row["id"], "attempts": new_attempts})
+        else:
+            # Rămâne `queued`: `_notification_due` decide când vine următoarea
+            # încercare, nu ciclul curent al buclei.
+            await db.execute(
+                "UPDATE notifications SET attempts = $2, error = $3 WHERE id = $1",
+                row["id"], new_attempts, "trimitere eșuată — se reîncearcă")
+            log.warning("notification send failed; will retry",
+                        extra={"id": row["id"], "attempts": new_attempts})
 
 
 async def _push_loop(app: Application, cfg: Config, db: Database) -> None:
@@ -1553,6 +1972,13 @@ class StampingBot(ExtBot):
 
 def build_application(cfg: Config, secrets: Secrets) -> Application:
     token = secrets.require("TELEGRAM_BOT_TOKEN")
+    # Cerută la construire, nu doar documentată: înainte de asta,
+    # `TELEGRAM_CALLBACK_HMAC_KEY` era obligatorie la `sentinel config-check`
+    # (`__main__.py`) și necitită de nimic — un secret care trebuia să existe
+    # și pe care nimic nu-l folosea. Vezi `callback_sign.py` pentru ce
+    # semnează, și docs/TELEGRAM.md §5 pentru de ce contează separat de
+    # tokenul botului.
+    callback_hmac_key = secrets.require("TELEGRAM_CALLBACK_HMAC_KEY").encode("utf-8")
     # `.bot(...)` rather than `.token(...)`: the builder would otherwise
     # construct a plain `ExtBot`, and nothing this process sent would say which
     # installation sent it.
@@ -1576,6 +2002,11 @@ def build_application(cfg: Config, secrets: Secrets) -> Application:
         request=HTTPXRequest(connection_pool_size=256),
         get_updates_request=HTTPXRequest(connection_pool_size=1),
     )).build()
+    # Disponibilă imediat, nu doar din `post_init`: `cmd_block` și
+    # `on_callback` o citesc din `context.bot_data`, care e ACELAȘI dicționar
+    # cu `app.bot_data` (garanția PTB), iar comenzile pot sosi din prima
+    # secundă de polling.
+    app.bot_data["callback_hmac_key"] = callback_hmac_key
 
     async def post_init(application: Application) -> None:
         db = Database(cfg)
@@ -1600,16 +2031,59 @@ def build_application(cfg: Config, secrets: Secrets) -> Application:
     app.post_init = post_init
     app.post_shutdown = post_shutdown
 
-    for command in COMMANDS:
+    for command in READ_ONLY:
         for name in command.names:
             app.add_handler(CommandHandler(name, _guard(command.handler)))
+    # State-changing: în plus față de READ_ONLY, cere mențiunea botului
+    # într-un grup (§8 din docs/TELEGRAM.md) — altfel un `/block` fără
+    # mențiune ajunge la toate boturile care citesc din același grup.
+    for command in ACTING:
+        for name in command.names:
+            app.add_handler(CommandHandler(
+                name, _guard(_require_mention_in_group(command.handler, name))))
 
     # Inline confirm buttons. The callbacks re-check authorisation themselves,
-    # so they are registered without the message-oriented _guard wrapper.
+    # so they are registered without the message-oriented _guard wrapper —
+    # `_guard_callback` below is the callback-shaped equivalent: safety net for
+    # an unexpected exception, not the authorisation check itself.
     # Patch buttons first: they carry opaque tokens and must not fall through to
     # the generic handler, which would treat the token as an address.
     app.add_handler(CallbackQueryHandler(on_patch_callback,
                                          pattern=r"^(pap1:|pap2:|pdry:|prej:)"))
-    app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^(blk:|unblk:|cancel$)"))
-    app.add_handler(CallbackQueryHandler(on_flush_callback, pattern=r"^flush$"))
+    # T2-3: linia lipsă pe care `patch_flow.on_pin_reply` o documenta ca
+    # „NOT YET WIRED" — cu `telegram.require_pin_for_apply: true` și fără ea,
+    # a doua atingere pe „✅ Aplică" trimitea promptul de PIN și rămânea acolo
+    # pentru totdeauna: niciun răspuns tastat nu putea ajunge la handler,
+    # fiindcă `bot.py` n-avea niciun `MessageHandler`. Restrâns la un răspuns
+    # de TEXT, care nu e o comandă (acelea au propriul handler mai sus) —
+    # `on_pin_reply` însuși mai verifică, dincolo de asta, că răspunsul țintește
+    # chiar promptul de PIN și că vine din chatul care a cerut aplicarea (vezi
+    # docstring-ul lui).
+    #
+    # Runda 3: NU prin `_guard`. `_guard` jurnalizează la INFO exact textul
+    # mesajului acceptat — pentru un PIN, asta înseamnă PIN-ul însuși, corect
+    # SAU greșit, scris în clar în journald, citibil de uid-ul `sentinel` pe
+    # ambele gazde. `_pin_guard` e sora lui `_guard`, gândită pentru un
+    # răspuns care nu e o comandă: verifică `_authorized`, nu lasă o excepție
+    # să scoată botul din funcțiune, dar nu scrie NICIODATĂ textul mesajului
+    # și nu cheamă `record_command` — vezi docstring-ul ei pentru ce
+    # jurnalizează în loc.
+    from sentinel.telegram import patch_flow
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & filters.REPLY,
+        _pin_guard(patch_flow.on_pin_reply)))
+    # `nteu:` era absent din tiparul ăsta: `bot.py` avea o ramură întreagă care
+    # o trata (linia „Nu sunt eu"), dar niciun `CallbackQueryHandler` n-o
+    # ruta acolo — butonul emis de `logins.py` la fiecare alertă de logare
+    # never-muted nu răspundea NICIODATĂ la apăsare. Vezi
+    # `tests/security/test_telegram_callback_routes.py`, care derivă tiparul
+    # din handlerele chiar înregistrate, nu dintr-o listă scrisă de mână.
+    app.add_handler(CallbackQueryHandler(
+        _guard_callback(on_callback), pattern=r"^(blk:|unblk:|nteu:|cancel$)"))
+    app.add_handler(CallbackQueryHandler(
+        _guard_callback(on_flush_callback), pattern=r"^flush$"))
+
+    # Plasa de la urmă: orice excepție pe care niciun handler de mai sus n-a
+    # prins-o. Vezi docstring-ul `_on_telegram_error`.
+    app.add_error_handler(_on_telegram_error)
     return app

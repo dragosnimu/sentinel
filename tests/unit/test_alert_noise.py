@@ -26,6 +26,7 @@ scutirii ar fi transformat zgomotul în pierdere.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import re
 
@@ -155,6 +156,32 @@ def test_the_alarms_that_must_never_be_held_are_still_there() -> None:
 # 3. Ținut nu e pierdut
 # ---------------------------------------------------------------------------
 
+class _NotificationsDB:
+    """Dublu minimal pentru `_push_notifications`: poartă un singur rând,
+    `queued`, și înregistrează fiecare `execute` ca să se poată verifica
+    exact ce (dacă ceva) s-a scris peste el.
+    """
+
+    def __init__(self, row: dict) -> None:
+        self._row = dict(row)
+        self.executed: list[tuple[str, tuple]] = []
+
+    async def fetch(self, sql, *args):
+        return [self._row]
+
+    async def execute(self, sql, *args):
+        self.executed.append((sql, args))
+
+
+def _held_row(**over) -> dict:
+    from datetime import datetime, timezone
+    baza = {"id": 1, "severity": "medium", "title": "t", "body": "b",
+            "kind": "generic", "buttons": None,
+            "enqueued_at": datetime.now(timezone.utc), "attempts": 0}
+    baza.update(over)
+    return baza
+
+
 def test_a_held_notification_stays_queued_instead_of_being_marked_failed() -> None:
     """Proprietatea pe care documentația o afirma și codul o contrazicea.
 
@@ -165,20 +192,26 @@ def test_a_held_notification_stays_queued_instead_of_being_marked_failed() -> No
 
     Contează cu atât mai mult de când `degraded` se ține: fără reparația asta,
     îngustarea scutirii ar fi transformat zgomotul în pierdere de informație.
+
+    Verificat prin EFECT, prin `_push_notifications` real cu o bază falsă —
+    un test alb anterior verifica prezența unor literale de sursă, iar o
+    rescriere a codului (chiar corectă) l-ar fi lăsat roșu degeaba, sau verde
+    din greșeală. Aici: un rând `medium`/`generic`, cu toate chat-urile pe
+    mute, nu are voie să primească NICIUN `UPDATE`.
     """
+    from types import SimpleNamespace
+
     from sentinel.telegram import bot
 
-    src = inspect.getsource(bot._push_notifications)
-    assert "all_quiet" in src, (
-        "golirea cozii nu se uită dacă TOATE chat-urile sunt pe mute, deci nu "
-        "poate deosebi «ținut» de «a eșuat»")
-    assert "continue" in src, "nu există nicio cale prin care rândul rămâne `queued`"
-    # Marcajul de eșec trebuie să vină DUPĂ o încercare reală, nu în locul ei.
-    held = src.index("all_quiet and not passes_anyway")
-    marked = src.index('"sent" if sent else "failed"')
-    assert held < marked, (
-        "verdictul de trimitere se scrie înaintea deciziei de a ține, deci un "
-        "mesaj amânat ar fi marcat oricum")
+    cfg = SimpleNamespace(telegram=SimpleNamespace(allowed_chat_ids=[111, 222]))
+    db = _NotificationsDB(_held_row())
+    quiet_chats = {111, 222}  # TOATE chat-urile — all_quiet
+
+    asyncio.run(bot._push_notifications(app=None, cfg=cfg, db=db, quiet_chats=quiet_chats))
+
+    assert db.executed == [], (
+        "un rând ținut nu are voie să primească niciun UPDATE — nici "
+        "'sent', nici 'failed', nici o creștere de `attempts`")
 
 
 def test_holding_does_not_burn_an_attempt() -> None:
@@ -187,11 +220,26 @@ def test_holding_does_not_burn_an_attempt() -> None:
     Numărată, un mesaj ținut peste o fereastră lungă ar putea trece de orice
     plafon de reîncercări viitor și ar fi abandonat fără să fi fost trimis
     niciodată.
+
+    Falsificat separat (raportul agentului): o ramură de ținere care ar
+    incrementa `attempts` tot ar lăsa testul de mai sus verde dacă acela ar
+    verifica doar starea, nu și `executed` gol — aici garda e explicit pe
+    „niciun `execute` deloc", care prinde exact mutația aia.
     """
+    from types import SimpleNamespace
+
     from sentinel.telegram import bot
 
-    src = inspect.getsource(bot._push_notifications)
-    ramura = src[src.index("if all_quiet"):src.index("sent = await _broadcast")]
-    assert "attempts" not in ramura, (
-        "ramura de ținere atinge `attempts`, deci o amânare arată ca o "
-        "încercare eșuată")
+    cfg = SimpleNamespace(telegram=SimpleNamespace(allowed_chat_ids=[111]))
+    row = _held_row(attempts=0)
+    db = _NotificationsDB(row)
+    quiet_chats = {111}
+
+    asyncio.run(bot._push_notifications(app=None, cfg=cfg, db=db, quiet_chats=quiet_chats))
+
+    # Niciun UPDATE nu s-a scris — deci `attempts`-ul din bază, dacă am fi
+    # citit rândul din nou, ar fi tot 0. Verificat direct pe apelurile
+    # înregistrate, nu presupus din absența unei erori.
+    attempts_updates = [a for _sql, a in db.executed if row["id"] in a]
+    assert not attempts_updates, (
+        "o amânare nu are voie să scrie `attempts`, sub nicio formă de UPDATE")

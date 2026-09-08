@@ -122,6 +122,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not sec.get("TELEGRAM_BOT_TOKEN"):
         log.error("telegram enabled but TELEGRAM_BOT_TOKEN is missing")
         return 78
+    if not sec.get("TELEGRAM_CALLBACK_HMAC_KEY"):
+        # Same reasoning as the token check above, kept separate rather than
+        # folded into a single "secrets missing" line: `build_application`
+        # would otherwise raise `SecretMissingError` straight through `main`,
+        # a traceback instead of the same friendly, distinct-per-cause exit
+        # this file uses for every other missing piece. See
+        # `sentinel/telegram/callback_sign.py` for what the key signs.
+        log.error("telegram enabled but TELEGRAM_CALLBACK_HMAC_KEY is missing")
+        return 78
     if not cfg.telegram.allowed_chat_ids:
         log.error("telegram enabled but allowed_chat_ids is empty; refusing to run")
         return 78

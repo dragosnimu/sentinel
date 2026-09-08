@@ -55,6 +55,9 @@ from sentinel.telegram.identity import PREFIX as INSTANCE_PREFIX
 # that grep costs whoever triages the finding the same hour a real leak would —
 # they cannot tell the difference from the match.
 TOKEN = "0:fixture-not-a-real-token"
+# Same reasoning, for the second secret `main()` now requires before it will
+# start the poller — see `callback_sign.py` for what it signs.
+HMAC_KEY = "fixture-not-a-real-hmac-key"
 
 
 def _cfg(chat_ids=(111, 222), enabled=True) -> Config:
@@ -63,7 +66,14 @@ def _cfg(chat_ids=(111, 222), enabled=True) -> Config:
 
 
 def _secrets(token: str | None = TOKEN) -> Secrets:
-    return Secrets({"TELEGRAM_BOT_TOKEN": token} if token else {})
+    values = {"TELEGRAM_BOT_TOKEN": token} if token else {}
+    if token:
+        # `--send-test` never reads this (it returns before `build_application`
+        # — see the module docstring), but the plain-polling path does, since
+        # `_send_test`'s callers don't need to. Present whenever the token is,
+        # so a fixture built for "everything configured" really is.
+        values["TELEGRAM_CALLBACK_HMAC_KEY"] = HMAC_KEY
+    return Secrets(values)
 
 
 @pytest.fixture

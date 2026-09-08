@@ -332,7 +332,9 @@ async def on_pin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
     caller wiring this into a generic text handler knows whether to also try
     treating the message as something else.
 
-    NOT YET WIRED to anything: `bot.py` has no text-message handler today —
+    WIRED in `bot.build_application` through `_pin_guard` (8 Sep 2026, round 3
+    of the Telegram change), not through the command guard — the PIN must never
+    reach the journal. Historically: `bot.py` had no text-message handler —
     every interaction in this flow is an inline-button callback. This
     function is complete and covered by its own tests, but until one line is
     added to `sentinel/telegram/bot.py:build_application`, next to the
@@ -348,12 +350,12 @@ async def on_pin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
     deliberate: failing CLOSED (no apply happens) is the same rule this
     codebase applies to every other check it cannot evaluate — the option
     used to fail OPEN instead (it approved and ran regardless), which is the
-    defect this fix closes even before the handler is wired.
+    defect this fix closed even before the handler was wired.
 
     Round 2 adds two checks BEFORE anything is treated as a PIN attempt:
 
     * **The message must be a reply to the PIN prompt itself.** The filter
-      in the (not yet wired) handler above is `filters.TEXT & filters.REPLY`
+      in the handler registration is `filters.TEXT & ~filters.COMMAND & filters.REPLY`
       — any text reply, to ANY message, while a PIN happens to be pending.
       Without pinning it to the prompt's own `message_id`, an unrelated
       message the operator sends to the same chat during the 5-minute

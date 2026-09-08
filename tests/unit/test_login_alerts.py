@@ -20,10 +20,32 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import sentinel.config as sentinel_config
 from sentinel.detect import logins as detect_logins
 from sentinel.telegram.quiet import NEVER_MUTED_KINDS, passes_anyway
 
 NOW = datetime(2026, 8, 24, 14, 0, tzinfo=timezone.utc)
+
+#: `_buttons()` semnează „Nu sunt eu" cu `TELEGRAM_CALLBACK_HMAC_KEY` (vezi
+#: `sentinel/telegram/callback_sign.py`) — fixtură, nu un secret real, exact
+#: ca celelalte chei de test din depozitul public.
+TEST_HMAC_KEY = b"login-alert-test-hmac-key-not-real"
+
+
+class _FakeSecrets:
+    def get(self, name, default=None):
+        return TEST_HMAC_KEY.decode("utf-8") if name == "TELEGRAM_CALLBACK_HMAC_KEY" \
+            else default
+
+
+@pytest.fixture(autouse=True)
+def _fake_callback_hmac_key(monkeypatch):
+    """Fără o cheie de test aici, orice test care trece prin
+    `announce_new_sessions` ar vedea butonul „Nu sunt eu" dispărând tăcut —
+    fără `TELEGRAM_CALLBACK_HMAC_KEY`, `_buttons` nu mai are cum să-l
+    semneze, deci nu-l mai emite deloc (vezi `logins._buttons`). Asta ar fi
+    o gaură a fixturii, nu un defect al codului sub test."""
+    monkeypatch.setattr(sentinel_config, "get_secrets", lambda: _FakeSecrets())
 
 #: Fusul CONFIGURAT, dat explicit la fiecare apel.
 #:
@@ -310,12 +332,21 @@ def test_the_alert_carries_the_two_buttons() -> None:
 
 def test_the_button_carries_the_SESSION_not_the_address() -> None:
     """Un buton care ar purta adresa poate fi apăsat peste trei ore, când de pe
-    ea e conectat altcineva. Sesiunea e ce trebuie închis."""
+    ea e conectat altcineva. Sesiunea e ce trebuie închis.
+
+    Verificat prin DESPACHETAREA semnăturii, nu printr-un literal: butonul e
+    semnat (`callback_sign.sign_session_action`), nu mai e text simplu — un
+    `nteu:<id>` nesemnat era exact ce lăsa pe oricine din chat să termine o
+    sesiune ghicită, inclusiv de pe o adresă din allowlist."""
+    from sentinel.telegram import callback_sign
+
     db = _DB([_sesiune(id=77)])
     run(detect_logins.announce_new_sessions(db, tz_name=TZ))
     butoane = json.loads(db.queued[0]["buttons"])
     nteu = [b for b in butoane if b["data"].startswith("nteu:")][0]
-    assert nteu["data"] == "nteu:77"
+    session_id, _issued = callback_sign.verify_session_action(
+        nteu["data"], TEST_HMAC_KEY, ttl_s=7 * 86_400)
+    assert session_id == 77
     assert "198.51.100.7" not in nteu["data"]
 
 
@@ -323,6 +354,22 @@ def test_a_session_without_an_address_gets_no_kill_button() -> None:
     """O logare pe consola locală n-are ce bloca, iar un buton care nu poate
     face ce promite e mai rău decât lipsa lui."""
     db = _DB([_sesiune(src_ip=None, terminal="tty1")])
+    run(detect_logins.announce_new_sessions(db, tz_name=TZ))
+    butoane = json.loads(db.queued[0]["buttons"])
+    assert not any(b["data"].startswith("nteu:") for b in butoane)
+
+
+def test_no_kill_button_without_a_configured_hmac_key(monkeypatch) -> None:
+    """Fără `TELEGRAM_CALLBACK_HMAC_KEY`, `_buttons` n-are cum să semneze —
+    un buton nesemnat ar fi exact vulnerabilitatea pe care semnarea o
+    închide, deci nu se emite deloc, în loc să cadă tăcut înapoi pe formatul
+    vechi (text simplu, fără semnătură)."""
+    class _NoKeySecrets:
+        def get(self, name, default=None):
+            return default
+
+    monkeypatch.setattr(sentinel_config, "get_secrets", lambda: _NoKeySecrets())
+    db = _DB([_sesiune()])
     run(detect_logins.announce_new_sessions(db, tz_name=TZ))
     butoane = json.loads(db.queued[0]["buttons"])
     assert not any(b["data"].startswith("nteu:") for b in butoane)
@@ -408,6 +455,31 @@ def test_a_command_line_cannot_break_the_message() -> None:
     corp = db.queued[0]["body"]
     assert "&lt;b&gt;" in corp
     assert "<b>totul e bine</b>" not in corp
+
+
+def test_an_account_name_cannot_break_the_open_message() -> None:
+    """`username`/`terminal` vin din datele de logare ale gazdei (utmp), nu
+    dintr-o coloană tipizată — nimic din cod nu garantează că nu conțin
+    `<`/`>`. T7 din audit: `open_text` le punea neescapate în modul HTML al
+    mesajului, ca linia de comandă din testul de mai sus înainte de reparație."""
+    db = _DB([_sesiune(username="<b>root</b>", terminal="<i>pts/0</i>")])
+    run(detect_logins.announce_new_sessions(db, tz_name=TZ))
+    corp = db.queued[0]["body"]
+    assert "<b>root</b>" not in corp
+    assert "<i>pts/0</i>" not in corp
+    assert "&lt;b&gt;root&lt;/b&gt;" in corp
+    assert "&lt;i&gt;pts/0&lt;/i&gt;" in corp
+
+
+def test_an_account_name_cannot_break_the_summary_message() -> None:
+    """Același câmp (`username`), aceeași vulnerabilitate, cealaltă
+    funcție care îl afișează — `summary_text` la închiderea sesiunii."""
+    db = _DB([_sesiune(username="<b>root</b>",
+                       closed_at=NOW + timedelta(minutes=5), alerted_at=NOW)])
+    run(detect_logins.summarise_closed_sessions(db))
+    corp = db.queued[0]["body"]
+    assert "<b>root</b>" not in corp
+    assert "&lt;b&gt;root&lt;/b&gt;" in corp
 
 
 # ---------------------------------------------------------------------------

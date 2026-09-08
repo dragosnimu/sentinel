@@ -160,13 +160,20 @@ async def classify(db: Database, session: dict[str, Any], *,
 # ---------------------------------------------------------------------------
 def open_text(session: dict[str, Any], surprize: list[str], *,
               tz_name: str | None) -> str:
-    cine = session.get("username") or "cont necunoscut"
-    de_unde = session.get("src_ip") or "local"
+    # `username` și `terminal` vin din datele de logare ale gazdei (utmp),
+    # nu dintr-o coloană tipizată ca `src_ip`: nimic nu împiedică un cont
+    # sau un nume de terminal să conțină `<`/`>`. Neescapate, ele rupeau
+    # mesajul HTML — sau, scrise cu grijă, îl puteau face să spună altceva
+    # decât s-a întâmplat, exact ca linia de comandă din `summary_text` de
+    # mai jos, care era deja escapată.
+    cine = _esc(session.get("username") or "cont necunoscut")
+    de_unde = session.get("src_ip") or "local"  # validat ca `inet` în DB
+    terminal = _esc(session.get("terminal") or "—")
     linii = [
         "🔐 <b>Logare pe server</b>",
         f"Cont: <code>{cine}</code>",
         f"De la: <code>{de_unde}</code>",
-        f"Terminal: <code>{session.get('terminal') or '—'}</code>",
+        f"Terminal: <code>{terminal}</code>",
         # În fusul configurat, cu marcajul lui. „21:15 UTC" despre ceva
         # întâmplat la miezul nopții îl pune pe operator să adune trei ore în
         # cap, la ora la care e cel mai puțin capabil s-o facă.
@@ -175,7 +182,10 @@ def open_text(session: dict[str, Any], surprize: list[str], *,
     if surprize:
         linii.append("")
         linii.append("⚠️ <b>Neobișnuit:</b>")
-        linii.extend(f"· {s}" for s in surprize)
+        # `s` poate purta contul sau adresa neescapate — `classify()` le
+        # ține curate pentru coloana `unexpected` (text[]), care nu e HTML;
+        # escaparea se face AICI, la randare, nu acolo la clasificare.
+        linii.extend(f"· {_esc(s)}" for s in surprize)
     else:
         linii.append("")
         linii.append("Nimic neobișnuit: cont, adresă și oră cunoscute.")
@@ -189,7 +199,7 @@ def summary_text(session: dict[str, Any], varf: list[dict[str, Any]]) -> str:
     spune nimic, «412 comenzi, dintre care 3 cu sudo, și iată-le» spune ce s-a
     întâmplat.
     """
-    cine = session.get("username") or "cont necunoscut"
+    cine = _esc(session.get("username") or "cont necunoscut")
     opened = session["opened_at"].astimezone(timezone.utc)
     closed = (session.get("closed_at") or opened).astimezone(timezone.utc)
     durata = closed - opened
@@ -246,6 +256,14 @@ async def announce_new_sessions(db: Database, *, tz_name: str | None) -> int:
     repornit între citire și trimitere ar anunța a doua oară, iar unul repornit
     invers n-ar anunța deloc.
     """
+    # Citită O SINGURĂ DATĂ pe trecere, nu per rând: cheia nu se schimbă în
+    # mijlocul unei bucle, iar `_buttons` primește exact ce a citit acest
+    # proces din `secrets.env`, nu ce s-a scris acolo ACUM. `get_secrets()`
+    # e cache-uit oricum (`sentinel.config`), deci nu e o interogare repetată.
+    from sentinel.config import get_secrets
+    hmac_key_str = get_secrets().get("TELEGRAM_CALLBACK_HMAC_KEY")
+    hmac_key = hmac_key_str.encode("utf-8") if hmac_key_str else None
+
     rows = await db.fetch(
         """
         SELECT id, session_key, username, host(src_ip) AS src_ip, terminal,
@@ -265,7 +283,7 @@ async def announce_new_sessions(db: Database, *, tz_name: str | None) -> int:
             _ENQUEUE, severitate, KIND,
             f"login:{session['session_key']}:{session['opened_at'].isoformat()}",
             "Logare pe server", open_text(session, surprize, tz_name=tz_name),
-            json.dumps(_buttons(session["id"], session.get("src_ip"))))
+            json.dumps(_buttons(session["id"], session.get("src_ip"), hmac_key)))
         await db.execute(
             "UPDATE login_sessions SET alerted_at = now(), unexpected = $2::text[] "
             "WHERE id = $1",
@@ -322,15 +340,27 @@ def _privileged() -> list[str]:
     return sorted(PRIVILEGED)
 
 
-def _buttons(session_id: int, src_ip: str | None) -> list[dict[str, str]]:
+def _buttons(session_id: int, src_ip: str | None,
+            hmac_key: bytes | None) -> list[dict[str, str]]:
     """Butoanele mesajului de logare.
 
     „Nu sunt eu" poartă identificatorul SESIUNII, nu adresa: adresa se citește la
     apăsare din rândul sesiunii, iar sesiunea e ce trebuie închisă. Un buton care
     ar purta adresa ar putea fi apăsat mult mai târziu, când alt om e conectat de
     pe ea.
+
+    Semnat ca `blk:`/`unblk:` (`callback_sign.sign_session_action`), nu trimis
+    ca text simplu: fără semnătură, orice membru al chatului care poate
+    acționa putea trimite manual `nteu:<id secvențial>`, iar `on_callback`
+    executa `block_and_terminate` pe orice sesiune ghicită — inclusiv una de
+    pe o adresă din allowlist, unde efectul era să-ți închizi singur propriul
+    SSH. Fără `hmac_key` (o instalare fără `TELEGRAM_CALLBACK_HMAC_KEY` încă
+    livrat), butonul nu se emite deloc: unul nesemnat ar fi exact vulnerabil
+    la fel ca înainte, iar textul mesajului rămâne complet fără el.
     """
     b: list[dict[str, str]] = [{"text": "✔️ Am văzut", "data": "cancel"}]
-    if src_ip:
-        b.append({"text": "🚨 Nu sunt eu", "data": f"nteu:{session_id}"})
+    if src_ip and hmac_key:
+        from sentinel.telegram import callback_sign
+        b.append({"text": "🚨 Nu sunt eu",
+                  "data": callback_sign.sign_session_action(hmac_key, session_id)})
     return b

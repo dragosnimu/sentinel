@@ -13,7 +13,14 @@ import pytest
 pytest.importorskip("telegram")
 
 from sentinel.db.repo.incidents import IncidentRow  # noqa: E402
-from sentinel.telegram import bot  # noqa: E402
+from sentinel.telegram import bot, callback_sign  # noqa: E402
+
+# Fixtură, nu un secret real — depozitul e public. `_incident_block_kb` cere
+# acum o cheie HMAC pentru fiecare buton blk:/unblk: (vezi `callback_sign.py`
+# și docs/TELEGRAM.md §5): fără o semnătură, orice expeditor autorizat putea
+# construi manual `blk:<orice ip>:<orice ttl>` fără nicio legătură cu
+# incidentul care a generat mesajul.
+KEY = b"test-fixture-hmac-key"
 
 
 def _incident(actor_key: str | None, auto_action: str | None = None) -> IncidentRow:
@@ -45,34 +52,56 @@ def test_incident_ip_rejects_non_addresses():
 
 
 def test_block_button_present_for_ip_incident():
-    kb = bot._incident_block_kb(_incident("203.0.113.53"), _cfg())
+    kb = bot._incident_block_kb(_incident("203.0.113.53"), _cfg(), KEY)
     assert kb is not None
     block_btn, ignore_btn = kb.inline_keyboard[0]
-    # The callback must be exactly what on_callback's blk: handler parses.
-    assert block_btn.callback_data == "blk:203.0.113.53:86400"
+    # The callback must be exactly what on_callback's blk: handler parses —
+    # verified STRUCTURALLY (verify_ip_action), not against a literal string:
+    # the payload now carries a signature and an issue time, neither of which
+    # a hand-written expected string could reproduce.
+    assert block_btn.callback_data.startswith("blk:")
+    ip, ttl, ref, _issued = callback_sign.verify_ip_action(
+        block_btn.callback_data, KEY, ttl_s=600)
+    assert (ip, ttl, ref) == ("203.0.113.53", 86400, 39)  # 39 = _incident()'s id
     assert "203.0.113.53" in block_btn.text
     assert ignore_btn.callback_data == "cancel"
 
 
 def test_block_button_ttl_label_matches_config():
-    kb = bot._incident_block_kb(_incident("203.0.113.53"), _cfg(default_ttl_s=3600))
-    assert kb.inline_keyboard[0][0].callback_data == "blk:203.0.113.53:3600"
+    kb = bot._incident_block_kb(_incident("203.0.113.53"), _cfg(default_ttl_s=3600), KEY)
+    ip, ttl, ref, _ = callback_sign.verify_ip_action(
+        kb.inline_keyboard[0][0].callback_data, KEY, ttl_s=600)
+    assert (ip, ttl) == ("203.0.113.53", 3600)
     assert "1h" in kb.inline_keyboard[0][0].text
 
 
 def test_no_button_when_actor_is_not_an_ip():
     # A dashboard-scraper campaign with a non-IP key must not render a block
     # button pointed at a string the executor would reject anyway.
-    assert bot._incident_block_kb(_incident("campaign:abc"), _cfg()) is None
+    assert bot._incident_block_kb(_incident("campaign:abc"), _cfg(), KEY) is None
 
 
 def test_armed_block_offers_unblock_not_block():
     # When the decider already auto-blocked, the alert must offer UNBLOCK, never
     # a second block.
-    kb = bot._incident_block_kb(_incident("203.0.113.53", auto_action="blocked"), _cfg())
+    kb = bot._incident_block_kb(_incident("203.0.113.53", auto_action="blocked"), _cfg(), KEY)
     btn = kb.inline_keyboard[0][0]
-    assert btn.callback_data == "unblk:203.0.113.53"
+    assert btn.callback_data.startswith("unblk:")
+    ip, ttl, ref, _ = callback_sign.verify_ip_action(btn.callback_data, KEY, ttl_s=600)
+    assert (ip, ttl) == ("203.0.113.53", 0)
     assert "eblochează" in btn.text  # "Deblochează"
+
+
+def test_a_tampered_block_button_from_a_stale_incident_message_is_refused():
+    """Falsificarea directă a T6: fără semnătură, oricine putea construi
+    `blk:<orice ip>:<orice ttl>` — cu ea, schimbarea unui singur caracter din
+    payload trebuie să respingă butonul, nu doar să-l lase valid din
+    întâmplare."""
+    kb = bot._incident_block_kb(_incident("203.0.113.53"), _cfg(), KEY)
+    data = kb.inline_keyboard[0][0].callback_data
+    tampered = data[:-1] + ("a" if data[-1] != "a" else "b")
+    with pytest.raises(callback_sign.BadSignature):
+        callback_sign.verify_ip_action(tampered, KEY, ttl_s=600)
 
 
 def test_auto_action_text_rendering():
@@ -91,6 +120,19 @@ def test_cidr_skip_reasons_are_translated_not_shown_raw():
     assert "cidr_requires_ttl" not in text
     text = bot._auto_action_text("skipped:max_active_cidrs")
     assert "max_active_cidrs" not in text
+
+
+def test_resolver_and_spoofable_skip_reasons_are_translated_not_shown_raw():
+    """`decider.py` emite și `skipped:configured_resolver` și
+    `skipped:spoofable_source` — fără o intrare aici, cheia brută ajungea
+    direct în alertă, netradusă, exact tiparul care a costat o zi de canal
+    tăcut prima dată (vezi docstring-ul testului de mai sus)."""
+    text = bot._auto_action_text("skipped:configured_resolver")
+    assert "configured_resolver" not in text
+    assert "resolver" in text
+    text = bot._auto_action_text("skipped:spoofable_source")
+    assert "spoofable_source" not in text
+    assert "falsificabil" in text
 
 
 def test_close_commands_are_registered_and_share_one_body():

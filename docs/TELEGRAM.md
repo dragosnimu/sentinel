@@ -34,9 +34,20 @@ există) și generează o linie de log pe oră.
 
 | Rol | Poate |
 |---|---|
-| `owner` | Tot. Ar trebui să fie un singur chat id |
-| `operator` | Blocare, deblocare, scanare. **Nu** aplicare de patch-uri, **nu** config |
+| `owner` | Tot |
+| `operator` | Tot ce poate `owner`, inclusiv aprobarea planurilor de patch |
 | `viewer` | Doar citire |
+
+**Corectat pe 8 septembrie 2026:** rândul lui `operator` spunea până acum
+„nu aplicare de patch-uri, nu config" — n-a fost niciodată adevărat în cod.
+`on_patch_callback` (aprobarea planurilor, `sentinel/telegram/bot.py`) și
+fiecare comandă de răspuns verifică aceeași funcție, `_can_act`, care nu
+deosebește `owner` de `operator` — vede doar „e unul din cele două, sau
+niciun rol nu e configurat". Un `operator` care apasă „✅ Aplică" pe un plan
+de patch chiar îl aplică. Dacă separarea asta contează pentru instalarea ta,
+e o schimbare de proiectare (cine anume poate autoriza o modificare pe
+gazdă), nu o corectare de o linie — cere o decizie a operatorului, nu una
+luată tăcut într-o trecere de reparații.
 
 **Într-un grup, autorizarea de bază e a grupului, nu a persoanei.**
 `_authorized` compară `chat.id` cu `allowed_chat_ids` — dacă id-ul unui grup e
@@ -109,31 +120,50 @@ persoană e un mecanism suplimentar, nu unul implicit.
 
 ## 3. Comenzi
 
-### Stare
+**Tabelul ăsta a fost corectat pe 8 septembrie 2026** — enumera în jur de
+cincisprezece comenzi care nu există în cod (`/allow`, `/scan`, `/restore`,
+`/actor`, `/top`, `/traffic`, `/watch`, `/plan`, `/report`, `/predict`,
+`/version`, `/config`, `/budget`…) și lipsea câteva care există
+(`/dashboard`, `/evenimente`, `/expuneri`, `/rezolva`, `/fp`, `/stiu`,
+`/comportament`, `/intreaba`). Lista de mai jos e derivată din
+`sentinel/telegram/bot.py::COMMANDS` — aceeași tabelă din care botul își
+publică propriul meniu (`/ajutor` arată exact asta) —, nu scrisă separat.
+Fiecare comandă are un nume canonic (primul din paranteza de alias) și, unde
+există, câteva alias-uri românești sau englezești care fac același lucru.
 
-| Comandă | Ce face |
-|---|---|
-| `/start`, `/help` | Meniu cu butoane |
-| `/status` | Un ecran: servicii up/down, incidente deschise pe severitate, IP-uri blocate, vulnerabilități critice, nivel de amenințare 0–100, buget AI |
-| `/services` | Per serviciu: stare, uptime azi/7z/30z, timp de răspuns |
-| `/incidents [n]` | Ultimele n incidente (implicit 10), cu buton `Detalii` |
-| `/incident <id>` | Dosarul complet: cronologie, actor, evidențe, verdict AI, acțiuni recomandate |
-| `/actor <ip>` | Profil: geo/ASN, reputație, stadiu în lanțul de atac, istoric |
-| `/top [24h\|7d]` | Top IP-uri, țări, ASN-uri, endpoint-uri țintite |
-| `/traffic [asset]` | Volum curent față de banda așteptată |
+### Stare (doar citire)
 
-### Răspuns
+| Comandă | Alias-uri | Ce face |
+|---|---|---|
+| `/ajutor` | `/start`, `/help` | Meniu cu toate comenzile, pe grupe |
+| `/dashboard` | `/panou` | Verdict, cifre, observații, top atacatori |
+| `/status` | — | O linie: incidente deschise și servicii |
+| `/incidente` | `/incidents` | Ultimele incidente deschise |
+| `/incident <id>` | — | Dosarul unui incident: cronologie, actor, evidențe |
+| `/vulnerabilitati` | `/vulns` | Vulnerabilități deschise, prioritizate |
+| `/vuln <id>` | — | Detaliul unei vulnerabilități |
+| `/evenimente [ip]` | `/events` | Evenimente brute, opțional filtrate pe un IP |
+| `/servicii` | `/services` | Fiecare serviciu: activ, degradat sau picat |
+| `/health` | `/sanatate` | Capacitatea gazdei: CPU, RAM, disc, conexiuni |
+| `/selfcheck` | `/autoverificare` | Chiar funcționează Sentinel? fiecare componentă |
+| `/comportament` | `/behaviour`, `/profil` | Ce a învățat agentul despre ce e normal aici |
+| `/blocklist` | `/blocate` | Ce IP-uri sunt blocate acum, și până când |
+| `/expuneri` | `/exposures`, `/expunere` | Ce ascultă pe toate interfețele, și dacă e intenționat |
+| `/patches` | `/patch`, `/patchuri` | Planuri de patch în așteptare; `/patch 3` pentru unul |
+| `/intreaba <întrebare>` | `/ask` | Întrebare liberă peste baza de date, read-only |
 
-| Comandă | Ce face |
-|---|---|
-| `/block <ip> [ttl] [motiv]` | Validează IP-ul, verifică allowlist-ul. TTL implicit 24h. Confirmare pentru permanent și pentru orice mai larg de /24 |
-| `/unblock <ip>` | Imediat |
-| `/blocklist [n]` | Blocurile active cu TTL rămas, motiv, contor de hit-uri, buton `Deblochează` pe fiecare |
-| `/allow <ip> [motiv]` | Adaugă în allowlist. Necesită confirmare |
-| `/watch <ip>` | Monitorizează fără să blocheze |
-| `/mute` | Ore de liniște — vezi §3.1 |
-| `/unmute` | Repornește alertele, oprind ambele mecanisme |
-| `/panic` | **Golește tot blocklist-ul, imediat.** Dublă confirmare. Disponibilă chiar și pe mute |
+### Răspuns (schimbă starea — vezi §8 pentru mențiunea în grup)
+
+| Comandă | Alias-uri | Ce face |
+|---|---|---|
+| `/rezolva <id> [notă]` | `/resolve` | Închide un incident |
+| `/fp <id>` | `/falspozitiv` | Închide un incident ca fals-pozitiv |
+| `/stiu <cheie> [nu]` | `/ack` | Marchează o expunere ca intenționată, sau anulează marcajul |
+| `/block <ip> [durată]` | `/blocheaza` | Blochează un IP, cu confirmare. Durata: `1h`, `30m`, secunde, sau `perm` — între 60s și 30 de zile |
+| `/unblock <ip>` | `/deblocheaza` | Deblochează un IP |
+| `/panic` | — | **Golește tot blocklist-ul, imediat.** Dublă confirmare. Disponibilă chiar și pe mute |
+| `/mute` | `/liniste` | Ore de liniște pentru acest chat — vezi §3.1 |
+| `/unmute` | — | Repornește alertele, oprind ambele mecanisme |
 
 ### 3.1 Ore de liniște
 
@@ -187,73 +217,80 @@ Dacă interogarea preferințelor eșuează, botul **alertează oricum**. E singu
 direcție sigură: o eroare de bază de date nu are voie să tacă un canal de
 securitate.
 
-### Vulnerabilități și patching
-
-| Comandă | Ce face |
-|---|---|
-| `/scan [all\|os\|web\|code\|<asset>]` | Pornește o scanare |
-| `/vulns [critical\|high\|kev]` | Listă prioritizată |
-| `/vuln <id>` | Detaliu + buton `Generează plan de patch` |
-| `/patch <finding_id>` | Generează un plan (AI) |
-| `/patches` | Planuri după stare |
-| `/plan <plan_id>` | Planul complet cu butoane de acțiune |
-| `/restore` | Puncte de restaurare; restaurarea cere dublă confirmare |
-
-### Rapoarte
-
-| Comandă | Ce face |
-|---|---|
-| `/report [zi\|saptamana\|luna]` | Generează și trimite raportul |
-| `/predict` | Predicțiile curente cu probabilități și nota de calibrare |
-| `/ask <întrebare>` | Întrebare liberă peste baza de date, read-only. Limitată ca rată și ca buget |
-
-### Administrare
-
-| Comandă | Ce face |
-|---|---|
-| `/health` | Sănătatea Sentinel: fiecare unitate, dimensiunea DB, adâncimea cozilor, prospețimea feed-urilor, ultimul apel AI reușit |
-| `/version` | Versiune, git sha, momentul deploy-ului |
-| `/config get\|set <key> [val]` | Doar parametri permiși (praguri, TTL-uri, ore liniștite). Niciodată secrete, căi sau allowlist-uri de comenzi |
-| `/budget` | Cheltuiala AI azi și luna asta față de plafon |
+Planurile de patch se aprobă prin butoane, nu prin comenzi separate de tipul
+`/plan` sau `/restore` — vezi `/patches` mai sus și §4 pentru fluxul de
+aprobare în doi pași. `/scan`, `/report`, `/predict`, `/version`, `/config`
+și `/budget` nu există în cod; erau documentate aici fără să fi fost
+implementate vreodată.
 
 ---
 
 ## 4. Butoane
 
+**Corectat pe 8 septembrie 2026** — tabelul enumera butoane fără niciun
+producător în cod (`🔍 Detalii`, `👁 Watch`, `🔇 Suprimă regula 1h`,
+`🔒 Permanentizează`, `📊 Vezi activitatea`, tot rândul „Vulnerabilitate" și
+tot rândul „Serviciu picat"). Ce chiar există:
+
 | Context | Butoane |
 |---|---|
-| Incident | `🔍 Detalii` · `🚫 Blochează IP` · `👁 Watch` · `✅ Fals pozitiv` · `🔇 Suprimă regula 1h` |
-| Auto-block | `↩️ Deblochează` · `🔒 Permanentizează` · `📊 Vezi activitatea` |
-| Mod observă (auto-block oprit) | `🚫 Blochează acum` · `👁 Watch` · `✅ Fals pozitiv` |
-| Vulnerabilitate | `📄 Detalii` · `🛠 Generează plan` · `😴 Amână 7 zile` · `🙈 Acceptă riscul` |
-| Plan de patch | `📄 Vezi` · `🧪 Dry-run` · `✅ Aplică` · `⏰ Programează` · `❌ Respinge` |
-| Serviciu picat | `🔄 Restart serviciu` · `📜 Ultimele loguri` · `🔇 Mute 30m` |
+| Incident, cu actor IP | `🚫 Blochează <ip> (Nh)` · `❌ Ignoră` — sau, dacă auto-block a acționat deja, `↩️ Deblochează <ip>` · `✔️ OK, lasă blocat` |
+| `/block` (confirmare) | `✅ Blochează <ip> (durată)` · `❌ Anulează` |
+| `/panic` (confirmare) | `🚨 Golește TOT blocklistul` · `❌ Anulează` |
+| Logare neobișnuită | `✔️ Am văzut` · `🚨 Nu sunt eu` (blochează adresa sesiunii ȘI o închide) |
+| Plan de patch | `🧪 Dry-run` · `✅ Aplică…` · `❌ Respinge`, apoi la a doua atingere `✅ DA, aplică acum` · `❌ Renunț` |
 
-Două butoane merită explicate:
-
-**`↩️ Deblochează`** apare pe *fiecare* mesaj de auto-block. O blocare greșită
-este la un tap distanță de anulare. Această proprietate este ce face auto-block-ul
-acceptabil.
-
-**`✅ Fals pozitiv`** nu doar închide incidentul: scrie o intrare de suprimare
-îngustă *și* alimentează datele de calibrare. Este mecanismul prin care rata de
-fals-pozitive scade în timp. Folosește-l.
+**`✅ Fals pozitiv`, „Watch" și butoanele de pe o vulnerabilitate sau pe un
+serviciu picat nu există** — dacă operatorul are nevoie de ele, e o comandă
+de scris, nu o corectare de documentație.
 
 ---
 
 ## 5. Securitatea butoanelor
 
 Telegram limitează `callback_data` la 64 de octeți și îl trimite înapoi de la
-client — deci poate fi rejucat și modificat.
+CLIENT, nu de la server — deci poate fi rejucat și modificat de oricine poate
+vedea mesajul, nu doar reluat identic.
 
-Sentinel pune în el **doar un token opac**. Payload-ul real stă pe server, în
-`telegram_callbacks`: single-use, cu TTL, semnat HMAC cu o cheie **separată de
-tokenul botului** (un token de bot scurs nu trebuie să permită și falsificarea
-aprobărilor).
+**Pentru `blk:`/`unblk:`** (blocare/deblocare manuală sau din alerta unui
+incident): payload-ul e semnat inline, în `callback_data` însuși —
+`sentinel/telegram/callback_sign.py`. IP-ul e codat binar (`ip.packed` +
+base64, nu text — un IPv6 necomprimat n-ar încăpea altfel în 64 de octeți),
+alături de TTL, id-ul incidentului care a emis butonul (0 pentru o comandă
+manuală, fără incident) și momentul emiterii, totul acoperit de o etichetă
+HMAC-SHA256 trunchiată, semnată cu **`TELEGRAM_CALLBACK_HMAC_KEY`** — o cheie
+separată de tokenul botului, ca un token de bot scurs să nu permită și
+falsificarea unei blocări. Verificată la apăsare: o semnătură care nu se
+potrivește sau un buton mai vechi decât `callback_ttl_s` (implicit 600s) e
+refuzat, nu executat — mesajul spune „buton expirat, folosește /block" (sau
+`/unblock`), nu doar „eroare". **Coloana `telegram_callbacks` din schema de
+migrare rămâne nescrisă** — varianta implementată e cea descrisă mai sus, nu
+un tabel de tokene single-use pe server; dacă varianta cu tabel e preferată
+mai târziu, e o schimbare de proiectare, nu o extindere a asteia.
 
-Pentru patch-uri, tokenul e legat de `plan_hash`. **Dacă planul se regenerează,
-hash-ul se schimbă și toate butoanele din mesajele anterioare mor.** Nu poți
-aproba planul A și să se execute planul B.
+**O semnătură validă rejucată ÎN interiorul TTL-ului tot funcționează.**
+Schema n-are unicitate per-token — doar expirare — deci fereastra practică de
+rejucare e cea a `callback_ttl_s` (implicit 600s), nu zero.
+
+**Butonul „🚨 Nu sunt eu"** (`nteu:`, de pe fiecare alertă de logare) e semnat
+la fel, cu o formă mai scurtă (`nteu:id_b36:issued_b36:sig` —
+`sentinel/telegram/callback_sign.py::sign_session_action`): fără IP, TTL sau
+`ref`, fiindcă la momentul emiterii nu există o adresă de purtat — se
+citește din `login_sessions` abia la apăsare (vezi §4). TTL-ul de verificare
+nu e purtat în payload, ci e o constantă a botului (`bot.NTEU_TTL_S`, 7
+zile) — mult mai lung decât `callback_ttl_s`, fiindcă butonul e gândit să
+fie apăsat ore mai târziu, nu în minutele imediat următoare unei alerte.
+Fără semnătură, orice membru cu drept de acțiune al chatului putea trimite
+manual `nteu:<id secvențial>` și termina orice sesiune ghicită — inclusiv una
+de pe o adresă din allowlist, unde efectul e să-ți închizi singur propriul
+SSH.
+
+**Pentru planurile de patch** (`pap1:`/`pap2:`/`pdry:`/`prej:`), mecanismul e
+diferit și mai vechi: tokenul din `callback_data` e opac, iar payload-ul real
+stă pe server, în `approval_tokens` — single-use, cu TTL, legat de
+`(chat, plan, plan_hash)`. **Dacă planul se regenerează, hash-ul se schimbă
+și toate butoanele din mesajele anterioare mor.** Nu poți aproba planul A și
+să se execute planul B.
 
 `✅ Aplică` nu execută niciodată direct. Deschide o a doua confirmare care
 restatează ținta, downtime-ul estimat și dimensiunea backup-ului — ca un tap
@@ -265,23 +302,57 @@ IP-urile prin `ipaddress`, id-urile ca întregi, TTL-urile mărginite între 60s
 `/block '; rm -rf /'` este respins de validarea IP-ului, nu de un filtru de
 escaping.
 
+### 5.1 La livrare: butoanele vechi mor
+
+`TELEGRAM_CALLBACK_HMAC_KEY` e citită și verificată abia din versiunea asta —
+înainte, câmpul era cerut la `sentinel config-check` și necitit de nimic.
+Orice buton `blk:`/`unblk:` trimis de o versiune ANTERIOARĂ acestei livrări
+poartă adresa ca text simplu, fără semnătură: după livrare, `on_callback` îl
+respinge ca „nevalid" (nu se poate decoda ca payload semnat), nu ca „expirat".
+Același destin îl are un buton `nteu:` emis de o instalare mai veche decât
+semnarea lui — `on_callback` îl respinge la fel, nu îl execută pe formatul
+vechi. **Alertele deja trimise în chat, din instalarea veche, nu mai pot fi
+blocate/închise din buton — doar prin `/block <ip>` scris de mână.** Nu e o
+pierdere: e limita firească a unei semnături introduse retroactiv. Ordinea
+de livrare care contează:
+
+1. `TELEGRAM_CALLBACK_HMAC_KEY` trebuie să existe în `secrets.env` (`openssl
+   rand -hex 32`) ÎNAINTE de repornirea lui `sentinel-telegram` — altfel
+   procesul nu pornește (`Secrets.require` ridică la construirea aplicației).
+2. Imediat după repornire, butoanele vechi din chat devin inerte. Alertele
+   NOI (de după repornire) au butoane funcționale.
+3. Dacă instalarea are `allowed_user_ids` de completat (§2.1) și HMAC-ul de
+   introdus în aceeași fereastră de mentenanță, ordinea dintre ele nu
+   contează una față de alta — dar amândouă trebuie să fie deja în cod și
+   livrate PE GAZDĂ înainte de a fi scrise în configurație, din același motiv
+   ca la §2.1: o cheie de configurare pe care codul vechi n-o cunoaște oprește
+   fiecare unitate care încarcă `sentinel.yaml`.
+
 ---
 
 ## 6. Volumul notificărilor
 
-Modul de eșec pe care aceste setări îl previn este oboseala de alerte. Un canal
-care sună de patruzeci de ori pe zi ajunge pe mute, iar un canal pe mute nu
-protejează nimic.
+**Corectat pe 8 septembrie 2026** — secțiunea vorbea despre o fereastră de
+5 minute și un fișier `/etc/sentinel/notifications.yaml` pe care nimic în cod
+nu le citește. Ce chiar există, verificat în `sentinel/telegram/bot.py`:
 
-- **Critic** trece întotdeauna: peste ore liniștite, peste mute, fără digest.
-  Dacă nu merită să trezești pe cineva, nu e critic — reclasifică regula.
-- **Mediu** intră în digest: peste 10 notificări în 5 minute devin un singur
-  mesaj cu totaluri și link către dashboard.
-- **Deduplicare**: același fingerprint de incident nu re-notifică timp de 30 de
-  minute, oricâte detecții acumulează. Un atac prin forță brută este un mesaj,
-  nu patru sute. O escaladare de severitate trece totuși.
-
-Toate setările în `/etc/sentinel/notifications.yaml`.
+- **Critic** trece întotdeauna: peste ore liniștite, peste mute, fără digest
+  — `passes_anyway` din `telegram/quiet.py`.
+- **Digestul e după NUMĂR de incidente în așteptare, nu după un interval de
+  timp.** Când mai multe de `telegram.digest_threshold` (implicit 10, dar
+  niciodată mai puțin de 6) așteaptă să fie trimise ÎN ACELAȘI CICLU al
+  buclei de push (la 15 secunde), pleacă ca un singur mesaj cu totaluri pe
+  severitate, nu unul per incident. Nu e restrâns la severitatea „medie" —
+  un lot mixt de incidente intră în digest la fel.
+- **Fingerprint-ul unui incident DESCHIS se actualizează, nu se dublează**:
+  o nouă detecție pe același `fingerprint`, cât timp incidentul e încă
+  `open`/`acknowledged`, crește `detection_count` pe rândul existent
+  (`sentinel/db/repo/incidents.py::upsert_incident`) în loc să deschidă un
+  incident nou — un atac prin forță brută rămâne un singur incident, nu
+  patru sute. Dacă asta se traduce și într-o singură alertă Telegram (nu doar
+  un singur RÂND în bază) depinde de codul care decide când să împingă
+  push-ul unui incident existent — cod din afara acestui fișier
+  (`sentinel/detect/`), neverificat aici.
 
 ---
 
@@ -300,10 +371,38 @@ roluri și de dubla confirmare, dar tot prea mult.
       WHERE source='telegram' AND at > now() - interval '7 days' ORDER BY at DESC"
    ```
 
+**Corectat pe 8 septembrie 2026** — rândul de mai jos spunea că PIN-ul acoperă
+și „modificarea allowlist-ului"; nu există nicio asemenea comandă (vezi §3),
+iar afirmația n-a fost niciodată adevărată în cod. PIN-ul condiționează DOAR
+a doua confirmare la aplicarea unui plan de patch.
+
 Ca apărare în adâncime, dacă telefonul poate fi pierdut sau furat: setează
 `TELEGRAM_APPLY_PIN` în `secrets.env` și `telegram.require_pin_for_apply: true`.
-Aplicarea patch-urilor și modificarea allowlist-ului vor cere un PIN — ceva ce
-hoțul nu are.
+A doua atingere de pe „✅ Aplică" nu mai rulează planul direct — botul cere un
+răspuns (reply, în chat, la promptul lui) cu PIN-ul, în cel mult 5 minute, cu
+maxim 3 încercări greșite înainte să anuleze cererea și să ceară planul din
+nou (`sentinel/telegram/patch_flow.py::on_pin_reply`). Fără PIN-ul corect,
+`approve_plan` nu se cheamă deloc — hoțul care are telefonul deblocat tot nu
+poate aplica un patch fără să știe și PIN-ul.
+
+**Corectat pe 8 septembrie 2026, runda 3: răspunsul cu PIN-ul nu mai e
+jurnalizat.** Handlerul care primește replica (`sentinel/telegram/bot.py::
+_pin_guard`) nu e cel folosit pentru comenzi obișnuite (`_guard`) — acela
+scrie textul mesajului acceptat în journald la fiecare comandă, ceea ce
+pentru un PIN ar însemna PIN-ul însuși, corect SAU greșit, în clar, citibil
+de uid-ul `sentinel` pe ambele gazde. `_pin_guard` nu scrie niciodată textul
+mesajului și nu numără răspunsul ca o comandă — jurnalizează o singură
+linie, `"pin attempt"`, doar cu rezultatul (`ok`/`wrong`/`expired`/`ignored`)
+și chat_id-ul. Un răspuns obișnuit trimis în chat cât timp, din întâmplare,
+un PIN e în așteptare — o replică la altceva — nu produce nicio linie: nu e
+o încercare de PIN, și numărarea lui ca atare (chiar și fără textul lui) ar
+fi exact defectul „înghite orice a sosit" pe care verificarea promptului
+(mai sus, §17 din OPERARE.md) există să-l închidă.
+
+**Ce rămâne adevărat indiferent de jurnal**: PIN-ul tastat ca răspuns e un
+mesaj Telegram obișnuit și rămâne în istoricul conversației — Telegram nu-l
+șterge. Jurnalul botului nu-l mai poartă, dar istoricul chatului tot îl
+poartă; vezi OPERARE.md §17 pentru nota operațională completă despre asta.
 
 ---
 
@@ -341,6 +440,29 @@ configurare, și de-asta soluția nu e un token comun.
   a trimis acel mesaj, deci apăsarea pe o alertă venită de la instanța A ajunge
   la A. Nu e nevoie nici de identitate de instanță în payload, nici de vreun
   canal de control între gazde.
+
+### Comenzile scrise de mână nu se rutează singure
+
+Butoanele se rutează singure (mai sus); o **comandă tastată** (`/block ...`),
+nu. Ambele boturi citesc din același grup, deci un `/block 203.0.113.7` scris
+FĂRĂ nicio mențiune ajunge la amândouă deodată — și fiecare îl execută pe
+propria gazdă. O singură comandă tastată o dată blochează aceeași adresă pe
+două servere de producție.
+
+**Decizie, luată și documentată aici** (8 septembrie 2026), nu doar codată
+tăcut: comenzile care schimbă starea (`/block`, `/unblock`, `/panic`,
+`/mute`, `/unmute`, `/rezolva`, `/fp`, `/stiu` — tabelul §3, coloana
+„Răspuns") CER mențiunea botului într-un chat care nu e privat:
+
+```
+/block@sentinel_gazda_a_bot 203.0.113.7 1h
+```
+
+Fără ea, botul răspunde cu un indiciu (numele lui propriu, citit din
+Telegram — nu dintr-o valoare de configurare) și NU execută nimic. Comenzile
+doar-citire (`/status`, `/incidente`, `/selfcheck`, `/dashboard`…) rămân fără
+mențiune — **ambele boturi răspund**, dar informația repetată e zgomot, nu o
+acțiune dublă, și cerința ar fi doar frecare fără niciun folos pentru ele.
 
 ### Procedura
 

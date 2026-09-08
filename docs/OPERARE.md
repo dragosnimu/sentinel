@@ -883,28 +883,21 @@ exista deloc, doar arăta ca și cum ar exista. Reparat parțial în
 * `on_pin_reply` verifică PIN-ul (comparație `hmac.compare_digest`, plafon de
   încercări per chat, expirare) și abia atunci aprobă și aplică.
 
-**Ce lipsește, și de ce nu s-a adăugat aici**: nimic din `bot.py` nu cheamă
-`on_pin_reply` — botul n-are azi niciun handler pentru mesaje text simple,
-doar butoane. `bot.py` e al altui scriitor pentru schimbarea asta (regula
-fișierelor disjuncte). Linia care lipsește, de adăugat lângă înregistrarea
-existentă a lui `on_patch_callback` în `build_application`:
+**Legarea în bot (8 septembrie 2026, runda a treia a fluxului Telegram)**:
+`build_application` înregistrează `on_pin_reply` printr-un înveliș propriu,
+`_pin_guard`, nu prin gardianul comun al comenzilor. Diferența e deliberată:
+gardianul comun scrie în jurnal textul fiecărui mesaj acceptat și îl numără ca
+poruncă, deci PIN-ul tastat ar fi ajuns verbatim în journald, pe care
+utilizatorul `sentinel` îl poate citi. Învelișul verifică autorizarea chatului,
+prinde excepțiile, nu scrie niciodată textul mesajului și nu numără nimic:
+jurnalul primește doar `pin attempt` cu rezultatul (`ok`, `wrong`, `expired`,
+`ignored`) și id-ul chatului. O replică omenească la altă alertă a botului nu
+produce nicio linie. Handler-ul răspunde doar la replici (`filters.REPLY`) la
+mesajul-prompt al PIN-ului, de la același chat care a dat al doilea tap.
 
-```python
-from telegram.ext import MessageHandler, filters
-app.add_handler(MessageHandler(
-    filters.TEXT & filters.REPLY & ~filters.COMMAND, patch_flow.on_pin_reply))
-```
-
-**Starea până atunci, spusă direct**: pornirea `require_pin_for_apply` NU mai
-aplică patch-uri fără PIN (defect închis), dar nici nu mai poate aplica NICIUN
-patch prin Telegram — al doilea tap rămâne blocat cerând un PIN pe care nimic
-nu-l poate livra. E alegerea sigură dintre două: eșec închis (nimic nu se
-aplică) în loc de eșec deschis (orice se aplica oricum), dar tot înseamnă că
-opțiunea, pornită azi, oprește fluxul normal de aprobare din Telegram — și
-panoul web nu e o alternativă: conform §3.5 din ARHITECTURA.md, dashboard-ul
-n-are nicio cale spre executor, doar `/dry-run` și `/reject`. **Nu porni
-`require_pin_for_apply` până nu se adaugă linia de mai sus** — altfel niciun
-patch nu se mai poate aplica prin niciun canal.
+**Ce rămâne adevărat**: PIN-ul stă în istoricul conversației Telegram, la
+vedere pentru oricine deschide grupul pe un telefon deblocat. Îl protejează
+doar ștergerea mesajului după aprobare, pe care botul n-o face în locul tău.
 
 **Ce s-a reparat în runda a doua (8 septembrie 2026), în `on_pin_reply`:**
 

@@ -566,7 +566,7 @@ sudo sentinel web --create-admin --username <user> --role operator
 sudo sentinel web --set-password --username <user>     # revocă și sesiunile
 sudo sentinel web --enroll-totp --username <user>      # telefon pierdut
 sudo sentinel web --revoke-sessions --username <user>
-sudo sentinel web --unlock --username <user>           # după 5 încercări eșuate
+sudo sentinel web --unlock --username <user>           # deblochează ambele etape (parolă și TOTP)
 ```
 
 Roluri: `owner` (tot), `operator` (blocare, deblocare, scanare — fără aplicare de
@@ -689,7 +689,7 @@ Pe Telegram: `/status`, `/incidents`, `/blocklist`, `/vulns`, `/health`,
 ### 6.1 Instalarea a eșuat la un pas
 
 Instalatorul e numerotat pe pași, idempotent și reluabil. Fiecare pas are un
-marker în `/var/lib/sentinel/.install-state/`.
+marker în `/var/lib/sentinel-install/`.
 
 ```bash
 # Repari cauza, apoi continui de la pasul respectiv
@@ -777,7 +777,7 @@ ssh deploy@203.0.113.10
 systemctl --failed
 diff <(systemctl list-units --type=service --state=running --no-legend --plain \
         | awk '{print $1}' | sort) \
-     /var/lib/sentinel/.install-state/baseline-services.txt
+     /var/lib/sentinel-install/baseline-services.txt
 free -h                    # cauza cea mai probabilă
 ```
 
@@ -996,5 +996,38 @@ neimplementate în runner. Calea de instalare Debian/Ubuntu este scrisă și
 acoperită de teste, dar **nu a fost încă rulată complet pe o gazdă Debian
 reală** — pe RHEL este verificată în producție.
 
-Detalii în [ARHITECTURA.md](ARHITECTURA.md) și în
+**Notă, 8 septembrie 2026 — patru găuri închise în calea de deploy.** Pachetul
+trimis pe gazdă se construiește acum din `git ls-files`, nu dintr-o listă de
+`--exclude`: un fișier ignorat de git (`credentiale.txt`, `env.txt`) nu mai
+poate ajunge în arhivă, indiferent cum se numește data viitoare. Directorul de
+marcaje ale instalării s-a mutat din `/var/lib/sentinel/.install-state` (scriibil
+de contul de serviciu) în `/var/lib/sentinel-install` (0700, doar root) — o
+migrare automată mută marcajele existente, fără să repornească niciun pas.
+Modul `dedicated` fără `--domain` randă acum `server_name` din numele gazdei, nu
+`_`, și verificarea de după nginx cere efectiv `/healthz` înainte să raporteze
+succes. Detalii în [ARHITECTURA.md](ARHITECTURA.md) și în
 [CHANGELOG.md](CHANGELOG.md).
+
+**Notă, runda 3 — migrarea marcajelor s-a redesenat, nu doar reparat.** Prima
+variantă (de mai sus) verifica doar proprietarul și modul căii vechi; asta
+lăsa trecere unui director root-owned care nu era totuși un marcaj —
+`/var/lib/sentinel/executor` (ține jurnalul de audit al executorului),
+redenumit de contul de serviciu peste calea veche, migra la fel de curat ca
+un marcaj real. Acum migrarea acceptă doar NUME cunoscute (marcaje de pas,
+`preflight.env`, `facts/`, `baseline-*.txt`); orice altceva rămâne pe loc,
+raportat. Marcajul de o singură dată se scrie necondiționat, la primul pas
+prin funcție, indiferent de rezultat — inclusiv pe o instalare nouă, fără
+nimic de migrat, sau pe un refuz — ca să nu mai fie interogată calea veche la
+nesfârșit; un refuz nu se mai reîncearcă automat, operatorul repară de mână și
+șterge marcajul dacă vrea o privire în plus. Detalii în comentariul din
+`migrate_legacy_state_markers` (`deploy/lib/common.sh`).
+
+**Gaură cunoscută, neînchisă:** `deploy/geoip/refresh.sh` e prins de regula
+`geoip/` din `.gitignore` (menită pentru datele MaxMind, nu pentru scriptul
+care le reîmprospătează) și n-a fost niciodată `git add`-uit — deci nu ajunge
+în pachetul de deploy prin nicio cale, indiferent de mecanismul de
+împachetare. Operatorul trebuie fie să-l adauge explicit cu `git add -f
+deploy/geoip/refresh.sh`, fie să ancoreze regula din `.gitignore` (de pildă
+`/geoip/` la rădăcină, sau o excludere pentru fișierele de date, nu pentru
+director). Nu s-a reparat aici — e o decizie despre ce anume ar trebui să
+însemne regula, nu un defect de mecanism.
