@@ -402,6 +402,468 @@ def test_apt_tolerates_one_package_without_an_origin(monkeypatch):
     assert {f["package"] for f in findings} == {"libssl3t64"}
 
 
+# --- the shape a real Ubuntu host actually printed -------------------------
+# Măsurat pe 14 septembrie 2026 pe gazda Ubuntu 24.04.4 LTS (noble), apt 2.8.3,
+# cu chiar comanda scanerului: `apt-get -s -q -o Debug::NoLocking=true
+# dist-upgrade`. Cele 15 linii `Inst` sunt copiate verbatim, nu rescrise: o formă
+# măsurată o dată valorează mai mult decât o duzină inventate, iar linia care a
+# oprit șapte scanări programate la rând e una dintre ele.
+#
+# A zecea poartă un al doilea grup de paranteze drepte DUPĂ paranteza rotundă.
+# `apt-get(8)` îl descrie la `-s`: „Square brackets indicate broken packages, and
+# empty square brackets indicate breaks that are of no consequence (rare)" — o
+# listă de pachete rupte pentru o clipă în timpul simulării, fără versiune, fără
+# origine și fără arhitectură.
+_APT_REAL_NOBLE = """\
+Inst motd-news-config [13ubuntu10.4] (13ubuntu10.5 Ubuntu:24.04/noble-updates [all])
+Inst base-files [13ubuntu10.4] (13ubuntu10.5 Ubuntu:24.04/noble-updates [amd64])
+Inst docker-ce-cli [5:29.7.2-1~ubuntu.24.04~noble] (5:29.8.0-1~ubuntu.24.04~noble Docker CE:noble [amd64])
+Inst containerd.io [2.3.3-1~ubuntu.24.04~noble] (2.3.5-1~ubuntu.24.04~noble Docker CE:noble [amd64])
+Inst docker-ce [5:29.7.2-1~ubuntu.24.04~noble] (5:29.8.0-1~ubuntu.24.04~noble Docker CE:noble [amd64])
+Inst libproc2-0 [2:4.0.4-4ubuntu3.2] (2:4.0.4-4ubuntu3.3 Ubuntu:24.04/noble-updates [amd64])
+Inst procps [2:4.0.4-4ubuntu3.2] (2:4.0.4-4ubuntu3.3 Ubuntu:24.04/noble-updates [amd64])
+Inst python-apt-common [2.7.7ubuntu5.2] (2.7.7ubuntu5.3 Ubuntu:24.04/noble-updates [all])
+Inst python3-apt [2.7.7ubuntu5.2] (2.7.7ubuntu5.3 Ubuntu:24.04/noble-updates [amd64])
+Inst ubuntu-release-upgrader-core [1:24.04.28] (1:24.04.29 Ubuntu:24.04/noble-updates [all]) []
+Inst python3-distupgrade [1:24.04.28] (1:24.04.29 Ubuntu:24.04/noble-updates [all])
+Inst byobu [6.11-0ubuntu1] (6.11-0ubuntu1.1 Ubuntu:24.04/noble-updates [all])
+Inst docker-buildx-plugin [0.36.1-1~ubuntu.24.04~noble] (0.37.1-1~ubuntu.24.04~noble Docker CE:noble [amd64])
+Inst docker-ce-rootless-extras [5:29.7.2-1~ubuntu.24.04~noble] (5:29.8.0-1~ubuntu.24.04~noble Docker CE:noble [amd64])
+Inst docker-compose-plugin [5.5.0-1~ubuntu.24.04~noble] (5.5.1-1~ubuntu.24.04~noble Docker CE:noble [amd64])
+"""
+
+#: Linia măsurată care poartă grupul de la sfârșit, ca să nu fie căutată prin
+#: fixtură cu un index care se poate muta.
+_APT_REAL_WITH_TRAILING_GROUP = (
+    "Inst ubuntu-release-upgrader-core [1:24.04.28] "
+    "(1:24.04.29 Ubuntu:24.04/noble-updates [all]) []")
+
+#: Măsurată pe aceeași gazdă pe 12 septembrie 2026 și păstrată în `scans.error`
+#: al scanării care a eșuat atunci: una dintre cele zece linii pe care parserul
+#: nu le-a putut citi. E singura formă REALĂ care are deodată buzunar de
+#: securitate, două origini și grupul de paranteze de la sfârșit — adică singura
+#: dovadă că drumul de la potrivire la constatare merge cu grupul prezent. O
+#: linie inventată cu aceeași formă n-ar dovedi decât că expresia se potrivește
+#: cu ce i-am scris noi.
+_APT_REAL_SECURITY_WITH_TRAILING_GROUP = (
+    "Inst libc6-dev [2.39-0ubuntu8.8] (2.39-0ubuntu8.9 "
+    "Ubuntu:24.04/noble-security, Ubuntu:24.04/noble-updates [amd64]) []")
+
+
+def test_every_measured_inst_line_parses(monkeypatch):
+    """Eșecul pe care îl previne: o singură formă de linie nerecunoscută oprește
+    toată scanarea, iar operatorul rămâne fără răspuns la „am actualizări de
+    securitate în așteptare?".
+
+    S-a întâmplat, și se citește în `scans`: șapte scanări programate la rând au
+    eșuat între 9 și 14 septembrie 2026 — cinci zile —, cu „1 din 15 linii `Inst`
+    (…) nu au forma așteptată" la majoritatea rulărilor și „10 din 29" pe 12
+    septembrie. Programate, nu „de noapte": șase au pornit imediat după miezul
+    nopții, dar una a rulat la 11:45 UTC, iar numărarea lor ca nopți e felul în
+    care șapte rulări se transformă în alt număr de zile decât au fost. Refuzul
+    era corect, o formă neînțeleasă n-are voie să
+    fie sărită; prețul lui e că o scanare eșuată nu rulează
+    `mark_resolved_absent`, deci pe un scaner care chiar scrisese constatări ele
+    ar fi rămas și deschise pe deasupra.
+    """
+    lines = [ln for ln in _APT_REAL_NOBLE.splitlines() if ln.strip()]
+    assert len(lines) == 15, (
+        "fixtura măsurată s-a scurtat; un test rămas fără date de rulat trece "
+        "fără să verifice nimic")
+
+    parsed, error = os_packages._read_inst_lines(_APT_REAL_NOBLE)
+    assert error is None, f"ieșirea reală a gazdei e respinsă: {error}"
+    assert len(parsed) == 15
+
+    # Nu doar „a potrivit": fiecare linie trebuie să dea numele, versiunea
+    # candidată și originea. O potrivire care lasă câmpurile goale ar trece de o
+    # aserțiune pe `error is None` și ar produce constatări fără conținut.
+    for line, m in parsed:
+        candidate, origins, _arch = os_packages._split_apt_body(m.group("body"))
+        assert m.group("name") and candidate and origins, \
+            f"câmpuri lipsă după potrivire: {line}"
+    assert [m.group("name") for _l, m in parsed][:3] == [
+        "motd-news-config", "base-files", "docker-ce-cli"]
+    assert _APT_REAL_WITH_TRAILING_GROUP in [ln for ln, _m in parsed], \
+        "linia cu grupul de la sfârșit nu mai e în fixtură"
+
+
+def test_the_trailing_broken_list_is_ignored_not_parsed():
+    """Eșecul pe care îl previne: versiunea, originea sau arhitectura citite
+    dintr-un grup care nu poartă niciuna dintre ele.
+
+    Grupul de după paranteză e o listă de pachete rupte momentan. Dacă ar fi
+    citit ca arhitectură, `raw.arch` ar deveni un nume de pachet; dacă ar intra
+    în corp, originea — singurul lucru care deosebește o actualizare de
+    securitate de una obișnuită — ar fi dusă de un grup care n-o conține.
+    """
+    m = os_packages._APT_INST.match(_APT_REAL_WITH_TRAILING_GROUP)
+    assert m, "linia reală cu grup la sfârșit nu potrivește"
+    assert m.group("name") == "ubuntu-release-upgrader-core"
+    assert m.group("installed") == "1:24.04.28"
+    assert os_packages._split_apt_body(m.group("body")) == (
+        "1:24.04.29", "Ubuntu:24.04/noble-updates", "all")
+
+    # Aceeași linie fără grup: fiecare câmp trebuie să iasă identic. Altfel
+    # toleranța ar fi cumpărat parsarea unei linii cu prețul alteia.
+    fara = _APT_REAL_WITH_TRAILING_GROUP[:-len(" []")]
+    m2 = os_packages._APT_INST.match(fara)
+    assert m2 and m2.groups() == m.groups()
+
+    # Varianta NEGOALĂ, pe care apt o documentează ca rară și pe care n-am
+    # văzut-o: numele dinăuntru n-au voie să ajungă în niciun câmp.
+    m3 = os_packages._APT_INST.match(
+        "Inst foo [1] (2 Ubuntu:24.04/noble-updates [all]) [bar baz ]")
+    assert m3 and m3.group("name") == "foo"
+    assert os_packages._split_apt_body(m3.group("body")) == (
+        "2", "Ubuntu:24.04/noble-updates", "all")
+
+    # Și o linie fără arhitectură deloc, dar cu lista de rupte: arhitectura
+    # rămâne goală, nu devine „bar".
+    m4 = os_packages._APT_INST.match("Inst foo [1] (2 Ubuntu:24.04/noble-security) [bar]")
+    assert m4 and os_packages._split_apt_body(m4.group("body")) == (
+        "2", "Ubuntu:24.04/noble-security", "")
+
+
+def test_a_security_update_with_a_trailing_group_still_becomes_a_finding(monkeypatch):
+    """Eșecul pe care îl previne: linia se parsează, dar constatarea nu mai ajunge
+    în panou — sau ajunge cu versiunea reparată luată din grupul greșit.
+
+    Pe gazda măsurată pe 14 septembrie niciuna dintre cele 15 linii nu era din
+    depozitul de securitate, deci drumul de la potrivire la constatare nu e
+    acoperit de acea fixtură. Linia de aici e tot măsurată, de pe aceeași gazdă,
+    cu două zile înainte: e una dintre cele zece pe care scanarea din 12
+    septembrie nu le-a putut citi, iar actualizarea ei de securitate pentru
+    `libc6-dev` n-a devenit niciodată constatare din cauza asta.
+    """
+    _apt_host(monkeypatch, out=(
+        "NOTE: This is only a simulation!\n"
+        + _APT_REAL_NOBLE
+        + _APT_REAL_SECURITY_WITH_TRAILING_GROUP + "\n"))
+    findings, error, _ = _run(os_packages.scan("debian"))
+
+    assert error is None, error
+    libc = next(f for f in findings if f["package"] == "libc6-dev")
+    assert libc["installed_version"] == "2.39-0ubuntu8.8"
+    assert libc["fixed_version"] == "2.39-0ubuntu8.9"
+    assert libc["raw"]["arch"] == "amd64"
+    # Ambele origini, în ordinea în care le-a scris apt: dacă parsarea ar tăia
+    # una, `_SECURITY_POCKET` ar putea rămâne fără buzunarul care contează.
+    assert libc["raw"]["origins"] == (
+        "Ubuntu:24.04/noble-security, Ubuntu:24.04/noble-updates")
+    # Restul fixturei măsurate e din `noble-updates` și din depozitul Docker.
+    # Constatarea trebuie să fie singura: o listă de actualizări obișnuite
+    # prezentate ca fiind de securitate e zgomotul după care operatorul nu mai
+    # citește niciuna.
+    assert [f["package"] for f in findings] == ["libc6-dev"]
+
+
+def test_the_tolerance_does_not_accept_anything_else_after_the_parenthesis(monkeypatch):
+    """Eșecul pe care îl previne: toleranța pentru lista de pachete rupte lărgită
+    până acceptă orice coadă, adică exact garda care a prins forma asta.
+
+    O coadă necunoscută după paranteză poate purta orice — inclusiv un al doilea
+    câmp de origine. Dacă ar fi ignorată în tăcere, scanarea ar raporta o listă
+    mai scurtă, iar `mark_resolved_absent` ar închide constatările liniilor
+    neînțelese.
+    """
+    _apt_host(monkeypatch, out=(
+        "Inst libssl3t64 [3.0.13-0ubuntu3.4] (3.0.13-0ubuntu3.5 "
+        "Ubuntu:24.04/noble-security [amd64])\n"
+        "Inst ceva-nou [1.0] (2.0 Ubuntu:24.04/noble-security [amd64]) ceva-necunoscut\n"))
+    findings, error, _ = _run(os_packages.scan("debian"))
+    assert findings == []
+    assert error and "nu au forma așteptată" in error
+    assert "ceva-necunoscut" in error
+
+
+def test_the_tolerance_accepts_exactly_one_trailing_group():
+    """Eșecul pe care îl previne: toleranța lărgită de la „exact un grup gol de
+    paranteze drepte" la „orice coadă de paranteze drepte", adică fix garda pe
+    care se sprijină toată schimbarea asta.
+
+    Cardinalitatea E linia de apărare, nu forma `[...]`. Testul de mai sus
+    hrănește doar cozi care nu sunt paranteze, deci fixează forma și lasă
+    numărul liber: cu `?` devenit `*`, sau cu clasa de caractere lărgită ca
+    grupul să înghită și `]`, o linie cu două grupuri e acceptată în tăcere. O
+    coadă necunoscută poate purta orice — un al doilea câmp de origine inclusiv
+    —, iar ce s-ar pierde atunci nu e o linie, ci deosebirea dintre o
+    actualizare de securitate și una obișnuită, pe o linie care n-ar mai fi
+    refuzată zgomotos.
+    """
+    # Două grupuri. Acceptată dacă `?` devine `*`, dar și dacă `[^\]]*` devine
+    # `.*` (un singur grup care înghite `] [`).
+    assert not os_packages._APT_INST.match(
+        "Inst foo [1] (2 Ubuntu:24.04/noble-updates [all]) [] []")
+
+    # Un singur grup, dar cu `]` înăuntru. Acceptată DOAR dacă se lărgește clasa
+    # de caractere — separat de cel de sus fiindcă acela nu deosebește cele două
+    # lărgiri între ele, iar o singură aserțiune ar spune care, nu că sunt două.
+    assert not os_packages._APT_INST.match(
+        "Inst foo [1] (2 Ubuntu:24.04/noble-updates [all]) [bar]]")
+
+    # Un grup NEÎNCHIS. Acceptat dacă `\]` de la capătul grupului devine `\]?` —
+    # o lărgire care, până la aserțiunea asta, nu pica niciun test din fișier: o
+    # coadă trunchiată ar fi fost înghițită în tăcere, deși nimeni n-a citit ce
+    # era în ea. Perechea ei, `\s*` → `\s+`, e o STRÂMTARE — singurul lucru pe
+    # care-l poate face e să respingă zgomotos linia măsurată, care e deja
+    # fixată mai jos —, deci nu-i trebuie aserțiune proprie.
+    assert not os_packages._APT_INST.match(
+        "Inst foo [1] (2 Ubuntu:24.04/noble-updates [all]) [bar")
+
+    # Și forma pe care toleranța chiar o acceptă, măsurată pe gazdă: fără ea,
+    # testul ar trece la fel de bine cu o expresie care respinge tot.
+    assert os_packages._APT_INST.match(_APT_REAL_WITH_TRAILING_GROUP)
+
+
+# --- ce ține apt în /var/lib/apt/lists, măsurat -----------------------------
+# Listarea completă a directorului, de pe aceeași gazdă Ubuntu 24.04.4 LTS, pe
+# 14 septembrie 2026: `LC_ALL=C ls -1A /var/lib/apt/lists | LC_ALL=C sort`.
+# Ordinea e a gazdei (sortarea numelor REALE), deci nu e alfabetică pe numele de
+# aici.
+#
+# E fixată din același motiv pentru care sunt fixate liniile `Inst`: câte
+# indexuri are gazda și câte dintre ele sunt de securitate s-a scris de mână în
+# comentarii și a fost greșit de două ori la rând. O cifră dintr-un paragraf nu
+# se poate reverifica; o listă de nume da. Testul de mai jos nu citește niciun
+# număr din proză — le derivă rulând chiar regula codului (`_apt_index_state`)
+# peste fixtură, deci dacă regula se schimbă, testul se mută cu ea în loc să
+# rămână în urmă.
+#
+# NUMELE OGLINZILOR SUNT ÎNLOCUITE; restul fiecărui nume e verbatim. Că fixtura
+# nu e o copie literală stă scris aici tocmai ca să n-o citească nimeni drept
+# una: repository-ul e public, iar oglinzile din care trage gazda spun de unde
+# se aprovizionează ea. S-a păstrat tot ce cântărește în regulă — numărul de
+# intrări, cele DOUĂ oglinzi care poartă fiecare cele patru componente
+# `noble-security`, despărțirea dintre ce e de securitate și ce nu, sufixul
+# `_Packages` pe care codul se sprijină — și, dinadins, faptul că una dintre
+# oglinzi are `security` chiar în numele de gazdă: regula se potrivește pe
+# NUMELE FIȘIERULUI, nu pe numele buzunarului, iar fixtura trebuie să poată
+# arăta asta.
+#
+# SCRISĂ PE COLOANE: fiecare `_` din numele real e un spațiu aici, iar testul
+# reface numele cu `"_".join(...)`. Nu e o preferință de așezare în pagină. Un
+# nume de index apt e, după punctul din numele de gazdă, o înșiruire neîntreruptă
+# de 60+ de caractere din alfabetul base64url — cu literă mică, literă mare și
+# cifră în ea, adică exact compoziția pe care o caută garda din
+# `tests/security/test_repo_is_sanitised.py`, care o raportează — pe drept, după
+# formă — drept posibilă valoare generată scăpată într-un depozit public.
+# Alternativa ar fi fost o scutire pe fișier în chiar garda aia, adică o gaură
+# numită într-o apărare, pentru niște nume care nu sunt secrete. Despicarea nu
+# schimbă măsurătoarea: numele se citește pe orizontală la fel de bine, iar ce
+# rulează testul sunt numele refăcute, nu coloanele.
+_APT_REAL_LISTS_ENTRIES = """\
+mirror-one.example.invalid ubuntu dists noble-backports InRelease
+mirror-one.example.invalid ubuntu dists noble-backports main binary-amd64 Packages
+mirror-one.example.invalid ubuntu dists noble-backports main cnf Commands-amd64
+mirror-one.example.invalid ubuntu dists noble-backports main dep11 Components-amd64.yml.gz
+mirror-one.example.invalid ubuntu dists noble-backports main i18n Translation-en
+mirror-one.example.invalid ubuntu dists noble-backports multiverse binary-amd64 Packages
+mirror-one.example.invalid ubuntu dists noble-backports multiverse cnf Commands-amd64
+mirror-one.example.invalid ubuntu dists noble-backports multiverse dep11 Components-amd64.yml.gz
+mirror-one.example.invalid ubuntu dists noble-backports multiverse i18n Translation-en
+mirror-one.example.invalid ubuntu dists noble-backports restricted cnf Commands-amd64
+mirror-one.example.invalid ubuntu dists noble-backports restricted dep11 Components-amd64.yml.gz
+mirror-one.example.invalid ubuntu dists noble-backports universe binary-amd64 Packages
+mirror-one.example.invalid ubuntu dists noble-backports universe cnf Commands-amd64
+mirror-one.example.invalid ubuntu dists noble-backports universe dep11 Components-amd64.yml.gz
+mirror-one.example.invalid ubuntu dists noble-backports universe i18n Translation-en
+mirror-one.example.invalid ubuntu dists noble-updates InRelease
+mirror-one.example.invalid ubuntu dists noble-updates main binary-amd64 Packages
+mirror-one.example.invalid ubuntu dists noble-updates main cnf Commands-amd64
+mirror-one.example.invalid ubuntu dists noble-updates main dep11 Components-amd64.yml.gz
+mirror-one.example.invalid ubuntu dists noble-updates main i18n Translation-en
+mirror-one.example.invalid ubuntu dists noble-updates multiverse binary-amd64 Packages
+mirror-one.example.invalid ubuntu dists noble-updates multiverse cnf Commands-amd64
+mirror-one.example.invalid ubuntu dists noble-updates multiverse dep11 Components-amd64.yml.gz
+mirror-one.example.invalid ubuntu dists noble-updates multiverse i18n Translation-en
+mirror-one.example.invalid ubuntu dists noble-updates restricted binary-amd64 Packages
+mirror-one.example.invalid ubuntu dists noble-updates restricted cnf Commands-amd64
+mirror-one.example.invalid ubuntu dists noble-updates restricted dep11 Components-amd64.yml.gz
+mirror-one.example.invalid ubuntu dists noble-updates restricted i18n Translation-en
+mirror-one.example.invalid ubuntu dists noble-updates universe binary-amd64 Packages
+mirror-one.example.invalid ubuntu dists noble-updates universe cnf Commands-amd64
+mirror-one.example.invalid ubuntu dists noble-updates universe dep11 Components-amd64.yml.gz
+mirror-one.example.invalid ubuntu dists noble-updates universe i18n Translation-en
+mirror-one.example.invalid ubuntu dists noble InRelease
+mirror-one.example.invalid ubuntu dists noble main binary-amd64 Packages
+mirror-one.example.invalid ubuntu dists noble main cnf Commands-amd64
+mirror-one.example.invalid ubuntu dists noble main dep11 Components-amd64.yml.gz
+mirror-one.example.invalid ubuntu dists noble main i18n Translation-en
+mirror-one.example.invalid ubuntu dists noble multiverse binary-amd64 Packages
+mirror-one.example.invalid ubuntu dists noble multiverse cnf Commands-amd64
+mirror-one.example.invalid ubuntu dists noble multiverse dep11 Components-amd64.yml.gz
+mirror-one.example.invalid ubuntu dists noble multiverse i18n Translation-en
+mirror-one.example.invalid ubuntu dists noble restricted binary-amd64 Packages
+mirror-one.example.invalid ubuntu dists noble restricted cnf Commands-amd64
+mirror-one.example.invalid ubuntu dists noble restricted i18n Translation-en
+mirror-one.example.invalid ubuntu dists noble universe binary-amd64 Packages
+mirror-one.example.invalid ubuntu dists noble universe cnf Commands-amd64
+mirror-one.example.invalid ubuntu dists noble universe dep11 Components-amd64.yml.gz
+mirror-one.example.invalid ubuntu dists noble universe i18n Translation-en
+auxfiles
+vendor-repo.example.invalid linux ubuntu dists noble InRelease
+vendor-repo.example.invalid linux ubuntu dists noble stable binary-amd64 Packages
+mirror-two.example.invalid ubuntu dists noble-backports InRelease
+mirror-two.example.invalid ubuntu dists noble-backports main binary-amd64 Packages
+mirror-two.example.invalid ubuntu dists noble-backports main cnf Commands-amd64
+mirror-two.example.invalid ubuntu dists noble-backports main dep11 Components-amd64.yml.gz
+mirror-two.example.invalid ubuntu dists noble-backports main i18n Translation-en
+mirror-two.example.invalid ubuntu dists noble-backports multiverse binary-amd64 Packages
+mirror-two.example.invalid ubuntu dists noble-backports multiverse cnf Commands-amd64
+mirror-two.example.invalid ubuntu dists noble-backports multiverse dep11 Components-amd64.yml.gz
+mirror-two.example.invalid ubuntu dists noble-backports multiverse i18n Translation-en
+mirror-two.example.invalid ubuntu dists noble-backports restricted cnf Commands-amd64
+mirror-two.example.invalid ubuntu dists noble-backports restricted dep11 Components-amd64.yml.gz
+mirror-two.example.invalid ubuntu dists noble-backports universe binary-amd64 Packages
+mirror-two.example.invalid ubuntu dists noble-backports universe cnf Commands-amd64
+mirror-two.example.invalid ubuntu dists noble-backports universe dep11 Components-amd64.yml.gz
+mirror-two.example.invalid ubuntu dists noble-backports universe i18n Translation-en
+mirror-two.example.invalid ubuntu dists noble-security InRelease
+mirror-two.example.invalid ubuntu dists noble-security main binary-amd64 Packages
+mirror-two.example.invalid ubuntu dists noble-security main cnf Commands-amd64
+mirror-two.example.invalid ubuntu dists noble-security main dep11 Components-amd64.yml.gz
+mirror-two.example.invalid ubuntu dists noble-security main i18n Translation-en
+mirror-two.example.invalid ubuntu dists noble-security multiverse binary-amd64 Packages
+mirror-two.example.invalid ubuntu dists noble-security multiverse cnf Commands-amd64
+mirror-two.example.invalid ubuntu dists noble-security multiverse dep11 Components-amd64.yml.gz
+mirror-two.example.invalid ubuntu dists noble-security multiverse i18n Translation-en
+mirror-two.example.invalid ubuntu dists noble-security restricted binary-amd64 Packages
+mirror-two.example.invalid ubuntu dists noble-security restricted cnf Commands-amd64
+mirror-two.example.invalid ubuntu dists noble-security restricted dep11 Components-amd64.yml.gz
+mirror-two.example.invalid ubuntu dists noble-security restricted i18n Translation-en
+mirror-two.example.invalid ubuntu dists noble-security universe binary-amd64 Packages
+mirror-two.example.invalid ubuntu dists noble-security universe cnf Commands-amd64
+mirror-two.example.invalid ubuntu dists noble-security universe dep11 Components-amd64.yml.gz
+mirror-two.example.invalid ubuntu dists noble-security universe i18n Translation-en
+mirror-two.example.invalid ubuntu dists noble-updates InRelease
+mirror-two.example.invalid ubuntu dists noble-updates main binary-amd64 Packages
+mirror-two.example.invalid ubuntu dists noble-updates main cnf Commands-amd64
+mirror-two.example.invalid ubuntu dists noble-updates main dep11 Components-amd64.yml.gz
+mirror-two.example.invalid ubuntu dists noble-updates main i18n Translation-en
+mirror-two.example.invalid ubuntu dists noble-updates multiverse binary-amd64 Packages
+mirror-two.example.invalid ubuntu dists noble-updates multiverse cnf Commands-amd64
+mirror-two.example.invalid ubuntu dists noble-updates multiverse dep11 Components-amd64.yml.gz
+mirror-two.example.invalid ubuntu dists noble-updates multiverse i18n Translation-en
+mirror-two.example.invalid ubuntu dists noble-updates restricted binary-amd64 Packages
+mirror-two.example.invalid ubuntu dists noble-updates restricted cnf Commands-amd64
+mirror-two.example.invalid ubuntu dists noble-updates restricted dep11 Components-amd64.yml.gz
+mirror-two.example.invalid ubuntu dists noble-updates restricted i18n Translation-en
+mirror-two.example.invalid ubuntu dists noble-updates universe binary-amd64 Packages
+mirror-two.example.invalid ubuntu dists noble-updates universe cnf Commands-amd64
+mirror-two.example.invalid ubuntu dists noble-updates universe dep11 Components-amd64.yml.gz
+mirror-two.example.invalid ubuntu dists noble-updates universe i18n Translation-en
+mirror-two.example.invalid ubuntu dists noble InRelease
+mirror-two.example.invalid ubuntu dists noble main binary-amd64 Packages
+mirror-two.example.invalid ubuntu dists noble main cnf Commands-amd64
+mirror-two.example.invalid ubuntu dists noble main dep11 Components-amd64.yml.gz
+mirror-two.example.invalid ubuntu dists noble main i18n Translation-en
+mirror-two.example.invalid ubuntu dists noble multiverse binary-amd64 Packages
+mirror-two.example.invalid ubuntu dists noble multiverse cnf Commands-amd64
+mirror-two.example.invalid ubuntu dists noble multiverse dep11 Components-amd64.yml.gz
+mirror-two.example.invalid ubuntu dists noble multiverse i18n Translation-en
+mirror-two.example.invalid ubuntu dists noble restricted binary-amd64 Packages
+mirror-two.example.invalid ubuntu dists noble restricted cnf Commands-amd64
+mirror-two.example.invalid ubuntu dists noble restricted i18n Translation-en
+mirror-two.example.invalid ubuntu dists noble universe binary-amd64 Packages
+mirror-two.example.invalid ubuntu dists noble universe cnf Commands-amd64
+mirror-two.example.invalid ubuntu dists noble universe dep11 Components-amd64.yml.gz
+mirror-two.example.invalid ubuntu dists noble universe i18n Translation-en
+lock
+partial
+security-mirror.example.invalid ubuntu dists noble-security InRelease
+security-mirror.example.invalid ubuntu dists noble-security main binary-amd64 Packages
+security-mirror.example.invalid ubuntu dists noble-security main cnf Commands-amd64
+security-mirror.example.invalid ubuntu dists noble-security main dep11 Components-amd64.yml.gz
+security-mirror.example.invalid ubuntu dists noble-security main i18n Translation-en
+security-mirror.example.invalid ubuntu dists noble-security multiverse binary-amd64 Packages
+security-mirror.example.invalid ubuntu dists noble-security multiverse cnf Commands-amd64
+security-mirror.example.invalid ubuntu dists noble-security multiverse dep11 Components-amd64.yml.gz
+security-mirror.example.invalid ubuntu dists noble-security multiverse i18n Translation-en
+security-mirror.example.invalid ubuntu dists noble-security restricted binary-amd64 Packages
+security-mirror.example.invalid ubuntu dists noble-security restricted cnf Commands-amd64
+security-mirror.example.invalid ubuntu dists noble-security restricted dep11 Components-amd64.yml.gz
+security-mirror.example.invalid ubuntu dists noble-security restricted i18n Translation-en
+security-mirror.example.invalid ubuntu dists noble-security universe binary-amd64 Packages
+security-mirror.example.invalid ubuntu dists noble-security universe cnf Commands-amd64
+security-mirror.example.invalid ubuntu dists noble-security universe dep11 Components-amd64.yml.gz
+security-mirror.example.invalid ubuntu dists noble-security universe i18n Translation-en
+"""
+
+#: Pe gazdă astea două sunt DIRECTOARE, nu fișiere (`auxfiles` și `partial`,
+#: al lui apt). Recreate ca directoare ca fixtura să semene cu gazda, nu
+#: fiindcă vreo aserțiune ar depinde de asta: `_apt_index_state` le exclude
+#: deja prin `"_Packages" in p.name`, deci un filtru `is_file()` adăugat
+#: peste ar fi o operație nulă și aici, și pe gazdă. Verificat: adăugarea lui
+#: lasă toată suita verde.
+_APT_REAL_LISTS_SUBDIRS = ("auxfiles", "partial")
+
+
+def test_the_index_counts_come_from_the_measured_directory(tmp_path, monkeypatch):
+    """Eșecul pe care îl previne: poarta care refuză „curat" fără index de
+    securitate, explicată de o cifră scrisă de mână — și apoi potrivită pe cifră.
+
+    `security_indexes == 0` e singurul lucru care deosebește o gazdă care nu
+    primește deloc actualizări de securitate de una obișnuită, adică cel mai
+    periculos zero din panou. Ca să fie de crezut, poarta a fost însoțită într-un
+    comentariu de numărul de indexuri de pe gazdă — număr greșit de două ori la
+    rând (patru, când pe gazdă sunt opt). Cine ar potrivi regula pe cifra din
+    comentariu ar strica fix poarta, și ar strica-o în direcția tăcută.
+
+    Aici nu mai e nicio cifră de crezut pe cuvânt: numele sunt măsurate și
+    fixate, iar numerele le calculează codul însuși peste ele.
+    """
+    names = ["_".join(ln.split())
+             for ln in _APT_REAL_LISTS_ENTRIES.splitlines() if ln.strip()]
+    assert len(names) == 135, (
+        "fixtura măsurată s-a scurtat; un test rămas fără date de rulat trece "
+        "fără să verifice nimic")
+    assert len(set(names)) == len(names), "nume duplicate în fixtură"
+
+    for name in names:
+        if name in _APT_REAL_LISTS_SUBDIRS:
+            (tmp_path / name).mkdir()
+        else:
+            (tmp_path / name).write_bytes(b"")
+    monkeypatch.setattr(os_packages, "APT_LISTS_DIR", tmp_path)
+
+    total, security, newest, error = os_packages._apt_index_state()
+    assert error is None, error
+    assert newest is not None, "niciun mtime citit dintr-un director plin"
+
+    # Cele două cifre, derivate de cod din fixtură. Legate și de ce numără
+    # regula, nu doar de un număr: dacă filtrul se lărgește (intrările care nu
+    # sunt `_Packages` încep să conteze) sau se strâmtează, cele două laturi ale
+    # egalității se depărtează, oricare ar fi cifra din dreapta.
+    indexes = [n for n in names if "_Packages" in n]
+    security_names = sorted(
+        n for n in indexes if os_packages._SECURITY_POCKET in n.lower())
+    assert len(indexes) == total == 31
+    assert len(security_names) == security == 8
+
+    # Forma pe care sanitizarea avea voie s-o atingă cel mai puțin: cele opt
+    # nume numărate ca „de securitate" vin de la DOUĂ oglinzi, cu aceleași patru
+    # componente fiecare. O fixtură turtită la o singură oglindă ar tot da 8 din
+    # aserțiunea de sus, dar n-ar mai semăna cu gazda măsurată.
+    assert len({n.split("_ubuntu_dists_")[0] for n in security_names}) == 2
+
+    # Și fiecare dintre cele opt e chiar un index din buzunarul de securitate —
+    # aserțiunea asta stă ÎNAINTEA despicării de mai jos dinadins, ca un nume
+    # care nu-l conține să spună asta, nu să iasă cu `IndexError` din despicare.
+    assert all("_noble-security_" in n for n in security_names)
+    assert {n.split("_noble-security_")[1].split("_")[0]
+            for n in security_names} == {
+        "main", "multiverse", "restricted", "universe"}
+
+    # Regula se uită la NUMELE FIȘIERULUI, deci potrivește și numele de gazdă al
+    # oglinzii, nu doar buzunarul — iar pe gazda măsurată una dintre cele două
+    # oglinzi chiar poartă `security` în numele ei. Azi nu iese niciun fals
+    # pozitiv din asta: tot ce numără regula e un index `noble-security` real,
+    # și aserțiunea de mai sus e cea care ar spune dacă vreodată nu mai e așa.
+    assert any(os_packages._SECURITY_POCKET in n.split("_ubuntu_dists_")[0].lower()
+               for n in security_names)
+
+
 def test_apt_records_how_old_its_metadata_is(monkeypatch):
     """A clean report from a three-week-old index is a partial picture. The age
     goes onto the `scans` row so the operator is not shown a fresh-looking clean

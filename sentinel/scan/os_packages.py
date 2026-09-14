@@ -294,21 +294,69 @@ APT_LISTS_STALE_DAYS: Final[int] = 7
 #   Inst libssl3 [3.0.13-0ubuntu3.4] (3.0.13-0ubuntu3.5 Ubuntu:24.04/noble-updates, \
 #        Ubuntu:24.04/noble-security [amd64])
 #   Inst linux-headers-6.8.0-45 (6.8.0-45.45 Ubuntu:24.04/noble-security [amd64])
+#   Inst ubuntu-release-upgrader-core [1:24.04.28] (1:24.04.29 \
+#        Ubuntu:24.04/noble-updates [all]) []
 #
-# The bracketed part is the currently installed version and is absent for a
-# package that would be newly installed. Chosen over `apt list --upgradable`,
-# which prints "WARNING: apt does not have a stable CLI interface" about itself
-# and means it — and over `apt-get -s upgrade`, which hides the updates that need
-# a new dependency, i.e. every kernel.
+# The bracketed part BEFORE the parenthesis is the currently installed version and
+# is absent for a package that would be newly installed. Chosen over `apt list
+# --upgradable`, which prints "WARNING: apt does not have a stable CLI interface"
+# about itself and means it — and over `apt-get -s upgrade`, which hides the
+# updates that need a new dependency, i.e. every kernel.
 #
-# NOT VERIFIED against a real Ubuntu or Debian host: nothing in this repository's
-# test environment runs apt. What is pinned below is the shape apt's own
-# `pkgSimulate::Describe` produces. `_read_inst_lines` is the guard for being
-# wrong about it — a line that starts with `Inst` and does not match here fails
-# the scan instead of being skipped, because a dropped `Inst` line is a security
-# update nobody is told about.
+# VERIFIED against a real host, for the first time, on 14 September 2026: Ubuntu
+# 24.04.4 LTS (noble), apt 2.8.3, the scanner's own command
+# `apt-get -s -q -o Debug::NoLocking=true dist-upgrade`. It printed 15 `Inst`
+# lines; all 15 are pinned verbatim as a fixture in `tests/unit/test_scan.py`,
+# because a shape measured once is worth more than a dozen invented ones.
+#
+# Exactly ONE of them carried a second bracket group AFTER the closing
+# parenthesis — the third example above. apt-get(8) documents it under `-s`:
+# "Square brackets indicate broken packages, and empty square brackets indicate
+# breaks that are of no consequence (rare)", i.e. a list of package names broken
+# for a moment during the simulation. It carries no version, no origin and no
+# architecture, and every field of that package extracts completely without it,
+# so it is skipped here and never parsed: the origin is the ONLY thing that tells
+# a security update from an ordinary one, and it lives inside the parentheses.
+#
+# The tolerated group is written `\[[^\]]*\]` — ANY content, not only the empty
+# `[]` that was actually measured. That is deliberate, and this is what the wider
+# form costs: a non-empty broken list (documented as rare, never seen here) is
+# accepted silently rather than failing loudly. Narrowing it to `\[\]` would buy
+# nothing — the group is never read, every field of the line extracts without it
+# — while it would turn the first real non-empty list into another scan-wide
+# failure of exactly the kind this tolerance was added to end. What stays guarded
+# is the CARDINALITY: one group, and nothing else after it
+# (`test_the_tolerance_accepts_exactly_one_trailing_group`).
+#
+# Until that was tolerated, that single line failed the whole scan. What it cost
+# is read out of `scans` and `findings`, not assumed: SEVEN consecutive scheduled
+# scans failed, from 2026-09-09 to 2026-09-14 — five days in which Sentinel could
+# not answer "are there pending Ubuntu security updates". Scheduled, not nightly:
+# six of the seven ran just after midnight but one ran at 11:45 UTC, and reading
+# them as one-per-night is how the count of runs turns into a count of days. On
+# 12 September ten of 29 `Inst` lines went unparsed, one of them a genuine
+# `noble-security` update for `libc6-dev`, which therefore never became a finding;
+# that line is preserved in `scans.error` and is pinned as a fixture in
+# `tests/unit/test_scan.py`.
+#
+# Two numbers that look like this outage and are not it. The `16h 5m` on the
+# Telegram alert is the age of the ALERT, not of the failure — `selfcheck_state`
+# dates `scan:last:apt` as degraded from a different clock, and reading the
+# message as the outage shortens five days into sixteen hours. And nothing stayed
+# "open" that should have closed: the apt scanner has never written a finding
+# (no row in `findings` has `ecosystem='deb'`), so what the failure cost is the
+# ANSWER, not a stale list.
+#
+# STILL NOT VERIFIED, and saying so is the point of this paragraph: the Debian
+# pocket names, the Ubuntu Pro pockets, and any line shape outside those 15 — a
+# non-empty broken list included, which is documented as rare and was not
+# observed. `_read_inst_lines` is the guard for being wrong about them — a line
+# that starts with `Inst` and does not match here fails the scan instead of being
+# skipped, because a dropped `Inst` line is a security update nobody is told
+# about.
 _APT_INST = re.compile(
-    r"^Inst\s+(?P<name>\S+)\s+(?:\[(?P<installed>[^\]]*)\]\s+)?\((?P<body>.+)\)\s*$")
+    r"^Inst\s+(?P<name>\S+)\s+(?:\[(?P<installed>[^\]]*)\]\s+)?"
+    r"\((?P<body>.+)\)(?:\s*\[[^\]]*\])?\s*$")
 
 # Every line the parser is answerable for. Kept separate from `_APT_INST` so that
 # "this is an Inst line" and "we understood it" are two different questions.
@@ -320,8 +368,33 @@ _APT_INST_ANY = re.compile(r"^Inst\s")
 # the substring covers all of them and any mirror that keeps the pocket name,
 # which every mirror does — the pocket name is part of the repository layout.
 #
-# Also NOT VERIFIED on a real host: neither the exact pocket names nor the
-# contents of /var/lib/apt/lists have been read from one.
+# VERIFIED on the Ubuntu host, 14 September 2026, in both places this substring
+# is used: /var/lib/apt/lists holds security indexes, so the gate below does not
+# fire on a normally configured host, and the origin field of a measured `Inst`
+# line reads `Ubuntu:24.04/noble-security`. One substring matches both spellings,
+# which is why there is only one constant.
+#
+# HOW MANY indexes there are is deliberately NOT written here. The directory
+# listing is checked in as a fixture and the counts are derived from it by
+# running this very rule over it
+# (`tests/unit/test_scan.py::test_the_index_counts_come_from_the_measured_directory`).
+# Written by hand in a comment, that number was wrong twice in a row; a number a
+# test computes from checked-in names cannot be wrong quietly.
+#
+# And what the rule matches here is the FILE NAME, not a pocket name: an index
+# fetched from a mirror whose HOSTNAME contains "security" is counted too. On the
+# measured host every name it counts is a genuine `noble-security` index, so
+# there is no false positive today. Testul pe fixtură NU e o santinelă peste
+# asta: fixtura e un instantaneu, deci dacă oglinzile gazdei se schimbă mâine,
+# ea nu se schimbă și nimic nu spune nimic. Aserțiunea pică la o REMĂSURARE —
+# adică atunci când cineva reîmprospătează fixtura și numele nu mai sunt
+# `noble-security`. În `_scan_apt` aceeași subșir se caută în câmpul de ORIGINE,
+# unde poate apărea doar un nume de buzunar.
+#
+# Still NOT read from a host: the Debian pockets and the Ubuntu Pro ones. Being
+# wrong about those is a scan that reports FEWER findings, not a loud failure —
+# `_read_inst_lines` guards the line shape, nothing guards a pocket name we never
+# saw.
 _SECURITY_POCKET = "security"
 
 
@@ -365,6 +438,12 @@ def _split_apt_body(body: str) -> tuple[str, str, str]:
 
     The architecture is stripped first and from the END, because an origin can
     itself contain brackets in principle and the arch never can.
+
+    `body` is only ever what is INSIDE the parentheses: the broken-package list
+    apt may append after them is consumed by `_APT_INST` and never reaches here,
+    so the bracket group found at the end is still the architecture and nothing
+    else. A body that never had one keeps `arch == ""` — an empty architecture is
+    not an error, it is a line apt printed without one.
     """
     arch = ""
     m = re.search(r"\[([^\[\]]*)\]\s*$", body)

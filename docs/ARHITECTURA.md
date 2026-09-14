@@ -462,11 +462,23 @@ Patru lucruri împiedică repetarea:
    — iar „ce a văzut scanarea" fără „cu ce s-a uitat" e o cifră căreia nu i se
    mai poate afla valabilitatea nici a doua zi.
 
-Ce **nu** e verificat pe o gazdă reală: formatul exact al liniei `Inst`, numele
-buzunarelor de securitate și conținutul lui `/var/lib/apt/lists`. Nimic din
-mediul de test nu rulează apt. Forma e fixată din sursa lui apt, iar punctul 3
-de mai sus e ce transformă o presupunere greșită într-un eșec zgomotos în loc de
-o listă mai scurtă.
+Citit de pe o gazdă Ubuntu reală (24.04.4 LTS, apt 2.8.3) pe 14 septembrie 2026:
+formatul liniei `Inst` — 15 linii fixate verbatim în teste, una cu un grup de
+paranteze drepte după paranteza rotundă —, numele buzunarului de securitate
+(`Ubuntu:24.04/noble-security`) și listarea completă a lui `/var/lib/apt/lists`.
+
+**Cifrele nu se mai scriu aici.** Câte indexuri de pachete are gazda și câte
+dintre ele intră la „de securitate" se derivă în `tests/unit/test_scan.py`,
+rulând chiar regula codului peste listarea fixată ca fixtură — scrise de mână în
+proză, au fost greșite de două ori la rând, și o cifră dintr-un paragraf nu se
+poate reverifica. Numele oglinzilor din fixtură sunt înlocuite, fiindcă
+repository-ul e public și oglinzile spun de unde se aprovizionează gazda; restul
+fiecărui nume e verbatim, scris pe coloane (`_` redat ca spațiu, cu motivul
+lângă fixtură) și refăcut de test. Ce **nu** e verificat: buzunarele
+Debian și cele Ubuntu Pro. Nimic din mediul de test nu rulează apt, deci forma
+rămâne fixată dintr-o măsurătoare și din sursa lui apt, iar punctul 3 de mai sus
+e ce transformă o presupunere greșită într-un eșec zgomotos în loc de o listă
+mai scurtă.
 
 ### 3.18 Al zecelea colector se uită la ce PLEACĂ, nu la ce intră
 
