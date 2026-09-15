@@ -570,30 +570,374 @@ async def module_load(db: Database, cursor: int) -> list[DetectionSpec]:
 
 
 # ---------------------------------------------------------------------------
-# 9. Momeală citită
+# 9. Momeală atinsă
 # ---------------------------------------------------------------------------
-async def bait_touched(db: Database, cursor: int) -> list[DetectionSpec]:
-    """Un fișier fără niciun cititor legitim tocmai a fost citit.
+#
+# ## Prima reparație (14 septembrie 2026): alerta nu mai afirmă ce nu știe
+#
+# Textul a spus, până atunci, „nimic legitim de pe gazdă nu deschide vreodată
+# acest fișier — cineva e deja înăuntru și caută credențiale". Afirmația e
+# MĂSURABIL falsă pentru `/root/.pgpass`, și a fost măsurată: incidentul #487,
+# `critical`, pe o comandă de administrare obișnuită. `psql` pornit prin `sudo`
+# (deci cu `$HOME=/root`) deschide `$HOME/.pgpass` la fiecare conexiune — asta
+# face libpq, nu comanda —, iar `$HOME`-ul lui root e chiar momeala. Două
+# citiri în `raw_events` pe gazda aceea, ambele
+# `exe=/usr/lib/postgresql/16/bin/psql`, `uid=0`, `auid=1001`, `syscall=257`,
+# aceeași sesiune.
+#
+# ## A doua (15 septembrie 2026): `ls` chiar declanșează regula
+#
+# Antetul de la `sentinel_bait` din `deploy/audit/sentinel.rules` susținea că
+# un `stat` — „ce fac `ls` și `find`" — nu intră sub niciuna dintre literele
+# `-p rwxa`, deci `-p r` nu poate suna pe o listare. MĂSURAT pe producție pe 15
+# septembrie 2026, e fals, și antetul e corectat acolo: TOATE cele 8
+# înregistrări SYSCALL cu `key="sentinel_bait"` din jurnalele de audit sunt
+# `arch=c000003e`, `syscall=191`/`192` (`getxattr`/`lgetxattr`), `comm="ls"`,
+# `success=no`. `ls` cere atributele extinse ale fiecărui nume pe care îl
+# listează, iar `-p r` prinde toată clasa READ a nucleului, nu doar
+# deschiderile. Prin colector au ieșit `bait_touched` cu `file_path` setat,
+# deci nici garda pe evidență nu le-a coborât: `raw_events` 8824116-8824119 și
+# 8824526-8824529, ieșite ca detecțiile 104014 și 104020, `critical`, câte 4
+# evenimente fiecare, niciuna suprimată.
+#
+# Deosebirea era deja în date. Citirile care chiar au deschis conținutul, pe
+# ambele gazde, sunt `syscall=257` (`openat`): `psql` pe una, iar pe cealaltă
+# `cat`, `head`, `dd` și `grep`-ul instalatorului (incidentul 65237, reparat în
+# `install_canary_baits` pe 31 august). Colectorul purta numărul în `raw`;
+# nimeni nu se uita la el.
+#
+# ## De ce se decide din perechea (arch, syscall) și de ce în TREI stări
+#
+# Numărul singur nu înseamnă nimic: 191 e `getxattr` pe x86_64 și `semctl` pe
+# tabela generică (aarch64). De-asta colectorul scrie acum și `arch`, iar
+# tabelele de mai jos sunt indexate după el. Numerele sunt măsurate pe gazdă cu
+# `ausyscall x86_64` pe 15 septembrie 2026, nu scrise din memorie.
+#
+#   * deschide conținutul     -> `critical`, textul tare
+#   * atinge doar atributele  -> `low`, detecție separată, text propriu
+#   * orice altceva           -> `critical`, iar textul SPUNE că nu știe
+#
+# A treia stare e cea care ține promisiunea. Numai o listă albă de „ce e citire
+# de conținut" ar fi făcut orice apel neprevăzut — `openat2` pe un ABI pe care
+# nu-l cunoaștem, un syscall nou — să iasă tăcut, adică exact o recoltare
+# devenită mai tăcută. Numai o listă neagră cu 191/192 ar fi lăsat un
+# `flistxattr` să sune `critical` pentru totdeauna. Amândouă sunt numite, iar
+# ce nu e în niciuna rămâne zgomotos. Lista de atribute se poate lărgi doar cu
+# măsurători, fiindcă numai lărgirea ei face ceva mai tăcut.
+#
+# ## De ce NU se schimbă regula de audit
+#
+# S-ar putea: `-w CALE -p r` e scurtătura pentru `-F path=CALE -F perm=r`, iar
+# o regulă scrisă ca `-a always,exit -F arch=b64 -S open,openat,openat2 -F
+# path=… -F key=sentinel_bait` ar opri înregistrările lui `ls` chiar în nucleu.
+# Costul, în `deploy/audit/sentinel.rules`, e în trei părți și e de ajuns:
+# cere câte o linie per ABI (`b64` ȘI `b32`), iar un ABI uitat devine un
+# fals-negativ TĂCUT, în nucleu, unde nimic din repository-ul ăsta nu se mai
+# poate uita; pierde cu totul semnalul de atribute, pe care alegerea de mai sus
+# îl păstrează la `low`; și nu ajută nici rândurile deja scrise, nici o gazdă pe
+# care `augenrules --load` a eșuat — chiar primul rând din tabelul lui
+# CLAUDE.md. Detecția trebuie să fie corectă și singură, deci se repară aici.
+_ARCH_X86_64 = "c000003e"
 
-    Nu e o tentativă și nu e o anomalie statistică calibrată pe istoric: e
-    citirea unui fișier pe care nimic de pe gazdă nu are motiv să-l deschidă,
-    niciodată — vezi antetul de la `sentinel_bait` din
-    `deploy/audit/sentinel.rules` pentru ce s-a verificat pe gazdă și de ce
-    urmărirea e `-p r`, nu `-p rwxa`. Critic de la prima citire, la fel ca
-    restul regulilor din fișierul ăsta: a doua nu adaugă nimic la ce trebuie
-    să știi.
+#: (arch) -> numerele care DESCHID conținutul. `ausyscall x86_64`, 15 sep 2026:
+#: open 2, openat 257, openat2 437.
+_CONTENT_READ_SYSCALLS: dict[str, frozenset[str]] = {
+    _ARCH_X86_64: frozenset({"2", "257", "437"}),
+}
+#: (arch) -> numerele care ating DOAR atributele extinse. Aceeași măsurătoare:
+#: getxattr 191, lgetxattr 192, fgetxattr 193, listxattr 194, llistxattr 195,
+#: flistxattr 196. Niciunul dintre ele nu poate întoarce octeții fișierului,
+#: oricâte ori ar fi chemat.
+_ATTRIBUTE_ONLY_SYSCALLS: dict[str, frozenset[str]] = {
+    _ARCH_X86_64: frozenset({"191", "192", "193", "194", "195", "196"}),
+}
+
+BAIT_CONTENT = "content"
+BAIT_ATTRIBUTE = "attribute"
+BAIT_UNKNOWN = "unknown"
+
+
+def bait_touch_kind(arch: str | None, syscall: str | None) -> str:
+    """Ce a atins momeala: conținutul, doar atributele, sau nu se poate spune.
+
+    Public fiindcă decizia asta e singurul lucru care coboară o severitate în
+    fișierul ăsta, deci trebuie să poată fi interogată direct dintr-un test, nu
+    dedusă din textul alertei.
     """
+    if not arch or not syscall:
+        return BAIT_UNKNOWN
+    if syscall in _CONTENT_READ_SYSCALLS.get(arch, frozenset()):
+        return BAIT_CONTENT
+    if syscall in _ATTRIBUTE_ONLY_SYSCALLS.get(arch, frozenset()):
+        return BAIT_ATTRIBUTE
+    return BAIT_UNKNOWN
+
+
+# Gruparea e pe (arch, syscall), nu pe acțiune ca la `_grouped`: apelul e
+# singurul lucru din rând care deosebește o deschidere de o pipăire de
+# atribute, iar un grup care le amestecă n-ar mai putea fi despărțit în Python.
+# Restul coloanelor păstrează exact forma pe care o cere `_spec`.
+_BAIT_SQL = """
+    SELECT e.raw->>'arch'                                        AS arch,
+           e.raw->>'syscall'                                     AS syscall,
+           count(*)                                              AS n,
+           array_agg(DISTINCT e.file_path)
+               FILTER (WHERE e.file_path IS NOT NULL)            AS paths,
+           array_agg(DISTINCT e.process)
+               FILTER (WHERE e.process IS NOT NULL)              AS procs,
+           array_agg(DISTINCT e.username)
+               FILTER (WHERE e.username IS NOT NULL)             AS users,
+           array_agg(e.id ORDER BY e.id DESC)                    AS event_ids,
+           min(e.ts) AS first_ts, max(e.ts) AS last_ts
+    FROM raw_events e
+    WHERE e.id > $1
+      AND e.source = 'auditd'
+      AND e.action = 'bait_touched'
+      AND e.ts > now() - make_interval(mins => $2)
+    GROUP BY 1, 2
+"""  # noqa: S608 - SQL din constante de modul, nu din date de la cineva
+
+
+def _bait_merge(rows: list[Any]) -> dict[str, Any]:
+    """Rândurile unei clase, adunate într-unul singur de forma cerută de `_spec`."""
+    def _distinct(col: str) -> list[Any]:
+        out: list[Any] = []
+        for r in rows:
+            for v in (r[col] or []):
+                if v is not None and v not in out:
+                    out.append(v)
+        return out
+
+    ids: list[int] = []
+    for r in rows:
+        ids.extend(r["event_ids"] or [])
+    return {
+        "action": "bait_touched",
+        "n": sum(r["n"] for r in rows),
+        "paths": _distinct("paths"),
+        "procs": _distinct("procs"),
+        "users": _distinct("users"),
+        "event_ids": sorted(ids, reverse=True),
+        "first_ts": min(r["first_ts"] for r in rows),
+        "last_ts": max(r["last_ts"] for r in rows),
+    }
+
+
+def _bait_calls(rows: list[Any]) -> list[str]:
+    """Perechile observate, puse în evidență ca să se vadă DIN CE s-a decis."""
+    return sorted({f"{r['arch'] or '?'}/{r['syscall'] or '?'}" for r in rows})
+
+
+_BAIT_PGPASS_NOTE = (
+    "`.pgpass` ARE un cititor legitim: libpq. Orice client legat de el, pornit "
+    "ca root fără parolă dată explicit (`psql`, `pg_dump`, un backup din "
+    "cron-ul lui root), deschide `$HOME/.pgpass` când face conexiunea, iar "
+    "`$HOME`-ul lui root e chiar momeala. Citirea aceea nu arată conținutul "
+    "nimănui — libpq îl parsează intern ca să aleagă o parolă — deci contează "
+    "CE proces a citit."
+)
+# Fapt, apoi unde se uită — nu concluzie. Versiunea dinainte încheia cu
+# „cititorul a fost adus de cine a citit", ceea ce e o acuzație, nu o
+# observație, și pe gazda de producție ajungea lipită de un `ls`.
+_BAIT_AWS_NOTE = (
+    "`.aws/credentials` e citit de AWS CLI/SDK, care nu e dependența nimicului "
+    "de pe gazdă. Dacă `command -v aws` nu întoarce nimic, nu există niciun "
+    "cititor instalat care să explice o deschidere a conținutului — atunci "
+    "procesul de mai sus e tot ce ai, și el se verifică mai jos."
+)
+_BAIT_UNKNOWN_NOTE = (
+    "Calea nu e una dintre momelile pe care regula le cunoaște, deci nu pot "
+    "spune ce cititor legitim ar avea — trateaz-o ca nelămurită, nu ca pe una "
+    "curată."
+)
+
+# Cum se verifică, indiferent de momeală. Ținut separat ca să nu se piardă
+# printre explicații: e singura parte care îi spune operatorului ce să TASTEZE.
+#
+# NU `ausearch -k sentinel_bait`, deși ăsta e răspunsul evident și e chiar
+# unealta făcută pentru asta. Măsurat pe gazdă (15 septembrie 2026, ~28 MB în
+# `/var/log/audit/`): `ausearch -k sentinel_bait`, `-i`, `-ts recent` și
+# `-ts today` — toate patru variantele — au fost omorâte de `timeout 25`, rc=124.
+# ausearch citește fișierele întregi înainte să filtreze, deci `-ts` nu ajută.
+# Forma de mai jos a fost măsurată pe 15 septembrie 2026 pe amândouă gazdele,
+# cu ~37 MB în director pe fiecare: 0,063 s pe producție, 0,035 s pe cealaltă,
+# și scoate exact aceleași linii ca forma dinaintea ei.
+#
+# Patru lucruri, fiecare măsurat, fiecare cu un fals-negativ în spate:
+#
+#   * TOT directorul, prin `grep -r`, nu `audit.log`. auditd rotește la
+#     `max_log_file = 8` MB, adică la 8-17 ore, cu `num_logs = 5`. Măsurat pe
+#     15 septembrie: pe producție, `audit.log` avea ZERO înregistrări SYSCALL
+#     cu cheia momelii și toate cele 8 erau în `audit.log.1`; pe cealaltă
+#     gazdă, 2 în `audit.log` și 1 în `audit.log.1`. O formă pe un singur
+#     fișier iese cu rc=0 și fără nicio linie, adică „nimic în neregulă" din
+#     tabelul lui CLAUDE.md, cu alt nume. Recursia peste director ține pasul și
+#     cu o rotație în plus, și cu una în minus.
+#   * `sudo` pe `grep`, iar recursia ține locul globului. `/var/log/audit` e
+#     `drwxr-x---` (root:sentinel pe producție, root:adm pe cealaltă — citite
+#     pe 15 septembrie), deci un `audit.log*` scris în comandă NU se desface în
+#     shell-ul operatorului: rămâne literal și grep-ul iese cu „No such file".
+#     Trebuie desfăcut de root, iar `grep -r` o face chiar în procesul pornit
+#     de sudo. Așa dispare și `sh -c "…"` — singurul motiv pentru care textul
+#     avea ghilimele. Restul conductei nu are nevoie de niciun drept.
+#   * Nicio ghilimea, nici simplă nici dublă. Textul alertei trece prin
+#     `html.escape(..., quote=True)` înainte de Telegram, care le preface în
+#     `&quot;` și `&#x27;`. Amândouă sunt legale în HTML-ul acceptat de
+#     Telegram, dar măsurat pe producție (15 septembrie 2026): din 708
+#     incidente notificate, `&` apare în 5 și `<`/`>` în 2 — livrate — iar `'`
+#     și `"` în ZERO. Alerta asta ar fi fost prima care le poartă. Dacă redarea
+#     ar fi greșită, `_broadcast` prinde excepția, `mark_notified` nu se mai
+#     execută și incidentul se reîncearcă la nesfârșit — nu se pierde, dar nu
+#     ajunge niciodată. Ghilimelele nu susțineau nimic, deci au plecat.
+#     Separatorul lui `sort` a rămas `(`, escapat cu `\`, fiindcă asta
+#     sortează după CEASUL înregistrării; `html.escape` nu atinge `\`.
+#   * `sort` ÎNAINTE de `tail`, și pe ceas, nu pe serial. Ordinea în care
+#     grep-ul scoate fișierele nu e cea cronologică — rotația face ca `.1` să
+#     fie mai vechi decât `audit.log` — deci un `tail` nesortat poate întoarce
+#     cele mai VECHI înregistrări, adică fix nu sesiunea care a declanșat
+#     alerta. ASTĂZI nu se poate ARĂTA pe niciuna dintre gazde, și asta se
+#     spune cinstit: pe producție toate cele 8 înregistrări stau în același
+#     fișier, deci ordinea fișierelor n-are ce încurca, iar pe cealaltă sunt 3
+#     în total, deci `tail -5` le ia pe toate — acolo am comparat sortat cu
+#     nesortat pe 15 septembrie și ieșirea e identică. Contează când ambele
+#     fișiere poartă potriviri, adică starea care tocmai s-a rotit. Cheia e
+#     câmpul de după `(`, adică epoca; serialul de după `:` ar fi fost mai
+#     ieftin de scris, dar ordinea după el nu e aceeași — 26 de inversiuni în
+#     136138 de înregistrări, măsurat pe producție — iar nucleul îl reia de la
+#     zero la fiecare pornire (comportament de nucleu, NEmăsurat aici: jurnalul
+#     de acum nu conține nicio repornire).
+#
+# Înregistrarea SYSCALL e cea care poartă tot ce trebuie: `exe`, `auid`, `uid`,
+# `ses`, `ppid`. Al doilea `grep` e ancorat la începutul liniei fiindcă, fără
+# ancoră, potrivește și linii care doar conțin cuvântul — înregistrările EXECVE
+# ale comenzii pe care tocmai a tastat-o operatorul (auditd îi loghează
+# argumentele, iar `sentinel_bait` e unul dintre ele, 55 de linii pe producție)
+# și `type=CONFIG_CHANGE` de la încărcarea regulii (8 pe cealaltă gazdă).
+_BAIT_HOW_TO_CHECK = (
+    "Verifică sesiunea înainte de orice concluzie: `sudo grep -rh "
+    "sentinel_bait /var/log/audit | grep ^type=SYSCALL | sort -t\\( -k2 -n | "
+    "tail -5` dă exe, auid, uid, ses și ppid, iar `sudo journalctl "
+    "_COMM=sudo -n 50` spune ce comandă a fost."
+)
+# Concluzia NU e comună, deși comanda e. Aceleași indicii înseamnă lucruri
+# diferite după ce s-a atins: la o deschidere de conținut, o sesiune pe care
+# nimic n-o explică e o recoltare; la o pipăire de atribute nu s-a scurs nimic,
+# iar cuvântul „recoltare" lipit acolo ar fi exact afirmația scoasă din text pe
+# 14 septembrie, întoarsă pe ușa din dos.
+_BAIT_VERDICT_HARVEST = (
+    " auid nesetat (4294967295), un cont de serviciu, sau nicio comandă care "
+    "să explice citirea — atunci e recoltare."
+)
+_BAIT_VERDICT_PROWL = (
+    " auid nesetat (4294967295), un cont de serviciu, sau nicio comandă care "
+    "să explice listarea — atunci cineva umblă prin directorul ăla, chiar dacă "
+    "n-a deschis nimic din el."
+)
+
+
+def _bait_notes(paths: list[str | None]) -> str:
+    """Ce cititor legitim are fiecare cale citită, în ordinea în care apar.
+
+    Necunoscutul se SPUNE. O cale de momeală mutată, pe care regula n-o
+    recunoaște, nu are voie să iasă din text ca și cum ar fi fost explicată —
+    și nici lipsa oricărei căi nu are voie să lase alerta fără nota asta.
+
+    Potrivirea e pe FORMA întreagă a numelui, nu pe coada lui: `endswith(
+    "/credentials")` dădea nota despre AWS oricărei momeli viitoare numită
+    `credentials`, oriunde ar fi fost plantată, iar nota aia afirmă ceva despre
+    ce e instalat pe gazdă. Un `/srv/app/credentials` rămâne nelămurit, ceea ce
+    e răspunsul adevărat.
+    """
+    notes: list[str] = []
+    for p in paths:
+        if not p:
+            continue
+        if p.endswith(".pgpass"):
+            note = _BAIT_PGPASS_NOTE
+        elif p.endswith("/.aws/credentials"):
+            note = _BAIT_AWS_NOTE
+        else:
+            note = _BAIT_UNKNOWN_NOTE
+        if note not in notes:
+            notes.append(note)
+    return " ".join(notes) or _BAIT_UNKNOWN_NOTE
+
+
+def _bait_head(row: dict[str, Any], ce: str) -> str:
+    return (f"{row['n']} {ce} în {WINDOW_MIN} min · "
+            f"{_fmt_paths(row['paths'] or [])} · "
+            f"proces: {', '.join((row['procs'] or [])[:3]) or '—'} · "
+            f"auid: {', '.join((row['users'] or [])[:3]) or '—'}. ")
+
+
+async def bait_touched(db: Database, cursor: int) -> list[DetectionSpec]:
+    """Un fișier-capcană a fost atins, și CE anume s-a atins din el.
+
+    Două detecții posibile, niciodată aceeași. Conținutul deschis (sau un apel
+    pe care nu-l recunoaștem) rămâne `critical` de la prima apariție, ca tot
+    restul fișierului: a doua nu adaugă nimic la ce trebuie să știi. O atingere
+    dovedit numai de atribute pleacă separat, la `low`, fiindcă nu arată
+    conținutul nimănui — vezi comentariul de deasupra pentru măsurătoarea care
+    a arătat că `ls` produce exact asta, și des.
+
+    Ce NU face: nu declară că cel care a atins fișierul e un atacator, și nu
+    declară nici că o listare n-a putut produce evenimentul. Pe amândouă le-a
+    afirmat, și amândouă erau false.
+    """
+    rows = await db.fetch(_BAIT_SQL, cursor, WINDOW_MIN)
+    pe_clase: dict[str, list[Any]] = {}
+    for r in rows:
+        pe_clase.setdefault(bait_touch_kind(r["arch"], r["syscall"]), []).append(r)
+
     out: list[DetectionSpec] = []
-    for row in await _grouped(db, cursor, ("bait_touched",)):
+
+    # Conținut și necunoscut pleacă împreună: severitatea lor e aceeași, iar o
+    # a doua detecție critică pe aceeași fereastră ar fi doar același telefon
+    # sunând de două ori. Ce le deosebește e propoziția de mai jos.
+    tari = pe_clase.get(BAIT_CONTENT, []) + pe_clase.get(BAIT_UNKNOWN, [])
+    if tari:
+        row = _bait_merge(tari)
+        nelamurite = pe_clase.get(BAIT_UNKNOWN, [])
+        if nelamurite:
+            titlu = "Momeală atinsă: nu pot spune dacă s-a deschis conținutul"
+            fapt = ("Cel puțin una dintre atingeri a venit printr-un apel pe "
+                    "care nu-l recunosc (vezi `calls` în evidență), deci NU "
+                    "pot spune dacă fișierul a fost deschis sau doar pipăit. "
+                    "Tratat ca și cum ar fi fost deschis. ")
+        else:
+            titlu = "Momeală citită: conținutul unui fișier-capcană a fost deschis"
+            fapt = ("Apelul înregistrat deschide fișierul (`open`/`openat`), "
+                    "deci i s-a cerut conținutul — nu e o listare și nu e o "
+                    "pipăire de atribute. ")
         out.append(_spec(
             row, rule_id="intrusion.bait_touched", severity="critical",
-            title="Momeală citită: fișier fără motiv legitim de acces",
-            summary=(f"{row['n']} citiri în {WINDOW_MIN} min · "
-                     f"{_fmt_paths(row['paths'] or [])} · "
-                     f"proces: {', '.join((row['procs'] or [])[:3]) or '—'} · "
-                     f"auid: {', '.join((row['users'] or [])[:3]) or '—'}. "
-                     f"Nimic legitim de pe gazdă nu deschide vreodată acest "
-                     f"fișier — cineva e deja înăuntru și caută credențiale.")))
+            title=titlu,
+            summary=(_bait_head(row, "atingeri") + fapt
+                     + f"{_bait_notes(row['paths'] or [])} "
+                     + _BAIT_HOW_TO_CHECK + _BAIT_VERDICT_HARVEST),
+            extra={"calls": _bait_calls(tari)}))
+
+    # Atributele, separat și la `low`. Fără notele despre cititorul legitim:
+    # alea răspund la «cine ar deschide fișierul ăsta», iar aici nimeni nu l-a
+    # deschis. Lipite de un `ls`, deveneau chiar acuzația pe care reparația din
+    # 14 septembrie o scosese din text.
+    atribute = pe_clase.get(BAIT_ATTRIBUTE, [])
+    if atribute:
+        row = _bait_merge(atribute)
+        out.append(_spec(
+            row, rule_id="intrusion.bait_attribute_probe", severity="low",
+            title="Momeală pipăită: doar atributele, nu conținutul",
+            summary=(_bait_head(row, "atingeri")
+                     + "Apelurile sunt din familia `getxattr` — citesc "
+                       "atributele extinse, nu octeții fișierului, deci nimeni "
+                       "nu a văzut ce scrie înăuntru. Asta face `ls` pe fiecare "
+                       "nume pe care îl listează, și la fel `find`, o "
+                       "completare de shell sau un `cp -a`. Nu e `critical` "
+                       "fiindcă nu s-a scurs nimic; nu e tăcere fiindcă "
+                       "procesul de mai jos tot trebuie să aibă un motiv să se "
+                       "uite prin directorul ăla. "
+                     + _BAIT_HOW_TO_CHECK + _BAIT_VERDICT_PROWL),
+            extra={"calls": _bait_calls(atribute)}))
     return out
 
 

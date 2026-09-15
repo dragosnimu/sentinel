@@ -204,20 +204,45 @@
 # watched (only /root/.ssh is, by sentinel_ssh), so a read here cannot collide
 # with an existing rule and arrive under the wrong action.
 #
-# -p r, not -p rwxa. A `stat()` -- what `ls` and `find` do, including the
-# operator's own diagnostics -- is neither a read, a write, an execute nor an
-# attribute change; the kernel does not classify it under any of the four
-# letters, so even `-p rwxa` would stay silent on a listing. The real
-# difference is in the other direction: `a` fires on any bulk attribute sweep
-# that never opens the content -- `chmod -R`, `chown -R`, `restorecon` after an
-# SELinux relabel, a backup tool restoring permissions -- and `w` fires on that
-# same tool restoring the file's bytes. None of those exist on this host today,
-# but the design assumes one might tomorrow, and reading the CONTENT is the
-# one thing a bait exists to catch. `-p r` is the only choice that stays quiet
-# through all of the above and still fires on the one action that matters.
-# What it misses: an attacker who only stats or chmods the file without ever
-# opening it gains nothing from that, so the miss costs nothing a bait was
-# meant to catch.
+# -p r, not -p rwxa. `a` fires on any bulk attribute sweep that never opens the
+# content -- `chmod -R`, `chown -R`, `restorecon` after an SELinux relabel, a
+# backup tool restoring permissions -- and `w` fires on that same tool
+# restoring the file's bytes. None of those exist on this host today, but the
+# design assumes one might tomorrow, and reading the CONTENT is the one thing a
+# bait exists to catch.
+#
+# THIS COMMENT USED TO CLAIM `ls` AND `find` CANNOT TRIGGER THE RULE, on the
+# grounds that a `stat()` falls under none of the four letters. That is false,
+# and production disproved it. MEASURED on 15 September 2026: of the SYSCALL
+# records carrying `key="sentinel_bait"` that were STILL ON DISK in
+# /var/log/audit at that moment -- 8 of them, all in `audit.log.1` -- every
+# single one was `arch=c000003e syscall=191`/`192` -- `getxattr`/`lgetxattr`,
+# `success=no`, `comm="ls"`. `ls` asks for each name's extended attributes, and
+# `-p r` maps to the kernel's whole READ permission class, not to opens alone.
+# Those 8 events reached the operator as two `critical` "bait content read"
+# alerts of four events each, neither suppressed (raw_events 8824116-8824119
+# and 8824526-8824529; detections 104014 and 104020).
+#
+# That 8 is what the FILES held, not a total, and the difference matters: the
+# database holds 13 `bait_touched` rows (measured the same day), the other five
+# being real `openat` content reads by `head`/`cat`/`dd`/`grep` on 30-31 August
+# whose audit records rotated away long ago. Both classes are real, `-p r`
+# catches both, and the detection has to tell them apart -- see below.
+#
+# The rule is UNCHANGED anyway, and the repair lives in
+# `sentinel/detect/intrusion.bait_touched`, which now decides from the
+# (arch, syscall) pair: content opened -> critical, attributes only -> low,
+# anything it cannot place -> critical and says so. Filtering here instead
+# would mean `-a always,exit -F arch=b64 -S open,openat,openat2` plus the same
+# path and the same key, one line per ABI: a forgotten ABI becomes a silent
+# false negative inside the kernel, where nothing in this repository can see
+# it, and the attribute signal is lost outright. It also would not help a row
+# already written, nor a host where `augenrules --load` failed -- the first
+# line of the table at the top of CLAUDE.md. The detection has to be right on
+# its own regardless, so that is where it was fixed.
+#
+# What `-p r` still misses: an attacker who only `chmod`s the file gains
+# nothing from that, so the miss costs nothing a bait was meant to catch.
 #
 # LAST in the file, deliberately, and for a reason that only exists because of
 # a defect these two lines almost caused. `-w` on a path that does not exist

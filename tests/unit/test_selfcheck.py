@@ -14,12 +14,17 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import inspect
+import json
 import re
+import sys
+import types
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 
+from sentinel.config import SelfcheckSilenceConfig
 from sentinel.selfcheck import checks
 from sentinel.selfcheck.checks import CheckResult, worst
 
@@ -73,10 +78,18 @@ def _cfg(**over):
         # `check_ingest_sources` le citește DIRECT — vezi
         # `test_no_check_reads_a_config_field_that_does_not_exist` —, iar un dublu
         # rămas în urmă ar face grupul „ingest” să pice pe altceva decât pe ce se
-        # testează.
-        ingest=SimpleNamespace(suricata=True),
+        # testează. `journald` și `flush_interval_ms` sunt citite direct de
+        # `_journald_reader`, din același motiv.
+        ingest=SimpleNamespace(suricata=True, journald=True,
+                               flush_interval_ms=1000),
         suricata=SimpleNamespace(enabled=False,
                                  eve_path="/var/log/suricata/eve.json"),
+        # `_silence_limit`/`_all_quiet_down_min` citesc secțiunea asta DIRECT —
+        # valorile sunt exact cele implicite din `SelfcheckSilenceConfig`, ca
+        # un dublu rămas în urmă să nu mute pragurile pe care le testează
+        # restul fișierului.
+        selfcheck=SimpleNamespace(max_silence_min=SimpleNamespace(
+            auditd=60, nginx=180, default=180)),
         # Ca pe `Config`-ul real: `check_ship_lag` citește `cfg.ship.enabled`
         # direct, nu printr-un `getattr` cu valoare de rezervă — vezi
         # `test_no_check_reads_a_config_field_that_does_not_exist` mai jos, care
@@ -104,15 +117,753 @@ def _source(name: str, minutes: float):
             "minute_tacere": minutes}
 
 
-def test_a_collector_that_stopped_while_others_write_is_down():
-    """The 21-hour blind spot. The service was active, had never restarted, and
-    logged nothing; only the data showed it."""
-    db = _DB(rows=[_source("sshd", 1260), _source("nginx", 2),
-                   _source("suricata", 1), _source("auditd", 1)])
+# --- cititorul journald e judecat pe poziția LUI, nu pe prospețimea jurnalului --
+#
+# Un jurnal fals, cu exact semantica pe care se sprijină
+# `_journal_first_unread`: `seek_cursor` NU ridică pentru un cursor care nu mai
+# există în jurnal — poziționează la cea mai apropiată intrare rămasă —, iar
+# primul `get_next()` de după căutare întoarce intrarea DE LA cursor, nu pe cea
+# de după ea. Testele de mai jos trec prin sonda adevărată, nu peste ea: dacă
+# dispare comparația de `__CURSOR` din ea, ori pasul care caută prima intrare
+# necitită, se vede aici.
+class _FakeJournalReader:
+    """`steps_onto_cursor` alege ce întoarce PRIMUL `get_next()` de după un
+    `seek_cursor`: intrarea DE LA cursor (ce documentează systemd, și pe ce se
+    sprijină `JournaldReader.seek`) sau pe cea de DUPĂ el. Semantica adevărată
+    a gazdei nu se poate verifica de pe mașina asta, iar dacă sonda o presupune
+    greșit, poziția validă a unui colector viu se citește drept „cursor
+    dispărut" — `down` la fiecare cinci minute pe o gazdă sănătoasă. De aia
+    testele de mai jos rulează pe amândouă.
+
+    Restul semanticii e cea reală: `seek_cursor` NU ridică pentru un cursor
+    care nu mai există (poziționează la cea mai apropiată intrare rămasă), iar
+    un `get_next()` care nu mai are ce întoarce lasă poziția neschimbată.
+    """
+
+    def __init__(self, entries, steps_onto_cursor=True):
+        self._entries = entries
+        self._steps_onto_cursor = steps_onto_cursor
+        self._loc = 0        # unde a nimerit căutarea
+        self._i = None       # indicele intrării curente; None = doar pe un loc
+        self.matches: list = []
+        self.closed = False
+
+    def add_match(self, **kw):
+        self.matches.append(kw)
+
+    def add_disjunction(self):
+        self.matches.append("OR")
+
+    def seek_cursor(self, cursor):
+        self._loc = next(
+            (i for i, e in enumerate(self._entries) if e["__CURSOR"] == cursor), 0)
+        self._i = None
+
+    def get_next(self):
+        if self._i is None:
+            i = self._loc if self._steps_onto_cursor else self._loc + 1
+        else:
+            i = self._i + 1
+        if i >= len(self._entries):
+            return {}
+        self._i = i
+        return self._entries[i]
+
+    def get_previous(self):
+        i = self._loc if self._i is None else self._i - 1
+        if i < 0 or i >= len(self._entries):
+            return {}
+        self._i = i
+        return self._entries[i]
+
+    def close(self):
+        self.closed = True
+
+
+def _entry(cursor: str, seconds_ago: float):
+    """O intrare de jurnal ca cele reale: `python-systemd` construiește
+    `__REALTIME_TIMESTAMP` cu fus, deci și dublul o face."""
+    return {"__CURSOR": cursor,
+            "__REALTIME_TIMESTAMP": (datetime.now(timezone.utc)
+                                     - timedelta(seconds=seconds_ago))}
+
+
+def _fake_journal(monkeypatch, entries, steps_onto_cursor=True):
+    """Pune un `systemd.journal` fals în `sys.modules` și întoarce lista
+    cititoarelor construite — ca un test să poată dovedi și că jurnalul NU a
+    fost deschis deloc, nu doar ce a răspuns."""
+    built = []
+
+    def _reader():
+        reader = _FakeJournalReader(entries, steps_onto_cursor)
+        built.append(reader)
+        return reader
+
+    journal_mod = types.ModuleType("systemd.journal")
+    journal_mod.Reader = _reader
+    systemd_mod = types.ModuleType("systemd")
+    systemd_mod.journal = journal_mod
+    monkeypatch.setitem(sys.modules, "systemd", systemd_mod)
+    monkeypatch.setitem(sys.modules, "systemd.journal", journal_mod)
+    return built
+
+
+# Poziția salvată a colectorului în jurnalul „viu" de mai jos. Vechimile din
+# perechea asta sunt deliberat DIFERITE — poziția e de acum 21 de ore, ultima
+# intrare din jurnal de acum 5 secunde. Puse pe același număr (cum erau), o
+# verificare care măsoară prospețimea jurnalului și una care măsoară distanța
+# până la colector dau același verdict, iar testul nu le mai deosebește.
+BUSY_STORED_CURSOR = "s=aa;i=1;b=bb;m=1;t=1;x=1"
+
+
+def _busy_journal():
+    """Jurnal care se umple în continuare, cu poziția colectorului rămasă la o
+    intrare de acum 21 de ore."""
+    return [
+        _entry(BUSY_STORED_CURSOR, 21 * 3600),
+        _entry("s=aa;i=2;b=bb;m=2;t=2;x=2", 20 * 3600),
+        _entry("s=aa;i=3;b=bb;m=3;t=3;x=3", 300),
+        _entry("s=aa;i=4;b=bb;m=4;t=4;x=4", 5),
+    ]
+
+
+@pytest.mark.parametrize("steps_onto_cursor", [True, False])
+def test_a_reader_frozen_for_21h_beside_a_journal_that_keeps_filling_is_down(
+        steps_onto_cursor, monkeypatch):
+    """Pata oarbă de 21 de ore, în forma în care chiar s-a întâmplat.
+
+    Cititorul a înghețat, jurnalul continuă să se umple. Un verdict luat din
+    vechimea CELEI MAI NOI intrări din jurnal găsește 5 secunde, deci „e doar
+    în lucru" și raportează `ok` (măsurat pe ambele gazde, 9 sep 2026, cu
+    cursorul înghețat de 21 de ore: 0.08s și 0.04s sub o toleranță de 61s). Pe
+    gazda de producție asta înseamnă autentificarea SSH nesupravegheată,
+    raportată ca sănătoasă — și e mai rău decât verificarea veche pe rânduri,
+    pe care schimbarea asta o înlocuiește. Ce trebuie măsurat e distanța până
+    la poziția colectorului: prima intrare NECITITĂ așteaptă de 20 de ore.
+
+    Rulat pe ambele semantici posibile ale primului pas de după `seek_cursor`
+    (vezi `_FakeJournalReader`): verdictul nu are voie să depindă de o
+    presupunere care nu se poate verifica de aici.
+    """
+    _fake_journal(monkeypatch, _busy_journal(), steps_onto_cursor)
+    db = _DB(rows=[_source("auditd", 2), _source("nginx", 2)],
+             row={"cursor": BUSY_STORED_CURSOR, "minute": 21 * 60})
     results = run(checks.check_ingest_sources(db, _cfg()))
     sshd = next(r for r in results if r.key == "ingest:sshd")
-    assert sshd.status == "down"
-    assert "alte surse scriu" in sshd.detail
+    assert sshd.status == "down", sshd.detail
+    assert sshd.facts["first_unread_age_s"] > 3600, (
+        "verdictul s-a luat din prospețimea jurnalului (ultima intrare, 5s), "
+        "nu din cât așteaptă prima intrare necitită a colectorului")
+    assert "restart sentinel-ingest" in sshd.action
+
+
+@pytest.mark.parametrize("steps_onto_cursor", [True, False])
+def test_the_same_busy_journal_with_a_caught_up_reader_is_ok(
+        steps_onto_cursor, monkeypatch):
+    """Perechea testului de mai sus: ACELAȘI jurnal, singura diferență e
+    poziția salvată a colectorului. Dacă verdictul nu se schimbă între cele
+    două, nu vine din ce pretinde că măsoară — iar un colector sănătos declarat
+    `down` la fiecare cinci minute umple canalul până când operatorul nu-l mai
+    citește.
+
+    Rulat pe ambele semantici posibile ale primului pas de după `seek_cursor`
+    (vezi `_FakeJournalReader`): verdictul nu are voie să depindă de o
+    presupunere care nu se poate verifica de aici.
+    """
+    entries = _busy_journal()
+    _fake_journal(monkeypatch, entries, steps_onto_cursor)
+    db = _DB(rows=[_source("auditd", 2), _source("nginx", 2)],
+             row={"cursor": entries[-1]["__CURSOR"], "minute": 3})
+    results = run(checks.check_ingest_sources(db, _cfg()))
+    sshd = next(r for r in results if r.key == "ingest:sshd")
+    assert sshd.status == "ok", sshd.detail
+    assert "first_unread_age_s" not in sshd.facts, (
+        "a raportat o întârziere deși după poziția colectorului nu mai e nimic")
+
+
+def test_a_frozen_reader_stays_down_when_the_journal_itself_goes_quiet(monkeypatch):
+    """Verdictul nu are voie să depindă de cât de recent a scris cineva în
+    jurnal — nici măcar în direcția „mai severă".
+
+    Cu ramura `down` legată de prospețimea jurnalului, pe producție ea era
+    accesibilă doar 27% din timp (măsurat: fracțiunea în care ultima intrare
+    potrivită era mai veche de 61s). Un cititor mort ar fi alternat `down` și
+    `ok` de la o rulare la alta, iar `runner.run_and_alert` anunță pe Telegram
+    o RECUPERARE la fiecare trecere înapoi — recuperări în mijlocul unei pene
+    care ține în continuare, de ordinul a o sută de mesaje pe zi."""
+    entries = [_entry(BUSY_STORED_CURSOR, 21 * 3600),
+               _entry("s=cc;i=2;b=bb;m=2;t=2;x=2", 20 * 3600 + 1800)]
+    _fake_journal(monkeypatch, entries)
+    db = _DB(rows=[_source("auditd", 2), _source("nginx", 2)],
+             row={"cursor": BUSY_STORED_CURSOR, "minute": 21 * 60})
+    results = run(checks.check_ingest_sources(db, _cfg()))
+    sshd = next(r for r in results if r.key == "ingest:sshd")
+    assert sshd.status == "down", sshd.detail
+
+
+@pytest.mark.parametrize("steps_onto_cursor", [True, False])
+def test_a_quiet_host_with_a_caught_up_reader_is_not_an_outage(
+        steps_onto_cursor, monkeypatch):
+    """Alarma falsă pentru care există schimbarea asta.
+
+    n8n, 9 sep 2026: o singură intrare în blocklist a oprit sursa de
+    brute-force care ținea jurnalul `sshd` cald, sshd n-a mai produs niciun
+    rând 16h37m cât auditd scria în continuare, iar verificarea veche pe
+    tăcerea rândului a acuzat un colector care funcționa — „🔴 Colector «sshd»
+    a amuțit". După poziția colectorului nu urmează nicio intrare, deci a citit
+    tot ce există: `ok`, oricât de veche ar fi poziția.
+
+    Rulat pe ambele semantici posibile ale primului pas de după `seek_cursor`
+    (vezi `_FakeJournalReader`): verdictul nu are voie să depindă de o
+    presupunere care nu se poate verifica de aici.
+    """
+    entries = [_entry("s=dd;i=1;b=bb;m=1;t=1;x=1", (16 * 60 + 37) * 60)]
+    _fake_journal(monkeypatch, entries, steps_onto_cursor)
+    db = _DB(rows=[_source("auditd", 5), _source("nginx", 5)],
+             row={"cursor": entries[0]["__CURSOR"], "minute": 16 * 60 + 37})
+    results = run(checks.check_ingest_sources(db, _cfg()))
+    sshd = next(r for r in results if r.key == "ingest:sshd")
+    assert sshd.status == "ok", sshd.detail
+    assert not sshd.bad
+
+
+def test_an_entry_written_between_two_polls_is_not_an_outage(monkeypatch):
+    """Colectorul își scrie cursorul la fiecare sondare care a citit ceva, deci
+    între două sondări jurnalul are în mod normal o intrare nepreluată. Fără
+    nicio toleranță, fiecare autentificare SSH ar produce o alertă `down` pe
+    gazda cea mai sănătoasă cu putință."""
+    entries = [_entry("s=ee;i=1;b=bb;m=1;t=1;x=1", 120),
+               _entry("s=ee;i=2;b=bb;m=2;t=2;x=2", 3)]
+    _fake_journal(monkeypatch, entries)
+    db = _DB(rows=[_source("auditd", 2), _source("nginx", 2)],
+             row={"cursor": entries[0]["__CURSOR"], "minute": 2})
+    results = run(checks.check_ingest_sources(db, _cfg()))
+    sshd = next(r for r in results if r.key == "ingest:sshd")
+    assert sshd.status == "ok", sshd.detail
+    assert sshd.facts["first_unread_age_s"] <= sshd.facts["tolerance_s"]
+
+
+def test_the_tail_tolerance_is_derived_from_the_collectors_self_heal_budget():
+    """Toleranța trebuie SĂ RĂMÂNĂ derivată din bugetul de auto-reparare al
+    cititorului, nu înlocuită cu un număr ales.
+
+    Cu 61s (o sondare + 60 de slack) verificarea acuza coada reconstrucției
+    automate care FUNCȚIONEAZĂ. Măsurat pe producție, 10 sep 2026, sonda
+    verbatim la 1 Hz: 6 probe din 3450 peste 61s, max 65.46s, fiecare la o
+    secundă după „journald reader produced nothing for 60 polls; rebuilding".
+    La 288 de rulări de selfcheck pe zi asta e ~0.6 `down` fals pe zi pe
+    producție, fiecare urmat la cinci minute de o RECUPERARE falsă — adică
+    exact felul de zgomot după care operatorul nu mai citește canalul.
+
+    Nimic nu lega numărul de sursa lui: două mutații plauzibile — împărțirea la
+    1000 scoasă (toleranță 1060s) și slack-ul lărgit la 3600s — treceau prin
+    TOATĂ suita. Singura aserțiune care-l atingea era relativă și adevărată
+    pentru orice toleranță ≥ 3s.
+
+    Podelele de mai jos au păzit multă vreme o singură direcție, iar cealaltă e
+    cea care face rău în tăcere: cu `JOURNALD_SELF_HEAL_CYCLES = 10` toleranța
+    urcă la 670s — unsprezece minute în care un cititor oprit nu e numit —, și
+    TOATĂ suita trecea (5053 passed, 20 skipped). Un prag umflat nu se vede în
+    niciun mesaj: verificarea rămâne verde exact atât timp cât e mai leneșă.
+    """
+    cfg = _cfg()
+    flush_s = cfg.ingest.flush_interval_ms / 1000
+    un_ciclu = (checks.REBUILD_AFTER_EMPTY_POLLS + 1) * flush_s
+    tol = checks._journald_tail_tolerance_s(cfg)
+
+    # Relația, nu litera. Podelele de mai jos păzesc direcțiile în care are
+    # voie să se miște.
+    assert tol == (checks.JOURNALD_SELF_HEAL_CYCLES * un_ciclu
+                   + checks.JOURNALD_TAIL_SLACK_S), (
+        f"toleranța ({tol}s) nu mai iese din bugetul de auto-reparare al "
+        f"cititorului ({un_ciclu}s pe ciclu) plus slack")
+
+    # DOUĂ cicluri, nu unul: `_rebuild()` pune `_empty_polls` pe zero, deci o
+    # reconstrucție care nu prinde din prima mai adună un rând întreg de
+    # sondări goale înainte de următoarea. O toleranță de un singur ciclu
+    # (121s cu constantele livrate) ar acuza exact asta — aceeași alarmă
+    # falsă, într-o mărime mai mică.
+    assert tol >= 2 * un_ciclu, (
+        f"toleranța ({tol}s) nu acoperă două cicluri de auto-reparare "
+        f"({2 * un_ciclu}s): o reconstrucție care nu prinde din prima e "
+        f"raportată drept cititor oprit")
+
+    # Și tavanul, fiindcă podeaua singură lasă deschisă exact direcția în care
+    # o verificare e reglată până tace. Ce argumentează mecanismul e DOUĂ
+    # cicluri plus slack, iar slack-ul e ținut sub un ciclu de aserțiunea
+    # următoare — deci numărul argumentat nu poate depăși trei cicluri. Al
+    # patrulea e marja unei schimbări viitoare care s-ar argumenta tot din
+    # mecanism (o a treia încercare de reconstrucție, de pildă). Peste el,
+    # numărul nu mai iese din auto-reparare: `CYCLES = 10` dă 670s, adică
+    # unsprezece minute de cititor oprit fără ca cineva să afle.
+    assert tol <= 4 * un_ciclu, (
+        f"toleranța ({tol}s) a trecut de patru cicluri de auto-reparare "
+        f"({4 * un_ciclu}s) — nu mai e bugetul mecanismului, e un prag lărgit "
+        f"până tace verificarea, iar pata oarbă se lungește cu el")
+
+    # Slack-ul rămâne slack. Dacă trece de un ciclu întreg, numărul nu mai e
+    # derivat din mecanism, e ales cât să tacă verificarea.
+    assert checks.JOURNALD_TAIL_SLACK_S <= un_ciclu, (
+        f"slack-ul ({checks.JOURNALD_TAIL_SLACK_S}s) a depășit bugetul de "
+        f"auto-reparare ({un_ciclu}s) din care ar trebui doar să absoarbă "
+        f"zgomotul unei sondări lungi")
+
+    # Și unitatea, exprimată în ce se pierde: pata oarbă de 21 de ore rămâne
+    # prinsă cu două ordine de mărime înainte să se întâmple. Cu
+    # `flush_interval_ms` neîmpărțit la 1000 toleranța ar fi de ~34 de ore,
+    # adică mai lungă decât pana pe care verificarea asta există ca s-o prindă.
+    assert 21 * 3600 / tol >= 100, (
+        f"toleranța ({tol}s) nu mai e cu două ordine de mărime sub pata oarbă "
+        f"de 21 de ore pentru care există verificarea")
+
+
+def test_the_tail_tolerance_follows_the_rebuild_constant_it_is_derived_from(
+        monkeypatch):
+    """Dacă pragul de reconstrucție al colectorului se schimbă, toleranța
+    trebuie să se miște singură.
+
+    Rescrisă ca literal — 121, 180, orice număr —, relația se rupe tăcut, iar
+    la următoarea schimbare a lui `REBUILD_AFTER_EMPTY_POLLS` verificarea ar
+    acuza din nou coada unei recuperări care funcționează: chiar defectul
+    reparat aici, întors pe ușa din dos, fără ca vreun test să-l vadă.
+    """
+    from sentinel.collectors import journald_reader
+
+    assert (checks.REBUILD_AFTER_EMPTY_POLLS
+            == journald_reader.REBUILD_AFTER_EMPTY_POLLS), (
+        "checks.py și-a făcut o copie proprie a pragului de reconstrucție, "
+        "deci cele două pot să se depărteze fără să observe nimeni")
+
+    # Intervalul de sondare vine din configurație: o instalare care golește
+    # tamponul mai rar are ciclul de auto-reparare mai lung, deci și toleranța.
+    lent = _cfg()
+    lent.ingest = SimpleNamespace(suricata=True, journald=True,
+                                  flush_interval_ms=2000)
+    assert checks._journald_tail_tolerance_s(lent) == (
+        checks.JOURNALD_SELF_HEAL_CYCLES
+        * (checks.REBUILD_AFTER_EMPTY_POLLS + 1) * 2.0
+        + checks.JOURNALD_TAIL_SLACK_S), (
+        "toleranța nu urmărește `ingest.flush_interval_ms`, deci pe o "
+        "instalare cu altă cadență e greșită în tăcere")
+
+    cfg = _cfg()
+    inainte = checks._journald_tail_tolerance_s(cfg)
+    monkeypatch.setattr(checks, "REBUILD_AFTER_EMPTY_POLLS", 300)
+    dupa = checks._journald_tail_tolerance_s(cfg)
+    assert dupa > inainte, (
+        "pragul de reconstrucție a crescut de cinci ori, toleranța n-a "
+        "urmat — deci e un literal, nu o relație")
+    assert dupa == (checks.JOURNALD_SELF_HEAL_CYCLES * 301
+                    * (cfg.ingest.flush_interval_ms / 1000)
+                    + checks.JOURNALD_TAIL_SLACK_S)
+
+
+def test_an_entry_left_behind_by_the_readers_own_rebuild_is_not_an_outage(
+        monkeypatch):
+    """Alarma falsă măsurată pe producție, scrisă ca test.
+
+    Cititorul se reface singur după `REBUILD_AFTER_EMPTY_POLLS` sondări goale,
+    iar cât se adună sondările alea prima intrare necitită îmbătrânește.
+    Măsurat 10 sep 2026 pe producție: `first_unread_age_s` până la 65.46s, la o
+    secundă după „rebuilding" în jurnalul serviciului, sub o toleranță de 61s —
+    deci `down` pe un colector care tocmai își revenea, urmat la cinci minute
+    de o RECUPERARE falsă, la 22 de reconstrucții pe oră (n8n: 59/h).
+
+    90 de secunde e înăuntrul a două cicluri de auto-reparare și în afara
+    vechii toleranțe de 61s: exact cazul care trebuie să fie `ok`.
+    """
+    entries = [_entry("s=ff;i=1;b=bb;m=1;t=1;x=1", 200),
+               _entry("s=ff;i=2;b=bb;m=2;t=2;x=2", 90)]
+    _fake_journal(monkeypatch, entries)
+    db = _DB(rows=[_source("auditd", 2), _source("nginx", 2)],
+             row={"cursor": entries[0]["__CURSOR"], "minute": 2})
+    results = run(checks.check_ingest_sources(db, _cfg()))
+    sshd = next(r for r in results if r.key == "ingest:sshd")
+    assert sshd.status == "ok", sshd.detail
+    assert not sshd.bad
+    # Garda testului: dacă intrarea de probă ajunge sub 61s, testul nu mai
+    # acoperă alarma falsă pentru care există și ar trece degeaba.
+    assert sshd.facts["first_unread_age_s"] > 61, (
+        "proba nu mai e peste vechea toleranță de 61s")
+
+
+def test_an_entry_older_than_two_self_heal_cycles_is_still_down(monkeypatch):
+    """Perechea testului de mai sus: același jurnal, altă vechime a primei
+    intrări necitite.
+
+    Toleranța a urcat de la 61s la 182s ca să nu mai acuze o reconstrucție care
+    funcționează. Dacă odată cu asta ar fi urcat oriunde — slack lărgit, o
+    unitate greșită care o duce la 34 de ore — cititorul oprit n-ar mai fi numit
+    deloc, iar pata oarbă de 21 de ore s-ar întoarce sub o suită verde."""
+    entries = [_entry("s=gg;i=1;b=bb;m=1;t=1;x=1", 1200),
+               _entry("s=gg;i=2;b=bb;m=2;t=2;x=2", 900)]
+    _fake_journal(monkeypatch, entries)
+    db = _DB(rows=[_source("auditd", 2), _source("nginx", 2)],
+             row={"cursor": entries[0]["__CURSOR"], "minute": 20})
+    results = run(checks.check_ingest_sources(db, _cfg()))
+    sshd = next(r for r in results if r.key == "ingest:sshd")
+    assert sshd.status == "down", sshd.detail
+    assert sshd.facts["first_unread_age_s"] > sshd.facts["tolerance_s"]
+    assert "restart sentinel-ingest" in sshd.action
+
+
+def test_the_down_message_never_quotes_an_age_below_the_budget_it_exceeded(
+        monkeypatch):
+    """Alerta nu are voie să se contrazică în propria ei frază.
+
+    Între 183 și 239 de secunde textul ieșea „stă necitită de 3 min — peste
+    bugetul de auto-reparare al cititorului (182s)": `_ago` taie la minute
+    întregi, deci operatorul citea 180 < 182 și un mesaj care pare greșit.
+    Telegram-ul e singurul canal prin care agentul poate spune ceva, iar o
+    alertă care nu se susține la citire e o alertă pe care se învață să o
+    sară — exact pana pe care fișierul ăsta există ca s-o prevină, mutată din
+    cod în text.
+    """
+    cfg = _cfg()
+    # Chiar peste buget, luat DIN buget: legată de 182 cu litera, proba ar
+    # ieși din bandă tăcut la prima schimbare a constantelor din care iese
+    # toleranța.
+    varsta = checks._journald_tail_tolerance_s(cfg) + 8
+    entries = [_entry("s=hh;i=1;b=bb;m=1;t=1;x=1", varsta + 400),
+               _entry("s=hh;i=2;b=bb;m=2;t=2;x=2", varsta)]
+    _fake_journal(monkeypatch, entries)
+    db = _DB(rows=[_source("auditd", 2), _source("nginx", 2)],
+             row={"cursor": entries[0]["__CURSOR"], "minute": 12})
+    results = run(checks.check_ingest_sources(db, cfg))
+    sshd = next(r for r in results if r.key == "ingest:sshd")
+    assert sshd.status == "down", sshd.detail
+    # Garda testului: proba trebuie să fie peste buget și sub o oră, adică
+    # exact banda în care rotunjirea la minute întregi minte.
+    assert (sshd.facts["tolerance_s"] < sshd.facts["first_unread_age_s"]
+            < 3600), sshd.facts
+
+    spus = re.search(r"necitită de (\d+)s", sshd.detail)
+    assert spus, f"vechimea nu mai e spusă în secunde: {sshd.detail}"
+    assert int(spus.group(1)) >= sshd.facts["tolerance_s"], (
+        f"mesajul spune o vechime mai mică decât bugetul pe care zice că-l "
+        f"depășește: {sshd.detail}")
+
+
+@pytest.mark.parametrize("steps_onto_cursor", [True, False])
+def test_a_cursor_the_journal_no_longer_holds_is_down_not_ok(
+        steps_onto_cursor, monkeypatch):
+    """Jurnalul s-a rotit (sau a fost golit) peste intrări pe care nu le-a
+    citit nimeni.
+
+    `seek_cursor` nu ridică pentru un cursor dispărut: poziționează la cea mai
+    apropiată intrare rămasă. Dacă nu se compară `__CURSOR`-ul intrării găsite
+    cu cel cerut, pasul următor arată ca „prima intrare necitită" a unei
+    poziții valide, iar pe un jurnal proaspăt rotit starea asta s-ar citi drept
+    „la zi" — pierdere de intrări raportată ca sănătate.
+
+    Rulat pe ambele semantici posibile ale primului pas de după `seek_cursor`
+    (vezi `_FakeJournalReader`): verdictul nu are voie să depindă de o
+    presupunere care nu se poate verifica de aici.
+    """
+    entries = [_entry("s=ff;i=9;b=bb;m=9;t=9;x=9", 6 * 3600),
+               _entry("s=ff;i=10;b=bb;m=10;t=10;x=10", 10),
+               _entry("s=ff;i=11;b=bb;m=11;t=11;x=11", 8)]
+    _fake_journal(monkeypatch, entries, steps_onto_cursor)
+    db = _DB(rows=[_source("auditd", 2), _source("nginx", 2)],
+             row={"cursor": "s=gone;i=1;b=bb;m=1;t=1;x=1", "minute": 8 * 60})
+    results = run(checks.check_ingest_sources(db, _cfg()))
+    sshd = next(r for r in results if r.key == "ingest:sshd")
+    assert sshd.status == "down", sshd.detail
+    assert sshd.facts["cursor_in_journal"] is False
+    assert "necitite" in sshd.detail
+
+
+def test_a_vanished_cursor_over_an_empty_journal_is_unknown_not_down(monkeypatch):
+    """Poziția a dispărut ȘI nu mai e nimic după locul ei: nu se poate spune
+    dacă s-au șters intrări necitite sau dacă jurnalul n-a avut ce să conțină.
+    „Nu știu" și „e stricat" sunt stări diferite, iar a doua trimisă degeaba e
+    exact alarma falsă care golește canalul de credit."""
+    _fake_journal(monkeypatch, [])
+    db = _DB(rows=[_source("auditd", 2), _source("nginx", 2)],
+             row={"cursor": "s=gone;i=1;b=bb;m=1;t=1;x=1", "minute": 8 * 60})
+    results = run(checks.check_ingest_sources(db, _cfg()))
+    sshd = next(r for r in results if r.key == "ingest:sshd")
+    assert sshd.status == "unknown", sshd.detail
+    assert not sshd.bad
+
+
+def test_an_empty_stored_cursor_is_unknown_and_asks_the_journal_nothing(monkeypatch):
+    """`collector_cursors.sshd.cursor` NULL sau gol înseamnă „nu există
+    poziție", nu „poziție veche".
+
+    Judecat ca un cursor obișnuit, un șir gol nu se potrivește cu nicio intrare
+    din jurnal, iar comparația care n-a avut loc iese cu un verdict oricum —
+    azi `down`, adică `critical` pe Telegram pentru o întrebare care n-a fost
+    pusă. Docstring-ul funcției promite `unknown` exact aici."""
+    built = _fake_journal(monkeypatch, _busy_journal())
+    db = _DB(rows=[_source("auditd", 2), _source("nginx", 2)],
+             row={"cursor": None, "minute": 12})
+    results = run(checks.check_ingest_sources(db, _cfg()))
+    sshd = next(r for r in results if r.key == "ingest:sshd")
+    assert sshd.status == "unknown", sshd.detail
+    assert sshd.facts["cursor_fp"] is None, (
+        "lipsa poziției a ieșit ca o amprentă — o poziție inexistentă nu are "
+        "ce să semene cu una salvată")
+    assert built == [], "a interogat jurnalul deși n-avea poziție de comparat"
+
+
+# --- ce pleacă de pe gazdă odată cu poziția colectorului -------------------
+#
+# `facts` e o coloană EXPEDIATĂ: `SELFCHECK_STREAM` din
+# sentinel/report/shipper.py o are în `columns`, iar `ship:selfcheck_state` e
+# pornit pe gazdă. Ce se pune acolo pleacă la agregatorul extern la fiecare
+# rulare a autodiagnosticului.
+#
+# Un cursor journald ca cele reale ca formă ȘI ca mărime — 124 de caractere
+# măsurate pe gazdă —, cu identificatorii INVENTAȚI, fiindcă `s=` (id-ul
+# fișierului de jurnal) și `b=` (id-ul de boot al mașinii) sunt exact ce n-are
+# voie să plece, iar repository-ul ăsta e public.
+LEAKY_CURSOR = ("s=" + "9f" * 16 + ";i=" + "b3" * 4 + ";b=" + "7a" * 16
+                + ";m=1a2b3c4d;t=64f0a1b2;x=5d6e7f80")
+
+# Fiecare ramură a lui `_journald_reader` care duce o poziție în `facts`.
+# Starea sondei e dată direct, nu prin jurnalul fals: aici nu se testează
+# sonda, ci ce publică verificarea DIN FIECARE ramură, iar verdictul așteptat
+# stă lângă ea ca să nu treacă un caz care a nimerit altă ramură decât cea pe
+# care pretinde că o acoperă.
+_LEAK_CASES = [
+    ("unavailable", "unavailable", None, "unknown"),
+    ("caught_up", "caught_up", None, "ok"),
+    ("gone_empty", "gone_empty", None, "unknown"),
+    ("behind fără moment", "behind", None, "unknown"),
+    ("behind sub toleranță", "behind", 5.0, "ok"),
+    ("behind peste toleranță", "behind", 21 * 3600.0, "down"),
+    ("gone", "gone", 6 * 3600.0, "down"),
+]
+
+
+def _probe(monkeypatch, state, age_s):
+    """Înlocuiește sonda jurnalului cu un răspuns dat."""
+    ts = (None if age_s is None
+          else datetime.now(timezone.utc) - timedelta(seconds=age_s))
+
+    def _fake(matches, cursor):
+        return state, ts, "systemd lipsește"
+
+    monkeypatch.setattr(checks, "_journal_first_unread", _fake)
+
+
+@pytest.mark.parametrize("nume,state,age_s,asteptat", _LEAK_CASES,
+                         ids=[c[0] for c in _LEAK_CASES])
+def test_the_journald_cursor_never_leaves_the_host_in_shipped_facts(
+        nume, state, age_s, asteptat, monkeypatch):
+    """Cursorul journald e `s=<id fișier jurnal>;…;b=<id boot>;…` — DOI
+    identificatori ai mașinii, 124 de caractere pe gazdă. Pus în `facts`, el
+    pleacă la agregatorul extern la fiecare autodiagnostic, de 288 de ori pe
+    zi: identificatorii părăsesc gazda, iar corpul cererii crește în fața unui
+    WAF care punctează corpurile și oprește DEFINITIV fluxul după patru
+    respingeri — adică exact canalul prin care agentul mai poate spune ceva.
+
+    Aserțiunea e pe VALOARE, nu pe numele cheii: o verificare care se uită doar
+    dacă s-a redenumit cheia ar trece în timp ce cursorul brut pleacă mai
+    departe sub alt nume. Și nici o bucată din el nu e acceptabilă — orice
+    fragment, de la început sau de la sfârșit, e fragment dintr-un
+    identificator.
+
+    Cursorul lui `_suricata_reader` (`<inod>:<offset>`) e în afara întrebării
+    ăsteia: n-are niciun identificator al mașinii în el. De asta se citește
+    aici doar `ingest:sshd`.
+    """
+    _probe(monkeypatch, state, age_s)
+    db = _DB(rows=[_source("auditd", 2), _source("nginx", 2)],
+             row={"cursor": LEAKY_CURSOR, "minute": 3})
+    results = run(checks.check_ingest_sources(db, _cfg()))
+    sshd = next(r for r in results if r.key == "ingest:sshd")
+
+    # Garda cazului: dacă ramura s-a mutat, testul nu mai acoperă ce spune.
+    assert sshd.status == asteptat, sshd.detail
+
+    blob = json.dumps(sshd.facts, ensure_ascii=False)
+    assert LEAKY_CURSOR not in blob, (
+        f"poziția întreagă a colectorului pleacă la agregator pe ramura "
+        f"„{nume}”: {blob}")
+    for token in LEAKY_CURSOR.split(";"):
+        assert token not in blob, (
+            f"«{token}» din cursor pleacă la agregator pe ramura „{nume}”: "
+            f"{blob}")
+    for cheie, valoare in sshd.facts.items():
+        if not isinstance(valoare, str):
+            continue
+        # Orice bucată brută a cursorului e, prin definiție, un subșir al lui.
+        assert len(valoare) < 3 or valoare not in LEAKY_CURSOR, (
+            f"`{cheie}` duce o bucată brută din poziția colectorului "
+            f"(«{valoare}») pe ramura „{nume}”")
+        assert len(valoare) <= 32, (
+            f"`{cheie}` trimite {len(valoare)} de caractere la agregator pe "
+            f"ramura „{nume}” — corpul expediat crește în fața WAF-ului care "
+            f"oprește fluxul după patru respingeri")
+
+
+def test_no_facts_in_the_journald_check_is_built_from_the_stored_cursor():
+    """Perechea structurală a testului de mai sus, pentru ramurile pe care el
+    nu le enumeră.
+
+    Testul de deasupra acoperă cele șapte ramuri de azi. A opta, adăugată
+    mâine cu `facts={"cursor": stored_cursor}` în ea, ar trece prin el fără să
+    fie atinsă — și abia pe gazdă s-ar vedea că id-ul de boot pleacă din nou.
+    Aici se citește FUNCȚIA: nicio valoare din niciun `facts=` al ei nu are
+    voie să se atingă de `stored_cursor`, nici întreg, nici feliat.
+    """
+    arbore = ast.parse(inspect.getsource(checks._journald_reader))
+    dicturi = [kw.value for nod in ast.walk(arbore)
+               if isinstance(nod, ast.Call)
+               for kw in nod.keywords
+               if kw.arg == "facts" and isinstance(kw.value, ast.Dict)]
+    assert len(dicturi) >= 7, (
+        f"s-au găsit doar {len(dicturi)} constatări cu `facts` în "
+        "`_journald_reader` — testul se uită în altă parte decât crede")
+    for d in dicturi:
+        for cheie, valoare in zip(d.keys, d.values):
+            nume = [n.id for n in ast.walk(valoare) if isinstance(n, ast.Name)]
+            eticheta = getattr(cheie, "value", "?")
+            assert "stored_cursor" not in nume, (
+                f"`{eticheta}` e construit din poziția brută a colectorului, "
+                f"iar `facts` pleacă la agregatorul extern — vezi "
+                f"`_cursor_fingerprint`")
+
+
+def test_the_shipped_position_still_tells_two_runs_apart(monkeypatch):
+    """Ce trebuie să RĂMÂNĂ posibil după ce cursorul nu mai pleacă: operatorul
+    (și agregatorul) trebuie să poată spune dacă poziția colectorului s-a
+    MIȘCAT între două rulări. Fără asta, un cititor înghețat și unul care
+    citește arată identic din afara gazdei, iar tăierea ar fi cumpărat
+    confidențialitatea cu chiar semnalul pentru care există verificarea.
+    """
+    def _fp_pentru(cursor):
+        _probe(monkeypatch, "caught_up", None)
+        db = _DB(rows=[_source("auditd", 2), _source("nginx", 2)],
+                 row={"cursor": cursor, "minute": 3})
+        results = run(checks.check_ingest_sources(db, _cfg()))
+        sshd = next(r for r in results if r.key == "ingest:sshd")
+        assert sshd.status == "ok", sshd.detail
+        return sshd.facts["cursor_fp"]
+
+    # Aceeași poziție, două rulări: neschimbată înseamnă neschimbată.
+    assert _fp_pentru(LEAKY_CURSOR) == _fp_pentru(LEAKY_CURSOR)
+
+    # Poziția a avansat cu o singură intrare — diferența dintre „cititorul
+    # merge" și „cititorul stă" e uneori chiar atât.
+    avansat = LEAKY_CURSOR.replace(";i=" + "b3" * 4, ";i=" + "b3" * 3 + "b4")
+    assert avansat != LEAKY_CURSOR
+    assert _fp_pentru(avansat) != _fp_pentru(LEAKY_CURSOR), (
+        "două poziții diferite dau aceeași amprentă — o poziție înghețată se "
+        "citește de la distanță ca una care se mișcă")
+
+    # Și lungimea, fiindcă ea decide cât de des mint comparațiile de mai sus.
+    # Sub 8 caractere hexa (32 de biți) coliziunile devin plauzibile la 288 de
+    # rulări pe zi, iar o coliziune spune „poziția nu s-a mișcat" despre un
+    # cititor care citește — tăcere falsă, nu alarmă falsă. Peste 16 nu se
+    # cumpără nimic: rămâne doar corp de cerere în plus, în fața WAF-ului care
+    # oprește fluxul după patru respingeri.
+    assert 8 <= checks.CURSOR_FINGERPRINT_HEX <= 16, (
+        f"amprenta poziției are {checks.CURSOR_FINGERPRINT_HEX} caractere — "
+        f"prea scurtă se ciocnește (o poziție care se mișcă se citește ca "
+        f"înghețată), prea lungă doar umflă corpul expediat")
+
+
+def test_a_journal_entry_without_a_timestamp_is_unknown_not_a_zero_lag(monkeypatch):
+    """O intrare de jurnal fără `__REALTIME_TIMESTAMP` nu are vechime, iar „nu
+    are vechime" nu e „e de acum".
+
+    Citită ca zero, întârzierea iese sub orice toleranță și un cititor oprit de
+    o noapte se raportează `ok` — aceeași boală ca măsurarea cantității
+    greșite, doar mai tăcută, fiindcă aici nici nu se vede că lipsește ceva.
+    Verificat: mutația care întorcea `now()` pentru o intrare fără moment nu
+    pica niciun test."""
+    entries = _busy_journal()
+    del entries[1]["__REALTIME_TIMESTAMP"]      # chiar prima intrare necitită
+    _fake_journal(monkeypatch, entries)
+    db = _DB(rows=[_source("auditd", 2), _source("nginx", 2)],
+             row={"cursor": BUSY_STORED_CURSOR, "minute": 21 * 60})
+    results = run(checks.check_ingest_sources(db, _cfg()))
+    sshd = next(r for r in results if r.key == "ingest:sshd")
+    assert sshd.status == "unknown", sshd.detail
+    assert "__REALTIME_TIMESTAMP" in sshd.detail
+
+
+def test_journald_reader_is_unknown_when_systemd_is_unavailable():
+    """Fără dublu: `_journal_first_unread` cade pe importul real (și lipsă pe
+    mașina asta) de `systemd` și trebuie să spună «nu știu», nu să inventeze
+    «ok» — un `ok` inventat aici ar șterge o constatare reală pe o gazdă unde
+    verificarea chiar n-a putut să se uite."""
+    db = _DB(rows=[_source("auditd", 2), _source("nginx", 2)],
+             row={"cursor": "s=x", "minute": 1})
+    results = run(checks.check_ingest_sources(db, _cfg()))
+    sshd = next(r for r in results if r.key == "ingest:sshd")
+    assert sshd.status == "unknown", sshd.detail
+    assert not sshd.bad
+
+
+def test_journald_reader_is_unknown_not_ok_when_the_cursor_row_is_missing(monkeypatch):
+    """Un rând din `collector_cursors` care nu s-a scris niciodată, ori a fost
+    șters, nu are voie să se citească drept «e bine» — vezi docstring-ul
+    modulului despre constatările retrase."""
+    _fake_journal(monkeypatch, _busy_journal())
+    db = _DB(rows=[_source("auditd", 2), _source("nginx", 2)], row=None)
+    results = run(checks.check_ingest_sources(db, _cfg()))
+    sshd = next(r for r in results if r.key == "ingest:sshd")
+    assert sshd.status == "unknown", sshd.detail
+
+
+def test_sudo_and_su_liveness_still_comes_from_the_reader_not_the_row(monkeypatch):
+    """Obligația schimbării: scoțând dovada pe rândul sshd pentru sudo/su, ele
+    nu au voie să rămână nedovedite. `_journald_reader` acoperă toate trei din
+    același cititor, deci un cititor oprit se vede sub `ingest:sshd` chiar și
+    când sudo tace de un an (condus de om, `ok` oricum) — și chiar și când
+    jurnalul e plin, ceea ce e cazul în care premisa veche cădea."""
+    _fake_journal(monkeypatch, _busy_journal())
+    db = _DB(rows=[_source("auditd", 2), _source("nginx", 2),
+                   _source("sudo", 60 * 24 * 365)],
+             row={"cursor": BUSY_STORED_CURSOR, "minute": 21 * 60})
+    results = run(checks.check_ingest_sources(db, _cfg()))
+    sshd = next(r for r in results if r.key == "ingest:sshd")
+    assert sshd.status == "down", (
+        "cititorul mort trebuia prins — el e dovada de viață pentru sudo/su")
+    sudo = next(r for r in results if r.key == "ingest:sudo")
+    assert sudo.status == "ok" and not sudo.bad
+
+
+def test_journald_disabled_in_config_says_so_instead_of_being_unknown_forever(monkeypatch):
+    """Aceeași alegere ca la `ship:lag` cu `ship.enabled: false`: un operator
+    care a oprit dinadins colectarea din jurnal trebuie să vadă «oprit», nu un
+    «nu știu» permanent, care arată ca o verificare stricată."""
+    built = _fake_journal(monkeypatch, _busy_journal())
+    cfg = _cfg()
+    cfg.ingest = SimpleNamespace(suricata=True, journald=False, flush_interval_ms=1000)
+    db = _DB(rows=[_source("auditd", 2), _source("nginx", 2)], row=None)
+    results = run(checks.check_ingest_sources(db, cfg))
+    sshd = next(r for r in results if r.key == "ingest:sshd")
+    assert sshd.status == "ok" and sshd.facts["configured"] is False
+    assert not any("collector_cursors" in s for s in db.sql), (
+        "a citit cursorul „sshd” deși jurnalul e oprit din `ingest`")
+    assert built == [], "a deschis jurnalul deși e oprit din `ingest`"
+
+
+def test_the_journald_probe_matches_exactly_what_the_collector_matches(monkeypatch):
+    """Sonda și cititorul viu trebuie să întrebe jurnalul același lucru.
+
+    Dacă sonda ar potrivi altceva (de exemplu doar `sshd`, fără
+    `sshd-session`, `sudo` și `su`), cursorul salvat de colector ar putea
+    aparține unei intrări pe care sonda n-o vede — și atunci ea ar citi poziția
+    validă a unui colector viu drept „cursor dispărut din jurnal", adică `down`
+    pe o gazdă sănătoasă."""
+    from sentinel.services.ingest_service import JOURNALD_COMMS
+
+    built = _fake_journal(monkeypatch, _busy_journal())
+    db = _DB(rows=[_source("auditd", 2)],
+             row={"cursor": BUSY_STORED_CURSOR, "minute": 21 * 60})
+    run(checks.check_ingest_sources(db, _cfg()))
+    assert len(built) == 1, "sonda n-a deschis jurnalul"
+    asked = [m["_COMM"] for m in built[0].matches if isinstance(m, dict)]
+    assert asked == list(JOURNALD_COMMS), asked
+    assert built[0].matches.count("OR") == len(JOURNALD_COMMS) - 1, (
+        "grupurile nu mai sunt legate prin SAU — vezi `apply_matches`")
+    assert built[0].closed, "cititorul de probă a rămas deschis"
 
 
 # --- S9: this check must not scan the whole raw_events retention window ----
@@ -148,6 +899,34 @@ def test_ingest_sources_scan_window_is_bounded_to_hours_not_days():
         "înainte să apuce să fie evaluat pe pragul lui")
 
 
+def test_the_shipped_default_patience_is_read_out_of_the_dataclass():
+    """`DEFAULT_MAX_SILENCE_MIN` e singurul loc din modul care mai numește
+    răbdarea implicită, iar niciun verdict nu-l citește: `_silence_limit`
+    întreabă CONFIGURAȚIA. O constantă care nu conduce nimic nu e contrazisă
+    de nimic — pusă pe 999, toată suita trecea (5053 passed, 20 skipped) —,
+    dar ea e ce citește omul care vine să afle „cu ce pleacă o instalare".
+
+    Ce se strică pentru operator dacă cele două se depărtează: fereastra de
+    scanare de mai sus e dimensionată pe ea (`RAW_EVENTS_INGEST_SCAN_HOURS`,
+    cu marja calculată din valoarea asta), și tot ea e numărul din care se
+    argumentează pragurile în comentariile secțiunii. Un al doilea exemplar
+    scris de mână se învechește tăcut la prima schimbare a valorii livrate, iar
+    argumentele construite pe el rămân în picioare arătând corect.
+    """
+    assert checks.DEFAULT_MAX_SILENCE_MIN == SelfcheckSilenceConfig().default, (
+        "constanta din checks.py nu mai e valoarea livrată de "
+        "`SelfcheckSilenceConfig.default` — e o a doua copie, scrisă de mână")
+    # Și că e chiar CEA MAI LUNGĂ răbdare livrată: fereastra de scanare își ia
+    # marja din ea, iar dacă un câmp per-sursă o depășește, marja aia e
+    # calculată pe numărul greșit.
+    livrate = SelfcheckSilenceConfig()
+    assert checks.DEFAULT_MAX_SILENCE_MIN == max(
+        getattr(livrate, f) for f in
+        (*checks.NAMED_SILENCE_SOURCES, "default")), (
+        "răbdarea implicită nu mai e cea mai lungă dintre cele livrate, deci "
+        "marja ferestrei de scanare e argumentată pe alt număr decât cel real")
+
+
 def test_a_quiet_night_is_not_an_outage():
     """Everything quiet together is a quiet host. Blaming each collector
     individually would be six alerts for one non-problem — and six false alerts
@@ -178,7 +957,7 @@ def test_silence_past_the_chattiest_sources_own_limit_is_down():
     """Peste pragul celei mai vorbărețe surse urmărite (azi 60 de minute, de la
     auditd), tăcerea încetează să fie o pauză normală — și tot acolo prinde
     pana reală de 21 de ore, de douăzeci de ori mai repede decât ea."""
-    limit = checks.ALL_QUIET_DOWN_MIN
+    limit = checks._all_quiet_down_min(_cfg())
     db = _DB(rows=[_source("auditd", limit + 1), _source("sshd", limit + 30),
                    _source("nginx", limit + 60)])
     results = run(checks.check_ingest_sources(db, _cfg()))
@@ -190,11 +969,27 @@ def test_silence_past_the_chattiest_sources_own_limit_is_down():
 def test_silence_exactly_at_the_limit_is_not_yet_down():
     """Limita e o graniță, nu o presupunere: la exact pragul celei mai
     vorbărețe surse, gazda poate fi încă într-o pauză legitimă."""
-    limit = checks.ALL_QUIET_DOWN_MIN
+    limit = checks._all_quiet_down_min(_cfg())
     db = _DB(rows=[_source("auditd", limit), _source("sshd", limit),
                    _source("nginx", limit)])
     results = run(checks.check_ingest_sources(db, _cfg()))
     assert not any(r.key == "ingest:all" for r in results)
+
+
+def test_a_raised_nginx_threshold_from_configuration_reaches_the_verdict():
+    """`selfcheck.max_silence_min.nginx: 1440` trebuie SĂ SCHIMBE verdictul
+    real pentru un nginx tăcut de 4 ore — altfel secțiunea din sentinel.yaml
+    există în fișier și nu face nimic, exact defectul pe care Change 2 îl
+    repară."""
+    cfg = _cfg()
+    cfg.selfcheck = SimpleNamespace(max_silence_min=SimpleNamespace(
+        auditd=60, nginx=1440, default=1440))
+    db = _DB(rows=[_source("auditd", 5), _source("nginx", 4 * 60)])
+    results = run(checks.check_ingest_sources(db, cfg))
+    nginx = next(r for r in results if r.key == "ingest:nginx")
+    assert nginx.status == "ok", (
+        "pragul ridicat din configurație nu a ajuns la verdict — nginx tăcut "
+        "4 ore a fost acuzat oricum, sub pragul implicit de 180 de minute")
 
 
 def test_one_source_past_its_own_limit_is_blamed_even_if_others_are_merely_quiet():
@@ -223,13 +1018,13 @@ def test_one_source_past_its_own_limit_is_blamed_even_if_others_are_merely_quiet
 def test_a_real_fault_is_never_withdrawn_by_a_single_sudo_keystroke():
     """Pana de 21 de ore cu un `sudo` tastat la ora 20 nu mai trece prin
     fereastra 5–60: cu un singur prag, `sudo` la 30 de minute ține
-    `ingest:auditd/nginx/sshd` acuzate pe nume în tot restul penei — niciodată
-    nu dispar de pe panou, care ar fi anunțat operatorului 55 de minute de
+    `ingest:auditd/nginx` acuzate pe nume în tot restul penei — niciodată nu
+    dispar de pe panou, care ar fi anunțat operatorului 55 de minute de
     recuperare în mijlocul unei pene totale."""
     db = _DB(rows=[_source("auditd", 1260), _source("nginx", 1260),
                    _source("sshd", 1260), _source("sudo", 30)])
     results = run(checks.check_ingest_sources(db, _cfg()))
-    for source in ("auditd", "nginx", "sshd"):
+    for source in ("auditd", "nginx"):
         r = next((x for x in results if x.key == f"ingest:{source}"), None)
         assert r is not None and r.status == "down", (
             f"ingest:{source} a dispărut de pe panou — o pană de 21h ascunsă "
@@ -239,15 +1034,15 @@ def test_a_real_fault_is_never_withdrawn_by_a_single_sudo_keystroke():
 
 
 def test_a_dead_journald_reader_is_blamed_even_beside_a_live_cursor_source():
-    """`journald` (auditd, sshd) mort de 4 ore lângă un rând `suricata` vechi
+    """`journald` (auditd, nginx) mort de 4 ore lângă un rând `suricata` vechi
     de 20 de minute nu mai dispare în `ingest:all`: cu un singur prag, rândul
-    suricata ține pragul comun jos, iar auditd/nginx/sshd rămân acuzate pe
-    nume — nu se pierd sub «ingest:all», care pe gazda de producție ar fi
-    ascuns exact colectorul mort."""
+    suricata ține pragul comun jos, iar auditd/nginx rămân acuzate pe nume —
+    nu se pierd sub «ingest:all», care pe gazda de producție ar fi ascuns
+    exact colectorul mort."""
     db = _DB(rows=[_source("auditd", 240), _source("nginx", 240),
                    _source("sshd", 240), _source("suricata", 20)])
     results = run(checks.check_ingest_sources(db, _cfg()))
-    for source in ("auditd", "nginx", "sshd"):
+    for source in ("auditd", "nginx"):
         r = next((x for x in results if x.key == f"ingest:{source}"), None)
         assert r is not None and r.status == "down", (
             f"ingest:{source} nu a fost acuzat lângă un rând suricata recent")
@@ -257,18 +1052,57 @@ def test_a_dead_journald_reader_is_blamed_even_beside_a_live_cursor_source():
 
 
 def test_all_quiet_threshold_is_pinned_to_the_smallest_per_source_limit():
-    """`ALL_QUIET_DOWN_MIN` trebuie SĂ RĂMÂNĂ derivat din pragurile per-sursă,
-    nu înlocuit cu o constantă coincidentă: o mutație care schimbă `min` în
-    `max` (prag 180, de trei ori mai permisiv) sau care-l înlocuiește cu 10 —
-    chiar valoarea care a produs 18 alerte «toate au amuțit» în ~45 de ore pe o
-    gazdă sănătoasă — trecea neobservată prin toate cele 18 fișiere de test
-    care importă `sentinel.selfcheck`, fiindcă nimic nu lega constanta de
-    sursa ei."""
-    assert checks.ALL_QUIET_DOWN_MIN == min(checks.SOURCE_MAX_SILENCE_MIN.values())
-    assert checks.ALL_QUIET_DOWN_MIN >= 30, (
+    """`_all_quiet_down_min` trebuie SĂ RĂMÂNĂ derivat din pragurile per-sursă
+    configurate, nu înlocuit cu o constantă coincidentă: o mutație care
+    schimbă `min` în `max` (prag 180, de trei ori mai permisiv) sau care-l
+    înlocuiește cu 10 — chiar valoarea care a produs 18 alerte «toate au
+    amuțit» în ~45 de ore pe o gazdă sănătoasă — trecea neobservată prin toate
+    cele 18 fișiere de test care importă `sentinel.selfcheck`, fiindcă nimic
+    nu lega constanta de sursa ei."""
+    cfg = _cfg()
+    limits = cfg.selfcheck.max_silence_min
+    assert checks._all_quiet_down_min(cfg) == min(
+        getattr(limits, name) for name in checks.NAMED_SILENCE_SOURCES)
+    assert checks._all_quiet_down_min(cfg) >= 30, (
         "sub 30 de minute pragul se apropie de cadența naturală măsurată pe "
         "gazda Docker (goluri de până la 5.02 minute) — flapping-ul de 18 "
         "alerte în ~45 de ore poate reveni fără ca vreun test s-o observe")
+
+
+def test_all_quiet_threshold_follows_configuration_not_the_shipped_defaults():
+    """Punctul întregii secțiuni 2: pragurile devin per-instalare. Un operator
+    care ridică `nginx` la un număr mare NU are voie să ridice și pragul
+    colectiv pe ascuns — cele două praguri configurate rămân `auditd` (60) și
+    `nginx`, iar podeaua urmează minimul configurat, nu constanta veche."""
+    cfg = _cfg()
+    cfg.selfcheck = SimpleNamespace(max_silence_min=SimpleNamespace(
+        auditd=45, nginx=1440, default=1440))
+    assert checks._all_quiet_down_min(cfg) == 45
+
+
+def test_the_collective_floor_is_taken_from_the_named_sources_not_from_default():
+    """`default` e rezerva pentru colectorii fără câmp propriu, nu răbdarea
+    vreunei surse urmărite — și dacă intră în podeaua colectivă, un operator
+    care coboară `default` ca să fie mai sever cu un colector oarecare coboară
+    pe ascuns și pragul lui `ingest:all`, adică readuce flapping-ul de 18
+    alerte «toate au amuțit» în ~45 de ore de pe gazda Docker sănătoasă.
+
+    Configurația de aici e aleasă ca cele două răspunsuri SĂ DIFERE: minimul
+    câmpurilor numite e 60, minimul cu `default` inclus ar fi 30. Cu
+    `auditd=45, nginx=1440, default=1440` — singura configurație testată până
+    acum — ambele dau același număr, deci nimic nu prindea diferența."""
+    cfg = _cfg()
+    cfg.selfcheck = SimpleNamespace(max_silence_min=SimpleNamespace(
+        auditd=60, nginx=180, default=30))
+    assert checks._all_quiet_down_min(cfg) == 60
+    # Și efectul, nu doar numărul: la 45 de minute de tăcere totală podeaua de
+    # 60 înseamnă „încă e o pauză legitimă", iar cu `default` inclus (30) s-ar
+    # fi emis `ingest:all` — `critical` pe o gazdă care doar respira.
+    db = _DB(rows=[_source("auditd", 45), _source("nginx", 45)])
+    results = run(checks.check_ingest_sources(db, cfg))
+    assert not any(r.key == "ingest:all" for r in results), (
+        "podeaua colectivă a coborât la `default`, deci o gazdă liniștită de "
+        "45 de minute e raportată ca pană totală")
 
 
 def test_a_human_driven_source_is_never_an_alert():
@@ -291,21 +1125,27 @@ def test_a_human_driven_source_is_never_an_alert():
 
 def test_human_driven_sources_carry_no_threshold():
     """Belt and braces: the two sets must not overlap. A threshold left behind
-    in SOURCE_MAX_SILENCE_MIN would be dead code that looks authoritative, and
-    the next person to read it would reinstate the bug."""
-    assert not (checks.HUMAN_DRIVEN & set(checks.SOURCE_MAX_SILENCE_MIN))
+    among `NAMED_SILENCE_SOURCES` would be dead code that looks authoritative,
+    and the next person to read it would reinstate the bug."""
+    assert not (checks.HUMAN_DRIVEN & checks.NAMED_SILENCE_SOURCES)
 
 
 def test_the_shared_journald_reader_still_has_a_watched_source():
-    """sudo and su are exempt because sshd proves the reader is alive — they all
-    come from ONE reader with one _COMM match set. If sshd ever stopped being
-    watched, or stopped sharing that reader, the exemption would silently become
-    a blind spot."""
+    """sudo and su are exempt because sshd proves the reader is alive — they
+    all come from ONE reader with one `_COMM` match set. If sshd ever stopped
+    being watched, or stopped sharing that reader, the exemption would
+    silently become a blind spot.
+
+    sshd's proof no longer comes from `NAMED_SILENCE_SOURCES` — it is in
+    `CURSOR_BACKED_SOURCES` instead, judged by `_journald_reader` on the
+    reader's own cursor (see that dataclass's docstring for why the row
+    threshold was removed)."""
     from sentinel.services.ingest_service import JOURNALD_COMMS
-    watched = set(checks.SOURCE_MAX_SILENCE_MIN) - checks.HUMAN_DRIVEN
-    assert "sshd" in watched, "sshd nu mai e supravegheat; sudo/su rămân neacoperite"
-    for comm in ("sudo", "su"):
-        assert comm in JOURNALD_COMMS
+    assert "sshd" in checks.CURSOR_BACKED_SOURCES, (
+        "sshd nu mai e supravegheat; sudo/su rămân neacoperite")
+    assert "sshd" not in checks.HUMAN_DRIVEN
+    for comm in ("sshd", "sudo", "su"):
+        assert comm in JOURNALD_COMMS, f"{comm} nu mai vine din același cititor"
     assert "sshd" in JOURNALD_COMMS, "sshd nu mai vine din același cititor"
 
 
@@ -508,23 +1348,26 @@ def test_suricata_is_not_judged_against_its_neighbours_any_more():
     potrivire de semnătură. Comparația dintre ele nu poate răspunde la „e stricat
     colectorul?", și exact ea a produs alertele `critical` din 28 august.
     """
-    assert "suricata" not in checks.SOURCE_MAX_SILENCE_MIN, (
-        "suricata a revenit în harta de praguri pe tăcere, deci e judecată din nou "
+    assert "suricata" not in checks.NAMED_SILENCE_SOURCES, (
+        "suricata a revenit în lista de praguri pe tăcere, deci e judecată din nou "
         "prin comparație cu vecini cu care nu e comparabilă")
     assert "suricata" in checks.CURSOR_BACKED_SOURCES
-    assert not (checks.CURSOR_BACKED_SOURCES & set(checks.SOURCE_MAX_SILENCE_MIN))
+    assert not (checks.CURSOR_BACKED_SOURCES & checks.NAMED_SILENCE_SOURCES)
 
 
 def test_the_neighbour_comparison_still_covers_the_row_driven_collectors():
     """Reparația nu are voie să însemne „taci peste tot".
 
-    auditd, sshd și nginx AU prins pana reală de 21 de ore, și rândul lor chiar e
-    proporțional cu traficul. Pragurile lor rămân.
+    auditd și nginx AU prins pana reală de 21 de ore, și rândul lor chiar e
+    proporțional cu traficul. Pragurile lor rămân — configurabile acum, dar
+    tot per-sursă. sshd a ieșit din listă fiindcă rândul lui nu mai e, singur,
+    dovada de viață (vezi `SelfcheckSilenceConfig`).
     """
-    for source in ("auditd", "sshd", "nginx"):
-        assert source in checks.SOURCE_MAX_SILENCE_MIN, (
+    for source in ("auditd", "nginx"):
+        assert source in checks.NAMED_SILENCE_SOURCES, (
             f"{source} și-a pierdut pragul de tăcere — verificarea care a prins "
             f"pata oarbă de 21 de ore nu-l mai acoperă")
+    assert "sshd" not in checks.NAMED_SILENCE_SOURCES
 
 
 def test_suricata_turned_off_in_config_says_so_instead_of_vanishing(tmp_path):
@@ -555,7 +1398,8 @@ def test_the_toggle_in_ingest_decides_whether_the_cursor_is_read_at_all(tmp_path
     """
     path, inode, size = _eve(tmp_path, 4096)
     cfg = _suricata_cfg(path)
-    cfg.ingest = SimpleNamespace(suricata=False)
+    cfg.ingest = SimpleNamespace(suricata=False, journald=False,
+                                 flush_interval_ms=1000)
     db = _DB(rows=[_source("nginx", 1)], row=_cursor_row(f"{inode}:{size}", 90.0))
     results = run(checks.check_ingest_sources(db, cfg))
 

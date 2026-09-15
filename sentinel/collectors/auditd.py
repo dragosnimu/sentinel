@@ -699,7 +699,16 @@ def parse_auditd_group(lines: list[str]) -> Event | None:
 
     raw: dict[str, Any] = {
         "record_type": "SYSCALL", "audit_key": key,
+        # `arch` lângă `syscall`, nu în locul lui, și niciodată unul fără
+        # celălalt: numărul singur nu înseamnă nimic. 191 e `getxattr` pe
+        # x86_64 și `semctl` pe tabela generică (aarch64) — două lucruri fără
+        # nicio legătură. `detect/intrusion` decide, din perechea asta, dacă o
+        # atingere de momeală a deschis CONȚINUTUL sau doar atributele, iar
+        # decizia aia coboară o severitate; un număr interpretat pe ABI-ul
+        # greșit ar înmuia exact alerta pentru care momeala există. Un rând
+        # fără `arch` rămâne „nu știu", adică `critical`.
         "syscall": syscall.get("syscall"), "success": syscall.get("success"),
+        **({"arch": syscall["arch"]} if syscall.get("arch") else {}),
         "uid": syscall.get("uid"), "auid": syscall.get("auid"),
         "comm": syscall.get("comm"), "exe": syscall.get("exe"),
         # REDACTAT înainte de a intra în dicționar, nu la citire: rândul ăsta

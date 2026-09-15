@@ -12,6 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from sentinel.constants import SEVERITIES
+
 
 @dataclass
 class DetectionSpec:
@@ -78,7 +80,26 @@ class DetectionSpec:
 # ridicarea pragului la `critical`, ceea ce ar tăcea și cele 124 de incidente
 # `high` deschise: o decizie a operatorului despre tot, nu un efect secundar al
 # gărzii ăsteia.
+#
+# PLAFON, nu valoare fixă, iar asta e a doua decizie. Când garda a fost scrisă,
+# fiecare regulă care susținea un fișier era `critical`, deci o atribuire era
+# totuna cu o coborâre. `intrusion.bait_attribute_probe` e prima regulă `low`
+# care susține un fișier: pentru ea atribuirea URCA severitatea cu două trepte
+# și lipea deasupra propoziția „Severitate coborâtă din `low`" — alerta spunea
+# exact pe dos ce tocmai făcuse, adică fix genul de afirmație pentru care
+# există garda asta. Deci severitatea se atinge numai în jos, iar textul de mai
+# jos spune care dintre cele două s-a întâmplat. Pentru regulile `critical`
+# nimic nu se schimbă: erau coborâte la `high` și rămân coborâte la `high`.
 UNSUPPORTED_SEVERITY = "high"
+
+# Necunoscutul se plafonează, nu se crede. O severitate care nu e pe scara
+# canonică e un defect în regula care a produs-o; lăsată neatinsă, ar putea
+# trece peste `critical` la orice comparație care o citește.
+_RANK = {s: i for i, s in enumerate(SEVERITIES)}
+
+
+def _above_the_guard(severity: str) -> bool:
+    return _RANK.get(severity, len(SEVERITIES)) > _RANK[UNSUPPORTED_SEVERITY]
 
 
 def _is_plausible_path(value: Any) -> bool:
@@ -95,19 +116,25 @@ def enforce_path_evidence(spec: DetectionSpec) -> DetectionSpec:
     if any(_is_plausible_path(p) for p in paths):
         return spec
 
+    ceruta = spec.severity
+    coborata = _above_the_guard(ceruta)
     spec.evidence = {
         **spec.evidence,
         "evidence_guard": "no_plausible_path",
-        "severity_claimed": spec.severity,
+        "severity_claimed": ceruta,
     }
-    spec.severity = UNSUPPORTED_SEVERITY
+    if coborata:
+        spec.severity = UNSUPPORTED_SEVERITY
     spec.fingerprint = f"{spec.fingerprint}:fara-cale"
     spec.title = f"{spec.title} — fără cale de fișier în evidență"
     spec.summary = (
         "Regula s-a declanșat, dar evidența nu conține nicio cale de fișier "
         "absolută, deci nu se poate spune CE s-a modificat. Cel mai probabil "
         "colectorul auditd nu a putut rezolva calea (înregistrare PATH fără "
-        "CWD), nu o intruziune. Severitate coborâtă din "
-        f"`{spec.evidence['severity_claimed']}` până când există o cale. "
-        f"Evidența brută: {spec.summary}")
+        "CWD), nu o intruziune. "
+        + (f"Severitate coborâtă din `{ceruta}` până când există o cale. "
+           if coborata else
+           f"Severitatea rămâne `{ceruta}`: garda nu urcă o alertă pe care "
+           "evidența n-o susține. ")
+        + f"Evidența brută: {spec.summary}")
     return spec

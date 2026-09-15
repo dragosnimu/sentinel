@@ -627,6 +627,54 @@ telegram:
 """))
 
 
+# --- selfcheck.max_silence_min: per-installation ingest silence thresholds --
+def test_selfcheck_silence_thresholds_load_as_a_typed_nested_section(tmp_path):
+    """The section round-trips into `SelfcheckSilenceConfig`, not a plain dict
+    — the shape `sentinel/selfcheck/checks.py` reads via `_silence_limit`."""
+    from sentinel.config import SelfcheckSilenceConfig
+
+    cfg = load_config(_write(tmp_path, """
+selfcheck:
+  max_silence_min:
+    nginx: 1440
+telegram:
+  enabled: false
+"""))
+    assert isinstance(cfg.selfcheck.max_silence_min, SelfcheckSilenceConfig)
+    assert cfg.selfcheck.max_silence_min.nginx == 1440
+    # Untouched fields keep the shipped defaults — a partial override must not
+    # silently zero out the sibling thresholds.
+    assert cfg.selfcheck.max_silence_min.auditd == 60
+    assert cfg.selfcheck.max_silence_min.default == 180
+
+
+def test_selfcheck_section_absent_keeps_the_shipped_defaults(tmp_path):
+    """Every host running today has no `selfcheck:` section at all — the
+    default must be exactly what was previously hard-coded in checks.py."""
+    cfg = load_config(_write(tmp_path, """
+telegram:
+  enabled: false
+"""))
+    assert cfg.selfcheck.max_silence_min.auditd == 60
+    assert cfg.selfcheck.max_silence_min.nginx == 180
+    assert cfg.selfcheck.max_silence_min.default == 180
+
+
+def test_a_misspelled_key_under_selfcheck_is_refused_not_silently_ignored(tmp_path):
+    """`ssh:` instead of a real field must stop the daemon at load — not sit
+    in the file doing nothing, which is what a `dict[str, int]` shape would
+    have allowed. This is the whole reason Change 2 uses a nested dataclass
+    instead of a dict: `_build` raises on any key it does not know."""
+    with pytest.raises(ConfigError, match="ssh"):
+        load_config(_write(tmp_path, """
+selfcheck:
+  max_silence_min:
+    ssh: 999
+telegram:
+  enabled: false
+"""))
+
+
 def test_a_quoted_pool_min_is_refused_not_silently_accepted(tmp_path):
     """The int-coercion gap was not specific to floats: a string int (`'5'`)
     passed through `_coerce` unchanged before this fix, for every int field,

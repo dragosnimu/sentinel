@@ -41,18 +41,27 @@ cursor and is therefore produced whether or not a row exists.)
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import os
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
+from dataclasses import fields as dc_fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
 
 import yaml
 
-from sentinel.config import CONFIG_PATH, Config, resolve_skip_command_accounts
+from sentinel.collectors.journald_reader import REBUILD_AFTER_EMPTY_POLLS
+from sentinel.config import (
+    CONFIG_PATH,
+    Config,
+    SelfcheckSilenceConfig,
+    resolve_skip_command_accounts,
+)
 from sentinel.constants import SYSTEMD_UNITS
 from sentinel.db.engine import Database
 from sentinel.db.repo import assets as assets_repo
@@ -168,17 +177,39 @@ async def check_units(cfg: Config) -> list[CheckResult]:
     return results
 
 
+# Constantă de modul, nu un tuplu în antetul buclei de mai jos, din exact
+# același motiv pentru care `check_units` citește `SYSTEMD_UNITS`: numele astea
+# sunt SURSA acțiunilor pe care le vede operatorul, iar acțiunile se construiesc
+# prin interpolare (`f"systemctl list-timers {unit}"`), deci un scanner de
+# șiruri literale nu vede niciodată numele, ci doar bucățile din jurul lui. Un
+# nume care nu corespunde niciunui fișier din `deploy/systemd/` produce `down`
+# permanent pe un timer care nu există, plus o comandă care nu scoate nimic. Ca
+# listă cu nume se poate citi din afară: `tests/unit/test_operator_commands_
+# exist.py` o compară cu unitățile livrate, și pică dacă funcția de mai jos
+# încetează să itereze chiar peste ea.
+SELFCHECK_TIMERS: tuple[str, ...] = (
+    "sentinel-scan.timer",
+    "sentinel-health.timer",
+    "sentinel-maintenance.timer",
+    "sentinel-watchdog.timer",
+    "sentinel-selfcheck.timer",
+    "sentinel-restore-drill.timer",
+    "sentinel-patch-window.timer",
+)
+
+
 async def check_timers(cfg: Config) -> list[CheckResult]:
     """Timers are scheduled and have actually fired.
 
     A timer that is enabled but whose next elapse is in the past has stopped;
     one that has never fired on a host that has been up for days never will.
+
+    Numele vin din `SELFCHECK_TIMERS` de mai sus, nu dintr-un tuplu inline —
+    vezi comentariul de acolo pentru ce anume poate fi verificat din afară
+    odată ce lista are un nume.
     """
     results: list[CheckResult] = []
-    for unit in ("sentinel-scan.timer", "sentinel-health.timer",
-                 "sentinel-maintenance.timer", "sentinel-watchdog.timer",
-                 "sentinel-selfcheck.timer", "sentinel-restore-drill.timer",
-                 "sentinel-patch-window.timer"):
+    for unit in SELFCHECK_TIMERS:
         state = await asyncio.to_thread(_systemctl, "is-active", unit)
         if not state:
             # An empty answer means `systemctl` is missing, errored, or timed
@@ -338,19 +369,60 @@ async def check_watchdog_state() -> list[CheckResult]:
 # host where OTHER sources are still writing". Generous on purpose: the
 # comparison against neighbours is what makes the check sharp, so these only
 # have to be long enough to survive a lull.
-SOURCE_MAX_SILENCE_MIN: dict[str, int] = {
-    "auditd": 60,      # cron, logins, privilege use
-    "nginx": 180,      # a low-traffic site can genuinely be quiet
-    "sshd": 180,       # ditto, though in practice never is
-}
-DEFAULT_MAX_SILENCE_MIN = 180
+#
+# Per-installation now (`selfcheck.max_silence_min` in sentinel.yaml — see
+# `SelfcheckSilenceConfig` in sentinel/config.py), not a module dict. No
+# verdict here reads the constant below — `_silence_limit` asks the CONFIG —
+# so its only job is to give this module's tests, and the
+# `RAW_EVENTS_INGEST_SCAN_HOURS` comment that sizes its window against it, a
+# name for "what an install gets if it never touches this section".
+#
+# READ OUT OF THE DATACLASS, not restated: written as a literal it was exactly
+# the hand-made second copy it claimed to spare anyone, and a copy that drives
+# no verdict is a copy nothing contradicts — `= 999` passed the whole suite.
+# `test_the_shipped_default_patience_is_read_out_of_the_dataclass` holds the
+# two together for the day someone gives it a verdict to drive again.
+#
+# `sshd` is not a field. It used to carry 180 minutes on the premise "an
+# internet-facing host is never quiet" — measured false on n8n, 9 Sep 2026: the
+# one blocklist entry that stopped a brute-force source also stopped the sshd
+# log that source had been keeping warm, and the check accused a collector
+# that was working of being dead. sshd, sudo and su are judged on the shared
+# journald reader's own cursor instead — see `CURSOR_BACKED_SOURCES` and
+# `_journald_reader` below.
+DEFAULT_MAX_SILENCE_MIN = SelfcheckSilenceConfig().default
+
+
+def _silence_limit(cfg: Config, source: str) -> int:
+    """The configured patience for `source`, or the operator's configured
+    default when `source` has no field of its own.
+
+    Reads `cfg.selfcheck.max_silence_min` directly — a `dataclass`, not a
+    `dict` — so `getattr` with the default field as the fallback is the whole
+    lookup; there is no second table to keep in sync with the config shape.
+    """
+    limits = cfg.selfcheck.max_silence_min
+    return getattr(limits, source, limits.default)
+
+
+# The per-source fields tracked BY NAME on `SelfcheckSilenceConfig` — i.e.
+# every field except `default`, which is the fallback for a source with no
+# field of its own and not itself a per-source patience. Derived from the
+# dataclass, not restated as a literal set: the alternative is exactly the
+# kind of duplication `test_all_quiet_threshold_is_pinned_to_the_smallest_
+# per_source_limit` exists to catch — a second list that can silently drift
+# from the fields that actually exist.
+NAMED_SILENCE_SOURCES: frozenset[str] = frozenset(
+    f.name for f in dc_fields(SelfcheckSilenceConfig) if f.name != "default")
 
 # S9: `check_ingest_sources`'s query used to scan `raw_events` over the last
 # 30 DAYS — `retention.raw_events_days`'s own default — to compute one
 # `max(ts)` per source, on a table measured at 4.7 GB and growing, from a
 # selfcheck timer that runs every five minutes. No verdict here ever needs
-# data older than `DEFAULT_MAX_SILENCE_MIN` (180 minutes, the longest patience
-# any tracked source gets before being named); a source that HAS a row
+# data older than `DEFAULT_MAX_SILENCE_MIN` (180 minutes with the shipped
+# configuration — the constant reads it out of `SelfcheckSilenceConfig`, so
+# the number below moves if that field ever does, and the margins in this
+# paragraph are the ones that hold at that value); a source that HAS a row
 # anywhere inside a window this wide is judged on its own limit exactly as
 # before. 48 hours keeps sixteen times that margin — enough slack for a quiet
 # weekend on a low-traffic site — while pruning to roughly 2 of the table's
@@ -402,11 +474,22 @@ RAW_EVENTS_INGEST_SCAN_HOURS = 48
 # 180) or replaced it outright with the old flapping value (10) passed every
 # test file that imports this module, because nothing pinned the relationship.
 # See `test_all_quiet_threshold_is_pinned_to_the_smallest_per_source_limit`.
-ALL_QUIET_DOWN_MIN = min(SOURCE_MAX_SILENCE_MIN.values())
+#
+# Config-driven, like `_silence_limit` above: reads the operator's configured
+# per-source numbers, not the shipped defaults, so an operator who raises
+# `nginx` to 1440 minutes on a genuinely low-traffic site also raises how long
+# the WHOLE host may be quiet before `ingest:all` fires — the two questions
+# share one floor for the reason argued above, and that must stay true whether
+# the numbers come from the defaults or from sentinel.yaml.
+def _all_quiet_down_min(cfg: Config) -> int:
+    limits = cfg.selfcheck.max_silence_min
+    return min(getattr(limits, name) for name in NAMED_SILENCE_SOURCES)
+
 
 # Sources whose rows are NOT proportional to traffic, so the arrival of rows
 # cannot be read as proof that their collector is alive. They are judged on the
-# reader's own cursor instead; see `_suricata_reader` below.
+# reader's own cursor instead; see `_suricata_reader` and `_journald_reader`
+# below.
 #
 # `suricata` was in the table above at 30 minutes, and the premise written into
 # the comment beneath it — "an exposed host is scanned continuously, so a silent
@@ -433,7 +516,16 @@ ALL_QUIET_DOWN_MIN = min(SOURCE_MAX_SILENCE_MIN.values())
 # mechanism working?" is the cursor's offset moving, and "did it find anything?"
 # is the row count. Zero rows is a legitimate answer to the second and says
 # nothing about the first.
-CURSOR_BACKED_SOURCES = frozenset({"suricata"})
+#
+# `sshd` joined this set for the same reason, on a different failure mode:
+# suricata's row count is not proportional to traffic; sshd's row count IS
+# proportional to traffic, but the traffic itself is adversarial — an operator
+# whose blocking works reduces it, which is success, not silence. See
+# `_journald_reader` for the fact that replaces "an internet-facing host is
+# never quiet": the journald reader's own cursor against the entry that
+# follows it in the journal, which is true regardless of whether anyone is
+# currently attacking.
+CURSOR_BACKED_SOURCES = frozenset({"suricata", "sshd"})
 
 # Sources whose events exist only when a HUMAN acts. Silence here is not
 # evidence of anything: a server nobody logged into for a day produces zero
@@ -448,22 +540,43 @@ CURSOR_BACKED_SOURCES = frozenset({"suricata"})
 # The `others_are_live` discriminator below cannot rescue them. It answers "is
 # the host quiet, or is this collector broken?" by comparing against neighbours,
 # and that only works where one row means one unit of the same kind of work —
-# nginx, auditd and sshd all write a row per connection, so the comparison is
-# between comparable quantities. It says nothing about whether a person happened
-# to type `sudo`, and — see `CURSOR_BACKED_SOURCES` above — nothing about a
-# source whose rows are produced by a signature match rather than by traffic.
+# nginx and auditd write a row per connection, so the comparison is between
+# comparable quantities. It says nothing about whether a person happened to
+# type `sudo`, and — see `CURSOR_BACKED_SOURCES` above — nothing about a source
+# whose rows are produced by a signature match, or by traffic an operator is
+# actively (and correctly) suppressing, rather than by ordinary use.
 #
 # They are not left unmonitored. sshd, sudo and su come from the SAME journald
 # reader — one `_COMM` match set, one loop, classified into sources after the
 # fact (see JOURNALD_COMMS in services/ingest_service.py). A broken reader takes
-# all three down together, and sshd on an internet-facing host is never quiet.
-# So the sshd row above IS the liveness proof for sudo and su.
+# all three down together, which used to be caught by treating the sshd ROW as
+# a heartbeat on the premise "an internet-facing host is never quiet".
+#
+# That premise was measured FALSE on n8n, 9 Sep 2026: the one blocklist entry
+# that stopped a brute-force source also stopped the sshd log that source had
+# been keeping warm — 16h37m of legitimate silence, plus a 4h gap earlier the
+# same day — and the check accused a working collector of being dead for
+# having, correctly, blocked the traffic. The better the blocking works, the
+# more often that premise breaks.
+#
+# The liveness proof for all three now comes from `_journald_reader` instead,
+# below: it seeks to the collector's stored cursor and steps forward one entry,
+# so what it measures is how long the FIRST UNREAD entry has been waiting —
+# "is the reader still reading?", answered without needing anyone (attacker or
+# operator) to have typed anything, and without asking how busy the journal
+# happens to be. That distinction is load-bearing for the exemption below: a
+# verdict taken from the journal's own tip would have read ~0 s of lag on a
+# reader frozen for 21 hours (measured on both hosts, 9 Sep 2026), so a broken
+# shared reader would NOT have shown up here and sudo/su would have been
+# exempt from a check that no longer looked. Its verdict is emitted once,
+# under `ingest:sshd`, and that single key is what still stands behind sudo
+# and su here; sshd is in `CURSOR_BACKED_SOURCES` for exactly this reason.
 #
 # What this does not catch, stated rather than papered over: a parse-level
 # regression affecting only sudo — a distro changing the sudo log format so the
 # regex in collectors/system.py stops matching — would leave sudo permanently
-# empty while sshd kept flowing. Catching that needs the reader to report what
-# it saw and discarded, which it does not currently track.
+# empty while the reader itself kept advancing. Catching that needs the reader
+# to report what it saw and discarded, which it does not currently track.
 HUMAN_DRIVEN = frozenset({"sudo", "su"})
 
 
@@ -474,6 +587,21 @@ def _ago(minutes: float) -> str:
     if m < 24 * 60:
         return f"{m // 60}h {m % 60}m"
     return f"{m // (24 * 60)}z {(m % (24 * 60)) // 60}h"
+
+
+def _ago_s(seconds: float) -> str:
+    """Vechime spusă în UNITATEA bugetului cu care e comparată în aceeași frază.
+
+    `_ago` taie la minute întregi, așa că o întârziere de 183s ieșea „stă
+    necitită de 3 min — peste bugetul … (182s)": 180 < 182, deci textul își
+    contrazice propriul verdict pentru cine îl citește pe telefon la 3
+    dimineața, iar o alertă care pare greșită se citește ca o alertă de
+    ignorat. Sub o oră se spune în secunde; peste, minutele sunt mai lizibile
+    și nu mai există nicio ambiguitate de rezolvat.
+    """
+    if seconds < 3600:
+        return f"{int(max(seconds, 0))}s"
+    return _ago(seconds / 60)
 
 
 def _numar(n: int, singular: str, plural: str) -> str:
@@ -689,22 +817,519 @@ async def _suricata_reader(db: Database, cfg: Config,
     ]
 
 
+# How long the FIRST UNREAD entry — the one immediately after the collector's
+# stored cursor — may sit there before "still catching up" becomes "the reader
+# stopped".
+#
+# The quantity matters more than the number. An earlier version of this check
+# measured the age of the journal's NEWEST matching entry instead, and that
+# says nothing at all about where the collector is: with the reader frozen for
+# 21 hours beside a journal that keeps filling — the exact fault this check
+# exists for — the newest entry is seconds old, so the measured "lag" was
+# ~0 s and the verdict was `ok`. Measured on both hosts on 9 September 2026,
+# real code, cursor deliberately frozen 21 h: lag 0.08 s and 0.04 s against a
+# tolerance of 61 s, verdict `ok` on a reader that had read nothing all night.
+#
+# ## Why the number is DERIVED and not chosen
+#
+# The first version of this tolerance was 61 s, argued from intent: `poll_once`
+# writes the `sshd` cursor on every poll that read an entry, so "under ordinary
+# load the first unread entry is never older than one `flush_interval_ms`", and
+# "even a full minute of slack is twenty times sooner than the 21-hour fault".
+# Measured on production 10 September 2026 — the verbatim probe, run as
+# `sentinel` against the LIVE cursor, 1 Hz for 35 minutes:
+#
+#     SAMPLES 2100   flagged 54
+#     first_unread_age_s     p50 0.08  p90 0.36  p99 41.58  max 65.46  >61s: 4
+#     cursor_updated_age_s   p50 0.54  p90 1.01  p99 41.69  max 65.48  >61s: 4
+#
+# Two independent instruments — the journal-side first-unread age above and the
+# DB-side `now() - collector_cursors.updated_at` — agreed to 0.1 s throughout,
+# so this is the host, not the probe. Across three runs: 6 samples over 61 s
+# out of 3450, ~0.2 % of wall time. At 288 selfcheck runs a day that is ~0.6
+# false `down` per day on production, each followed five minutes later by a
+# false RECOVERY (`runner.run_and_alert` treats any non-`bad` status after
+# `down` as recovered).
+#
+# The cause is not load. It is the collector's OWN self-heal, traced to the
+# second:
+#
+#     13:10:05.861  "journald reader produced nothing for 60 polls; rebuilding"
+#     13:10:06.08   last flagged sample  ->  would have been `down`
+#
+# `JournaldReader` rebuilds itself after `REBUILD_AFTER_EMPTY_POLLS` empty polls
+# (see that module's docstring for the 21-hour fault it recovers from). While
+# those polls accumulate the first unread entry ages, up to
+# `(REBUILD_AFTER_EMPTY_POLLS + 1) × flush_interval` — the rebuild fires on the
+# poll AFTER the last empty one. A 61 s tolerance therefore alerts on the tail
+# of a recovery that is WORKING.
+#
+# So the budget is computed from the mechanism instead of being argued from
+# intent — `_journald_tail_tolerance_s` below — and it covers TWO cycles, not
+# one. `_rebuild()` resets `_empty_polls` to zero, so a rebuild that does not
+# catch on at its first attempt accumulates another full round before the next
+# one fires. One cycle (121 s with the shipped constants) would fire on exactly
+# that: the same false alarm in a smaller size.
+#
+# ## What this costs, said plainly
+#
+# This number is BIGGER THAN THE DETECTION NEEDS. It is this big because it
+# must not fire on a known, deferred defect: the reader rebuilding itself
+# roughly once a minute — measured 10 September 2026, production 709 rebuilds
+# in 32.1 h (22/h), n8n 1891 in 32.2 h (59/h). Fixing that rebuild loop is what
+# would let this number shrink; until then the tolerance has to cover it,
+# because a check that cries wolf at the tail of a working recovery stops being
+# read, and a check nobody reads detects nothing at all.
+#
+# The price is that the 21-hour blind spot is named after ~182 s instead of
+# ~61 s — still 400–600× sooner than it was actually found, and two orders of
+# magnitude below the fault itself. The two verdicts that do NOT pass through
+# this comparison are untouched: a caught-up reader is `ok` at any age, and a
+# cursor the journal no longer holds is `down` with no tolerance whatsoever. So
+# the detection this check exists for is not weakened in any way that matters.
+#
+# Someone will read this later and want to simplify it back down to a minute.
+# The paragraph above is why not.
+#
+# How busy the journal is does not enter the comparison, which is why this
+# cannot flap with traffic: a caught-up reader has no unread entry to measure
+# and is `ok` at any gap length. Measured over 24 h on 9 September 2026 —
+# production 12 518 matching entries (median gap 1.0 s, p90 12 s, max 596 s),
+# n8n 463 (max gap 46 892 s) — neither host's own gaps are compared against
+# this number any more; under the old formulation production's 596 s gap would
+# have been.
+
+# Self-heal cycles the tolerance has to sit above. Two, not one: a rebuild that
+# fails to catch on resets the counter and costs a second full round, and that
+# is a reader recovering, not a reader stopped.
+JOURNALD_SELF_HEAL_CYCLES = 2
+
+# Slack ON TOP of the self-heal budget, for a poll that simply ran long — GC, a
+# burst of unrelated I/O, a host briefly under load. Sized as the ORDER of the
+# noise that is not the rebuild itself, and it is the only part of this number
+# still chosen rather than derived; if it ever has to grow past one self-heal
+# cycle to keep the check quiet, then the cause is not slack and the check is
+# being tuned to hide something.
+JOURNALD_TAIL_SLACK_S = 60
+
+
+def _journald_tail_tolerance_s(cfg: Config) -> float:
+    """How long the first unread journal entry may sit there before the reader
+    is called stopped.
+
+    Derived from the collector's own self-heal budget — `REBUILD_AFTER_EMPTY_
+    POLLS` empty polls at `cfg.ingest.flush_interval_ms` each, times
+    `JOURNALD_SELF_HEAL_CYCLES` — plus `JOURNALD_TAIL_SLACK_S`. Written as a
+    relationship rather than as a literal so that changing the collector's
+    rebuild threshold moves this on its own: a literal is precisely how the
+    61 s that alerted on a working recovery got here.
+
+    With the shipped constants: 2 × (60 + 1) × 1 s + 60 s = 182 s.
+    """
+    flush_s = cfg.ingest.flush_interval_ms / 1000
+    # `+ 1`: `read_new` tests `_empty_polls >= REBUILD_AFTER_EMPTY_POLLS` at the
+    # TOP of the poll, so the rebuild happens on the poll after the last empty
+    # one, and the entry has been waiting since before that poll ran.
+    return (JOURNALD_SELF_HEAL_CYCLES * (REBUILD_AFTER_EMPTY_POLLS + 1) * flush_s
+            + JOURNALD_TAIL_SLACK_S)
+
+# What `_journal_first_unread` found, from the collector's stored position:
+#
+#   "unavailable" — could not look at all (no `systemd` module, journal error,
+#                   an entry without a usable timestamp). Never `ok`.
+#   "caught_up"   — the position exists and nothing follows it: the reader has
+#                   read everything there is, however long ago that was.
+#   "behind"      — the position exists and something follows it; the returned
+#                   timestamp is that first unread entry's.
+#   "gone"        — the position is NOT in the journal any more; the returned
+#                   timestamp belongs to the nearest surviving entry, so the
+#                   real lag is at least that and entries were destroyed
+#                   before being read.
+#   "gone_empty"  — the position is not in the journal and nothing follows the
+#                   place it would have been either; nothing to measure.
+_JournalProbe = Literal["unavailable", "caught_up", "behind", "gone", "gone_empty"]
+
+
+def _entry_ts(entry: dict[str, Any]) -> datetime | None:
+    """`__REALTIME_TIMESTAMP` of a journal entry as an aware datetime, or
+    `None` when the entry does not carry one — which the caller turns into
+    "I could not look", not into a lag of zero.
+
+    `python-systemd` builds these with `_LOCAL_TIMEZONE`, so both hosts return
+    an aware value and the naive branch below is defensive only; it matches
+    what `collectors/journald_reader.read_new` does with the same field.
+    """
+    ts = entry.get("__REALTIME_TIMESTAMP")
+    if ts is None:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts
+
+
+def _cursor_of(entry: dict[str, Any]) -> str:
+    return str(entry.get("__CURSOR") or "")
+
+
+def _probe_ts(state: _JournalProbe,
+              entry: dict[str, Any]) -> tuple[_JournalProbe, datetime | None, str]:
+    """`state` with the entry's timestamp — or "I could not look" when the
+    entry has none, because a missing timestamp is not a lag of zero."""
+    ts = _entry_ts(entry)
+    if ts is None:
+        return ("unavailable", None,
+                "intrarea de comparat cu poziția colectorului nu are "
+                "__REALTIME_TIMESTAMP")
+    return state, ts, ""
+
+
+def _journal_first_unread(
+    matches: list[dict[str, str]], cursor: str,
+) -> tuple[_JournalProbe, datetime | None, str]:
+    """Where the journal stands relative to `cursor` — the collector's OWN
+    saved position — as `(state, timestamp, why)`.
+
+    This is the journald sibling of the `(size, inode)` vs. stored offset
+    comparison in `_suricata_reader`: the fact that decides is the distance
+    between the COLLECTOR'S POSITION and the log, never the freshness of the
+    log by itself. See `JOURNALD_TAIL_SLACK_S` for the measurement that killed
+    the freshness formulation.
+
+    A short-lived, read-only `systemd.journal.Reader`, separate from the ingest
+    daemon's own long-lived one — the two live in different processes, so
+    there is no live reader to ask here even in principle. Cheap enough to
+    open fresh every five minutes: one seek and at most two steps, no
+    iteration over history.
+
+    Uses `apply_matches` from `collectors/journald_reader.py` — the SAME match
+    construction the ingest daemon's own reader uses — so "what counts as an
+    sshd/sudo/su entry" cannot silently diverge between the two call sites.
+
+    What this measurement assumes, stated rather than hidden: `poll_once`
+    stores the cursor of the last entry it got a MESSAGE out of, so a matching
+    entry with no `MESSAGE` field at the very tip would be looked at by the
+    collector, left behind by the stored cursor, and read here as unread. No
+    `_COMM` in `JOURNALD_COMMS` logs without a message, so this is a
+    theoretical gap and not an observed one.
+
+    What it deliberately does NOT assume is which entry the first step after a
+    seek lands on — see the comments in the body. Getting that wrong in the
+    trusting direction would report every healthy host as having lost its
+    position, every five minutes, and it is not a thing that can be checked
+    from a development machine.
+    """
+    try:
+        from systemd import journal  # noqa: PLC0415 - server-only, imported on use
+    except ImportError as exc:
+        return "unavailable", None, f"modulul systemd nu e disponibil: {exc}"
+
+    from sentinel.collectors.journald_reader import apply_matches
+
+    reader = None
+    try:
+        reader = journal.Reader()
+        apply_matches(reader, matches)
+        reader.seek_cursor(cursor)
+        # `seek_cursor` does NOT fail for a cursor the journal no longer holds:
+        # it positions as close as it can and the next step returns the nearest
+        # surviving entry instead (this is why systemd documents
+        # `sd_journal_test_cursor` right beside it). So the only proof that the
+        # collector's position still EXISTS is an entry carrying that very
+        # `__CURSOR` — compared here, never assumed from a seek that "worked".
+        at = reader.get_next()
+        if at and _cursor_of(at) == cursor:
+            # The step landed ON the stored position, so the next one is the
+            # first entry the collector has not read.
+            unread = reader.get_next()
+            if not unread:
+                return "caught_up", None, ""
+            return _probe_ts("behind", unread)
+
+        # Two very different things look the same from here: the position is
+        # gone from the journal, or the step above already moved PAST the entry
+        # at the cursor. Which of the two `sd_journal_next` does after a
+        # `seek_cursor` is documented (it lands on the entry at the cursor,
+        # which is what `JournaldReader.seek` relies on) but not observable
+        # from a development machine — and assuming it and being wrong would
+        # report EVERY healthy host as having lost its position, `down`, every
+        # five minutes. So it is measured instead: one step back. If the entry
+        # before where we landed is the stored cursor, the position exists and
+        # `at` is simply the first unread entry.
+        prev = reader.get_previous()
+        if prev and _cursor_of(prev) == cursor:
+            if not at:
+                return "caught_up", None, ""
+            return _probe_ts("behind", at)
+        if not at:
+            return "gone_empty", None, ""
+        return _probe_ts("gone", at)
+    except Exception as exc:  # noqa: BLE001 - any journal failure is "I don't know"
+        return "unavailable", None, str(exc)
+    finally:
+        if reader is not None:
+            with contextlib.suppress(Exception):
+                reader.close()
+
+
+# Câte caractere hexa din digest pleacă în `facts` ca amprentă a poziției.
+#
+# 12 (48 de biți) fiindcă amprenta are exact O întrebuințare — „e altă poziție
+# decât la rularea trecută?" —, iar la comparație pe egalitate singurul mod de
+# a minți e coliziunea: 2^-48 pe o comparație, adică o dată la ~10^11 ani la
+# 288 de rulări pe zi. Mai lung n-ar cumpăra nimic și ar costa: `facts` e o
+# coloană EXPEDIATĂ, iar corpul cererii e punctat de WAF-ul de la marginea
+# agregatorului. Mai scurt ar ajunge să se ciocnească într-un timp de gândit,
+# iar o coliziune spune „poziția n-a mișcat" despre un cititor care chiar
+# citește — tăcere falsă, adică exact felul de minciună de care nu se prinde
+# nimeni.
+CURSOR_FINGERPRINT_HEX = 12
+
+
+def _cursor_fingerprint(cursor: str) -> str | None:
+    """Amprenta unei poziții din jurnal: se compară între rulări, nu se poate
+    întoarce în identificatorul din care a ieșit.
+
+    Un cursor journald e `s=<id fișier jurnal>;i=…;b=<id boot>;m=…;t=…;x=…` —
+    124 de caractere măsurate pe gazdă —, iar `s=` și `b=` sunt IDENTIFICATORI
+    AI MAȘINII. `facts` e o coloană expediată (`SELFCHECK_STREAM` în
+    sentinel/report/shipper.py, `ship:selfcheck_state` e pornit), deci pusă
+    acolo brut, poziția ar pleca la agregatorul extern la fiecare
+    autodiagnostic: identificatorii ar părăsi gazda, iar corpul cererii ar
+    crește în fața unui WAF care oprește DEFINITIV fluxul după patru
+    respingeri.
+
+    Digest întreg, nu o bucată din cursor: orice fragment brut — început,
+    sfârșit, mijloc — e fragment dintr-un identificator. Ce se pierde: nimic
+    din ce se citea (nimeni nu citește valoarea, doar o compară). Ce rămâne:
+    poziții diferite dau amprente diferite, aceeași poziție dă aceeași
+    amprentă.
+
+    Șir gol înseamnă „nu există poziție", nu o poziție cu amprentă — vezi
+    ramura care iese `unknown` în `_journald_reader`.
+    """
+    if not cursor:
+        return None
+    return hashlib.sha256(
+        cursor.encode("utf-8")).hexdigest()[:CURSOR_FINGERPRINT_HEX]
+
+
+async def _journald_reader(db: Database, cfg: Config,
+                           sshd_row_minutes: float | None) -> list[CheckResult]:
+    """Is the shared sshd/sudo/su journald reader still reading? — asked of the
+    distance between the collector's own position and the journal, not of the
+    journal's freshness and not of whether an sshd ROW happened to arrive.
+
+    Sibling of `_suricata_reader` above, same shape — there, the stored offset
+    against the file's real size; here, the stored cursor against the entry
+    that follows it:
+
+    * **nothing follows the collector's stored cursor** — the reader has read
+      everything there is. `ok`, however long ago that was: this is the
+      quiet-host case, and it is the entire point of this check existing (see
+      `CURSOR_BACKED_SOURCES` for the measurement that forced it — n8n,
+      9 Sep 2026, 16h37m of genuine sshd silence after a blocklist entry did
+      its job).
+    * **the first unread entry is younger than `_journald_tail_tolerance_s`**
+      — a poll has not run yet, or the reader is inside its own rebuild. `ok`.
+    * **the first unread entry is older than that** — the reader has stopped
+      advancing over a journal that has something to give it. This is the
+      21-hour blind spot `journald_reader.py`'s module docstring describes,
+      and it is `down`.
+    * **the stored cursor is no longer in the journal at all** — entries were
+      destroyed before anyone read them. `down`, under its own wording,
+      because the hole in the record is real whichever way it was made.
+    * **the `systemd` module is unavailable, the journal cannot be read, the
+      stored cursor is empty, or the cursor is gone AND nothing survives near
+      it to measure against** — `unknown`, said out loud. Not `ok`: the runner
+      reconciles state against the keys a run emits, so answering "fine" to a
+      question that was never answered would clear a real finding and show the
+      operator a recovery that never happened.
+
+    The verdict never keys off how recently the journal was written to, and
+    never off `rebuilds`/`empty_polls` (which count normal quiet on both
+    hosts). So a stuck reader does not alternate between `down` and `ok` as the
+    journal's own tip moves, the way the freshness formulation did —
+    `runner.run_and_alert` announces a RECOVERY on every `down` → not-bad
+    transition, and a verdict that flickered would announce recoveries in the
+    middle of an outage that was still running.
+
+    What that does NOT promise is `down` on every single run. The `unknown`
+    branches above stay reachable while a reader is stuck — `unavailable` in
+    particular catches ANY exception out of the journal probe — and `unknown`
+    is not `bad`, so the runner would announce that transition as a recovery
+    too. Not observed on either host (0 of ~3550 probes, 10 September 2026),
+    and `_suricata_reader` above has the same shape, so this is the standing
+    cost of "say when you cannot look" rather than a defect of this check. It
+    is written down so the guarantee is not read as stronger than it is.
+
+    `sshd_row_minutes` is how long ago the last sshd ROW landed, or `None` if
+    none is in the scan window. Reported, never judged — see the module
+    docstring's warning about confirming intent instead of effect.
+    """
+    if not cfg.ingest.journald:
+        return [CheckResult(
+            "ingest:sshd", "Colector „sshd”", "ok",
+            detail="oprit în configurație — pe gazda asta nu se citește jurnalul",
+            facts={"configured": False})]
+
+    from sentinel.services.ingest_service import JOURNALD_COMMS
+
+    note = (f" · ultimul rând sshd acum {_ago(sshd_row_minutes)}"
+            if sshd_row_minutes is not None
+            else " · niciun rând sshd în fereastra de scanare")
+
+    row = await db.fetchrow(
+        "SELECT cursor, EXTRACT(EPOCH FROM (now() - updated_at))/60 AS minute "
+        "FROM collector_cursors WHERE name = 'sshd'")
+    if row is None:
+        return [CheckResult(
+            "ingest:sshd", "Nu pot spune dacă „sshd” mai e citit", "unknown",
+            detail="jurnalul e pornit în configurație, dar nu există cursorul "
+                   "`sshd` în collector_cursors — nu s-a citit niciodată, ori "
+                   f"rândul a fost șters{note}",
+            action="journalctl -u sentinel-ingest -n 100",
+            facts={"configured": True, "cursor_fp": None})]
+
+    stored_cursor = str(row["cursor"] or "")
+    cursor_age_min = float(row["minute"] or 0)
+    # NULL sau șir gol: rândul există, poziția nu. Nu e o poziție veche, e
+    # absența unei poziții — n-are ce să fie comparat cu jurnalul, deci
+    # întrebarea rămâne fără răspuns și se spune ca atare. Judecând-o ca pe un
+    # cursor obișnuit, un șir gol nu s-ar potrivi cu nimic din jurnal și ar ieși un
+    # verdict dintr-o comparație care n-a avut loc.
+    if not stored_cursor:
+        return [CheckResult(
+            "ingest:sshd", "Nu pot spune dacă „sshd” mai e citit", "unknown",
+            detail=f"rândul `sshd` din collector_cursors există, dar cursorul e "
+                   f"gol — nu există poziție salvată de comparat cu jurnalul, "
+                   f"iar rândul a fost atins ultima oară acum "
+                   f"{_ago(cursor_age_min)}{note}",
+            action="journalctl -u sentinel-ingest -n 100",
+            facts={"configured": True, "cursor_fp": None,
+                   "cursor_age_min": int(cursor_age_min)})]
+
+    # Amprenta, nu poziția: `facts` pleacă la agregator — vezi
+    # `_cursor_fingerprint`.
+    cursor_fp = _cursor_fingerprint(stored_cursor)
+
+    matches = [{"_COMM": c} for c in JOURNALD_COMMS]
+    state, first_unread_ts, why = await asyncio.to_thread(
+        _journal_first_unread, matches, stored_cursor)
+    tolerance_s = _journald_tail_tolerance_s(cfg)
+
+    if state == "unavailable":
+        return [CheckResult(
+            "ingest:sshd", "Nu pot spune dacă „sshd” mai e citit", "unknown",
+            detail=f"jurnalul nu s-a putut interoga direct ({why}) — nu se poate "
+                   f"compara poziția colectorului cu ce urmează după ea{note}",
+            action="journalctl -u sentinel-ingest -n 100",
+            facts={"cursor_fp": cursor_fp, "cursor_age_min": int(cursor_age_min)})]
+
+    if state == "caught_up":
+        # Singurul verdict care are voie să ignore vechimea poziției: dacă după
+        # cursor nu mai e nimic, cititorul a citit tot ce există, iar cât de
+        # demult a fost asta e o măsură a liniștii gazdei, nu a colectorului.
+        return [CheckResult(
+            "ingest:sshd", "Colector „sshd”", "ok",
+            detail=f"cititorul a citit tot ce există în jurnal — după poziția lui "
+                   f"nu urmează nicio intrare potrivită, iar poziția s-a scris "
+                   f"acum {_ago(cursor_age_min)}{note}",
+            facts={"cursor_fp": cursor_fp, "cursor_age_min": int(cursor_age_min)})]
+
+    if state == "gone_empty":
+        return [CheckResult(
+            "ingest:sshd", "Nu pot spune dacă „sshd” mai e citit", "unknown",
+            detail=f"poziția salvată a colectorului nu mai e în jurnal și nici "
+                   f"după locul ei nu e vreo intrare potrivită — nu se poate "
+                   f"spune dacă intrările au fost șterse necitite sau dacă "
+                   f"jurnalul n-a avut ce să conțină{note}",
+            action="journalctl --disk-usage ; journalctl -u sentinel-ingest -n 100",
+            facts={"cursor_fp": cursor_fp, "cursor_age_min": int(cursor_age_min)})]
+
+    if first_unread_ts is None:
+        # Nu se poate ajunge aici — „behind" și „gone" întorc întotdeauna un
+        # moment, altfel ies pe „unavailable". Scris ca ramură, nu ca `assert`:
+        # o excepție ar lăsa cheia neemisă, iar o cheie lipsă e citită de runner
+        # drept constatare retrasă, adică exact recuperarea falsă de evitat.
+        return [CheckResult(
+            "ingest:sshd", "Nu pot spune dacă „sshd” mai e citit", "unknown",
+            detail=f"sonda jurnalului a întors starea „{state}” fără un moment de "
+                   f"comparat — nu se poate spune cât de în urmă e colectorul{note}",
+            action="journalctl -u sentinel-ingest -n 100",
+            facts={"cursor_fp": cursor_fp, "probe_state": state})]
+    lag_s = (datetime.now(timezone.utc) - first_unread_ts).total_seconds()
+
+    if state == "gone":
+        # Cursorul nu mai e în jurnal: `seek_cursor` a nimerit altă intrare
+        # decât cea cerută (vezi `_journal_first_unread`). Ce s-a scris între
+        # poziția colectorului și cea mai veche intrare rămasă a dispărut fără
+        # să fie citit, iar `lag_s` e doar marginea de jos a întârzierii.
+        #
+        # `down`, ca ramura `rotated` din `_suricata_reader`, și fără toleranță:
+        # un jurnal golit sub un colector viu (`Storage=volatile` peste o
+        # repornire, ori un `journalctl --vacuum-*` manual) ajunge tot aici și
+        # e raportat ca defect, nu trecut cu vederea — gaura din înregistrare e
+        # reală în ambele cazuri, iar tăcerea e chiar eșecul pe care fișierul
+        # ăsta există ca să-l prevină. Vârsta poziției e în text ca să se vadă
+        # din alertă care din cele două s-a întâmplat.
+        return [CheckResult(
+            "ingest:sshd", "Colectorul „sshd” și-a pierdut poziția în jurnal", "down",
+            detail=f"poziția salvată a colectorului (scrisă acum "
+                   f"{_ago(cursor_age_min)}) nu mai există în jurnal, iar cea mai "
+                   f"veche intrare potrivită de după ea e de acum "
+                   f"{_ago(lag_s / 60)} — ori jurnalul s-a rotit peste intrări "
+                   f"necitite, ori a fost golit sub colector; oricum, lipsesc "
+                   f"intrări pe care nu le-a citit nimeni{note}",
+            action="systemctl restart sentinel-ingest ; journalctl --disk-usage ; "
+                   "journalctl -u sentinel-ingest -n 100",
+            facts={"cursor_fp": cursor_fp, "cursor_age_min": int(cursor_age_min),
+                   "cursor_in_journal": False,
+                   "first_unread_age_s": round(lag_s, 1),
+                   "tolerance_s": round(tolerance_s, 1)})]
+
+    if lag_s <= tolerance_s:
+        return [CheckResult(
+            "ingest:sshd", "Colector „sshd”", "ok",
+            detail=f"după poziția colectorului urmează o intrare scrisă acum "
+                   f"{int(max(lag_s, 0))}s — sub bugetul de auto-reparare al "
+                   f"cititorului ({int(tolerance_s)}s), deci ori sondarea n-a "
+                   f"rulat încă, ori cititorul se reface singur{note}",
+            facts={"cursor_fp": cursor_fp, "cursor_age_min": int(cursor_age_min),
+                   "first_unread_age_s": round(lag_s, 1),
+                   "tolerance_s": round(tolerance_s, 1)})]
+
+    return [CheckResult(
+        "ingest:sshd", "Colectorul „sshd” nu mai citește jurnalul", "down",
+        detail=f"prima intrare de după poziția colectorului stă necitită de "
+               f"{_ago_s(lag_s)} — peste bugetul de auto-reparare al "
+               f"cititorului ({int(tolerance_s)}s) — deci cititorul nu mai "
+               f"avansează, deși jurnalul are ce să-i dea{note}",
+        action="systemctl restart sentinel-ingest ; "
+               "journalctl -u sentinel-ingest -n 100",
+        facts={"cursor_fp": cursor_fp, "cursor_age_min": int(cursor_age_min),
+               "first_unread_age_s": round(lag_s, 1),
+               "tolerance_s": round(tolerance_s, 1)})]
+
+
 async def check_ingest_sources(db: Database, cfg: Config) -> list[CheckResult]:
     """Each collector that has ever produced data is still producing it.
 
     This is the check that would have caught the 21-hour blind spot: the ingest
     service was `active`, had never restarted, and had logged no error, while
-    its journald reader returned nothing poll after poll. Only the data said so.
+    its journald reader returned nothing poll after poll. Only the data said so
+    — though for sshd/sudo/su specifically that proof no longer comes from a
+    ROW; see `_journald_reader` below and `CURSOR_BACKED_SOURCES`.
 
-    That argument holds for every source whose rows are proportional to traffic,
-    and only for those. The sources listed in `CURSOR_BACKED_SOURCES` are judged
-    on their reader's cursor instead, and their verdict is produced here — not
-    skipped — so the `ingest:*` namespace still has exactly one author.
+    The row-silence argument holds for every source whose rows are
+    proportional to ORDINARY traffic, and only for those. The sources listed
+    in `CURSOR_BACKED_SOURCES` are judged on their reader's cursor instead, and
+    their verdict is produced here — not skipped — so the `ingest:*` namespace
+    still has exactly one author.
 
-    One floor, `ALL_QUIET_DOWN_MIN`, decides both "is this source blamed by
-    name?" and "has everyone gone quiet?" — see the comment above the constant
-    for why a second, shorter number used for the first question opened a band
-    in which a source past its own limit got neither verdict, and a real fault
+    One floor, `_all_quiet_down_min(cfg)`, decides both "is this source blamed
+    by name?" and "has everyone gone quiet?" — see the comment above it for why
+    a second, shorter number used for the first question opened a band in
+    which a source past its own limit got neither verdict, and a real fault
     disappeared from the panel instead of being reported under either name.
     """
     rows = await db.fetch(
@@ -719,10 +1344,14 @@ async def check_ingest_sources(db: Database, cfg: Config) -> list[CheckResult]:
         RAW_EVENTS_INGEST_SCAN_HOURS)
     ages = {r["source"]: float(r["minute_tacere"] or 0) for r in rows}
     # Judged on the cursor, so it is asked BEFORE the "no rows at all" branch and
-    # survives it: a host where Suricata has matched nothing for a month has no
-    # suricata row to group by, and dropping out of the query is exactly the case
-    # where "is the reader alive" still needs an answer.
-    cursor_backed = await _suricata_reader(db, cfg, ages.get("suricata"))
+    # survives it: a host where Suricata has matched nothing for a month (or
+    # sshd has produced nothing for as long the blocking keeps working) has no
+    # row to group by, and dropping out of the query is exactly the case where
+    # "is the reader alive" still needs an answer.
+    cursor_backed = [
+        *await _suricata_reader(db, cfg, ages.get("suricata")),
+        *await _journald_reader(db, cfg, ages.get("sshd")),
+    ]
 
     if not rows:
         return [*cursor_backed,
@@ -737,7 +1366,7 @@ async def check_ingest_sources(db: Database, cfg: Config) -> list[CheckResult]:
     # floor: below it, a source past its own limit is blamed by name because
     # something else is still recent; above it, nothing is recent enough to
     # call it "someone else is live", so the fault becomes `ingest:all`
-    # instead. See `ALL_QUIET_DOWN_MIN` above for why this must be one number.
+    # instead. See `_all_quiet_down_min` above for why this must be one number.
     #
     # `ages` — and therefore `freshest` — includes CURSOR_BACKED_SOURCES and
     # HUMAN_DRIVEN sources too, unfiltered. Left alone deliberately: their row
@@ -747,7 +1376,8 @@ async def check_ingest_sources(db: Database, cfg: Config) -> list[CheckResult]:
     # verdict either way. Narrowing this to "judged" sources only would be
     # unrequested scope; it would not change whether a fault is reported.
     freshest = min(ages.values())
-    others_are_live = freshest <= ALL_QUIET_DOWN_MIN
+    all_quiet_down_min = _all_quiet_down_min(cfg)
+    others_are_live = freshest <= all_quiet_down_min
 
     results: list[CheckResult] = list(cursor_backed)
     for source, minutes in sorted(ages.items()):
@@ -764,7 +1394,7 @@ async def check_ingest_sources(db: Database, cfg: Config) -> list[CheckResult]:
                         f"evenimentele apar doar când cineva lucrează pe server"),
                 facts={"minutes_silent": int(minutes), "human_driven": True}))
             continue
-        limit = SOURCE_MAX_SILENCE_MIN.get(source, DEFAULT_MAX_SILENCE_MIN)
+        limit = _silence_limit(cfg, source)
         if minutes <= limit:
             results.append(CheckResult(
                 f"ingest:{source}", f"Colector „{source}”", "ok",
@@ -792,7 +1422,7 @@ async def check_ingest_sources(db: Database, cfg: Config) -> list[CheckResult]:
         results.append(CheckResult(
             "ingest:all", "Toate sursele au amuțit", "down",
             detail=(f"nicio sursă n-a mai scris de {_ago(freshest)} — peste "
-                    f"pragul de {_ago(ALL_QUIET_DOWN_MIN)} al celei mai "
+                    f"pragul de {_ago(all_quiet_down_min)} al celei mai "
                     f"vorbărețe surse urmărite"),
             action="systemctl status sentinel-ingest; journalctl -u sentinel-ingest -n 100"))
     return results
@@ -1018,7 +1648,17 @@ async def check_resources(db: Database) -> list[CheckResult]:
             results.append(CheckResult(
                 f"res:disk:{mount}", f"Disc {mount} aproape plin", status,
                 detail=f"{used}% folosit",
-                action="Verifică retenția: sentinel maintenance --prune",
+                # `-A20`, nu `-A10`. Măsurat pe ambele gazde (15 septembrie
+                # 2026, citit direct din `/etc/sentinel/sentinel.yaml`): `retention:`
+                # e pe linia 24 în producție și 54 pe n8n, iar
+                # `disk_guard_free_pct` — singura valoare din bloc care
+                # contează pentru o alertă de disc — e exact a zecea linie de
+                # după, deci ULTIMA pe care `-A10` o mai tipărește. Un singur
+                # comentariu adăugat în bloc și operatorul, trimis aici de o
+                # partiție plină, n-o mai vede deloc. Marja nu costă nimic:
+                # secțiunea următoare din șablon oprește oricum cititul.
+                action="grep -A20 '^retention:' /etc/sentinel/sentinel.yaml ; "
+                       "systemctl start sentinel-maintenance",
                 facts={"used_pct": used}))
         else:
             results.append(CheckResult(f"res:disk:{mount}", f"Disc {mount}", "ok",
@@ -2953,7 +3593,22 @@ async def check_last_scan(db: Database, cfg: Config) -> list[CheckResult]:
                 detail=f"ultima rulare s-a încheiat cu „{status}”: {eroare}. Ce a "
                        f"reparat operatorul între timp apare în continuare ca "
                        f"deschis, fiindcă lista nu s-a mai împrospătat",
-                action="journalctl -u sentinel-scan -n 50 ; sentinel scan --now",
+                # Citit ÎNTÂI, repornit după. Nu fiindcă `-n 50` s-ar umple —
+                # măsurat, o rulare de `sentinel-scan` scrie 13–15 linii de
+                # jurnal, deci 50 țin cam trei rulări și o repornire pusă
+                # prima NU ar împinge eroarea afară din fereastră. Motivul e
+                # mai simplu și rezistă la orice volum: dacă repornirea reușește
+                # și șterge simptomul, dovada de ce a eșuat data trecută nu mai
+                # e de găsit nicăieri.
+                #
+                # `systemctl start`, nu `sentinel scan --now` — flagul acela nu
+                # a existat niciodată, iar serviciul refuză un flag necunoscut
+                # în loc să pornească implicit. De știut înainte de a-l tasta:
+                # `sentinel-scan.service` e `Type=oneshot` cu
+                # `TimeoutStartSec=14400`, deci comanda BLOCHEAZĂ până se
+                # termină scanarea, fără să scrie nimic pe ecran (măsurat pe
+                # gazdă, ultimele trei rulări: 52 s, 58 s, 107 s). Nu e blocată; rulează.
+                action="journalctl -u sentinel-scan -n 50 ; systemctl start sentinel-scan",
                 facts={"scanner": scanner, "status": status, "error": eroare}))
             continue
 
@@ -3711,7 +4366,7 @@ async def check_instance_identity(db: Database) -> list[CheckResult]:
         detail=f"urma scriitorului spune „{outcome}”, dar rândul din "
                f"`instance_identity` lipsește — oglinda nu se scrie, deci o bază "
                f"restaurată pe o clonă n-ar mai fi prinsă",
-        action="sentinel migrate ; journalctl -u sentinel-migrate -n 50",
+        action="sentinel migrate",
         facts={"mirrored": False, "writer_ran": True, "outcome": outcome})]
 
 

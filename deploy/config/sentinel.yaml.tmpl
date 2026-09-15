@@ -406,6 +406,24 @@ intel:
   epss: true
   kev: true
 
+# ---------------------------------------------------------------------------
+# Selfcheck — cât timp poate tăcea un colector înainte să fie acuzat, pe o
+# gazdă unde vecinii lui încă scriu.
+#
+# `sshd` nu are un câmp aici: rândul lui a încetat să mai fie o dovadă de
+# viață sigură (o adresă blocată cu succes reduce chiar traficul care ținea
+# jurnalul cald), deci sshd, sudo și su sunt judecate pe cursorul cititorului
+# de journald, nu pe tăcerea rândului — vezi docs/OPERARE.md §8.
+#
+# Ridică `nginx` (sau `default`, pentru orice colector fără câmp propriu aici)
+# doar pe un site cu adevărat cu trafic redus, unde tăcerea normală trece de
+# valoarea implicită și verificarea acuză un colector care de fapt funcționează.
+selfcheck:
+  max_silence_min:
+    auditd: 60
+    nginx: 180
+    default: 180
+
 suricata:
   enabled: @@SURICATA_ENABLED@@
   eve_path: /var/log/suricata/eve.json

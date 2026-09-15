@@ -567,6 +567,46 @@ class IntelConfig:
 
 
 @dataclass
+class SelfcheckSilenceConfig:
+    """Per-source patience for `check_ingest_sources`: how long a collector may
+    stay quiet on a host where OTHER sources are still writing before it is
+    named as broken by itself.
+
+    A NESTED DATACLASS, not `dict[str, int]`, and that shape is the point, not
+    an implementation detail: `_coerce` only widens `list[int]`/`list[str]`
+    today, and a nested dataclass gets `_build`'s unknown-key `ConfigError` for
+    free — an operator who writes `ssh:` here instead of a real field is
+    refused at load, not left with a threshold that silently never applies.
+    See `sentinel/selfcheck/checks.py` for how these are used.
+
+    `sshd` is deliberately not a field here. It used to be, at 180 minutes, on
+    the premise "an internet-facing host is never quiet" — false on a host
+    whose blocking is working, where the sshd log goes quiet exactly BECAUSE
+    the attacker traffic that kept it warm got blocked (n8n, 9 Sep 2026: one
+    blocklist entry, 16h37m of legitimate sshd silence, a false "SENTINEL NU
+    FUNCȚIONEAZĂ COMPLET"). sshd, sudo and su are judged on the shared
+    journald reader's own cursor instead — see `CURSOR_BACKED_SOURCES` and
+    `_journald_reader` in checks.py — which answers "is the reader still
+    reading?" without needing anyone to have typed anything.
+    """
+    auditd: int = 60      # cron, logins, privilege use
+    nginx: int = 180      # a low-traffic site can genuinely be quiet
+    default: int = 180    # any collector with no field of its own above
+
+
+@dataclass
+class SelfcheckConfig:
+    """Per-installation tuning for `sentinel selfcheck`.
+
+    Everything here defaults to exactly what was previously hard-coded in
+    `sentinel/selfcheck/checks.py`, so an installation that never sets this
+    section behaves exactly as it did before the section existed.
+    """
+    max_silence_min: SelfcheckSilenceConfig = field(
+        default_factory=SelfcheckSilenceConfig)
+
+
+@dataclass
 class SuricataConfig:
     # Set to false by the installer when MemAvailable was under the gate at
     # install time. Sentinel then runs log-only, which is still genuinely good.
@@ -624,6 +664,7 @@ class Config:
     health: HealthConfig = field(default_factory=HealthConfig)
     intel: IntelConfig = field(default_factory=IntelConfig)
     suricata: SuricataConfig = field(default_factory=SuricataConfig)
+    selfcheck: SelfcheckConfig = field(default_factory=SelfcheckConfig)
 
 
 # ---------------------------------------------------------------------------

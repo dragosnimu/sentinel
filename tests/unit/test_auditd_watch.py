@@ -101,6 +101,21 @@ BAIT_READ = [
     'proctitle=636174002F726F6F742F2E706770617373',
 ]
 
+# `ls -l /root`, aceeași momeală. `ls` cere atributele extinse ale fiecărui
+# nume pe care îl listează, iar `-p r` prinde toată clasa READ a nucleului, nu
+# doar deschiderile — deci getxattr (191) ajunge sub aceeași cheie de audit.
+# Forma e cea MĂSURATĂ pe producție pe 15 septembrie 2026 (`success=no`,
+# `exit=-61`: fișierul n-are atributul cerut), cu identificatorii înlocuiți.
+BAIT_LISTED = [
+    'type=SYSCALL msg=audit(1754390900.200:9700): arch=c000003e syscall=191 '
+    'success=no exit=-61 a0=7ffd a1=55e2 a2=0 a3=0 items=1 ppid=4301 '
+    'pid=5201 auid=1000 uid=0 gid=0 euid=0 tty=(none) ses=5 comm="ls" '
+    'exe="/usr/bin/ls" subj=unconfined key="sentinel_bait"',
+    'type=CWD msg=audit(1754390900.200:9700): cwd="/root"',
+    'type=PATH msg=audit(1754390900.200:9700): item=0 name="/root/.pgpass" '
+    'inode=555 dev=fd:00 mode=0100600 ouid=0 ogid=0 nametype=NORMAL',
+]
+
 # Regula altcuiva de pe aceeași gazdă. Nu e a noastră, nu ne privește.
 FOREIGN_RULE = [
     'type=SYSCALL msg=audit(1754390300.777:9100): arch=c000003e syscall=257 '
@@ -208,6 +223,34 @@ def test_a_bait_file_read_becomes_an_event():
     assert ev.process == "/usr/bin/cat"
     assert ev.raw["audit_key"] == "sentinel_bait"
     assert "unmapped_action" not in ev.raw, "acțiunea nu are voie să fie degradată"
+
+
+def test_a_bait_record_carries_the_abi_its_syscall_number_belongs_to():
+    """Fără ABI, numărul apelului nu poate decide nimic — și decide o severitate.
+
+    Ce se strică dacă pică: `detect/intrusion.bait_touched` coboară la `low`
+    numai o atingere despre care poate DOVEDI că a citit doar atributele, iar
+    dovada e perechea (arch, syscall). 191 e `getxattr` pe x86_64 și `semctl`
+    pe tabela generică. Dacă `arch` nu ajunge în `raw`, fiecare atingere rămâne
+    „nu știu" — adică `critical` pe fiecare `ls -l /root`, care e chiar pana
+    măsurată pe producție pe 15 septembrie 2026 (raw_events 8824526-8824529).
+    Verificat până la capăt, nu doar că un câmp există: clasificarea reală.
+    """
+    from sentinel.detect.intrusion import (BAIT_ATTRIBUTE, BAIT_CONTENT,
+                                           bait_touch_kind)
+
+    citit = parse_auditd_lines(BAIT_READ)[0]
+    assert citit.raw["arch"] == "c000003e"
+    assert citit.raw["syscall"] == "257"
+    assert bait_touch_kind(citit.raw.get("arch"),
+                           citit.raw.get("syscall")) == BAIT_CONTENT
+
+    listat = parse_auditd_lines(BAIT_LISTED)[0]
+    assert listat.action == "bait_touched", (
+        "`ls` chiar produce înregistrarea; antetul regulii spunea că nu poate")
+    assert listat.file_path == "/root/.pgpass"
+    assert bait_touch_kind(listat.raw.get("arch"),
+                           listat.raw.get("syscall")) == BAIT_ATTRIBUTE
 
 
 @pytest.mark.parametrize("group", [FOREIGN_RULE, UNKEYED], ids=["altă regulă", "fără cheie"])
@@ -477,6 +520,12 @@ def test_every_audit_rule_key_has_a_mapping():
     rules = (REPO / "deploy" / "audit" / "sentinel.rules").read_text(encoding="utf-8")
     keys = set()
     for line in rules.splitlines():
+        # Comentariile citează chei în text ca să explice regulile, iar o linie
+        # de comentariu nu încarcă nimic în nucleu. Fără saltul ăsta, testul
+        # pică pe o frază corectă, iar cine îl vede roșu învață să rescrie
+        # comentariul în loc să citească eșecul — s-a întâmplat deja o dată.
+        if line.lstrip().startswith("#"):
+            continue
         for token in line.split():
             if token.startswith("-k") and token != "-k":
                 keys.add(token[2:])

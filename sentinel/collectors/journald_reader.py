@@ -44,6 +44,23 @@ log = get_logger(__name__)
 REBUILD_AFTER_EMPTY_POLLS = 60
 
 
+def apply_matches(reader: Any, matches: list[dict[str, str]]) -> None:
+    """OR each match GROUP against the others, AND the keys within one group.
+
+    Shared by `JournaldReader._build` below and the selfcheck's read-only tail
+    probe (`selfcheck/checks.py:_journal_first_unread`), so "what the live reader
+    matches" and "what the self-check asks the journal directly" cannot drift
+    into two different definitions of "an sshd/sudo/su entry".
+    """
+    first = True
+    for group in matches:
+        if not first:
+            reader.add_disjunction()
+        for key, value in group.items():
+            reader.add_match(**{key: value})
+        first = False
+
+
 class JournaldReader:
     def __init__(self, matches: list[dict[str, str]]):
         self._matches = matches
@@ -57,15 +74,7 @@ class JournaldReader:
         from systemd import journal  # noqa: PLC0415 - server-only, imported on use
 
         reader = journal.Reader()
-        # Each match dict is OR-ed against the others (add_disjunction between
-        # groups), the keys within a dict are AND-ed.
-        first = True
-        for group in self._matches:
-            if not first:
-                reader.add_disjunction()
-            for key, value in group.items():
-                reader.add_match(**{key: value})
-            first = False
+        apply_matches(reader, self._matches)
         return reader
 
     def seek(self, cursor: str | None) -> None:

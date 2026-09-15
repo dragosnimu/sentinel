@@ -130,7 +130,6 @@ ignore_missing_imports = true
 # ---------------------------------------------------------------------------
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-asyncio_mode = "auto"
 # `-rfEs`, nu `-rs`: motivul fiecărui skip apare în sumar, fără să se piardă
 # rezumatul eșecurilor. `-r` ÎNLOCUIEȘTE lista implicită (`fE`), deci un `-rs`
 # singur ar fi ascuns exact liniile „FAILED ..." — un flag pus pentru
