@@ -23,6 +23,16 @@ DEFAULT_SOCKET = "/run/sentinel/executor.sock"
 DEFAULT_TIMEOUT_S = 30
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
+#: Added on top of an op's OWN declared duration to get the socket timeout for
+#: that single call. `patch_step_exec` can legitimately run for up to 3600s
+#: (executor/commands.py, op_patch_step_exec) while this client's default is
+#: 30s — a client that gives up after 30s reports the step failed while the
+#: executor, as root, is still running it, and a rollback can then start
+#: concurrently with the very step it is rolling back. The margin covers
+#: connection setup and JSON marshalling on top of the server's own timeout,
+#: not a substitute for knowing what that timeout is.
+TIMEOUT_MARGIN_S = 15
+
 
 class ExecutorClient:
     def __init__(
@@ -31,8 +41,16 @@ class ExecutorClient:
         self.socket_path = socket_path
         self.timeout_s = timeout_s
 
-    def call(self, op: str, **args: Any) -> dict[str, Any]:
+    def call(self, op: str, *, socket_timeout_s: float | None = None, **args: Any) -> dict[str, Any]:
         """Send one request and return its result.
+
+        `socket_timeout_s`, when given, overrides this client's own
+        `timeout_s` for this one call only. Callers that ask the executor to
+        run something whose own duration they know — a patch step's
+        `timeout_s`, a backup's fixed archive timeout — should pass it here,
+        derived from that duration plus `TIMEOUT_MARGIN_S`; a single shared
+        client instance otherwise has to pick one timeout for both a `ping`
+        and an hour-long patch step, and either number is wrong for the other.
 
         Raises `ExecutorUnavailable` when the socket cannot be reached (retryable)
         and `ExecutorRejected` when the executor validated the request and said no
@@ -40,10 +58,11 @@ class ExecutorClient:
         """
         request = {"id": uuid.uuid4().hex, "op": op, "args": args}
         payload = (json.dumps(request) + "\n").encode()
+        timeout = self.timeout_s if socket_timeout_s is None else socket_timeout_s
 
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(self.timeout_s)
+                sock.settimeout(timeout)
                 sock.connect(self.socket_path)
                 sock.sendall(payload)
 

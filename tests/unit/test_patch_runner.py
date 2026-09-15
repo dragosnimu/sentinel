@@ -245,6 +245,42 @@ def test_apply_runs_every_forward_phase_in_order(_fake_executor):
     assert "applied" in db.plan_statuses
 
 
+def test_every_call_site_asks_for_a_socket_timeout_beyond_the_ops_own(_fake_executor):
+    """Every `patch_step_exec`/`backup_create` call this codebase makes must
+    pass `socket_timeout_s` strictly greater than the op's own declared
+    duration on the executor side (`timeout_s` for a step/check,
+    `_BACKUP_CREATE_TAR_TIMEOUT_S` for a backup).
+
+    Prevents: a call site that forgets `+ TIMEOUT_MARGIN_S` (or keeps using
+    the client's short fixed default) reporting a still-running root command
+    as failed, which can start a rollback concurrently with the very step it
+    is rolling back. Exercises all three call sites at once — runner.py's own
+    apply step, checks.py's "command"-kind post_verification (also
+    patch_step_exec), and backup.py's backup_create — because `_plan()`
+    contains one of each."""
+    from sentinel.patch import backup as backup_mod
+    from sentinel.respond.executor_client import TIMEOUT_MARGIN_S
+
+    db = _FakeDB(_plan())
+    res = run(runner.run_plan(db, None, 1, mode="apply"))
+    assert res.status == "succeeded"
+
+    seen_patch_step_exec = seen_backup_create = False
+    for c in _fake_executor.calls:
+        if c["op"] == "patch_step_exec":
+            seen_patch_step_exec = True
+            declared = c["timeout_s"]
+            assert c["socket_timeout_s"] == declared + TIMEOUT_MARGIN_S
+        elif c["op"] == "backup_create":
+            seen_backup_create = True
+            assert c["socket_timeout_s"] == (
+                backup_mod._BACKUP_CREATE_TAR_TIMEOUT_S + TIMEOUT_MARGIN_S)
+
+    assert seen_patch_step_exec and seen_backup_create, (
+        "the fixture plan must exercise both call kinds, or this test proves nothing"
+    )
+
+
 def test_dry_run_never_executes_for_real(_fake_executor):
     db = _FakeDB(_plan())
     run(runner.run_plan(db, None, 1, mode="dry_run"))
