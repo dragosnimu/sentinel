@@ -212,7 +212,7 @@ Rulează automat la 5 minute și la 90 de secunde după boot. Alertează pe Tele
 |---|---|
 | `unit:*` | Procesul există. Cea mai slabă dovadă din listă, și e prima doar fiindcă e cea așteptată |
 | `watchdog:state` | Watchdog-ul anti-lockout chiar își scrie starea, nu doar rulează. Fără ea, „web-ul e jos de câte secunde" repornește de la zero la fiecare minut și flush-ul de siguranță la 5 minute nu se poate declanșa niciodată — s-a întâmplat pe gazda de producție 4-7 septembrie 2026, cu timerul „activ" tot timpul |
-| `ingest:*` | Fiecare colector a scris un rând recent. **Asta prinde orbirea** |
+| `ingest:*` | Fiecare colector a scris un rând recent — cu excepția `suricata` și `sshd`, judecate pe cursorul propriului cititor, nu pe rând (vezi mai jos). **Asta prinde orbirea** |
 | `detect:cursor` | Detectorul consumă ce scriu colectorii. Ingestia într-o tabelă pe care n-o citește nimeni e o imitație convingătoare de funcționare |
 | `nft:table`, `nft:count` | Kernelul chiar are tabela, iar baza spune același lucru ca el |
 | `executor:socket` | Singura componentă privilegiată răspunde |
@@ -246,6 +246,70 @@ e stricat. Toți tăcuți deodată e o noapte liniștită, raportată o singură
 
 Fără regula asta ai fi primit șase alerte pentru un singur defect, și ai fi
 oprit canalul într-o săptămână.
+
+**Pragurile de tăcere sunt configurabile, per instalare**, în `sentinel.yaml`:
+
+```yaml
+selfcheck:
+  max_silence_min:
+    auditd: 60      # cron, logări, folosire de privilegii
+    nginx: 180       # un site cu trafic redus poate tăcea legitim mai mult
+    default: 180     # orice alt colector fără câmp propriu aici
+```
+
+Ridică `nginx` (sau `default`) doar pe o gazdă unde ai văzut cu ochii tăi
+tăceri legitime mai lungi decât valoarea implicită — de exemplu un site cu
+trafic sezonier. O cheie scrisă greșit sub `max_silence_min` (ex. `ssh:` în
+loc de un câmp real) oprește pornirea cu `ConfigError`, nu se pierde tăcut:
+secțiunea e o structură tipizată, nu o hartă liberă.
+
+**`sshd` nu are un prag aici, dinadins.** Avea unul (180 minute), pe premisa
+„o gazdă expusă pe internet nu tace niciodată" — falsă pe o gazdă unde
+blocarea chiar funcționează: măsurat pe `n8n`, 9 septembrie 2026, o singură
+intrare în blocklist a oprit sursa de brute-force care ținea jurnalul `sshd`
+cald, iar verificarea veche a acuzat un colector care funcționa corect de
+„a amuțit", cu 16h37m de tăcere complet legitimă. Cu cât blocarea
+funcționează mai bine, cu atât premisa aia se rupe mai des.
+
+`ingest:sshd` (și, prin el, dovada de viață pentru `sudo`/`su` — vezi mai jos)
+vine acum din **cât stă necitită prima intrare de după poziția salvată a
+colectorului**: verificarea sare la cursorul din `collector_cursors` și face un
+pas înainte. Dacă după poziția lui nu urmează nimic, cititorul a citit tot ce
+există și e `ok` oricât de veche ar fi poziția — asta e cazul gazdei liniștite,
+și e exact scopul schimbării. Dacă intrarea de după el așteaptă de mai mult
+decât bugetul de auto-reparare al cititorului (182 de secunde cu valorile
+livrate — vezi mai jos), e `down` — pata oarbă de 21 de ore rămâne prinsă, doar
+nu mai depinde de cât de des a scris cineva `ssh`.
+
+**Toleranța nu e un număr ales, e bugetul de auto-reparare al colectorului.**
+`JournaldReader` se reconstruiește singur după 60 de sondări goale
+(`REBUILD_AFTER_EMPTY_POLLS`), iar cât se adună sondările alea prima intrare
+necitită îmbătrânește. Cu o toleranță de 61 de secunde verificarea acuza exact
+coada acelei recuperări care funcționează: măsurat pe producție, 10 septembrie
+2026, 6 probe din 3450 peste 61s (max 65.46s), adică ~0.6 alerte `down` false
+pe zi, fiecare urmată la cinci minute de o „revenire" falsă. Toleranța se
+calculează acum din `REBUILD_AFTER_EMPTY_POLLS × ingest.flush_interval_ms`,
+pentru DOUĂ cicluri — o reconstrucție care nu prinde din prima resetează
+contorul și mai costă un rând întreg de sondări — plus un slack de 60 de
+secunde. Numărul e mai mare decât are nevoie detecția, dinadins: acoperă un
+defect cunoscut și amânat, cititorul care se reconstruiește de 22 de ori pe oră
+pe producție și de 59 pe n8n. Reparat acela, numărul poate scădea. Costul, spus
+pe față: pata oarbă de 21 de ore e numită după ~182 de secunde în loc de ~61,
+adică tot de câteva sute de ori mai repede decât a fost găsită în realitate, iar
+cele două verdicte care nu trec prin comparația asta — cititor la zi și cursor
+dispărut din jurnal — rămân neatinse.
+
+Ce se măsoară e distanța dintre colector și jurnal, nu prospețimea jurnalului.
+Diferența nu e de nuanță: pe un cititor înghețat de 21 de ore lângă un jurnal
+care continuă să se umple, „ultima intrare din jurnal" e veche de câteva
+secunde, deci un prag pus pe ea ar raporta `ok` exact în timpul penei (măsurat
+pe ambele gazde, 9 septembrie 2026).
+
+Două stări au text propriu, ca să nu fie confundate cu un cititor mort:
+poziția salvată nu mai există în jurnal (jurnal rotit sau golit peste intrări
+necitite — `down`, și spune care din cele două după vechimea poziției), și
+cursorul salvat e gol ori jurnalul nu s-a putut citi — `unknown`, niciodată
+`ok`: „n-am putut întreba" și „e bine" nu sunt aceeași stare.
 
 ### Nu repară nimic
 
@@ -786,12 +850,53 @@ decât o linie galbenă.
 
 ## 16. Momelile (fișiere-canar)
 
-Doi fișiere pe gazdă n-au niciun motiv legitim să fie citite, niciodată:
-`/root/.pgpass` și `/root/.aws/credentials`. Conținutul lor e fals — o parolă și
-o pereche de chei care nu funcționează nicăieri — pus acolo deliberat, ca momeală.
-O citire a oricăruia dintre ele produce un incident `critical` care trece de
-orice fereastră de liniște: nimic de pe gazdă n-are motiv să le deschidă, deci o
-citire înseamnă că cineva e deja înăuntru și caută credențiale.
+Două fișiere de pe gazdă conțin credențiale false — o parolă și o pereche de
+chei care nu funcționează nicăieri — puse acolo deliberat, ca momeală:
+`/root/.pgpass` și `/root/.aws/credentials`. O citire a oricăruia produce un
+incident `critical` care trece de orice fereastră de liniște.
+
+### Ce înseamnă alerta, și ce NU înseamnă
+
+Până pe 15 septembrie 2026, alerta spunea „nimic legitim de pe gazdă nu
+deschide vreodată acest fișier — cineva e deja înăuntru și caută credențiale".
+Pentru `/root/.aws/credentials` asta e adevărat cât timp nu ai AWS CLI sau un
+SDK instalat. Pentru `/root/.pgpass` e **fals**, și a costat un `critical` pe o
+comandă de rutină (incidentul #487): `psql` pornit prin `sudo` rulează cu
+`$HOME=/root`, iar libpq — biblioteca de client, nu comanda — deschide
+`$HOME/.pgpass` la fiecare conexiune. `$HOME`-ul lui root e chiar momeala.
+Același lucru îl fac `pg_dump`, `pg_restore` și orice backup care se conectează
+ca root.
+
+Severitatea a rămas `critical` pentru amândouă, dinadins. O retrogradare „dacă
+procesul e psql și utilizatorul e administrator" e exact ce ar reproduce un
+atacator care ți-a luat sesiunea. Ce s-a schimbat e textul: alerta spune acum
+ce s-a observat și cum deosebești în două minute rutina de o recoltare.
+
+**Cum verifici o alertă de momeală:**
+
+```bash
+# Ce proces, sub ce auid, în ce sesiune. Înregistrarea SYSCALL poartă exe,
+# auid, uid, ses și ppid; al doilea grep scoate înregistrările EXECVE ale
+# comenzii pe care tocmai ai tastat-o tu.
+sudo grep sentinel_bait /var/log/audit/audit.log | grep SYSCALL | tail -5
+# Ce comandă a fost.
+sudo journalctl _COMM=sudo -n 50
+```
+
+**Nu `ausearch -k sentinel_bait`**, deși e unealta făcută pentru asta: citește
+fișierele de audit întregi înainte să filtreze, deci nici `-ts recent` nu
+ajută. Măsurat pe 15 septembrie 2026, cu ~28 MB în `/var/log/audit/`, toate
+cele patru variante au fost omorâte de `timeout 25`. `grep`-ul de mai sus
+durează 0,095 s.
+
+* un client PostgreSQL (`psql`, `pg_dump`, …) pe `/root/.pgpass`, cu un `auid`
+  care e al unui om care lucra atunci și o comandă în jurnalul lui sudo care o
+  explică → rutină. Citirea aia nu arată conținutul nimănui: libpq îl parsează
+  intern ca să aleagă o parolă;
+* `cat`, `grep`, `strings`, `tar`, `curl` — sau orice pe `/root/.aws/credentials`
+  pe o gazdă fără AWS CLI → cititorul a fost adus de cine a citit;
+* `auid` nesetat (`4294967295`), un cont de serviciu, sau nicio comandă care să
+  explice citirea → tratează ca recoltare de credențiale.
 
 **Nu le șterge și nu le edita.** Dacă dai peste ele într-un `find` sau într-un
 backup și arată a fișiere uitate de altcineva, nu sunt — sunt puse de instalator,

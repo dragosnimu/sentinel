@@ -1,5 +1,138 @@
 # Changelog
 
+## 0.22.6 — Momeala nu mai spune că ești spart, iar garda pe comenzi chiar se uită
+
+Două lucruri, amândouă de aceeași formă: un text care AFIRMĂ ceva ce nu a
+verificat.
+
+### Momeala citită nu mai declară o intruziune
+
+Incidentul #487, `critical`, care trece de `/mute` prin construcție:
+*„Nimic legitim de pe gazdă nu deschide vreodată acest fișier — cineva e deja
+înăuntru și caută credențiale."* Nu era nicio intruziune. `psql` pornit prin
+`sudo` rulează cu `$HOME=/root`, iar libpq — biblioteca de client, nu comanda —
+deschide `$HOME/.pgpass` la fiecare conexiune. `$HOME`-ul lui root e chiar
+momeala. Două citiri în `raw_events`, ambele
+`exe=/usr/lib/postgresql/16/bin/psql`, `uid=0`, `auid=1001`, `syscall=257`,
+aceeași sesiune, complet explicate.
+
+* **Severitatea a rămas `critical`, dinadins.** O retrogradare „dacă `exe` e
+  psql și `auid` e administrativ" e exact ce ar reproduce un atacator care ți-a
+  luat sesiunea. Un test cere ca ACELAȘI proces și ACELAȘI `auid` ca în #487 să
+  producă în continuare `critical` și să treacă de fereastra de liniște — adică
+  reparația să nu fi făcut o recoltare mai tăcută decât era;
+* **S-a schimbat ce afirmă textul:** faptele observate, ce cititor legitim are
+  fiecare momeală, și ce să tastezi ca să deosebești în două minute o conexiune
+  de rutină de o recoltare. `auid` nesetat, un cont de serviciu, sau nicio
+  comandă care să explice citirea — atunci e recoltare;
+* **Nu `ausearch -k`, deși e unealta făcută pentru asta.** Măsurat pe gazdă, cu
+  ~28 MB în `/var/log/audit/`: toate cele patru variante (`-k`, `-k -i`,
+  `-ts recent`, `-ts today`) au fost omorâte de `timeout 25`, rc=124 — ausearch
+  citește fișierele întregi înainte să filtreze. Un `grep` pe același fișier
+  durează 0,095 s. O comandă care pare că atârnă, dată unui om la 3 dimineața
+  într-o alertă `critical`, ar fi fost exact defectul reparat în aceeași zi de
+  cealaltă jumătate a acestei versiuni;
+* **Cele două momeli primesc explicații diferite, fiindcă nu sunt la fel.**
+  `/root/.pgpass` are un cititor legitim instalat și rulat de mână;
+  `/root/.aws/credentials` nu are niciunul (`command -v aws` nu întoarce nimic
+  pe gazda incidentului). Un text comun ar fi înmuiat degeaba alerta de AWS;
+* **O cale de momeală mutată** (`CANARY_PGPASS_PATH`) pe care regula nu o
+  recunoaște e raportată ca nelămurită, nu strecurată fără notă. „Nu știu ce
+  citește asta" și „e în regulă" nu au voie să arate la fel.
+
+### Garda pe comenzile din alerte se uită și acolo unde nu se uita
+
+`tests/unit/test_operator_commands_exist.py` a fost scris ca să prindă o
+comandă pe care gazda o refuză. Avea el însuși trei goluri, fiecare de forma
+„am confirmat intenția, nu efectul":
+
+* **Cele două tipare de unități aveau un prag comun.** Măsurat, `systemctl` dă
+  43 de referințe și `journalctl` 65, iar pragul era `>= 40` — deci oricare
+  dintre ele orbit pe rând lăsa suita verde. Iar defectul de la care pornise
+  tot, `journalctl -u sentinel-migrate`, era o referință de `journalctl`. Acum
+  fiecare tipar își dovedește singur că vede ceva;
+* **Numele de unități interpolate erau invizibile.** `check_units` și
+  `check_timers` își construiesc acțiunile cu `f"journalctl -u {unit} -n 50"`,
+  iar AST-ul dă scanerului două constante fără niciun nume între ele. Se
+  verifică acum SURSA: `SYSTEMD_UNITS` și noul `SELFCHECK_TIMERS` (lista de
+  timere a ieșit din antetul buclei ca să poată fi citită din afară) se compară
+  cu fișierele din `deploy/systemd/`, iar un al doilea test citește cele două
+  funcții cu AST-ul și pică dacă vreuna încetează să itereze lista numită. Un
+  nume derapat acolo e `down` permanent pe o unitate inexistentă PLUS o comandă
+  care tipărește un jurnal gol;
+* **Șabloanele panoului nu erau citite.** Patru comenzi operator-facing ies de
+  acolo, în blocuri `<code>`, și se livrează ca `package-data`.
+  `--set-password` redenumit în `--set-passwd` trecea toate testele;
+* **Un comentariu la capătul unei linii de shell făcea fișierul roșu pe cod
+  corect** — iar ieșirea ieftină dintr-un test roșu pe cod corect e slăbirea
+  lui. Tăierea se face acum cum o face shell-ul: `${VAR#pre}`, `$#` și un
+  `#` între ghilimele rămân intacte.
+
+### Colectorul „sshd” nu mai e judecat după traficul atacatorului
+
+`ingest:sshd` se judeca pe sosirea rândurilor, cu un prag de 180 de minute
+scris ca o constantă de modul. Premisa din comentariul de lângă el — *„in
+practice never is"* — e adevărată pe serverul de producție (3842 de linii sshd
+parsabile în 24h) și falsă pe cel de automatizări (44, cu un gol real de
+16h37m). Verificarea folosea, fără s-o spună, traficul atacatorului drept puls:
+după ce s-a blocat sursa de forță brută care ținea jurnalul cald, colectorul s-a
+acuzat singur că a murit. Pe același panou, `ingest:sudo` — din ACELAȘI cititor
+journald — spunea calm că tăcerea lui e normală.
+
+Acum se compară poziția colectorului cu coada jurnalului: dacă după cursorul
+salvat nu urmează nicio intrare, cititorul e la zi, oricât de veche ar fi
+poziția. Toleranța nu mai e un număr ales, ci se derivă din bugetul de
+auto-reparare al cititorului — și e mai mare decât are nevoie mecanismul,
+fiindcă acoperă un defect cunoscut și amânat (cititorul se reconstruiește o dată
+pe minut pe ambele gazde). Repararea aceluia o lasă să scadă.
+
+Pragurile devin per-instalare, în `sentinel.yaml`, ca dataclass imbricat — o
+cheie scrisă greșit cade la încărcare în loc să tacă.
+
+Cursorul journald nu mai pleacă în `facts`, care e o coloană expediată către
+agregator: 124 de caractere ce poartă id-ul fișierului de jurnal și boot-id-ul
+mașinii. Rămâne o amprentă scurtă, bună la comparat între rulări, inutilă ca
+identificator.
+
+### Și, în treacăt
+
+* `grep -A10 '^retention:'` avea margine zero: măsurat pe ambele gazde,
+  `disk_guard_free_pct` — singura valoare din bloc care contează pentru o
+  alertă de disc — e exact a zecea linie, ultima tipărită. Un comentariu
+  adăugat în bloc și operatorul nu o mai vede. Trecut pe `-A20`, cu un test
+  care măsoară distanța în șablonul livrat în loc să pinuiască o cifră;
+* `asyncio_mode = "auto"` scos din `pyproject.toml`: suita nu are niciun test
+  async, iar opțiunea emitea `PytestConfigWarning: Unknown config option` la
+  fiecare rulare.
+
+## 0.22.5 — Scanarea apt nu mai cade pe grupul pe care apt îl adaugă după paranteză
+
+`apt-get -s dist-upgrade` adaugă uneori, după paranteza cu versiunea și
+originea, încă un grup între paranteze drepte. `man apt-get` sub `-s`: *„Square
+brackets indicate broken packages, and empty square brackets indicate breaks
+that are of no consequence (rare)."* Expresia cerea ca linia să se termine la
+paranteza rotundă, deci o astfel de linie nu se potrivea.
+
+Forma liniei fusese fixată din sursa lui apt, fără nicio gazdă pe care să
+ruleze — și comentariul spunea asta pe față. Garda scrisă pentru cazul în care
+ghicitul e greșit a funcționat exact cum trebuia: a oprit scanarea zgomotos în
+loc să sară linia. O linie `Inst` sărită ar fi fost o actualizare de securitate
+despre care nu află nimeni, iar `mark_resolved_absent` rulează pe ce se
+întoarce — deci o listă mai scurtă nu doar sub-raportează, ci ÎNCHIDE
+constatarea pe care linia aia o producea.
+
+Costul, citit din `scans`: șapte scanări programate eșuate consecutiv între 9 și
+14 septembrie 2026. Pe 12 septembrie zece linii din 29 au rămas necitite, una
+dintre ele o actualizare `noble-security` pentru `libc6-dev` care n-a devenit
+niciodată constatare. Cinci zile în care instalarea n-a putut răspunde la
+întrebarea „există actualizări de securitate în așteptare".
+
+Grupul e ignorat, nu interpretat: nu poartă versiune, origine sau arhitectură. O
+linie `Inst` care tot nu se poate citi oprește în continuare scanarea. Iar
+cifrele nu se mai scriu în comentarii — câte indexuri are gazda și câte sunt de
+securitate se derivă într-un test, rulând chiar regula codului peste listarea
+fixată ca fixtură; scrise de mână, au fost greșite de două ori la rând.
+
 ## 0.22.4 — Scanerul de pachete știe pe ce distribuție e, iar eșecul lui nu mai e un zero
 
 Instalatorul trece pe Ubuntu de pe 27 august, dovedit pe un VM real. Runtime-ul
