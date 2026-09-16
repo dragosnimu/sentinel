@@ -75,6 +75,56 @@ def read_new_lines(path: str, cursor: str | None, *, max_bytes: int = 4_000_000)
     return lines, f"{inode}:{new_offset}"
 
 
+def at_end(path: str, cursor: str | None) -> bool:
+    """True only when `cursor` names this file and stops at its current end.
+
+    The claim is narrow on purpose, and it is worth reading twice: **at the
+    instant of this call, this file holds no bytes this cursor has not read.**
+    That is all. Three things it deliberately does NOT say:
+
+      * not "everything the kernel has written has been read". A record
+        generated a moment ago may still be inside auditd's queue and not yet
+        in the file at all; no byte position can see it;
+      * not "no record has been missed". Across a rotation this answers False
+        for exactly as long as the new file is unread, and True again
+        afterwards — while the records that went to the rotated file, or into
+        the gap while auditd reopened it, were never read by anyone and never
+        will be. A hole that has scrolled past is invisible to a size
+        comparison, so "at the end" spans it without noticing;
+      * not "and it is still true now". The answer describes the moment it was
+        taken. A caller that measures it, then does work, then acts on the
+        answer is acting on a fact about the past — see the note in
+        `services/ingest_service.py` about the window that opened between a
+        `getsize` at the top of a poll and one after the batch was written.
+
+    The one caller is the audit-session watermark in
+    `sentinel/services/ingest_service.py`, which uses it for what it does say:
+    with no unread bytes, the moment of the read is a lower bound on how far
+    the tail has been followed IN TIME. When bytes remain unread, that bound
+    comes from the last record's own timestamp instead, which is the stronger
+    of the two and the one that holds under load.
+
+    Every uncertainty answers False: no cursor yet, a cursor for a different
+    inode (the file rotated and the new one has not been read from the start),
+    a malformed cursor, a file that cannot be stat'ed, or a trailing partial
+    line the tailer deliberately left behind.
+    """
+    if cursor is None:
+        return False
+    inode = _inode(path)
+    if inode is None:
+        return False
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return False
+    try:
+        c_inode_s, c_offset_s = cursor.split(":", 1)
+        return int(c_inode_s) == inode and int(c_offset_s) == size
+    except ValueError:
+        return False
+
+
 def expand_paths(patterns: list[str]) -> list[str]:
     """Resolve the configured globs to actual files, newest first.
 
