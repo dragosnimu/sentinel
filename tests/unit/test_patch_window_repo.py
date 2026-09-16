@@ -90,6 +90,40 @@ def test_candidates_exclude_plans_the_window_already_decided_on():
     assert db.fetch_args == (repo.WINDOW_CANDIDATE_MAX_AGE_DAYS, 7)
 
 
+def test_a_human_requested_plan_never_enters_the_window_pool():
+    """De pe 15 septembrie 2026 `/planifica` scrie planuri `generated_by =
+    'ai_manual'`, iar bazinul ferestrei n-avea niciun filtru de origine.
+    EXECUTAT peste SQLite: un plan cerut de om, exact la fel de proaspăt și de
+    validat ca unul automat, nu are voie să apară printre candidați.
+
+    Ce se strică dacă apare: planul manual poate deveni
+    `outstanding_window_plan`, iar cât timp e acolo fereastra nu mai propune
+    NIMIC până când un om decide — o comandă manuală ar bloca astfel calea
+    automată. Și, dacă un exercițiu de restaurare l-ar face eligibil, ar fi
+    ștampilat `proposed_by_window` de o fereastră care nu l-a trecut niciodată
+    prin poarta ei, de unde un eșec al lui ar opri (`window_halt`) toate
+    celelalte propuneri ale ferestrei.
+    """
+    where = _where_and_order(run(_capture_sql(repo.window_candidate_plans)))
+    where_sqlite = (where
+        .replace("now() - make_interval(days => $1)", "?")
+        .replace("$2", "?"))
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE patch_plans (id INTEGER, status TEXT, "
+                 "generated_by TEXT, proposed_by_window INTEGER, created_at TEXT)")
+    fresh = "2026-09-14T00:00:00+00:00"
+    conn.executemany("INSERT INTO patch_plans VALUES (?,?,?,?,?)", [
+        (1, "validated", "ai", 0, fresh),          # output automat -> candidat
+        (2, "validated", "ai_manual", 0, fresh),   # cerut de om -> NU
+        (3, "validated", "manual", 0, fresh),      # scris de om -> NU
+        (4, "validated", None, 0, fresh),          # fără etichetă -> NU
+    ])
+    sql = f"SELECT id FROM patch_plans WHERE {where_sqlite}"
+    matched = {r[0] for r in conn.execute(sql, ("2026-08-15T00:00:00+00:00", 10))}
+    assert matched == {1}, matched
+
+
 def test_candidates_are_ordered_oldest_first():
     """Un plan care așteaptă de o săptămână nu are voie să fie sărit mereu de
     unul generat aseară."""
@@ -114,13 +148,13 @@ def test_candidates_are_bounded_in_age_when_executed():
 
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE patch_plans (id INTEGER, status TEXT, "
-                 "proposed_by_window INTEGER, created_at TEXT)")
+                 "generated_by TEXT, proposed_by_window INTEGER, created_at TEXT)")
     old_cutoff = "2026-08-01T00:00:00+00:00"
-    conn.executemany("INSERT INTO patch_plans VALUES (?,?,?,?)", [
-        (1, "validated", 0, "2026-08-02T00:00:00+00:00"),   # fresh enough -> in
-        (2, "validated", 0, "2026-01-01T00:00:00+00:00"),   # too old -> out
-        (3, "validated", 1, "2026-08-02T00:00:00+00:00"),   # already released -> out
-        (4, "rejected", 0, "2026-08-02T00:00:00+00:00"),    # wrong status -> out
+    conn.executemany("INSERT INTO patch_plans VALUES (?,?,?,?,?)", [
+        (1, "validated", "ai", 0, "2026-08-02T00:00:00+00:00"),   # fresh enough -> in
+        (2, "validated", "ai", 0, "2026-01-01T00:00:00+00:00"),   # too old -> out
+        (3, "validated", "ai", 1, "2026-08-02T00:00:00+00:00"),   # already released -> out
+        (4, "rejected", "ai", 0, "2026-08-02T00:00:00+00:00"),    # wrong status -> out
     ])
     sql = f"SELECT id FROM patch_plans WHERE {where_sqlite}".replace(
         "ORDER BY created_at", "ORDER BY created_at").replace("LIMIT ?", "LIMIT ?")
