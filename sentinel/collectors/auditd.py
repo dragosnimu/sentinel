@@ -32,18 +32,47 @@ log = get_logger(__name__)
 _KEEP = {
     "USER_AUTH": "auth_attempt",
     "USER_LOGIN": "login",
-    # Ieșirea din sesiune. NUMAI `USER_LOGOUT`.
+    # Ieșirea din sesiune. `USER_LOGOUT` — și `USER_END`, dar NUMAI cel al lui
+    # sshd. Semnalul nu e tipul înregistrării, e PERECHEA (tip, executabil
+    # emitent), iar istoria de mai jos explică de ce a fost nevoie de amândouă
+    # jumătățile ca să ajungem aici.
     #
-    # `USER_END` a stat aici o zi, și era greșit: e perechea lui `USER_START`,
-    # nu a lui `USER_LOGIN`. PAM deschide și închide un strat pentru fiecare
-    # `sudo`, `su` sau modul de autentificare din interiorul sesiunii, iar prima
-    # închidere sosea la o secundă după logare — încă din faza de autentificare
-    # a lui sshd.
+    # `USER_END` LUAT ÎNTREG a stat aici o zi, și era greșit: e perechea lui
+    # `USER_START`, nu a lui `USER_LOGIN`. PAM deschide și închide un strat
+    # pentru fiecare `sudo`, `su` sau modul de autentificare din interiorul
+    # sesiunii, iar prima închidere sosea la o secundă după logare — încă din
+    # faza de autentificare a lui sshd.
     #
     # Numărat pe jurnalul real, într-o rotație: 31 `USER_LOGIN`, 44 `USER_START`,
     # 44 `USER_END`, 11 `USER_LOGOUT`. Consecința: 1534 de comenzi orfane din
     # 14157, plus un rând-fantomă la fiecare închidere în plus.
+    #
+    # DAR OpenSSH pe Ubuntu/Debian nu poartă patch-ul de audit al distribuției
+    # (Launchpad #1948357) și nu emite NICIODATĂ `USER_LOGOUT` — măsurat pe
+    # gazda n8n (Ubuntu 24.04): 50 `USER_LOGIN`, 0 `USER_LOGOUT`. Fără o a doua
+    # cale, fiecare sesiune de-acolo se închidea abia prin măturătoarea din
+    # `db/repo/logins.py` (`STALE_SESSION_H` = 12 ore), iar «🔓 Sesiune
+    # încheiată» sosea la jumătate de zi distanță de faptă — 19 din 19 sesiuni
+    # închise pe gazda aia purtau `closed_inferred = true`.
+    #
+    # Ce deosebește un `USER_END` care CHIAR închide sesiunea de unul care doar
+    # închide un strat PAM e cine l-a emis, nu tipul lui: numărate pe n8n, cele
+    # 1811 `USER_END` se împart 900 `cron`, 216 `sudo`, 179 `sshd`, 5 `su`, 3
+    # `runuser`, 1 `systemd-executor` — filtrat pe `exe` (vezi
+    # `_SESSION_END_EXE`), rămân doar cele 179 de teardown real, iar restul, cel
+    # care producea cei 1534 de orfani, e exclus la fel ca înainte.
+    #
+    # Verificat și pe timing, ca nu cumva filtrarea pe `exe` să reînvie
+    # artefactul de-o secundă din faza de autentificare: pe producție
+    # (AlmaLinux, care emite ambele), 128 de sesiuni au și `USER_LOGOUT` și
+    # `USER_END` de la sshd, cu delta 0s de fiecare dată — sshd trimite
+    # amândouă înregistrările în aceeași secundă, iar garda `deja` din
+    # `close_session` (`db/repo/logins.py`) absoarbe dubla emisie fără
+    # rând-fantomă, exact cum absorbea deja cele 175 de `USER_END` PAM. Restul
+    # sesiunilor arată durate reale (0s, 6s, 50s, 154s, 2547s), nu un artefact
+    # de-o secundă.
     "USER_LOGOUT": "logout",
+    "USER_END": "logout",  # doar de la sshd/sshd-session -- vezi _SESSION_END_EXE
     "USER_ACCT": "auth_attempt",
     "ANOM_ABEND": "process_crash",       # a segfault can be an exploit landing
     "ANOM_PROMISCUOUS": "promiscuous",   # someone put an interface into promisc
@@ -56,6 +85,24 @@ _KEEP = {
     "ROLE_ASSIGN": "account_change",
     "CONFIG_CHANGE": "audit_config_change",  # someone edited the audit rules
 }
+
+#: Binarele al căror `USER_END` chiar înseamnă „s-a închis sesiunea de login".
+#:
+#: PAM emite `USER_END` la închiderea FIECĂRUI strat — sshd, dar și `sudo`,
+#: `su`, `cron`, `runuser` din interiorul sesiunii —, și doar primul e
+#: teardown-ul sesiunii de login. Numărat pe gazda Ubuntu: din 1811 `USER_END`,
+#: 900 sunt `cron`, 216 `sudo`, 179 `sshd`, 5 `su`, 3 `runuser`, 1
+#: `systemd-executor`. Luate fără filtru, ar reînvia exact defectul descris în
+#: comentariul de la `_KEEP["USER_LOGOUT"]`: 1534 de comenzi orfane din 14157.
+#:
+#: Ambele nume, fiindcă auditd le scrie diferit după distribuție: AlmaLinux
+#: 9.9 pornește sshd prin `sshd-session`, Ubuntu 24.04 (OpenSSH 9.6) direct
+#: prin `sshd`.
+#:
+#: Comparația e pe NUMELE DE FIȘIER, nu pe calea întreagă și nu ca substring —
+#: `/usr/local/bin/sshd-wrapper` sau `/opt/x/notsshd` nu înseamnă sshd, oricât
+#: de asemănător arată numele.
+_SESSION_END_EXE = frozenset({"sshd", "sshd-session"})
 
 # ---------------------------------------------------------------------------
 # Înregistrările de supraveghere: SYSCALL + PATH + EXECVE
@@ -313,6 +360,15 @@ def parse_auditd(line: str) -> Event | None:
         key = f["key"]
         if key in _INTERESTING and key not in fields:
             fields[key] = _unquote(f["val"])[:200]
+
+    if rtype == "USER_END":
+        # Semnalul e PERECHEA (tip, executabil), nu tipul singur -- vezi
+        # comentariul de la `_KEEP["USER_LOGOUT"]` și `_SESSION_END_EXE`. Un
+        # `USER_END` de la `sudo`, `cron`, `su` sau `runuser` e un strat PAM
+        # închis la mijlocul sesiunii, nu ieșirea din ea.
+        exe_base = (fields.get("exe") or "").rsplit("/", 1)[-1]
+        if exe_base not in _SESSION_END_EXE:
+            return None
 
     # auditd writes the peer address as addr= (or hostname= on some records);
     # "?" is its placeholder for "not applicable", not an address.
@@ -794,3 +850,54 @@ def parse_auditd_lines(lines: list[str]) -> list[Event]:
         if ev is not None:
             out.append(ev)
     return out
+
+
+def last_record_time(lines: list[str]) -> datetime | None:
+    """Ceasul ultimei înregistrări dintr-un tur de citire, sau `None`.
+
+    E jumătatea de timp a cursorului de audit: cursorul spune CÂT s-a citit din
+    fișier, asta spune PÂNĂ CÂND. Reaper-ul de sesiuni are nevoie de a doua,
+    fiindcă întrebarea lui („poate exista o comandă necitită a sesiunii ăsteia?")
+    se pune în timp, nu în octeți — vezi `services/ingest_service.py`.
+
+    Se citește din `msg=audit(<epoch>.<ms>:<serial>)`, adică din ștampila pusă
+    de NUCLEU la generarea înregistrării, nu din ora la care am citit-o noi.
+
+    Căutarea merge de la coadă spre cap și se oprește la prima ștampilă
+    citibilă: auditd scrie în ordinea în care nucleul îi dă înregistrările, deci
+    ultima linie e cea mai nouă. Liniile fără ștampilă (o linie tăiată de
+    rotație, un fragment) se sar în loc să întoarcă `None` — altfel un singur
+    rest de linie la coada lotului ar îngheța filigranul.
+
+    Fracțiunea se ia ca `0.<ms>`, nu ca `int(ms)/1000`: auditd scrie azi trei
+    zecimale, dar un număr diferit de cifre ar muta filigranul cu secunde
+    întregi, iar aici secundele se compară cu momentul unui scan.
+
+    `None` înseamnă „niciuna dintre liniile astea nu poartă o ștampilă" — nu
+    „acum". Apelantul NU are voie să pună un implicit în locul ei: un filigran
+    inventat e exact felul de „am citit tot" care închide o sesiune peste
+    comenzile ei.
+    """
+    for line in reversed(lines):
+        m = _STAMP.search(line)
+        if m is None:
+            continue
+        moment = _stamp_time(m["epoch"], m["ms"])
+        if moment is not None:
+            return moment
+    return None
+
+
+def _stamp_time(epoch: str, ms: str) -> datetime | None:
+    """Ștampila unei înregistrări, sau `None` dacă nu e un moment posibil.
+
+    `None` în loc de excepție: o ștampilă imposibilă (an 50000, un ceas sărit)
+    nu are voie să oprească filigranul întregului lot — se sare peste ea și se
+    caută mai sus, exact ca peste o înregistrare stricată în
+    `parse_auditd_lines`.
+    """
+    try:
+        return datetime.fromtimestamp(int(epoch) + float(f"0.{ms}"),
+                                      tz=timezone.utc)
+    except (ValueError, OSError, OverflowError):
+        return None

@@ -310,6 +310,25 @@ def test_a_process_without_a_login_session_is_skipped() -> None:
     assert db.commands == []
 
 
+def test_a_logout_with_an_unset_session_id_closes_nothing() -> None:
+    """`ses=4294967295` înseamnă „niciun login" pentru un `USER_END`/`USER_LOGOUT`
+    la fel ca pentru orice alt eveniment auditd.
+
+    Tratat ca o cheie adevărată, ar aduna toate procesele fără sesiune — cron,
+    containere — sub o singură „sesiune" comună, iar aici ar și ÎNCHIDE-o pe
+    aceea la prima ieșire a oricăruia dintre ele, sau ar fabrica un rând nou
+    fără cont și fără adresă.
+    """
+    db = _DB()
+    run(logins.project(db, [_login("432")]))
+    run(logins.project(db, [_logout("4294967295")]))
+
+    assert len(db.sessions) == 1, (
+        "o cheie de sesiune nesetată a produs un rând nou")
+    assert db.sessions[0]["closed_at"] is None, (
+        "o cheie de sesiune nesetată a închis sesiunea adevărată")
+
+
 def test_events_from_other_sources_are_ignored() -> None:
     """Numai auditd poartă `ses`. Un eveniment sshd cu aceleași câmpuri ar
     produce o a doua sesiune pentru aceeași logare."""
@@ -635,6 +654,28 @@ def test_repeated_logouts_do_not_create_phantom_sessions() -> None:
         f"{len(db.sessions)} rânduri pentru o singură sesiune: închiderile "
         f"repetate au fabricat sesiuni-fantomă")
     assert db.sessions[0]["username"] == "operator"
+
+
+def test_two_user_end_in_the_same_second_produce_one_close_not_two() -> None:
+    """Măsurat pe producție: sshd trimite `USER_LOGOUT` ȘI `USER_END` pentru
+    aceeași ieșire, în ACEEAȘI secundă — delta +0s pe 128 din 128 de sesiuni.
+
+    Fără garda `deja` din `close_session`, a doua închidere n-ar mai găsi nicio
+    sesiune DESCHISĂ cu cheia asta și ar fabrica una nouă, deja închisă, fără
+    cont și fără adresă — exact fantoma descrisă la „175 `USER_END` pentru 55 de
+    logări". Testul de mai sus falsifică asta cu un decalaj de secunde; aici e
+    forma exactă pe care o emite producția: același `ts`, nu unul apropiat.
+    """
+    db = _DB()
+    run(logins.project(db, [_login("432")]))
+    run(logins.project(db, [_logout("432"), _logout("432")]))
+
+    assert len(db.sessions) == 1, (
+        f"{len(db.sessions)} rânduri pentru o singură sesiune: cele două "
+        f"închideri din aceeași secundă au fabricat o sesiune-fantomă")
+    assert db.sessions[0]["username"] == "operator", (
+        "fantoma are contul gol -- arată exact ca o logare neatribuită")
+    assert db.sessions[0]["closed_at"] == NOW + timedelta(hours=1)
 
 
 def test_a_command_arriving_after_the_session_closed_is_still_attached() -> None:

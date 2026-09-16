@@ -53,6 +53,20 @@ LOGOUT = (
 )
 
 
+def _user_end(exe: str) -> str:
+    """Un `USER_END` cu executabilul emitent dat.
+
+    Formă identică cu `LOGOUT`, cu tipul și `exe` schimbate: e chiar ce scrie
+    PAM la închiderea unui strat, indiferent care l-a deschis.
+    """
+    return (
+        'type=USER_END msg=audit(1787575999.000:178501): pid=1814689 uid=0 '
+        'auid=1000 ses=432 msg=\'op=PAM:session_close '
+        f'exe="{exe}" hostname=? addr=198.51.100.7 '
+        'terminal=ssh res=success\'UID="root" AUID="operator" ID="operator"'
+    )
+
+
 def _comanda(argv: list[str], *, ses: str = "432", auid: str = "1000",
              tty: str = "pts0") -> list[str]:
     """Grupul de linii pe care îl produce un `execve` supravegheat."""
@@ -124,23 +138,74 @@ def test_a_failed_login_does_not_invent_a_username() -> None:
     assert ev.username is None, f"s-a inventat un cont: {ev.username!r}"
 
 
-def test_only_USER_LOGOUT_ends_a_session() -> None:
-    """`USER_END` NU e perechea lui `USER_LOGIN`, iar asta a costat o livrare.
+def test_a_pam_layer_closed_mid_session_is_not_read_as_a_logout() -> None:
+    """`USER_END` LUAT ÎNTREG NU e perechea lui `USER_LOGIN` — asta a costat o
+    livrare.
 
     E perechea lui `USER_START`: PAM deschide și închide un strat pentru fiecare
-    `sudo`, `su` sau modul de autentificare din interiorul sesiunii, iar prima
-    închidere sosea la o secundă după logare — încă din faza de autentificare a
-    lui sshd.
+    `sudo`, `su`, `cron` sau `runuser` din interiorul sesiunii, și doar unul
+    dintre ei e chiar ieșirea. Numărat pe gazda Ubuntu: din 1811 `USER_END`, 900
+    sunt `cron`, 216 `sudo`, 5 `su`, 3 `runuser` — niciunul teardown de sesiune.
 
-    Numărat pe jurnalul real, într-o rotație: 31 `USER_LOGIN`, 44 `USER_START`,
-    44 `USER_END`, 11 `USER_LOGOUT`. Cu `USER_END` drept ieșire, sesiunea era
-    „închisă" înainte să ruleze prima comandă: **1534 de comenzi orfane din
-    14157**, plus un rând-fantomă la fiecare închidere în plus.
+    Cu `USER_END` drept ieșire necondiționat, sesiunea era „închisă" înainte să
+    ruleze prima comandă: **1534 de comenzi orfane din 14157**, plus un
+    rând-fantomă la fiecare închidere în plus. Filtrul pe `exe` — vezi
+    `_SESSION_END_EXE` — e ce ține regresia asta închisă acum că `USER_END` al
+    lui sshd trece.
+
+    A doua jumătate: un `USER_END` fără `exe` deloc — linia tăiată de rotația
+    jurnalului chiar înainte de `exe=`, dar cu `ses=` încă prezent — trebuie să
+    iasă tot `None`, nu să fie citit ca ieșire. Garda e `(fields.get("exe") or
+    "")`: dacă vreodată devine un implicit care se rezolvă la un binar din
+    `_SESSION_END_EXE` (ex. `or "sshd"`), o linie trunchiată de rotație ar
+    închide o sesiune încă vie, iar sumarul de comenzi al ei ar raporta mai
+    puțin decât a tastat omul.
     """
-    strat = LOGOUT.replace("type=USER_LOGOUT", "type=USER_END")
-    assert parse_auditd(strat) is None, (
-        "un strat PAM închis a fost citit ca ieșire din sesiune")
+    for exe in ("/usr/sbin/cron", "/usr/bin/sudo", "/usr/bin/su",
+                "/usr/sbin/runuser", "/usr/lib/systemd/systemd-executor"):
+        assert parse_auditd(_user_end(exe)) is None, (
+            f"un strat PAM al lui {exe!r} a fost citit ca ieșire din sesiune")
 
+    fara_exe = _user_end("sshd").replace('exe="sshd" ', "")
+    assert parse_auditd(fara_exe) is None, (
+        "un USER_END fara camp exe (linie taiata de rotatie) a fost citit ca "
+        "iesire din sesiune")
+
+
+@pytest.mark.parametrize("exe", ["/usr/sbin/sshd",
+                                  "/usr/libexec/openssh/sshd-session"])
+def test_a_user_end_from_sshd_closes_the_session(exe: str) -> None:
+    """Ubuntu/Debian nu au patch-ul de audit (Launchpad #1948357) și nu emit
+    NICIODATĂ `USER_LOGOUT` — măsurat pe gazda n8n: 50 `USER_LOGIN`, 0
+    `USER_LOGOUT`. Fără această cale, fiecare sesiune de-acolo se închidea abia
+    la douăsprezece ore, prin măturătoare, iar «🔓 Sesiune încheiată» sosea la
+    jumătate de zi distanță de plecarea omului.
+
+    Ambele ortografii contează: Ubuntu 24.04 (OpenSSH 9.6) scrie `sshd`,
+    AlmaLinux 9.9 scrie `sshd-session`.
+    """
+    ev = parse_auditd(_user_end(exe))
+    assert ev is not None, f"USER_END de la {exe!r} nu a închis sesiunea"
+    assert ev.action == "logout"
+    assert ev.raw.get("ses") == "432"
+    assert ev.username == "operator"
+
+
+def test_the_sshd_match_is_an_exact_basename_not_a_substring() -> None:
+    """`"sshd" in exe` ar prinde orice binar care poartă literele astea în nume.
+
+    Un wrapper local sau un binar cu nume înșelător nu e sshd, oricât de
+    asemănător arată — verificarea trebuie să fie pe numele de fișier exact.
+    """
+    assert parse_auditd(_user_end("/usr/local/bin/sshd-wrapper")) is None, (
+        "un substring al lui «sshd» a fost citit ca sshd adevărat")
+    assert parse_auditd(_user_end("/opt/x/notsshd")) is None
+
+
+def test_user_logout_still_closes_a_session_regardless_of_exe() -> None:
+    """Garda de regresie pentru producție (AlmaLinux), care emite `USER_LOGOUT`
+    dintotdeauna și nu are voie să se oprească din asta odată cu filtrul nou.
+    """
     ev = parse_auditd(LOGOUT)
     assert ev is not None
     assert ev.action == "logout"
