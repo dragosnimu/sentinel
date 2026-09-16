@@ -68,10 +68,19 @@ from __future__ import annotations
 import re
 from collections.abc import Collection
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sentinel.db.engine import Database
+from sentinel.logging_setup import get_logger
 from sentinel.model.event import Event
+
+log = get_logger(__name__)
+
+if TYPE_CHECKING:
+    # Numai pentru tip: `collectors/audit_sessions.py` importă `NO_SESSION` de
+    # aici, deci un import obișnuit în sens invers ar fi un ciclu. Funcția care
+    # o primește nu are nevoie de clasă la rulare, doar de câmpurile ei.
+    from sentinel.collectors.audit_sessions import LiveAuditSessions
 
 #: Ce valoare a lui `ses` înseamnă „nicio sesiune de login".
 #:
@@ -94,7 +103,29 @@ NO_SESSION = frozenset({"4294967295", "unset", "-1", "", "?"})
 #: fără să se atingă nimeni de ea, iar o închidere prea grăbită ar trimite
 #: rezumatul în timp ce omul e încă acolo — și l-ar trimite din nou la fiecare
 #: comandă următoare.
+#:
+#: De pe 15 septembrie 2026 măturătoarea nu mai e calea obișnuită, ci plasa:
+#: `reap_dead_sessions` închide sesiunea când sesiunea ei de audit chiar a
+#: dispărut de pe gazdă, în minute în loc de ore. Aici rămân cazurile pe care
+#: nimeni nu le poate observa — o gazdă pe care `/proc` nu se poate citi, un
+#: proces rămas în urmă care ține id-ul de sesiune viu, ingestia oprită.
 STALE_SESSION_H = 12
+
+#: Cât trebuie să stea nemișcat un rând înainte ca absența sesiunii lui de pe
+#: gazdă să însemne că s-a terminat.
+#:
+#: Nu apără împotriva unei sesiuni VII — aia e apărată de faptul că o sesiune
+#: vie are procese, deci apare în `/proc`. Apără împotriva cursei dintre cele
+#: două citiri: instantaneul din `/proc` se ia înaintea instrucțiunii, iar o
+#: sesiune născută între ele ar lipsi din el fără să fi murit vreodată.
+#:
+#: Două minute, adică de o mie de ori mai mult decât decalajul măsurat între
+#: cele două citiri (o trecere de ingestie; întârzierea auditd pe gazda Ubuntu
+#: la 15 septembrie 2026 era de 0,34 s) și de 360 de ori mai puțin decât cele
+#: douăsprezece ore pe care le înlocuiește. Direcția în care greșim dacă e prea
+#: mic e singura care contează: un rezumat trimis despre cineva care încă
+#: tastează. De-asta nu e mai mic.
+REAP_GRACE_S = 120
 
 #: Binarele care înseamnă „a rulat ceva cu privilegii". Numărate separat, fiindcă
 #: «412 comenzi» nu spune nimic iar «412 comenzi, 3 cu sudo» spune ce s-a
@@ -378,9 +409,29 @@ async def _find_session(db: Database, key: str, ts: Any) -> int | None:
 async def _attach_orphans(db: Database, key: str, session_id: int) -> int:
     """Leagă de sesiune comenzile care sosiseră înaintea ei.
 
-    Numai cele NELEGATE și numai pe cheia asta. Fără marginea de timp a sesiunii:
-    o comandă orfană cu aceeași cheie nu poate aparține alteia — cheia e unică pe
-    pornire, iar sesiunea găsită e cea deschisă.
+    Numai cele NELEGATE și numai pe cheia asta, într-o fereastră de un minut
+    în jurul deschiderii — aceeași margine de ceas dezaliniat pe care o
+    folosește `_find_session` mai sus.
+
+    `close_session` fabrică rândul cu `opened_at = closed_at` când n-a văzut
+    deschiderea — vezi docstring-ul ei. Pentru o sesiune fabricată, fereastra
+    de o secundă în care ea „există" cade EXACT la închidere, iar comenzile ei
+    reale, dacă au rulat mai devreme de un minut, rămân neatașate — corect,
+    fiindcă nu există un fapt din care să se dovedească cui aparțin.
+
+    S-a încercat o lărgire a marginii de jos până la închiderea celei mai
+    recente sesiuni ANTERIOARE cu aceeași cheie (sau, în lipsa ei, ora de
+    pornire a gazdei). Măsurat pe producție, 16 septembrie 2026: fiindcă
+    `session_key` se reciclează NUMAI la reboot, orice sesiune anterioară găsită
+    era, prin construcție, dincolo de o repornire — granița „lărgită" nu apăra
+    nimic, doar întindea fereastra peste boot. 1616 comenzi orfane s-ar fi
+    legat greșit, 1607 dintre ele peste graniță de reboot, cu utilizator diferit
+    de al sesiunii care le-ar fi înghițit (320 de comenzi ale uid 1000 din
+    24 august atașate unei sesiuni `sentinel-deploy` din 7 septembrie; 143 de
+    comenzi root din 4 septembrie atașate unei sesiuni din 14 septembrie).
+    Exact ce interzice capul acestei funcții: fapta unei persoane în cronologia
+    alteia. Lărgirea a fost retrasă; o identitate de boot adevărată (un
+    `boot_id` ștampilat pe rând, nu o comparație de ore) rămâne lucru separat.
     """
     result = await db.execute(
         """
@@ -423,6 +474,13 @@ async def project(db: Database, events: list[Event],
     # necunoscută se caută oricum în bază, deci un proces repornit nu pierde
     # nimic.
     known: dict[str, int] = {}
+    # Sesiunile ÎNCHISE în lotul ăsta. Scoase din `known` imediat după închidere
+    # (mai jos), ca o comandă cu aceeași cheie mai departe în lot să nu se lege
+    # orbește de o sesiune care s-ar putea să fi fost deja retrasă — dar tot
+    # trebuie recalculate: `_attach_orphans` de la închidere poate atașa comenzi
+    # care schimbă `command_count`, iar sesiunea aia nu mai e în `known` la
+    # finalul buclei ca să intre în recalculare pe calea veche.
+    closed: set[int] = set()
 
     for ev in events:
         if ev.source != "auditd":
@@ -448,6 +506,20 @@ async def project(db: Database, events: list[Event],
             session_id = await close_session(db, ev, key)
             if session_id is not None:
                 counts["sessions_closed"] += 1
+                # Pe Ubuntu `USER_LOGIN` se scrie DOAR pentru sesiunile cu pty
+                # — majoritatea sesiunilor sshd n-au niciuna. `open_session`
+                # nu rulează niciodată pentru ele, deci comenzile lor sosesc
+                # deja orfane și rămân așa pentru totdeauna dacă nimeni nu mai
+                # caută înapoi. `close_session` întoarce un rând de fiecare
+                # dată — deschis și tocmai închis, deja închis (dedup), sau
+                # fabricat — și oricare din cele trei e un rând de care se pot
+                # lega orfanele. `_attach_orphans` atinge numai
+                # `session_id IS NULL`, deci a treia rulare pe aceeași
+                # sesiune (PAM + sshd trimit până la trei semnale de închidere
+                # pentru o singură ieșire) nu mai are ce lega — idempotentă
+                # prin construcție, nu prin verificare separată aici.
+                counts["orphans_attached"] += await _attach_orphans(db, key, session_id)
+                closed.add(session_id)
             known.pop(key, None)
 
         elif ev.action == "command":
@@ -472,10 +544,12 @@ async def project(db: Database, events: list[Event],
 
     if counts["commands"] or counts["orphans_attached"]:
         # `known` contine si sesiunile gasite in baza pentru comenzi, nu doar pe
-        # cele deschise in lot. Se recalculeaza si dupa legarea orfanelor: altfel
-        # contorul unei sesiuni ar ramane in urma exact cu comenzile care i s-au
-        # atasat cu intarziere, iar rezumatul n-ar mai fi de acord cu lista.
-        atinse = sorted(set(known.values()))
+        # cele deschise in lot; `closed` le adauga pe cele inchise in lotul asta,
+        # scoase din `known` mai sus. Se recalculeaza si dupa legarea orfanelor:
+        # altfel contorul unei sesiuni ar ramane in urma exact cu comenzile care
+        # i s-au atasat cu intarziere -- la deschidere sau la inchidere -- iar
+        # rezumatul n-ar mai fi de acord cu lista.
+        atinse = sorted(set(known.values()) | closed)
         await _refresh_counters(db, atinse)
         counts["promoted"] = await _promote_interactive(db, atinse)
     return counts
@@ -506,6 +580,188 @@ async def close_stale_sessions(db: Database) -> int:
         """,
         STALE_SESSION_H)
     return int(str(result).rsplit(" ", 1)[-1]) if result else 0
+
+
+async def reap_dead_sessions(db: Database, live: LiveAuditSessions,
+                             observed_s_ago: float) -> int:
+    """Închide rândurile a căror sesiune de audit nu mai există pe gazdă.
+
+    Calea rapidă rămâne `USER_LOGOUT` — când sosește, e precisă și imediată.
+    Asta e calea pentru restul, care pe gazda Ubuntu înseamnă TOT: 17 din 17
+    sesiuni închise de acolo poartă `closed_inferred = true`, adică niciuna
+    n-a fost închisă vreodată de o ieșire văzută, iar rezumatul lor a plecat
+    fix la douăsprezece ore după ultima comandă.
+
+    ## De ce primește dovada, nu o listă de chei
+
+    Fiindcă „nu e nimeni logat” și „n-am putut citi” arată identic ca listă
+    goală, iar diferența dintre ele e diferența dintre a nu închide nimic și a
+    închide TOT. Nu e o grijă teoretică: sub `ProtectProc=invisible` — cum
+    rulează `sentinel-detect.service` chiar acum — un scan al lui `/proc` vede
+    zece procese, toate ale lui, și zero sesiuni. Cu `trusted = False` funcția
+    asta nu atinge niciun rând, iar garda stă într-un singur loc: apelantul nu
+    repetă decizia, ca să nu poată nimeri unul dintre ei altfel.
+
+    ## Ce moment primește rândul
+
+    Ultima activitate cunoscută — ultima comandă, sau deschiderea dacă n-a
+    rulat nimic —, împreună cu `closed_inferred = true`. NU `now()`: nimeni
+    n-a văzut ieșirea, deci ora la care am observat noi absența n-are nicio
+    legătură cu ora la care a plecat omul, iar diferența dintre ele poate fi
+    de ore. Exact regula măturătoarei, dinadins: două căi care scriu același
+    rând după reguli diferite ar face ca „Durată” să însemne altceva după cum
+    l-a atins una sau alta. Ce iese în mesaj e o margine de jos, și
+    `summary_text` o spune ca atare.
+
+    ## De ce nu poate inunda telefonul
+
+    Fereastra ei se termină exact unde începe a măturătoarei: un rând fără
+    activitate de peste `STALE_SESSION_H` ore e treaba lui
+    `close_stale_sessions`, și era și înaintea acestei funcții. Deci prima
+    rulare pe o gazdă cu restanță nu poate închide niciun rând pe care
+    măturătoarea nu l-ar fi închis oricum în următoarele douăsprezece ore — nu
+    există niciun val pe care să-l producă ea și nu l-ar fi produs cealaltă.
+
+    Ce rămâne nerezolvat, și nu de aici: o gazdă pe care detecția a stat oprită
+    săptămâni adună rânduri deschise, iar la repornire măturătoarea le rezumă
+    pe toate deodată. E comportamentul de azi, neschimbat.
+
+    ## De ce primește și VECHIMEA observației
+
+    Fiindcă `live` descrie gazda la momentul scanului, iar instrucțiunea rulează
+    mai târziu — uneori mult mai târziu, fiindcă apelantul așteaptă dinadins să
+    fi citit coada de audit dincolo de clipa scanului (vezi
+    `services/ingest_service.py`). Între cele două momente se poate LOGA cineva,
+    iar sesiunea lui lipsește dintr-un scan luat înainte să existe, fără să fi
+    murit vreodată.
+
+    Până pe 15 septembrie 2026 apărarea era implicită: răgazul se măsura de la
+    `now()`, deci ținea numai cât timp scanul era mai proaspăt de
+    `REAP_GRACE_S`. Nimic nu impunea asta și nimic n-ar fi spus când încetează
+    să fie adevărat. Acum ambele margini se măsoară din clipa observației —
+    „rândul ăsta tăcea deja de două minute CÂND m-am uitat la gazdă" —, deci un
+    scan vechi întârzie închiderea în loc s-o facă greșită, iar apelantul poate
+    ține unul în mână oricât are nevoie.
+
+    Vine ca DURATĂ, nu ca moment: momentul ar fi de pe ceasul procesului, iar
+    comparația se face pe ceasul bazei. Două ceasuri care nu sunt de acord fac
+    dintr-un răgaz de două minute un răgaz de altceva; o durată înseamnă
+    același lucru pe amândouă.
+
+    ## Rularea în paralel cu măturătoarea
+
+    Se pot atinge: reaper-ul rulează în ingestie, măturătoarea în detecție.
+    Dacă nimeresc același rând, scriu aceeași valoare (aceeași expresie pentru
+    `closed_at`), iar rezumatul pleacă o singură dată fiindcă `summarised_at` e
+    ce-l oprește, nu numărul de închideri.
+    """
+    if not live.trusted:
+        return 0
+    result = await db.execute(
+        """
+        WITH candidat AS (
+            SELECT s.id,
+                   COALESCE((SELECT max(ts) FROM session_commands c
+                              WHERE c.session_id = s.id),
+                            s.opened_at) AS ultima
+              FROM login_sessions s
+             WHERE s.closed_at IS NULL
+               AND NOT (s.session_key = ANY($1::text[]))
+        )
+        UPDATE login_sessions s
+           SET closed_at = candidat.ultima,
+               closed_inferred = true
+          FROM candidat
+         WHERE s.id = candidat.id
+           AND candidat.ultima < now() - make_interval(secs => $4)
+                                       - make_interval(secs => $2)
+           AND candidat.ultima > now() - make_interval(secs => $4)
+                                       - make_interval(hours => $3)
+        """,
+        # `max(ts)` calculat o singură dată pe sesiune deschisă, în CTE, și
+        # numai pentru cele care NU mai sunt vii: instrucțiunea măturătoarei
+        # scrie același subselect de două ori, iar 0031 a măsurat ce costă.
+        #
+        # `$4` e vechimea scanului: `now() - $4` e clipa în care s-a citit
+        # `/proc`, iar ambele margini pleacă de acolo. Negativ n-are înțeles —
+        # ar muta marginile în VIITOR, adică ar închide rânduri active —, deci
+        # se taie la zero aici, nu în apelant, unde s-ar putea uita.
+        sorted(live.keys), float(REAP_GRACE_S), STALE_SESSION_H,
+        max(0.0, float(observed_s_ago)))
+    return int(str(result).rsplit(" ", 1)[-1]) if result else 0
+
+
+# ---------------------------------------------------------------------------
+# Starea reaper-ului, scrisă unde supraviețuiește unei reporniri
+# ---------------------------------------------------------------------------
+#: Numele urmei în `collector_cursors`. Prefixul `reaper:` îl ține departe de
+#: numele de colectoare, care sunt surse de evenimente.
+REAPER_MARKER = "reaper:sessions"
+
+#: Vocabularul stărilor. Îl citește `selfcheck/checks.py:check_session_reaper`,
+#: deci e un contract între două fișiere și e fixat de test — un șir schimbat
+#: aici și necitit acolo ar face verificarea să raporteze o stare inexistentă
+#: drept „nu știu", la nesfârșit.
+REAPER_WORKING = "working"   # scan de încredere, instrucțiunea a rulat
+REAPER_BLIND = "blind"       # `/proc` necitibil: `trusted = False`, nimic atins
+REAPER_WAITING = "waiting"   # coada de audit nu e citită până dincolo de scan
+
+#: Cât de des se rescrie urma când starea NU se schimbă.
+#:
+#: Urma are două întrebuințări, iar a doua o cere: „ce stare" se scrie la
+#: schimbare, dar „mai rulează cineva" se citește din `updated_at`, și o valoare
+#: care nu se mai atinge devine indistinguibilă de un daemon oprit. Cinci minute
+#: înseamnă un rând scris de 288 de ori pe zi — nimic — și o fereastră în care
+#: `check_session_reaper` poate spune „urma a înghețat" fără să acuze o gazdă
+#: liniștită.
+REAPER_REFRESH_S = 300
+
+
+async def record_reaper_state(db: Database, state: str,
+                              seen_through: datetime | None) -> None:
+    """Scrie ce face reaper-ul acolo unde se poate citi după o repornire.
+
+    Jurnalul nu e de ajuns, și nu din principiu: pe gazda de producție nu există
+    `/var/log/journal`, deci jurnalul stă în RAM (2,79 zile măsurate) și se
+    pierde la fiecare reboot. Un WARNING scris o dată, la schimbarea stării, e
+    exact felul de dovadă care dispare fix când e nevoie de ea — iar «reaper-ul
+    e înfometat» și «n-a murit nicio sesiune» arată identic pentru oricine se
+    uită de-afară.
+
+    `cursor_at` ia filigranul cozii de audit, nu ora scrierii: diferența dintre
+    el și `now()` E mărimea întârzierii, adică singurul număr din care se poate
+    spune dacă starea `waiting` e o clipă sau o zi. `NULL` când nu s-a măsurat
+    încă niciun filigran — „nu știu" e o a treia valoare și n-are voie să fie
+    scrisă ca zero.
+
+    Eșecul se loghează și se înghite, ca la `db/identity_mirror.py:_record`:
+    dacă nici urma nu se poate scrie, baza e căzută, iar asta se aude mai tare
+    decât o sesiune închisă târziu. Ce NU are voie să facă e să oprească
+    închiderea sesiunilor — scrierea e o raportare, nu o condiție.
+    """
+    try:
+        await db.execute(
+            """
+            INSERT INTO collector_cursors (name, cursor, cursor_at, updated_at)
+            VALUES ($1, $2, $3, now())
+            ON CONFLICT (name) DO UPDATE
+                SET cursor = EXCLUDED.cursor,
+                    cursor_at = EXCLUDED.cursor_at,
+                    updated_at = now()
+            """,
+            REAPER_MARKER, state, seen_through)
+    except Exception as exc:  # noqa: BLE001
+        log.error("cannot record the session reaper state",
+                  extra={"state": state, "detail": str(exc)[:220]})
+
+
+async def read_reaper_state(db: Database) -> dict[str, Any] | None:
+    """Urma reaper-ului, sau `None` dacă n-a fost scrisă niciodată."""
+    row = await db.fetchrow(
+        "SELECT cursor, cursor_at, updated_at FROM collector_cursors "
+        "WHERE name = $1",
+        REAPER_MARKER)
+    return dict(row) if row is not None else None
 
 
 async def _promote_interactive(db: Database, session_ids: list[int]) -> int:

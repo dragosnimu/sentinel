@@ -65,6 +65,7 @@ from sentinel.config import (
 from sentinel.constants import SYSTEMD_UNITS
 from sentinel.db.engine import Database
 from sentinel.db.repo import assets as assets_repo
+from sentinel.db.repo import logins as logins_repo
 from sentinel.db.repo.logins import REAL_TTY_SQL
 from sentinel.respond import watchdog as _watchdog
 from sentinel.scan import inventory
@@ -4698,6 +4699,179 @@ async def check_inventory(db: Database) -> list[CheckResult]:
 
 
 # ---------------------------------------------------------------------------
+# Reaper-ul de sesiuni: mai închide cineva sesiunile moarte?
+# ---------------------------------------------------------------------------
+#: Peste cât timp fără nicio scriere urma reaper-ului nu mai descrie prezentul.
+#:
+#: Derivat, nu ales: ingestia rescrie rândul la fiecare `REAPER_REFRESH_S` chiar
+#: când nu se schimbă nimic, tocmai ca să se poată deosebi „starea asta e de
+#: acum" de „daemonul a murit în starea asta". Trei reîmprospătări ratate la
+#: rând nu mai sunt o trecere sărită, sunt un scriitor care nu mai e.
+REAPER_STALE_S = logins_repo.REAPER_REFRESH_S * 3
+
+
+async def check_session_reaper(db: Database, cfg: Config) -> list[CheckResult]:
+    """Se mai închid sesiunile moarte, sau rezumatele au tăcut din nou?
+
+    Pana pe care o prinde, în cuvintele operatorului: *„am rulat comenzi dar nu
+    am primit alerta… sesiunea a fost închisă dar tot nu am primit."* Măsurat pe
+    gazdă pe 15 septembrie 2026: toate cele 17 sesiuni închise fuseseră închise
+    de măturătoarea de douăsprezece ore, niciuna de o ieșire văzută, iar
+    rezumatul plecase la 12h00m după ultima comandă — adică, pentru omul care
+    închisese terminalul dimineața, niciodată.
+
+    Reaper-ul din ingestie e reparația. Are însă trei feluri de a nu lucra, și
+    toate trei arată de-afară exact ca o gazdă pe care n-a murit nicio sesiune:
+
+      * **orb** — `/proc` nu se poate citi (`ProtectProc`, un modul de
+        securitate care refuză o citire), deci scanul nu e de încredere și nu se
+        atinge niciun rând;
+      * **în așteptare** — coada de audit n-a fost citită dincolo de clipa
+        scanului. E forma normală a porții pentru o fracțiune de secundă; ținută
+        minute în șir înseamnă că ingestia e în urmă și rezumatele cu ea;
+      * **niciodată pornit** — `auditd` e cerut în configurație dar fișierul lui
+        lipsește, sau daemonul rulează cod dinaintea reaper-ului. Atunci nu
+        există nici măcar o stare de citit.
+
+    De-asta verificarea nu se uită la sesiuni, ci la URMA scriitorului
+    (`collector_cursors`, sub `reaper:sessions`): un tabel de sesiuni fără
+    rânduri închise recent înseamnă în egală măsură „nimeni nu s-a delogat" și
+    „reaper-ul e mort", iar din bază nu se poate spune care. Urma e scrisă de
+    cine ia hotărârea, la fiecare hotărâre, și supraviețuiește unei reporniri —
+    ceea ce o linie de jurnal pe gazda asta NU face: nu există
+    `/var/log/journal`, deci jurnalul stă în RAM și se pierde la reboot.
+    """
+    key = "sessions:reaper"
+
+    if not cfg.ingest.auditd:
+        # Sesiunile de login se construiesc DOAR din înregistrări auditd
+        # (`logins.project` sare peste orice alt izvor), deci fără colectorul
+        # ăla nu există rânduri de închis. E singura cale prin care „nu rulează"
+        # chiar înseamnă „n-are ce rula".
+        return [CheckResult(
+            key, "Închiderea sesiunilor de login", "ok",
+            detail="colectorul auditd e oprit în configurație, deci nu se "
+                   "deschide și nu se închide nicio sesiune de login",
+            facts={"auditd": False})]
+
+    try:
+        urma = await logins_repo.read_reaper_state(db)
+    except Exception as exc:  # noqa: BLE001
+        return [CheckResult(
+            key, "Nu pot citi starea reaper-ului de sesiuni", "unknown",
+            detail=f"urma `{logins_repo.REAPER_MARKER}` nu s-a putut citi: "
+                   f"{str(exc)[:140]}",
+            action="sentinel migrate")]
+
+    if urma is None:
+        # Nu e `ok`: „n-am ce raporta" și „e bine" sunt stări diferite. Rândul
+        # apare în cel mult o jumătate de minut de ingestie, deci dacă lipsește
+        # mai mult, chiar lipsește ceva.
+        return [CheckResult(
+            key, "Reaper-ul de sesiuni n-a raportat niciodată", "unknown",
+            detail="nicio urmă sub `reaper:sessions`: ori ingestia rulează cod "
+                   "dinaintea reaper-ului, ori `auditd` e cerut în configurație "
+                   "iar fișierul lui de jurnal lipsește, deci reaper-ul iese "
+                   "înainte să se uite la gazdă",
+            action="systemctl status sentinel-ingest; ls -l "
+                   "/var/log/audit/audit.log; apoi "
+                   "docs/ISTORIC-SESIUNI.md, „Când pleacă «Sesiune "
+                   "încheiată»”",
+            facts={"writer_ran": False})]
+
+    stare = str(urma.get("cursor") or "")
+    filigran = urma.get("cursor_at")
+    scris_acum = since(urma.get("updated_at"))
+    intarziere = since(filigran)
+    fapte: dict[str, Any] = {
+        "state": stare,
+        "watermark_lag_s": None if intarziere is None else int(intarziere.total_seconds()),
+        "written_s_ago": None if scris_acum is None else int(scris_acum.total_seconds()),
+    }
+
+    if scris_acum is None or scris_acum.total_seconds() > REAPER_STALE_S:
+        # Starea scrisă poate fi oricât de liniștitoare; dacă n-a mai fost
+        # atinsă, e o fotografie, nu o stare. Fără ramura asta, un daemon mort
+        # în `working` ar raporta „merge" la nesfârșit.
+        return [CheckResult(
+            key, "Reaper-ul de sesiuni nu mai raportează", "degraded",
+            detail=f"ultima stare scrisă e „{stare}”, dar urma n-a mai fost "
+                   f"atinsă de {_durata(scris_acum)} — se rescrie la fiecare "
+                   f"{logins_repo.REAPER_REFRESH_S // 60} minute chiar când nu "
+                   f"se schimbă nimic, deci asta înseamnă că nu mai scrie "
+                   f"nimeni; sesiunile se închid iar abia la "
+                   f"{logins_repo.STALE_SESSION_H} ore",
+            action="systemctl status sentinel-ingest",
+            facts=fapte)]
+
+    if stare == logins_repo.REAPER_BLIND:
+        return [CheckResult(
+            key, "Reaper-ul de sesiuni nu poate vedea procesele gazdei", "degraded",
+            detail="scanul din `/proc` nu e de încredere, deci niciun rând nu "
+                   "se atinge: „nicio sesiune vie” ar închide toate sesiunile "
+                   "gazdei deodată, iar refuzul e purtarea corectă. Rezumatele "
+                   f"pleacă însă abia la {logins_repo.STALE_SESSION_H} ore",
+            action="verifică `ProtectProc=` în sentinel-ingest.service și dacă "
+                   "un modul de securitate (AppArmor, SELinux) confinează "
+                   "procesul; jurnalul unității spune care dintre ele",
+            facts=fapte)]
+
+    if stare == logins_repo.REAPER_WAITING:
+        prea_mult = intarziere is None or intarziere.total_seconds() > REAPER_STALE_S
+        if prea_mult:
+            return [CheckResult(
+                key, "Reaper-ul de sesiuni așteaptă coada de audit", "degraded",
+                detail=f"ingestia n-a citit `audit.log` decât până acum "
+                       f"{_durata(intarziere)}, iar reaper-ul nu închide o "
+                       f"sesiune înainte să fi citit dincolo de clipa în care "
+                       f"s-a uitat la gazdă — altfel rezumatul ar număra mai "
+                       f"puține comenzi decât s-au rulat. Rezumatele întârzie "
+                       f"cu exact atât",
+                action="uită-te la volumul de înregistrări auditd (`auditctl "
+                       "-s`, regulile din /etc/audit/rules.d) și la jurnalul "
+                       "lui sentinel-ingest: „session reaping deferred”",
+                facts=fapte)]
+        return [CheckResult(
+            key, "Închiderea sesiunilor de login", "ok",
+            detail=f"reaper-ul așteaptă coada de audit, rămasă în urmă cu "
+                   f"{_durata(intarziere)} — forma normală a porții cât timp "
+                   f"ingestia recuperează un vârf",
+            facts=fapte)]
+
+    if stare == logins_repo.REAPER_WORKING:
+        return [CheckResult(
+            key, "Închiderea sesiunilor de login", "ok",
+            detail=f"scanul gazdei e de încredere, iar coada de audit e citită "
+                   f"până acum {_durata(intarziere)}; sesiunile moarte se "
+                   f"închid în minute, nu la {logins_repo.STALE_SESSION_H} ore",
+            facts=fapte)]
+
+    # O stare pe care fișierul ăsta n-o cunoaște: vocabularul s-a despărțit în
+    # două. Raportată ca necunoscută, nu ca bună — altfel o redenumire făcută
+    # într-un singur fișier ar stinge verificarea tăcut, pentru totdeauna.
+    return [CheckResult(
+        key, "Reaper-ul de sesiuni raportează o stare necunoscută", "unknown",
+        detail=f"urma spune „{stare[:60]}”, iar `selfcheck/checks.py` nu "
+               f"cunoaște starea asta — vocabularul din "
+               f"`db/repo/logins.py` și cititorul lui s-au despărțit",
+        action="compară `REAPER_WORKING/BLIND/WAITING` cu ce scrie "
+               "`services/ingest_service.py`",
+        facts=fapte)]
+
+
+def _durata(d: timedelta | None) -> str:
+    """O durată în cuvinte scurte, pentru mesajele de mai sus."""
+    if d is None:
+        return "„nu se știe”"
+    secunde = int(d.total_seconds())
+    if secunde < 90:
+        return f"{secunde} s"
+    if secunde < 5400:
+        return f"{secunde // 60} min"
+    return f"{secunde // 3600} h {secunde % 3600 // 60} min"
+
+
+# ---------------------------------------------------------------------------
 CHECKS: tuple[tuple[str, Callable], ...] = (
     ("units", check_units),
     ("timers", check_timers),
@@ -4719,6 +4893,7 @@ CHECKS: tuple[tuple[str, Callable], ...] = (
     ("inventory", check_inventory),
     ("audit", check_audit_records),
     ("history", check_command_history_filter),
+    ("sessions", check_session_reaper),
     ("beacon", check_beacon_delivery),
     ("alerting", check_alerting),
     ("autonomy", check_autonomy),

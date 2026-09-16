@@ -1318,3 +1318,127 @@ def test_a_batch_that_only_attaches_orphans_still_refreshes_the_counters() -> No
         "sesiunea nu s-a promovat, deci alerta de logare nu ar pleca niciodată "
         "pentru o sesiune ale cărei comenzi au sosit înaintea logării")
     assert counts["promoted"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Orfanele legate la ÎNCHIDERE, nu doar la deschidere -- 16 septembrie 2026
+#
+# Pe Ubuntu `USER_LOGIN` se scrie DOAR pentru sesiunile cu pty: măsurat pe
+# n8n, 217 din 224 de sesiuni sshd n-au niciuna, deci `open_session` nu
+# rulează niciodată pentru ele și `_attach_orphans` -- chemată doar de acolo
+# până acum -- nu ajungea niciodată la comenzile lor. Rezultatul măsurat: 58,4%
+# comenzi orfane rămase după ce `close_session` a început să fabrice rândul de
+# închidere -- fabricarea creează un rând, dar nimeni nu mai căuta înapoi
+# după el.
+# ---------------------------------------------------------------------------
+def test_a_command_before_a_user_end_with_no_login_is_attached_at_close() -> None:
+    """Comanda sosită înaintea unui `USER_END` pentru o sesiune fără
+    `USER_LOGIN` trebuie legată de rândul pe care închiderea îl creează.
+
+    Fără apelul de la închidere, comanda asta rămâne cu `session_id NULL`
+    pentru totdeauna: nimic nu mai caută înapoi după ea, fiindcă
+    `_attach_orphans` se chema doar din `open_session`, iar pe o sesiune
+    sshd fără pty `open_session` nu rulează niciodată.
+    """
+    db = _DB()
+    run(logins.project(db, [_command("700", ts=NOW)]))
+    assert db.commands[0]["session_id"] is None, (
+        "comanda a fost legată prea devreme -- testul nu mai probează nimic")
+
+    run(logins.project(db, [_logout("700", ts=NOW + timedelta(seconds=30))]))
+
+    assert len(db.sessions) == 1
+    assert db.commands[0]["session_id"] == db.sessions[0]["id"], (
+        "comanda a rămas orfană: închiderea n-a căutat-o")
+
+
+def test_a_normally_opened_session_still_closes_correctly() -> None:
+    """Calea veche, deschisă cu `USER_LOGIN`, nu trebuie stricată de apelul nou.
+
+    Comanda și `USER_END` sosesc în ACELAȘI lot, comanda înaintea închiderii:
+    sesiunea era deja deschisă, deci comanda se leagă direct la scriere, nu
+    prin `_attach_orphans` -- calea asta trebuie probată separat de cea a
+    orfanelor. Închiderea scoate cheia din `known` înainte de finalul buclei
+    (vezi `project()`); dacă sesiunea închisă n-ar rămâne evidențiată separat
+    pentru recalculare, `command_count` ar rămâne 0 peste o comandă scrisă
+    corect, în chiar lotul care a închis-o.
+    """
+    db = _DB()
+    run(logins.project(db, [_login("701")]))
+    sesiune_id = db.sessions[0]["id"]
+
+    run(logins.project(db, [
+        _command("701", ts=NOW + timedelta(seconds=30)),
+        _logout("701", ts=NOW + timedelta(minutes=1)),
+    ]))
+
+    assert len(db.sessions) == 1, "închiderea a fabricat un al doilea rând"
+    assert db.commands[0]["session_id"] == sesiune_id, (
+        "comanda scrisă pe sesiunea deschisă a fost dezlegată sau relegată "
+        "greșit la închidere")
+    assert db.sessions[0]["command_count"] == 1, (
+        "sesiunea a fost scoasă din evidență la închidere, iar contorul ei "
+        "n-a mai fost recalculat în lotul care a închis-o")
+
+
+def test_a_reused_ses_from_another_session_is_not_claimed_at_close() -> None:
+    """Regresia pe care fereastra de timp o oprește, acum pe calea de închidere.
+
+    O comandă orfană de acum trei luni, cu aceeași cheie `ses` (renumerotată
+    după repornire), NU are voie să fie înghițită de rândul pe care o
+    închidere de AZI îl fabrică -- ar pune fapta cuiva în cronologia altcuiva.
+    """
+    db = _DB()
+    veche = NOW - timedelta(days=90)
+    run(logins.project(db, [_command("702", ts=veche)]))
+    assert db.commands[0]["session_id"] is None
+
+    run(logins.project(db, [_logout("702", ts=NOW)]))
+
+    assert db.commands[0]["session_id"] is None, (
+        "o comandă de acum trei luni a fost lipită de sesiunea închisă azi")
+
+
+def test_three_close_signals_in_the_same_second_attach_the_orphan_once() -> None:
+    """Măsurat pe producție: `USER_LOGOUT` plus două `USER_END` pentru aceeași
+    ieșire, în ACEEAȘI secundă.
+
+    Legarea orfanei trebuie să fie idempotentă: a doua și a treia rulare nu au
+    ce mai lega, deci nu au voie să numere din nou, să dubleze rândul de
+    sesiune sau să umfle `command_count`.
+    """
+    db = _DB()
+    run(logins.project(db, [_command("703", ts=NOW)]))
+
+    counts = run(logins.project(db, [
+        _logout("703", ts=NOW + timedelta(seconds=1)),
+        _logout("703", ts=NOW + timedelta(seconds=1)),
+        _logout("703", ts=NOW + timedelta(seconds=1)),
+    ]))
+
+    assert len(db.sessions) == 1, "cele trei semnale au fabricat mai multe rânduri"
+    assert db.commands[0]["session_id"] == db.sessions[0]["id"]
+    assert counts["orphans_attached"] == 1, (
+        "aceeași comandă a fost numărată ca atașată de mai multe ori")
+    assert db.sessions[0]["command_count"] == 1, (
+        "contorul a numărat orfana de mai multe ori")
+
+
+def test_command_count_after_close_matches_the_rows_that_exist() -> None:
+    """`command_count` trebuie să fie de acord cu ce e realmente în
+    `session_commands`, chiar și pe calea de închidere -- nu doar la
+    deschidere, unde e deja probat de `test_the_counters_are_recomputed_from_the_rows`.
+    """
+    db = _DB()
+    run(logins.project(db, [
+        _command("704", ts=NOW, argv="/usr/bin/ls", exe="/usr/bin/ls"),
+        _command("704", ts=NOW, argv="/usr/bin/sudo systemctl restart x",
+                 exe="/usr/bin/sudo"),
+    ]))
+
+    run(logins.project(db, [_logout("704", ts=NOW + timedelta(seconds=5))]))
+
+    s = db.sessions[0]
+    legate = [c for c in db.commands if c["session_id"] == s["id"]]
+    assert s["command_count"] == len(legate) == 2
+    assert s["sudo_count"] == 1

@@ -198,6 +198,18 @@ def summary_text(session: dict[str, Any], varf: list[dict[str, Any]]) -> str:
     Comenzile privilegiate se arată pe nume; restul se numără. «412 comenzi» nu
     spune nimic, «412 comenzi, dintre care 3 cu sudo, și iată-le» spune ce s-a
     întâmplat.
+
+    ## De ce durata nu e mereu o durată
+
+    `closed_inferred` înseamnă că nimeni n-a văzut ieșirea: momentul închiderii
+    e ultima activitate cunoscută, pusă acolo de `reap_dead_sessions` sau de
+    `close_stale_sessions`. Sesiunea a ținut cel puțin atât, și posibil mult
+    mai mult — omul a putut sta la prompt o oră fără să tasteze.
+
+    Nu e un caz marginal. Măsurat în baza gazdei Ubuntu pe 15 septembrie 2026:
+    **17 din 17** sesiuni închise au `closed_inferred = true`, deci FIECARE
+    „Durată" trimisă vreodată de acolo a fost una dintr-astea, dată drept
+    măsurată. Una dintre ele spunea «0m» despre o sesiune cu 71 de comenzi.
     """
     cine = _esc(session.get("username") or "cont necunoscut")
     opened = session["opened_at"].astimezone(timezone.utc)
@@ -205,13 +217,18 @@ def summary_text(session: dict[str, Any], varf: list[dict[str, Any]]) -> str:
     durata = closed - opened
     minute = int(durata.total_seconds() // 60)
     lungime = f"{minute // 60}h {minute % 60}m" if minute >= 60 else f"{minute}m"
+    presupus = bool(session.get("closed_inferred"))
 
     linii = [
         "🔓 <b>Sesiune încheiată</b>",
         f"Cont: <code>{cine}</code> · de la <code>{session.get('src_ip') or 'local'}</code>",
-        f"Durată: {lungime} · {session.get('command_count', 0)} comenzi"
+        f"Durată: {'cel puțin ' if presupus else ''}{lungime}"
+        f" · {session.get('command_count', 0)} comenzi"
         f" · {session.get('sudo_count', 0)} privilegiate",
     ]
+    if presupus:
+        linii.append("· sfârșitul nu s-a văzut; s-a numărat până la ultima "
+                     "activitate, deci sesiunea a putut ține mai mult")
     # `command_count` numără rândurile care SUNT în tabelă, iar curățarea le poate
     # fi luat pe cele mai multe. Spus așa, mesajul rămâne adevărat și după ea: un
     # «0 comenzi» singur ar spune «n-a rulat nimic» despre un deploy de o jumătate
@@ -304,7 +321,7 @@ async def summarise_closed_sessions(db: Database) -> int:
     rows = await db.fetch(
         """
         SELECT id, session_key, username, host(src_ip) AS src_ip, terminal,
-               opened_at, closed_at, command_count, sudo_count,
+               opened_at, closed_at, closed_inferred, command_count, sudo_count,
                commands_purged
           FROM login_sessions
          WHERE closed_at IS NOT NULL
