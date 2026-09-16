@@ -80,6 +80,13 @@ coverage.xml
 *.db
 *.sqlite3
 data/
+# ...dar NU stratul de acces la date al agregatorului, care e COD.
+# Regula `data/` de mai sus e pentru directoare de date la rulare. Prindea si
+# `aggregator/lib/data/`: 12 fisiere .ts pe care panoul le ruleaza si care nu
+# existau in niciun depozit -- traiau doar pe discul unui om. Descoperit pe
+# 16 septembrie 2026, fiindca un test picase intr-o clona curata acolo unde
+# trecea in arborele de lucru.
+!aggregator/lib/data/
 dumps/
 *.pcap
 *.mmdb
@@ -126,6 +133,18 @@ sentinel/web/static/vendor/*
 
 # Prezentarea generată local (binar, conține un instantaneu de producție)
 docs/Sentinel-prezentare.pdf
+
+# Livrabilele comerciale generate local, ținute în docs/ la cererea operatorului
+# (9 septembrie 2026). Conțin capturi reale din producție: adrese, domenii,
+# identificatori de instanță. Repository-ul e public, deci fișierele stau pe disc
+# dar nu intră niciodată în istoric. Versiunea sanitizată, când există, primește
+# un nume fără dată și se adaugă explicit.
+docs/Sentinel-audit-securitate-*.pdf
+docs/Sentinel-rezumat-tehnic-*.docx
+docs/Sentinel-prezentare-20*.pdf
+docs/Sentinel-prezentare-20*.pptx
+docs/Sentinel-fisa-produs-*.pdf
+docs/Sentinel-fisa-produs-*.pptx
 
 # Worktree-uri temporare create de agenti; au propriul `.git` si nu sunt
 # continut de repository. Fara asta, `test_every_enumerated_file_can_be_read`
