@@ -664,6 +664,431 @@ async def cmd_patches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
+# --- cererea manuală a unui plan de patch -----------------------------------
+# Câte generări pot rula în paralel. NU e un plafon de cost — ăla e
+# `budget.allowed`, înăuntrul lui `planner.generate`, și e zilnic; ăsta e unul de
+# concurență. Măsurat pe gazda de producție pe 15 septembrie 2026: 857 de
+# findinguri deschise cu versiune care repară, adică 857 de apăsări posibile, iar
+# un apel Opus ține zeci de secunde. Două deodată e destul cât operatorul să nu
+# aștepte după el însuși, și destul de puțin cât o apăsare în buclă să fie
+# REFUZATĂ vizibil, nu servită tăcut.
+MAX_CONCURRENT_PLAN_REQUESTS = 2
+
+# Cine a cerut planul, scris în `patch_plans.generated_by`. Nu `'ai'`: valoarea
+# aia înseamnă „ieșit nesupravegheat din planner-ul automat", iar
+# `unnotified_plans` / `unnotified_window_gated_plans` chiar decid pe ea. Nu
+# `'manual'` nici: planul tot modelul îl scrie, iar `'manual'` (implicitul lui
+# `store_plan`) s-ar citi ca „scris de un om". Ăsta e exact al treilea caz —
+# redactat de model, cerut de un om, pe loc.
+MANUAL_PLAN_ORIGIN = "ai_manual"
+
+# Cererile în curs, pe finding. Dicționarul ține ȘI referința tare la task:
+# `asyncio` documentează că un task nereferit poate fi colectat de GC în timpul
+# rulării, iar aici asta ar însemna o generare plătită care dispare fără să
+# răspundă nimănui. Intrarea se scoate din `add_done_callback`, adică DUPĂ ce
+# corutina s-a terminat, nu dinăuntrul ei.
+_plan_requests: dict[int, asyncio.Task] = {}
+
+
+async def cmd_planifica(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/planifica <id vulnerabilitate>` — cere un plan de remediere pentru un
+    finding anume.
+
+    De ce există. `planner.generate_for_kev` redactează automat DOAR pentru
+    findingurile KEV, cu versiune care repară și fără plan viu — pe gazda reală
+    mulțimea aia e goală, deci nu face nimic, corect. Docstring-ul lui spune că
+    restul „pot aștepta să ceară un om", iar omul n-avea pe unde: `generate` era
+    importat într-un singur loc din tot codul, `scan/orchestrator.py`, care
+    cheamă doar `generate_for_kev`. Măsurat pe producție pe 15 septembrie 2026:
+    1028 findinguri deschise, 857 cu versiune care repară, ultimul plan generat
+    pe 3 august. Jumătatea automată a proiectării funcționa; jumătatea „la
+    cerere" n-a fost niciodată cablată.
+
+    Rolul se verifică aici, ca la orice comandă din `ACTING`: o generare e un
+    apel Opus plătit, adică o consecință, nu o citire. Verificarea de chat și de
+    expeditor (`_authorized`) o face `_guard`, iar mențiunea în grup
+    `_require_mention_in_group` — ambele fiindcă comanda e înregistrată în
+    `ACTING`, nu fiindcă le repetă ea. Vezi `on_flush_callback` pentru ce se
+    întâmplă când un handler verifică doar rolul.
+
+    Refuzurile deterministe se fac TOATE înainte de confirmare și înainte de
+    orice task: un finding inexistent, unul deja rezolvat, unul fără versiune
+    care repară și unul care are deja un plan viu sunt patru răspunsuri pe care
+    le poate da baza de date, iar niciunul nu merită un apel la model.
+    """
+    from sentinel.config import get_secrets
+    from sentinel.db.repo import findings as findings_repo
+    from sentinel.db.repo import patches as patch_repo
+    from sentinel.patch import planner
+
+    cfg: Config = context.bot_data["cfg"]
+    db: Database = context.bot_data["db"]
+    chat_id = update.effective_chat.id
+
+    if not _can_act(cfg, chat_id):
+        await update.message.reply_text(
+            "Cererea unui plan cheltuie un apel către model, deci cere rol de "
+            "operator sau owner. Contul tău are acces doar de vizualizare.")
+        return
+
+    # `.isdecimal()`, nu `.isdigit()`: `'²'.isdigit()` e `True` — categoria
+    # Unicode „digit" include exponenți și cifre-index care NU sunt zecimale
+    # — dar `int('²')` ridică `ValueError`, ceea ce ar fi omorât handlerul
+    # (vezi nota din memorie despre `[0-9]` sub UTF-8, același gen de
+    # defect). `.isdecimal()` acceptă doar cifrele pe care `int()` chiar le
+    # parsează, inclusiv cifre zecimale non-ASCII (arabo-indice etc.), la
+    # fel ca înainte.
+    if not context.args or not context.args[0].isdecimal():
+        await update.message.reply_text(
+            "Folosire: <code>/planifica &lt;id&gt;</code> — id-ul unei "
+            "VULNERABILITĂȚI din /vulnerabilitati.\n"
+            "Pentru un plan deja generat: <code>/patch &lt;id plan&gt;</code>.",
+            parse_mode=ParseMode.HTML)
+        return
+
+    finding_id = int(context.args[0])
+    finding = await findings_repo.get_finding(db, finding_id)
+    if finding is None:
+        await update.message.reply_text(
+            f"Vulnerabilitatea #{finding_id} nu există. Lista: /vulnerabilitati")
+        return
+    if finding.get("status") != "open":
+        await update.message.reply_text(
+            f"Vulnerabilitatea #{finding_id} nu mai e deschisă (stare: "
+            f"<code>{_esc(finding.get('status'))}</code>) — un plan pentru ea ar "
+            "repara ceva ce scanarea nu mai vede.", parse_mode=ParseMode.HTML)
+        return
+    # Ecosistemul pe care lanțul de patch chiar îl poate atinge, decis de
+    # `planner.unplannable_reason` din `platform.family` — nu de o listă scrisă
+    # a doua oară aici. Măsurat pe producție pe 15 septembrie 2026: din cele 857
+    # de findinguri deschise cu remediere cunoscută, 407 nu sunt pachete ale
+    # gazdei (npm, alpine, go, composer, deb sub trivy), iar primele 12 după
+    # prioritate sunt toate din categoria aia. Fără refuzul ăsta, prima apăsare
+    # a operatorului costă până la două apeluri Opus și se poate termina doar
+    # cu `rejected_invalid` sau cu un plan `dnf` plauzibil pentru un pachet
+    # Alpine, care pică abia la dry-run.
+    #
+    # Refuz, nu avertisment: e ușor de lărgit mai târziu (o intrare în
+    # `OS_PACKAGE_ECOSYSTEM`, sau un planner care știe și de containere), pe
+    # când banii cheltuiți pe un refuz garantat nu se întorc.
+    motiv_ecosistem = planner.unplannable_reason(
+        finding.get("ecosystem"), cfg.platform.family)
+    if motiv_ecosistem is not None:
+        await update.message.reply_text(
+            f"Vulnerabilitatea #{finding_id} "
+            f"(<code>{_esc(finding.get('package'))}</code>) nu poate primi un "
+            f"plan de remediere: {_esc(motiv_ecosistem)}.\n"
+            f"Detalii: <code>/vuln {finding_id}</code>",
+            parse_mode=ParseMode.HTML)
+        return
+
+    if not finding.get("fixed_version"):
+        # Refuzat aici, nu lăsat pe seama modelului: fără o versiune care repară
+        # nu există nimic de aplicat, planul n-ar avea ce pune în `apply`, iar
+        # `generate` oricum refuză înainte de apel. Diferența e că răspunsul
+        # vine acum, cu aceleași cuvinte pe care le folosește deja /vuln, în loc
+        # de o confirmare urmată de un refuz peste câteva secunde.
+        await update.message.reply_text(
+            f"Vulnerabilitatea #{finding_id} (<code>{_esc(finding.get('package'))}</code>) "
+            "nu are o versiune care o repară — nu există ce aplica. "
+            f"Detalii: <code>/vuln {finding_id}</code>", parse_mode=ParseMode.HTML)
+        return
+
+    live = await patch_repo.live_plan_for_finding(db, finding_id)
+    if live is not None:
+        # Refuz, nu înlocuire. Un plan viu poate fi `approved`, `scheduled` sau
+        # chiar `applying`, iar o redactare nouă ar lăsa două planuri vii pentru
+        # aceeași vulnerabilitate, fiecare cu propriile butoane — iar butoanele
+        # vechi sunt legate de `plan_hash`, deci ar deveni tăcut inutile. Calea
+        # de a cere altul există deja și e explicită: respinge-l pe ăsta cu
+        # butonul lui, ceea ce îi scoate statusul din `LIVE_PLAN_STATUSES`, și
+        # cere din nou.
+        await update.message.reply_text(
+            f"Vulnerabilitatea #{finding_id} are deja planul <b>#{live.id}</b> "
+            f"(stare: <code>{_esc(live.status)}</code>).\n"
+            f"Vezi-l: <code>/patch {live.id}</code>. Dacă nu e bun, respinge-l de "
+            "pe butonul lui și cere altul.", parse_mode=ParseMode.HTML)
+        return
+
+    if finding_id in _plan_requests:
+        await update.message.reply_text(
+            f"Deja cer un plan pentru vulnerabilitatea #{finding_id} — mai durează "
+            "câteva zeci de secunde. Îți scriu când e gata.")
+        return
+    if len(_plan_requests) >= MAX_CONCURRENT_PLAN_REQUESTS:
+        await update.message.reply_text(
+            f"Se generează deja {len(_plan_requests)} planuri "
+            f"(maximum {MAX_CONCURRENT_PLAN_REQUESTS} deodată). "
+            "Mai încearcă după ce primești răspunsul la ele.")
+        return
+
+    api_key = get_secrets().get("ANTHROPIC_API_KEY")
+    if not api_key:
+        await update.message.reply_text(
+            "Generarea unui plan are nevoie de o cheie API Anthropic, care nu e "
+            "configurată acum.")
+        return
+    if not cfg.ai.enabled:
+        await update.message.reply_text("Stratul AI e dezactivat în configurație.")
+        return
+
+    # Locul se rezervă ÎNAINTE de `await`-ul care trimite confirmarea: între
+    # verificarea de mai sus și crearea task-ului nu are voie să existe un punct
+    # de suspendare, altfel două apăsări rapide trec amândouă de ea și plătesc
+    # două apeluri pentru același finding. `create_task` doar programează —
+    # corutina pornește abia la primul `await` de mai jos, deci confirmarea
+    # pleacă prima.
+    task = asyncio.create_task(_run_plan_request(
+        context.bot, db, cfg, api_key, chat_id=chat_id, finding=finding))
+    _plan_requests[finding_id] = task
+    task.add_done_callback(
+        lambda t: _cerere_incheiata(finding_id, chat_id, t))
+
+    await update.message.reply_text(
+        f"🧠 Cer un plan de remediere pentru vulnerabilitatea <b>#{finding_id}</b> "
+        f"(<code>{_esc(finding.get('cve') or finding.get('title'))}</code> · "
+        f"{_esc(finding.get('package'))} "
+        f"{_esc(finding.get('installed_version') or '?')} → "
+        f"{_esc(finding.get('fixed_version'))}).\n"
+        "<i>Modelul are două încercări, validatorul decide. Durează de obicei "
+        "zeci de secunde — îți scriu oricum ar ieși.</i>",
+        parse_mode=ParseMode.HTML)
+
+
+def _cerere_incheiata(finding_id: int, chat_id: int, task: asyncio.Task) -> None:
+    """Eliberează locul din registru ȘI citește excepția task-ului.
+
+    Locul se eliberează oricum ar fi ieșit generarea — asta face de la început.
+    Citirea excepției e plasa de sub plasă: `_run_plan_request` își prinde
+    singur eșecurile și le spune operatorului, dar dacă însuși blocul `except`
+    de acolo moare (sau dacă task-ul e omorât altfel), singurul lucru care ar
+    mai fi rămas era mesajul lui `asyncio` — „Task exception was never
+    retrieved", în jurnalul lui `asyncio`, nu al lui Sentinel, la o oră
+    nedeterminată, când colectorul de gunoi ajunge la task. Aici e citită pe
+    loc, sub numele modulului, cu findingul și chatul lângă ea.
+
+    `task.exception()` ridică `CancelledError` pentru un task anulat, deci
+    anularea se verifică ÎNAINTE — o anulare la oprirea botului nu e un defect
+    de raportat.
+    """
+    _plan_requests.pop(finding_id, None)
+    if task.cancelled():
+        log.warning("plan request cancelled",
+                    extra={"finding": finding_id, "chat_id": chat_id})
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.error("plan request task died without reporting",
+                  extra={"finding": finding_id, "chat_id": chat_id,
+                         "detail": f"{type(exc).__name__}: {exc}"})
+
+
+async def _run_plan_request(bot: Any, db: Database, cfg: Config, api_key: str, *,
+                            chat_id: int, finding: dict[str, Any]) -> None:
+    """Redactarea propriu-zisă, în afara buclei de long-poll.
+
+    De ce task separat. `planner.generate` face până la două apeluri Opus, de
+    ordinul zecilor de secunde fiecare, iar `python-telegram-bot` procesează
+    update-urile UNUL CÂTE UNUL (`concurrent_updates` nu e activat în
+    `build_application`). Un `await` de patruzeci de secunde în handler ar fi
+    însemnat un bot mut pe toată durata lui: nici /status, nici /unblock, nici
+    butonul de deblocare de pe alerta care tocmai a sosit.
+
+    De ce fiecare ieșire ajunge la operator. Un task de fundal care moare cu o
+    excepție NU trece prin `add_error_handler`-ul lui PTB; ar rămâne doar
+    confirmarea de pornire și apoi tăcere — adică exact forma din CLAUDE.md în
+    care se confirmă intenția, nu efectul. Ce nu poate fi trimis se jurnalizează
+    explicit, fiindcă „nu știu" și „e bine" sunt stări diferite.
+
+    De ce NIMIC nu stă în afara lui `try`, nici măcar importurile și citirea
+    id-ului. Găsit la revizuire (runda 2), demonstrat: cu cele trei importuri și
+    `int(finding["id"])` deasupra blocului, un `ImportError` pe o gazdă livrată
+    pe jumătate — sau orice altceva pe liniile alea — omora task-ul ÎNAINTE de
+    `try`. Operatorul rămânea cu „🧠 Cer un plan…" și cu tăcere, `log.error` nu
+    rula niciodată, iar singura urmă era „Task exception was never retrieved" în
+    jurnalul lui `asyncio`. Plasa de sub plasă e `_cerere_incheiata`, care
+    citește excepția task-ului dacă până și `except`-ul de aici cade.
+    """
+    async def _spune(text: str) -> None:
+        await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+
+    try:
+        from sentinel.db.repo import patches as patch_repo
+        from sentinel.patch import planner
+        from sentinel.telegram import patch_flow
+
+        finding_id = int(finding["id"])
+        eticheta = _esc(finding.get("cve") or finding.get("package") or f"#{finding_id}")
+
+        plan_db_id, status = await planner.generate(
+            db, cfg, api_key, finding_id, generated_by=MANUAL_PLAN_ORIGIN)
+
+        if status == "validated" and plan_db_id is not None:
+            row = await patch_repo.get_plan(db, plan_db_id)
+            if row is None:
+                # Generat, stocat, și necitit înapoi. Nu e „a mers" și nu e nici
+                # „a picat" — e a treia stare, și se spune ca atare.
+                await _spune(
+                    f"⚠️ Planul <b>#{plan_db_id}</b> pentru vulnerabilitatea "
+                    f"#{finding_id} a fost generat și validat, dar nu l-am putut "
+                    f"reciti din bază ca să ți-l arăt. Încearcă "
+                    f"<code>/patch {plan_db_id}</code>.")
+                return
+            nota, cu_aplicare = await _verdict_de_intoarcere(db, row)
+            await patch_flow.send_plan_for_approval(
+                bot, db, chat_id, row, gate_note=nota, allow_apply=cu_aplicare)
+            # Marcat notificat DUPĂ ce a plecat, nu înainte. Planul e
+            # `generated_by = MANUAL_PLAN_ORIGIN`, deci trece de filtrul
+            # `generated_by <> 'ai'` din `unnotified_plans` și `_push_plans` l-ar
+            # oferi a doua oară, cu încă un set de butoane, în cel mult 15
+            # secunde. Dacă trimiterea de mai sus aruncă, linia asta nu se
+            # execută — și atunci bucla de push chiar trebuie să-l livreze:
+            # „nimic nu e marcat notificat până nu ajunge la cineva".
+            #
+            # Marcat ȘI când butonul de aplicare a fost RETRAS (`cu_aplicare`
+            # fals): altfel `_push_plans` l-ar trimite din nou peste 15 secunde,
+            # cu butonul întreg și fără verdict, adică exact ce tocmai s-a
+            # refuzat. Retragerea butonului de aici n-ar mai fi însemnat nimic.
+            await patch_repo.mark_plan_notified(db, plan_db_id)
+            log.warning("patch plan generated on request",
+                        extra={"plan": plan_db_id, "finding": finding_id,
+                               "chat_id": chat_id})
+            return
+
+        if status == "rejected_invalid":
+            # Lista de erori E răspunsul. Modelul a cheltuit două încercări, iar
+            # ce a produs refuzul lor e singurul lucru de valoare care a rămas:
+            # spune dacă e vina promptului, a modelului sau a unui pachet care
+            # chiar nu se poate repara aici. Un „a eșuat" generic ar arunca-o,
+            # cu ea stând scrisă în `patch_plans.validation_errors`.
+            row = await patch_repo.get_plan(db, plan_db_id) if plan_db_id else None
+            errors = row.validation_errors if row is not None else None
+            lines = [
+                f"⛔ <b>Plan RESPINS de validator</b> — vulnerabilitatea "
+                f"#{finding_id} ({eticheta})",
+                f"Modelul a avut {planner.MAX_ATTEMPTS} încercări; a doua a primit "
+                "erorile primei înapoi și tot n-a trecut.",
+            ]
+            if isinstance(errors, list) and errors:
+                lines.append("")
+                lines.append("<b>Ce a reclamat validatorul:</b>")
+                for err in errors[:8]:
+                    cale = _esc(str(err.get("path") or "?"))[:80]
+                    mesaj = _esc(str(err.get("message") or err.get("code") or "?"))[:200]
+                    lines.append(f"• <code>{cale}</code>: {mesaj}")
+                if len(errors) > 8:
+                    lines.append(f"<i>…și încă {len(errors) - 8}.</i>")
+            else:
+                lines.append("")
+                lines.append(
+                    "<i>Planul respins nu poartă nicio listă de erori în bază — "
+                    "asta n-ar trebui să se întâmple, verifică jurnalul lui "
+                    "sentinel-telegram.</i>")
+            if plan_db_id:
+                lines.append(
+                    f"\nPlanul e păstrat ca dovadă: <code>/patch {plan_db_id}</code>.")
+            await _spune("\n".join(lines))
+            return
+
+        # Orice altceva e un MOTIV, nu o stare de plan: buget epuizat, asset
+        # protejat, model indisponibil, finding dispărut între timp. Textul vine
+        # ca atare de la `planner.generate`, care spune exact ce s-a întâmplat —
+        # inclusiv numele asset-ului protejat și cifrele plafonului de buget. Un
+        # mesaj generic scris aici ar arunca singurul lucru pe care refuzul l-a
+        # produs, iar o traducere pe bucăți ar cere potrivirea pe textul altui
+        # modul, care se schimbă fără să anunțe.
+        await _spune(
+            f"⛔ Niciun plan pentru vulnerabilitatea #{finding_id} ({eticheta}).\n"
+            f"Motiv: <b>{_esc(status)}</b>")
+    except Exception as exc:  # noqa: BLE001 - un task de fundal nu are plasă
+        # Recitit din `finding` cu `.get`, nu din variabilele de mai sus: blocul
+        # ăsta trebuie să spună DESPRE CE vulnerabilitate vorbește și atunci când
+        # `try` a murit chiar pe linia care citea id-ul, adică înainte ca ele să
+        # existe. `.get` pe un dict nu poate arunca; dacă nici `finding` nu e un
+        # dict, „?" e răspunsul onest, iar excepția tot ajunge în mesaj.
+        detalii = finding if isinstance(finding, dict) else {}
+        numar = _esc(detalii.get("id", "?"))
+        unde = _esc(detalii.get("cve") or detalii.get("package") or "?")
+        log.error("plan request failed", exc_info=exc,
+                  extra={"finding": detalii.get("id"), "chat_id": chat_id,
+                         "detail": f"{type(exc).__name__}: {exc}"})
+        try:
+            await _spune(
+                f"❌ Cererea de plan pentru vulnerabilitatea #{numar} "
+                f"({unde}) a picat: <code>{_esc(type(exc).__name__)}: "
+                f"{_esc(exc)}</code>")
+        except Exception as send_exc:  # noqa: BLE001
+            log.error("plan request outcome reached nobody",
+                      extra={"finding": detalii.get("id"), "chat_id": chat_id,
+                             "detail": f"{type(send_exc).__name__}: {send_exc}"})
+
+
+async def _verdict_de_intoarcere(db: Database, row: Any) -> tuple[str, bool]:
+    """Verdictul porții de întoarcere pentru un plan: textul care se pune lângă
+    el și dacă butonul „Aplică" are voie să apară.
+
+    Decizia NU e recalculată aici: `window.evaluate(plan, dovadă)` e o funcție
+    pură, iar docstring-ul ei spune explicit că există ca să fie refolosită
+    identic de fereastra săptămânală și de verificarea de sănătate. A treia
+    folosire e asta. O copie a regulilor scrisă aici ar fi divergit exact în
+    direcția în care contează: un plan pe care fereastra îl refuză, oferit cu
+    buton întreg de cealaltă cale.
+
+    Ce se face cu verdictul (decizie luată pe 15 septembrie 2026, fiindcă
+    operatorul n-a răspuns, deci varianta conservatoare):
+
+    * `NOT_REVERSIBLE` — butonul „Aplică" se RETRAGE. Fie planul se declară
+      el însuși irevocabil, fie ultimul exercițiu a găsit o arhivă care nu se
+      reface; niciuna nu e o lipsă de informație, ambele sunt un defect numit.
+      Dry-run și Respinge rămân: niciunul nu schimbă mașina.
+    * `UNPROVEN` — butonul rămâne, cu verdictul scris lângă el. Măsurat pe
+      amândouă gazdele pe 15 septembrie 2026, `latest_archive_drill_summary`
+      n-are niciun rând (0 artefacte-arhivă în `restore_drill_items`), deci
+      ORICE plan iese azi `UNPROVEN`; ascuns la starea asta, butonul n-ar
+      exista niciodată, iar comanda ar fi inutilă din prima zi. Lăsat FĂRĂ
+      verdict ar fi fost varianta în care sistemul știa că întoarcerea nu e
+      dovedită și n-a spus nimic.
+    * orice altă stare — tratată ca necunoscută, cu butonul retras. „Nu știu"
+      și „e bine" sunt stări diferite; dacă poarta capătă vreodată o a patra
+      stare, drumul spre execuție nu se deschide singur pentru ea.
+
+    Dacă dovada nu poate fi CITITĂ, verdictul e „necunoscut", spus ca atare, și
+    butonul rămâne — lipsa unei citiri din baza de date nu e un fapt despre
+    plan, iar tratarea ei ca refuz ar face comanda să pară stricată exact când
+    baza are o pană scurtă.
+    """
+    from sentinel.db.repo import patches as patch_repo
+    from sentinel.patch import window
+
+    try:
+        dovada = await patch_repo.latest_archive_drill_summary(db)
+    except Exception as exc:  # noqa: BLE001
+        log.error("return-path verdict could not be computed",
+                  extra={"plan": getattr(row, "id", None),
+                         "detail": f"{type(exc).__name__}: {exc}"})
+        return ("❔ <b>Întoarcere: necunoscută</b> — n-am putut citi dovada "
+                f"exercițiului de restaurare (<code>{_esc(type(exc).__name__)}</code>). "
+                "Butonul rămâne, dar nimic nu spune azi că planul se poate "
+                "întoarce.", True)
+
+    poarta = window.evaluate(row.plan, dovada)
+    if poarta.state == window.REVERSIBLE:
+        return (f"✅ <b>Întoarcere dovedită</b> — {_esc(poarta.reason)}", True)
+    if poarta.state == window.NOT_REVERSIBLE:
+        return (f"⛔ <b>Fără cale de întoarcere</b> — {_esc(poarta.reason)}\n"
+                "<i>Butonul de aplicare a fost RETRAS. Dry-run și Respinge "
+                "rămân — niciunul nu schimbă nimic pe mașină.</i>", False)
+    if poarta.state == window.UNPROVEN:
+        return (f"⚠️ <b>Întoarcere NEDOVEDITĂ</b> — {_esc(poarta.reason)}\n"
+                "<i>Butonul de aplicare rămâne: tu ai cerut planul și ești "
+                "lângă el. Lipsa dovezii nu e o dovadă că nu merge — dar e "
+                "lipsa dovezii.</i>", True)
+    return (f"❔ <b>Întoarcere: verdict necunoscut</b> "
+            f"(<code>{_esc(poarta.state)}</code>) — {_esc(poarta.reason)}\n"
+            "<i>Butonul de aplicare a fost RETRAS: o stare pe care codul ăsta "
+            "n-o cunoaște nu deschide singură drumul spre execuție.</i>", False)
+
+
 async def cmd_intreaba(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """`/intreaba <întrebare>` — întrebări în limbaj natural despre starea
     serverului, răspunse dintr-un catalog fix de interogări scrise de mână
@@ -1806,6 +2231,11 @@ ACTING = [
             "Închide un incident ca fals-pozitiv: /fp 42"),
     Command(("stiu", "ack"), cmd_ack_exposure,
             "Marchează o expunere ca intenționată: /stiu tcp/10000"),
+    # Nu „patch": `/patch <id>` înseamnă deja PLANUL cu id-ul ăla, iar comanda
+    # asta primește id-ul unei VULNERABILITĂȚI. Două verbe pentru două lucruri,
+    # ca mesajul care trimite la ele să nu fie nevoit să explice care e care.
+    Command(("planifica", "genereaza"), cmd_planifica,
+            "Cere un plan de remediere: /planifica 7 (id din /vulnerabilitati)"),
     Command(("block", "blocheaza"), cmd_block,
             "Blochează un IP: /block 203.0.113.7 24h"),
     Command(("unblock", "deblocheaza"), cmd_unblock,

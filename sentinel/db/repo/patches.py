@@ -114,6 +114,50 @@ async def list_plans(db: Database, *, limit: int = 50) -> list[PlanRow]:
     return [_plan(r) for r in rows]
 
 
+# Statusurile în care planul unui finding e ÎNCĂ VIU: există, e al cuiva, și o a
+# doua redactare pentru același finding ar fi bani cheltuiți pe un duplicat.
+#
+# Scrise O SINGURĂ DATĂ aici fiindcă DOUĂ locuri iau o decizie din ele —
+# `planner.generate_for_kev` (ce mai merită redactat automat) și
+# `live_plan_for_finding` de mai jos (ce refuză o cerere manuală de pe Telegram).
+# Două copii ar fi divergit exact în direcția care doare: una ar fi lăsat să
+# treacă un duplicat pe care cealaltă îl credea blocat, iar diferența s-ar fi
+# văzut abia pe factura de la model.
+#
+# Ce NU e aici, deliberat, dintre statusurile admise de CHECK-ul din
+# `0004_patch.sql`: `draft`, `rejected_invalid`, `rejected`, `expired`,
+# `failed`, `rolled_back`. Fiecare înseamnă că finding-ul a rămas FĂRĂ plan
+# utilizabil, deci o redactare nouă e exact ce trebuie — vezi
+# `tests/unit/test_patch_planner_kev.py` pentru `expired`, unde blocarea ar fi
+# lăsat un finding KEV fără plan pentru totdeauna.
+LIVE_PLAN_STATUSES = ("validated", "approved", "applying", "applied", "scheduled")
+
+
+async def live_plan_for_finding(db: Database, finding_id: int) -> PlanRow | None:
+    """Planul viu al unui finding, dacă are unul — altfel `None`.
+
+    `generate_for_kev` are aceeași condiție, ca `NOT EXISTS`, fiindcă alege
+    singur findingurile. `planner.generate` nu are niciuna: e treaba
+    apelantului, spune docstring-ul lui. Pentru o cerere manuală apelantul e
+    `bot.cmd_planifica`, iar fără verificarea asta a doua apăsare pe același
+    finding ar plăti încă un apel Opus pentru un plan pe care operatorul îl are
+    deja pe ecran — și ar produce două planuri vii pentru aceeași
+    vulnerabilitate, fiecare cu propriile butoane de aprobare.
+
+    Cel mai RECENT, dacă cumva sunt mai multe: e cel către care trimitem
+    operatorul.
+    """
+    row = await db.fetchrow(
+        f"""
+        SELECT {_PLAN_COLS} FROM patch_plans
+        WHERE $1 = ANY(finding_ids) AND status = ANY($2::text[])
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        finding_id, list(LIVE_PLAN_STATUSES))
+    return _plan(row) if row else None
+
+
 # --- push queue -------------------------------------------------------------
 #
 # The bot claims rows from these two queries and stamps them. Everything else
@@ -214,10 +258,44 @@ async def set_plan_status(db: Database, plan_db_id: int, status: str) -> None:
 
 
 async def expire_stale_plans(db: Database) -> int:
+    """Expiră planurile care NU sunt în grija ferestrei, după `PLAN_TTL_HOURS`.
+
+    Chemată din `maintenance_service.expire_plans` (orar). Până pe 15
+    septembrie 2026 funcția asta n-avea NICIUN apelant — grep peste `sentinel/`,
+    `deploy/` și `scripts/` întorcea doar definiția — iar consecința s-a văzut
+    abia când `/planifica` a început să scrie planuri `generated_by='ai_manual'`:
+    un plan cerut de operator și lăsat neatins nu expira niciodată, deci bloca
+    pentru totdeauna orice altă cerere pentru același finding
+    (`live_plan_for_finding`), bloca `generate_for_kev` dacă findingul era KEV,
+    iar `/patch <id>` continua să ofere butoane de aprobare luni mai târziu,
+    pentru versiuni de pachet care între timp se schimbaseră.
+
+    `generated_by IS DISTINCT FROM 'ai'` — deci NU planurile automate:
+
+    * un plan AI are deja un ciclu propriu de îmbătrânire, cu alt plafon și alt
+      motiv (`expire_stale_window_candidates`, `WINDOW_CANDIDATE_MAX_AGE_DAYS`
+      = 30 de zile). Exercițiul de restaurare rulează lunar, fereastra
+      săptămânal; cele 72h de aici l-ar omorî pe fiecare înainte ca fereastra
+      să apuce să se uite la el, adică ar face Funcționalitatea 08 inertă;
+    * un plan cerut de om n-are nicio fereastră care să-l aștepte: i s-au dat
+      butoanele pe loc. Dacă n-a fost atins în trei zile, faptele pe care a fost
+      scris (versiunea instalată, versiunea care repară) sunt vechi de trei zile
+      — iar o cerere nouă e ieftină și scrie planul pe faptele de acum.
+
+    `IS DISTINCT FROM`, nu `<>`: coloana e `TEXT NULL` fără CHECK, iar planurile
+    scrise înainte ca eticheta să existe au `generated_by` NULL. Cu `<>`, NULL
+    n-ar fi fost niciodată egal cu nimic și rândurile alea ar fi rămas veșnice —
+    exact defectul reparat aici, mutat pe altă coloană.
+
+    `expired` nu e în `LIVE_PLAN_STATUSES`, deci expirarea de aici chiar
+    deblochează cererea următoare; asta e capătul PRODUCTIV al plafonului, la
+    fel ca la `expire_stale_window_candidates`.
+    """
     rows = await db.fetch(
         """
         UPDATE patch_plans SET status = 'expired'
         WHERE status IN ('validated', 'approved')
+          AND generated_by IS DISTINCT FROM 'ai'
           AND created_at < now() - make_interval(hours => $1)
         RETURNING id
         """,
@@ -488,11 +566,28 @@ async def window_candidate_plans(db: Database, *, limit: int = 10,
     eliberat oricând ar deveni eligibil, oricât de departe în timp — găsit la
     revizuire, nu presupus. `PLAN_TTL_HOURS` (72h) e prea scurt pentru
     cadența săptămânală a ferestrei; vezi `WINDOW_CANDIDATE_MAX_AGE_DAYS`.
+
+    `generated_by = 'ai'`, ca la `expire_stale_window_candidates` și
+    `unnotified_window_gated_plans`: toată calea ferestrei e despre output
+    NESUPRAVEGHEAT al planner-ului automat. Filtrul lipsea de aici, iar de pe
+    15 septembrie 2026 `/planifica` scrie planuri `ai_manual`, care intrau în
+    bazin — cu trei urmări, toate greșite:
+
+    * un plan cerut de om, pe care omul nu-l atinge, putea deveni
+      `outstanding_window_plan` și oprea fereastra să mai propună ORICE până la
+      o decizie umană — o comandă manuală ar fi blocat calea automată;
+    * dacă un exercițiu de restaurare l-ar fi găsit eligibil, ar fi fost
+      ștampilat `proposed_by_window` de o fereastră care nu l-a trecut
+      niciodată prin poartă, iar de acolo un eșec al lui ar fi aprins
+      `window_halt` pentru toate celelalte;
+    * planul manual are deja butoanele lui, trimise la cererea operatorului;
+      n-are ce „elibera" fereastra la el.
     """
     rows = await db.fetch(
         f"""
         SELECT {_PLAN_COLS} FROM patch_plans
-        WHERE status = 'validated' AND NOT proposed_by_window
+        WHERE status = 'validated' AND generated_by = 'ai'
+          AND NOT proposed_by_window
           AND created_at > now() - make_interval(days => $1)
         ORDER BY created_at
         LIMIT $2
@@ -509,9 +604,9 @@ async def expire_stale_window_candidates(db: Database, *,
     nu doar tăierea din `window_candidate_plans`.
 
     Fără asta, un plan care depășește plafonul dispărea tăcut: nimic nu-l
-    marca `expired` (`expire_stale_plans`, definit mai sus pentru
-    `PLAN_TTL_HOURS`, n-are niciun apelant — cod mort, lăsat neatins aici,
-    fiindcă pragul lui de 72h e alt concept, pentru altă cale), iar
+    marca `expired` (`expire_stale_plans`, definit mai sus, nu atinge planurile
+    AI — pragul lui de 72h e alt concept, pentru altă cale: planurile cerute de
+    om, care n-au nicio fereastră care să le aștepte), iar
     `planner.generate_for_kev` refuză să redacteze un plan nou cât timp
     finding-ul are unul `validated` — deci finding-ul KEV rămânea fără plan
     proaspăt PENTRU TOTDEAUNA, iar `/patches` nu spunea nimic despre asta.

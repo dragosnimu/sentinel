@@ -38,6 +38,69 @@ log = get_logger(__name__)
 
 MAX_ATTEMPTS = 2
 
+# Lista de statusuri „planul e încă viu" vine din `repo.LIVE_PLAN_STATUSES`, nu
+# scrisă a doua oară aici: aceeași decizie e luată și de
+# `repo.live_plan_for_finding`, pentru cererea manuală de pe Telegram. Două copii
+# ar fi divergit, iar divergența ar fi fost invizibilă — una ar refuza o cerere
+# pe care cealaltă o consideră necesară.
+#
+# Interpolare de text, nu parametru: rămâne o listă de literali constanți din
+# cod (nimic din afară nu ajunge aici), iar forma `IN (...)` e chiar cea pe care
+# `tests/unit/test_patch_planner_kev.py` o ia din interogarea reală și o rulează
+# pe SQLite.
+_LIVE_STATUS_LIST = ", ".join(f"'{status}'" for status in repo.LIVE_PLAN_STATUSES)
+
+# Ecosistemul de pachete pe care planul îl poate CHIAR atinge, pe familie de
+# distribuție — `platform.family` din configurație, scris de instalator.
+#
+# Măsurat pe gazda de producție pe 15 septembrie 2026: din 857 de findinguri
+# deschise cu versiune care repară, 450 sunt `rpm` (scaner `dnf`) și 407 nu
+# sunt — npm 185, alpine 82, go 80, composer 44, deb 16 — iar TOATE primele 12
+# după prioritate sunt din a doua categorie. Cele 407 vin din `trivy_image`
+# (conținutul unei imagini de container) și `trivy_fs` (lockfile-uri de
+# aplicație): nu sunt pachete ale gazdei, iar reparația lor înseamnă
+# reconstruirea imaginii sau `npm`/`composer` — binare pe care allowlist-ul
+# executorului nu le mai conține (vezi docs/PATCHING.md §10, îngustat pe 8
+# septembrie 2026). Un plan pentru ele nu poate exista, oricât de bun ar fi
+# modelul: singurul final posibil e `rejected_invalid` sau un plan `dnf`
+# plauzibil pentru un pachet Alpine, care pică la dry-run.
+OS_PACKAGE_ECOSYSTEM: dict[str, str] = {"rhel": "rpm", "debian": "deb"}
+
+
+def unplannable_reason(ecosystem: str | None, family: str) -> str | None:
+    """Motivul pentru care findingul ăsta nu poate primi un plan pe gazda asta,
+    sau `None` dacă poate. Determinist, fără bază de date și fără model — exact
+    ca poarta de asset protejat din `generate`, și din același motiv: un refuz
+    sigur nu merită două apeluri Opus.
+
+    Funcție, nu o mulțime globală, fiindcă răspunsul depinde de gazdă: pe
+    familia `rhel` se pot planifica pachete `rpm`, pe `debian` pachete `deb`.
+    O familie necunoscută NU e tratată ca „probabil rpm" — „nu știu" și „e
+    bine" sunt stări diferite, iar direcția sigură aici e refuzul.
+
+    Textul întors e SIMPLU, fără marcaj: apelantul îl escapează și îl pune în
+    mesajul lui (vezi `bot.cmd_planifica`). Un modul care nu vorbește cu
+    Telegram n-are de unde ști în ce format e citit.
+    """
+    asteptat = OS_PACKAGE_ECOSYSTEM.get((family or "").strip().lower())
+    if asteptat is None:
+        return (f"gazda e declarată platform.family={family!r}, iar pentru "
+                "familia asta nu se știe ce pachete poate atinge un plan — nu "
+                "se cere unul pe ghicite")
+    eco = (ecosystem or "").strip().lower()
+    if not eco:
+        return ("findingul nu spune din ce ecosistem e, deci nu se poate ști "
+                "dacă e un pachet al gazdei — un plan cerut pe nesigur costă un "
+                "apel la model ca să fie respins")
+    if eco != asteptat:
+        return (f"e o vulnerabilitate {eco}, nu un pachet al gazdei. Se pot "
+                f"planifica doar pachetele de sistem {asteptat}: restul "
+                "(conținut de container, lockfile-uri de aplicație) se repară "
+                "reconstruind imaginea sau din depozitul aplicației, iar "
+                "binarele alea nu sunt în allowlist-ul executorului "
+                "(docs/PATCHING.md §10)")
+    return None
+
 
 def _check_fields_doc() -> str:
     """Render the per-kind required fields FROM the validator's own table.
@@ -230,11 +293,21 @@ def _build_user(ctx: dict[str, Any], errors: list[str] | None = None) -> str:
 
 
 async def generate(db: Database, cfg: Config, api_key: str,
-                   finding_id: int) -> tuple[int | None, str]:
+                   finding_id: int, *, generated_by: str = "ai") -> tuple[int | None, str]:
     """Generate, validate and store a plan for one finding.
 
     Returns (plan_db_id, status). Status is 'validated', 'rejected_invalid', or
     an error string. Never raises into the caller's loop.
+
+    `generated_by` records WHO asked, not who drafted — the model drafts either
+    way. It defaults to `'ai'`, which is what `generate_for_kev` stores and what
+    `unnotified_plans` holds back from the fast approval channel until
+    `sentinel-patch-window` releases it (see `0043_patch_window.sql`). A plan the
+    operator asked for by name is not unattended model output: it is attended by
+    definition, it goes straight back to the chat that asked, and the same
+    migration says so — "bucla rapidă oferă BUTONUL DE APROBARE direct pentru
+    planurile care NU vin de la planner-ul automat". Passing a different value is
+    how that path finally exists.
     """
     ctx = await _context(db, finding_id)
     if ctx is None:
@@ -281,7 +354,7 @@ async def generate(db: Database, cfg: Config, api_key: str,
             plan_db_id = await repo.store_plan(
                 db, plan=plan, plan_hash=plan_hash(plan), status="validated",
                 asset_id=ctx.get("asset_id"), finding_ids=[finding_id],
-                generated_by="ai", model=model)
+                generated_by=generated_by, model=model)
             log.warning("patch plan generated",
                         extra={"plan": plan_db_id, "finding": finding_id,
                                "attempt": attempt, "cve": ctx.get("cve")})
@@ -299,7 +372,7 @@ async def generate(db: Database, cfg: Config, api_key: str,
         asset_id=ctx.get("asset_id"), finding_ids=[finding_id],
         validation_errors=[{"path": e.path, "code": e.code, "message": e.message}
                            for e in validation.errors],
-        generated_by="ai", model=model)
+        generated_by=generated_by, model=model)
     log.error("patch plan rejected after retries",
               extra={"plan": plan_db_id, "finding": finding_id,
                      "errors": len(errors or [])})
@@ -315,13 +388,13 @@ async def generate_for_kev(db: Database, cfg: Config, api_key: str,
     exploiting can wait for a human to ask.
     """
     rows = await db.fetch(
-        """
+        f"""
         SELECT f.id FROM findings f
         WHERE f.status = 'open' AND f.kev AND f.fixed_version IS NOT NULL
           AND NOT EXISTS (
               SELECT 1 FROM patch_plans p
               WHERE f.id = ANY(p.finding_ids)
-                AND p.status IN ('validated','approved','applying','applied','scheduled')
+                AND p.status IN ({_LIVE_STATUS_LIST})
           )
         ORDER BY f.priority DESC LIMIT $1
         """,

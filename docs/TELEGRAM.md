@@ -159,6 +159,7 @@ există, câteva alias-uri românești sau englezești care fac același lucru.
 | `/rezolva <id> [notă]` | `/resolve` | Închide un incident |
 | `/fp <id>` | `/falspozitiv` | Închide un incident ca fals-pozitiv |
 | `/stiu <cheie> [nu]` | `/ack` | Marchează o expunere ca intenționată, sau anulează marcajul |
+| `/planifica <id vuln>` | `/genereaza` | Cere un plan de remediere pentru o vulnerabilitate anume — vezi §3.2 |
 | `/block <ip> [durată]` | `/blocheaza` | Blochează un IP, cu confirmare. Durata: `1h`, `30m`, secunde, sau `perm` — între 60s și 30 de zile |
 | `/unblock <ip>` | `/deblocheaza` | Deblochează un IP |
 | `/panic` | — | **Golește tot blocklist-ul, imediat.** Dublă confirmare. Disponibilă chiar și pe mute |
@@ -217,11 +218,75 @@ Dacă interogarea preferințelor eșuează, botul **alertează oricum**. E singu
 direcție sigură: o eroare de bază de date nu are voie să tacă un canal de
 securitate.
 
-Planurile de patch se aprobă prin butoane, nu prin comenzi separate de tipul
+Planurile de patch se **aprobă** prin butoane, nu prin comenzi separate de tipul
 `/plan` sau `/restore` — vezi `/patches` mai sus și §4 pentru fluxul de
-aprobare în doi pași. `/scan`, `/report`, `/predict`, `/version`, `/config`
-și `/budget` nu există în cod; erau documentate aici fără să fi fost
-implementate vreodată.
+aprobare în doi pași. A **cere** un plan e altceva, și pentru asta există
+`/planifica` (§3.2). `/plan`, `/restore`, `/scan`, `/report`, `/predict`,
+`/version`, `/config` și `/budget` nu există în cod; erau documentate aici fără
+să fi fost implementate vreodată.
+
+### 3.2 `/planifica <id vulnerabilitate>` — cere un plan
+
+Generarea automată (`planner.generate_for_kev`) redactează planuri doar pentru
+vulnerabilitățile din catalogul KEV care au și o versiune care le repară.
+Deliberat: un apel la model costă bani, iar un plan pentru ceva ce nimeni nu
+exploatează „poate aștepta să ceară un om". Pe gazdă, mulțimea aceea e goală —
+1028 de findinguri deschise, 857 cu remediere cunoscută, un singur KEV și niciun
+KEV cu remediere (măsurat pe 15 septembrie 2026). Rezultatul: ultimul plan
+generat pe 3 august, și nicio cale prin care omul să ceară.
+
+```
+/planifica 7      cere un plan pentru VULNERABILITATEA #7 (id din /vulnerabilitati)
+/patch 3          arată PLANUL #3 (alt id, alt lucru)
+```
+
+Ce se întâmplă:
+
+1. Se verifică, din bază, cinci lucruri, înainte de orice cost: findingul
+   există, e încă deschis, e un pachet al gazdei, are o versiune care îl repară,
+   și nu are deja un plan viu. Un plan viu **nu** e înlocuit — răspunsul trimite
+   la el. Ca să ceri altul, respinge-l întâi de pe butonul lui.
+2. Cererea pleacă într-un task separat, iar botul confirmă imediat: generarea
+   ține zeci de secunde, iar botul răspunde la comenzi una câte una. Cât timp
+   rulează, o a doua apăsare pe același finding e refuzată, și nu pot rula mai
+   mult de două generări deodată.
+3. Rezultatul vine ca mesaj separat, oricare ar fi el: planul cu butoanele de
+   aprobare, sau motivul exact — erorile validatorului (planul respins rămâne în
+   bază ca dovadă), plafonul de buget cu cifrele lui, sau faptul că asset-ul e
+   protejat și se aplică manual.
+
+**Ce se poate planifica** (adăugat pe 15 septembrie 2026): doar pachetele de
+sistem ale gazdei — `rpm` pe familia `rhel`, `deb` pe `debian`, după
+`platform.family`. Din cele 857 de findinguri cu remediere cunoscută ale gazdei
+de producție, 407 sunt `npm`, `alpine`, `go`, `composer` sau `deb` găsite de
+Trivy în imagini de container și în lockfile-uri de aplicație — iar primele 12
+după prioritate sunt toate din categoria aia. Ele nu se repară de pe gazdă:
+`npm`, `pip`, `composer`, `docker` și `git` au fost scoase din allowlist-ul
+executorului (§10 din `docs/PATCHING.md`), iar planner-ul scrie pentru `dnf`.
+Cererea e deci refuzată pe loc, cu motivul — altfel costa până la două apeluri
+Opus ca să se termine în `rejected_invalid` sau într-un plan `dnf` plauzibil
+pentru un pachet Alpine, care pică abia la dry-run.
+
+**Verdictul de întoarcere**, scris sub plan, lângă butoane: aceeași funcție pe
+care o folosește fereastra săptămânală (`patch/window.py:evaluate`), nu o copie
+a ei. Trei stări:
+
+| Verdict | Ce înseamnă | Butonul „Aplică" |
+|---|---|---|
+| întoarcere dovedită | planul are un backup `path` și ultimul exercițiu de restaurare a dovedit o arhivă restaurabilă, recent | rămâne |
+| întoarcere **nedovedită** | nu există (încă) dovadă — azi, pe amândouă gazdele, e cazul fiecărui plan: niciun exercițiu n-a atins vreodată o arhivă | rămâne, cu verdictul scris lângă el |
+| **fără cale de întoarcere** | planul se declară irevocabil, sau ultimul exercițiu a găsit o arhivă care nu se reface | **retras** — rămân doar Dry-run și Respinge |
+
+Butonul se retrage doar în ultima stare: ascuns și la „nedovedită", n-ar apărea
+niciodată, iar comanda ar fi inutilă din prima zi. Retragerea e a MESAJULUI
+acesta: `/patch <id>` arată planul cu butoanele lui obișnuite, fiindcă poarta de
+execuție rămâne, ca până acum, `window_halt` din a doua atingere.
+
+Un plan cerut așa și neatins **expiră după 72 de ore** (`PLAN_TTL_HOURS`),
+prin trecerea orară de mentenanță — altfel findingul lui n-ar mai putea primi
+niciodată alt plan.
+
+Comanda cere rol de **operator sau owner**: cheltuie un apel la model.
 
 ---
 

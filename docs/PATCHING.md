@@ -18,7 +18,7 @@ validator determinist, iar apoi prin două confirmări explicite ale tale.
 
 ```
 finding (vulnerabilitate deduplicată, prioritizată)
-   ↓  /patch <id>  sau  butonul din UI  sau  jobul nocturn pentru KEV critice
+   ↓  /planifica <id vuln>  sau  jobul nocturn pentru KEV cu remediere cunoscută
 context: asset, stack, unit, webroot, repo, baze de date, patch-uri anterioare
    ↓
 claude -p --permission-mode plan  →  subagentul sentinel-patch-engineer
@@ -62,6 +62,43 @@ Non-negociabil, în `sentinel/patch/validator.py`:
 Un plan invalid de două ori se stochează ca `rejected_invalid` și ți se spune că
 AI-ul nu a putut produce o procedură sigură. **Este un rezultat acceptabil** — și
 mult mai bun decât un plan plauzibil care rupe producția.
+
+### `pkg_version` — RHEL și Debian, cu epoch
+
+Verificarea de versiune de pachet (`preflight`/`post_verification`, `kind:
+pkg_version`) compară `equals`/`at_least` contra versiunii instalate — reparat
+8 septembrie 2026, verificarea acceptase orice pachet instalat, indiferent de
+versiune, până atunci.
+
+Pe `platform.family: rhel` folosește `rpm -q --qf
+%{EPOCH}:%{VERSION}-%{RELEASE}\n` — epoch inclus explicit (producția are 237
+de pachete cu unul: `nginx 2:1.20.1-…`, `openssl 1:3.5.5-…`) și `\n` ca separator
+de linie, fiindcă `rpm -q` fără restricție de versiune scrie o linie PE
+INSTANȚĂ instalată — `kernel` are de obicei mai multe deodată. Cea mai nouă
+instanță (comparată corect, nu prima din listă) e cea folosită. Comparația
+însăși e o portare linie-cu-linie a `rpmvercmp` din rpm — epoch numeric întâi,
+apoi versiune, apoi release, cu `~` (pre-release, sortează înaintea a orice) și
+`^` (post-release, sortează după bază dar înaintea unui segment real următor)
+tratate separat de restul.
+
+Pe `platform.family: debian` folosește `dpkg-query -W -f '${Version}\n'` și o
+portare a algoritmului de comparare al `dpkg --compare-versions`
+(`epoch:upstream_version-debian_revision`, `~` cu aceeași semantică ca la rpm).
+`dpkg-query` a intrat în allowlist-ul binarelor executorului
+(`executor/policy.py:BINARY_ALLOWLIST`) doar-citire, în runda a doua — dacă
+gazda rulează un executor mai vechi, care nu-l are încă, verificarea eșuează
+CLOSED cu mesajul explicit „dpkg-query nu e permis de executor pe această
+gazdă încă", nu cu un „neimplementat" generic care ar deveni fals de îndată ce
+executorul e la zi.
+
+Ambele formate de interogare scriu literal cele două caractere backslash-n în
+argv, NICIODATĂ un octet de linie nouă real — `executor/policy.py:
+SHELL_METACHARACTERS` refuză orice element de argv care conține un `\n`
+adevărat, deci o linie nouă reală aici ar face executorul să refuze
+interogarea de fiecare dată. `rpm`/`dpkg-query` își interpretează singure
+`\n`-ul din formatul de interogare ca linie nouă în IEȘIREA lor — exact ca la
+un prompt de shell, unde shell-ul (nu rpm) ar fi cel care ar transforma o
+linie nouă reală în altceva dacă ar fi tastată direct.
 
 ---
 
@@ -233,7 +270,7 @@ surprins de un restart.
 
 ## 9. Prima dată pe un asset nou
 
-1. `/vuln <id>` → `🛠 Generează plan`
+1. `/vuln <id>` → `/planifica <id>`
 2. `📄 Vezi` — citește-l efectiv. Verifică:
    - versiunea din preflight corespunde cu ce e instalat
    - backup-ul acoperă **și** fișierele **și** baza de date
@@ -247,3 +284,103 @@ surprins de un restart.
 Pentru orice asset cu `criticality ≥ 4`, fă prima dată exercițiul pe un canary,
 inclusiv ruperea deliberată a health check-ului ca să verifici că rollback-ul
 chiar funcționează.
+
+---
+
+<!-- Secțiune adăugată în runda de securitate din 8 septembrie 2026 —
+     delimitată intenționat, nu reflow peste restul fișierului. -->
+
+## 10. Binarele permise într-un pas de plan (îngustat 8 septembrie 2026)
+
+Verificatorul rundei 1 a rulat allowlist-ul de-atunci (32 de binare, cu o
+listă de interdicții peste câteva dintre cele mai riscante) pe binare reale și
+a obținut root prin `patch_step_exec` pe șase căi separate: `git
+--exec-path=/var/lib/sentinel evilcmd`, `sed -n '2e ...'`, `rpm -i evil.rpm`,
+`dnf install evil.rpm`, `npm install <url>`, `pip install --find-links=...` și
+câteva combinații de flag-uri `docker`. Fiecare dintre binarele acelea are o
+suprafață de scripting/hook proprie ce nu poate fi enumerată exhaustiv — `-c`
+la git, comanda `e` la sed, hook-urile de ciclu de viață la npm/pip, docker
+fiind prin definiție o telecomandă către gazdă. Reparația nu a fost o listă de
+interdicții mai bună; a fost scoaterea binarelor de pe allowlist.
+
+**Allowlist-ul curent** (`executor/policy.py:BINARY_ALLOWLIST`, oglindit
+byte-cu-byte în `sentinel/constants.py:PATCH_BINARY_ALLOWLIST` — vezi
+`test_policy_agrees_with_sentinel_constants`), fiecare cu o gramatică
+POZITIVĂ (subcomenzi permise, flag-uri permise, formă a argumentelor
+poziționale), nu o listă de interdicții:
+
+| Binar | Formă permisă |
+|---|---|
+| `dnf` | `{upgrade,update,install,downgrade,reinstall,remove,clean,check-update,makecache}` + `-y`, `--setopt=install_weak_deps=False`, `--enablerepo=`/`--disablerepo=<nume simplu>`. Fără `.rpm`/`.deb` local, fără `-c`, fără `--installroot`, fără `dnf shell` |
+| `apt-get` / `apt` | `{install,upgrade,dist-upgrade,update,remove,autoremove}` + `-y`, `-o Dpkg::Options::=--force-confold` (exact atât). Fără `.deb` local |
+| `rpm` | doar interogare/verificare: `-q`, `-qa`, `-V`, `--qf`/`--queryformat <format fără %( sau lua:>`. Fără `-i/-U/-e/--import/--dbpath/--root/--eval/--pipe` |
+| `dpkg-query` | `-W`, `-l`, `-s`, `-f`/`--showformat <format>` — nou în această rundă |
+| `dpkg` | doar `--compare-versions VERSION OP VERSION` — nou în această rundă |
+| `systemctl` | exact `systemctl ACȚIUNE UNITATE`, ACȚIUNE ∈ {start,stop,restart,reload,status,is-active}; `link`/`enable`/`mask`/`daemon-reload` refuzate, unități de tipul `sshd.service` refuzate — neschimbat din runda 1 |
+| `tar` | `-c`/`-x`/`-t` (exact unul) cu `-f`, `-z`/`-j`/`-J`/`--zstd`, `-C`/`--directory`, `--one-top-level`, `-p`, `--no-same-owner`/`--same-owner` — listă pozitivă, nu interdicții |
+| `cp`, `mv`, `mkdir` | un set restrâns de flag-uri obișnuite (recursiv, forțat, verbose, etc.) |
+| `install` | flag-uri obișnuite; **fără `--strip-program=`** — rulează comanda dată ca root, echivalentul lui `--to-command` la tar |
+| `chmod` | modul (poziția întâi) trebuie octal sau simbolic recunoscut; fără `--reference=` |
+| `chown` | proprietarul (poziția întâi) trebuie `user[:grup]`, fără `/` |
+| `nginx` | exact `nginx -t` — reload/restart trec prin `systemctl` |
+| `test` | exact `test -e CALE` — singura formă pe care `sentinel/patch/checks.py` o construiește |
+| `sha256sum` | exact `sha256sum CALE` — la fel |
+
+**Scoase de pe allowlist** (fără nicio gramatică, pentru că niciuna n-ar fi
+cinstită): `docker`, `git`, `npm`, `yarn`, `composer`, `pip`/`pip3`, `wp`,
+`sed`, `curl`, `httpd`, `apachectl`, `mysqldump`, `mysql`, `pg_dump`, `psql`,
+`zstd`, `gzip`, `ln`, `certbot` — niciunul nu are un apelant real în acest
+depozit azi, și mai multe au propriul mecanism de shell-escape (`\!` la
+psql) sau de hook (npm/pip). **`rm` NU a fost adăugat** deși verificatorul
+rundei 1 l-a recomandat: `tests/security/test_patch_safety.py` codifică deja
+decizia că ștergerea trece doar prin `op_backup_prune`, operație îngustă,
+legată de cale — nu printr-un argv general.
+
+Adăugarea unui binar înapoi pe listă e o decizie separată, cu gramatică
+proprie scrisă și testată — nu un efect secundar al altui bilet (vezi §3 mai
+sus, care spunea deja asta despre `dpkg`/`dpkg-query` înainte să fie
+adăugate).
+
+### Legarea `patch_step_exec` de un plan aprobat
+
+O gramatică spune că o comandă e bine formată. Nu spune că operatorul a
+aprobat-o PE ACEEA. `dnf -y install un-pachet-plauzibil` trece de gramatică
+fără să fi trecut vreodată prin cele două confirmări din Telegram.
+
+Executorul are acum un registru în memorie: `register_plan(plan_hash, steps,
+ttl_s, approval_token)`, unde `approval_token` e HMAC-SHA256 peste
+`plan_hash` cu cheia `SENTINEL_EXECUTOR_APPROVAL_KEY` din
+`/etc/sentinel/secrets.env`. Un apel REAL (nu dry-run) către `patch_step_exec`
+trebuie acum să trimită `plan_hash` + `step_index`, iar executorul refuză
+dacă argv nu e identic, byte cu byte, cu pasul înregistrat la acel index.
+Dry-run rămâne fără nevoie de aprobare — nu execută nimic, deci n-are ce
+proteja legarea.
+
+**Linia necesară în `secrets.env`** (instalatorul trebuie s-o genereze —
+neschimbat aici, `deploy/install.sh` nu e proprietatea acestei runde):
+
+```
+SENTINEL_EXECUTOR_APPROVAL_KEY=<hex aleator de minim 32 octeți, ex. openssl rand -hex 32>
+```
+
+**Fără cheie, `patch_step_exec` e dezactivat pe gazda aia** — orice apel real
+refuză, cu un motiv explicit, nu o eroare ambiguă. Închis implicit, nu deschis
+implicit.
+
+**Cablarea rămasă, pentru runda care deține `runner.py`/`checks.py`:**
+`sentinel/patch/runner.py` trebuie să apeleze
+`ExecutorClient.register_plan(plan_hash, steps, ttl_s=…, approval_token=…)`
+o dată, imediat după ce planul e confirmat aprobat (lângă verificarea
+`row.status != "approved"` din `run_plan`), cu `steps` fiind lista aplatizată
+a TUTUROR comenzilor pe care planul le va trimite spre `patch_step_exec` — nu
+doar `apply`/`rollback`, ci și verificările `command`/`systemd`/`file_exists`/
+`file_absent`/`file_sha256` pe care `sentinel/patch/checks.py` le construiește
+pentru `preflight`/`health_check`/`post_verification`. Fiecare apel către
+`patch_step_exec`, din ambele fișiere, trebuie apoi să trimită `plan_hash` +
+indicele corespunzător din acea listă aplatizată. **Până nu se face asta în
+ambele fișiere, o rulare `mode="apply"` refuză la primul preflight real** —
+un `mode="dry_run"` rămâne neafectat, pentru că verificările sunt simulate
+local în `runner.py` fără să atingă executorul. Textul exact al liniei și
+limitarea recunoscută (uid-ul `sentinel` poate citi aceeași cheie din
+`secrets.env`) sunt în `executor/README.md`, secțiunea „Binding to an
+approved plan".

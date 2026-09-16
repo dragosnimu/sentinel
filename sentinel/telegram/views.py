@@ -202,7 +202,7 @@ async def cmd_vulns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(rows) > 20:
         lines.append(f"\n<i>…și încă {len(rows) - 20}.</i>")
 
-    await _reply(update, clamp(lines, tail="\n/vuln &lt;id&gt; · /patch &lt;id&gt; pentru un plan"))
+    await _reply(update, clamp(lines, tail="\n/vuln &lt;id&gt; · /planifica &lt;id&gt; pentru un plan"))
 
 
 async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -239,7 +239,12 @@ async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f'<a href="{url}">{esc(name)}</a>' for name, url in links)]
 
     if row.get("fixed_version"):
-        lines.append(f"\nPlan de remediere: <code>/patch {row['id']}</code>")
+        # `/planifica`, nu `/patch`: `/patch <id>` deschide PLANUL cu id-ul ăla,
+        # iar aici id-ul e al unui finding. Linia asta trimitea operatorul să
+        # tasteze un id de vulnerabilitate într-o comandă care citește id-uri de
+        # plan — pe gazda reală, cu 4 planuri și 1028 de findinguri, răspunsul
+        # era „Plan inexistent." sau, mai rău, planul altcuiva.
+        lines.append(f"\nCere un plan: <code>/planifica {row['id']}</code>")
     else:
         lines.append("\n<i>Fără versiune care repară — nu se poate genera un plan.</i>")
 
@@ -353,6 +358,7 @@ HELP = """🛡️ <b>Sentinel — comenzi</b>
 <b>Patch-uri</b>
 /patches — planuri în așteptare
 /patch &lt;id&gt; — planul, cu butoane de aprobare
+/planifica &lt;id vuln&gt; — cere un plan pentru o vulnerabilitate anume
 
 <b>Trafic și servicii</b>
 /evenimente [ip] — evenimente brute

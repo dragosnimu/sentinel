@@ -862,6 +862,30 @@ async def prune_backups(db: Database, cfg: Config) -> tuple[str, dict[str, Any]]
             {"removed": n})
 
 
+async def expire_plans(db: Database) -> tuple[str, dict[str, Any]]:
+    """Expiră planurile de patch cerute de om și neatinse de `PLAN_TTL_HOURS`.
+
+    De ce AICI, și nu în bucla de push a botului sau în fereastra săptămânală:
+    plafonul e de 72 de ore, deci un timer săptămânal (`sentinel-patch-window`)
+    l-ar rata cu zilele, iar bucla de 15 secunde a botului ar face un UPDATE
+    de întreținere de 5760 de ori pe zi ca să prindă o schimbare care se
+    întâmplă o dată la câteva zile. Timerul orar de aici duce plafonul la o
+    precizie de o oră, ceea ce e mult sub granulația lui.
+
+    De ce contează că rulează cineva: până pe 15 septembrie 2026
+    `expire_stale_plans` n-avea niciun apelant. Un plan cerut din Telegram cu
+    `/planifica` și lăsat neatins rămânea `validated` pentru totdeauna, deci
+    findingul lui nu mai putea primi NICIODATĂ alt plan — nici la cerere
+    (`live_plan_for_finding`), nici automat dacă era KEV
+    (`planner.generate_for_kev`) — iar `/patch <id>` îi oferea butoane de
+    aprobare luni mai târziu, pe versiuni de pachet care nu mai existau.
+    """
+    from sentinel.db.repo import patches as patch_repo
+    n = await patch_repo.expire_stale_plans(db)
+    return (f"{n} planuri de patch expirate" if n else "niciun plan de patch de expirat",
+            {"expired": n, "ttl_hours": patch_repo.PLAN_TTL_HOURS})
+
+
 # ---------------------------------------------------------------------------
 # 9. Incidente tăcute
 # ---------------------------------------------------------------------------
@@ -960,6 +984,7 @@ async def run(db: Database, cfg: Config) -> Report:
     await _step(rep, "disk_guard", disk_guard(db, cfg))
     await _step(rep, "intel", refresh_intel(db))
     await _step(rep, "backups", prune_backups(db, cfg))
+    await _step(rep, "expire_plans", expire_plans(db))
     await _step(rep, "stale_incidents", close_stale_incidents(db, cfg))
     await _step(rep, "quiet_campaigns", quiet_campaigns(db))
     return rep

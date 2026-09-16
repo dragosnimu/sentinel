@@ -482,3 +482,56 @@ def test_the_notice_source_is_registered_in_the_push_loop():
     src = inspect.getsource(bot._push_loop)
     assert '"plan_notices"' in src
     assert "_push_window_gated_notices" in src
+
+
+# --- send_plan_for_approval's default is the whole approval path -----------
+# `allow_apply: bool = True` is read nowhere near a docstring or a name — it's
+# a bare keyword default. Flipping it to `False` would silently drop the
+# Apply button AND the stage-1 token from every caller that does not pass it
+# explicitly: `cmd_patches` (`/patch <id>`), `_push_plans`, and — after the
+# V1 fix — the manual `/planifica` path too. None of those callers pass
+# `allow_apply` today. Found on review, round 3 (16 sep 2026): nothing in
+# this file executed `send_plan_for_approval` and looked at the keyboard or
+# at `approvals.issue`; every other test here checks the SQL or the source
+# text, never the button that actually reaches the operator.
+def test_send_plan_for_approval_mints_a_token_and_an_apply_button_by_default():
+    pytest.importorskip("telegram")
+    from sentinel.db.repo import approvals
+    from sentinel.telegram import patch_flow
+
+    plan = {"target": {"asset_name": "web-1", "stack": "rpm"},
+           "risk": {"reversible": True, "blast_radius": "single host"},
+           "backup": [], "apply": [], "rollback": []}
+    row = SimpleNamespace(id=99, plan_hash="h", plan=plan, status="validated",
+                          reversible=True, estimated_downtime_s=5,
+                          requires_reboot=False, risk_level="high")
+
+    issued: list[dict] = []
+
+    async def _issue(db, **kw):
+        issued.append(kw)
+        return "minted-token"
+
+    real_issue = approvals.issue
+    approvals.issue = _issue
+    try:
+        sent: list[tuple] = []
+
+        class _Bot:
+            async def send_message(self, chat_id, text, **kw):
+                sent.append((chat_id, text, kw))
+
+        run(patch_flow.send_plan_for_approval(_Bot(), object(), 42, row))
+    finally:
+        approvals.issue = real_issue
+
+    assert issued and issued[0]["stage"] == 1 and issued[0]["plan_id"] == 99, (
+        "niciun token stage-1 emis — un `allow_apply` implicit devenit `False` "
+        "ar opri tăcut aprobarea peste tot, fără niciun test care s-o vadă")
+    assert sent, "send_message n-a fost chemat deloc"
+    _, _, kw = sent[0]
+    buttons = [b.callback_data for row_ in kw["reply_markup"].inline_keyboard
+              for b in row_]
+    assert any(b.startswith("pap1:") for b in buttons), (
+        f"butonul Aplică lipsește din tastatura implicită: {buttons}")
+    assert any(b == f"pap1:minted-token" for b in buttons), buttons

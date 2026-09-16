@@ -18,6 +18,18 @@ is built to be hard to do by accident and impossible to do by replay:
     is defence in depth for a lost or stolen phone: `approve_plan` is not
     called until the correct PIN is typed back, compared constant-time, with a
     per-chat attempt cap. See `on_pin_reply`.
+  * **The return-path verdict is re-checked at `on_stage1`, for every plan.**
+    `send_plan_for_approval` does not evaluate anything on its own, so any
+    caller that hands out a full keyboard for a `validated` plan — `/patch
+    <id>`, `/patches`, `_push_plans` — used to rely on the caller having
+    already computed `window.evaluate` and set `allow_apply` accordingly.
+    Proved wrong by execution (round 2, 16 sep 2026): `/patch <id>` calls
+    `send_plan_for_approval` with no verdict at all, so a plan the window
+    would refuse — `risk.reversible: false`, or a restore drill that found a
+    corrupt archive — still minted a fresh stage-1 token with a live Apply
+    button. The gate now lives where every stage-1 token is redeemed, not at
+    whichever entry point happened to compute it. UNPROVEN-permissive on
+    purpose: see the comment at the check itself for why.
 """
 
 from __future__ import annotations
@@ -115,19 +127,41 @@ def format_window_notice(row: patches.PlanRow, reason: str) -> str:
 
 
 async def send_plan_for_approval(bot: Any, db: Database, chat_id: int,
-                                 row: patches.PlanRow) -> None:
-    """Offer a validated plan. Dry-run needs no token; apply starts stage 1."""
-    token = await approvals.issue(
-        db, purpose="patch_apply", stage=1, chat_id=chat_id,
-        plan_id=row.id, plan_hash=row.plan_hash, created_by="push")
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧪 Dry-run (nu schimbă nimic)",
-                              callback_data=f"pdry:{row.id}")],
-        [InlineKeyboardButton("✅ Aplică…", callback_data=f"pap1:{token}"),
-         InlineKeyboardButton("❌ Respinge", callback_data=f"prej:{row.id}")],
-    ])
-    await bot.send_message(chat_id, format_plan(row), parse_mode=ParseMode.HTML,
-                           reply_markup=kb)
+                                 row: patches.PlanRow, *,
+                                 gate_note: str | None = None,
+                                 allow_apply: bool = True) -> None:
+    """Offer a validated plan. Dry-run needs no token; apply starts stage 1.
+
+    `gate_note` is appended verbatim (already HTML, already escaped by its
+    author) under the plan. It exists so the caller can state the return-path
+    verdict next to the buttons: this module does not evaluate anything — see
+    `sentinel/patch/window.py`, whose `evaluate()` is the single source of that
+    decision and which deliberately does not talk to Telegram.
+
+    `allow_apply=False` withholds the apply button AND the stage-1 token: the
+    token is not issued at all, because `on_stage1` consumes whatever token it
+    is handed and a token with no button on it is still a valid token — a
+    forwarded callback or a second client would walk straight past a button
+    that was merely hidden. Dry-run and reject stay: neither changes the
+    machine, and taking away the one safe way to inspect a plan would be the
+    same mistake `on_dry_run` was written to undo.
+    """
+    rows = [[InlineKeyboardButton("🧪 Dry-run (nu schimbă nimic)",
+                                  callback_data=f"pdry:{row.id}")]]
+    if allow_apply:
+        token = await approvals.issue(
+            db, purpose="patch_apply", stage=1, chat_id=chat_id,
+            plan_id=row.id, plan_hash=row.plan_hash, created_by="push")
+        rows.append([
+            InlineKeyboardButton("✅ Aplică…", callback_data=f"pap1:{token}"),
+            InlineKeyboardButton("❌ Respinge", callback_data=f"prej:{row.id}")])
+    else:
+        rows.append([InlineKeyboardButton("❌ Respinge",
+                                          callback_data=f"prej:{row.id}")])
+
+    text = format_plan(row) + (f"\n\n{gate_note}" if gate_note else "")
+    await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML,
+                           reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def on_stage1(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -153,6 +187,51 @@ async def on_stage1(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
     if row.status != "validated":
         await query.edit_message_text(f"⛔ Planul nu mai e valabil (stare: {row.status}).")
+        return
+
+    # V1 (runda 3, 16 sep 2026): verdictul de întoarcere se citește AICI, nu la
+    # propunere. `send_plan_for_approval` nu evaluează nimic — vezi docstring-ul
+    # ei — și `cmd_patches`/`/patch <id>` îl cheamă fără `gate_note`/`allow_apply`
+    # pentru ORICE plan `validated`, indiferent cine l-a generat: un plan
+    # `ai_manual` marcat `NOT_REVERSIBLE` la propunere tot ajungea, prin
+    # `/patch <id>`, cu tastatura întreagă și un token stage-1 proaspăt — dovedit
+    # prin execuție în runda 2, nu doar citit din sursă. Poarta ținută doar la
+    # propunere era deci ocolibilă de a doua cale de intrare; asta stă pe drumul
+    # COMUN spre execuție — orice token stage-1, indiferent de unde a plecat
+    # butonul, trece pe aici. La fel ca `window_halt`, recitit mai jos în
+    # `on_stage2`: dovada se citește proaspăt la fiecare atingere, nu se
+    # moștenește dintr-un verdict calculat cu zile în urmă, la propunere.
+    #
+    # UNPROVEN-permisivă, deliberat: `window.evaluate` întoarce NOT_REVERSIBLE
+    # doar când planul se declară el însuși irevocabil SAU un exercițiu de
+    # restaurare a găsit o arhivă care NU se reface — o dovadă POZITIVĂ. Orice
+    # altceva (niciun backup 'path', niciun exercițiu, dovadă veche, sau — mai
+    # jos — o pană la citirea ei) e UNPROVEN sau necunoscut, iar poarta lasă
+    # planul să treacă: măsurat pe ambele gazde pe 16 sep 2026, 0 artefacte de
+    # arhivă în `restore_drill_items`, deci `latest_archive_drill_summary`
+    # întoarce mereu `None` și ORICE plan e azi UNPROVEN. O poartă care blochează
+    # pe UNPROVEN ar opri aprobarea peste tot, chiar acum, până la exercițiul din
+    # 1 oct — asta ar fi exact „nu știu" tratat ca „nu se poate", nu ca stare
+    # separată.
+    from sentinel.patch import window
+    try:
+        dovada = await patches.latest_archive_drill_summary(db)
+    except Exception as exc:  # noqa: BLE001
+        # O pană la citire NU e un verdict "nu se poate întoarce" — e o pană.
+        # Rămâne permisivă pentru același motiv ca UNPROVEN: doar un NOT_REVERSIBLE
+        # DOVEDIT blochează, iar aici nu s-a dovedit nimic, s-a doar eșuat citirea.
+        log.error("return-path gate could not read drill evidence",
+                 extra={"plan": row.id, "detail": f"{type(exc).__name__}: {exc}"})
+        dovada = None
+    poarta = window.evaluate(row.plan, dovada)
+    if poarta.state == window.NOT_REVERSIBLE:
+        await query.edit_message_text(
+            f"⛔ <b>Fără cale de întoarcere</b> — {_esc(poarta.reason)}\n"
+            "Aprobarea a fost refuzată aici, la prima atingere: niciun token "
+            "de confirmare nu a fost emis. Butoanele de pe mesajul ăsta "
+            f"nu mai sunt: dă din nou <code>/patch {row.id}</code> dacă "
+            "vrei un dry-run — acela nu schimbă nimic pe mașină.",
+            parse_mode=ParseMode.HTML)
         return
 
     stage2 = await approvals.issue(

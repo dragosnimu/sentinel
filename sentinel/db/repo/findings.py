@@ -198,6 +198,27 @@ async def open_counts(db: Database) -> dict[str, int]:
     return counts
 
 
+async def get_finding(db: Database, finding_id: int) -> dict[str, Any] | None:
+    """Un singur finding, oricare i-ar fi starea — sau `None` dacă id-ul nu există.
+
+    `list_open` nu poate răspunde la întrebarea asta: filtrează `status =
+    'open'`, deci un finding rezolvat între timp ar ieși de acolo drept
+    „inexistent". Pentru operatorul care tocmai a cerut un plan pentru el, „nu
+    există" și „s-a reparat deja" sunt două fapte diferite, iar cel care cere
+    planul are nevoie de al doilea, nu de primul.
+    """
+    row = await db.fetchrow(
+        """
+        SELECT f.id, f.cve, f.title, f.severity, f.cvss, f.kev, f.priority,
+               f.package, f.installed_version, f.fixed_version, f.ecosystem,
+               f.scanner, f.status, a.name AS asset_name
+        FROM findings f LEFT JOIN assets a ON a.id = f.asset_id
+        WHERE f.id = $1
+        """,
+        finding_id)
+    return dict(row) if row else None
+
+
 async def list_open(db: Database, *, limit: int = 100) -> list[dict[str, Any]]:
     rows = await db.fetch(
         """
