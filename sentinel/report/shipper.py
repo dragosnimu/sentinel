@@ -751,6 +751,19 @@ class Stream:
     #: de la 60 de minute contra unui ragaz de 15 — deci fluxul nu putea fi
     #: niciodata `ok` cat avea ceva in asteptare, si trimitea o alerta „a ramas
     #: in urma" la fiecare ora. Alarma nu era despre server; era despre aritmetica.
+    #:
+    #: Nici `bucket + 1 unitate` nu e destul, si asta a costat a doua oara, pe 17
+    #: septembrie 2026. Mentenanta nu scrie intervalul EXACT la inchiderea lui —
+    #: cand trece o rundă fara evenimente (fereastra ei taiata la secunda de
+    #: pornire a serviciului, nu la minutul rotund), intervalul ramane nescris pana
+    #: la runda urmatoare, care il rescrie ATUNCI, cu `updated_at` = momentul
+    #: rescrierii, nu momentul inchiderii. Masurata de la `bucket + 1 unitate`,
+    #: varsta randului sare direct la peste o ora — desi randul exista, la forma
+    #: finala, de doar cateva secunde. Vezi `_rollup_lag` pentru masuratoarea
+    #: corecta: varsta se numara de la clipa in care randul a devenit expediabil
+    #: LA RUNDA ASTA, `GREATEST(updated_at, bucket + 1 unitate)`, nu de la eticheta
+    #: intervalului. O intarziere REALA de mentenanta tot arata ca o ora intreaga,
+    #: fiindca atunci `updated_at` insusi e vechi de o ora.
     rollup_unit: str = "hour"
 
     def __post_init__(self) -> None:
@@ -2773,31 +2786,53 @@ async def _rollup_lag(db: Database, stream: Stream) -> StreamLag:
     ține o alarmă aprinsă pe purtarea corectă a mecanismului — adică operatorul
     ar învăța s-o ignore, și atunci n-ar mai vedea nici restanța adevărată.
     """
-    # O singură coloană, deci `fetchval` — și asta nu e o preferință de stil.
-    # Citit cu `fetchrow`, un flux al cărui rând nu se poate citi deloc ar ieși
-    # de aici cu „n-a plecat niciodată": o stare REALĂ, plauzibilă, și greșită.
-    # `check_ship_lag` ar scrie-o ca verdict, iar `_reconcile_state` ar șterge
-    # restanța adevărată — adică operatorul ar vedea o revenire care nu s-a
-    # întâmplat. Excepția care iese de aici devine `unknown`, care e răspunsul
-    # corect la o întrebare fără răspuns.
-    cursor_at = await db.fetchval(
-        "SELECT cursor_at FROM collector_cursors WHERE name = $1",
+    # O SINGURĂ interogare pentru toată perechea, nu una pe jumătate: expeditorul
+    # scrie `(cursor, cursor_at)` ATOMIC, într-un singur `UPDATE` (`_advance_rollup`).
+    # Citite separat (doi `fetchval`), o avansare care comite exact între cele
+    # două citiri ar lăsa aici un `cursor_at` VECHI lipit de un `cursor` NOU — o
+    # pereche pe care baza n-a avut-o niciodată. Fereastra de mai jos compară
+    # întâi `updated_at`, deci un `cursor_at` vechi ar arăta drept neexpediat un
+    # rând deja expediat. E o cursă TEORETICĂ, corectă de reparat — `_mutable_lag`,
+    # alături, citea deja perechea dintr-un singur `fetchrow` —, dar NU explică
+    # alarma din 17 septembrie 2026 pe `event_rollup_1h`: acolo cele două
+    # avansări ale cursorului au căzut amândouă în afara ferestrei de citire a
+    # verificării, deci n-a existat nicio citire ruptă. Cauza aceea e în
+    # formula de vârstă, mai jos. Vezi `tests/integration/test_rollup_lag_torn_read_pg.py`
+    # pentru proprietatea de atomicitate în sine.
+    row = await db.fetchrow(
+        "SELECT cursor, cursor_at FROM collector_cursors WHERE name = $1",
         stream.cursor_name)
-    if cursor_at is None:
+    if row is None or row["cursor_at"] is None:
         return StreamLag(stream.name, None, None, 0, None,
                          updated_at_trigger=False)
-    cursor_key = str(await db.fetchval(
-        "SELECT cursor FROM collector_cursors WHERE name = $1",
-        stream.cursor_name) or "")
+    cursor_at = row["cursor_at"]
+    cursor_key = str(row["cursor"] or "")
     counted = await db.fetchrow(
         f"SELECT count(*) AS pending, "  # noqa: S608 - identificatori din STREAMS
         # Vechimea se numara de la momentul in care randul a devenit
-        # EXPEDIABIL — sfarsitul intervalului lui —, nu de la eticheta. Eticheta
-        # e inceputul, deci masurata de acolo, restanta unui contor orar porneste
-        # de la 60 de minute in clipa in care apare, si trece de orice ragaj
-        # rezonabil inainte sa fi trecut o secunda.
-        f"EXTRACT(EPOCH FROM (now() - (min({stream.key_column})"
-        f" + interval '1 {stream.rollup_unit}')))/60 AS oldest_min "
+        # EXPEDIABIL LA RUNDA ASTA, nu de la eticheta intervalului si nu doar de
+        # la inchiderea lui teoretica (`bucket + 1 unitate`).
+        #
+        # De ce nu ajunge nici `bucket + 1 unitate`: mentenanta nu rescrie
+        # neaparat intervalul EXACT la inchiderea lui — o runda fara evenimente
+        # nu scrie nimic, iar runda urmatoare care GASESTE date rescrie atunci,
+        # cu `updated_at` = momentul rescrierii. Masurat pe gazda reala pe 17
+        # septembrie 2026: bucketul 03:00 UTC a fost scris abia la 04:01:35, la
+        # runda urmatoare — `now() - (bucket + 1h)` a aratat 61 de minute pentru
+        # un rand vechi, la forma finala, de 3 secunde, si alarma s-a stins
+        # singura la privirea urmatoare. Nu era o restanta: era ora gresita de
+        # la care se numara.
+        #
+        # `GREATEST(updated_at, bucket + 1 unitate)` repara asta fara sa
+        # ascunda o restanta REALA: pe un rand scris la timp, cele doua sunt
+        # (aproape) egale si GREATEST nu schimba nimic; pe un rand rescris
+        # tarziu, `updated_at` e mai mare si ia el varsta — momentul in care
+        # randul a devenit vizibil verificarii, nu momentul in care eticheta lui
+        # spune ca s-a inchis. O mentenanta cu adevarat blocata tot arata ca o
+        # ora intreaga, fiindca atunci `updated_at` insusi e vechi de o ora.
+        f"EXTRACT(EPOCH FROM (now() - min(GREATEST({stream.time_column}, "
+        f"{stream.key_column} + interval '1 {stream.rollup_unit}'))))/60 "
+        f"AS oldest_min "
         f"FROM {stream.table} "
         f"WHERE ({stream.time_column}, {stream.key_column}) > "
         f"($1::timestamptz, $2::text::timestamptz) "

@@ -2419,6 +2419,16 @@ async def check_ship_lag(db: Database, cfg: Config) -> list[CheckResult]:
                        "lost_below_cursor": item.lost_below_cursor}))
             continue
 
+        # Un sfat separat pentru fluxurile de agregate (`ROLLUP`), care spunea
+        # „compară cu ora mentenanței înainte să cauți în jurnalul expeditorului",
+        # a fost scris și retras pe 17 septembrie 2026 fără să ajungă vreodată
+        # într-un commit — deci nu-l căuta în istoric. Explicația lui era chiar
+        # greșeala reparată mai sus, în `_rollup_lag`: vârsta calculată din
+        # eticheta intervalului (`bucket + 1 unitate`), nu din clipa în care
+        # rândul a devenit expediabil. Cu formula reparată, o rescriere întârziată
+        # a mentenanței arată vârsta corectă — câteva secunde, nu o oră — și nu
+        # mai ajunge niciodată pe ramura asta; sfatul ar fi trimis operatorul să
+        # verifice un timer care n-are nicio legătură cu o restanță reală.
         results.append(CheckResult(
             f"ship:lag:{item.stream}", f"{title} a rămas în urmă", "degraded",
             # Fraza se acordă cu numărul ei, adjectivul inclusiv: „1 rând
@@ -2435,9 +2445,10 @@ async def check_ship_lag(db: Database, cfg: Config) -> list[CheckResult]:
             # backoff-ul pe flux încoace: un flux oprit (ceas, trigger, rând
             # necodificabil) nu mai contribuie cu rânduri la lot și nu mai
             # încetinește pe nimeni — de-aia lista de cauze de mai jos e scurtă.
-            action="journalctl -u sentinel-shipper -n 50  (caută „200 fără ecou” "
-                   "— un cursor care nu avansează la un răspuns 200 înseamnă că "
-                   "cererea nu ajunge la agregator; caută și „HTTP 413”, care "
+            action="journalctl -u sentinel-shipper -n 50  (caută "
+                   "„200 fără ecou” — un cursor care nu avansează la un "
+                   "răspuns 200 înseamnă că cererea nu ajunge la agregator; "
+                   "caută și „HTTP 413”, care "
                    f"înseamnă lot peste plafonul agregatorului de "
                    f"{AGGREGATOR_MAX_BODY_BYTES} octeți. Lotul e COMUN mai multor "
                    f"fluxuri, iar câmpul `batch_streams` din aceeași linie spune "

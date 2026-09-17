@@ -2688,6 +2688,14 @@ def test_a_check_that_cannot_look_says_so_instead_of_saying_ok(monkeypatch):
         async def fetchval(self, sql, *a):
             raise RuntimeError("relatia collector_cursors nu exista")
 
+        # `_rollup_lag` citește `(cursor, cursor_at)` cu un SINGUR `fetchrow`
+        # (nu doi `fetchval` separați — vezi `shipper.py`), deci o bază complet
+        # necitibilă trebuie să cadă și pe drumul ăsta, altfel fluxul de
+        # agregate ar trece pe lângă `_Broken` și ar întoarce o restanță
+        # plauzibilă în loc de „nu pot spune”.
+        async def fetchrow(self, sql, *a):
+            raise RuntimeError("relatia collector_cursors nu exista")
+
     results = _lag(_Broken(), _lag_cfg())
     assert results, "verificarea nu a emis nicio cheie"
     assert {r.status for r in results} == {"unknown"}, results

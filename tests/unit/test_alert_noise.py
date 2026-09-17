@@ -38,28 +38,20 @@ ROLLUPS = [s for s in STREAMS if s.cursor_kind == ROLLUP]
 
 # ---------------------------------------------------------------------------
 # 1. Aritmetica
+#
+# Testul care verifica direct formula de varsta a fost sters de aici pe 17
+# septembrie 2026: cerea substringuri din sursa lui `_rollup_lag`
+# (`inspect.getsource`), nu comportamentul ei — trecea neschimbat sub formula
+# veche, sub formula reparata si sub cel putin doua formule stricate testate cu
+# mutatii. O sursa nu e o dovada de comportament, la fel cum un cod de iesire nu
+# e dovada de efect. Proprietatea e verificata acum pe Postgres real, in ambele
+# directii (rand scris tarziu SI rand cu adevarat blocat), in
+# `tests/integration/test_rollup_lag_torn_read_pg.py`.
 # ---------------------------------------------------------------------------
 
 def test_there_is_a_rollup_stream_to_talk_about() -> None:
     """Garda: fără flux de agregate, testele de mai jos n-ar proba nimic."""
     assert ROLLUPS, "niciun flux de agregate declarat"
-
-
-def test_rollup_lag_is_measured_from_when_the_row_became_shippable() -> None:
-    """De la SFÂRȘITUL intervalului, nu de la eticheta lui.
-
-    Măsurat de la etichetă, un contor orar pornește la 60 de minute de restanță
-    în clipa în care apare — peste orice răgaz rezonabil, înainte să fi trecut o
-    secundă. Asta producea o alertă pe oră, la nesfârșit, despre nimic.
-    """
-    from sentinel.report import shipper
-
-    src = inspect.getsource(shipper._rollup_lag)
-    assert "interval '1 " in src, (
-        "restanța se măsoară de la eticheta intervalului, deci pornește de la o "
-        "unitate întreagă și nu poate coborî sub răgaz")
-    assert "min(" in src and "+ interval" in src.replace("\n", " ").replace("  ", " "), (
-        "adunarea unei unități la momentul cel mai vechi lipsește")
 
 
 def test_the_grace_window_is_wider_than_zero_for_a_fresh_bucket() -> None:
