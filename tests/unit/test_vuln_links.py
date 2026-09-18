@@ -150,11 +150,34 @@ def test_telegram_plan_message_links_its_cves():
         id=5, risk_level="low", plan_hash="x", reversible=True, requires_reboot=False,
         estimated_downtime_s=5,
         plan={"target": {"asset_name": "localhost", "stack": "os"},
-              "vulnerabilities": [{"cve": "CVE-2026-9538"}],
+              "vulnerabilities": [{"cve": "CVE-2026-9538", "ecosystem": "rpm"}],
               "apply": [], "backup": [], "rollback": []})
     text = patch_flow.format_plan(row)
     assert "access.redhat.com/security/cve/CVE-2026-9538" in text
     assert "<a href=" in text
+
+
+def test_telegram_plan_message_skips_redhat_for_a_non_rpm_finding():
+    """A Debian/Ubuntu finding has no relationship to Red Hat's advisory
+    database. `format_plan` used to pass `rpm=True` unconditionally, so ANY
+    plan's CVE got a Red Hat link regardless of which platform it actually
+    came from — the operator reading a Debian patch plan would tap a link that
+    has nothing to do with the package. `ecosystem` is the deterministic fact
+    `planner.generate` fills in; without it (or with anything but `rpm`), no
+    Red Hat link belongs on the message."""
+    pytest.importorskip("telegram")
+    from types import SimpleNamespace
+
+    from sentinel.telegram import patch_flow
+    row = SimpleNamespace(
+        id=6, risk_level="low", plan_hash="x", reversible=True, requires_reboot=False,
+        estimated_downtime_s=5,
+        plan={"target": {"asset_name": "localhost", "stack": "os"},
+              "vulnerabilities": [{"cve": "CVE-2026-9538", "ecosystem": "deb"}],
+              "apply": [], "backup": [], "rollback": []})
+    text = patch_flow.format_plan(row)
+    assert "access.redhat.com" not in text
+    assert "nvd.nist.gov/vuln/detail/CVE-2026-9538" in text
 
 
 def test_telegram_incident_alert_carries_references():

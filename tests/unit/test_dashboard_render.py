@@ -292,3 +292,38 @@ def test_invalid_plan_shows_why_and_offers_no_actions():
     assert "respins de validator" in html
     assert "rm nu este permis" in html
     assert "Dry-run" not in html           # an invalid plan offers nothing
+
+
+def test_patch_detail_links_red_hat_only_for_an_rpm_finding():
+    """`patch.html` hard-coded `rpm=true`, so every CVE on the patch page
+    pointed at Red Hat errata — on the Debian host too, where the package has
+    no Red Hat relationship at all and the operator is sent to an advisory
+    about a different distribution's build.
+
+    The ecosystem is a deterministic fact the planner copies into the plan
+    from the database (`telegram/patch_flow.py` already reads it the same
+    way). A plan stored before that fact existed has no ecosystem: then
+    nothing is ASSERTED — the generic links stand — rather than guessing
+    "probably rpm", which is how the wrong link got there in the first place.
+    """
+    import json as _json
+
+    def _render(ecosystem):
+        row = _plan_row()
+        row.plan = _json.loads(_json.dumps(row.plan))
+        row.plan["vulnerabilities"] = [{
+            "cve": "CVE-2026-12345", "package": "nginx", "severity": "high",
+            **({"ecosystem": ecosystem} if ecosystem is not None else {}),
+        }]
+        return _env().get_template("patch.html").render(
+            user=_context()["user"], active="patches", p=row,
+            plan_json="{}", executions=[], steps=[], can_act=True,
+            csrf_token="t", version="1",
+            request=type("Q", (), {"query_params": {}})())
+
+    assert "access.redhat.com" in _render("rpm")
+    for eco in ("deb", "npm", None):
+        html = _render(eco)
+        assert "access.redhat.com" not in html, (
+            f"ecosystem={eco!r} still links to Red Hat errata")
+        assert "CVE-2026-12345" in html, "the CVE itself disappeared from the page"

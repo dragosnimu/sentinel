@@ -58,9 +58,20 @@ def test_secrets_are_removed_from_the_target_after_install():
 
 
 def test_packaging_excludes_the_secrets_directory():
-    tar_line = next(l for l in WIZARD.splitlines() if "tar --exclude" in l)
-    assert "secrets/*" in tar_line or "--exclude='secrets/*'" in WIZARD
-    assert "--exclude='.git'" in WIZARD
+    """Since 2026-09-08, `wizard.sh` builds the package the same way
+    `deploy.sh` does — from what git tracks — not from a hand-maintained
+    `--exclude` list. `secrets/` is excluded at TWO layers now: it is
+    gitignored (only `secrets/.gitkeep` is tracked), and
+    `scripts/lib/build-package.sh`'s own pathspecs trim it again as a second
+    line of defence. See `tests/security/test_package_contents.py`, which
+    builds a real archive and checks the effect; this file only checks that
+    `wizard.sh` calls the shared, tested function rather than reimplementing
+    its own `tar --exclude` list — the exact shape of the bug that shipped
+    `credentiale.txt` and `env.txt` to a host."""
+    assert "build_sentinel_package" in WIZARD
+    assert "tar --exclude" not in WIZARD, (
+        "wizard.sh has its own tar --exclude list again — the same shape of "
+        "bug this file's packaging was moved off of")
 
 
 # --- nothing changes before consent -----------------------------------------
@@ -68,7 +79,7 @@ def test_confirmation_precedes_every_mutation():
     """Everything above the confirmation must be questions and read-only checks;
     an installer that has already edited nginx by the time it asks is lying."""
     confirm_at = WIZARD.index("Din acest punct înainte se modifică serverul")
-    for mutating in ("tar --exclude", "scp -q", "run_install"):
+    for mutating in ("build_sentinel_package", "scp -q", "run_install"):
         assert WIZARD.index(mutating) > confirm_at, \
             f"{mutating!r} happens before the operator confirms"
 
@@ -208,7 +219,8 @@ def test_deploy_replaces_the_remote_deploy_tree_rather_than_nesting():
     """`cp -r src dest` nests when dest exists, so the second deploy left the
     FIRST deploy's rollback.sh in place — the one script whose staleness bites."""
     deploy = (REPO / "scripts" / "deploy.sh").read_text(encoding="utf-8")
-    block = deploy.split("# Keep the extracted tree", 1)[1].split("ssh_run \"rm -rf", 1)[0]
+    block = deploy.split("# Copy the deploy/ tree", 1)[1] \
+                   .split("# REMOTE_DIR itself is removed", 1)[0]
     # Comments in this block quote the very command shapes under test, so
     # matching against them would check the prose instead of the code.
     code = "\n".join(l for l in block.splitlines() if not l.strip().startswith("#"))

@@ -47,11 +47,15 @@ REAL_AUDIT_RULES = (REPO / "deploy" / "audit" / "sentinel.rules").read_bytes()
 
 BASH = shutil.which("bash")
 TAR = shutil.which("tar")
+GIT = shutil.which("git")
 POWERSHELL = shutil.which("powershell.exe") or shutil.which("powershell")
 
 needs_bash = pytest.mark.skipif(BASH is None, reason="no bash on PATH")
 needs_tar = pytest.mark.skipif(TAR is None, reason="no tar on PATH")
+needs_git = pytest.mark.skipif(GIT is None, reason="no git on PATH")
 needs_powershell = pytest.mark.skipif(POWERSHELL is None, reason="no powershell on PATH")
+
+BUILD_SH = REPO / "scripts" / "lib" / "build-package.sh"
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +349,15 @@ def _repo_copy(tmp_path: Path) -> Path:
 
     secrets/ is NOT copied — the real secrets file must not be duplicated into
     a temporary directory — so a dummy one is written in its place.
+
+    Also turned into its own git working tree: since 8 Sep 2026 deploy.sh
+    packages via `build_sentinel_package` (scripts/lib/build-package.sh),
+    which reads `git ls-files` — a plain `shutil.copytree` with no `.git` at
+    all is not a git working tree, and deploy.sh would die at "not a git
+    working tree" before ever reaching the guard these tests are about.
+    `git add -A` (no commit needed — `git ls-files` reads the index) tracks
+    everything copied, so nothing here is left untracked either, which would
+    otherwise trip the untracked-file guard for an unrelated reason.
     """
     dest = tmp_path / "repo"
     shutil.copytree(
@@ -360,6 +373,9 @@ def _repo_copy(tmp_path: Path) -> Path:
         b"SENTINEL_DB_PASSWORD=x\nANTHROPIC_API_KEY=x\n"
         b"TELEGRAM_BOT_TOKEN=x\nTELEGRAM_CHAT_ID=x\n"
     )
+    subprocess.run([GIT, "init", "-q"], cwd=dest, check=True)
+    subprocess.run([GIT, "-c", "core.autocrlf=false", "add", "-A", "."],
+                   cwd=dest, check=True, capture_output=True)
     return dest
 
 
@@ -395,6 +411,7 @@ def _run_deploy_sh(repo: Path, bin_dir: Path) -> subprocess.CompletedProcess:
 
 @needs_bash
 @needs_tar
+@needs_git
 @pytest.mark.skipif(os.name != "nt" and shutil.which("cygpath") is None and os.name == "nt",
                     reason="needs a POSIX-ish shell environment")
 def test_deploy_sh_stops_when_a_shipped_file_has_a_cr(tmp_path: Path) -> None:
@@ -421,6 +438,7 @@ def test_deploy_sh_stops_when_a_shipped_file_has_a_cr(tmp_path: Path) -> None:
 
 @needs_bash
 @needs_tar
+@needs_git
 def test_deploy_sh_runs_through_when_nothing_carries_a_cr(tmp_path: Path) -> None:
     """The negative control for the test above.
 
@@ -446,8 +464,15 @@ def _normalise_tree(root: Path) -> None:
     the situation the guard exists for — and this test is about deploy.sh's
     accept path, not about the state of the checkout. The check on the real
     tree is test_the_working_tree_ships_no_crlf below.
+
+    `.git/` is skipped: `root` is now a git working tree of its own (see
+    _repo_copy), and rewriting bytes inside git's own object store is not
+    what this helper is for — `git ls-files` only cares about the working
+    tree, not about this function also walking into `.git/`.
     """
     for path in root.rglob("*"):
+        if ".git" in path.relative_to(root).parts:
+            continue
         if not path.is_file() or path.suffix.lower() == ".ps1":
             continue
         data = path.read_bytes()
@@ -462,8 +487,9 @@ def _normalise_tree(root: Path) -> None:
 
 @needs_bash
 @needs_tar
+@needs_git
 def test_the_working_tree_ships_no_crlf() -> None:
-    """Fail here, in 0.7 s, rather than at the deploy that follows.
+    """Fail here, in under a second, rather than at the deploy that follows.
 
     .gitattributes normalises on commit and on checkout, so it cannot see a
     file rewritten in between — and git actively hides that case: the blob
@@ -475,25 +501,40 @@ def test_the_working_tree_ships_no_crlf() -> None:
     If this fails, run the sed the guard prints. If git then says the files are
     unmodified, some tool in the pipeline is rewriting them.
 
-    The set checked is what `tar` puts in the package, derived from deploy.sh's
-    own --exclude arguments — deliberately not "every tracked file". tar does
-    not read .gitignore, so a file git never sees can still be shipped: that is
-    how credentiale.txt, at the repository root, turned out to be inside every
-    package. Filtering by git-tracked status would have hidden it, and an
-    exemption by name would have hidden it permanently.
-    """
-    excludes = sorted(set(re.findall(
-        r"--exclude=['\"]([^'\"]+)['\"]", DEPLOY_SH.read_text(encoding="utf-8"))))
-    assert excludes, "deploy.sh has no --exclude arguments; the package shape is unknown"
+    The set checked is what `build_sentinel_package` puts in the package — as
+    of 8 Sep 2026, that is `git ls-files` minus a few pathspecs, not deploy.sh's
+    own --exclude arguments (that mechanism is retired; see
+    scripts/lib/build-package.sh).
 
+    This file used to argue AGAINST filtering by git-tracked status here,
+    because tar-minus-excludes could not see .gitignore either, and
+    `credentiale.txt` — gitignored, never `git add`ed — still ended up in
+    every tarball, at the repository root. That objection is now closed from
+    a different direction, not by continuing to avoid git-tracked filtering:
+    `build_sentinel_package` REFUSES to build at all when a shipped path is
+    untracked and NOT gitignored (the case that mattered — a file nobody told
+    git about yet, `sentinel/telegram/callback_sign.py` on 8 Sep 2026, is not
+    something "filtering by git-tracked status" can silently ship, because
+    the build stops instead of silently excluding it OR silently including
+    it). A gitignored file staying out silently remains correct — that was
+    never the bug; `credentiale.txt` was gitignored, so `git ls-files` never
+    saw it in the first place, same as now.
+    """
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         tarball = Path(tmp) / "worktree.tar.gz"
-        built = _run(
-            [TAR, *[f"--exclude={e}" for e in excludes],
-             "-czf", _posix(tarball), "-C", _posix(REPO), "."],
+        script = (
+            "set -u\n"   # nu -e: RC=3 (fișiere neurmărite) e citit mai jos, nu o eroare
+            f'source "{_posix(BUILD_SH)}"\n'
+            f'build_sentinel_package "{_posix(tarball)}" "{_posix(REPO)}"\n'
+            'echo "RC=$?"\n'
         )
-        assert built.returncode == 0, built.stderr
+        built = _run([BASH, "-c", script])
+        if "RC=3" in built.stdout:
+            pytest.skip(
+                "working tree has untracked files that would ship -- cannot build "
+                f"the package to check its line endings: {built.stdout + built.stderr}")
+        assert "RC=0" in built.stdout, built.stdout + built.stderr
         proc = _run_bash_guard(tarball)
 
     assert proc.returncode == 0, proc.stdout + proc.stderr

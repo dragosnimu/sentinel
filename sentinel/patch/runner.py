@@ -259,8 +259,22 @@ async def run_plan(db: Database, cfg: Config, plan_db_id: int, *,
 
     plan = row.plan
 
+    # S1c/Guard 1: `platform_family` has to reach re-validation the same way it
+    # already reaches `checks.evaluate` further down — computed once, here,
+    # before the first thing that can refuse the plan. Guard 1 used to call
+    # `validate_plan(plan)` with no family at all, which skips the
+    # cross-platform binary check entirely (see `validate_plan`'s own
+    # docstring: `None` means "skip the check", not "assume rhel"), so a
+    # `dnf` plan stored for an `rhel` host kept re-validating as fine even
+    # after redeployment to a `debian` host changed `cfg.platform.family` out
+    # from under it — exactly the class of drift this guard exists to catch.
+    # `cfg` is `None` in tests that never reach a family-sensitive check (same
+    # reason `checks.evaluate`'s own default exists); a real caller always
+    # supplies a real `Config`.
+    family = cfg.platform.family if cfg is not None else "rhel"
+
     # Guard 1: the plan must still validate against today's rules.
-    result = validate_plan(plan)
+    result = validate_plan(plan, platform_family=family)
     if not result.valid:
         await repo.set_plan_status(db, plan_db_id, "rejected_invalid")
         raise PatchRefused(
@@ -302,14 +316,10 @@ async def run_plan(db: Database, cfg: Config, plan_db_id: int, *,
         await repo.set_plan_status(db, plan_db_id, "applying")
 
     dry = mode == "dry_run"
-    # S1c: `checks.evaluate` needs to know which package manager / version
-    # syntax `pkg_version` speaks — it used to run with no `family` at all,
-    # which defaults to `rhel` (see `evaluate`'s own docstring) regardless of
-    # what the host actually is, silently mis-evaluating every debian check
-    # as if `rpm` existed there. `cfg` is `None` in tests that never reach a
-    # `pkg_version` check (same reason `evaluate`'s own default exists); a
-    # real caller always supplies a real `Config`.
-    family = cfg.platform.family if cfg is not None else "rhel"
+    # S1c: `checks.evaluate` needs the same `family` computed above, for the
+    # same reason — `pkg_version` speaks rpm or dpkg-query depending on it,
+    # and defaults to `rhel` (see `evaluate`'s own docstring) if never told
+    # otherwise.
     all_steps: list[StepOutcome] = []
     seq = 1
     # S3b: a crash is not automatically a reason to roll back. Preflight and

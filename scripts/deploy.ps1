@@ -828,52 +828,19 @@ $tarball   = Join-Path $env:TEMP "sentinel-$stamp.tar.gz"
 $PackageMaxKb = 20480
 
 Write-Info 'packaging the repository'
-Push-Location $RepoRoot
-try {
-    # secrets/ is excluded. Secrets go over stdin; a tarball lands in /tmp on
-    # the server and lingers there.
-    #
-    # watcher/ is excluded on purpose, not to save bytes. It is the external
-    # witness, and its whole value is running somewhere the monitored host
-    # cannot reach. Shipping a copy here would put the thing that reports
-    # Sentinel's death on the machine whose death it reports.
-    #
-    # aggregator/ is excluded for the same reason and one more. It runs on the
-    # same external hosting as the witness, and it is the archive of what left
-    # this machine — "what left cannot be deleted from here" stops being true
-    # the moment a copy of the archive's schema and credentials-handling code
-    # sits on the host being archived. Nothing under deploy/ or sentinel/ reads
-    # it.
-    #
-    # scratchpad/ holds verification harnesses and their `.bak` copies of
-    # install.sh, config.py and the signing module — source nothing on the host
-    # runs, second copies of files whose single-copy-ness is the point, and a
-    # stale harness that can be run against a newer tree. The size ceiling below
-    # sees none of that. This list must stay identical to the one in deploy.sh;
-    # tests/security/test_package_contents.py compares them, because a Windows
-    # deploy that ships what a Linux deploy excludes is the same hole.
-    #
-    # .claude/worktrees/ is excluded; the REST of .claude/ must ship.
-    # `deploy/install.sh` step 25 copies ${SRC_ROOT}/.claude/skills and
-    # ${SRC_ROOT}/.claude/agents out of this archive into the workspace the
-    # headless CLI runs in. Excluding all of .claude/ deletes the source of
-    # that cp and kills the install at step 25; making the cp tolerant would be
-    # worse, because the CLI would then lose the skill and the agents silently.
-    # worktrees/ is the part that grows — 6.6 MB against 228 KB of skills — and
-    # the only part that would push the archive over $PackageMaxKb.
-    & $tar --exclude='./secrets' --exclude='./.git' `
-           --exclude='./.claude/worktrees' `
-           --exclude='./tests' `
-           --exclude='./docs' --exclude='./watcher' --exclude='./aggregator' `
-           --exclude='./scratchpad' `
-           --exclude='./dist' `
-           --exclude='node_modules' --exclude='.next' `
-           --exclude='__pycache__' --exclude='*.pyc' `
-           --exclude='.venv' --exclude='.pytest_cache' --exclude='.mypy_cache' `
-           --exclude='.ruff_cache' `
-           -czf $tarball .
-    if ($LASTEXITCODE -ne 0) { Die 'packaging failed' }
-} finally { Pop-Location }
+# Built from what git tracks, not from the working tree minus an --exclude
+# list — see scripts/lib/build-package.sh (the reasoning is argued there once,
+# for both twins) for why a denylist is the wrong shape: it shipped
+# credentiale.txt and env.txt, gitignored and never `git add`ed, because
+# neither name was on it. scripts/lib/Build-Package.ps1 is the PowerShell twin
+# that runs here; it trims the same tracked-but-must-not-ship categories
+# (secrets/, tests/, docs/, watcher/, aggregator/, scratchpad/,
+# .claude/worktrees/) via the same git pathspecs, so this and deploy.sh cannot
+# drift apart on what leaves the machine.
+& (Join-Path $PSScriptRoot 'lib\Build-Package.ps1') -Tarball $tarball -RepoRoot $RepoRoot
+if ($LASTEXITCODE -ne 0) {
+    Die "packaging failed (exit $LASTEXITCODE) — see above. Deploy must be run from a git clone (docs/DEPLOYMENT.md section 3.1); this cannot fall back to shipping the whole tree without reintroducing the hole it closes."
+}
 
 $sizeKb = [math]::Round((Get-Item $tarball).Length / 1KB)
 Write-Ok "package built ($sizeKb KB)"
@@ -884,7 +851,7 @@ Write-Ok "package built ($sizeKb KB)"
 # line instead of a wait long enough to reach for Ctrl+C.
 if ($sizeKb -gt $PackageMaxKb) {
     Remove-Item $tarball -Force -ErrorAction SilentlyContinue
-    Die "package is $sizeKb KB, over the $PackageMaxKb KB ceiling. Something large is being shipped that should not be. Add it to the exclude list in this script."
+    Die "package is $sizeKb KB, over the $PackageMaxKb KB ceiling. Something large is being shipped that should not be. Add a pathspec exclusion in scripts/lib/build-package.sh (and its PowerShell twin) — or, if it is untracked, check whether it should be `git add`ed instead."
 }
 
 # A CRLF in a .sh or .service file fails on Linux as `bad interpreter:
@@ -906,6 +873,17 @@ if ($LASTEXITCODE -ne 0) {
     Die 'refusing to deploy this package — see above.'
 }
 
+# Everything from here on touches $remoteDir on the server. Wrapped in
+# try/finally -- the PowerShell twin of deploy.sh's `trap cleanup EXIT` --
+# because `exit` still runs a `finally` (verified: PowerShell 5.1 and 7 both
+# unwind through it), and because $ErrorActionPreference = 'Stop' turns any
+# uncaught cmdlet error into a terminating exception a bare Die() call would
+# never see. A failed install used to leave the extracted copy behind,
+# world-readable, under /tmp; --from-step does not read it back -- $stamp is
+# reminted and the package is rebuilt and reuploaded on every invocation of
+# this script -- so removing it here on every exit path costs a resume
+# nothing.
+try {
 Write-Info "transferring to ${HostName}:$remoteDir"
 if ((Test-Ssh -Command "mkdir -p '$remoteDir'") -ne 0) { Die "cannot create $remoteDir on the server" }
 & $scp @scpArgs -q $tarball "${target}:$remoteDir/sentinel.tar.gz"
@@ -929,7 +907,7 @@ if ($DryRun) {
     $firewalldArg = if ($AllowFirewalld) { '--allow-firewalld' } else { '' }
     Invoke-SshLive -Tty -Command "sudo '$remoteDir/deploy/preflight.sh' $domainArg --web-port $WebPort --nginx-mode $NginxMode $adminArg $ufwArg $firewalldArg"
     $rc = $LASTEXITCODE
-    Test-Ssh -Command "rm -rf '$remoteDir'" | Out-Null
+    # $remoteDir is removed by the `finally` block below, not here.
     exit $rc
 }
 
@@ -988,6 +966,9 @@ if ($installRc -ne 0) {
     Write-Warn 'installation failed'
     Write-Warn 'The installer is step-numbered and idempotent. Fix the cause, then resume:'
     Write-Warn "    $resumeCmd -FromStep <N>"
+    Write-Warn 'This re-packages and re-uploads a fresh copy to a new /tmp directory --'
+    Write-Warn 'the failed run''s extracted copy on the server has already been removed,'
+    Write-Warn 'and -FromStep relies on step markers on the server, not on that copy.'
     Write-Warn 'Or undo everything:'
     Write-Warn "    $resumeCmd -Rollback"
     exit 1
@@ -995,9 +976,11 @@ if ($installRc -ne 0) {
 
 Write-Ok 'installation finished'
 
-# Keep the extracted tree: rollback.sh lives in it, and it is what a resume uses.
+# Copy the deploy/ tree to a place that outlives this run: rollback.sh lives
+# in it, and $remoteDir itself is /tmp scratch removed by the `finally` block
+# below regardless of what happens here -- $remoteDir is NOT storage and
+# -FromStep does not read it back (see the try/finally comment above).
 Test-Ssh -Tty -Command "sudo mkdir -p /opt/sentinel && sudo cp -r '$remoteDir/deploy' /opt/sentinel/deploy" | Out-Null
-Test-Ssh -Command "rm -rf '$remoteDir'" | Out-Null
 
 $dash = if ($Domain) { $Domain } else { $HostName }
 if ($NginxMode -eq 'shared') {
@@ -1021,3 +1004,11 @@ Write-Host @"
     4. Dupa 72h fara fals-pozitive, activeaza-l.
 
 "@
+} finally {
+    # Runs on every exit from the try block above -- success, a Die() call,
+    # an uncaught terminating error, or the dry-run's `exit $rc`. If the
+    # remote `mkdir -p` inside the try never ran (an earlier Die(), before
+    # this block starts, for a missing key or an unreachable host), the
+    # directory never existed on the server and `rm -rf` on it is a no-op.
+    Test-Ssh -Command "rm -rf '$remoteDir'" 2>$null | Out-Null
+}

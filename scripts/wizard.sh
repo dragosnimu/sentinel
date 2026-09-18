@@ -33,6 +33,7 @@ export LC_ALL="${LC_ALL:-C.UTF-8}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+source "${SCRIPT_DIR}/lib/build-package.sh"
 
 # ---------------------------------------------------------------- appearance
 if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
@@ -374,11 +375,17 @@ title "Instalare"
 STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 
+# Construită din ce urmărește git, nu din arborele de lucru minus o listă de
+# excluderi — vezi scripts/lib/build-package.sh pentru motiv: acolo unde a
+# fost cazul confirmat, `credentiale.txt` și `env.txt`, ignorate de git și
+# niciodată `git add`-uite, au ajuns totuși în arhivă fiindcă vechea listă nu
+# știa de numele lor. O listă de excluderi trebuie anunțată despre fiecare
+# fișier secret care va exista vreodată; `git ls-files` știe deja.
 info "împachetez proiectul…"
-tar --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' \
-    --exclude='secrets/*' --exclude='.venv' --exclude='node_modules' \
-    -czf "${STAGE}/sentinel.tar.gz" -C "$REPO_DIR" . 2>/dev/null \
-    || die "împachetarea a eșuat"
+build_sentinel_package "${STAGE}/sentinel.tar.gz" "$REPO_DIR" \
+    || die "împachetarea a eșuat — wizard-ul trebuie rulat dintr-un clonă git \
+(vezi docs/DEPLOYMENT.md §3.1); nu există o cale de rezervă care să trimită tot \
+arborele, fiindcă asta ar redeschide exact gaura pe care o închide asta"
 good "arhivă: $(du -h "${STAGE}/sentinel.tar.gz" | cut -f1)"
 
 # Secrets go on stdin, never in argv: `ps` on a shared host shows arguments to

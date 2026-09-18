@@ -29,10 +29,17 @@ from typing import Any
 from sentinel.ai import budget
 from sentinel.ai.client import call_structured
 from sentinel.config import Config
+from sentinel.constants import PATCH_BINARY_ALLOWLIST
 from sentinel.db.engine import Database
 from sentinel.db.repo import patches as repo
 from sentinel.logging_setup import get_logger
-from sentinel.patch.validator import CHECK_REQUIRED_FIELDS, plan_hash, validate_plan
+from sentinel.patch.validator import (
+    BACKUP_KIND_UNAVAILABLE_ON,
+    CHECK_REQUIRED_FIELDS,
+    PLATFORM_PACKAGE_BINARIES,
+    plan_hash,
+    validate_plan,
+)
 
 log = get_logger(__name__)
 
@@ -120,8 +127,156 @@ def _check_fields_doc() -> str:
     lines.append("   · pkg_version cere ÎN PLUS `equals` sau `at_least`")
     return "\n".join(lines)
 
-PLANNER_SYSTEM = """\
-Ești inginerul de patch-uri al agentului Sentinel, pe un server AlmaLinux 9.
+
+def _binary_allowlist_doc(family: str) -> str:
+    """The allowed binaries FOR THIS FAMILY, read from `sentinel.constants`
+    and narrowed by `validator.PLATFORM_PACKAGE_BINARIES` — the same two
+    tables the validator enforces.
+
+    Written out by hand, this list had already drifted from
+    `PATCH_BINARY_ALLOWLIST`: the prompt still named `httpd`, `wp`, `certbot`,
+    `curl`... none of which the validator has allowed since the allowlist was
+    narrowed for the executor work. A model told a binary is fine when the
+    validator will reject it pays for a guaranteed second-attempt failure —
+    generated from the one table the validator actually checks, the two
+    cannot drift apart again.
+
+    `PATCH_BINARY_ALLOWLIST` itself is platform-agnostic — it has no opinion
+    on `dnf` vs `apt-get` — so listing it whole told a Debian host `dnf` and
+    `rpm` were fine, and `validate_plan`'s own `platform_family` check then
+    rejected them: the "guaranteed second-attempt failure" this function's
+    docstring already promises to remove, reopened by omission. The OTHER
+    family's package-manager binaries are subtracted here so the prompt never
+    again offers a binary this host provably does not have.
+    """
+    other_families_binaries: set[str] = set()
+    for fam, binaries in PLATFORM_PACKAGE_BINARIES.items():
+        if fam != family:
+            other_families_binaries |= binaries
+    allowed = sorted(b for b in PATCH_BINARY_ALLOWLIST if b not in other_families_binaries)
+    return ", ".join(allowed)
+
+
+# `rpm_state` has no Debian equivalent — `BACKUP_KINDS` does not carry a
+# `dpkg_state`, and the validator refuses `rpm_state` outright when
+# `platform_family="debian"` (`BACKUP_KIND_UNAVAILABLE_ON` in validator.py).
+# Teaching the model a kind the validator will then refuse is exactly the
+# same class of drift `_binary_allowlist_doc` exists to prevent, for backup
+# kinds instead of binaries.
+def _backup_kind_doc(family: str) -> str:
+    """Which backup kinds to teach, read from the validator's OWN table.
+
+    This used to test `if family == "rhel"` in two places, which happened to
+    agree with `BACKUP_KIND_UNAVAILABLE_ON` only because that table has
+    exactly one entry and exactly two families exist. The moment a kind
+    becomes unavailable on `rhel` too — or a third family appears — the
+    hand-written condition would keep teaching a kind the validator refuses,
+    which is the same drift-by-duplication the grammar had, spelled with an
+    `if` instead of a regex.
+    """
+    unavailable = BACKUP_KIND_UNAVAILABLE_ON.get("rpm_state", frozenset())
+    rpm_state_usable = family not in unavailable
+    lines = ['    · `path`      → o cale absolută de fișier/director (ex. "/etc/nginx")']
+    if rpm_state_usable:
+        lines.append(
+            '    · `rpm_state` → NUMELE PACHETULUI, nu o cale (ex. "curl"). Se salvează\n'
+            '      versiunea instalată, ca rollback-ul să o poată fixa.')
+    lines.append('    · `git_ref`   → calea depozitului git')
+    doc = "\n".join(lines)
+    if rpm_state_usable:
+        doc += (
+            '\n  Un `rpm_state` cu o cale (ex. "/var/lib/rpm") este RESPINS de validator:\n'
+            '  `rpm -q` primește un nume de pachet, nu o cale, iar backup-ul ar eșua.')
+    return doc
+
+
+# What each platform family is called, and what "the boring update" looks like
+# on it. Keyed exactly like `sentinel.constants.PLATFORM_FAMILIES` — nothing
+# reaches `_render_system` with a family outside this dict, because
+# `Config.platform.family` is refused at load time if it is not one of the two
+# (`sentinel/config.py`), and `unplannable_reason` refuses to generate a plan
+# for an ecosystem the family cannot own before the model is ever called.
+#
+# `update_example`/`apply_argv`/`rollback_argv` are the forms BOTH the
+# validator and `executor/policy.py` accept — verified by
+# `tests/security/test_plan_argvs_match_executor_policy.py`, which runs every
+# argv in the plan fixtures through the executor's own `check_argv`. The
+# debian pair used to be `apt-get -y install --only-upgrade <pachet>`, which
+# the executor refuses (`--only-upgrade` is not on its flag list), together
+# with a rollback that could only be `apt-get -y install <pachet>` — no
+# version, so it reinstalled exactly the version the patch had just replaced.
+# Both halves are now version-pinned, which is the only form apt has for
+# going back: there is no `apt-get downgrade`.
+_PLATFORM_PROMPT_FACTS: dict[str, dict[str, str]] = {
+    "rhel": {
+        "os_name": "AlmaLinux 9",
+        "pkg_ecosystem": "pachete RPM prin dnf",
+        "update_example": "dnf -y update <pachet>",
+        "apply_argv": '["dnf", "-y", "update", "{pkg}"]',
+        "rollback_argv": '["dnf", "-y", "downgrade", "{pkg}-{installed}"]',
+    },
+    "debian": {
+        "os_name": "Debian/Ubuntu",
+        "pkg_ecosystem": "pachete DEB prin apt-get",
+        "update_example": "apt-get -y install <pachet>=<versiunea care repară>",
+        "apply_argv": '["apt-get", "-y", "install", "{pkg}={fixed}"]',
+        "rollback_argv":
+            '["apt-get", "-y", "install", "--allow-downgrades", "{pkg}={installed}"]',
+    },
+}
+
+
+def _update_recipe_doc(family: str) -> str:
+    """Rețeta completă pentru un pachet de sistem, pe familia dată.
+
+    Cele patru piese se țin una pe alta și de-aia sunt scrise împreună:
+    preflight-ul fixează ce era instalat, apply-ul pune versiunea care repară,
+    rollback-ul se întoarce la EXACT ce a văzut preflight-ul, iar
+    post_verification confirmă efectul. Fără preflight, rollback-ul s-ar putea
+    fixa pe o versiune pe care gazda n-a avut-o niciodată — de aceea nu e
+    decor.
+    """
+    facts = _PLATFORM_PROMPT_FACTS[family]
+    apply_argv = facts["apply_argv"].format(
+        pkg="<pachet>", fixed="<versiunea care repară>", installed="<versiunea instalată>")
+    rollback_argv = facts["rollback_argv"].format(
+        pkg="<pachet>", fixed="<versiunea care repară>", installed="<versiunea instalată>")
+    lines = [
+        "REȚETA pentru un pachet de sistem — folosește-o ca atare, cele patru",
+        "piese se sprijină una pe alta:",
+        "  · preflight:         pkg_version {name: <pachet>, equals: <versiunea instalată>}",
+        f"  · apply:             {apply_argv}",
+        f"  · rollback:          {rollback_argv}",
+        "  · post_verification: pkg_version {name: <pachet>, at_least: <versiunea care repară>}",
+        "Preflight-ul NU e formalitate: dacă versiunea de pe gazdă nu e cea din",
+        "contextul de mai sus, rollback-ul s-ar fixa pe o versiune greșită, deci",
+        "planul trebuie să se oprească înainte să schimbe ceva.",
+    ]
+    if family == "debian":
+        lines += [
+            "Versiunea e OBLIGATORIE în ambele comenzi: `apt-get` nu are `downgrade`,",
+            "iar `install <pachet>` fără `=versiune` reinstalează chiar versiunea",
+            "vulnerabilă. Din același motiv `--allow-downgrades` e acceptat DOAR cu",
+            "`install` și DOAR cu `=versiune` pe fiecare pachet; `--only-upgrade` nu",
+            "e acceptat deloc.",
+        ]
+    lines += [
+        "ONEST, și spune-o în `restore_instructions_ro`: un rollback fixat pe",
+        "versiune poate totuși eșua la rulare dacă acea versiune nu mai există în",
+        "depozit (arhivele curăță versiunile vechi). E mult mai bun decât unul care",
+        "sigur nu restaurează nimic, dar nu e o garanție — nu-l prezenta ca atare.",
+    ]
+    return "\n".join(lines)
+
+# The template, not yet rendered: still carries `%%...%%` placeholders for
+# everything that depends on the host (family) or on another module's table
+# (the check-kind fields, the binary allowlist). `PLANNER_SYSTEM` below is this
+# template rendered for `rhel`, kept as a plain string because
+# `tests/unit/test_patch_validator.py` imports it directly to prove the
+# check-kind fields and the substitution both hold — `generate()` itself calls
+# `_render_system(cfg.platform.family)` and never reads this name.
+_PLANNER_SYSTEM_TEMPLATE = """\
+Ești inginerul de patch-uri al agentului Sentinel, pe un server %%OS_NAME%%.
 Primești o vulnerabilitate confirmată și contextul ei determinist, și produci un
 plan de remediere care va fi executat AUTOMAT, ca root, pe o mașină de producție.
 
@@ -130,10 +285,10 @@ REGULI ABSOLUTE — un plan care le încalcă este respins de validator, nu disc
 1. Fiecare comandă este o listă `argv`, niciodată un șir. Fără shell, fără `|`,
    `&&`, `;`, `$(...)`, fără redirectări. Dacă ai nevoie de shell, planul e greșit.
 2. Primul element al fiecărui argv trebuie să fie un binar din lista permisă:
-   dnf, rpm, systemctl, nginx, httpd, apachectl, docker, git, npm, yarn,
-   composer, pip, pip3, wp, mysqldump, mysql, pg_dump, psql, tar, zstd, gzip,
-   cp, mv, ln, mkdir, install, chown, chmod, sed, test, sha256sum, certbot, curl.
+   %%BINARY_LIST%%.
    `rm` NU este permis. Nu ștergi nimic, niciodată.
+   `systemctl` cere NUMELE COMPLET al unității — `nginx.service`, nu `nginx` —
+   și doar acțiunile start/stop/restart/reload/status.
 3. Nu atinge niciodată: /opt/sentinel, /etc/sentinel, /var/lib/sentinel,
    /var/backups/sentinel, /root/.ssh, /etc/ssh, /etc/passwd, /etc/shadow,
    /etc/sudoers, /boot.
@@ -155,33 +310,67 @@ STRUCTURA EXACTĂ a câmpurilor obligatorii:
 - `schema_version`: 1
 - `target`: {asset_id: <int>, asset_name: "<nume>", protected: false,
   stack: "<stack>", unit: "<unit systemd sau null>"}
-- `vulnerabilities`: [{finding_id: <int>, cve: "CVE-YYYY-NNNNN", package: "...",
-  severity: "low|medium|high|critical"}]
+- `vulnerabilities`: un array cu cel puțin un obiect — poate fi `[{}]`. Conținutul
+  lui e IGNORAT: după ce răspunzi, e înlocuit automat cu finding_id, cve, package
+  și severitatea citite din baza de date, aceleași pe care le-ai primit mai jos
+  în context. Nu inventa aici un CVE sau un finding_id — dacă mai sus scrie
+  „CVE: —", findingul chiar nu are unul, iar planul e verificat contra
+  identificatorului cerut, nu contra a ce pui tu în acest câmp.
 - `risk`: {level: "low|medium|high|critical", blast_radius:
   "single-service|multi-service|host-wide", reversible: <bool>,
   requires_reboot: <bool>, estimated_downtime_s: <int>, confidence: <0..1>}
 - `backup`: [{id, desc_ro, kind, source, restore_argv: [...], estimated_size_mb}]
   unde `source` depinde de `kind`:
-    · `path`      → o cale absolută de fișier/director (ex. "/etc/nginx")
-    · `rpm_state` → NUMELE PACHETULUI, nu o cale (ex. "curl"). Se salvează
-      versiunea instalată, ca rollback-ul să o poată fixa.
-    · `git_ref`   → calea depozitului git
-  Un `rpm_state` cu o cale (ex. "/var/lib/rpm") este RESPINS de validator:
-  `rpm -q` primește un nume de pachet, nu o cale, iar backup-ul ar eșua.
+%%BACKUP_KIND_DOC%%
 - `restore_instructions_ro`: text
-Folosește exact valorile din contextul primit pentru asset_id, asset_name și
-finding_id — nu le inventa.
+Folosește exact valorile din contextul primit pentru asset_id și asset_name —
+nu le inventa. (finding_id, cve, package: vezi mai sus — sunt suplinite automat.)
 
-Preferă soluția cea mai plictisitoare care funcționează. Pe AlmaLinux, aproape
-întotdeauna asta înseamnă `dnf -y update <pachet>` plus repornirea unității,
+Preferă soluția cea mai plictisitoare care funcționează. Pe %%OS_NAME%%, aproape
+întotdeauna asta înseamnă `%%UPDATE_EXAMPLE%%` plus repornirea unității,
 nu o secvență inteligentă. Nu inventa pași. Nu presupune fișiere pe care nu ți
 le-am arătat.
 
+%%UPDATE_RECIPE%%
+
 Răspunde DOAR prin apelul tool-ului `emit_patch_plan`."""
 
-# Substituted, not f-stringed: the prompt is full of literal `{...}` describing
-# the JSON shape, and an f-string would try to interpolate every one of them.
-PLANNER_SYSTEM = PLANNER_SYSTEM.replace("%%CHECK_FIELDS%%", _check_fields_doc())
+
+def _render_system(family: str) -> str:
+    """Render the planner's system prompt for one platform family.
+
+    The prompt used to say "AlmaLinux 9" as a literal, independent of what
+    `cfg.platform.family` actually held — correct for every host that existed
+    when it was written, and silently wrong the day a Debian host joined the
+    fleet: `unplannable_reason` correctly gated WHICH findings could get a
+    plan by family, then this text told the model it was somewhere it was not,
+    and it drafted `dnf` commands for a `deb` finding on Ubuntu. Substituted,
+    not f-stringed: the template is full of literal `{...}` describing the
+    JSON shape, and an f-string would try to interpolate every one of them.
+    """
+    facts = _PLATFORM_PROMPT_FACTS.get(family)
+    if facts is None:
+        raise ValueError(
+            f"no prompt facts for platform.family={family!r} — Config already "
+            "refuses an unknown family at load time, so reaching this means "
+            "_PLATFORM_PROMPT_FACTS has drifted from "
+            "sentinel.constants.PLATFORM_FAMILIES"
+        )
+    text = _PLANNER_SYSTEM_TEMPLATE
+    text = text.replace("%%OS_NAME%%", facts["os_name"])
+    text = text.replace("%%UPDATE_EXAMPLE%%", facts["update_example"])
+    text = text.replace("%%BINARY_LIST%%", _binary_allowlist_doc(family))
+    text = text.replace("%%CHECK_FIELDS%%", _check_fields_doc())
+    text = text.replace("%%BACKUP_KIND_DOC%%", _backup_kind_doc(family))
+    text = text.replace("%%UPDATE_RECIPE%%", _update_recipe_doc(family))
+    return text
+
+
+# The `rhel` rendering, importable as a plain string. Kept for
+# `tests/unit/test_patch_validator.py`, which checks the check-kind fields and
+# the placeholder substitution against a fixed string; `generate()` below does
+# not read this name; it calls `_render_system(cfg.platform.family)`.
+PLANNER_SYSTEM = _render_system("rhel")
 
 
 def _tool_schema() -> dict[str, Any]:
@@ -254,7 +443,45 @@ async def _context(db: Database, finding_id: int) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-def _build_user(ctx: dict[str, Any], errors: list[str] | None = None) -> str:
+def _exact_commands(ctx: dict[str, Any], facts: dict[str, str]) -> list[str]:
+    """Cele două comenzi, scrise cu valorile REALE din baza de date.
+
+    Șablonul de sistem descrie forma cu `<pachet>`/`<versiune>`; aici sunt
+    chiar valorile pe care le-a citit `_context`, ca modelul să nu aibă de
+    compus un nume de pachet cu o versiune — exact locul unde a inventat până
+    acum.
+
+    Dacă versiunea instalată lipsește din finding, rollback-ul fixat pe
+    versiune NU se poate scrie: nu se ghicește una, se spune că nu există și
+    se cere `reversible: false`. „Nu știu" și „e bine" sunt stări diferite, iar
+    un rollback ghicit ar fixa o versiune pe care gazda n-a avut-o niciodată.
+    """
+    pkg = ctx.get("package")
+    installed = ctx.get("installed_version")
+    fixed = ctx.get("fixed_version")
+    if not pkg or not fixed:
+        return []
+    out = ["", "Comenzile exacte pentru acest pachet (valorile sunt din baza de "
+                "date — folosește-le ca atare, nu le rescrie):",
+           f"- apply:    {facts['apply_argv'].format(pkg=pkg, fixed=fixed, installed=installed)}"]
+    if installed:
+        out += [
+            f"- rollback: {facts['rollback_argv'].format(pkg=pkg, fixed=fixed, installed=installed)}",
+            f"- preflight `pkg_version`: {{name: \"{pkg}\", equals: \"{installed}\"}}",
+            f"- post_verification `pkg_version`: {{name: \"{pkg}\", at_least: \"{fixed}\"}}",
+        ]
+    else:
+        out += [
+            "- rollback: NU se poate fixa pe o versiune — findingul nu spune ce "
+            "versiune e instalată acum. Pune `risk.reversible: false` și explică "
+            "în `restore_instructions_ro` ce trebuie făcut manual; nu inventa o "
+            "versiune de revenire.",
+        ]
+    return out
+
+
+def _build_user(ctx: dict[str, Any], family: str, errors: list[str] | None = None) -> str:
+    facts = _PLATFORM_PROMPT_FACTS[family]
     parts = [
         "Vulnerabilitate confirmată (fapte deterministe, de încredere):",
         f"- CVE: {ctx.get('cve') or '—'}",
@@ -273,8 +500,10 @@ def _build_user(ctx: dict[str, Any], errors: list[str] | None = None) -> str:
         f"- expus la internet: {'DA' if ctx.get('is_internet_exposed') else 'nu'}",
         f"- criticitate: {ctx.get('criticality') or 3}/5",
         "",
-        "Sistem: AlmaLinux 9, pachete RPM prin dnf. Managerul de servicii e systemd.",
+        f"Sistem: {facts['os_name']}, {facts['pkg_ecosystem']}. Managerul de "
+        "servicii e systemd.",
     ]
+    parts += _exact_commands(ctx, facts)
     if ctx.get("protected"):
         parts.append(
             "\nATENȚIE: asset-ul e marcat PROTEJAT. Validatorul respinge orice plan "
@@ -330,13 +559,23 @@ async def generate(db: Database, cfg: Config, api_key: str,
         return None, f"buget: {reason}"
 
     model = cfg.ai.model_patch
+    family = cfg.platform.family
+    system_prompt = _render_system(family)
+    # The facts this plan is ABOUT, read from the database — the standard the
+    # validator holds the model's own output to. Built once, from the same
+    # `ctx` the model was shown, never from anything the model returns.
+    finding_facts = {
+        "finding_id": finding_id,
+        "cve": ctx.get("cve"),
+        "package": ctx.get("package"),
+    }
     errors: list[str] | None = None
     started = time.time()
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
         result = await call_structured(
-            api_key, model=model, system=PLANNER_SYSTEM,
-            user=_build_user(ctx, errors), tool=_tool_schema(),
+            api_key, model=model, system=system_prompt,
+            user=_build_user(ctx, family, errors), tool=_tool_schema(),
             max_tokens=8192, timeout=cfg.ai.timeout_s)
         await budget.record(
             db, purpose="patch_plan", model=model,
@@ -349,7 +588,45 @@ async def generate(db: Database, cfg: Config, api_key: str,
             return None, f"model indisponibil: {result.error}"
 
         plan = result.tool_input
-        validation = validate_plan(plan)
+        if isinstance(plan, dict):
+            # `vulnerabilities` is not the model's to invent. A model asked
+            # for an identifier it does not have will produce one — measured
+            # in production as `finding_id: 0` and `CVE-0000-00000`, both
+            # schema-valid — so it is never asked: whatever it drafted here is
+            # replaced with the same deterministic facts `_build_user` showed
+            # it, straight from `ctx`. The validator's `finding=` check below
+            # is the second, independent gate on the same facts — this
+            # overwrite is not trusted to be the only thing standing between a
+            # fabricated identifier and a stored plan.
+            # `cvss`/`epss` are deliberately NOT carried into the plan.
+            # `findings.cvss` and `findings.epss` are `numeric(3,1)` /
+            # `numeric(5,4)` (0003_vuln.sql), and asyncpg has no codec
+            # configured for `numeric` anywhere in this project, so `ctx`
+            # holds them as `decimal.Decimal` — a type `json.dumps` refuses.
+            # `plan_hash()` and `repo.store_plan` both serialise this dict to
+            # JSON, so a scored finding (the normal case, not the edge case)
+            # would crash plan generation right here. Nothing reads
+            # `cvss`/`epss` back off a stored plan — `patch_flow.py` and the
+            # validator only ever look at `cve`/`ecosystem`/`package` — so
+            # there is no value in carrying a type hazard for a field nobody
+            # consumes. The finding's own `cvss`/`epss` remain visible
+            # wherever the operator actually reads them: the finding row
+            # itself (`telegram/views.py`), not a copy inside the plan.
+            plan["vulnerabilities"] = [{
+                "finding_id": finding_id,
+                "cve": ctx.get("cve"),
+                "kev": bool(ctx.get("kev")),
+                "package": ctx.get("package"),
+                "current": ctx.get("installed_version"),
+                "fixed_in": ctx.get("fixed_version"),
+                "severity": ctx.get("severity"),
+                # Not validated, not required — carried through so
+                # `telegram/patch_flow.py` can pick the right advisory link
+                # (Red Hat only makes sense for an `rpm` finding) without
+                # guessing from the host it happens to run on.
+                "ecosystem": ctx.get("ecosystem"),
+            }]
+        validation = validate_plan(plan, platform_family=family, finding=finding_facts)
         if validation.valid:
             plan_db_id = await repo.store_plan(
                 db, plan=plan, plan_hash=plan_hash(plan), status="validated",
@@ -386,17 +663,52 @@ async def generate_for_kev(db: Database, cfg: Config, api_key: str,
     Only KEV, only with a known fix, only a few at a time: generation is the
     expensive model call in this system, and a plan for something nobody is
     exploiting can wait for a human to ask.
+
+    Și numai pentru ecosistemul pe care familia gazdei îl poate CHIAR atinge.
+    `/planifica` trecea prin `unplannable_reason` de la început; bucla asta nu,
+    deci pe gazda Debian cerea planuri pentru findinguri npm/alpine/go — două
+    apeluri Opus fiecare, toate terminate în `rejected_invalid`, sau, mai rău,
+    un plan `apt-get` plauzibil pentru un pachet dintr-o imagine de container.
+
+    Filtrul e în SQL, nu după `LIMIT`: pe gazda de producție TOATE primele 12
+    findinguri KEV după prioritate sunt din ecosisteme pe care gazda nu le
+    poate atinge (vezi comentariul de la `OS_PACKAGE_ECOSYSTEM`), deci o
+    filtrare de după selecție ar consuma cele trei sloturi pe rânduri
+    imposibile și n-ar mai genera niciodată nimic. `unplannable_reason` rămâne
+    poarta finală pe fiecare rând rămas — o singură decizie, luată într-un
+    singur loc, chiar dacă interogarea ar fi cândva slăbită.
     """
+    family = cfg.platform.family
+    expected = OS_PACKAGE_ECOSYSTEM.get((family or "").strip().lower())
+    if expected is None:
+        # Familie necunoscută: nu se ghicește „probabil rpm". Același refuz ca
+        # în `unplannable_reason`, doar că aici nu există un finding anume
+        # despre care să se raporteze.
+        log.warning("no KEV plans drafted: unknown platform family",
+                    extra={"family": family})
+        return []
+
     rows = await db.fetch(
         f"""
-        SELECT f.id FROM findings f
+        SELECT f.id, f.ecosystem FROM findings f
         WHERE f.status = 'open' AND f.kev AND f.fixed_version IS NOT NULL
+          AND lower(trim(f.ecosystem)) = $1
           AND NOT EXISTS (
               SELECT 1 FROM patch_plans p
               WHERE f.id = ANY(p.finding_ids)
                 AND p.status IN ({_LIVE_STATUS_LIST})
           )
-        ORDER BY f.priority DESC LIMIT $1
+        ORDER BY f.priority DESC LIMIT $2
         """,
-        limit)
-    return [await generate(db, cfg, api_key, r["id"]) for r in rows]
+        expected, limit)
+
+    results: list[tuple[int | None, str]] = []
+    for r in rows:
+        reason = unplannable_reason(r["ecosystem"], family)
+        if reason is not None:
+            log.info("KEV finding skipped as unplannable on this host",
+                     extra={"finding": r["id"], "ecosystem": r["ecosystem"]})
+            results.append((None, reason))
+            continue
+        results.append(await generate(db, cfg, api_key, r["id"]))
+    return results

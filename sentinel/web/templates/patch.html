@@ -57,7 +57,14 @@
       <tbody>
         {% for v in p.plan.get('vulnerabilities', []) %}
         <tr>
-          <td class="mono nowrap">{{ vuln.cve_cell(v.get('cve'), rpm=true) }}</td>
+          {# `rpm=true` era hard-codat: pe gazda Debian fiecare CVE ducea la
+             errata Red Hat, care n-are nicio legătură cu pachetul. Se citește
+             din `ecosystem`, faptul determinist pe care `planner.generate` îl
+             pune în plan din baza de date — exact ca în
+             `telegram/patch_flow.py`. Un plan vechi, de dinainte ca faptul să
+             fie salvat, nu are câmpul: atunci NU se afirmă „e RPM", se lasă
+             legăturile generice. #}
+          <td class="mono nowrap">{{ vuln.cve_cell(v.get('cve'), rpm=(v.get('ecosystem') == 'rpm')) }}</td>
           <td>{{ v.get('package', '') }}</td>
           <td class="muted small">{{ v.get('severity', '') }}</td>
         </tr>

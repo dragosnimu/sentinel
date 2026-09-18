@@ -68,11 +68,16 @@ def format_plan(row: patches.PlanRow) -> str:
 
     # Linked, not printed. This message is where the decision to patch a
     # production box gets made, and "look it up yourself" is a poor way to ask
-    # for that decision. Red Hat first: these are RPM findings, so the question
-    # is backport status, which NVD answers wrongly for backported packages.
+    # for that decision. Red Hat first ONLY for an `rpm` finding — the question
+    # there is backport status, which NVD answers wrongly for backported
+    # packages. `rpm=True` used to be unconditional here regardless of which
+    # platform the finding actually came from, so a Debian finding (rare, but
+    # not impossible, to carry a CVE) got a Red Hat link on a host that has no
+    # Red Hat relationship to it. `ecosystem` is a deterministic fact filled in
+    # by `planner.generate`, not model output — see the comment there.
     from sentinel.intel.links import cve_html
 
-    cves = " · ".join(cve_html(v.get("cve"), rpm=True)
+    cves = " · ".join(cve_html(v.get("cve"), rpm=(v.get("ecosystem") == "rpm"))
                       for v in vulns[:4] if v.get("cve")) or "—"
     lines = [
         f"{RISK_EMOJI.get(row.risk_level, '⚪')} <b>Plan de patch #{row.id}</b> · "
@@ -113,7 +118,9 @@ def format_window_notice(row: patches.PlanRow, reason: str) -> str:
 
     from sentinel.intel.links import cve_html
 
-    cves = " · ".join(cve_html(v.get("cve"), rpm=True)
+    # Same reasoning as `format_plan`: Red Hat only for an `rpm` finding, read
+    # from the deterministic `ecosystem` fact, never assumed.
+    cves = " · ".join(cve_html(v.get("cve"), rpm=(v.get("ecosystem") == "rpm"))
                       for v in vulns[:4] if v.get("cve")) or "—"
     lines = [
         f"📋 <b>Plan de patch #{row.id} generat</b> — {_esc(target.get('asset_name', '?'))}",

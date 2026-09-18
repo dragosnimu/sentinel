@@ -115,9 +115,17 @@ def _sql_repo() -> str:
     return db.sql
 
 
+#: Ecosistemul pe care familia gazdei de test îl poate atinge. Luat din
+#: `planner.OS_PACKAGE_ECOSYSTEM`, nu scris de mână: dacă tabela aia s-ar
+#: schimba, interogarea ar filtra pe altceva decât inserează testul, iar
+#: rândul ar dispărea din rezultat — adică testul ar deveni verde din motivul
+#: greșit (niciun rând găsit arată la fel ca „plan viu care blochează").
+ECOSISTEM = planner.OS_PACKAGE_ECOSYSTEM["rhel"]
+
+
 def _sql_planner() -> str:
     db = _CaptureDB()
-    run(planner.generate_for_kev(db, cfg=None, api_key="sk-test", limit=3))
+    run(planner.generate_for_kev(db, cfg=_cfg(), api_key="sk-test", limit=3))
     return db.sql
 
 
@@ -146,7 +154,15 @@ def _tradu_repo(sql: str) -> str:
 def _tradu_planner(sql: str) -> str:
     needle = "f.id = ANY(p.finding_ids)"
     assert needle in sql, f"tipar PostgreSQL neașteptat: {sql!r}"
-    return sql.replace(needle, "f.id = p.finding_id").replace("$1", "?")
+    # `$1` e ecosistemul, `$2` limita. Poarta de ecosistem e în SQL fiindcă pe
+    # gazda reală toate findingurile KEV de sus sunt din ecosisteme pe care
+    # gazda nu le poate atinge, deci o filtrare de după `LIMIT` n-ar mai
+    # genera niciodată nimic. Aserțiunea ține traducătorul onest: dacă filtrul
+    # dispare din interogare, testul o spune, nu potrivește pe altceva.
+    assert "lower(trim(f.ecosystem)) = $1" in sql, (
+        f"filtrul de ecosistem a dispărut din interogare: {sql!r}")
+    return (sql.replace(needle, "f.id = p.finding_id")
+               .replace("$1", "?").replace("$2", "?"))
 
 
 def _cauta(conn: sqlite3.Connection, finding_id: int) -> list:
@@ -173,8 +189,9 @@ def _conn(status: str, *, origine: str = "ai_manual",
     conn.execute(f"CREATE TABLE patch_plans ({', '.join(coloane)}, "
                  "generated_by TEXT, finding_id INTEGER)")
     conn.execute("CREATE TABLE findings (id INTEGER, status TEXT, kev INTEGER, "
-                 "fixed_version TEXT, priority INTEGER)")
-    conn.execute("INSERT INTO findings VALUES (7, 'open', 1, '1.2.3', 5)")
+                 "fixed_version TEXT, priority INTEGER, ecosystem TEXT)")
+    conn.execute("INSERT INTO findings VALUES (7, 'open', 1, '1.2.3', 5, ?)",
+                 (ECOSISTEM,))
     conn.execute("INSERT INTO patch_plans (id, status, created_at, generated_by, "
                  "finding_id) VALUES (99, ?, ?, ?, 7)", (status, creat, origine))
     return conn
@@ -238,7 +255,8 @@ def test_un_plan_viu_e_vazut_de_amandoua_interogarile(status):
         f"cererea manuală nu vede planul în starea {status!r}, deci ar redacta "
         "un al doilea peste el")
 
-    ramase = {r[0] for r in conn.execute(_tradu_planner(_sql_planner()), (3,))}
+    ramase = {r[0] for r in conn.execute(_tradu_planner(_sql_planner()),
+                                         (ECOSISTEM, 3))}
     assert ramase == set(), (
         f"planner-ul automat ar redacta încă un plan peste unul în starea {status!r}")
 
@@ -261,7 +279,8 @@ def test_un_plan_mort_nu_blocheaza_nici_cererea_nici_redactarea(status):
         f"un plan în starea {status!r} blochează cererea manuală, deși findingul "
         "a rămas fără plan utilizabil")
 
-    ramase = {r[0] for r in conn.execute(_tradu_planner(_sql_planner()), (3,))}
+    ramase = {r[0] for r in conn.execute(_tradu_planner(_sql_planner()),
+                                         (ECOSISTEM, 3))}
     assert ramase == {7}
 
 
@@ -352,7 +371,8 @@ def test_dupa_expirare_findingul_poate_primi_din_nou_un_plan():
     assert _cauta(conn, 7) == [], (
         "planul expirat blochează în continuare cererea manuală — findingul "
         "rămâne fără plan și fără cale să ceară altul")
-    ramase = {r[0] for r in conn.execute(_tradu_planner(_sql_planner()), (3,))}
+    ramase = {r[0] for r in conn.execute(_tradu_planner(_sql_planner()),
+                                         (ECOSISTEM, 3))}
     assert ramase == {7}, "nici planner-ul automat nu mai are voie să-l creadă blocat"
 
 
@@ -393,7 +413,7 @@ def _planner_simulat(monkeypatch, capturat: list):
     monkeypatch.setattr(planner.budget, "record", _record)
     monkeypatch.setattr(planner, "call_structured", _call)
     monkeypatch.setattr(planner, "validate_plan",
-                        lambda plan: SimpleNamespace(valid=True, errors=[]))
+                        lambda plan, **kw: SimpleNamespace(valid=True, errors=[]))
     monkeypatch.setattr(planner, "plan_hash", lambda plan: "h" * 8)
     monkeypatch.setattr(planner.repo, "store_plan", _store_plan)
 
@@ -409,7 +429,7 @@ def test_planul_automat_ramane_etichetat_ai(monkeypatch):
 
     class _DB(_CaptureDB):
         async def fetch(self, sql, *a):
-            return [{"id": 7}]
+            return [{"id": 7, "ecosystem": ECOSISTEM}]
 
     run(planner.generate_for_kev(_DB(), cfg=_cfg(), api_key="sk-test", limit=1))
 

@@ -95,6 +95,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SECRETS_FILE="${REPO_ROOT}/secrets/.env.local"
+source "${REPO_ROOT}/scripts/lib/build-package.sh"
 
 HOST=""; KEY=""; DOMAIN=""; EMAIL=""; ADMIN_IP=""; DB_PORT=""; SECRETS_ARG=""
 # Rotation consent, separate from ASSUME_YES on purpose — see the --yes note
@@ -567,6 +568,21 @@ you meant, or without --yes to be asked interactively."
 }
 
 cleanup() {
+    # The extracted copy on the server is removed HERE, unconditionally, so it
+    # runs on the success path and every failure path alike — a `die` deeper
+    # in this script, Ctrl+C, or falling off the end all trigger EXIT the same
+    # way. A failed install used to leave this tree behind, world-readable,
+    # under /tmp/sentinel-deploy-<stamp> until the next successful deploy
+    # happened to overwrite the same host. --from-step does not read this
+    # directory back: STAMP is re-minted and the package is rebuilt and
+    # re-uploaded on every invocation of this script (see STAMP above), so a
+    # resume after this cleanup has nothing to lose and nothing to reupload
+    # that it was not already going to reupload.
+    #
+    # Run while the control-master connection (if any) is still open — a
+    # control-socket round trip, not a fresh TCP+auth handshake — which is why
+    # this line runs BEFORE the `ssh -O exit` below closes it.
+    [[ -n "${REMOTE_DIR:-}" ]] && { ssh_run "rm -rf '${REMOTE_DIR}'" >/dev/null 2>&1 || true; }
     [[ "$MUX" == "yes" ]] &&
         ssh -O exit "${SSH_OPTS[@]}" "${USER}@${HOST}" 2>/dev/null || true
     [[ -n "${TARBALL:-}" && -f "${TARBALL:-}" ]] && rm -f "$TARBALL"
@@ -696,65 +712,18 @@ PACKAGE_MAX_KB=20480
 
 info "packaging the repository"
 
-# secrets/ is excluded from the tarball. Secrets travel on stdin only — a
-# tarball lands in /tmp on the server and lingers there.
-#
-# watcher/ is excluded on purpose, not to save bytes. It is the external
-# witness, and its whole value is running somewhere the monitored host cannot
-# reach. Shipping a copy here would put the thing that reports Sentinel's death
-# on the machine whose death it reports.
-#
-# aggregator/ is excluded for the same reason and one more. It runs on the same
-# external hosting as the witness, and it is the archive of what left this
-# machine — "what left cannot be deleted from here" stops being true the moment
-# a copy of the archive's schema and credentials-handling code sits on the host
-# that is being archived. Nothing under deploy/ or sentinel/ reads it.
-#
-# scratchpad/ is where verification harnesses keep their working copies —
-# `.bak` snapshots of install.sh, config.py, signing.py, beacon.py. Three
-# reasons it must not ship, and the size ceiling below sees none of them: it is
-# source that nothing on the host runs, it is a second copy of files whose
-# single-copy-ness is the point, and a stale harness left there can be executed
-# against a newer tree. That last one is not hypothetical — it clobbered this
-# working tree twice during E2.2.
-#
-# .claude/worktrees/ is excluded; the REST of .claude/ must ship, and that
-# distinction is load-bearing. `deploy/install.sh` step 25 does
-# `cp -r "${SRC_ROOT}/.claude/skills"` and the same for `.claude/agents`, where
-# SRC_ROOT is this archive unpacked on the host. An exclude on all of .claude/
-# deletes the source of that cp; with `set -euo pipefail` the installer dies at
-# step 25. Making the cp tolerant instead would be worse: the headless CLI on
-# the server would lose the skill and the six agent definitions without a word,
-# so patch-plan generation, /ask and incident dossiers stop existing and
-# nothing reports a fault.
-#
-# worktrees/ is the part that actually grows — 228 KB of skills and 52 KB of
-# agents against 6.6 MB of worktrees, under a 20 MB ceiling. It is a second
-# checkout this repository leaves behind between agent sessions; nothing on the
-# host reads it, and it is the only thing under .claude/ that would push the
-# archive past PACKAGE_MAX_KB.
-#
-# The list is an intention. `tests/security/test_package_contents.py` builds a
-# real archive with a file planted under scratchpad/ and asserts `tar -tzf`
-# does not list it, because the archive is the effect.
-tar --exclude='./secrets' \
-    --exclude='./.git' \
-    --exclude='./.claude/worktrees' \
-    --exclude='./tests' \
-    --exclude='./docs' \
-    --exclude='./watcher' \
-    --exclude='./aggregator' \
-    --exclude='./scratchpad' \
-    --exclude='./dist' \
-    --exclude='node_modules' \
-    --exclude='.next' \
-    --exclude='__pycache__' \
-    --exclude='*.pyc' \
-    --exclude='.venv' \
-    --exclude='.pytest_cache' \
-    --exclude='.mypy_cache' \
-    --exclude='.ruff_cache' \
-    -czf "$TARBALL" -C "$REPO_ROOT" .
+# Built from what git tracks, not from the working tree minus a denylist —
+# see scripts/lib/build-package.sh for why a denylist is the wrong shape for
+# this (it shipped credentiale.txt and env.txt, gitignored and never `git
+# add`ed, because neither name was on it). The rationale for excluding
+# secrets/, tests/, docs/, watcher/, aggregator/, scratchpad/ and
+# .claude/worktrees/ specifically — all categories git DOES track but that
+# must not reach the wire — is written there, once, so this call site and
+# wizard.sh cannot drift apart on it.
+build_sentinel_package "$TARBALL" "$REPO_ROOT" \
+    || die "packaging failed — see above. Deploy must be run from a git clone \
+(docs/DEPLOYMENT.md §3.1); this cannot fall back to shipping the whole tree \
+without reintroducing the hole it closes."
 
 size_kb=$(( $(stat -c%s "$TARBALL" 2>/dev/null || stat -f%z "$TARBALL") / 1024 ))
 ok "package built (${size_kb} KB)"
@@ -767,7 +736,8 @@ if (( size_kb > PACKAGE_MAX_KB )); then
     die "package is ${size_kb} KB, over the ${PACKAGE_MAX_KB} KB ceiling.
     Something large is being shipped that should not be. Inspect with:
     tar -tzf ${TARBALL} | head -50
-    then add it to the exclude list above."
+    then add it to the pathspec exclusions in scripts/lib/build-package.sh —
+    or, if it is untracked, check whether it should be \`git add\`ed instead."
 fi
 
 # A CRLF in a .sh or .service file fails on Linux as `bad interpreter:
@@ -806,7 +776,9 @@ if (( DRY_RUN )); then
     info "preflight only — nothing on the server will be changed"
     ssh_sudo "'${REMOTE_DIR}/deploy/preflight.sh' ${DOMAIN:+--domain '${DOMAIN}'} --web-port '${WEB_PORT}' --nginx-mode '${NGINX_MODE}' ${ADMIN_IP:+--admin-ip '${ADMIN_IP}'} ${ALLOW_UFW:+--allow-ufw} ${ALLOW_FIREWALLD:+--allow-firewalld}"
     rc=$?
-    ssh_run "rm -rf '${REMOTE_DIR}'"
+    # REMOTE_DIR is removed by the `cleanup` EXIT trap, not here — see its
+    # comment for why an explicit second removal would only add a redundant
+    # round trip.
     exit $rc
 fi
 
@@ -868,6 +840,9 @@ if ! ssh "${SSH_OPTS[@]}" "${USER}@${HOST}" \
     warn "The installer is step-numbered and idempotent. Fix the cause, then resume:"
     warn "    ./scripts/deploy.sh --host ${HOST} --user ${USER} ${KEY:+--key ${KEY}} \\"
     warn "        ${DOMAIN:+--domain ${DOMAIN}} ${ALLOW_UFW:+--allow-ufw} ${ALLOW_FIREWALLD:+--allow-firewalld} --from-step <N>"
+    warn "This re-packages and re-uploads a fresh copy to a new /tmp directory —"
+    warn "the failed run's extracted copy on the server has already been removed,"
+    warn "and --from-step relies on step markers on the server, not on that copy."
     warn "Or undo everything:"
     warn "    ./scripts/deploy.sh --host ${HOST} --user ${USER} ${KEY:+--key ${KEY}} --rollback"
     exit 1
@@ -875,8 +850,10 @@ fi
 
 ok "installation finished"
 
-# Keep the extracted tree: rollback.sh lives in it, and the operator will want
-# it if something needs resuming.
+# Copy the deploy/ tree to a place that outlives this run: rollback.sh lives
+# in it, and REMOTE_DIR itself is about to be removed by the `cleanup` EXIT
+# trap regardless of what happens below — it is /tmp scratch, not storage, and
+# --from-step does not read it back (see the trap's comment).
 #
 # Replaced wholesale, not copied over. `cp -r src dest` nests when dest exists,
 # so the second deploy to a host produced /opt/sentinel/deploy/deploy and left
@@ -890,7 +867,8 @@ ssh_sudo "install -d -m 0755 /opt/sentinel" \
     && ssh_sudo "rm -rf /opt/sentinel/deploy" \
     && ssh_sudo "cp -r '${REMOTE_DIR}/deploy' /opt/sentinel/deploy" \
     || warn "could not refresh /opt/sentinel/deploy — rollback.sh there may be from an older release"
-ssh_run "rm -rf '${REMOTE_DIR}'"
+# REMOTE_DIR itself is removed by the `cleanup` EXIT trap, once, on every exit
+# path — not duplicated here.
 
 # ---------------------------------------------------------------------------
 printf '\n'

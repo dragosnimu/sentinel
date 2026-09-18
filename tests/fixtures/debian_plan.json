@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "target": {
+    "asset_id": 0,
+    "asset_name": "host",
+    "protected": false,
+    "stack": "host",
+    "unit": null
+  },
+  "vulnerabilities": [
+    {
+      "finding_id": 0,
+      "cve": "CVE-0000-00000",
+      "package": "polkitd",
+      "severity": "medium"
+    }
+  ],
+  "risk": {
+    "level": "medium",
+    "blast_radius": "single-service",
+    "reversible": true,
+    "requires_reboot": false,
+    "estimated_downtime_s": 5,
+    "confidence": 0.8
+  },
+
+  "preflight": [
+    {
+      "id": "pf1",
+      "desc_ro": "Verifică spațiul liber",
+      "check": { "kind": "disk_free", "path": "/var/backups/sentinel", "min_bytes": 1000000 },
+      "blocking": true
+    },
+    {
+      "id": "pf2",
+      "desc_ro": "Versiunea instalată e cea din finding, deci rollback-ul fixat pe ea e corect",
+      "check": { "kind": "pkg_version", "name": "polkitd", "equals": "0.105-1" },
+      "blocking": true
+    }
+  ],
+
+  "backup": [
+    {
+      "id": "bk1",
+      "desc_ro": "Salvează binarul polkitd",
+      "kind": "path",
+      "source": "/usr/lib/policykit-1",
+      "estimated_size_mb": 1,
+      "restore_argv": ["tar", "--zstd", "-xf", "{artifact}", "-C", "/"]
+    }
+  ],
+
+  "apply": [
+    {
+      "id": "ap1",
+      "desc_ro": "Actualizează polkitd la versiunea care repară",
+      "argv": ["apt-get", "-y", "install", "polkitd=0.106-2"],
+      "timeout_s": 300,
+      "idempotent": true,
+      "on_failure": "rollback"
+    }
+  ],
+
+  "health_check": [
+    {
+      "id": "hc1",
+      "desc_ro": "Serviciul e activ",
+      "check": { "kind": "systemd", "unit": "polkit.service", "expect_state": "active" },
+      "blocking": true
+    }
+  ],
+
+  "rollback": [
+    {
+      "id": "rb1",
+      "desc_ro": "Revino la versiunea de dinainte, fixată explicit",
+      "argv": ["apt-get", "-y", "install", "--allow-downgrades", "polkitd=0.105-1"],
+      "timeout_s": 300,
+      "idempotent": true,
+      "on_failure": "abort"
+    }
+  ],
+
+  "post_verification": [
+    {
+      "id": "pv1",
+      "desc_ro": "Versiunea e cea corectată",
+      "check": { "kind": "pkg_version", "name": "polkitd", "at_least": "0.106-2" },
+      "blocking": true
+    }
+  ],
+
+  "restore_instructions_ro": "Dacă totul eșuează: apt-get -y install --allow-downgrades polkitd=0.105-1 && systemctl restart polkit.service. Atenție: revenirea depinde de existența versiunii 0.105-1 în arhivă; dacă a fost curățată, pachetul rămâne pe versiunea nouă și e nevoie de decizia operatorului."
+}

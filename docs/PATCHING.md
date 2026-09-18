@@ -312,7 +312,7 @@ poziționale), nu o listă de interdicții:
 | Binar | Formă permisă |
 |---|---|
 | `dnf` | `{upgrade,update,install,downgrade,reinstall,remove,clean,check-update,makecache}` + `-y`, `--setopt=install_weak_deps=False`, `--enablerepo=`/`--disablerepo=<nume simplu>`. Fără `.rpm`/`.deb` local, fără `-c`, fără `--installroot`, fără `dnf shell` |
-| `apt-get` / `apt` | `{install,upgrade,dist-upgrade,update,remove,autoremove}` + `-y`, `-o Dpkg::Options::=--force-confold` (exact atât). Fără `.deb` local |
+| `apt-get` / `apt` | `{install,upgrade,dist-upgrade,update,remove,autoremove}` + `-y`, `-o Dpkg::Options::=--force-confold`, `--allow-downgrades` (doar cu `install` și doar dacă FIECARE pachet are `=versiune`). Pachetul poate fi `nume[:arh][=versiune]`, versiunea strict `[A-Za-z0-9.+~:-]`. Fără `.deb` local (verificat pe specificația întreagă, deci și `foo=1.0.deb`), fără `--only-upgrade` |
 | `rpm` | doar interogare/verificare: `-q`, `-qa`, `-V`, `--qf`/`--queryformat <format fără %( sau lua:>`. Fără `-i/-U/-e/--import/--dbpath/--root/--eval/--pipe` |
 | `dpkg-query` | `-W`, `-l`, `-s`, `-f`/`--showformat <format>` — nou în această rundă |
 | `dpkg` | doar `--compare-versions VERSION OP VERSION` — nou în această rundă |
@@ -340,6 +340,81 @@ Adăugarea unui binar înapoi pe listă e o decizie separată, cu gramatică
 proprie scrisă și testată — nu un efect secundar al altui bilet (vezi §3 mai
 sus, care spunea deja asta despre `dpkg`/`dpkg-query` înainte să fie
 adăugate).
+
+### Actualizarea unui pachet Debian e fixată pe versiune, în ambele direcții
+
+`apt` nu are `downgrade`. Singura formă de revenire e `install pachet=versiune`,
+iar `--allow-downgrades` e necesar fiindcă versiunea de întoarcere e mai mică
+decât cea instalată. De aici rețeta pe care o învață promptul planificatorului
+(`sentinel/patch/planner.py:_update_recipe_doc`) și pe care o acceptă amândouă
+părțile:
+
+| fază | comandă / verificare |
+|---|---|
+| preflight | `pkg_version {name: <pachet>, equals: <versiunea instalată>}` |
+| apply | `apt-get -y install <pachet>=<versiunea care repară>` |
+| rollback | `apt-get -y install --allow-downgrades <pachet>=<versiunea instalată>` |
+| post_verification | `pkg_version {name: <pachet>, at_least: <versiunea care repară>}` |
+
+Preflight-ul nu e decor: dacă versiunea din baza de date a rămas în urma celei
+de pe gazdă, rollback-ul ar fixa o versiune greșită, deci planul se oprește
+înainte să schimbe ceva.
+
+`--allow-downgrades` fără `=versiune` e REFUZAT de executor: fără pin, apt
+alege orice candidat mai vechi, iar cel mai vechi candidat e chiar versiunea
+vulnerabilă pe care patch-ul a scos-o. `--only-upgrade` nu e acceptat deloc —
+sub forma fixată nu spune nimic în plus față de pin, iar fiecare flag pe un
+allowlist citit de un proces root e un cost permanent.
+
+Onest: un rollback fixat pe versiune poate eșua la rulare dacă versiunea aia nu
+mai e în arhivă. E mult mai bun decât unul care sigur nu restaurează nimic, dar
+nu e o garanție, și planul trebuie s-o spună în `restore_instructions_ro`.
+
+### Validatorul nu mai are o părere proprie despre argv
+
+`sentinel/patch/validator.py` importă `executor.policy` și îl întreabă pe EL
+dacă o comandă din plan are voie să ruleze (`_validate_executor_grammar`).
+Până în runda a treia avea o gramatică proprie, iar cele două au divergit exact
+cât n-a comparat nimeni: validatorul accepta `apt-get -y install --only-upgrade
+<pachet>`, pe care executorul îl refuză la primul pas de aplicare — deci
+fiecare plan Debian ajuns pe Telegram era garantat să moară în mijlocul
+aplicării.
+
+Importul e leneș, iar eșecul lui e o EROARE PE PLAN, nu o excepție la import:
+`sentinel/telegram/patch_flow.py` importă validatorul, iar un fișier lipsă n-are
+voie să oprească botul. Un validator care nu poate citi gramatica nu știe dacă
+planul e sigur, deci refuză și spune de ce.
+
+Și pentru verificări, nu doar pentru pași. `sentinel/patch/checks.py`
+CONSTRUIEȘTE un argv pentru șase din cele unsprezece tipuri de verificare —
+`command`, `systemd`, `file_exists`, `file_absent`, `file_sha256`,
+`pkg_version` — și îl trimite pe același drum `patch_step_exec`. Docstring-ul
+lui spunea până în runda a patra că „doar tipul `command` ajunge la executor",
+iar validatorul l-a crezut: o verificare de sănătate pe `dbus.service` (unitate
+din `UNCONTROLLABLE_UNITS`), un `file_exists` pe `/etc/shadow` sau un
+`pkg_version` pe un nume care conține `passwd` treceau validarea și erau
+refuzate abia la rulare. Pentru o verificare de sănătate, refuzul vine DUPĂ
+pasul de aplicare: pachetul e deja actualizat, verificarea nu se poate evalua,
+iar runner-ul dă înapoi un patch care reușise.
+
+Construcția argv-ului stă acum într-o singură funcție, `checks.argv_for(check,
+family)`, chemată și de `_dispatch` (ca să execute) și de validator (ca să
+întrebe `check_argv`). Nu o a doua listă de tipuri în validator: un tip nou de
+verificare e acoperit din ziua în care e adăugat, iar
+`tests/security/test_plan_argvs_match_executor_policy.py` generează acoperirea
+din `CHECK_KINDS`, nu dintr-o listă scrisă de mână.
+
+Un plan salvat care verifică `dbus.service` nu mai validează de acum. Asta e
+intenția — planul chiar nu se poate verifica pe gazda asta — dar înseamnă că
+planurile deja stocate cu astfel de verificări trec în `rejected_invalid` la
+prima încercare de rulare.
+
+Instalatorul (pasul 24) pune același `policy.py` în două locuri:
+`/opt/sentinel/libexec/policy.py`, pe care îl rulează procesul root, și
+`/opt/sentinel/lib/executor/policy.py`, pe care îl importă validatorul —
+amândouă root:root 0644, deci partea neprivilegiată citește regulile fără să le
+poată schimba. Pasul verifică apoi importul chiar ca utilizatorul `sentinel`,
+nu doar prezența fișierului.
 
 ### Legarea `patch_step_exec` de un plan aprobat
 

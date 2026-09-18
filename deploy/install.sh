@@ -1705,7 +1705,7 @@ without hash verification. Generate the lock with pip-compile --generate-hashes.
 
 # --- 24 -------------------------------------------------------------------
 step_package() {
-    rm -rf "${SENTINEL_PREFIX}/lib/sentinel"
+    rm -rf "${SENTINEL_PREFIX}/lib/sentinel" "${SENTINEL_PREFIX}/lib/executor"
     install -d -m 0755 "${SENTINEL_PREFIX}/lib"
     cp -r "${SRC_ROOT}/sentinel" "${SENTINEL_PREFIX}/lib/sentinel"
     cp "${SRC_ROOT}/VERSION" "${SENTINEL_PREFIX}/VERSION"
@@ -1723,6 +1723,41 @@ step_package() {
             install -D -m 0644 -o root -g root \
                 "${SRC_ROOT}/executor/${f}" "${SENTINEL_PREFIX}/libexec/${f}"
     done
+
+    # The SAME policy.py, installed a second time on the sentinel package's own
+    # import path (PYTHONPATH=/opt/sentinel/lib in every unit).
+    # `sentinel/patch/validator.py` imports it and asks IT whether a plan's
+    # commands would be permitted, instead of keeping a second opinion about
+    # the grammar — the two had already drifted far enough that the validator
+    # approved `apt-get -y install --only-upgrade <pkg>`, which the executor
+    # refuses at apply step 1.
+    #
+    # Same file, same step, so the copy cannot lag behind the one the root
+    # process runs. Root-owned and 0644: the unprivileged side can READ the
+    # rules and still cannot change them, and it never executes this copy —
+    # /opt/sentinel/libexec/policy.py is what the root daemon loads.
+    #
+    # No __init__.py: `executor` is an implicit namespace package, which is
+    # also how it is imported from the repository root in the test suite.
+    install -d -m 0755 -o root -g root "${SENTINEL_PREFIX}/lib/executor"
+    install -m 0644 -o root -g root \
+        "${SRC_ROOT}/executor/policy.py" "${SENTINEL_PREFIX}/lib/executor/policy.py"
+
+    # Not "the file is on disk" — that is what the step already did. This
+    # imports it the way the validator will, as the unprivileged user, from a
+    # directory that is not the source tree, and checks that the object it got
+    # back is the grammar and not an empty namespace package. A file present
+    # but unimportable (wrong path, wrong permissions, a stray __init__.py
+    # shadowing it) would otherwise show up for the first time as "every patch
+    # plan is refused", hours later, on Telegram.
+    local import_err
+    if ! import_err="$(sudo -u "$SENTINEL_USER" env PYTHONPATH="${SENTINEL_PREFIX}/lib" \
+            "${SENTINEL_PREFIX}/venv/bin/python" -c \
+            'import executor.policy as p; p.check_argv(["dnf","-y","update","nginx"])' 2>&1)"; then
+        die "executor.policy is not importable from ${SENTINEL_PREFIX}/lib as ${SENTINEL_USER} — \
+sentinel/patch/validator.py asks it whether a plan's commands may run, so every patch plan would be \
+refused with 'executor_policy_unreadable' until this is fixed: ${import_err//$'\n'/ }"
+    fi
 
     # Front-end libraries: downloaded with checksum verification, never
     # committed. P1 needs none of them; from P2 the charts do.

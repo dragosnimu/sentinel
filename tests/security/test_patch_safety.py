@@ -74,11 +74,108 @@ def test_restore_script_verifies_before_touching_anything():
 
 
 # --- the runner -------------------------------------------------------------
-def test_runner_revalidates_at_execution_time():
+def test_runner_revalidates_at_execution_time(monkeypatch):
     """A row in a database is not a promise: constants change and code is
-    redeployed between storing a plan and running it."""
-    assert "validate_plan(plan)" in RUNNER
-    assert "rejected_invalid" in RUNNER
+    redeployed between storing a plan and running it. Proven by actually
+    running `run_plan`, not by grepping the source for the call —
+    `validate_plan(plan)` with no `platform_family` SKIPS the cross-platform
+    binary check entirely (`platform_family=None` means "not checked", per
+    `validate_plan`'s own docstring), so a source-text match on the call
+    existing proves nothing about whether Guard 1 still catches a `dnf` plan
+    re-validated on a host that has since been redeployed as `debian`.
+
+    The executor client is replaced with one that always raises: if Guard 1
+    ever again let this plan through, the test must fail because nothing
+    stopped it — not because it happened to reach a real (or, on this
+    machine, nonexistent) AF_UNIX socket.
+    """
+    import asyncio
+    import json as _json
+    from types import SimpleNamespace
+
+    import pytest
+
+    from sentinel.patch import runner as runner_mod
+    from sentinel.patch.validator import plan_hash
+
+    class _RefusingExecutor:
+        def call(self, *a, **kw):
+            raise AssertionError(
+                "run_plan reached the executor — Guard 1 should have refused "
+                "this dnf plan on a debian host before anything ran")
+
+    monkeypatch.setattr(runner_mod, "_client", _RefusingExecutor())
+
+    dnf_plan = {
+        "schema_version": 1,
+        "target": {"asset_id": 1, "asset_name": "nginx", "protected": False,
+                   "stack": "rpm", "unit": "nginx.service"},
+        "vulnerabilities": [{"finding_id": 1, "cve": "CVE-2026-12345", "package": "nginx"}],
+        "risk": {"level": "low", "blast_radius": "single-service", "reversible": True,
+                 "requires_reboot": False, "estimated_downtime_s": 1, "confidence": 0.9},
+        "preflight": [{"id": "pf1", "desc_ro": "spațiu liber", "blocking": True,
+                       "check": {"kind": "disk_free", "path": "/var", "min_bytes": 1}}],
+        "backup": [{"id": "bk1", "desc_ro": "salvez configurația", "kind": "path",
+                    "source": "/etc/nginx", "restore_argv": ["systemctl", "reload", "nginx.service"],
+                    "estimated_size_mb": 1}],
+        "apply": [{"id": "ap1", "desc_ro": "actualizez pachetul",
+                   "argv": ["dnf", "-y", "update", "nginx"], "timeout_s": 60,
+                   "on_failure": "rollback", "expect_exit": [0]}],
+        "health_check": [{"id": "hc1", "desc_ro": "serviciul e activ", "blocking": True,
+                          "check": {"kind": "systemd", "unit": "nginx.service",
+                                   "expect_state": "active"}}],
+        "rollback": [{"id": "rb1", "desc_ro": "revin la versiunea anterioară",
+                     "argv": ["dnf", "-y", "downgrade", "nginx"], "timeout_s": 60,
+                     "on_failure": "abort", "expect_exit": [0]}],
+        "post_verification": [{"id": "pv1", "desc_ro": "versiunea e corectă", "blocking": True,
+                               "check": {"kind": "pkg_version", "name": "nginx", "at_least": "1"}}],
+        "restore_instructions_ro": "dnf -y downgrade nginx",
+    }
+
+    class _StoredPlanDB:
+        """Just enough of the repo surface to answer `repo.get_plan`, record
+        what `repo.set_plan_status` is told to write, and — should Guard 1
+        ever fail to refuse this plan — let execution proceed far enough
+        for that failure to show up as "PatchRefused was never raised"
+        instead of an unrelated AttributeError from an incomplete fake."""
+
+        def __init__(self):
+            self.statuses: list[str] = []
+            self._next_id = 1
+
+        async def fetchrow(self, sql, *a):
+            if "FROM patch_plans" in sql:
+                return {"id": 1, "plan_id": "test-plan-not-a-real-uuid",
+                        "plan_hash": plan_hash(dnf_plan), "plan": _json.dumps(dnf_plan),
+                        "status": "approved", "risk_level": "low", "requires_reboot": False,
+                        "reversible": True, "estimated_downtime_s": 1, "asset_id": None,
+                        "created_at": None, "approved_by": "test", "approved_at": None,
+                        "validation_errors": None}
+            return None
+
+        async def fetchval(self, sql, *a):
+            self._next_id += 1
+            return self._next_id
+
+        async def fetch(self, sql, *a):
+            return []
+
+        async def execute(self, sql, *a):
+            if "UPDATE patch_plans SET status" in sql:
+                self.statuses.append(a[1])
+            return "OK"
+
+    db = _StoredPlanDB()
+    cfg = SimpleNamespace(platform=SimpleNamespace(family="debian"))
+
+    with pytest.raises(runner_mod.PatchRefused):
+        asyncio.run(runner_mod.run_plan(db, cfg, 1, mode="dry_run"))
+
+    assert db.statuses == ["rejected_invalid"], (
+        f"a dnf plan re-validated against a debian host must be refused as "
+        f"rejected_invalid — got {db.statuses!r}. Guard 1 skipped "
+        f"platform_family, so a plan drafted for the wrong OS family kept "
+        f"re-validating clean after redeployment.")
 
 
 def test_runner_checks_the_hash_matches_the_stored_plan():

@@ -168,21 +168,38 @@ SECRET_PATH_PATTERNS: Final[tuple[str, ...]] = (
 # ---------------------------------------------------------------------------
 # argv[0] must be one of these. `sh`, `bash`, `env`, `sudo` and `python` are
 # absent on purpose: they turn an argv allowlist into no allowlist at all.
+#
+# Narrowed 8 September 2026 to match `executor/policy.py:BINARY_ALLOWLIST`
+# byte for byte (see test_policy_agrees_with_sentinel_constants and
+# executor/README.md, "It stays small") after the round-1 verifier got root
+# through `patch_step_exec` via `git`, `sed`, `rpm`, `dnf`, `npm`, `pip` and
+# `docker` invocations that were grammar-legal under the previous,
+# denylist-on-an-allowlist rules. Every binary here now has a POSITIVE
+# grammar on the executor side — dropped rather than given one: `docker`,
+# `git`, `npm`, `yarn`, `composer`, `pip`, `pip3`, `wp`, `sed`, `curl`,
+# `httpd`, `apachectl`, `mysqldump`, `mysql`, `pg_dump`, `psql`, `zstd`,
+# `gzip`, `ln`, `certbot` — none has a caller in this repository today, and
+# several (sed, git's `-c`, npm/pip's lifecycle scripts, psql's `\!`, docker
+# itself) have a scripting/hook surface too rich to enumerate honestly. `rm`
+# was NOT added despite being on the round-1 verifier's suggested list —
+# tests/security/test_patch_safety.py::test_rm_is_not_in_the_patch_binary_
+# allowlist encodes a standing decision that deletion goes through the one
+# narrow, path-scoped `op_backup_prune` operation, not general argv.
 PATCH_BINARY_ALLOWLIST: Final[frozenset[str]] = frozenset(
     {
-        "dnf", "rpm", "systemctl",
-        "nginx", "httpd", "apachectl",
-        "docker",
-        "git", "npm", "yarn", "composer", "pip", "pip3", "wp",
-        "mysqldump", "mysql", "pg_dump", "psql",
-        "tar", "zstd", "gzip",
-        "cp", "mv", "ln", "mkdir", "install", "chown", "chmod", "sed", "test",
+        "dnf", "apt-get", "apt",
+        "rpm", "dpkg-query", "dpkg",
+        "systemctl",
+        "nginx",
+        "tar",
+        "cp", "mv", "mkdir", "install", "chown", "chmod",
         # Read-only inspection: these can answer a question but cannot change
-        # anything, which is why they are safe to allow and why the schema's
-        # file_sha256 check needs them.
-        "sha256sum",
-        "certbot",
-        "curl",
+        # anything. Not on the round-1 verifier's suggested list, but not
+        # optional — sentinel/patch/checks.py builds `["test","-e",path]` and
+        # `["sha256sum",path]` directly for the file_exists/file_absent/
+        # file_sha256 check kinds, and removing either breaks every plan that
+        # uses one.
+        "test", "sha256sum",
     }
 )
 

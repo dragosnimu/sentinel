@@ -227,6 +227,40 @@ def test_a_finding_without_a_fix_does_not_offer_a_patch_plan(monkeypatch):
     assert "nu se poate genera" in msg.sent[0]
 
 
+def test_vuln_detail_points_at_planifica_not_at_patch(monkeypatch):
+    """`/patch <id>` citește id-uri de PLAN; aici id-ul e al unei
+    VULNERABILITĂȚI. Măsurat pe gazda de producție pe 15 septembrie 2026: 4
+    planuri, cu id-urile 2-5, și findinguri cu id-uri de la 1 la 29 434, dintre
+    care exact 4 cad în intervalul 2-5. Linia asta trimitea deci operatorul fie
+    la «Plan inexistent.», fie — pentru patru vulnerabilități — la planul
+    ALTCUIVA, cu butoanele lui de aprobare, pentru alt pachet și alt asset.
+    """
+    monkeypatch.setattr(views.findings_repo, "list_open", _async([_FINDING]))
+    upd, msg = _update()
+    run(views.cmd_vuln(upd, _ctx(None, ["42"])))
+    text = msg.sent[0]
+    assert "/planifica 42" in text, (
+        "detaliul unei vulnerabilități nu mai spune cum se cere un plan pentru ea")
+    assert "/patch" not in text, (
+        "id-ul unei vulnerabilități e oferit unei comenzi care caută planuri: "
+        f"{text!r}")
+
+
+def test_vulns_list_points_at_planifica_not_at_patch(monkeypatch):
+    """Aceeași greșeală, pe lista din care operatorul citește id-urile: coada
+    mesajului îi spune ce să tasteze imediat după ce i-a arătat 20 de id-uri de
+    vulnerabilitate. `/patch <id>` acolo înseamnă «ia id-ul ăsta și caută-l
+    printre planuri»."""
+    monkeypatch.setattr(views.findings_repo, "open_counts",
+                        _async({"high": 1, "total": 1, "kev": 0}))
+    monkeypatch.setattr(views.findings_repo, "list_open", _async([_FINDING]))
+    upd, msg = _update()
+    run(views.cmd_vulns(upd, _ctx(None)))
+    text = msg.sent[0]
+    assert "/planifica" in text
+    assert "/patch" not in text, text
+
+
 def test_vuln_detail_carries_all_three_sources(monkeypatch):
     monkeypatch.setattr(views.findings_repo, "list_open",
                         _async([{**_FINDING, "kev": True}]))

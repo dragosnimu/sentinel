@@ -51,7 +51,7 @@ def _plan(*, with_rollback: bool = True) -> dict[str, Any]:
         ],
         "backup": [{"id": "bk1", "desc_ro": "salvez configurația nginx",
                     "kind": "path", "source": "/etc/nginx",
-                    "restore_argv": ["systemctl", "reload", "nginx"],
+                    "restore_argv": ["systemctl", "reload", "nginx.service"],
                     "estimated_size_mb": 5}],
         "apply": [_step("ap1", ["dnf", "-y", "update", "nginx"], expect_exit=[0, 100])],
         "health_check": [
@@ -292,7 +292,7 @@ def test_apply_failure_rolls_back(_fake_executor):
     # The rollback uses a different binary from the one that failed, so it can
     # actually succeed — that is the "clean rollback" path.
     plan = _plan()
-    plan["rollback"] = [_step("rb1", ["systemctl", "restart", "nginx"], on_failure="abort")]
+    plan["rollback"] = [_step("rb1", ["systemctl", "restart", "nginx.service"], on_failure="abort")]
     _fake_executor.fail_on = {"dnf"}
     db = _FakeDB(plan)
     res = run(runner.run_plan(db, None, 1, mode="apply"))
@@ -340,7 +340,7 @@ def test_a_phase_stops_at_its_first_failure(_fake_executor):
     plan = _plan()
     plan["apply"] = [
         _step("a1", ["dnf", "-y", "update", "nginx"]),
-        _step("a2", ["systemctl", "restart", "nginx"]),
+        _step("a2", ["systemctl", "restart", "nginx.service"]),
     ]
     _fake_executor.fail_on = {"dnf"}
     db = _FakeDB(plan)
@@ -420,7 +420,7 @@ def test_crash_after_apply_starts_still_rolls_back(_fake_executor):
     """The flip side of the test above: apply_started must not be so
     conservative that a REAL crash after changes were made goes unrolled."""
     plan = _plan()
-    plan["rollback"] = [_step("rb1", ["systemctl", "restart", "nginx"], on_failure="abort")]
+    plan["rollback"] = [_step("rb1", ["systemctl", "restart", "nginx.service"], on_failure="abort")]
     db = _CrashOnRealApplyStepInsertDB(plan, crash_phase="health_check")
     res = run(runner.run_plan(db, None, 1, mode="apply"))
     assert res.status in ("rolled_back", "rollback_failed")
@@ -456,9 +456,25 @@ def test_platform_family_from_cfg_reaches_checks_evaluate(_fake_executor, monkey
 
     monkeypatch.setattr(checks_mod, "evaluate", spy)
 
+    # `_plan()` is an rpm-family fixture (`dnf` in apply/rollback) — Guard 1
+    # in `run_plan` now re-validates WITH `cfg.platform.family` (that fix is
+    # what this file's own `test_runner_revalidates_at_execution_time`-style
+    # coverage lives in `tests/security/test_patch_safety.py` for), so a
+    # `dnf` plan against `family="debian"` is correctly refused before ever
+    # reaching `_run_check`. Swapped to `apt-get` here so this test keeps
+    # isolating what it actually names: whether `family` reaches
+    # `checks.evaluate`, not whether Guard 1 does its job.
     plan = _plan()
+    plan["apply"][0]["argv"] = ["apt-get", "-y", "install", "nginx=1.20.1-1"]
+    plan["rollback"][0]["argv"] = ["apt-get", "-y", "install", "--allow-downgrades",
+                                   "nginx=1.18.0-0"]
+    # `equals`, not `at_least`: the rollback above pins nginx to 1.18.0-0, and
+    # `_validate_rollback_pin` requires a preflight that actually verifies that
+    # exact version is what is installed — a rollback to a version nothing
+    # checked is a rollback to a version the host may never have had.
     plan["preflight"].append(
-        _check("pf_pkg", {"kind": "pkg_version", "name": "nginx", "at_least": "1.0"},
+        _check("pf_pkg", {"kind": "pkg_version", "name": "nginx",
+                          "equals": "1.18.0-0"},
               blocking=False))
     db = _FakeDB(plan)
     cfg = SimpleNamespace(platform=SimpleNamespace(family="debian"))

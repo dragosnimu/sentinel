@@ -29,6 +29,7 @@ from typing import Any
 from sentinel.constants import (
     PATCH_BINARY_ALLOWLIST,
     PATCH_FORBIDDEN_SUBSTRINGS,
+    PLATFORM_FAMILIES,
     PROTECTED_PATHS,
     REBOOT_REQUIRED_PACKAGES,
     SHELL_METACHARACTERS,
@@ -57,6 +58,20 @@ CHECK_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "disk_free": ("path", "min_bytes"),
     "no_open_incident": ("asset_id",),
     "command": ("argv",),
+}
+
+# Package-manager binaries that only make sense on ONE platform family. A `dnf`
+# step in a plan meant for a `debian` host — or `apt-get` on `rhel` — is not a
+# procedure mistake the model can be asked to fix on retry: it is proof the
+# plan was drafted for the wrong operating system, because the planner prompt
+# used to say "AlmaLinux 9" unconditionally regardless of what
+# `platform.family` actually held. Keyed the same as
+# `sentinel.constants.PLATFORM_FAMILIES`, deliberately not imported from there:
+# this is about which BINARY belongs to which family, a validator-local
+# judgement, not the family list itself.
+PLATFORM_PACKAGE_BINARIES: dict[str, frozenset[str]] = {
+    "rhel": frozenset({"dnf", "rpm"}),
+    "debian": frozenset({"apt-get", "apt", "dpkg", "dpkg-query"}),
 }
 
 _ID_RE = re.compile(r"^[a-z0-9_]{2,16}$")
@@ -105,8 +120,34 @@ def plan_hash(plan: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-def validate_plan(plan: Any) -> ValidationResult:
-    """Validate a patch plan. Never raises; returns every problem found."""
+def validate_plan(
+    plan: Any,
+    *,
+    platform_family: str | None = None,
+    finding: dict[str, Any] | None = None,
+) -> ValidationResult:
+    """Validate a patch plan. Never raises; returns every problem found.
+
+    Two keyword-only arguments make this check TRUTH, not just FORM, for the
+    two ways a plan has fabricated facts in production:
+
+    * `platform_family` — the host's `cfg.platform.family` ("rhel" or
+      "debian"). When given, an `argv[0]` that is a package-manager binary of
+      the OTHER family is rejected: a plan is not "correct" merely because it
+      is schema-valid, and `dnf` on a Debian host is proof of exactly that gap.
+      `None` (the default) skips the check — callers that genuinely do not
+      know the host's family, like the standalone skill CLI, get the same
+      behaviour as before this argument existed, not a guess.
+    * `finding` — the deterministic facts (`finding_id`, `cve`, `package`) the
+      plan was generated FOR, read from the database, never from the model.
+      When given, `plan["vulnerabilities"]` is checked against it: a different
+      `finding_id`, a CVE the finding does not have, or a different package are
+      all rejected. This is what makes fabrication — `finding_id: 0`,
+      `CVE-0000-00000` — impossible to validate rather than merely unlikely to
+      be asked for. `None` skips the check for callers with no finding in hand
+      (e.g. `runner.run_plan`'s execution-time re-validation, which validates
+      whatever plan was already approved, not a fresh generation request).
+    """
     result = ValidationResult()
 
     if not isinstance(plan, dict):
@@ -116,13 +157,13 @@ def validate_plan(plan: Any) -> ValidationResult:
     _validate_top_level(plan, result)
     target = plan.get("target") if isinstance(plan.get("target"), dict) else {}
     _validate_target(target, result)
-    _validate_vulnerabilities(plan.get("vulnerabilities"), result)
+    _validate_vulnerabilities(plan.get("vulnerabilities"), result, finding=finding)
     risk = plan.get("risk") if isinstance(plan.get("risk"), dict) else {}
     _validate_risk(risk, result)
 
     apply_steps = _validate_step_list(plan.get("apply"), "apply", result, min_items=1)
     rollback_steps = _validate_step_list(plan.get("rollback"), "rollback", result, min_items=0)
-    backups = _validate_backups(plan.get("backup"), result)
+    backups = _validate_backups(plan.get("backup"), result, platform_family=platform_family)
 
     preflight = _validate_check_list(plan.get("preflight"), "preflight", result, min_items=1)
     health = _validate_check_list(plan.get("health_check"), "health_check", result, min_items=1)
@@ -130,6 +171,13 @@ def validate_plan(plan: Any) -> ValidationResult:
         plan.get("post_verification"), "post_verification", result, min_items=1
     )
 
+    _validate_platform_binaries(
+        platform_family, apply_steps, rollback_steps, backups, preflight, health, postver, result
+    )
+    _validate_executor_grammar(
+        platform_family, apply_steps, rollback_steps, backups,
+        preflight, health, postver, result
+    )
     _validate_coupling(plan, risk, apply_steps, rollback_steps, backups, preflight, result)
     _validate_reboot_flag(plan, risk, result)
     _validate_restore_instructions(plan, result)
@@ -197,7 +245,9 @@ def _validate_target(target: dict[str, Any], r: ValidationResult) -> None:
         r.error("$.target.databases", "bad_type", "databases must be a list")
 
 
-def _validate_vulnerabilities(vulns: Any, r: ValidationResult) -> None:
+def _validate_vulnerabilities(
+    vulns: Any, r: ValidationResult, *, finding: dict[str, Any] | None = None
+) -> None:
     if not isinstance(vulns, list) or not vulns:
         r.error("$.vulnerabilities", "empty", "at least one vulnerability is required")
         return
@@ -218,6 +268,52 @@ def _validate_vulnerabilities(vulns: Any, r: ValidationResult) -> None:
                 f"{base}.fixed_in",
                 "no_fixed_version",
                 "no fixed version recorded; confirm a fix genuinely exists before patching",
+            )
+
+        if finding is None:
+            continue
+
+        # The finding this plan was actually generated for, read from the
+        # database by the caller — never from the model's own output. A plan
+        # is not "about" whatever finding_id it happens to write down; it is
+        # about the finding it was asked to fix, and a mismatch here is not a
+        # formatting slip, it is the model inventing an identifier it was
+        # never given (measured: `finding_id: 0`, `CVE-0000-00000` — both
+        # schema-valid, both fabricated).
+        expected_id = finding.get("finding_id")
+        if expected_id is not None and "finding_id" in v and v.get("finding_id") != expected_id:
+            r.error(
+                f"{base}.finding_id",
+                "finding_id_mismatch",
+                f"finding_id {v.get('finding_id')!r} does not match the finding this "
+                f"plan was generated for ({expected_id!r}) — a plan may not claim to "
+                "fix a finding other than the one it was asked about",
+            )
+
+        expected_cve = finding.get("cve")
+        if cve:
+            if not expected_cve or str(cve).upper() != str(expected_cve).upper():
+                have = expected_cve or "no CVE at all"
+                r.error(
+                    f"{base}.cve",
+                    "cve_mismatch",
+                    f"{cve!r} is not the CVE of the requested finding (it has {have!r}) "
+                    "— do not attribute a CVE the finding does not carry; if it has "
+                    "none, leave cve empty",
+                )
+
+        expected_package = finding.get("package")
+        pkg = v.get("package")
+        if (
+            expected_package
+            and pkg
+            and str(pkg).strip().lower() != str(expected_package).strip().lower()
+        ):
+            r.error(
+                f"{base}.package",
+                "package_mismatch",
+                f"{pkg!r} does not match the requested finding's package "
+                f"{expected_package!r}",
             )
 
 
@@ -472,7 +568,22 @@ def _check_source_shape(kind: str, source: str, path: str, r: ValidationResult) 
                 f"{kind} takes an absolute path — got {source!r}")
 
 
-def _validate_backups(backups: Any, r: ValidationResult) -> list[dict[str, Any]]:
+# `BACKUP_KINDS` has no Debian package-state equivalent to `rpm_state` — the
+# executor's `rpm_state` op runs `rpm -q`, a binary that does not exist on a
+# Debian host, so a plan that picks it there aborts at the FIRST apply step,
+# before anything changes. Adding a `dpkg_state` kind would mean touching the
+# executor, a separate batch; `path` (the package's own files or config) is
+# already an available, sufficient backup for a Debian package update, so the
+# rule here is a refusal, not a substitution: pick something that exists on
+# this host.
+BACKUP_KIND_UNAVAILABLE_ON: dict[str, frozenset[str]] = {
+    "rpm_state": frozenset({"debian"}),
+}
+
+
+def _validate_backups(
+    backups: Any, r: ValidationResult, *, platform_family: str | None = None
+) -> list[dict[str, Any]]:
     if backups is None:
         return []
     if not isinstance(backups, list):
@@ -487,8 +598,16 @@ def _validate_backups(backups: Any, r: ValidationResult) -> list[dict[str, Any]]
             continue
         if not _ID_RE.match(str(item.get("id", ""))):
             r.error(f"{base}.id", "bad_format", "id must match ^[a-z0-9_]{2,16}$")
-        if item.get("kind") not in BACKUP_KINDS:
+        kind = item.get("kind")
+        if kind not in BACKUP_KINDS:
             r.error(f"{base}.kind", "bad_enum", f"must be one of {BACKUP_KINDS}")
+        elif platform_family and platform_family in BACKUP_KIND_UNAVAILABLE_ON.get(kind, ()):
+            r.error(
+                f"{base}.kind", "backup_kind_wrong_platform",
+                f"{kind!r} does not exist on platform.family={platform_family!r} "
+                f"(it runs a binary that host does not have). Use 'path' to back "
+                f"up the package's own files or configuration instead.",
+            )
         source = item.get("source")
         if not isinstance(source, str) or not source:
             r.error(f"{base}.source", "missing_field", "source is required")
@@ -568,6 +687,257 @@ def _validate_check_list(
                 _validate_argv(check.get("argv"), f"{base}.check.argv", r)
         valid.append(item)
     return valid
+
+
+# ---------------------------------------------------------------------------
+# Platform coupling — the argv that runs must belong on the host it runs on
+# ---------------------------------------------------------------------------
+def _iter_plan_argvs(
+    apply_steps: list[dict[str, Any]],
+    rollback_steps: list[dict[str, Any]],
+    backups: list[dict[str, Any]],
+    *check_lists: list[dict[str, Any]],
+    builder: Any = None,
+    family: str | None = None,
+):
+    """Every argv the runner could actually execute, with a path for errors.
+
+    Three shapes carry a command LITERALLY — an apply/rollback step's `argv`
+    and a backup's `restore_argv` — and the checks carry them by
+    construction: `sentinel/patch/checks.py` BUILDS an argv for six of the
+    eleven check kinds (`command`, `systemd`, `file_exists`, `file_absent`,
+    `file_sha256`, `pkg_version`) and sends each down the same
+    `patch_step_exec` path the apply steps use.
+
+    This function used to look only at `kind == "command"`, because
+    `checks.py`'s own module docstring said that was the only kind reaching
+    the executor. It was not, and the cost was measured: a `systemd` health
+    check naming `dbus.service` (an `UNCONTROLLABLE_UNITS` entry) or a
+    `file_exists` on `/etc/shadow` validated clean, and the refusal arrived
+    at run time — for a health check, that is AFTER the apply step has
+    already changed the machine, so the plan rolls back a patch that
+    succeeded.
+
+    The fix is not five more `if kind ==` branches here; that is a second
+    list that goes stale the next time a kind is added. `builder` is
+    `checks.argv_for`, the same function `_dispatch` uses to execute, so the
+    set of commands inspected here is derived from the code that produces
+    them. Without a `builder` (a caller that could not import `checks`) this
+    degrades to the literal argvs only — and `_validate_executor_grammar`
+    has already refused the plan in that case, so the narrower walk cannot
+    let anything through.
+    """
+    for step in (*apply_steps, *rollback_steps):
+        argv = step.get("argv")
+        if isinstance(argv, list) and argv:
+            yield f"argv[id={step.get('id')}]", argv
+    for b in backups:
+        argv = b.get("restore_argv")
+        if isinstance(argv, list) and argv:
+            yield f"backup[id={b.get('id')}].restore_argv", argv
+    for checks in check_lists:
+        for item in checks:
+            check = item.get("check")
+            if not isinstance(check, dict):
+                continue
+            if builder is None:
+                argv = check.get("argv") if check.get("kind") == "command" else None
+            else:
+                try:
+                    argv = builder(check, family or "")
+                except Exception:
+                    # A check missing a required field: `_validate_check_list`
+                    # has already recorded that as an error, and guessing what
+                    # the author meant is not this function's job.
+                    argv = None
+            if isinstance(argv, list) and argv:
+                yield f"check[id={item.get('id')}].argv", argv
+
+
+def _validate_platform_binaries(
+    platform_family: str | None,
+    apply_steps: list[dict[str, Any]],
+    rollback_steps: list[dict[str, Any]],
+    backups: list[dict[str, Any]],
+    preflight: list[dict[str, Any]],
+    health: list[dict[str, Any]],
+    postver: list[dict[str, Any]],
+    r: ValidationResult,
+) -> None:
+    """Reject a package-manager binary that belongs to a DIFFERENT platform
+    family than the one this plan will run on.
+
+    `None` (family unknown to the caller) skips this rather than guessing —
+    the same "unknown is not fine" rule `unplannable_reason` already applies
+    upstream of generation. This is the check that keeps that rule true after
+    the fact: a prompt edit that reintroduces "AlmaLinux 9" as a literal would,
+    without this, again produce a `dnf` plan on a Debian host that validates
+    clean — exactly today's defect, silently reopened.
+    """
+    if not platform_family:
+        return
+    forbidden: set[str] = set()
+    for family, binaries in PLATFORM_PACKAGE_BINARIES.items():
+        if family != platform_family:
+            forbidden |= binaries
+    if not forbidden:
+        return
+    builder, _ = _check_argv_builder()
+    for path, argv in _iter_plan_argvs(
+            apply_steps, rollback_steps, backups, preflight, health, postver,
+            builder=builder, family=platform_family):
+        program = str(argv[0]).rsplit("/", 1)[-1]
+        if program in forbidden:
+            r.error(
+                f"$.{path}[0]",
+                "binary_wrong_platform",
+                f"{program!r} is a package-manager binary for a different platform "
+                f"family than this host (platform.family={platform_family!r}). The "
+                "plan was drafted for the wrong operating system.",
+            )
+
+
+# ---------------------------------------------------------------------------
+# The executor's grammar is the authority — this module does not keep a second
+# opinion about it
+# ---------------------------------------------------------------------------
+# `executor/policy.py` is the thing that actually decides, as root, whether a
+# command runs: `patch_step_exec` and `backup_restore` in `executor/commands.py`
+# both call its `check_argv` before executing anything. This module used to
+# carry its own, independent idea of what an argv may look like, and the two
+# drifted exactly as far as nobody was comparing them. Measured on 18 September
+# 2026: the validator blessed `apt-get -y install --only-upgrade polkitd`,
+# which `check_argv` refuses outright, so every Debian plan that reached the
+# operator on Telegram was guaranteed to die at apply step 1 — and the fixture
+# plan's own `["systemctl", "reload", "nginx"]` is refused for the same reason
+# (the executor requires a full unit name), which is the rhel half of the same
+# defect.
+#
+# So the question is asked of the module that answers it for real, instead of
+# being answered a second time here. Two properties of HOW it is asked matter:
+#
+# * The import is lazy, and its failure is an error ON THE PLAN, never an
+#   exception at import time. `sentinel/telegram/patch_flow.py` imports this
+#   module, so a module-level `from executor import policy` would turn a
+#   missing file into a crash-looping Telegram bot — the one failure this
+#   repository has already paid a full day for.
+# * A validator that cannot reach the grammar does not know whether the plan
+#   is safe. It says so and refuses; "unknown" and "fine" are different states.
+#
+# Deployment: `deploy/install.sh` step 24 installs the same `policy.py` twice —
+# `/opt/sentinel/libexec/policy.py` is what the root process runs, and
+# `/opt/sentinel/lib/executor/policy.py` is the read-only copy on the sentinel
+# package's own `PYTHONPATH`. Both root-owned, neither writable by `sentinel`,
+# so the untrusted side can read the rules without being able to change them.
+def _executor_policy() -> tuple[Any, str | None]:
+    """The executor's policy module, or the reason it could not be loaded.
+
+    Returns `(module, None)` or `(None, reason)`. Never raises: the caller
+    turns a failure into a validation error, because every caller of
+    `validate_plan` is a long-running service that must not die over this.
+    """
+    try:
+        from executor import policy as executor_policy
+    except Exception as exc:
+        # Every import failure means the same thing here — the grammar is not
+        # readable — so they are caught as one rather than enumerated.
+        return None, f"{type(exc).__name__}: {exc}"
+    return executor_policy, None
+
+
+def _check_argv_builder() -> tuple[Any, str | None]:
+    """`checks.argv_for`, or the reason it could not be loaded.
+
+    Lazy for the same reason `_executor_policy` is: this module is imported
+    by `sentinel/telegram/patch_flow.py`, and `sentinel/patch/checks.py`
+    pulls in the database engine and the executor client. A validator that
+    could not be imported without them would put the alerting channel behind
+    a socket library.
+    """
+    try:
+        from sentinel.patch.checks import argv_for
+    except Exception as exc:
+        # As above: every failure means the same thing — the commands the
+        # checks will run cannot be known from here.
+        return None, f"{type(exc).__name__}: {exc}"
+    return argv_for, None
+
+
+def _validate_executor_grammar(
+    platform_family: str | None,
+    apply_steps: list[dict[str, Any]],
+    rollback_steps: list[dict[str, Any]],
+    backups: list[dict[str, Any]],
+    preflight: list[dict[str, Any]],
+    health: list[dict[str, Any]],
+    postver: list[dict[str, Any]],
+    r: ValidationResult,
+) -> None:
+    """Refuse any argv the root executor would refuse, using its own code.
+
+    Covers every argv `_iter_plan_argvs` can produce: the literal ones in
+    apply/rollback steps and backup restores, and the ones
+    `sentinel/patch/checks.py` builds from a structured check. All of them
+    reach `check_argv` at run time, and a plan is only "valid" if every one
+    of them can actually execute.
+
+    `platform_family=None` (the standalone skill CLI) is not a reason to skip
+    the check kinds: only `pkg_version`'s argv depends on the family, so the
+    plan is examined once per known family and a command refused on any of
+    them is reported. That is exact rather than a guess about which host the
+    plan is for — and today the two families differ only in which
+    (allowlisted) query binary they name, so it costs nothing.
+    """
+    policy, reason = _executor_policy()
+    builder, builder_reason = _check_argv_builder()
+    if builder is None:
+        r.error(
+            "$", "check_builder_unreadable",
+            f"`sentinel.patch.checks.argv_for` could not be loaded ({builder_reason}), "
+            "so the commands this plan's preflight, health and verification "
+            "checks would run as root cannot be known. Refused rather than "
+            "assumed safe.",
+        )
+        return
+    if policy is None:
+        r.error(
+            "$", "executor_policy_unreadable",
+            "the executor's own command policy could not be loaded "
+            f"({reason}), so it is impossible to tell whether the commands in "
+            "this plan would be permitted to run as root. Refused rather than "
+            "assumed safe. On the host this means /opt/sentinel/lib/executor/"
+            "policy.py is missing — redeploy; it is installed by install.sh "
+            "step 24 alongside /opt/sentinel/libexec/policy.py.",
+        )
+        return
+    # A dict, not a list: the same literal apply-step argv is produced once
+    # per candidate family below, and reporting it twice would tell the
+    # operator there are two problems where there is one.
+    candidates: dict[tuple[str, tuple[str, ...]], tuple[str, list[str]]] = {}
+    for fam in ((platform_family,) if platform_family else PLATFORM_FAMILIES):
+        for path, argv in _iter_plan_argvs(
+                apply_steps, rollback_steps, backups, preflight, health, postver,
+                builder=builder, family=fam):
+            candidates.setdefault((path, tuple(str(a) for a in argv)), (path, argv))
+
+    for path, argv in candidates.values():
+        try:
+            policy.check_argv(list(argv))
+        except policy.PolicyRefusal as refusal:
+            r.error(
+                f"$.{path}", "executor_would_refuse",
+                f"the root executor refuses this command, so it can never run: "
+                f"{refusal}",
+            )
+        except Exception as exc:
+            # Anything other than a refusal is a bug in the policy module.
+            # Reported as a plan error all the same: a validator that crashes
+            # here takes `patch_flow.py` — and the Telegram bot — with it.
+            r.error(
+                f"$.{path}", "executor_check_failed",
+                f"the executor's policy raised {type(exc).__name__}: {exc} while "
+                "checking this command. That is a bug, not an approval.",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +1026,90 @@ def _validate_coupling(
                 f"the target has {len(databases)} database(s) but no database backup "
                 "item. File-only backups do not roll back schema or data changes.",
             )
+
+    _validate_rollback_pin(rollback_steps, preflight, r)
+
+
+def _validate_rollback_pin(
+    rollback_steps: list[dict[str, Any]],
+    preflight: list[dict[str, Any]],
+    r: ValidationResult,
+) -> None:
+    """An apt rollback may only pin a version the preflight actually checked.
+
+    The executor permits `--allow-downgrades` for exactly one purpose —
+    putting a package back on the version that was installed before the patch
+    — and it can only enforce the SHAPE of that: a pin is present. Whether the
+    pinned version is the one the plan verified was installed is a question
+    only the whole plan can answer, so it is answered here.
+
+    Without this, `rollback: apt-get -y install --allow-downgrades
+    openssl=1.0.2` validates clean in a plan whose preflight checked
+    `polkitd`: a "rollback" that downgrades an unrelated package to a version
+    nobody looked at, authorised by a button the operator pressed to undo
+    something else. The preflight `equals` is what makes the pin meaningful;
+    a pin without one is a version taken on the model's word.
+
+    Compared as literal strings, deliberately: both values are supposed to be
+    the same `installed_version` fact the planner injected into the prompt, so
+    any difference at all — an added epoch, a guessed revision — means one of
+    them did not come from the database.
+    """
+    verified: dict[str, str] = {}
+    for item in preflight:
+        check = item.get("check")
+        if not isinstance(check, dict) or check.get("kind") != "pkg_version":
+            continue
+        equals = check.get("equals")
+        if isinstance(equals, str) and equals:
+            verified[str(check.get("name"))] = equals
+
+    for i, step in enumerate(rollback_steps):
+        argv = step.get("argv")
+        if not isinstance(argv, list) or not argv:
+            continue
+        if str(argv[0]).rsplit("/", 1)[-1] not in ("apt", "apt-get"):
+            continue
+        skip_next = False
+        # `part`, not `token`: with the obvious name, ruff reads `part == "-o"`
+        # as a hardcoded credential (S105) and the file stops being clean.
+        for part in argv[1:]:
+            if skip_next:
+                # The VALUE of `-o`, e.g. `Dpkg::Options::=--force-confold`.
+                # It is not a flag (no leading dash) and it does contain an
+                # `=`, so a loop that only looked at those two things read it
+                # as a pin of a package called `Dpkg` — a refusal on a plan
+                # the executor is perfectly happy with. Measured before this
+                # line existed.
+                skip_next = False
+                continue
+            if not isinstance(part, str):
+                continue
+            if part == "-o":
+                skip_next = True
+                continue
+            if part.startswith("-") or "=" not in part:
+                continue
+            name, _, version = part.partition("=")
+            name = name.split(":", 1)[0]
+            if name not in verified:
+                r.error(
+                    f"$.rollback[{i}].argv",
+                    "rollback_pin_unverified",
+                    f"this step pins {name!r} to {version!r}, but no preflight check "
+                    f"confirms which version of {name!r} is installed. A rollback to "
+                    "a version nothing verified can install something the host never "
+                    "had — add a pkg_version preflight with `equals`.",
+                )
+            elif verified[name] != version:
+                r.error(
+                    f"$.rollback[{i}].argv",
+                    "rollback_pin_mismatch",
+                    f"this step rolls {name!r} back to {version!r}, but the preflight "
+                    f"verifies the installed version is {verified[name]!r}. One of the "
+                    "two is not the version this host actually has, and the rollback "
+                    "is the half that runs when something has already gone wrong.",
+                )
 
 
 def _validate_reboot_flag(

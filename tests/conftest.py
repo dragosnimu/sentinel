@@ -29,6 +29,19 @@ def good_plan() -> dict[str, Any]:
 
 
 @pytest.fixture
+def debian_plan() -> dict[str, Any]:
+    """The Debian counterpart of `good_plan`: a complete, valid plan for an
+    `apt-get` host, version-pinned on both directions.
+
+    Shared with `tests/unit/test_patch_planner_platform.py::_full_debian_plan`
+    on purpose — a second, private copy of the same plan is a copy nothing
+    cross-checks, and that is how the refused `--only-upgrade` form survived
+    three rounds in a test fixture.
+    """
+    return json.loads((FIXTURES / "debian_plan.json").read_text(encoding="utf-8"))
+
+
+@pytest.fixture
 def broken_plan(good_plan: dict[str, Any]):
     """Return a helper that breaks exactly one thing in an otherwise valid plan.
 

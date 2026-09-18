@@ -6,9 +6,21 @@ matters for safety — "is nginx active?" expressed as `{"kind": "systemd", "uni
 "nginx.service", "expect_state": "active"}` cannot be turned into anything else,
 whereas the same question expressed as a shell command can.
 
-Only the `command` kind reaches the executor, and it does so through the same
-validated-argv path as an apply step. Every other kind is answered by a targeted
-query the executor already exposes.
+SIX kinds reach the executor as an argv, not one. `command` is the obvious one,
+but `systemd`, `file_exists`, `file_absent`, `file_sha256` and `pkg_version`
+all BUILD an argv here and send it down the same `patch_step_exec` path, where
+`executor/policy.py:check_argv` judges it exactly as it judges an apply step.
+This docstring used to claim the opposite — "only the `command` kind reaches
+the executor" — and that sentence is why the plan validator checked four argv
+shapes instead of every one: a health check naming `dbus.service`, or a
+`file_exists` on `/etc/shadow`, validated clean and was refused at run time,
+AFTER the apply step had already changed the machine. Only `disk_free`,
+`no_open_incident` and the unimplemented `http`/`tcp`/`docker` send no argv.
+
+Which argv each kind builds lives in ONE place, `argv_for()` below, so that the
+validator can ask the same function rather than keeping its own list of kinds
+to worry about — a second list is a list that goes stale the next time a kind
+is added.
 
 A check that cannot be evaluated is a FAILED check, never a passing one. The
 alternative — treating "I could not tell" as "fine" — is how a patch proceeds
@@ -63,26 +75,79 @@ async def evaluate(db: Database, check: dict[str, Any], *, family: str = "rhel")
         return CheckOutcome(False, f"verificarea nu a putut fi evaluată: {exc}", kind)
 
 
+def argv_for(check: dict[str, Any], family: str = "rhel") -> list[str] | None:
+    """The argv this check will hand the executor, or `None` if it hands none.
+
+    Pure: it builds the command and returns it, it does not run it. That is
+    the whole point — `_dispatch` below calls it to execute, and
+    `sentinel/patch/validator.py` calls it to ask `policy.check_argv` whether
+    the command would be permitted BEFORE the operator is asked to approve
+    the plan. One builder, two callers, so the set of commands the validator
+    inspects is derived from the code that produces them and cannot fall
+    behind it.
+
+    `None` means "this kind talks to the executor some other way, or not at
+    all" — `disk_free` calls the `disk_free` op with a path argument rather
+    than an argv, `no_open_incident` is a database query, and `http`/`tcp`/
+    `docker` are declared unimplemented. It also means "I cannot build one",
+    which is why an unknown `family` returns `None` for `pkg_version` instead
+    of guessing rpm: the caller must treat that as unknown, not as fine.
+
+    Raises `KeyError` on a check missing a field its kind requires. The
+    validator has already reported those as errors by the time it calls this,
+    and `evaluate()` turns any exception into a FAILED check, so neither
+    caller can mistake a malformed check for a passing one.
+    """
+    kind = str(check.get("kind", ""))
+
+    if kind == "systemd":
+        return ["systemctl", "is-active", str(check["unit"])]
+    if kind == "command":
+        return [str(a) for a in check["argv"]]
+    if kind in ("file_exists", "file_absent"):
+        return ["test", "-e", str(check["path"])]
+    if kind == "file_sha256":
+        return ["sha256sum", str(check["path"])]
+    if kind == "pkg_version":
+        name = str(check["name"])
+        if family == "rhel":
+            # S1b: the LITERAL two characters backslash-n, not a real newline
+            # byte — `executor/policy.py:SHELL_METACHARACTERS` refuses any
+            # argv element containing an actual "\n", so a genuine newline
+            # byte here would make the executor reject the query outright,
+            # always. rpm's own `--qf` format engine parses a backslash-n
+            # escape in the format STRING and renders a real newline in ITS
+            # OWN output — the same thing `rpm -qa --qf '%{NAME}\n'` does at
+            # a shell prompt, where the shell (not rpm) is what would turn a
+            # raw newline into something else if one were typed instead.
+            return ["rpm", "-q", "--qf", "%{EPOCH}:%{VERSION}-%{RELEASE}\\n", name]
+        if family == "debian":
+            # Same escape rule as the rpm branch above, for dpkg-query's own
+            # `-f` format engine.
+            return ["dpkg-query", "-W", "-f", "${Version}\\n", name]
+        return None
+    return None
+
+
 async def _dispatch(db: Database, kind: str, c: dict[str, Any], family: str) -> CheckOutcome:
     if kind == "systemd":
         unit, expect = str(c["unit"]), str(c["expect_state"])
-        res = await _exec(["systemctl", "is-active", unit])
+        res = await _exec(argv_for(c, family))
         state = str(res.get("stdout", "")).strip()
         return CheckOutcome(state == expect, f"{unit} este {state!r}, așteptat {expect!r}", kind)
 
     if kind == "command":
-        argv = [str(a) for a in c["argv"]]
         expect = [int(x) for x in c.get("expect_exit", [0])]
-        res = await _exec(argv, timeout=int(c.get("timeout_s", 60)))
+        res = await _exec(argv_for(c, family), timeout=int(c.get("timeout_s", 60)))
         code = res.get("exit_code")
         return CheckOutcome(code in expect, f"cod {code}, așteptat {expect}", kind)
 
     if kind == "file_exists":
-        res = await _exec(["test", "-e", str(c["path"])])
+        res = await _exec(argv_for(c, family))
         return CheckOutcome(res.get("exit_code") == 0, f"{c['path']} există", kind)
 
     if kind == "file_absent":
-        res = await _exec(["test", "-e", str(c["path"])])
+        res = await _exec(argv_for(c, family))
         return CheckOutcome(res.get("exit_code") != 0, f"{c['path']} lipsește", kind)
 
     if kind == "pkg_version":
@@ -109,7 +174,7 @@ async def _dispatch(db: Database, kind: str, c: dict[str, Any], family: str) -> 
         return CheckOutcome(n == 0, f"{n} incidente grave deschise", kind)
 
     if kind == "file_sha256":
-        res = await _exec(["sha256sum", str(c["path"])])
+        res = await _exec(argv_for(c, family))
         actual = str(res.get("stdout", "")).split()[0] if res.get("stdout") else ""
         return CheckOutcome(actual == str(c["sha256"]),
                             f"sha256 {'corespunde' if actual == str(c['sha256']) else 'diferit'}",
@@ -466,22 +531,22 @@ def _best_installed(lines: list[str], evr_cmp: Any) -> str:
 
 
 async def _check_pkg_version(c: dict[str, Any], family: str) -> CheckOutcome:
-    name = str(c["name"])
     equals = c.get("equals")
     at_least = c.get("at_least")
     op, target = ("=", str(equals)) if equals else (">=", str(at_least))
 
+    # The query itself is built by `argv_for` — the same function the plan
+    # validator asks, so a `pkg_version` check whose package name the executor
+    # would refuse is rejected before the operator approves the plan instead
+    # of failing after the apply step has already run.
+    argv = argv_for(c, family)
+    if argv is None:
+        return CheckOutcome(
+            False, f"platform.family={family!r} necunoscută pentru pkg_version",
+            "pkg_version")
+
     if family == "rhel":
-        # S1b: the LITERAL two characters backslash-n, not a real newline
-        # byte — `executor/policy.py:SHELL_METACHARACTERS` refuses any argv
-        # element containing an actual "\n", so a genuine newline byte here
-        # would make the executor reject the query outright, always. rpm's
-        # own `--qf` format engine parses a backslash-n escape in the format
-        # STRING and renders a real newline in ITS OWN output — the same
-        # thing `rpm -qa --qf '%{NAME}\n'` does at a shell prompt, where the
-        # shell (not rpm) is what would turn a raw newline into something
-        # else if one were typed instead.
-        res = await _exec(["rpm", "-q", "--qf", "%{EPOCH}:%{VERSION}-%{RELEASE}\\n", name])
+        res = await _exec(argv)
         if res.get("exit_code") != 0:
             return CheckOutcome(False, f"neinstalat, așteptat {op} {target}", "pkg_version")
         lines = [ln for ln in str(res.get("stdout", "")).splitlines() if ln.strip()]
@@ -499,12 +564,7 @@ async def _check_pkg_version(c: dict[str, Any], family: str) -> CheckOutcome:
 
     if family == "debian":
         try:
-            # Same escape rule as the rpm branch above: the literal two
-            # characters backslash-n, which dpkg-query's own `-f` format
-            # engine turns into a real newline in its output — a raw
-            # newline byte in the argv would be refused by the executor's
-            # own policy before it ever reached dpkg-query.
-            res = await _exec(["dpkg-query", "-W", "-f", "${Version}\\n", name])
+            res = await _exec(argv)
         except ExecutorRejected:
             # S1c: fails CLOSED with the honest reason, not the old blanket
             # "not implemented" — this host's executor may or may not have
@@ -530,5 +590,9 @@ async def _check_pkg_version(c: dict[str, Any], family: str) -> CheckOutcome:
                 + ("" if ok else " — nesatisfăcut"),
             "pkg_version")
 
+    # Unreachable: `argv_for` above already returns None for any family that is
+    # neither rhel nor debian. Kept so that teaching `argv_for` a new family
+    # without teaching this function how to parse its output fails loudly
+    # instead of silently reporting a check as satisfied.
     return CheckOutcome(
         False, f"platform.family={family!r} necunoscută pentru pkg_version", "pkg_version")
