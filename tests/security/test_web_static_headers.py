@@ -96,8 +96,15 @@ def _https_server_scope(text: str) -> str:
     rather than a literal port picks the right block in both templates:
     shared listens on the literal `443`, dedicated listens on
     `@@PUBLIC_PORT@@`, a substitution marker, not yet a port number.
+
+    `[^;]*` after `http2`, rather than `;` straight away: the dedicated
+    template's listen line now ends in `@@DEFAULT_SERVER@@`, which renders
+    either empty or as ` default_server` depending on whether `--domain` was
+    given (see render_dedicated_vhosts in deploy/install.sh). Anchored on `;`
+    this stopped matching at all, and the assertion below then reported "the
+    vhost's TLS listener moved or is gone", which was not what had happened.
     """
-    listen = re.search(r"^\s*listen\s+\S+\s+ssl\s+http2;", text, re.M)
+    listen = re.search(r"^\s*listen\s+\S+\s+ssl\s+http2[^;]*;", text, re.M)
     assert listen, "no HTTPS `listen ... ssl http2;` line found — the vhost's TLS listener moved or is gone"
     first_location = re.search(r"^\s*location\b", text[listen.start():], re.M)
     assert first_location, "no `location` directive found after the HTTPS listen line"

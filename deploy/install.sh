@@ -3261,6 +3261,68 @@ nginx_listens_on_80() {
     grep -qE '^[[:space:]]*listen[[:space:]]+(\[::\]:|[0-9.]+:|\*:)?80([^0-9]|$)' <<< "$dump"
 }
 
+# Which block already claims default_server on this port — asked of what nginx
+# ACTUALLY LOADS, not of what happens to be on disk.
+#
+#   $1        the port
+#   $2..$n    paths that are OURS, and so are not "another vhost"
+#
+# `nginx -T` is the whole effective configuration with includes resolved, and
+# it is the only place where "does something else already own this port" is a
+# fact rather than a guess about which files nginx might read. The previous
+# version of this measurement grepped /etc/nginx/ recursively, which counts
+# files nginx never loads: Debian's sites-available/*, and hand-made backups —
+# production carries one of those today, /etc/nginx/conf.d/sentinel-shared\
+# .conf.bak-selfsigned.
+#
+# The failure that opens: on a dedicated host, a conf.d/sentinel.conf.bak-<date>
+# left behind by an earlier no-domain install holds `listen <port> …
+# default_server`, matches neither exclusion by name, and would make EVERY
+# later no-domain deploy die — the "works once, then blocks every re-deploy"
+# outcome the exclusions exist to prevent, arriving through the back door, and
+# now fatal rather than merely skipping the deny block. nginx does not include
+# that file, so nginx does not report it.
+#
+# Same three outcomes as nginx_listens_on_80 three screens up, for the same
+# reason:
+#
+#   0  yes — the file(s) that declare it are on stdout
+#   1  no
+#   2  could not look (nginx absent, or it refused to dump its configuration)
+#
+# Collapsing 2 into 1 would answer "nothing else owns this port" about a host
+# whose nginx will not parse its own configuration.
+nginx_foreign_default_on_port() {
+    local port="$1"; shift
+    local dump current="" line found="" ignored
+    have nginx || return 2
+    dump="$(nginx -T 2>/dev/null)" || return 2
+
+    # The trailing [^0-9;] is what keeps :84430 from matching :8443; the old
+    # grep had `[^;]*` straight after the port and would have counted it.
+    local re="^[[:space:]]*listen[[:space:]]+(\[::\]:|[0-9.]+:|\*:)?${port}[^0-9;][^;]*default_server"
+
+    while IFS= read -r line; do
+        # nginx -T labels every file it read with this exact header line; it is
+        # what makes the answer attributable to a file, which a flat grep of
+        # the dump would not be.
+        if [[ "$line" == '# configuration file '*: ]]; then
+            current="${line#\# configuration file }"
+            current="${current%:}"
+            continue
+        fi
+        [[ "$line" =~ $re ]] || continue
+        for ignored in "$@"; do
+            [[ "$current" == "$ignored" ]] && continue 2
+        done
+        [[ " $found " == *" $current "* ]] && continue
+        found="${found}${current} "
+    done <<< "$dump"
+
+    [[ -n "$found" ]] || return 1
+    printf '%s\n' $found
+}
+
 SENTINEL_NGINX_SNIPPET_DIR=/etc/nginx/sentinel
 
 install_sentinel_nginx_snippets() {
@@ -3277,6 +3339,271 @@ install_sentinel_nginx_snippets() {
             ok "removed ${stale} - it applied to every site on this host"
         fi
     done
+}
+
+# ---------------------------------------------------------------------------
+# Dedicated mode: who answers on :PUBLIC_PORT
+# ---------------------------------------------------------------------------
+#
+# In dedicated mode Sentinel owns PUBLIC_PORT outright, so there are exactly
+# two honest configurations of it. The installer must land in one of them and
+# never between, because between them is where the outage lives:
+#
+#   --domain given    the app vhost is selected by that name; the deny block
+#                     keeps default_server and refuses every other Host.
+#                     Strong posture, and the operator was told the name.
+#   --domain absent   the installer cannot know how the operator will browse
+#                     to this machine. So the app vhost becomes default_server
+#                     itself and NO deny block is installed: the dashboard
+#                     answers on that port whatever the Host. Weaker, said out
+#                     loud here and again in the closing summary.
+#
+# The third state was measured on the live Ubuntu host on 2026-09-18: two
+# server blocks on :8443, BOTH `server_name _`, the deny block holding
+# `default_server`. `_` is not a wildcard — it is a name no real Host ever
+# equals — so nothing matched either block by name, every request fell through
+# to default_server, and every request got 444. `systemctl is-active
+# sentinel-web` said active, `ss -lntp` showed nginx bound to the port, and the
+# installer reported success at every step.
+#
+# GUESSING THE NAME WAS REJECTED AS THE REPAIR, and that is the part worth
+# keeping. `hostname -f` on that host is n8n.cryptoitdata.eu; the operator
+# reaches it at n8n.srv1051579.hstgr.cloud. A vhost named after the guess
+# routes nothing, the deny block still wins, and the operator still gets 444 —
+# the same outage, produced by its own fix. Widening server_name with a guessed
+# LIST (short name, FQDN, public IP) is worse: putting the address there hands
+# a bare-IP scan the login page, which is the one thing the deny block exists
+# to prevent.
+
+# Renders the pair of files that decides who answers on :PUBLIC_PORT.
+#
+#   $1  directory to write them into (/etc/nginx/conf.d in production; the
+#       tests point it at a temp dir and read the result back)
+#   $2  path(s) of a block that ALREADY declares default_server on this port
+#       and is not ours, or "" when there is none. Measured by the caller,
+#       because measuring it means grepping /etc/nginx.
+#
+# Reads DOMAIN, PUBLIC_PORT, SCRIPT_DIR. Writes sentinel.conf always;
+# sentinel-default-deny.conf only with --domain, and DELETES it otherwise. The
+# delete is not tidiness: a host installed by an earlier version has that file
+# on disk, and a re-deploy that merely declined to write it would leave the 444
+# exactly where it is.
+render_dedicated_vhosts() {
+    local dir="$1" foreign_default="$2"
+    local conf="${dir}/sentinel.conf"
+    local deny_conf="${dir}/sentinel-default-deny.conf"
+    local vhost_name vhost_default
+
+    if [[ -n "$DOMAIN" ]]; then
+        vhost_name="$DOMAIN"
+        vhost_default=""
+    else
+        # `_` is safe HERE and only here, because this block carries
+        # default_server: nginx selects it for every Host that matches nothing
+        # else, which on a port of our own is every Host. The name is never
+        # consulted, so it cannot be the wrong guess.
+        vhost_name="_"
+        vhost_default=" default_server"
+
+        # Two default_server blocks on one port is not a weaker posture, it is
+        # `nginx -t` refusing the entire configuration ("duplicate default
+        # server"). Stopping here, before anything is written, is the only
+        # answer that does not leave the operator's nginx unreloadable.
+        if [[ -n "$foreign_default" ]]; then
+            die "--nginx-mode dedicated without --domain needs Sentinel's own vhost to be \
+the default server on :${PUBLIC_PORT}, and this already declares default_server there:
+        ${foreign_default}
+nginx refuses a configuration with two of them. Either pass --domain <name>, which selects \
+Sentinel's vhost by name and leaves that block alone, or move that block off :${PUBLIC_PORT}."
+        fi
+    fi
+
+    sed -e "s|@@DOMAIN@@|${vhost_name}|g" \
+        -e "s|@@DEFAULT_SERVER@@|${vhost_default}|g" \
+        -e "s|@@PORT@@|8787|g" \
+        -e "s|@@PUBLIC_PORT@@|${PUBLIC_PORT}|g" \
+        -e "s|@@TLS_DIR@@|$(tls_dir)|g" \
+        "${SCRIPT_DIR}/nginx/sentinel.conf.tmpl" > "$conf"
+
+    if [[ -z "$DOMAIN" ]]; then
+        rm -f "$deny_conf"
+        warn "no --domain given, so the dashboard on :${PUBLIC_PORT} answers to ANY Host, \
+including a bare-IP scan, and no catch-all deny is installed. That is deliberate: guessing \
+a name is what made every request return 444. Narrow it to one name by re-running with \
+--domain <name>."
+        return 0
+    fi
+
+    # Catch-all deny for requests that reach Sentinel's port without naming its
+    # vhost. Without it, nginx makes Sentinel's the default for that port and it
+    # answers for ANY Host — so a bare-IP scan returns the login page,
+    # advertising both that a security dashboard exists here and where to aim a
+    # credential attack.
+    #
+    # Scoped to Sentinel's port only, so it cannot collide with a default_server
+    # someone else declared on 80 or 443.
+    if [[ -n "$foreign_default" ]]; then
+        rm -f "$deny_conf"
+        warn "another vhost already declares default_server on :${PUBLIC_PORT}:"
+        printf '        %s\n' $foreign_default >&2
+        warn "Skipped Sentinel's catch-all to avoid breaking it. Verify by hand that"
+        warn "https://<this-ip>:${PUBLIC_PORT}/ does NOT return the Sentinel login page."
+        return 0
+    fi
+
+    sed -e "s|@@PUBLIC_PORT@@|${PUBLIC_PORT}|g" \
+        -e "s|@@TLS_DIR@@|$(tls_dir)|g" \
+        "${SCRIPT_DIR}/nginx/sentinel-default-deny.conf.tmpl" > "$deny_conf"
+    chmod 0644 "$deny_conf"
+    ok "catch-all deny on :${PUBLIC_PORT} — only https://${DOMAIN}:${PUBLIC_PORT} reaches the dashboard"
+}
+
+# One HTTPS request, its status code as a fact. Never fails the caller.
+#
+# WHY A FUNCTION AND NOT A `curl` WRITTEN WHERE THE VERDICT IS TAKEN. Under
+# `set -euo pipefail`, a plain `code="$(curl …)"` at step level aborts the
+# WHOLE installer, silently, the instant curl exits nonzero — and curl does
+# that routinely here for reasons that are not "nginx is broken": rc=7 on a
+# closed port, rc=92 on an HTTP/2 framing error when nginx answers 444
+# (observed on the live Ubuntu host, 8 Sep 2026). The step then died on the
+# assignment with no message at all, so the verdict it was about to print
+# never appeared. Here the curl runs inside the subshell of the caller's own
+# `$( … )`, which bash does NOT give errexit to unless `inherit_errexit` is
+# set (it is not, anywhere in this tree) — so a nonzero curl can no longer
+# take the caller down, and whatever `-w` captured before curl failed is
+# still what gets printed and judged.
+#
+# `|| true` is a SECOND guard, not the one doing the work: it is what keeps
+# that true if this is ever called outside a command substitution, or if
+# `inherit_errexit` is ever switched on. Measured on 18 Sep 2026: removing it
+# today changes no observable behaviour, precisely because of the subshell.
+https_code() {
+    local url="$1"; shift
+    local code
+    code="$(curl -sk --max-time 10 -o /dev/null -w '%{http_code}' ${1+"$@"} "$url" 2>/dev/null || true)"
+    [[ -n "$code" ]] || code="000"
+    printf '%s' "$code"
+}
+
+# Codes that mean Sentinel's own vhost answered. 401/302 are what an
+# unauthenticated request can legitimately get; 503 is the app still starting.
+SENTINEL_ANSWERED='^(200|301|302|303|307|308|401|503)$'
+
+# Why a name did not answer from here — measured, and explicitly UNKNOWN when
+# it cannot be measured. One line, never fails.
+name_resolution_note() {
+    local name="$1" answer own
+    if ! have getent; then
+        printf 'whether %s resolves at all is UNKNOWN from here — getent is missing from this host' "$name"
+        return 0
+    fi
+    # `|| true`: a name that does not resolve is getent's ORDINARY way of
+    # saying so (nonzero exit), not a script fault — and `pipefail` would turn
+    # that into an immediate abort of the whole installer over a diagnostic.
+    answer="$(getent hosts "$name" 2>/dev/null | awk '{print $1}' | tr '\n' ' ' || true)"
+    if [[ -z "${answer// /}" ]]; then
+        printf '%s does not resolve on this host at all' "$name"
+        return 0
+    fi
+    own="$(public_ips | tr '\n' ' ' || true)"
+    printf '%s resolves here to %s; this host owns %s' \
+        "$name" "${answer% }" "${own:-<no global address>}"
+}
+
+# Does the configuration just written actually deliver a request to Sentinel?
+#
+# `nginx -t` and reload_nginx prove the file parses and that the master adopted
+# it. NEITHER proves a request reaches Sentinel's vhost rather than something
+# that closes the connection — both were green on the host in the outage, for
+# weeks, while every visit got 444.
+#
+# The question differs by configuration, because the honest question does:
+#
+#   --domain   the vhost is selected by name, so the proof is that a request
+#              FOR THAT NAME reaches Sentinel, and separately that one for any
+#              other Host does not.
+#   no domain  the vhost is default_server, so the proof is that a request
+#              naming nothing this host knows reaches Sentinel anyway.
+#
+# TWO SEPARATE FACTS IN THE --domain CASE, and they are reported separately on
+# purpose. A probe that lets this host resolve the name itself measures the
+# operator's own path, but a 200 from it does not prove OUR nginx answered —
+# the name may point at another machine entirely. A probe pinned to 127.0.0.1
+# proves our routing and says nothing about whether anything outside can get
+# here. So the pinned probe decides whether the step lives or dies, and the
+# resolved probe decides whether something is recorded for the closing summary.
+verify_dashboard_answers() {
+    local unknown_host="nu-exista.sentinel.invalid"
+    local code loop_code note
+
+    if [[ -z "$DOMAIN" ]]; then
+        # The Host header names something no block on this host is configured
+        # for. If the app vhost holds default_server it answers; if anything
+        # else does, this is the request that comes back empty — which is
+        # exactly the outage, reproduced here before the operator meets it.
+        code="$(https_code "https://127.0.0.1:${PUBLIC_PORT}/healthz" -H "Host: ${unknown_host}")"
+        if [[ "$code" =~ $SENTINEL_ANSWERED ]]; then
+            ok "a request naming nothing (Host: ${unknown_host}) reaches the dashboard on \
+:${PUBLIC_PORT} (HTTP ${code}) — which is what 'no --domain' has to mean"
+            return 0
+        fi
+        die "a request on :${PUBLIC_PORT} with an unknown Host answered ${code}, and without \
+--domain that is the only kind of request there is: Sentinel's vhost is supposed to be the \
+default server on this port. ${code} means something else is, so the dashboard is \
+unreachable however the operator browses to it. Inspect with:
+    nginx -T | grep -nE 'listen[[:space:]]+(\\[::\\]:)?${PUBLIC_PORT}|server_name'"
+    fi
+
+    # -- 1. The operator's own path: let this host resolve the name ----------
+    code="$(https_code "https://${DOMAIN}:${PUBLIC_PORT}/healthz")"
+
+    # -- 2. This host's nginx, pinned to loopback ----------------------------
+    loop_code="$(https_code "https://${DOMAIN}:${PUBLIC_PORT}/healthz" \
+                 --resolve "${DOMAIN}:${PUBLIC_PORT}:127.0.0.1")"
+    if ! [[ "$loop_code" =~ $SENTINEL_ANSWERED ]]; then
+        die "this host's own nginx answered ${loop_code} to https://${DOMAIN}:${PUBLIC_PORT}/healthz \
+(name pinned to 127.0.0.1, so neither DNS nor any firewall is in the way). The vhost for \
+'${DOMAIN}' is not what serves that request — with the catch-all deny on :${PUBLIC_PORT} that \
+is a closed connection for every visitor. Inspect with:
+    nginx -T | grep -B2 -A8 'server_name ${DOMAIN}'"
+    fi
+
+    if [[ "$code" =~ $SENTINEL_ANSWERED ]]; then
+        ok "https://${DOMAIN}:${PUBLIC_PORT}/healthz reaches the dashboard (HTTP ${code}), \
+resolved the way a browser resolves it"
+    else
+        note="$(name_resolution_note "$DOMAIN")"
+        warn "THE ROUTING CHECK WAS WEAKENED. Resolved normally from this host, \
+https://${DOMAIN}:${PUBLIC_PORT}/healthz answered ${code}; only with the name pinned to \
+127.0.0.1 did it answer ${loop_code}. So nginx here routes '${DOMAIN}' to the dashboard, but \
+nothing here proves a visitor arrives. Measured: ${note}."
+        obstacle "https://${DOMAIN}:${PUBLIC_PORT}/healthz does not answer when this host \
+resolves the name itself (HTTP ${code}), although nginx here does serve it (HTTP ${loop_code} \
+over loopback). Measured: ${note}. Point DNS for '${DOMAIN}' at this host, and make sure \
+:${PUBLIC_PORT} is open on the way in."
+    fi
+
+    # -- 3. The hardening the operator was promised, not assumed -------------
+    #
+    # A bare IP in the URL sends no SNI, so nginx picks the default server for
+    # the certificate and then the Host header picks the block — which is
+    # precisely what a port scanner's request looks like.
+    code="$(https_code "https://127.0.0.1:${PUBLIC_PORT}/" -H "Host: ${unknown_host}")"
+    case "$code" in
+        000|444)
+            # Not "the catch-all deny is in effect": when a foreign
+            # default_server was found above, ours was deliberately not
+            # installed and it is THEIRS that refused. The effect is the same
+            # and is what gets claimed; the mechanism is not assumed.
+            ok "an unknown Host on :${PUBLIC_PORT} gets no response at all — a scan of this address learns nothing"
+            ;;
+        *)
+            warn "an unknown Host on :${PUBLIC_PORT} answered HTTP ${code}. The catch-all deny \
+is NOT refusing it, so a scan of this address learns that something is here. Find which block \
+answers:
+    nginx -T | grep -nE 'listen[[:space:]]+(\\[::\\]:)?${PUBLIC_PORT}.*default_server'"
+            ;;
+    esac
 }
 
 # --- 33 -------------------------------------------------------------------
@@ -3349,39 +3676,33 @@ nginx.conf — it is yours. If nginx fails to start, a server block in it is \
 competing for :80."
     fi
 
-    local conf=/etc/nginx/conf.d/sentinel.conf
-    sed -e "s|@@DOMAIN@@|${DOMAIN:-_}|g" \
-        -e "s|@@PORT@@|8787|g" \
-        -e "s|@@PUBLIC_PORT@@|${PUBLIC_PORT}|g" \
-        -e "s|@@TLS_DIR@@|$(tls_dir)|g" \
-        "${SCRIPT_DIR}/nginx/sentinel.conf.tmpl" > "$conf"
+    # Measured BEFORE our own files are rewritten, and with BOTH of our own
+    # files excluded from the answer. Without the sentinel.conf exclusion the
+    # no-domain rendering below would find, on the next deploy, the
+    # default_server IT wrote on this one, conclude that someone else owns the
+    # port, and die — a repair that works once and then blocks every re-deploy.
+    local foreign_default="" fd_state=0
+    foreign_default="$(nginx_foreign_default_on_port "$PUBLIC_PORT" \
+        /etc/nginx/conf.d/sentinel.conf \
+        /etc/nginx/conf.d/sentinel-default-deny.conf)" || fd_state=$?
 
-    # Catch-all deny for requests that reach Sentinel's port without naming its
-    # vhost. Without it, nginx makes Sentinel's the default for that port and it
-    # answers for ANY Host — so a bare-IP scan returns the login page,
-    # advertising both that a security dashboard exists here and where to aim a
-    # credential attack.
-    #
-    # Scoped to Sentinel's port only, so it cannot collide with a default_server
-    # someone else declared on 80 or 443.
-    local deny_conf=/etc/nginx/conf.d/sentinel-default-deny.conf
-    local existing_default
-    existing_default="$(grep -rlE "listen[[:space:]]+(\[::\]:)?${PUBLIC_PORT}[^;]*default_server" \
-        /etc/nginx/ 2>/dev/null | grep -v 'sentinel-default-deny' || true)"
-
-    if [[ -z "$existing_default" ]]; then
-        sed -e "s|@@PUBLIC_PORT@@|${PUBLIC_PORT}|g" \
-            -e "s|@@TLS_DIR@@|$(tls_dir)|g" \
-            "${SCRIPT_DIR}/nginx/sentinel-default-deny.conf.tmpl" > "$deny_conf"
-        chmod 0644 "$deny_conf"
-        ok "catch-all deny on :${PUBLIC_PORT} — only https://${DOMAIN:-<domain>}:${PUBLIC_PORT} reaches the dashboard"
-    else
-        rm -f "$deny_conf"
-        warn "another vhost already declares default_server on :${PUBLIC_PORT}:"
-        printf '        %s\n' $existing_default >&2
-        warn "Skipped Sentinel's catch-all to avoid breaking it. Verify by hand that"
-        warn "https://<this-ip>:${PUBLIC_PORT}/ does NOT return the Sentinel login page."
+    # "Could not look" is not "nothing there", and it is not a reason to stop
+    # either. nginx refusing to dump means its configuration does not parse —
+    # possibly because of a broken sentinel.conf THIS RUN is about to replace,
+    # so dying here would block the deploy that fixes it. So: say it, write our
+    # files, and let the `nginx -t` twenty lines down be the thing that decides.
+    # That check is not a formality here: two default_server blocks on one port
+    # is exactly what it refuses, by name, with `duplicate default server`.
+    if (( fd_state == 2 )); then
+        foreign_default=""
+        warn "nginx would not dump its effective configuration, so whether another block \
+already claims default_server on :${PUBLIC_PORT} is UNKNOWN — not 'nothing there'. Sentinel's \
+vhost is written anyway; if there IS such a block, the nginx -t below refuses the whole \
+configuration with 'duplicate default server' and this step stops before reloading. Read it \
+by hand with: nginx -T"
     fi
+
+    render_dedicated_vhosts /etc/nginx/conf.d "$foreign_default"
 
     # SELinux blocks nginx from proxying to 127.0.0.1:8787 by default, and the
     # symptom is a 502 with nothing useful in the nginx log.
@@ -3392,6 +3713,11 @@ competing for :80."
     reload_nginx
 
     obtain_certificate
+
+    # Proof, not report. Everything above says what was WRITTEN; this asks
+    # nginx what it DOES with it, and stops the step when the answer is that
+    # nothing reaches the dashboard.
+    verify_dashboard_answers
 }
 
 # ---------------------------------------------------------------------------
@@ -5125,6 +5451,119 @@ above, from Telegram. Sentinel is installed, but it cannot reach you yet."
     esac
 }
 
+# ---------------------------------------------------------------------------
+# Ce mai stă între operator și panou — strâns pe parcurs, tipărit LA FINAL
+# ---------------------------------------------------------------------------
+#
+# Avertismentul despre ufw există de mult în preflight și e corect (vezi
+# comentariul lung de la deploy/preflight.sh:327). Defectul nu e el: e locul
+# unde apare. Trece pe ecran la minutul doi al unei instalări de un sfert de
+# oră, iar rularea se termină cu „Instalare completă". Operatorul citește
+# ultimul lucru de pe ecran, nu al treilea, și pleacă spre un panou care nu
+# răspunde. Condițiile se strâng aici și se tipăresc ultimele, cu comanda
+# exactă.
+#
+# Două liste, fiindcă sunt două lucruri diferite: ce BLOCHEAZĂ accesul, și ce
+# trebuie ȘTIUT despre postura cu care a rămas gazda. A le amesteca ar pune un
+# fapt de securitate în lista de „de reparat" sau invers.
+PENDING_OBSTACLES=()
+CLOSING_NOTES=()
+
+obstacle()     { PENDING_OBSTACLES+=("$1"); }
+closing_note() { CLOSING_NOTES+=("$1"); }
+
+# ufw, RE-măsurat la final, nu reluat din decizia pasului 1.
+#
+# Între preflight și banner trec sferturi de oră, iar operatorului i s-a spus
+# la minutul doi să deschidă portul. Dacă a făcut-o între timp, a-i repeta
+# instrucțiunea e o minciună mică exact acolo unde tocmai am promis adevărul.
+#
+# Patru stări, fiindcă „nu se poate citi" nu e „e în regulă":
+#   0  ufw blochează portul
+#   1  nu-l blochează (inactiv, politică implicită allow, sau regulă existentă)
+#   2  ufw e acolo dar starea lui nu s-a putut citi
+#   3  întrebarea nu se pune (ufw nu e instalat, sau mod shared, unde Sentinel
+#      nu deschide niciun port propriu)
+#
+# Tiparele de grep sunt aceleași cu ale preflight-ului, deliberat: două
+# răspunsuri diferite la aceeași întrebare, pe aceeași rulare, ar fi mai rău
+# decât niciunul.
+ufw_blocks_public_port() {
+    have ufw || return 3
+    [[ "$NGINX_MODE" == "shared" ]] && return 3
+    local state
+    state="$(ufw status verbose 2>/dev/null || true)"
+    [[ -n "$state" ]] || return 2
+    grep -qi '^Status: active' <<< "$state" || return 1
+    grep -qE '^Default:[^,]*allow \(incoming\)' <<< "$state" && return 1
+    grep -qE "^${PUBLIC_PORT}(/tcp)?([[:space:]]+\(v6\))?[[:space:]]+ALLOW" <<< "$state" && return 1
+    return 0
+}
+
+report_closing_facts() {
+    # Postura se recalculează AICI, din configurația rulării, nu se memorează
+    # la pasul 33: pasul e în ALWAYS_STEPS azi, dar dacă vreodată nu mai e,
+    # nota ar dispărea tăcut de pe ecran exact pe gazdele deja instalate.
+    if [[ "$NGINX_MODE" != "shared" && -z "$DOMAIN" ]]; then
+        closing_note "Panoul de pe :${PUBLIC_PORT} răspunde la ORICE Host, inclusiv la un \
+scan pe IP gol. Fără --domain instalatorul nu are de unde ști numele prin care ajungi la
+      mașină, iar a-l ghici e exact ce a făcut ca fiecare cerere să primească 444. Ca să-l
+      îngustezi la un singur nume, re-rulează instalarea cu:
+          --domain <numele-prin-care-deschizi-panoul>"
+    fi
+
+    # --allow-ufw NU e o a cincea stare măsurată — portul e închis la fel în
+    # amândouă cazurile. E răspunsul la altceva: dacă operatorul a ALES asta.
+    #
+    # `preflight.sh` deosebește deja cele două (liniile 378 și 383), și
+    # deosebirea e purtătoare: „or if the dashboard is meant to be reached only
+    # through an ssh tunnel, in which case the port SHOULD stay closed and this
+    # is the right answer, not a workaround." Pe gazda n8n exact așa se ajunge
+    # la panou, fiindcă HSTS pe :443 face certificatul autosemnat de pe :8443
+    # inutilizabil în browser — iar `deploy.ps1 -AllowUfw` trimite ALLOW_UFW=1
+    # la fiecare livrare.
+    #
+    # Fără ramura asta, ultimul lucru de pe ecran îi cerea operatorului să
+    # anuleze o decizie pe care tocmai o luase. Tot rostul mutării rezumatului
+    # la final a fost ca un avertisment adevărat să nu mai treacă neobservat;
+    # n-are voie să devină unul fals.
+    local ufw_state=0
+    ufw_blocks_public_port || ufw_state=$?
+    if (( ufw_state == 0 )) && [[ "${ALLOW_UFW:-0}" == "1" ]]; then
+        closing_note "Portul ${PUBLIC_PORT} e ÎNCHIS în ufw și ai cerut --allow-ufw, deci a \
+rămas așa intenționat. Panoul nu răspunde din afară — ceea ce e răspunsul CORECT dacă ajungi
+      la el printr-un tunel ssh, nu ceva de reparat. Dacă totuși vrei să răspundă din afară:
+          sudo ufw allow ${PUBLIC_PORT}/tcp
+      sau, doar pentru adresa ta:
+          sudo ufw allow from <ip-ul-tău> to any port ${PUBLIC_PORT} proto tcp"
+        ufw_state=4
+    fi
+    case $ufw_state in
+        0) obstacle "ufw e ACTIV și nicio regulă din el nu lasă ${PUBLIC_PORT}/tcp să intre. \
+Panoul nu răspunde din afară până rulezi:
+          sudo ufw allow ${PUBLIC_PORT}/tcp
+      sau, doar pentru adresa ta:
+          sudo ufw allow from <ip-ul-tău> to any port ${PUBLIC_PORT} proto tcp
+      Sentinel nu umblă în firewall-ul tău, deci comanda asta rămâne a ta." ;;
+        2) obstacle "ufw e instalat, dar starea lui NU s-a putut citi acum, deci dacă lasă \
+${PUBLIC_PORT}/tcp să intre e NECUNOSCUT — nu „în regulă\". Verifică:
+          sudo ufw status verbose" ;;
+    esac
+
+    (( ${#CLOSING_NOTES[@]} + ${#PENDING_OBSTACLES[@]} )) || return 0
+
+    local item
+    if (( ${#CLOSING_NOTES[@]} )); then
+        printf '\n  DE ȘTIUT:\n'
+        for item in "${CLOSING_NOTES[@]}"; do printf '\n   *  %s\n' "$item"; done
+    fi
+    if (( ${#PENDING_OBSTACLES[@]} )); then
+        printf '\n  CE MAI STĂ ÎNTRE TINE ȘI PANOU:\n'
+        for item in "${PENDING_OBSTACLES[@]}"; do printf '\n   *  %s\n' "$item"; done
+    fi
+    printf '\n'
+}
+
 # ===========================================================================
 main() {
     section "Sentinel installer"
@@ -5222,9 +5661,29 @@ main() {
     assert_forced_steps_ran
 
     section "Instalare completă"
+    # Cu --domain, URL-ul e numele pe care vhost-ul chiar îl servește și pe
+    # care verificarea de la pasul 33 l-a cerut efectiv.
+    #
+    # Fără --domain NU EXISTĂ nume: vhost-ul e `default_server` și răspunde la
+    # orice Host, deci singurul lucru adevărat de tipărit e o adresă a gazdei.
+    # Un `hostname -f` aici ar fi chiar ghicitul care a produs pana — pe gazda
+    # de producție întoarce n8n.cryptoitdata.eu, iar operatorul ajunge la
+    # mașină prin cu totul alt nume. Nota din report_closing_facts spune că
+    # merge orice Host, deci adresa nu e o îngustare, e un exemplu care chiar
+    # se deschide.
+    local banner_host
+    if [[ -n "$DOMAIN" ]]; then
+        banner_host="$DOMAIN"
+    else
+        # Prima adresă IPv4 globală. `|| true` peste tot lanțul: `grep -v` fără
+        # potrivire iese 1, iar `head -1` închide conducta devreme — sub
+        # `pipefail` oricare dintre ele ar opri instalarea completă în bară.
+        banner_host="$( { public_ips | grep -v ':' | head -1; } 2>/dev/null || true)"
+        [[ -n "$banner_host" ]] || banner_host="$(hostname -f 2>/dev/null || hostname)"
+    fi
     cat <<EOF
 
-  Dashboard   : https://${DOMAIN:-$(hostname -f)}$( [[ "$NGINX_MODE" == "shared" ]] || printf ':%s' "$PUBLIC_PORT" )
+  Dashboard   : https://${banner_host}$( [[ "$NGINX_MODE" == "shared" ]] || printf ':%s' "$PUBLIC_PORT" )
   Mod nginx   : ${NGINX_MODE}
   Config      : ${SENTINEL_CONFIG_DIR}/sentinel.yaml
   Inventar    : ${SENTINEL_CONFIG_DIR}/inventory.yaml   <- REVIZUIEȘTE
@@ -5245,7 +5704,7 @@ main() {
   security group din cloud o face. Verifică din exterior:
 
       curl -sk -o /dev/null -w '%{http_code}
-' https://${DOMAIN:-<host>}:${PUBLIC_PORT}/healthz
+' https://${banner_host}:${PUBLIC_PORT}/healthz
 
   Ieșiri de urgență:
       touch ${SENTINEL_CONFIG_DIR}/PANIC     -> blocklist golit în ≤60s
@@ -5253,6 +5712,10 @@ main() {
 
 EOF
     (( WARN_COUNT > 0 )) && warn "${WARN_COUNT} avertisment(e) — vezi mai sus"
+
+    # Ultimul lucru de pe ecran, după bară și după numărul de avertismente:
+    # ce mai stă între operator și panou. Vezi comentariul de la definiție.
+    report_closing_facts
     return 0
 }
 

@@ -38,11 +38,19 @@ pytestmark = pytest.mark.security
 
 # Setul de variabile cu care s-au generat etaloanele. `@@TLS_DIR@@` primește
 # constanta istorică: exact șirul care era scris cu mâna în șablon.
+#
+# `@@DEFAULT_SERVER@@` e gol AICI fiindcă etalonul e cazul CU `--domain`:
+# vhost-ul e ales după nume, iar `default_server` stă pe blocul de refuz. Vezi
+# `render_dedicated_vhosts` în install.sh. Cazul fără `--domain` (marcajul
+# randat ca ` default_server`) e exercitat în
+# tests/security/test_installer_nginx_dedicated_domain.py, prin funcția
+# livrată, nu prin tabelul ăsta.
 RHEL_VARS = {
     "@@DOMAIN@@": "sentinel.example.com",
     "@@PORT@@": "8787",
     "@@PUBLIC_PORT@@": "8443",
     "@@TLS_DIR@@": "/etc/pki/tls",
+    "@@DEFAULT_SERVER@@": "",
 }
 DEBIAN_VARS = {**RHEL_VARS, "@@TLS_DIR@@": "/etc/ssl"}
 

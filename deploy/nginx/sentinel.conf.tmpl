@@ -46,8 +46,25 @@ upstream sentinel_app {
 server {
     # `listen ... http2`, not `http2 on;`: the standalone directive is nginx
     # 1.25.1+, and AlmaLinux 9 ships 1.20.1, which rejects it.
-    listen @@PUBLIC_PORT@@ ssl http2;
-    listen [::]:@@PUBLIC_PORT@@ ssl http2;
+    #
+    # These two lines either carry `default_server` or they do not, and which
+    # of the two it is decides who answers on this port:
+    #
+    #   server_name is a real name -- the installer was given --domain. This
+    #       block is selected by that name, and sentinel-default-deny.conf
+    #       holds default_server on the port, so every other Host gets 444.
+    #   server_name is `_` --------- no --domain was given. There is no name
+    #       to be selected by, so this block carries default_server itself
+    #       and no deny block is installed: any Host reaches the dashboard.
+    #
+    # The third combination must never be written: `server_name _` here
+    # WITHOUT default_server, while the deny block has it. `_` is not a
+    # wildcard — it is a name no real Host ever equals — so nothing would
+    # ever select this block, every request would fall through to the deny,
+    # and every request would get 444. That shipped, and it cost the operator
+    # the dashboard. See render_dedicated_vhosts in deploy/install.sh.
+    listen @@PUBLIC_PORT@@ ssl http2@@DEFAULT_SERVER@@;
+    listen [::]:@@PUBLIC_PORT@@ ssl http2@@DEFAULT_SERVER@@;
     server_name @@DOMAIN@@;
 
     # certbot rewrites these two lines when it issues a real certificate. Until
