@@ -20,6 +20,7 @@ Three things a chat message is not, and that shape everything below:
 from __future__ import annotations
 
 import html
+from dataclasses import dataclass
 from typing import Any
 
 from telegram import Update
@@ -33,7 +34,10 @@ from sentinel.db.repo import events as events_repo
 from sentinel.db.repo import findings as findings_repo
 from sentinel.intel.links import cve_html, cve_links
 from sentinel.logging_setup import get_logger
+from sentinel.scan.subject import (KIND_APP, KIND_CONTAINER, KIND_LABELS, KIND_OS,
+                                   KIND_UNKNOWN, categories, describe)
 from sentinel.util import tz
+from sentinel.util.ids import parse_id
 
 log = get_logger(__name__)
 
@@ -49,6 +53,16 @@ log = get_logger(__name__)
 # label is an `&` and escapes to five. Even then 3600 + 349 is under 4096, so
 # nothing clamped here can be pushed over the limit by it and `stamp` never has
 # to trim a message this function produced.
+#
+# Unitatea e **codul UTF-16**, nu caracterul Python, fiindcă aia numără
+# Telegram. Un emoji din planurile suplimentare (U+1F600 și mai sus) e un
+# singur `len()` și DOUĂ unități pe fir. Măsurat pe o listă construită din
+# etichete cu emoji: `len` 3350, unități UTF-16 4914 — peste 4096, deci
+# mesajul e refuzat întreg și operatorul primește eroarea generică a lui
+# `_guard` în locul răspunsului. Nicio coloană de pe gazdă nu are azi caractere
+# ne-ASCII (verificat pe `package`, `location`, `cve`), dar toate trei sunt
+# scrise de scanare peste ce găsește pe disc, iar un nume de director sub un
+# web root îl alege cine încarcă fișiere acolo.
 MAX_MESSAGE = 3600
 
 _SEV_EMOJI = {"info": "⚪", "low": "🔵", "medium": "🟡", "high": "🟠", "critical": "🔴"}
@@ -59,21 +73,35 @@ def esc(value: Any) -> str:
     return html.escape(str(value), quote=False) if value is not None else "—"
 
 
+def w16(text: str) -> int:
+    """Cât ocupă textul în unități UTF-16 — felul în care numără Telegram.
+
+    `len()` numără caractere Python. Pentru orice din planurile suplimentare
+    (emoji, alfabete rare) cele două diferă cu factor doi, iar diferența cade
+    exact pe partea greșită: bugetul pare respectat și mesajul e refuzat.
+    """
+    return len(text.encode("utf-16-le")) // 2
+
+
 def clamp(lines: list[str], *, tail: str = "") -> str:
     """Join lines, stopping before the message limit and saying it was cut.
 
     Truncating in the middle of a list without a word about it is how an
     operator concludes there were four attackers when there were forty.
+
+    Socoteala e în unități UTF-16 (vezi `MAX_MESSAGE`): numărate în caractere
+    Python, un mesaj plin de emoji trece de plafon fără ca nimic de aici să
+    observe, iar Telegram refuză tot mesajul, nu doar coada lui.
     """
     out: list[str] = []
-    used = len(tail)
+    used = w16(tail)
     for line in lines:
-        if used + len(line) + 1 > MAX_MESSAGE:
+        if used + w16(line) + 1 > MAX_MESSAGE:
             out.append(f"\n<i>…listă scurtată ({len(lines) - len(out)} rânduri "
                        f"în plus). Vezi panoul web pentru tot.</i>")
             break
         out.append(line)
-        used += len(line) + 1
+        used += w16(line) + 1
     if tail:
         out.append(tail)
     return "\n".join(out)
@@ -157,73 +185,367 @@ def _delta(deltas: dict, key: str) -> str:
 # ---------------------------------------------------------------------------
 # /vulns
 # ---------------------------------------------------------------------------
+#: Câte constatări se CER bazei pentru un mesaj. Ceea ce se cere e de ordinul a
+#: ceea ce se poate afișa: comanda cerea 200 de rânduri, tipărea 20 și scria
+#: „200 afișate" — pe gazda de producție, cu 1055 deschise, singura cifră
+#: adevărată din propoziția aia era că erau vulnerabilități.
+#:
+#: Nu e o promisiune că se arată 20. Câte intră îl decide `fit_blocks`, în
+#: funcție de cât de lungi sunt chiar rândurile cerute: pe datele reale ale
+#: gazdei încap **17** din cele 20 (referințe de imagine lungi și trei legături
+#: CVE pe rând), iar antetul spune 17. Plafonul e aici ca să nu se ceară bazei
+#: un ordin de mărime peste ce poate încăpea vreodată; un test cere ca pe
+#: rânduri scurte să intre toate 20, altfel numărul ăsta n-ar descrie nimic.
+VULN_LIMIT = 20
+
+#: Cât din eticheta „pe ce stă" intră pe un rând de listă. `describe` întoarce
+#: referința imaginii verbatim și numele aplicației dintr-o cale — amândouă
+#: scrise de scaner peste text pe care nu-l controlăm. Fără plafon, o singură
+#: constatare cu o cale lungă mănâncă locul altor cinci.
+MAX_SUBJECT_LIST = 44
+
+#: Același lucru în detaliul unei singure constatări, unde e loc de mai mult.
+MAX_SUBJECT_DETAIL = 120
+
+#: Cât ocupă numele unui pachet sau o versiune pe un rând de listă. `package`
+#: și `fixed_version` vin dintr-un manifest scanat sub un web root, deci
+#: lungimea lor o alege cine scrie manifestul. Nemărginite, o singură
+#: constatare poate depăși singură tot bugetul mesajului, iar lista de
+#: dedesubt rămâne goală cu antetul spunând cinstit „0 afișate".
+MAX_FIELD_LIST = 56
+
+#: Cât din identificatorul CVE intră pe un rând. Al patrulea câmp netrusted de
+#: pe rândul ăla, și singurul rămas nemărginit: `cve_html` cade pe
+#: `escape(str(cve))` pentru orice nu e un CVE bine format, fără plafon, iar o
+#: singură constatare cu un „CVE" de 4 kB în vârful priorității golea lista
+#: (antet „0 afișate", zero rânduri — cinstit, dar inutil). Măsurat pe ambele
+#: gazde: `max(length(cve))` e 14. 32 lasă loc și pentru GHSA și DLA.
+MAX_CVE_LIST = 32
+
+#: Cât din argumentul neînțeles se citează înapoi operatorului. Ca la pagină:
+#: un mesaj care repetă întreg ce i s-a dat e un mesaj a cărui lungime o alege
+#: altcineva.
+MAX_ECHO = 40
+
+
+@dataclass(frozen=True)
+class VulnFilter:
+    """Ce a cerut argumentul lui `/vulnerabilitati`, tradus o singură dată.
+
+    `severities`/`kev_only`/`kind` merg în SQL; `title` și `scope` sunt ce
+    citește operatorul. Toate patru ies din aceeași potrivire, deci antetul nu
+    poate numi altă mulțime decât cea interogată.
+
+    `warning` e nevid când argumentul n-a putut fi onorat. Un filtru
+    neînțeles se SPUNE: 1055 de rânduri sub un titlu pe care operatorul a cerut
+    să-l restrângă e aceeași minciună ca zero rânduri.
+    """
+
+    title: str
+    scope: str
+    severities: tuple[str, ...] | None = None
+    kev_only: bool = False
+    kind: str | None = None
+    warning: str | None = None
+
+    @property
+    def filtered(self) -> bool:
+        return self.severities is not None or self.kev_only or self.kind is not None
+
+
+# Argumentele pe categorie oglindesc `?asociat=` din pagină, dar în cuvintele
+# pe care le tastează operatorul. Nu e o a doua clasificare: aliasul duce la
+# `kind`-ul lui `scan.subject`, iar scanerele categoriei vin tot din
+# `subject.categories`, măsurate în bază. Cu și fără diacritice, fiindcă un
+# argument e text liber și „aplicație" e felul firesc de a-l scrie.
+#: Cuvintele de filtru pe care botul le ANUNȚĂ — în coada listei și în /ajutor.
+#: Una singură, fiindcă două liste care se pot despărți înseamnă un ajutor care
+#: oferă un cuvânt refuzat de comandă, sau un cuvânt care merge și despre care
+#: nu află nimeni. Un test cere ca fiecare cuvânt de aici să fie înțeles de
+#: `parse_vuln_filter`, ca fiecare categorie din `subject.KINDS` să fie
+#: accesibilă prin cel puțin unul dintre ele, și ca `HELP` să le listeze pe
+#: exact acestea.
+FILTER_WORDS: tuple[str, ...] = ("kev", "critice", "mari", "sistem", "container",
+                                 "aplicatie", "necunoscut")
+
+_KIND_ARGS: dict[str, str] = {
+    "sistem": KIND_OS, "os": KIND_OS, "sistem-de-operare": KIND_OS,
+    "container": KIND_CONTAINER, "containere": KIND_CONTAINER,
+    "aplicatie": KIND_APP, "aplicație": KIND_APP, "aplicatii": KIND_APP,
+    "aplicații": KIND_APP, "app": KIND_APP,
+    "necunoscut": KIND_UNKNOWN, "unknown": KIND_UNKNOWN,
+}
+
+
+def parse_vuln_filter(arg: str) -> VulnFilter:
+    """Argumentul, în ce se interoghează și în ce se scrie în antet.
+
+    Pură, ca să poată fi verificată fără bază de date: aici se decide și ce
+    mulțime se cere, și cum se numește ea pe ecran, iar dacă cele două ar fi
+    scrise în locuri diferite s-ar putea despărți.
+    """
+    a = arg.strip().lower()
+    if not a:
+        return VulnFilter("Vulnerabilități deschise", "deschise")
+    if a in ("kev", "exploatate"):
+        return VulnFilter("Vulnerabilități exploatate activ (KEV)",
+                          "deschise exploatate activ", kev_only=True)
+    if a in ("critice", "critical"):
+        return VulnFilter("Vulnerabilități critice", "critice deschise",
+                          severities=("critical",))
+    if a in ("mari", "high"):
+        return VulnFilter("Vulnerabilități critice și mari",
+                          "critice sau mari deschise",
+                          severities=("critical", "high"))
+    if a in _KIND_ARGS:
+        kind = _KIND_ARGS[a]
+        label = KIND_LABELS[kind]
+        return VulnFilter(f"Vulnerabilități · {label}",
+                          f"deschise în „{label}”", kind=kind)
+    return VulnFilter(
+        "Vulnerabilități deschise", "deschise",
+        warning=f"Filtru neînțeles: „{_echo(arg)}”. Se arată toate categoriile.")
+
+
+def _echo(value: str) -> str:
+    """Valoarea, scurtată, pentru un mesaj care o citează înapoi."""
+    return value if len(value) <= MAX_ECHO else value[:MAX_ECHO] + "…"
+
+
+def _trim(value: Any, width: int) -> str:
+    """Textul BRUT, mărginit la `width` caractere. Nu escapează nimic.
+
+    Separat de `_short` fiindcă are un al doilea apelant: `cve_html` escapează
+    el însuși ce primește, deci acolo trebuie dată valoarea netrecută prin
+    `esc` — altfel un `&` ajunge `&amp;amp;` pe ecran.
+    """
+    text = "" if value is None else str(value)
+    return text if len(text) <= width else text[:width - 1] + "…"
+
+
+def _short(value: Any, width: int) -> str:
+    """Textul, mărginit la `width` și abia apoi escapat.
+
+    Ordinea contează, și e singurul motiv pentru care funcția asta există:
+    tăiat DUPĂ escapare, `&lt;` rămâne `&l`, Telegram refuză mesajul întreg, și
+    un singur rând ostil oprește alerta, nu doar rândul lui. Tăiat înainte,
+    `width` numără și caracterele pe care operatorul chiar le vede — un
+    `&lt;a&gt;` ocupă 4 caractere din buget, nu 12.
+    """
+    return esc(_trim(value, width))
+
+
+def _subject_line(row: dict, *, width: int) -> str:
+    """Pe ce stă constatarea — sistem de operare, imagine, aplicație.
+
+    `scan.subject.describe`, aceeași funcție care umple coloana „Asociat cu"
+    din pagină. O a doua hartă scaner→categorie aici ar fi exact felul în care
+    botul și panoul ajung să spună lucruri diferite despre același rând, adică
+    ce se repară acum.
+    """
+    return _short(describe(row.get("scanner"), row.get("location")).label, width)
+
+
+def fit_blocks(blocks: list[list[str]], budget: int) -> list[list[str]]:
+    """Blocurile care încap întregi în `budget` unități UTF-16.
+
+    Unități, nu caractere: `w16`, aceeași măsură ca `clamp` și ca rezervarea
+    din apelant. Trei socoteli în două unități ar lăsa nemărginită exact felia
+    dintre ele.
+
+    Un bloc e o constatare, cu toate liniile ei. Se taie între constatări, nu
+    prin mijlocul uneia — o constatare fără rândul ei de pachet arată ca o
+    constatare fără pachet.
+
+    EXISTĂ ca antetul să poată număra ce s-a tipărit cu adevărat. Dacă
+    scurtarea ar rămâne în seama lui `clamp`, numărul din antet ar fi scris
+    înainte să se știe câte rânduri intră, iar mesajul ar spune din nou mai
+    mult decât arată — de data asta cu 20 în loc de 200.
+    """
+    kept: list[list[str]] = []
+    used = 0
+    for block in blocks:
+        cost = sum(w16(line) + 1 for line in block)
+        if used + cost > budget:
+            break
+        kept.append(block)
+        used += cost
+    return kept
+
+
 async def cmd_vulns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Open findings, most urgent first, with a filter argument.
 
     Ordered by the prioritisation score rather than by CVSS: a critical CVE in
     something not exposed matters less than a medium one being exploited in the
     wild right now, and the score is what already encodes that.
+
+    Trei cantități, măsurate pe gazda de producție la 21 septembrie 2026 și
+    până acum amestecate în una singură: câte se ARATĂ (20), câte sunt în
+    mulțimea cerută (477 pe sistemul de operare) și câte sunt deschise în total
+    (1055). Un mesaj care spune doar una dintre ele se citește ca și cum ar fi
+    toate trei.
+
+    Filtrele merg în SQL, înaintea lui `LIMIT`. Filtrate în Python pe rândurile
+    deja tăiate, `/vulnerabilitati critice` răspundea cu „criticele dintre
+    primele 200 după prioritate" — o mulțime care pe gazda reală nu conține
+    niciun pachet al sistemului, fiindcă primul rând `dnf` e al 373-lea.
     """
     db: Database = context.bot_data["db"]
-    arg = (context.args[0].lower() if context.args else "")
+    sel = parse_vuln_filter(context.args[0] if context.args else "")
 
-    counts = await findings_repo.open_counts(db)
-    rows = await findings_repo.list_open(db, limit=200)
+    # Categoriile se numără peste TOATE rândurile deschise, iar `total_open` e
+    # suma aceleiași măsurători — deci „din N în categorie" și „din M în total"
+    # nu pot proveni din două numărători care nu se adună.
+    cats = categories(await findings_repo.open_counts_by_scanner(db))
+    total_open = sum(c.count for c in cats)
 
-    if arg in ("kev", "exploatate"):
-        rows = [r for r in rows if r.get("kev")]
-        title = "Vulnerabilități exploatate activ (KEV)"
-    elif arg in ("critical", "critice", "high", "mari"):
-        wanted = {"critical", "high"} if arg in ("high", "mari") else {"critical"}
-        rows = [r for r in rows if r["severity"] in wanted]
-        title = f"Vulnerabilități {esc(arg)}"
-    else:
-        title = "Vulnerabilități deschise"
+    scanners: list[str] | None = None
+    warnings: list[str] = [sel.warning] if sel.warning else []
+    if len(context.args or ()) > 1:
+        # Un singur selector pe comandă. Al doilea cuvânt nu se poate onora,
+        # deci se SPUNE: de când coada listei anunță șapte filtre,
+        # `/vulnerabilitati critice sistem` e o tastare firească, iar tăcerea
+        # ar da un răspuns despre toate categoriile sub un cuvânt care cerea
+        # una singură.
+        warnings.append(
+            f"Se ia un singur filtru, „{_echo(context.args[0])}”. "
+            f"Restul argumentelor nu au fost folosite.")
+    if sel.kind is not None:
+        cat = next((c for c in cats if c.kind == sel.kind), None)
+        if cat is None:
+            # Un alias care duce la un `kind` pe care `subject.categories` nu-l
+            # mai produce. Nu se poate întâmpla azi (`KINDS` le acoperă pe
+            # toate), și tocmai de-aia se spune, în loc să se arate tot.
+            sel = parse_vuln_filter("")
+            warnings.append("Categoria cerută nu mai există. Se arată toate categoriile.")
+        else:
+            # Lista, chiar goală, înseamnă „numai scanerele categoriei" —
+            # niciodată „fără filtru". Vezi `_scanner_clause`.
+            scanners = list(cat.scanners)
+
+    severities = list(sel.severities) if sel.severities is not None else None
+    counts = await findings_repo.open_counts(
+        db, scanners=scanners, severities=severities, kev_only=sel.kev_only)
+    rows = await findings_repo.list_open(
+        db, limit=VULN_LIMIT, scanners=scanners, severities=severities,
+        kev_only=sel.kev_only)
+    # Trei dus-întorsuri, nu o tranzacție: o scanare care se termină între ele
+    # poate lăsa „20 afișate din 19" pentru o singură apăsare. Aceeași alegere
+    # ca pagina — o tranzacție în jurul unei citiri costă mai mult decât cazul
+    # cel mai rău, iar cifrele rămân măsurate, nu netezite.
+    selected_total = int(counts.get("total", 0))
+
+    warn_lines = ([f"⚠️ <i>{esc(w)}</i>" for w in warnings] + [""]) if warnings else []
 
     if not rows:
-        await _reply(update, f"✅ <b>{title}</b>: niciuna.\n"
-                             f"<i>Scanarea rulează nocturn; /vuln &lt;id&gt; pentru detaliu.</i>")
+        empty = [f"✅ <b>{sel.title}</b>: niciuna."]
+        if sel.filtered:
+            # „Nimic în categoria asta" lângă 1055 deschise e altceva decât
+            # „nimic deschis", și numai a doua e o veste bună.
+            empty.append(f"<i>{total_open} deschise în total — /vulnerabilitati "
+                         f"le arată pe cele mai prioritare.</i>")
+        else:
+            empty.append("<i>Scanarea rulează nocturn; /vuln &lt;id&gt; pentru detaliu.</i>")
+        await _reply(update, clamp(warn_lines + empty))
         return
 
     head = " · ".join(
-        f"{_SEV_EMOJI[s]}{counts[s]}" for s in ("critical", "high", "medium", "low")
+        f"{_SEV_EMOJI[s]}{counts[s]}"
+        for s in ("critical", "high", "medium", "low", "info")
         if counts.get(s)) or "—"
-    lines = [f"🛠️ <b>{title}</b> — {len(rows)} afișate",
-             f"{head}" + (f" · 🔥 {counts['kev']} KEV" if counts.get("kev") else ""), ""]
+    if counts.get("kev"):
+        head += f" · 🔥 {counts['kev']} KEV"
 
-    for r in rows[:20]:
+    blocks: list[list[str]] = []
+    for r in rows:
         kev = " 🔥" if r.get("kev") else ""
-        ref = cve_html(r.get("cve"), rpm=(r.get("scanner") == "dnf"), kev=bool(r.get("kev")))
-        lines.append(
-            f"{_SEV_EMOJI.get(r['severity'], '⚪')} <b>#{r['id']}</b> {ref}{kev}")
-        lines.append(f"   <code>{esc(r.get('package') or r.get('location') or '?')}</code>"
-                     f" → {esc(r.get('fixed_version') or 'fără fix cunoscut')}"
-                     f" · prio {r.get('priority', 0)}")
-    if len(rows) > 20:
-        lines.append(f"\n<i>…și încă {len(rows) - 20}.</i>")
+        # `_trim` pe valoarea brută: `cve_html` escapează el ce primește.
+        ref = cve_html(_trim(r.get("cve"), MAX_CVE_LIST),
+                       rpm=(r.get("scanner") == "dnf"), kev=bool(r.get("kev")))
+        blocks.append([
+            f"{_SEV_EMOJI.get(r['severity'], '⚪')} <b>#{r['id']}</b> {ref}{kev}",
+            f"   <code>{_short(r.get('package') or r.get('location') or '?', MAX_FIELD_LIST)}</code>"
+            f" → {_short(r.get('fixed_version') or 'fără fix cunoscut', MAX_FIELD_LIST)}"
+            f" · prio {r.get('priority', 0)}"
+            f" · {_subject_line(r, width=MAX_SUBJECT_LIST)}",
+        ])
 
-    await _reply(update, clamp(lines, tail="\n/vuln &lt;id&gt; · /planifica &lt;id&gt; pentru un plan"))
+    tail = ("\n/vuln &lt;id&gt; · /planifica &lt;id&gt; pentru un plan"
+            "\n<i>filtre: " + " · ".join(FILTER_WORDS) + "</i>")
+
+    # Bugetul se rezervă cu numerele CELE MAI MARI pe care le pot lua antetul
+    # și nota de coadă (toate rândurile cerute, toate cele nearătate), deci
+    # rescrierea lor cu numerele reale nu poate decât să scurteze mesajul.
+    # Invers — rezervat pe mic și rescris pe mare — ar trece peste limită, iar
+    # Telegram refuză mesajul întreg.
+    def _head_lines(shown: int) -> list[str]:
+        scope = f"{shown} afișate din {selected_total} {sel.scope}"
+        if sel.filtered:
+            scope += f" · {total_open} deschise în total"
+        return [*warn_lines, f"🛠️ <b>{sel.title}</b>", head, f"<i>{scope}</i>", ""]
+
+    def _rest_note(shown: int) -> list[str]:
+        missing = selected_total - shown
+        return ([f"\n<i>…și încă {missing} neafișate. Panoul web le are pe toate.</i>"]
+                if missing > 0 else [])
+
+    # `+ 1` la coadă: `clamp` o lipește cu un `\n` în plus față de lungimea ei.
+    # Totul în unități UTF-16, ca `clamp` și `fit_blocks` — trei socoteli în
+    # două unități ar lăsa exact felia dintre ele nemărginită.
+    reserved = sum(w16(line) + 1 for line in _head_lines(len(rows))) + w16(tail) + 1
+    reserved += sum(w16(line) + 1 for line in _rest_note(0))
+    kept = fit_blocks(blocks, MAX_MESSAGE - reserved)
+
+    shown = len(kept)
+    lines = [*_head_lines(shown),
+             *(line for block in kept for line in block),
+             *_rest_note(shown)]
+    await _reply(update, clamp(lines, tail=tail))
 
 
 async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Detaliul unei constatări, căutat după id în bază — nu într-o listă.
+
+    Comanda citea primele 1000 de rânduri deschise și căuta id-ul printre ele.
+    Pe gazda de producție, cu 1055 deschise, ultimele 55 nu se puteau deschide
+    deloc: răspunsul era „inexistentă sau deja rezolvată" pentru o
+    vulnerabilitate care exista și era deschisă. `get_finding` ia rândul după
+    cheia primară, deci nu există „prea departe în listă".
+
+    Și separă cele două stări pe care mesajul ăla le amesteca: o constatare
+    rezolvată e un fapt diferit de un id inexistent, iar operatorul care tocmai
+    a citit un id dintr-o alertă are nevoie să știe care dintre ele e.
+    """
     db: Database = context.bot_data["db"]
-    if not context.args or not context.args[0].isdigit():
+    # `parse_id`, nu `.isdigit()`: id-ul ăsta ajunge acum în bază, unde coloana
+    # e `bigint`. `9223372036854775808` are 19 cifre ASCII, trece de `isdigit()`
+    # și de `int()`, iar asyncpg îl refuză pe fir cu `DataError` — adică o
+    # excepție în handler și „A apărut o eroare la procesarea comenzii" în loc
+    # de un răspuns. Vezi `sentinel/util/ids.py`.
+    fid = parse_id(context.args[0]) if context.args else None
+    if fid is None:
         await _reply(update, "Folosire: <code>/vuln &lt;id&gt;</code> — id-ul din /vulnerabilitati")
         return
 
-    fid = int(context.args[0])
-    rows = await findings_repo.list_open(db, limit=1000)
-    row = next((r for r in rows if r["id"] == fid), None)
+    row = await findings_repo.get_finding(db, fid)
     if row is None:
-        await _reply(update, "Vulnerabilitate inexistentă sau deja rezolvată.")
+        await _reply(update, f"Vulnerabilitatea #{fid} nu există. Lista: /vulnerabilitati")
         return
 
+    deschisa = row.get("status") == "open"
     rpm = row.get("scanner") == "dnf"
     lines = [
         f"{_SEV_EMOJI.get(row['severity'], '⚪')} <b>Vulnerabilitate #{row['id']}</b>"
         + (" · 🔥 <b>exploatată activ</b>" if row.get("kev") else ""),
         f"<b>{esc(row.get('title'))}</b>",
+    ]
+    if not deschisa:
+        lines.append(f"⚪ <i>Nu mai e deschisă (stare: {esc(row.get('status'))}) — "
+                     f"ce urmează e ultima constatare, nu starea de acum.</i>")
+    lines += [
         "",
+        f"Asociat cu: {_subject_line(row, width=MAX_SUBJECT_DETAIL)}",
         f"Pachet: <code>{esc(row.get('package') or '—')}</code>",
         f"Instalat: <code>{esc(row.get('installed_version') or '—')}</code>",
         f"Repară: <code>{esc(row.get('fixed_version') or 'necunoscut')}</code>",
@@ -238,7 +560,10 @@ async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines += ["", "<b>Detalii:</b> " + " · ".join(
             f'<a href="{url}">{esc(name)}</a>' for name, url in links)]
 
-    if row.get("fixed_version"):
+    if not deschisa:
+        lines.append("\n<i>Nu mai e deschisă — un plan pentru ea ar repara ceva "
+                     "ce scanarea nu mai vede.</i>")
+    elif row.get("fixed_version"):
         # `/planifica`, nu `/patch`: `/patch <id>` deschide PLANUL cu id-ul ăla,
         # iar aici id-ul e al unui finding. Linia asta trimitea operatorul să
         # tasteze un id de vulnerabilitate într-o comandă care citește id-uri de
@@ -352,7 +677,7 @@ HELP = """🛡️ <b>Sentinel — comenzi</b>
 /rezolva &lt;id&gt; · /fp &lt;id&gt; — închide, sau marchează fals-pozitiv
 
 <b>Vulnerabilități</b>
-/vulnerabilitati [kev|critice|mari] — findings deschise, prioritizate
+/vulnerabilitati [kev|critice|mari|sistem|container|aplicatie|necunoscut] — findings deschise, prioritizate
 /vuln &lt;id&gt; — detaliu, cu legături către NVD și Red Hat
 
 <b>Patch-uri</b>

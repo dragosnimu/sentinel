@@ -76,6 +76,7 @@ from sentinel.logging_setup import get_logger
 from sentinel.respond import actions
 from sentinel.telegram import callback_sign, views
 from sentinel.util import tz
+from sentinel.util.ids import parse_id
 from sentinel.telegram.identity import current_tag, stamp
 
 log = get_logger(__name__)
@@ -630,8 +631,22 @@ async def cmd_patches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     db: Database = context.bot_data["db"]
     cfg: Config = context.bot_data["cfg"]
 
-    if context.args and context.args[0].isdigit():
-        row = await patch_repo.get_plan(db, int(context.args[0]))
+    # `parse_id`: valoarea ajunge într-o căutare după cheia primară a lui
+    # `patch_plans` (`bigserial`), deci are aceeași margine de sus ca celelalte.
+    #
+    # Iar un argument care NU e id se spune. `/patch 0` și `/patch ٢` răspundeau
+    # „Plan inexistent."; trecute prin `parse_id` fără linia de mai jos, ar fi
+    # căzut pe lista de planuri în așteptare — adică un răspuns plauzibil la o
+    # comandă pe care nimeni n-a dat-o, din care operatorul n-ar fi aflat că
+    # id-ul tastat n-a fost înțeles. `/patches`, fără argument, rămâne lista.
+    plan_id = parse_id(context.args[0]) if context.args else None
+    if context.args and plan_id is None:
+        await update.message.reply_text(
+            "Nu am înțeles id-ul planului. <code>/patches</code> pentru lista "
+            "completă.", parse_mode=ParseMode.HTML)
+        return
+    if plan_id is not None:
+        row = await patch_repo.get_plan(db, plan_id)
         if row is None:
             await update.message.reply_text("Plan inexistent.")
             return
@@ -731,14 +746,15 @@ async def cmd_planifica(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "operator sau owner. Contul tău are acces doar de vizualizare.")
         return
 
-    # `.isdecimal()`, nu `.isdigit()`: `'²'.isdigit()` e `True` — categoria
-    # Unicode „digit" include exponenți și cifre-index care NU sunt zecimale
-    # — dar `int('²')` ridică `ValueError`, ceea ce ar fi omorât handlerul
-    # (vezi nota din memorie despre `[0-9]` sub UTF-8, același gen de
-    # defect). `.isdecimal()` acceptă doar cifrele pe care `int()` chiar le
-    # parsează, inclusiv cifre zecimale non-ASCII (arabo-indice etc.), la
-    # fel ca înainte.
-    if not context.args or not context.args[0].isdecimal():
+    # `parse_id`, nu `.isdigit()` și nici `.isdecimal()`: `'²'.isdigit()` e
+    # `True` iar `int('²')` ridică `ValueError`, dar asta era doar jumătatea
+    # văzută atunci. Cealaltă jumătate e marginea de sus: id-ul pleacă spre o
+    # coloană `bigint`, iar `9223372036854775808` trece și de `.isdecimal()`,
+    # și de `int()`, ca să fie refuzat abia de asyncpg, cu excepție în handler.
+    # O singură definiție pentru toate locurile care citesc un id:
+    # `sentinel/util/ids.py`.
+    finding_id = parse_id(context.args[0]) if context.args else None
+    if finding_id is None:
         await update.message.reply_text(
             "Folosire: <code>/planifica &lt;id&gt;</code> — id-ul unei "
             "VULNERABILITĂȚI din /vulnerabilitati.\n"
@@ -746,7 +762,6 @@ async def cmd_planifica(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             parse_mode=ParseMode.HTML)
         return
 
-    finding_id = int(context.args[0])
     finding = await findings_repo.get_finding(db, finding_id)
     if finding is None:
         await update.message.reply_text(
@@ -1199,7 +1214,8 @@ async def _close_incident(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if not _can_act(cfg, update.effective_chat.id):
         await update.message.reply_text("Doar owner/operator pot închide incidente.")
         return
-    if not context.args or not context.args[0].isdigit():
+    incident_id = parse_id(context.args[0]) if context.args else None
+    if incident_id is None:
         await update.message.reply_text(
             "Folosire: <code>/resolve &lt;id&gt; [notă]</code>\n"
             "sau <code>/fp &lt;id&gt;</code> pentru fals-pozitiv.",
@@ -1207,7 +1223,6 @@ async def _close_incident(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
 
     db: Database = context.bot_data["db"]
-    incident_id = int(context.args[0])
     note = " ".join(context.args[1:])[:300] or None
 
     inc = await inc_repo.get_incident(db, incident_id)
@@ -1300,10 +1315,11 @@ async def cmd_ack_exposure(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def cmd_incident(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     db: Database = context.bot_data["db"]
-    if not context.args or not context.args[0].isdigit():
+    incident_id = parse_id(context.args[0]) if context.args else None
+    if incident_id is None:
         await update.message.reply_text("Folosire: <code>/incident &lt;id&gt;</code>", parse_mode=ParseMode.HTML)
         return
-    inc = await inc_repo.get_incident(db, int(context.args[0]))
+    inc = await inc_repo.get_incident(db, incident_id)
     if inc is None:
         await update.message.reply_text("Incident inexistent.")
         return

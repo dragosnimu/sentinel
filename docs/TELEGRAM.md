@@ -140,8 +140,8 @@ există, câteva alias-uri românești sau englezești care fac același lucru.
 | `/status` | — | O linie: incidente deschise și servicii |
 | `/incidente` | `/incidents` | Ultimele incidente deschise |
 | `/incident <id>` | — | Dosarul unui incident: cronologie, actor, evidențe |
-| `/vulnerabilitati` | `/vulns` | Vulnerabilități deschise, prioritizate |
-| `/vuln <id>` | — | Detaliul unei vulnerabilități |
+| `/vulnerabilitati [filtru]` | `/vulns` | Vulnerabilități deschise, prioritizate. Filtru: `kev`, `critice`, `mari`, sau categoria pe care stau — `sistem`, `container`, `aplicatie`, `necunoscut` (aceleași ca pastilele din panou). Filtrul se aplică în interogare, iar antetul spune câte se arată, câte sunt în categoria cerută și câte sunt deschise în total. Un filtru neînțeles e spus, nu ignorat |
+| `/vuln <id>` | — | Detaliul unei vulnerabilități, căutat după id (nu printre primele N) — inclusiv una deja rezolvată, care se spune ca atare |
 | `/evenimente [ip]` | `/events` | Evenimente brute, opțional filtrate pe un IP |
 | `/servicii` | `/services` | Fiecare serviciu: activ, degradat sau picat |
 | `/health` | `/sanatate` | Capacitatea gazdei: CPU, RAM, disc, conexiuni |

@@ -38,6 +38,7 @@ from sentinel.db.repo import findings as fx
 from sentinel.db.repo import users as users_repo
 from sentinel.logging_setup import get_logger
 from sentinel.scan.subject import KIND_UNKNOWN, Category, categories, describe
+from sentinel.util.ids import parse_id
 from sentinel.web.deps import current_user, get_db
 
 log = get_logger(__name__)
@@ -99,22 +100,23 @@ def resolve_page(raw: str | None, pages: int) -> tuple[int, str | None]:
     onorată întocmai. O pagină cerută dincolo de sfârșit ar întoarce altfel un
     tabel gol care arată exact ca „nu mai e nimic deschis".
 
-    Doar cifre ASCII: `int()` acceptă și cifrele arabo-indice sau pe cele
-    fullwidth, iar un „２" într-un URL nu e ce a vrut cineva să scrie — e mai
-    cinstit să spunem că nu l-am înțeles decât să ghicim că înseamnă 2.
+    Ce înseamnă „un număr" e decis de `sentinel.util.ids.parse_id`, o singură
+    dată pentru tot depozitul: doar cifre ASCII (`int()` acceptă și cifrele
+    arabo-indice sau pe cele fullwidth, iar un „２" într-un URL nu e ce a vrut
+    cineva să scrie), și lungimea verificată înaintea conversiei (un șir de
+    4301 de cifre trece de `isdigit()` și pică în `int()`, deci verificarea
+    pusă să curețe parametrul l-ar fi transformat ea însăși într-o pagină de
+    eroare).
 
-    Și doar `MAX_PAGE_DIGITS` cifre: mulțimea de caractere singură nu ajunge.
-    Un șir de 4301 de cifre trece de `isdigit()` și pică în `int()`, deci
-    verificarea care curăță parametrul l-ar fi transformat ea însăși dintr-o
-    valoare absurdă într-o pagină de eroare.
+    Marginea de aici e `MAX_PAGE_DIGITS`, nu `bigint`: un număr de pagină nu
+    ajunge în nicio coloană, deci lumea lui e cât poate avea tabela asta, nu
+    cât duce Postgres.
     """
     if raw is None:
         return 1, None
-    text = raw.strip()
-    if (not text.isascii() or not text.isdigit()
-            or len(text) > MAX_PAGE_DIGITS or int(text) < 1):
+    wanted = parse_id(raw, maximum=10**MAX_PAGE_DIGITS - 1)
+    if wanted is None:
         return 1, f"Număr de pagină neînțeles: „{_echo(raw)}”. Se arată prima pagină."
-    wanted = int(text)
     if wanted > pages:
         return pages, f"Pagina {wanted} nu există; ultima e {pages}."
     return wanted, None

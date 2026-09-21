@@ -211,24 +211,89 @@ def _scanner_clause(scanners: list[str] | None, column: str,
     return f" AND coalesce({column}, '') = ANY(${len(args)}::text[])"
 
 
+def _severity_clause(severities: list[str] | None, column: str,
+                     args: list[Any]) -> str:
+    """`AND <column> = ANY($n)` când se cere un filtru, nimic când nu se cere.
+
+    Aceeași convenție ca `_scanner_clause`, din același motiv: `None` e „fără
+    filtru", `[]` e „nicio severitate cerută, deci niciun rând". Un apelant
+    care traduce cuvântul tastat de operator într-o listă are voie să producă
+    lista goală, iar asta trebuie să însemne zero rânduri, nu toate.
+
+    Fără `coalesce`: `severity` e `NOT NULL` cu `CHECK (severity IN
+    ('info','low','medium','high','critical'))` de la migrația 0003, deci
+    mulțimea valorilor e închisă și niciun rând nu poate scăpa filtrului
+    printr-un NULL. `scanner` n-are constrângerea asta, de-aia acolo e nevoie
+    de coalesce și aici nu.
+
+    EXISTĂ ca filtrul să se aplice ÎNAINTE de `LIMIT`. Filtrarea în Python, pe
+    rândurile deja tăiate, răspundea la „arată-mi criticele" cu „criticele
+    care se întâmplă să fie în primele N după prioritate" — pe gazda de
+    producție, unde primele 200 de rânduri nu conțin niciun `dnf`, cele două
+    răspunsuri n-au nimic în comun.
+    """
+    if severities is None:
+        return ""
+    args.append(list(severities))
+    return f" AND {column} = ANY(${len(args)}::text[])"
+
+
+def _subset_clause(args: list[Any], *, prefix: str = "",
+                   scanners: list[str] | None = None,
+                   severities: list[str] | None = None,
+                   kev_only: bool = False) -> str:
+    """Filtrele opționale ale unei mulțimi de constatări deschise, într-o ordine.
+
+    Un singur loc, fiindcă ordinea clauzelor din SQL trebuie să fie exact
+    ordinea în care parametrii intră în `args`: `$1` e al primei clauze
+    adăugate. Două apeluri împrăștiate într-o expresie cu `+` ar depinde de
+    ordinea de evaluare a unei linii, iar o inversare ar da numerelor de
+    parametru altă semnificație fără nicio eroare de sintaxă — filtrul pe
+    severitate ar căuta printre numele de scanere.
+
+    `kev_only` e boolean, nu tri-stare: „numai cele exploatate activ" e o
+    întrebare pe care o pune cineva, „numai cele care NU sunt în KEV" nu e, iar
+    un al treilea caz nefolosit ar fi cod pe care nu-l verifică nimic.
+
+    Cu toate implicite întoarce `""` — aceeași interogare, caracter cu
+    caracter, ca înainte de a exista filtrele astea.
+    """
+    clause = _scanner_clause(scanners, f"{prefix}scanner", args)
+    clause += _severity_clause(severities, f"{prefix}severity", args)
+    if kev_only:
+        clause += f" AND {prefix}kev"
+    return clause
+
+
 async def open_counts(db: Database, *,
-                      scanners: list[str] | None = None) -> dict[str, int]:
+                      scanners: list[str] | None = None,
+                      severities: list[str] | None = None,
+                      kev_only: bool = False) -> dict[str, int]:
     """Constatările deschise pe severitate, plus `total` și `kev`.
 
     `scanners` restrânge numărătoarea la un subset — folosit de pagină când e
     aplicat un filtru pe categorie, ca pastilele de severitate și numitorul din
     „rândurile 1–200 din N" să descrie ACEEAȘI mulțime ca tabelul. Numărate
     global lângă un tabel filtrat, ar fi din nou cifre care nu se adună.
+
+    `severities` și `kev_only` sunt aceeași nevoie pentru filtrele botului:
+    numerele din antet trebuie să descrie mulțimea din care s-a tăiat lista de
+    dedesubt. Numărate global lângă o listă filtrată pe severitate, dădeau
+    „🔥 2 KEV" deasupra unei liste în care nu era niciunul.
     """
     args: list[Any] = []
-    clause = _scanner_clause(scanners, "scanner", args)
+    clause = _subset_clause(args, scanners=scanners, severities=severities,
+                            kev_only=kev_only)
     rows = await db.fetch(
         "SELECT severity, count(*) AS n FROM findings WHERE status = 'open'"
         f"{clause} GROUP BY severity", *args)
     counts = {r["severity"]: int(r["n"]) for r in rows}
     counts["total"] = sum(counts.values())
+    # `kev_only` nu se mai adaugă aici: interogarea are deja `AND kev`, iar o a
+    # doua copie ar fi doar o clauză redundantă care schimbă textul SQL pe care
+    # se sprijină ciotul din teste.
     kev_args: list[Any] = []
-    kev_clause = _scanner_clause(scanners, "scanner", kev_args)
+    kev_clause = _subset_clause(kev_args, scanners=scanners, severities=severities)
     counts["kev"] = int(await db.fetchval(
         f"SELECT count(*) FROM findings WHERE status = 'open' AND kev{kev_clause}",
         *kev_args) or 0)
@@ -265,12 +330,19 @@ async def get_finding(db: Database, finding_id: int) -> dict[str, Any] | None:
     „inexistent". Pentru operatorul care tocmai a cerut un plan pentru el, „nu
     există" și „s-a reparat deja" sunt două fapte diferite, iar cel care cere
     planul are nevoie de al doilea, nu de primul.
+
+    `epss` și `location` sunt în listă fiindcă detaliul din Telegram le arată:
+    `epss` era deja pe ecran când rândul venea din `list_open`, iar `location`
+    e ce decide, prin `scan.subject.describe`, dacă lucrul ăsta stă pe sistemul
+    de operare, într-o imagine sau într-o aplicație. O coloană lipsă aici nu
+    dă eroare — dă un câmp care dispare tăcut din mesaj.
     """
     row = await db.fetchrow(
         """
-        SELECT f.id, f.cve, f.title, f.severity, f.cvss, f.kev, f.priority,
-               f.package, f.installed_version, f.fixed_version, f.ecosystem,
-               f.scanner, f.status, a.name AS asset_name
+        SELECT f.id, f.cve, f.title, f.severity, f.cvss, f.epss, f.kev,
+               f.priority, f.package, f.installed_version, f.fixed_version,
+               f.location, f.ecosystem, f.scanner, f.status,
+               a.name AS asset_name
         FROM findings f LEFT JOIN assets a ON a.id = f.asset_id
         WHERE f.id = $1
         """,
@@ -279,7 +351,9 @@ async def get_finding(db: Database, finding_id: int) -> dict[str, Any] | None:
 
 
 async def list_open(db: Database, *, limit: int = 100, offset: int = 0,
-                    scanners: list[str] | None = None) -> list[dict[str, Any]]:
+                    scanners: list[str] | None = None,
+                    severities: list[str] | None = None,
+                    kev_only: bool = False) -> list[dict[str, Any]]:
     """O felie din constatările deschise, în ordinea priorității.
 
     `scanners` e filtrul pe categorie al paginii (vezi `_scanner_clause`:
@@ -288,6 +362,11 @@ async def list_open(db: Database, *, limit: int = 100, offset: int = 0,
     de sistem n-aveau niciun drum către ecran: toate stau sub pragul de
     prioritate al primelor 200 de rânduri.
 
+    `severities` și `kev_only` sunt aici, în SQL, și nu la apelant, tocmai
+    fiindcă `LIMIT` se aplică după `WHERE` și înaintea oricărei filtrări în
+    Python. Botul tăia 200 de rânduri și abia apoi păstra criticele din ele;
+    întrebarea la care răspundea nu era „care sunt criticele deschise".
+
     `f.id DESC` la coada ordonării nu e decor: `priority`, `severity` și
     `last_seen` se repetă pe sute de rânduri, iar o ordine parțială înseamnă că
     două pagini consecutive pot arăta același rând de două ori și-l pot sări pe
@@ -295,7 +374,8 @@ async def list_open(db: Database, *, limit: int = 100, offset: int = 0,
     le arate.
     """
     args: list[Any] = []
-    clause = _scanner_clause(scanners, "f.scanner", args)
+    clause = _subset_clause(args, prefix="f.", scanners=scanners,
+                            severities=severities, kev_only=kev_only)
     args.append(limit)
     limit_param = len(args)
     args.append(offset)
