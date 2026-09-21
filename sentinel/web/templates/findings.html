@@ -6,27 +6,59 @@
 {% block content %}
 <h1>Vulnerabilități</h1>
 
+{% for a in avertismente %}
+<div class="notice notice-warn">
+  <strong>Cererea n-a putut fi onorată întocmai.</strong>
+  <p>{{ a }}</p>
+</div>
+{% endfor %}
+
+{# Numărătoarea pe categorii se face peste TOATE constatările deschise, nu
+   peste rândurile de pe ecran: pe gazda de producție niciunul dintre primele
+   200 de rânduri nu e al sistemului de operare, deși acolo sunt 477 deschise.
+   O pastilă pe zero e un fapt măsurat; o categorie lipsă e o pagină care tace.
+   Fiecare pastilă e și singurul drum către rândurile pe care le numără. #}
+<div class="statline">
+  {% for c in categorii %}
+  <a href="{{ c.url }}" class="pill{{ '' if c.active else ' pill-off' }}"
+     {% if c.active %}aria-current="page"{% endif %}>{{ c.count }} {{ c.label }}</a>
+  {% endfor %}
+  {% if selectat %}<a href="{{ url_toate }}" class="pill pill-off">toate ×</a>{% endif %}
+</div>
+
 <div class="statline">
   {% if counts.critical %}<span class="pill pill-bad">{{ counts.critical }} critice</span>{% endif %}
   {% if counts.high %}<span class="pill pill-bad">{{ counts.high }} mari</span>{% endif %}
   {% if counts.medium %}<span class="pill pill-warn">{{ counts.medium }} medii</span>{% endif %}
   {% if counts.low %}<span class="pill pill-off">{{ counts.low }} mici</span>{% endif %}
   {% if counts.kev %}<span class="pill pill-bad" title="CISA Known Exploited — exploatat activ">🔥 {{ counts.kev }} KEV</span>{% endif %}
-  <span class="muted small">{{ counts.total }} deschise · scanare nocturnă</span>
+  {# Ce felie se vede din ce există. Pastilele de severitate și numărul de aici
+     descriu AMÂNDOUĂ mulțimea curentă (filtrată sau nu); categoriile de mai sus
+     rămân globale. Un tabel tăiat la 200 fără numitor transformă orice
+     numărătoare făcută pe pagină într-un rezultat greșit. #}
+  <span class="muted small">{% if counts.total > shown %}rândurile {{ primul }}–{{ ultimul }} din {{ counts.total }}{% else %}{{ counts.total }}{% endif %} deschise{% if selectat %} în „{{ selectat }}”{% endif %} · scanare nocturnă</span>
 </div>
 
 {% if not rows %}
 <div class="notice notice-info">
+  {% if selectat %}
+  <strong>Nicio vulnerabilitate deschisă în „{{ selectat }}”.</strong>
+  <p>Pastilele de mai sus spun câte sunt în fiecare categorie;
+     <a href="{{ url_toate }}">toate</a> le aduce pe toate înapoi.</p>
+  {% else %}
   <strong>Nicio vulnerabilitate deschisă.</strong>
   <p>Scanerul de pachete OS (<code>dnf updateinfo</code>) rulează în fereastra de
      mentenanță (03:00–05:00). Rezultatele apar aici, prioritizate.</p>
+  {% endif %}
 </div>
 {% endif %}
 
 <div class="table-scroll">
   <table>
     <thead>
-      <tr><th class="num">Prio</th><th>Sev.</th><th>CVE</th><th>Titlu</th><th>Pachet</th><th>Fix</th><th>Scaner</th></tr>
+      {# „Asociat cu", nu „Scaner": numele scanerului spune CUM a fost găsită
+         constatarea, nu PE CE stă. Scanerul rămâne în `title`. #}
+      <tr><th class="num">Prio</th><th>Sev.</th><th>CVE</th><th>Titlu</th><th>Pachet</th><th>Fix</th><th>Asociat cu</th></tr>
     </thead>
     <tbody>
     {% for r in rows %}
@@ -41,10 +73,21 @@
         <td>{{ r.title }}</td>
         <td class="mono">{{ r.package or '—' }}</td>
         <td class="mono nowrap">{{ r.fixed_version or '—' }}</td>
-        <td class="muted small">{{ r.scanner }}</td>
+        <td class="small" title="{{ r.subject.detail }}">{{ r.subject.label }}</td>
       </tr>
     {% endfor %}
     </tbody>
   </table>
 </div>
+
+{# Paginile sunt drumul către rândurile de sub prag. Fără ele, o categorie cu
+   mai mult de PAGE_LIMIT constatări (sistemul de operare, 477 pe producție)
+   e numărată pe pagină fără să poată fi citită întreagă. #}
+{% if pagini > 1 %}
+<div class="statline">
+  {% if prev_url %}<a href="{{ prev_url }}" class="pill pill-off">← înapoi</a>{% endif %}
+  <span class="muted small">pagina {{ pagina }} din {{ pagini }}</span>
+  {% if next_url %}<a href="{{ next_url }}" class="pill pill-off">înainte →</a>{% endif %}
+</div>
+{% endif %}
 {% endblock %}

@@ -213,15 +213,27 @@ def test_sidebar_marks_the_active_page():
 
 
 def test_findings_page_renders():
+    # The context here mirrors what `findings_page` builds. It is deliberately
+    # NOT the authority on that shape — `tests/unit/test_findings_page.py`
+    # drives the real handler through the real app, and a divergence between
+    # the two is caught there, not here. This test stays on the markup.
+    from sentinel.scan.subject import categories, describe
+
     html = _env().get_template("findings.html").render(
-        user=_context()["user"], active="findings",
+        user=_context()["user"], active="findings", shown=1,
+        primul=1, ultimul=1, pagina=1, pagini=1,
+        prev_url=None, next_url=None, url_toate="/findings",
+        selectat=None, avertismente=[],
+        categorii=[{"kind": c.kind, "label": c.label, "count": c.count,
+                    "url": f"/findings?asociat={c.kind}", "active": False}
+                   for c in categories({"dnf": 2})],
         counts={"total": 2, "critical": 1, "high": 1, "kev": 1},
         rows=[{"id": 1, "cve": "CVE-2026-9538", "advisory_id": None, "title": "x",
                "severity": "critical", "cvss": 9.8, "epss": 0.7, "kev": True,
                "priority": 100, "package": "kernel", "installed_version": "1",
                "fixed_version": "2", "scanner": "dnf", "location": None,
                "status": "open", "last_seen": NOW, "asset_name": None,
-               "sev_dot": "bad"}])
+               "sev_dot": "bad", "subject": describe("dnf", None)}])
     assert "CVE-2026-9538" in html and "kernel" in html
     # A dnf finding: Red Hat first (backport status is the real question here),
     # NVD alongside, and the KEV catalogue because this row is flagged kev.

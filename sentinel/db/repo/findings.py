@@ -188,14 +188,73 @@ async def count_open_outside_severities(db: Database, scanner: str,
         scanner, asset_id, list(visible_severities), bool(visible_unscored)) or 0)
 
 
-async def open_counts(db: Database) -> dict[str, int]:
+def _scanner_clause(scanners: list[str] | None, column: str,
+                    args: list[Any]) -> str:
+    """`AND <column> = ANY($n)` când se cere un filtru, nimic când nu se cere.
+
+    `None` și `[]` NU înseamnă același lucru, și confuzia dintre ele e singurul
+    fel în care filtrul ăsta poate minți: `None` e „fără filtru, arată tot", iar
+    `[]` e „categoria asta n-are niciun scaner, deci n-are niciun rând". Un
+    `if scanners:` ar fi tratat lista goală ca pe absența filtrului și ar fi
+    arătat TOATE constatările sub eticheta unei categorii goale.
+
+    `coalesce(..., '')` pe aceeași formă ca numărătoarea din
+    `open_counts_by_scanner`: `scanner` e NOT NULL azi pe ambele gazde, dar
+    dacă asta s-ar schimba vreodată, `scanner = ANY(ARRAY[''])` NU potrivește
+    un NULL, în timp ce numărătoarea l-ar aduna la „necunoscut" — pastila ar
+    spune N, iar pagina filtrată ar arăta zero. Cele două laturi se scriu la
+    fel ca să nu se poată contrazice.
+    """
+    if scanners is None:
+        return ""
+    args.append(list(scanners))
+    return f" AND coalesce({column}, '') = ANY(${len(args)}::text[])"
+
+
+async def open_counts(db: Database, *,
+                      scanners: list[str] | None = None) -> dict[str, int]:
+    """Constatările deschise pe severitate, plus `total` și `kev`.
+
+    `scanners` restrânge numărătoarea la un subset — folosit de pagină când e
+    aplicat un filtru pe categorie, ca pastilele de severitate și numitorul din
+    „rândurile 1–200 din N" să descrie ACEEAȘI mulțime ca tabelul. Numărate
+    global lângă un tabel filtrat, ar fi din nou cifre care nu se adună.
+    """
+    args: list[Any] = []
+    clause = _scanner_clause(scanners, "scanner", args)
     rows = await db.fetch(
-        "SELECT severity, count(*) AS n FROM findings WHERE status = 'open' GROUP BY severity")
+        "SELECT severity, count(*) AS n FROM findings WHERE status = 'open'"
+        f"{clause} GROUP BY severity", *args)
     counts = {r["severity"]: int(r["n"]) for r in rows}
     counts["total"] = sum(counts.values())
+    kev_args: list[Any] = []
+    kev_clause = _scanner_clause(scanners, "scanner", kev_args)
     counts["kev"] = int(await db.fetchval(
-        "SELECT count(*) FROM findings WHERE status = 'open' AND kev") or 0)
+        f"SELECT count(*) FROM findings WHERE status = 'open' AND kev{kev_clause}",
+        *kev_args) or 0)
     return counts
+
+
+async def open_counts_by_scanner(db: Database) -> dict[str, int]:
+    """Câte constatări deschise are fiecare scaner, peste TOATE rândurile.
+
+    Una singură, și peste toată tabela: pagina taie la 200 de rânduri, iar pe
+    gazda de producție niciunul dintre primele 200 nu e `dnf` — primul e al
+    373-lea. O numărătoare pe categorii făcută din rândurile afișate ar spune
+    „zero pe sistemul de operare" despre o gazdă cu 477 de constatări deschise
+    pe pachetele ei.
+
+    `scanner` e NOT NULL în schemă — verificat în `information_schema.columns`
+    pe ambele gazde la 21 septembrie 2026, cu zero NULL-uri și zero șiruri
+    goale. `coalesce` nu e deci o apărare împotriva datelor de azi, ci
+    perechea exactă a filtrului din `_scanner_clause`: dacă o migrație ar slăbi
+    coloana, cheia numărată aici și valoarea căutată acolo ar rămâne aceeași,
+    în loc ca pastila să spună N și pagina filtrată să arate zero.
+    """
+    rows = await db.fetch(
+        "SELECT coalesce(scanner, '') AS scanner, count(*) AS n "
+        "FROM findings WHERE status = 'open' GROUP BY 1")
+    return {str(r["scanner"]): int(r["n"]) for r in rows}
 
 
 async def get_finding(db: Database, finding_id: int) -> dict[str, Any] | None:
@@ -219,16 +278,37 @@ async def get_finding(db: Database, finding_id: int) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
-async def list_open(db: Database, *, limit: int = 100) -> list[dict[str, Any]]:
+async def list_open(db: Database, *, limit: int = 100, offset: int = 0,
+                    scanners: list[str] | None = None) -> list[dict[str, Any]]:
+    """O felie din constatările deschise, în ordinea priorității.
+
+    `scanners` e filtrul pe categorie al paginii (vezi `_scanner_clause`:
+    `None` arată tot, `[]` nu arată nimic), iar `offset` e ce face ca rândul
+    201 să fie accesibil. Fără el, pe gazda de producție cele 477 de constatări
+    de sistem n-aveau niciun drum către ecran: toate stau sub pragul de
+    prioritate al primelor 200 de rânduri.
+
+    `f.id DESC` la coada ordonării nu e decor: `priority`, `severity` și
+    `last_seen` se repetă pe sute de rânduri, iar o ordine parțială înseamnă că
+    două pagini consecutive pot arăta același rând de două ori și-l pot sări pe
+    al treilea — paginarea ar pierde exact rândurile pe care a fost adăugată să
+    le arate.
+    """
+    args: list[Any] = []
+    clause = _scanner_clause(scanners, "f.scanner", args)
+    args.append(limit)
+    limit_param = len(args)
+    args.append(offset)
+    offset_param = len(args)
     rows = await db.fetch(
-        """
+        f"""
         SELECT f.id, f.cve, f.advisory_id, f.title, f.severity, f.cvss, f.epss,
                f.kev, f.priority, f.package, f.installed_version, f.fixed_version,
                f.scanner, f.location, f.status, f.last_seen, a.name AS asset_name
         FROM findings f LEFT JOIN assets a ON a.id = f.asset_id
-        WHERE f.status = 'open'
-        ORDER BY f.priority DESC, f.severity DESC, f.last_seen DESC
-        LIMIT $1
+        WHERE f.status = 'open'{clause}
+        ORDER BY f.priority DESC, f.severity DESC, f.last_seen DESC, f.id DESC
+        LIMIT ${limit_param} OFFSET ${offset_param}
         """,
-        limit)
+        *args)
     return [dict(r) for r in rows]
