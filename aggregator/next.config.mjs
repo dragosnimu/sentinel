@@ -32,8 +32,9 @@
  *
  * Măsurat înainte de a fi scris, nu presupus: în `lib/` și `app/` nu există
  * niciun `<script>`, niciun `<style>`, niciun `onclick` și nicio origine
- * externă. Singurele resurse sunt `/panel.css` și `/martor.css`, ambele de pe
- * aceeași origine — de unde `style-src 'self'` și nimic altceva.
+ * externă. Singurele resurse sunt `/panel.css`, `/martor.css` și `/logo.svg`,
+ * toate de pe aceeași origine — de unde `style-src 'self'` și `img-src 'self'`,
+ * fără `data:`: marca e un FIȘIER, nu o adresă inline în foaia de stil.
  *
  * `form-action 'self'` contează în mod deosebit aici: fără el, o injecție care
  * ar reuși să pună un `<form>` în pagină ar putea trimite sesiunea sau

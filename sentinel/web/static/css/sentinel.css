@@ -1,5 +1,5 @@
 /*
- * Sentinel — hand-written CSS, no framework, no build step, no CDN, no webfont.
+ * Sentinel — hand-written CSS, no framework, no build step, no CDN.
  *
  * Read under stress, often at night, often on a phone, often by someone who has
  * just been woken up. That drives every decision here:
@@ -13,39 +13,118 @@
  *     but nothing external, so this keeps `script-src 'self'` intact with no
  *     icon font and no sprite file to ship.
  *
- * Warm palette rather than the usual blue: amber reads as "attention" without
- * the alarm-red fatigue of a page where everything is urgent.
+ * ## The brand, and the one place it is deliberately not followed
+ *
+ * The palette below is the company site's, measured from its live custom
+ * properties rather than eyeballed: primary #1e88e5, secondary #26c6b5, the
+ * dark family #0a0f1e / #050811, slate text. Three surfaces share it — this
+ * dashboard, the aggregator panel and the witness status page — and where they
+ * need the same token they use the same NAME, so the same word cannot mean two
+ * colours in two files. `tests/unit/test_design_system.py` fails if it does.
+ *
+ * The accent is the brand PRIMARY, not the secondary teal. The teal sits in the
+ * same hue band as `--ok`, which on this page means "healthy". An accent a
+ * tired reader can mistake for "everything is fine" is a correctness bug on a
+ * dashboard where colour carries meaning, so the teal is kept for the logo
+ * gradient and for decoration that carries no state, and nowhere else.
+ *
+ * `--ok`, `--warn` and `--bad` are unchanged: they are semantics, not brand.
+ *
+ * ## Webfonts: allowed by the policy, still not shipped
+ *
+ * This header used to say "no webfont" as a flat rule. That is no longer the
+ * reason. `deploy/nginx/sentinel-security-headers.conf` sets `font-src 'self'`,
+ * so a woff2 under `static/` would load, and Inter, Space Grotesk and JetBrains
+ * Mono are all OFL, so self-hosting them is legal.
+ *
+ * They are still not shipped, and the reason is weight, not policy. Three
+ * families are tens of kilobytes even subset, this page is read on a phone on
+ * whatever link the operator happens to have, and there is no build step here
+ * to do the subsetting — an unsubset family would be a few hundred kilobytes
+ * in front of the one screen that has to appear immediately. So the stacks
+ * NAME the brand families first: a machine that already has Inter or JetBrains
+ * Mono installed renders the brand face, everyone else gets the system UI face
+ * at the same metrics. Reversible: drop the woff2 files under `static/fonts/`,
+ * add `@font-face`, and delete this paragraph.
  */
 
 :root {
-  /* Dark first: incidents happen at night. */
-  --bg:        #100d0b;
-  --bg-raised: #191512;
-  --bg-input:  #221c18;
-  --bg-hover:  #2a231d;
-  --border:    #2b2420;
-  --border-lit:#3d332c;
+  /* Dark first: incidents happen at night. Declared, not merely implied — the
+     browser needs it for scrollbars and form controls, and the design-system
+     test reads it to know which theme this file's `:root` describes. */
+  color-scheme: dark light;
 
-  --fg:        #f2ede8;
-  --fg-muted:  #a49689;
-  --fg-dim:    #7a6d62;
+  /* Brand constants, measured from the company site's own custom properties.
+     Theme-independent, because they are the mark rather than the surface.
 
-  --accent:     #f26b1d;
-  --accent-soft:#3a2115;
-  --accent-dim: #7a3a12;
+     The secondary teal is deliberately not among them. Every place it could go
+     on this page, colour carries state, and it sits in the same hue band as
+     `--ok`. The logo keeps its own two gradient stops, inside the mark itself,
+     which is the one place teal appears and the one place it means nothing. */
+  --brand-primary:     #1e88e5;
+  --brand-primary-700: #1565c0;
+  --brand-dark:        #0a0f1e;
+  --brand-darker:      #050811;
+
+  --bg:        var(--brand-darker);
+  --bg-raised: var(--brand-dark);
+  --bg-input:  #0f1729;
+  /* Set by the WORST case that lands on it, not by taste. A hover swaps the
+     ground under everything already in the row — links included — so every
+     foreground listed against `--bg` or `--bg-raised` has to clear it too.
+     At #152036 the accent link inside a hovered table row measured 4.42:1,
+     below AA, and the incident title in `incidents.html` is exactly that.
+     #131d31 brings it to 4.58:1. The cost is a fainter hover on a button
+     (1.06:1 from `--bg-input` instead of 1.10:1); text you cannot read is a
+     worse trade than a tint you have to look for. */
+  --bg-hover:  #131d31;
+  --border:    #1e293b;
+  /* Lighter than `--border` on purpose: this one outlines things you can type
+     in or press, and WCAG 1.4.11 wants 3:1 for those. Measured against the
+     DIMMEST case it has to clear, which is a hovered control rather than a
+     resting one: 3.34:1 on `--bg-hover`, 3.67:1 on `--bg-input`. `--border`
+     only separates panels, so it stays quiet. */
+  --border-lit:#647289;
+
+  --fg:        #f8fafc;
+  --fg-muted:  #94a3b8;
+  /* The dimmest value that still clears 4.5:1 on BOTH dark surfaces (5.78 on
+     `--bg`, 5.51 on `--bg-raised`). It carries real sentences — feed timestamps,
+     KPI notes — so it is body text, not decoration. */
+  --fg-dim:    #7c8ba1;
+
+  --accent:      var(--brand-primary);
+  --accent-hover:#42a0f0;
+  --accent-soft: #08172a;
+  /* NOT the brand's darker step here, unlike the light theme. `--accent-dim`
+     outlines things (the owner chip), so it owes 3:1 against every ground it
+     can sit on — and on a dark ground "dimmer" means darker, which is the
+     direction that loses contrast. #1565c0 measured 2.93:1 on the hovered
+     userbox. This is the darkest blue that still clears 3:1 on all four dark
+     grounds (3.37:1 worst) while staying visibly below the accent (1.36:1
+     apart), which is the whole point of the token. */
+  --accent-dim:  #1a6fce;
 
   --ok:   #35c98a;
   --warn: #f0a92e;
   --bad:  #f2564d;
-  --off:  #7a6d62;
+  --off:  #7a8699;
+  /* Severity "high" sits between `--bad` and `--warn` and used to borrow
+     `--accent`. It cannot any more: the accent is now blue, and a blue "high"
+     on a severity ramp reads as informational. Its own token, so the ramp
+     survives the next palette change. */
+  --high: #f26b1d;
 
-  --radius:    12px;
-  --radius-sm: 8px;
+  --radius-sm: .5rem;
+  --radius:    .625rem;
+  --radius-lg: 1rem;
 
-  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: Inter, "Segoe UI", system-ui, -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif;
+  --display: "Space Grotesk", Inter, "Segoe UI", system-ui, -apple-system, sans-serif;
 
-  --shadow: 0 1px 2px rgb(0 0 0 / .35), 0 6px 22px rgb(0 0 0 / .22);
+  --shadow:    0 1px 2px rgb(0 0 0 / .35), 0 8px 24px -8px rgb(30 136 229 / .25);
+  --shadow-lg: 0 24px 48px -16px rgb(30 136 229 / .35);
   --sidebar-w: 236px;
 
   /* Categorical series colours for the report charts. Eight, because a stacked
@@ -65,22 +144,45 @@
 
 @media (prefers-color-scheme: light) {
   :root {
-    --bg:        #f6f4f1;
+    --bg:        #f8fafc;
     --bg-raised: #ffffff;
     --bg-input:  #ffffff;
-    --bg-hover:  #f0ece7;
-    --border:    #e3ddd6;
-    --border-lit:#cabfb4;
-    --fg:        #171310;
-    --fg-muted:  #6b5f55;
-    --fg-dim:    #8d8177;
-    --accent:     #d4560c;
-    --accent-soft:#fdf0e6;
-    --accent-dim: #f0c3a0;
+    /* #f1f5f9 until the aggregator's "you are here" row stopped depending
+       on this tint being its only marker. One step lighter closes the last
+       exemption in the contrast table: `--bad` on a hovered row reaches
+       4.503:1 against a 4.5:1 requirement.
+       THREE THOUSANDTHS of margin. Any later nudge to either `--bad` or this
+       value reopens it — which is fine, because
+       `test_every_foreground_over_its_background_meets_AA` now measures that
+       pair and will say so, but do not assume there is room here. */
+    --bg-hover:  #f3f6fa;
+    --border:    #e2e8f0;
+    --border-lit:#78879c;
+    --fg:        #0f172a;
+    --fg-muted:  #475569;
+    /* One step darker than the obvious slate-500: at #64748b the role chip
+       inside a hovered userbox measured 4.23:1. This clears 4.74:1 there and
+       4.96:1 on the page. */
+    --fg-dim:    #5f6e83;
+    /* The brand primary is #1e88e5, but on white it measures 3.1:1 — below AA
+       for the body text and links that use it. The brand's own darker step is
+       what the site uses on light sections, and it measures 5.75:1. */
+    --accent:      var(--brand-primary-700);
+    --accent-hover:#0d47a1;
+    --accent-soft: #e3f0fb;
+    --accent-dim:  #4a90d9;
     --ok:   #12996a;
     --warn: #b57a12;
     --bad:  #cf3a31;
-    --shadow: 0 1px 2px rgb(23 19 16 / .05), 0 5px 18px rgb(23 19 16 / .06);
+    /* `--off` had no light-theme value at all: it inherited the dark theme's
+       WARM grey, which on a slate page reads as a different family. This is a
+       family change, not a legibility fix — measured, the inherited #7a6d62
+       was slightly the better of the two (5.01:1 on white against 4.76:1),
+       and the token needs 3:1, so both are far clear of what it owes. */
+    --off:  #64748b;
+    --high: #d4560c;
+    --shadow:    0 1px 2px rgb(15 23 42 / .06), 0 8px 24px -8px rgb(30 136 229 / .25);
+    --shadow-lg: 0 24px 48px -16px rgb(30 136 229 / .28);
 
     /* Darker series colours: the dark-theme set washes out to pastel on white
        and two of the bands become indistinguishable. */
@@ -136,19 +238,42 @@ body {
   display: inline-flex;
   align-items: center;
   gap: .65rem;
-  font-weight: 700;
+  font-family: var(--display);
+  font-weight: 800;
   font-size: 1.12rem;
   letter-spacing: .04em;
   color: var(--fg);
   text-decoration: none;
 }
+
+/* The company mark, as a background image rather than inline SVG.
+ *
+ * Inline would put a second element with `id="g"` into any page that shows the
+ * mark twice, and the second gradient then wins for both — one instance
+ * silently steals the other's fill. A background image is a separate document
+ * per use, so the id cannot collide, and it costs no markup.
+ *
+ * A data: URI rather than `/static/logo.svg`, because nginx serves `/static/`
+ * with `Cache-Control: immutable` for a week and a bare URL in here would not
+ * move when the mark does — the failure `tests/unit/test_asset_urls.py` exists
+ * for. The bytes ride inside this stylesheet, whose URL already carries a
+ * content digest. `img-src 'self' data:` allows it; the icon masks below use
+ * the same mechanism. The aggregator's copy of this mark is a real file
+ * because ITS policy is `img-src 'self'` with no `data:` — two mechanisms, one
+ * mark, and `tests/unit/test_design_system.py` compares their geometry. */
 .brand-mark {
+  /* `display` is load-bearing, not tidiness. In `.brand` the `inline-flex`
+     parent blockifies this span, so the sidebar mark renders. On the auth
+     pages the parent is `.auth-head`, a plain div: a bare `<span>` stays an
+     inline box, `width`/`height` do not apply to it, and the mark is simply
+     absent above the wordmark on login, TOTP and the error page — silently,
+     because an empty span reports nothing. */
+  display: inline-block;
   width: 20px; height: 20px;
-  border-radius: 6px;
-  background: linear-gradient(140deg, var(--accent), #ffb066);
   flex: none;
+  background: center / contain no-repeat url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' stop-color='%2317CBA6'/%3E%3Cstop offset='100%25' stop-color='%233275EC'/%3E%3C/linearGradient%3E%3C/defs%3E%3Ccircle cx='50' cy='50' r='48' fill='url(%23g)'/%3E%3Cg fill='white'%3E%3Ccircle cx='30' cy='35' r='4'/%3E%3Ccircle cx='55' cy='25' r='4'/%3E%3Ccircle cx='75' cy='40' r='4'/%3E%3Ccircle cx='40' cy='55' r='4'/%3E%3Ccircle cx='65' cy='60' r='4'/%3E%3Ccircle cx='50' cy='78' r='4'/%3E%3C/g%3E%3Cpath d='M30 35 L55 25 L75 40 M40 55 L55 25 M40 55 L65 60 L75 40 M40 55 L50 78 L65 60 M30 35 L40 55' stroke='white' stroke-width='2.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
 }
-.brand-mark-lg { width: 34px; height: 34px; border-radius: 10px; }
+.brand-mark-lg { width: 34px; height: 34px; }
 
 .sidenav { display: flex; flex-direction: column; gap: .15rem; }
 .sidenav a {
@@ -212,7 +337,7 @@ body {
 .avatar {
   width: 32px; height: 32px;
   border-radius: 9px;
-  background: linear-gradient(140deg, var(--accent), #b8480d);
+  background: linear-gradient(140deg, var(--brand-primary-700), var(--brand-dark));
   color: #fff;
   display: grid; place-items: center;
   font-size: .8rem; font-weight: 700; letter-spacing: .02em;
@@ -244,7 +369,7 @@ form.inline { display: inline; margin: 0; }
 .footer-plain { justify-content: center; padding: 1.2rem; }
 
 /* ================================================================ type */
-h1 { font-size: 1.9rem; font-weight: 700; margin: 0 0 .25rem; letter-spacing: -.025em; }
+h1 { font-family: var(--display); font-size: 1.9rem; font-weight: 800; margin: 0 0 .25rem; letter-spacing: -.025em; }
 h2 { font-size: 1.22rem; font-weight: 640; margin: 2.2rem 0 .9rem; letter-spacing: -.012em; }
 .page-sub { margin: 0 0 1.7rem; color: var(--fg-muted); font-size: 1.02rem; }
 
@@ -363,7 +488,7 @@ h2 { font-size: 1.22rem; font-weight: 640; margin: 2.2rem 0 .9rem; letter-spacin
 .geobar-key { font-weight: 700; font-size: .98rem; font-variant-numeric: tabular-nums; }
 .geobar-track { background: var(--bg-input); border-radius: 999px; height: 9px; overflow: hidden; }
 .geobar-fill { display: block; height: 100%; border-radius: 999px;
-               background: linear-gradient(90deg, var(--accent), #ff9a4d); min-width: 4px; }
+               background: linear-gradient(90deg, var(--brand-primary-700), var(--brand-primary)); min-width: 4px; }
 .geobar-val { font-size: .9rem; color: var(--fg-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 /* Activity feed */
@@ -413,8 +538,12 @@ input:focus-visible, select:focus-visible, a:focus-visible, button:focus-visible
   cursor: pointer; text-align: center; text-decoration: none;
 }
 .btn:hover { border-color: var(--fg-dim); background: var(--bg-hover); }
-.btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 650; }
-.btn-primary:hover { filter: brightness(1.1); }
+/* Textul butonului e `--bg`, nu alb: alb pe #1e88e5 masoara 3.68:1, sub AA
+   pentru un buton de 16,7px. `--bg` da 5.44:1 pe intuneric si 5.49:1 pe lumina.
+   Hover-ul foloseste un ton propriu, nu `filter: brightness()` — filtrul urca
+   contrastul intr-o tema si il coboara in cealalta. */
+.btn-primary { background: var(--accent); border-color: var(--accent); color: var(--bg); font-weight: 650; }
+.btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
 .btn-quiet { background: transparent; color: var(--fg-muted); }
 .btn-quiet:hover { color: var(--fg); }
 .btn-block { display: block; width: 100%; }
@@ -443,7 +572,7 @@ input:focus-visible, select:focus-visible, a:focus-visible, button:focus-visible
 .auth-card {
   width: 100%; max-width: 410px;
   background: var(--bg-raised); border: 1px solid var(--border);
-  border-radius: 16px; padding: 2rem; box-shadow: var(--shadow);
+  border-radius: var(--radius-lg); padding: 2rem; box-shadow: var(--shadow-lg);
 }
 .auth-head { text-align: center; margin-bottom: 1.6rem; }
 .auth-head h1 { margin: .7rem 0 .25rem; font-size: 1.5rem; }
@@ -598,7 +727,7 @@ table.events td { vertical-align: top; }
 /* Severity and patch state keep the page's own semantics rather than a
    categorical hue: critical must be the same red everywhere in the interface. */
 .rep-crit { fill: var(--bad); }
-.rep-high { fill: var(--accent); }
+.rep-high { fill: var(--high); }
 .rep-med  { fill: var(--warn); }
 .rep-low  { fill: var(--rep-c2); }
 .rep-info { fill: var(--off); }
@@ -620,7 +749,7 @@ table.events td { vertical-align: top; }
 .rep-swatch.rep-c6 { background: var(--rep-c6); }
 .rep-swatch.rep-c7 { background: var(--rep-c7); }
 .rep-swatch.rep-crit { background: var(--bad); }
-.rep-swatch.rep-high { background: var(--accent); }
+.rep-swatch.rep-high { background: var(--high); }
 .rep-swatch.rep-med  { background: var(--warn); }
 .rep-swatch.rep-low  { background: var(--rep-c2); }
 .rep-swatch.rep-info { background: var(--off); }

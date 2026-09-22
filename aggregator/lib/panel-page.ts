@@ -549,7 +549,14 @@ export function summaryPage(view: SummaryView): string {
   parts.push(table(
     "<th>Server</th><th>Stare</th><th>Rol</th><th>Ultimul lot (UTC)</th>",
     view.instances.map((inst) => {
-      const aici = inst.instanceId === view.selected ? ' class="aici"' : "";
+      // `aria-current` lângă clasă, nu în locul ei: clasa desenează dunga,
+      // atributul o SPUNE. Un marcaj pur vizual nu ajunge la cine folosește un
+      // cititor de ecran, iar regula foii de stil e că nicio culoare nu e
+      // singurul semn. `"true"` și nu `"page"`: rândul nu e o legătură către
+      // pagina curentă, e elementul ales din setul afișat — `page` e pentru
+      // navigație, `true` e cazul generic, singurul corect pentru un `<tr>`.
+      const aici = inst.instanceId === view.selected
+        ? ' class="aici" aria-current="true"' : "";
       return `<tr${aici}>` +
         `<td>${escapeHtml(inst.label ?? inst.instanceId)}<br>` +
         `<code class="id">${escapeHtml(inst.instanceId)}</code></td>` +

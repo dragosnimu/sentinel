@@ -4,27 +4,142 @@
  * `style=` nu există în marcaj, fiindcă acela ar cere `unsafe-inline` — vezi
  * `lib/auth/http.ts`.
  *
- * Fără fonturi externe și fără imagini de la alte origini: politica le refuză,
- * iar o pagină care cere ce nu poate primi arată stricat fără să spună de ce. */
+ * Fără fonturi externe: politica le refuză, iar o pagină care cere ce nu poate
+ * primi arată stricat fără să spună de ce. Singura imagine e `/logo.svg`, de
+ * pe aceeași origine — NU o adresă `data:`, fiindcă `img-src 'self'` din
+ * `lib/csp.ts` nu o cuprinde, iar marca n-ar apărea deloc, tăcut.
+ *
+ * ## Numele culorilor sunt ale sistemului, nu ale acestei pagini
+ *
+ * Aceleași NUME ca în `public/martor.css` și ca în tabloul de bord
+ * (`sentinel/web/static/css/sentinel.css`), cu aceleași valori pe aceeași temă.
+ * Până acum erau trei vocabulare pentru aceleași lucruri, adică trei locuri în
+ * care se poate schimba unul singur. `--fundal` a devenit `--bg`, `--panou` →
+ * `--bg-raised`, `--linie` → `--border`, `--slab` → `--fg-muted`, `--text` →
+ * `--fg`; `tests/unit/test_design_system.py` pică dacă un nume comun capătă
+ * două valori.
+ *
+ * Accentul e ALBASTRUL PRIMAR al mărcii, nu turcoazul ei: turcoazul stă în
+ * aceeași bandă de ton cu verdele de „sănătos", iar pe un panou de securitate
+ * un accent confundabil cu un verdict bun e un defect, nu o preferință. Pe
+ * lumină e treapta închisă a mărcii, #1565c0: #1e88e5 pe alb măsoară 3,1:1,
+ * sub AA pentru legăturile care îl folosesc.
+ *
+ * Culorile de SEVERITATE și benzile graficelor rămân cele de dinainte. Sunt
+ * semantică și lizibilitate, nu marcă, iar alegerea lor a fost făcută ca să se
+ * deosebească între ele și pentru cine nu distinge roșul de verde. Ce s-a
+ * mutat, și doar atât:
+ *
+ *   * `.sev-high`, exact cât să-și păstreze pragul AA pe fundalul nou —
+ *     inclusiv pe rândul evidențiat, care e tot un fundal. Vechiul `#c2570b`
+ *     măsoară 4,305 pe `--bg`, deci mutarea lui e necesară;
+ *   * `.sev-medium` a fost mutat în aceeași rundă, dar NU mai e necesar:
+ *     după ce rândul evidențiat s-a luminat la `#f3f6fa`, vechiul `#8a6d0b`
+ *     ajunge singur la 4,534 acolo. Valoarea nouă rămâne, pentru marjă, dar
+ *     se șterge fără ca vreun test să se înroșească — deci nu e o apărare,
+ *     e o alegere;
+ *   * „medium" și „low" aveau DOUĂ valori pe temă întunecată — una în coloană,
+ *     alta în bandă — pentru același cuvânt; au rămas cu cea din coloană;
+ *   * „info" și „alta" au acum tokenuri proprii, `--band-info` și
+ *     `--band-alta`. O vreme au fost amândouă `--fg-muted`, adică aceeași
+ *     culoare pentru două categorii care pot sta alăturate în aceeași bandă:
+ *     un segment în loc de două, și două pastile identice în legendă. Textul
+ *     coloanei rămâne pe griul lizibil; banda are nevoie de altceva. */
 
 :root {
   color-scheme: light dark;
-  --fundal: #ffffff;
-  --text: #16181d;
-  --slab: #5c6370;
-  --linie: #d8dbe0;
-  --panou: #f6f7f9;
-  --accent: #1f4fd8;
+
+  /* Constantele mărcii, măsurate de pe site. Aceleași în ambele teme, fiindcă
+     sunt marca, nu suprafața. Turcoazul mărcii lipsește dinadins: pe pagina
+     asta orice culoare poartă o stare, iar el stă în aceeași bandă de ton cu
+     verdele de „sănătos". Singurul loc în care apare e degradeul din interiorul
+     mărcii, adică exact locul în care nu spune nimic. */
+  --brand-primary:     #1e88e5;
+  --brand-primary-700: #1565c0;
+  --brand-dark:        #0a0f1e;
+  --brand-darker:      #050811;
+
+  --bg:        #f8fafc;
+  --bg-raised: #ffffff;
+  --bg-input:  #ffffff;
+  --bg-hover:  #f3f6fa;
+  --border:    #e2e8f0;
+  /* Mai apăsat decât `--border`: ăsta conturează ce se apasă sau ce se
+     completează, iar WCAG 1.4.11 cere 3:1 pentru așa ceva (măsurat 3,28:1 pe
+     alb). `--border` doar desparte rânduri și panouri, deci rămâne discret. */
+  --border-lit:#78879c;
+
+  --fg:       #0f172a;
+  --fg-muted: #475569;
+
+  --accent:      var(--brand-primary-700);
+  --accent-hover:#0d47a1;
+
+  /* Severitatea nu e marcă, e semantică: valorile rămân cele alese pentru
+     lizibilitate, nu cele ale site-ului. Sunt tokenuri fiindcă fiecare era
+     scris de trei ori — coloana de severitate, banda de proporții, pastila
+     din legendă — plus roșul mesajului de eroare de pe poartă, iar patru
+     litere în patru locuri se despart una de alta fără ca nimic să pice.
+
+     `--sev-high` a fost #c2570b, ales cât să treacă 4,5:1 pe ALB. Fundalul
+     paginii nu mai e alb, ci #f8fafc, unde aceeași culoare măsoară 4,31:1 —
+     sub prag. Coborâtă exact cât să-și păstreze pragul: 5,06:1. */
+  --sev-critical: #b4232c;
+  --sev-high:     #b04f09;
+  /* #8a6d0b măsura 4,37:1 pe rândul evidențiat, sub prag; coborâtă exact cât
+     să treacă și acolo (4,87:1). */
+  --sev-medium:   #816609;
+  --sev-low:      #3b6ea5;
+
+  /* Cele DOUĂ griuri ale benzii de proporții, și de ce sunt două.
+   *
+   * `severityClass()` din `lib/panel-page.ts` trimite orice severitate
+   * nerecunoscută în `sev-alta`, deci un rezumat poate avea în aceeași bandă
+   * și un segment `info`, și unul `alta`. Scrise cu aceeași culoare — cum au
+   * fost o vreme — cele două segmente se ating fără nicio muchie vizibilă și
+   * se citesc ca unul singur, iar legenda arată două pastile identice. Sunt
+   * despărțite prin LUMINOZITATE, 1,83:1, aceeași regulă ca a benzilor `g-s*`.
+   *
+   * Sunt tokenuri separate de `--fg-muted` fiindcă pe ele nu stă text: aici
+   * contează să se deosebească una de alta, nu să fie lizibile ca literă. */
+  --band-info: #6c7480;
+  --band-alta: #9aa2ae;
+
+  /* Tendința. Sus/jos dau CULOAREA, nu verdictul: o creștere de detecții nu e
+     automat rea, dar pe un panou de atacuri așa se citește. */
+  --trend-up:   #b4232c;
+  --trend-down: #2f7d4f;
+
+  --radius:    .625rem;
+  --radius-lg: 1rem;
+
+  --mono: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: Inter, "Segoe UI", system-ui, -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif;
+  --display: "Space Grotesk", Inter, "Segoe UI", system-ui, -apple-system, sans-serif;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --fundal: #14161a;
-    --text: #e6e8ec;
-    --slab: #9aa2ae;
-    --linie: #2b2f37;
-    --panou: #1b1e24;
-    --accent: #7aa2ff;
+    --bg:        var(--brand-darker);
+    --bg-raised: var(--brand-dark);
+    --bg-input:  #0f1729;
+    --bg-hover:  #131d31;
+    --border:    #1e293b;
+    --border-lit:#647289;
+
+    --fg:       #f8fafc;
+    --fg-muted: #94a3b8;
+
+    --accent:      var(--brand-primary);
+    --accent-hover:#42a0f0;
+
+    --sev-critical: #ff7b82;
+    --sev-high:     #ffa657;
+    --sev-medium:   #d6bb52;
+    --sev-low:      #79b8ff;
+
+    --trend-up:   #ff7b82;
+    --trend-down: #6fd39b;
   }
 }
 
@@ -32,9 +147,9 @@
 
 body {
   margin: 0;
-  background: var(--fundal);
-  color: var(--text);
-  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.5 var(--sans);
 }
 
 a { color: var(--accent); }
@@ -44,31 +159,54 @@ a { color: var(--accent); }
   align-items: center;
   gap: 1rem;
   padding: .75rem 1.25rem;
-  border-bottom: 1px solid var(--linie);
-  background: var(--panou);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-raised);
 }
 
-.marca { font-weight: 600; text-decoration: none; color: var(--text); }
-.cine { margin-left: auto; color: var(--slab); }
+.marca {
+  display: inline-flex;
+  align-items: center;
+  gap: .5rem;
+  font-family: var(--display);
+  font-weight: 700;
+  letter-spacing: -.01em;
+  text-decoration: none;
+  color: var(--fg);
+}
+
+/* Marca firmei, pusă din CSS. Marcajul e construit ca ȘIR în
+ * `lib/panel-page.ts`, iar un element pur decorativ n-are ce căuta acolo unde
+ * se escapează date; `content: ""` o ține și în afara arborelui de
+ * accesibilitate, fiindcă numele e deja scris în text lângă ea. */
+.marca::before {
+  content: "";
+  width: 22px;
+  height: 22px;
+  flex: none;
+  background: center / contain no-repeat url("/logo.svg");
+}
+
+.cine { margin-left: auto; color: var(--fg-muted); }
 .bara form { margin: 0; }
 
 .bara button {
   font: inherit;
   padding: .3rem .8rem;
-  border: 1px solid var(--linie);
-  border-radius: 6px;
-  background: var(--fundal);
-  color: var(--text);
+  border: 1px solid var(--border-lit);
+  border-radius: var(--radius);
+  background: var(--bg-input);
+  color: var(--fg);
   cursor: pointer;
 }
 
 main { padding: 1.25rem; max-width: 72rem; margin: 0 auto; }
 
-h1 { font-size: 1.15rem; margin: 1.5rem 0 .6rem; }
+h1 { font-family: var(--display); font-weight: 700; letter-spacing: -.02em;
+     font-size: 1.15rem; margin: 1.5rem 0 .6rem; }
 h1:first-of-type { margin-top: .5rem; }
 h2 { font-size: 1rem; margin: 1.5rem 0 .5rem; }
 
-.gol { color: var(--slab); }
+.gol { color: var(--fg-muted); }
 
 table {
   width: 100%;
@@ -80,15 +218,15 @@ table {
 th, td {
   text-align: left;
   padding: .5rem .6rem;
-  border-bottom: 1px solid var(--linie);
+  border-bottom: 1px solid var(--border);
   vertical-align: top;
 }
 
-th { color: var(--slab); font-weight: 600; font-size: .85rem; }
+th { color: var(--fg-muted); font-weight: 600; font-size: .85rem; }
 
 td.nr { text-align: right; }
 
-code.id { color: var(--slab); font-size: .8rem; }
+code.id { color: var(--fg-muted); font-size: .8rem; font-family: var(--mono); }
 
 .sev {
   display: inline-block;
@@ -103,19 +241,14 @@ code.id { color: var(--slab); font-size: .8rem; }
    * cine nu deosebește roșul de verde. */
 }
 
-.sev-critical { color: #b4232c; }
-.sev-high     { color: #c2570b; }
-.sev-medium   { color: #8a6d0b; }
-.sev-low      { color: #3b6ea5; }
-.sev-info     { color: var(--slab); }
-.sev-alta     { color: var(--slab); }
-
-@media (prefers-color-scheme: dark) {
-  .sev-critical { color: #ff7b82; }
-  .sev-high     { color: #ffa657; }
-  .sev-medium   { color: #d6bb52; }
-  .sev-low      { color: #79b8ff; }
-}
+.sev-critical { color: var(--sev-critical); }
+.sev-high     { color: var(--sev-high); }
+.sev-medium   { color: var(--sev-medium); }
+.sev-low      { color: var(--sev-low); }
+/* Coloana de severitate poartă TEXT, deci ia griul lizibil, nu pe cel al
+ * benzii: acolo contează contrastul cu fundalul, aici deosebirea de vecin. */
+.sev-info     { color: var(--fg-muted); }
+.sev-alta     { color: var(--fg-muted); }
 
 .detaliu {
   display: grid;
@@ -124,10 +257,10 @@ code.id { color: var(--slab); font-size: .8rem; }
   margin: 0;
 }
 
-.detaliu dt { color: var(--slab); }
+.detaliu dt { color: var(--fg-muted); }
 .detaliu dd { margin: 0; overflow-wrap: anywhere; }
 
-.taiat { color: var(--slab); font-size: .9rem; }
+.taiat { color: var(--fg-muted); font-size: .9rem; }
 
 /* Ecran îngust: tabelele se derulează în containerul lor, nu împing pagina. */
 @media (max-width: 40rem) {
@@ -144,15 +277,15 @@ code.id { color: var(--slab); font-size: .8rem; }
   margin: 0;
 }
 
-.bara .alege label { color: var(--slab); font-size: .85rem; }
+.bara .alege label { color: var(--fg-muted); font-size: .85rem; }
 
 .bara select {
   font: inherit;
   padding: .25rem .4rem;
-  border: 1px solid var(--linie);
-  border-radius: 6px;
-  background: var(--fundal);
-  color: var(--text);
+  border: 1px solid var(--border-lit);
+  border-radius: var(--radius);
+  background: var(--bg-input);
+  color: var(--fg);
   max-width: 16rem;
 }
 
@@ -161,39 +294,69 @@ code.id { color: var(--slab); font-size: .8rem; }
   flex-wrap: wrap;
   gap: .25rem 1rem;
   padding: .5rem 1.25rem;
-  border-bottom: 1px solid var(--linie);
+  border-bottom: 1px solid var(--border);
 }
 
 .meniu a {
   text-decoration: none;
-  color: var(--slab);
+  color: var(--fg-muted);
   padding: .25rem 0;
   border-bottom: 2px solid transparent;
 }
 
-.meniu a:hover { color: var(--text); }
+.meniu a:hover { color: var(--fg); }
 
 .meniu a.aici {
-  color: var(--text);
+  color: var(--fg);
   font-weight: 600;
   border-bottom-color: var(--accent);
 }
 
-/* Rândul serverului privit acum, în tabelul din rezumat. */
-tr.aici > td { background: var(--panou); }
+/* Rândul serverului privit acum, în tabelul din rezumat.
+ *
+ * Dunga de la stânga e semnul REAL; fundalul e doar un ecou al ei. Măsurat pe
+ * 22 septembrie 2026, înainte: singurul semn era `background: var(--bg-hover)`,
+ * adică 1,047:1 față de pagină — perceptibil pe un ecran bun dacă știi deja pe
+ * care rând să te uiți, și deloc pe un telefon în lumină. Un marcaj pe care
+ * trebuie să-l cauți ca să-l vezi nu răspunde la întrebarea pe care o pune
+ * („pe care server mă uit?"), o amână.
+ *
+ * Aceeași formă ca la `.cron-blocare td:first-child` mai jos, dinadins: o
+ * dungă de 3px la marginea rândului e o formă, nu un ton, deci se vede și pe
+ * un ecran spălăcit și la tipărire. În `--accent`, nu în verdele blocărilor:
+ * ăsta spune „aici te uiți", nu „aici s-a blocat ceva".
+ *
+ * `padding-left` coborât de la .6rem la .5rem, ca rândul ales să nu fie
+ * împins cu toți cei 3px ai dungii față de vecinii lui. Compensarea e
+ * PARȚIALĂ, și cifra contează pentru cine o citește ca să deducă altceva:
+ * .6rem e 9,6px, dunga e 3px, iar .5rem scade doar 1,6px — deci conținutul
+ * rândului ales stă cu 1,4px mai la dreapta decât al vecinilor. Măsurat în
+ * browser, nu dedus. Sub pragul la care observă cineva pe un singur rând, și
+ * de-aia valoarea rămâne rotundă; dacă se schimbă vreodată, `calc(.6rem - 3px)`
+ * spune relația în loc de rezultat.
+ *
+ * De ce nu se pune problema la `.cron-blocare`, care are aceeași dungă:
+ * acolo FIECARE rând primește una, deci toate se deplasează la fel și nu
+ * există decalaj relativ. `tr.aici` e un rând între vecini fără dungă.
+ *
+ * Culoarea nu e nici aici singurul semn: rândul poartă și `aria-current` în
+ * marcaj (vezi `lib/panel-page.ts`), fiindcă o dungă colorată nu spune nimic
+ * unui cititor de ecran. */
+tr.aici > td { background: var(--bg-hover); }
+tr.aici > td:first-child { border-left: 3px solid var(--accent); padding-left: .5rem; }
 
 /* „Fluxul nu se expediază" — o afirmație despre CONDUCTĂ, nu despre server.
  * Se distinge vizual de „nimic de arătat" tocmai fiindcă reparația diferă. */
 .lipsa {
   border-left: 3px solid var(--accent);
-  background: var(--panou);
+  background: var(--bg-raised);
   padding: .7rem .9rem;
-  border-radius: 0 6px 6px 0;
+  border-radius: 0 var(--radius) var(--radius) 0;
 }
 
-.lipsa-cell { color: var(--slab); }
+.lipsa-cell { color: var(--fg-muted); }
 
-.nota { color: var(--slab); max-width: 60ch; }
+.nota { color: var(--fg-muted); max-width: 60ch; }
 
 .nota code, .lipsa code { font-size: .9em; }
 
@@ -211,17 +374,17 @@ tr.aici > td { background: var(--panou); }
   align-items: baseline;
   gap: .4rem;
   text-decoration: none;
-  color: var(--slab);
-  border: 1px solid var(--linie);
+  color: var(--fg-muted);
+  border: 1px solid var(--border-lit);
   border-radius: 999px;
   padding: .2rem .7rem;
   font-size: .9rem;
 }
 
-.filtre a:hover { color: var(--text); }
+.filtre a:hover { color: var(--fg); }
 
 .filtre a.aici {
-  color: var(--text);
+  color: var(--fg);
   border-color: var(--accent);
   font-weight: 600;
 }
@@ -231,7 +394,7 @@ tr.aici > td { background: var(--panou); }
 .filtre .nr {
   font-variant-numeric: tabular-nums;
   font-size: .85em;
-  color: var(--slab);
+  color: var(--fg-muted);
 }
 
 .filtre a.aici .nr { color: var(--accent); }
@@ -258,7 +421,7 @@ body.poarta {
   align-items: center;
   justify-content: center;
   padding: 1.25rem;
-  background: var(--panou);
+  background: var(--bg);
 }
 
 .carte {
@@ -266,13 +429,27 @@ body.poarta {
   max-width: 22rem;
   margin: 0;
   padding: 1.5rem 1.5rem 1.25rem;
-  background: var(--fundal);
-  border: 1px solid var(--linie);
-  border-radius: 10px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+/* Marca, deasupra titlului. Aceeași întrebare ca pe pagina panoului — „e a
+ * ta pagina asta?" — se pune cel mai tare aici, unde se cere o parolă. */
+.carte::before {
+  content: "";
+  display: block;
+  width: 40px;
+  height: 40px;
+  margin: 0 0 .9rem;
+  background: center / contain no-repeat url("/logo.svg");
 }
 
 .carte h1 {
   margin: 0 0 1.1rem;
+  font-family: var(--display);
+  font-weight: 700;
+  letter-spacing: -.02em;
   font-size: 1.15rem;
 }
 
@@ -282,7 +459,7 @@ body.poarta {
 .carte label {
   display: inline-block;
   margin-bottom: .3rem;
-  color: var(--slab);
+  color: var(--fg-muted);
   font-size: .85rem;
 }
 
@@ -291,10 +468,10 @@ body.poarta {
   width: 100%;
   font: inherit;
   padding: .5rem .6rem;
-  color: var(--text);
-  background: var(--fundal);
-  border: 1px solid var(--linie);
-  border-radius: 6px;
+  color: var(--fg);
+  background: var(--bg-input);
+  border: 1px solid var(--border-lit);
+  border-radius: var(--radius);
 }
 
 /* Focus VIZIBIL, nu doar prezent: fără el, cine navighează din tastatură nu
@@ -306,37 +483,49 @@ body.poarta {
   outline-offset: 1px;
 }
 
+/* Textul butonului e `--bg`, nu alb scris de mână: pe întuneric accentul e
+ * #1e88e5, iar albul pe el măsoară 3,68:1 — sub AA. `--bg` dă 5,49:1 pe
+ * lumină și 5,44:1 pe întuneric, fiindcă se întoarce odată cu tema. */
 .carte button {
   width: 100%;
   font: inherit;
   padding: .55rem .9rem;
-  color: var(--fundal);
+  color: var(--bg);
   background: var(--accent);
   border: 1px solid var(--accent);
-  border-radius: 6px;
+  border-radius: var(--radius);
   cursor: pointer;
+}
+
+.carte button:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
 }
 
 /* Al doilea buton de pe pagina de TOTP e „Renunță": aceeași formă, dar nu
  * aceeași greutate. Două butoane pline unul sub altul întreabă la fel de tare,
  * iar cel care duce înapoi n-ar trebui. */
 .carte form + form button {
-  color: var(--text);
-  background: var(--fundal);
-  border-color: var(--linie);
+  color: var(--fg);
+  background: var(--bg-input);
+  border-color: var(--border-lit);
 }
 
-/* Mesajul de eroare. `role="alert"` îl anunță; culoarea și rama îl arată. */
+.carte form + form button:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-lit);
+}
+
+/* Mesajul de eroare. `role="alert"` îl anunță; culoarea și rama îl arată.
+ * Roșul vine din `--sev-critical`, nu scris de mână: era singura culoare din
+ * secțiunea asta care se întreținea separat, și deci singura care se putea
+ * despărți de restul panoului fără ca nimic să se plângă. */
 .carte [role="alert"] {
   padding: .6rem .7rem;
   border: 1px solid currentColor;
-  border-radius: 6px;
-  color: #b4232c;
+  border-radius: var(--radius);
+  color: var(--sev-critical);
   background: color-mix(in srgb, currentColor 8%, transparent);
-}
-
-@media (prefers-color-scheme: dark) {
-  .carte [role="alert"] { color: #ff9b96; }
 }
 
 /* Codul TOTP: șase cifre care se citesc mai ușor distanțate și centrate. */
@@ -374,23 +563,23 @@ body.poarta {
  * Nu depinde numai de culoare: bara ocupă toată înălțimea, ceea ce nicio bară
  * de date n-o face decât la maxim, iar `<title>` spune în cuvinte ce e. */
 .g-lipsa {
-  fill: var(--slab);
+  fill: var(--fg-muted);
   opacity: .16;
 }
 
 .g-grila {
-  stroke: var(--linie);
+  stroke: var(--border);
   stroke-width: 1;
 }
 
 .g-axa {
-  fill: var(--slab);
+  fill: var(--fg-muted);
   font-size: 11px;
   font-family: inherit;
 }
 
 .g-val {
-  fill: var(--text);
+  fill: var(--fg);
   font-size: 11px;
   font-family: inherit;
   font-variant-numeric: tabular-nums;
@@ -402,7 +591,7 @@ body.poarta {
   width: .85rem;
   height: .7rem;
   vertical-align: -.05rem;
-  background: var(--slab);
+  background: var(--fg-muted);
   opacity: .16;
   border-radius: 2px;
 }
@@ -420,14 +609,14 @@ body.poarta {
 }
 
 .card {
-  border: 1px solid var(--linie);
-  border-radius: 6px;
-  background: var(--panou);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
   padding: .6rem .7rem;
 }
 
 .card-eticheta {
-  color: var(--slab);
+  color: var(--fg-muted);
   font-size: .78rem;
   text-transform: uppercase;
   letter-spacing: .04em;
@@ -442,23 +631,15 @@ body.poarta {
   font-variant-numeric: tabular-nums;
 }
 
-.card-sub { color: var(--slab); font-size: .8rem; }
+.card-sub { color: var(--fg-muted); font-size: .8rem; }
 
 /* Cartonasul cu ceva grav deschis. Culoarea NU e singurul semn — textul de
  * dedesubt spune «N grave» —, dar marginea il scoate din sirul celorlalte. */
-.card-alarma { border-color: #b4232c; }
+.card-alarma { border-color: var(--sev-critical); }
 
-/* Tendinta. Sus/jos dau CULOAREA, nu verdictul: o crestere de detectii nu e
- * automat rea, dar pe un panou de atacuri asa se citeste. */
-.t-sus  { color: #b4232c; }
-.t-jos  { color: #2f7d4f; }
-.t-egal { color: var(--slab); }
-
-@media (prefers-color-scheme: dark) {
-  .card-alarma { border-color: #ff7b82; }
-  .t-sus { color: #ff7b82; }
-  .t-jos { color: #6fd39b; }
-}
+.t-sus  { color: var(--trend-up); }
+.t-jos  { color: var(--trend-down); }
+.t-egal { color: var(--fg-muted); }
 
 /* Benzile graficului stivuit.
  *
@@ -487,7 +668,7 @@ body.poarta {
   flex-wrap: wrap;
   gap: .1rem .9rem;
   margin: .1rem 0 .6rem;
-  color: var(--slab);
+  color: var(--fg-muted);
   font-size: .82rem;
 }
 
@@ -508,7 +689,7 @@ body.poarta {
 .leg-pata.g-s3 { background: #7b4fb8; }
 .leg-pata.g-s4 { background: #8a6d0b; }
 .leg-pata.g-s5 { background: #6c7480; }
-.leg-pata.g-lipsa { background: var(--slab); opacity: .3; }
+.leg-pata.g-lipsa { background: var(--fg-muted); opacity: .3; }
 
 @media (prefers-color-scheme: dark) {
   .leg-pata.g-s0 { background: #7aa2ff; }
@@ -529,30 +710,22 @@ body.poarta {
   margin: .2rem 0 .3rem;
 }
 
-.banda-sev-critical { fill: #b4232c; }
-.banda-sev-high     { fill: #c2570b; }
-.banda-sev-medium   { fill: #8a6d0b; }
-.banda-sev-low      { fill: #3b6ea5; }
-.banda-sev-info     { fill: #6c7480; }
-.banda-sev-alta     { fill: #9aa2ae; }
+/* Aceleași tokenuri ca ale coloanei de severitate, dinadins: banda și coloana
+ * spun același lucru, iar dacă s-ar putea despărți s-ar despărți exact când
+ * cineva schimbă una singură. */
+.banda-sev-critical { fill: var(--sev-critical); }
+.banda-sev-high     { fill: var(--sev-high); }
+.banda-sev-medium   { fill: var(--sev-medium); }
+.banda-sev-low      { fill: var(--sev-low); }
+.banda-sev-info     { fill: var(--band-info); }
+.banda-sev-alta     { fill: var(--band-alta); }
 
-.leg-pata.banda-sev-critical { background: #b4232c; }
-.leg-pata.banda-sev-high     { background: #c2570b; }
-.leg-pata.banda-sev-medium   { background: #8a6d0b; }
-.leg-pata.banda-sev-low      { background: #3b6ea5; }
-.leg-pata.banda-sev-info     { background: #6c7480; }
-.leg-pata.banda-sev-alta     { background: #9aa2ae; }
-
-@media (prefers-color-scheme: dark) {
-  .banda-sev-critical { fill: #ff7b82; }
-  .banda-sev-high     { fill: #ffa657; }
-  .banda-sev-medium   { fill: #d9bb4a; }
-  .banda-sev-low      { fill: #7aa2ff; }
-  .leg-pata.banda-sev-critical { background: #ff7b82; }
-  .leg-pata.banda-sev-high     { background: #ffa657; }
-  .leg-pata.banda-sev-medium   { background: #d9bb4a; }
-  .leg-pata.banda-sev-low      { background: #7aa2ff; }
-}
+.leg-pata.banda-sev-critical { background: var(--sev-critical); }
+.leg-pata.banda-sev-high     { background: var(--sev-high); }
+.leg-pata.banda-sev-medium   { background: var(--sev-medium); }
+.leg-pata.banda-sev-low      { background: var(--sev-low); }
+.leg-pata.banda-sev-info     { background: var(--band-info); }
+.leg-pata.banda-sev-alta     { background: var(--band-alta); }
 
 /* Doua clasamente unul langa altul pe ecran lat, unul sub altul pe telefon. */
 .doua {
@@ -566,16 +739,16 @@ body.poarta {
 h2 {
   font-size: .95rem;
   margin: 1rem 0 .2rem;
-  color: var(--slab);
+  color: var(--fg-muted);
   font-weight: 600;
 }
 
 /* Cronologia. Blocarea se deosebeste de detectie printr-o dunga la stanga, nu
  * doar prin cuvant: cele doua se citesc impreuna, iar «am fost atacat de X» si
  * «am blocat X» trebuie sa se poata separa dintr-o privire. */
-.cron-blocare td:first-child { border-left: 3px solid #2f7d4f; padding-left: .5rem; }
-.cron-detectie td:first-child { border-left: 3px solid var(--linie); padding-left: .5rem; }
-
-@media (prefers-color-scheme: dark) {
-  .cron-blocare td:first-child { border-left-color: #6fd39b; }
-}
+/* Verdele e ACELAȘI cu al pastilei de tendință în scădere, dinadins și dintr-un
+ * singur token: amândouă spun „direcția pe care o vrei". Scris de mână aici, ar
+ * fi fost a doua definiție a aceleiași culori, iar tema întunecată avea deja
+ * două — una în fiecare loc. */
+.cron-blocare td:first-child { border-left: 3px solid var(--trend-down); padding-left: .5rem; }
+.cron-detectie td:first-child { border-left: 3px solid var(--border); padding-left: .5rem; }

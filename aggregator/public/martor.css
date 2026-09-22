@@ -1,19 +1,50 @@
 /* Stiluri proprii, fără framework.
    Martorul e o componentă de securitate: fiecare dependență e suprafață de
    atac, iar o pagină care arată un singur verdict nu are nevoie de un sistem
-   de design. */
+   de design.
+
+   Ce are totuși e sistemul de culori al firmei, același cu al panoului și al
+   tabloului de bord: aceleași NUME pentru aceleași lucruri, ca un cuvânt să nu
+   însemne două culori în două fișiere. `tests/unit/test_design_system.py` pică
+   dacă se despart.
+
+   Verdictul „e viu" e `--ok`, nu turcoazul mărcii. Turcoazul stă în aceeași
+   bandă de ton cu verdele de „sănătos", iar pe pagina asta verdictul e singurul
+   lucru care se citește — o culoare de marcă pe care cineva o poate confunda cu
+   un verdict e chiar defectul, nu o preferință. Turcoazul rămâne în degradeul
+   mărcii de sus, care nu spune nimic despre stare.
+
+   Fără fonturi aduse de undeva: `@font-face` ar cere octeți în plus exact pe
+   pagina care trebuie să apară instantaneu pe telefon, iar stiva de mai jos
+   numește întâi familiile mărcii, deci cine le are instalate le vede. */
 
 :root {
-  --abyss: #050811;
-  --panel: #0E1526;
-  --line: #1E293B;
-  --text: #E2E8F0;
-  --muted: #94A3B8;
-  --teal: #26C6B5;
-  --alert: #F0524D;
-  --amber: #F0A92E;
-  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  --sans: Inter, "Segoe UI", system-ui, -apple-system, sans-serif;
+  /* Pagina asta are o singură temă. Declarat, nu doar subînțeles: browserul are
+     nevoie de asta pentru bare de derulare, iar testul sistemului de design
+     citește exact linia asta ca să știe despre ce temă vorbește `:root`. */
+  color-scheme: dark;
+
+  /* Constantele mărcii, măsurate de pe site. Doar cele două tonuri închise:
+     pagina n-are nicio legătură și niciun buton, deci albastrul primar n-ar
+     avea unde să stea, iar turcoazul ar sta lângă un verdict — adică exact
+     confuzia de care fuge foaia asta. */
+  --brand-dark:   #0a0f1e;
+  --brand-darker: #050811;
+
+  --bg:        var(--brand-darker);
+  --bg-raised: var(--brand-dark);
+  --border:    #1e293b;
+  --fg:        #f8fafc;
+  --fg-muted:  #94a3b8;
+
+  --ok:  #35c98a;
+  --bad: #f2564d;
+
+  --radius-xl: 1.5rem;
+
+  --mono: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: Inter, "Segoe UI", system-ui, -apple-system, Roboto, "Helvetica Neue", Arial, sans-serif;
+  --display: "Space Grotesk", Inter, "Segoe UI", system-ui, -apple-system, sans-serif;
 }
 
 * { box-sizing: border-box; }
@@ -21,8 +52,8 @@
 body {
   margin: 0;
   min-height: 100vh;
-  background: var(--abyss);
-  color: var(--text);
+  background: var(--bg);
+  color: var(--fg);
   font: 400 16px/1.6 var(--sans);
   display: grid;
   place-items: center;
@@ -38,12 +69,25 @@ body {
   gap: 16px;
 }
 
+/* Marca, deasupra teancului. Pusă din CSS, nu din marcaj: pagina e un ȘIR de
+   HTML scris în `lib/witness-page.ts` (vezi antetul de acolo), iar un element
+   pur decorativ n-are ce căuta acolo unde se escapează date. `content: ""` o
+   ține în afara arborelui de accesibilitate — numele produsului e scris în
+   text dedesubt. Fișier, nu `data:`: politica e `img-src 'self'`. */
+.stack::before {
+  content: "";
+  justify-self: center;
+  width: 44px;
+  height: 44px;
+  background: center / contain no-repeat url("/logo.svg");
+}
+
 .card {
   width: 100%;
   max-width: 560px;
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 20px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
   padding: 32px;
 }
 
@@ -51,7 +95,7 @@ body {
   font: 700 11px/1 var(--sans);
   letter-spacing: 0.16em;
   text-transform: uppercase;
-  color: var(--muted);
+  color: var(--fg-muted);
   margin: 0 0 20px;
 }
 
@@ -60,8 +104,8 @@ body {
   align-items: center;
   gap: 14px;
   margin: 0 0 8px;
-  font: 700 26px/1.2 var(--sans);
-  letter-spacing: -0.02em;
+  font: 700 26px/1.2 var(--display);
+  letter-spacing: -0.025em;
 }
 
 .dot {
@@ -70,34 +114,41 @@ body {
   border-radius: 50%;
   flex: none;
 }
-.ok    .dot { background: var(--teal);  box-shadow: 0 0 0 5px rgb(38 198 181 / .15); }
-.bad   .dot { background: var(--alert); box-shadow: 0 0 0 5px rgb(240 82 77 / .15); }
-.unknown .dot { background: var(--muted); box-shadow: 0 0 0 5px rgb(148 163 184 / .12); }
+/* Aureola se face DIN culoarea bulinei, nu dintr-un `rgb()` scris alături.
+   Scris alături, e a doua definiție a aceleiași culori, iar la prima schimbare
+   se desparte de prima — adică o umbră de altă culoare decât punctul din
+   mijlocul ei, ceea ce nu se observă până nu te uiți fix la el. */
+.ok    .dot { background: var(--ok);
+              box-shadow: 0 0 0 5px color-mix(in srgb, var(--ok) 15%, transparent); }
+.bad   .dot { background: var(--bad);
+              box-shadow: 0 0 0 5px color-mix(in srgb, var(--bad) 15%, transparent); }
+.unknown .dot { background: var(--fg-muted);
+                box-shadow: 0 0 0 5px color-mix(in srgb, var(--fg-muted) 12%, transparent); }
 
-.ok .verdict    { color: var(--teal); }
-.bad .verdict   { color: var(--alert); }
-.unknown .verdict { color: var(--muted); }
+.ok .verdict    { color: var(--ok); }
+.bad .verdict   { color: var(--bad); }
+.unknown .verdict { color: var(--fg-muted); }
 
-.lede { margin: 0 0 24px; color: var(--muted); font-size: 15px; }
+.lede { margin: 0 0 24px; color: var(--fg-muted); font-size: 15px; }
 
-.rows { border-top: 1px solid var(--line); }
+.rows { border-top: 1px solid var(--border); }
 .row {
   display: flex;
   justify-content: space-between;
   gap: 16px;
   padding: 12px 0;
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--border);
   font-size: 14px;
 }
-.row span { color: var(--muted); }
-.row b { font: 600 14px/1.5 var(--mono); color: var(--text); }
+.row span { color: var(--fg-muted); }
+.row b { font: 600 14px/1.5 var(--mono); color: var(--fg); }
 
 .note {
   margin: 24px 0 0;
   font-size: 13px;
   line-height: 1.6;
-  color: var(--muted);
-  border-left: 2px solid var(--line);
+  color: var(--fg-muted);
+  border-left: 2px solid var(--border);
   padding-left: 14px;
 }
 
@@ -105,5 +156,5 @@ body {
   .ok .dot { animation: pulse 2.4s ease-in-out infinite; }
 }
 @keyframes pulse {
-  50% { box-shadow: 0 0 0 9px rgb(38 198 181 / 0); }
+  50% { box-shadow: 0 0 0 9px transparent; }
 }

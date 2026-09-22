@@ -26,8 +26,10 @@
  *
  * `default-src 'none'` și de acolo în sus doar ce s-a măsurat că e folosit: în
  * `lib/` și `app/` nu există niciun `<script>`, niciun `<style>`, niciun
- * `onclick` și nicio origine externă — singurele resurse sunt `/panel.css` și
- * `/martor.css`, de pe aceeași origine. `tests/security-headers.test.ts` scanează
+ * `onclick` și nicio origine externă — singurele resurse sunt `/panel.css`,
+ * `/martor.css` și `/logo.svg`, de pe aceeași origine. `img-src` rămâne
+ * `'self'` fără `data:`, iar foile de stil se sprijină pe asta: marca e un
+ * fișier, nu o adresă `data:` inlinată în CSS, care ar fi refuzată tăcut. `tests/security-headers.test.ts` scanează
  * sursele la fiecare rulare și pică dacă cineva adaugă ceva ce politica ar bloca.
  */
 

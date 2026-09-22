@@ -1,14 +1,14 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" role="img" aria-label="Sentinel">
-  <!-- The company mark, byte-for-byte the geometry served by the company site's
-       own /favicon.svg. Inline SVG rather than a PNG: one small file, no raster
-       assets to ship, and it stays sharp on any display.
+  <!-- Marca firmei. Fișier servit de la aceeași origine, NU o adresă `data:`
+       inline în foaia de stil: politica agregatorului e `img-src 'self'`, fără
+       `data:` (vezi `lib/csp.ts`), deci o marcă inlinată în CSS ar fi refuzată
+       de browser și n-ar apărea nicăieri — tăcut, fiindcă un fundal lipsă nu
+       dă nicio eroare vizibilă.
 
-       The same six nodes and the same two gradient stops also live in
-       `css/sentinel.css` (.brand-mark, as a data: URI) and in the aggregator's
-       `public/logo.svg`. Three copies exist because three content-security
-       policies differ, not because three marks do —
-       `tests/unit/test_design_system.py` compares their geometry and fails if
-       one of them drifts. -->
+       Aceeași geometrie stă în `sentinel/web/static/favicon.svg` și în
+       `.brand-mark` din `sentinel/web/static/css/sentinel.css`. Trei copii
+       fiindcă politicile diferă, nu fiindcă marca diferă;
+       `tests/unit/test_design_system.py` le compară și pică dacă una fuge. -->
   <defs>
     <linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#17CBA6"/>
