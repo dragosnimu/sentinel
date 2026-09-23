@@ -319,6 +319,7 @@ care a ținut valorile nu mai e pe stivă.
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import os
 import re
@@ -624,65 +625,344 @@ VALUE_EXEMPT: dict[str, tuple[dict[str, int], str]] = {
 # nu declarat. O valoare care nu se potrivește cu nicio instrucțiune rămâne
 # neexemptată, oricât de „la număr" ar sta scutirea.
 #
-# Derivarea rulează codul SURSĂ, `discover()` din `lib/migrate.ts` (care
-# cheamă `splitStatements` din `lib/sql-statements.ts`) prin `node --import
-# tsx`, nu o a doua parsare SQL scrisă aici în Python. O a doua implementare a
-# segmentării în instrucțiuni ar fi exact al doilea punct orb: dacă cele două
-# ar diferi pe un caz de margine (un `;` într-un literal, un comentariu de
-# bloc), garda ar putea fie respinge o migrație reală, fie accepta un secret pe
-# care „segmentarea ei" l-ar fi clasificat greșit ca sha256 legitim. Rulând
-# chiar codul care produce manifestul, nu există a doua opinie de contrazis.
+# ## A doua formă, până pe 23 septembrie 2026: rula `node --import tsx`
+#
+# Derivarea rula codul SURSĂ, `discover()` din `lib/migrate.ts`, prin `node
+# --import tsx`, ca să nu existe o a doua parsare SQL scrisă aici în Python —
+# motivul e cel din nota de mai jos, „De ce nu se reimplementează segmentarea".
+# Măsurat pe o clonă proaspătă, fără `npm ci` (nimeni nu-l rulează pentru suita
+# Python, nici local, nici în CI-ul care rulează doar `pytest`):
+# `aggregator/node_modules` lipsește, `node is None` sau directorul lipsă
+# întorcea `None` de fiecare dată, deci garda era roșie pe ORICE checkout
+# curat — exact genul de gardă pe care cineva o scoate.
+#
+# ## Forma de-acum: date comise, nu `node`
+#
+# `bin/generate-migrations-manifest.ts` scrie, la fiecare regenerare, și
+# `lib/migrations-manifest.sources.json` — comis în depozit, ca și
+# `migrations-manifest.ts`. Pentru fiecare instrucțiune conține textul
+# normalizat exact peste care s-a calculat `sha256`-ul (`sql`) și poziția lui
+# ÎN OCTEȚI în fișierul `.sql` de pe disc (`sourceStart`/`sourceEnd`). Vezi
+# capul lui `bin/generate-migrations-manifest.ts`, secțiunea „A doua ieșire",
+# pentru ce anume dovedește fiecare câmp.
+#
+# Verificarea de-aici, `_migration_statement_is_verified`, face DOUĂ lucruri,
+# niciunul dintre ele o parsare SQL:
+#
+#   1. `hashlib.sha256(sql) == sha256`-ul din manifest — un hash, nu o
+#      segmentare, peste un text pe care Python nu l-a produs, doar l-a citit;
+#   2. non-spațiile lui `sql`, în ordine, apar tot în ordine în octeții reali
+#      ai fișierului `.sql`, în felia `[sourceStart, sourceEnd)` — o proprietate
+#      ADEVĂRATĂ mereu pentru orice normalizare corectă (ea doar șterge
+#      comentarii și comprimă spații, nu adaugă și nu reordonează caractere),
+#      deci Python o poate cere fără să știe UNDE sunt comentariile sau
+#      literalii, doar CĂ non-spațiile stau în ordinea aia.
+#
+# Peste asta, `_verified_migration_statement_hashes` cere ca feliile
+# succesive dintr-un fișier să se ATINGĂ exact (sfârșitul uneia e începutul
+# următoarei, prima începe la octetul 0) — dacă un offset a fost falsificat,
+# fie apare o gaură, fie o suprapunere, iar fișierul ăla rămâne întreg
+# neverificat, ÎNAINTE să se uite cineva la vreun `sql`.
+#
+# ## De ce nu se reimplementează segmentarea
+#
+# O a doua implementare a spargerii în instrucțiuni (găsirea gărzilor, a
+# literalilor, a comentariilor de bloc) ar fi exact al doilea punct orb: dacă
+# cele două ar diferi pe un caz de margine (un `;` într-un literal, un
+# comentariu de bloc), garda ar putea fie respinge o migrație reală, fie
+# accepta un secret pe care „segmentarea ei" l-ar fi clasificat greșit ca
+# sha256 legitim. Verificarea de mai sus nu segmentează nimic — ia
+# SEGMENTAREA (offset-urile) ca DATĂ, produsă de codul sursă, și verifică doar
+# proprietăți generice de text (un hash, o subsecvență) peste ea.
 _MIGRATIONS_MANIFEST_REL = "aggregator/lib/migrations-manifest.ts"
+_MIGRATIONS_MANIFEST_SOURCES_REL = "aggregator/lib/migrations-manifest.sources.json"
 
-# Scriptul rulează cu `--input-type=module`, ca `import` să funcționeze direct
-# din `-e` — testat manual: fără el, Node tratează `-e` ca CommonJS și
-# `import` e o eroare de sintaxă. `cwd=aggregator/` face `./lib/migrate.ts` să
-# se rezolve la fel cum se rezolvă din `bin/generate-migrations-manifest.ts`.
-_MIGRATION_HASH_SCRIPT = (
-    'import { discover, MIGRATIONS_DIR } from "./lib/migrate.ts";\n'
-    "const migrations = discover(MIGRATIONS_DIR);\n"
-    "const hashes = [];\n"
-    "for (const m of migrations) for (const s of m.statements) hashes.push(s.sha256);\n"
-    "process.stdout.write(JSON.stringify(hashes));\n"
-)
+_WHITESPACE_RUN = re.compile(r"\s+")
+
+
+def _without_whitespace(text: str) -> str:
+    """`text` fără niciun caracter de spațiu alb — vezi `_is_ordered_subsequence`."""
+    return _WHITESPACE_RUN.sub("", text)
+
+
+def _is_ordered_subsequence(needle: str, haystack: str) -> bool:
+    """`True` dacă fiecare caracter din `needle`, ÎN ORDINE, apare în `haystack`.
+
+    Potrivire lacomă, de la stânga la dreapta — corectă pentru o verificare de
+    subsecvență (nu e o potrivire de tipar, deci nu are nevoie de backtracking).
+    Folosită ca să dovedească „textul normalizat chiar vine din felia asta a
+    fișierului", fără să știe nimic despre gărzi, literali sau comentarii SQL —
+    orice normalizare corectă doar ȘTERGE caractere și comprimă spații, nu
+    adaugă și nu reordonează, deci non-spațiile textului normalizat sunt mereu
+    o subsecvență a non-spațiilor sursei, pentru un text produs cinstit.
+    """
+    if not needle:
+        return True
+    pos = 0
+    target = needle[pos]
+    for ch in haystack:
+        if ch == target:
+            pos += 1
+            if pos == len(needle):
+                return True
+            target = needle[pos]
+    return False
+
+
+def _migration_statement_is_verified(
+        stmt: object, file_bytes: bytes, expected_start: int) -> tuple[bool, str | None, int]:
+    """Verifică O instrucțiune din `migrations-manifest.sources.json`.
+
+    Întoarce `(verificat, sha256_dacă_verificat, sourceEnd)`. `sourceEnd` se
+    întoarce chiar și la eșec — apelantul are nevoie de el ca să judece dacă
+    urmează o gaură sau o suprapunere, dar NU continuă să verifice restul
+    fișierului dacă orice instrucțiune a lui eșuează (vezi apelantul: un fișier
+    cu un offset stricat rămâne întreg neverificat, nu doar instrucțiunea aia).
+    """
+    if not isinstance(stmt, dict):
+        return False, None, expected_start
+    sql_text, start, end = stmt.get("sql"), stmt.get("sourceStart"), stmt.get("sourceEnd")
+    if not isinstance(sql_text, str) or not isinstance(start, int) or not isinstance(end, int):
+        return False, None, expected_start
+    if start != expected_start or end < start or end > len(file_bytes):
+        # Felia asta nu se ATINGE de precedenta, sau iese din fișier — exact
+        # simptomul unui offset falsificat. Nu se mai uită la conținut.
+        return False, None, end if isinstance(end, int) else expected_start
+    span = file_bytes[start:end]
+    try:
+        span_text = span.decode("utf-8")
+    except UnicodeDecodeError:
+        return False, None, end
+    if not _is_ordered_subsequence(_without_whitespace(sql_text), _without_whitespace(span_text)):
+        # `sql` nu se poate deriva din octeții reali ai feliei — fabricat, sau
+        # offset-ul arată în altă parte decât instrucțiunea pe care pretinde.
+        return False, None, end
+    return True, hashlib.sha256(sql_text.encode("utf-8")).hexdigest(), end
 
 
 @functools.lru_cache(maxsize=None)
-def _real_migration_statement_hashes() -> frozenset[str] | None:
-    """sha256-urile REALE ale instrucțiunilor SQL din `aggregator/migrations/`.
+def _real_migration_statement_hashes(repo: Path = REPO) -> frozenset[str] | None:
+    """sha256-urile instrucțiunilor SQL VERIFICATE contra `aggregator/migrations/`.
 
-    `None` dacă nu se pot deriva AICI — `node` lipsește, `aggregator/
-    node_modules` lipsește, procesul a picat sau ieșirea nu e JSON valid. Nu e
-    „fișierul e curat", e „n-am putut verifica": apelantul tratează `None` ca
-    mulțime goală de scutiri, deci fiecare hexa din manifest rămâne
-    NEexemptată — o gardă de scurgere care nu poate verifica autenticitatea
-    unei valori nu are voie s-o lase să treacă din lipsă de unealtă.
+    `None` doar dacă `migrations-manifest.sources.json` însuși lipsește sau nu
+    are forma așteptată — apelantul tratează `None` ca mulțime goală de
+    scutiri, deci fiecare hexa din manifest rămâne NEexemptată. „N-am putut
+    verifica" nu e „fișierul e curat".
 
-    Cache fără argumente: procesul `node` costă, iar valoarea nu se schimbă în
-    timpul unei rulări de pytest — `aggregator/migrations/` nu se editează sub
-    picioarele suitei.
+    Un fișier de migrație individual care nu se poate verifica (offset
+    stricat, .sql lipsă, subsecvență care nu se potrivește la O SINGURĂ
+    instrucțiune) NU întoarce `None` pentru tot — dar întoarce fișierul ÎNTREG
+    neverificat, nu doar instrucțiunea stricată: `expected_start` al fiecărei
+    instrucțiuni depinde de `sourceEnd`-ul precedentei din același fișier, deci
+    o instrucțiune stricată rupe și verificarea celor de după ea. Eșec ÎNCHIS
+    pe fișier, nu pe tot depozitul — celelalte fișiere de migrație rămân
+    verificate normal.
+
+    `repo`: parametrizat pentru falsificare (vezi testele
+    `test_migration_hash_derivation_*` de mai jos) — altfel testele ar trebui
+    să scrie peste `aggregator/lib/migrations-manifest.sources.json` REAL ca
+    să verifice o cale de eșec, exact tiparul interzis la `_scan_secret_store`.
+    Cache pe `repo`: valoarea nu se schimbă în timpul unei rulări de pytest
+    pentru același `repo`.
     """
-    node = shutil.which("node")
-    if node is None:
-        return None
-    if not (REPO / "aggregator" / "node_modules").is_dir():
+    sources_path = repo / _MIGRATIONS_MANIFEST_SOURCES_REL
+    try:
+        raw = sources_path.read_text(encoding="utf-8")
+    except OSError:
         return None
     try:
-        out = subprocess.run(
-            [node, "--import", "tsx", "--input-type=module", "-e", _MIGRATION_HASH_SCRIPT],
-            cwd=REPO / "aggregator", capture_output=True, encoding="utf-8",
-            errors="replace", timeout=60)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if out.returncode != 0 or not out.stdout:
-        return None
-    try:
-        hashes = json.loads(out.stdout)
+        data = json.loads(raw)
     except json.JSONDecodeError:
         return None
-    if not isinstance(hashes, list) or not all(isinstance(h, str) for h in hashes):
+    migrations = data.get("migrations") if isinstance(data, dict) else None
+    if not isinstance(migrations, list):
         return None
-    return frozenset(hashes)
+
+    verified: set[str] = set()
+    for migration in migrations:
+        if not isinstance(migration, dict):
+            continue
+        file_name, statements = migration.get("file"), migration.get("statements")
+        if not isinstance(file_name, str) or not isinstance(statements, list):
+            continue
+        try:
+            file_bytes = (repo / "aggregator" / "migrations" / file_name).read_bytes()
+        except OSError:
+            continue  # fișierul .sql lipsește — nimic din fișierul ăsta nu se verifică
+
+        expected_start = 0
+        file_hashes: list[str] = []
+        file_ok = True
+        for stmt in statements:
+            ok, digest, expected_start = _migration_statement_is_verified(
+                stmt, file_bytes, expected_start)
+            if not ok:
+                file_ok = False
+                break
+            assert digest is not None
+            file_hashes.append(digest)
+        if file_ok:
+            verified.update(file_hashes)
+    return frozenset(verified)
+
+
+def _fixture_migration_sql() -> str:
+    """Un fișier de migrație minimal, cu DOUĂ instrucțiuni, pentru testele de
+    mai jos. Fără spații suplimentare în interiorul instrucțiunilor, dinadins:
+    textul normalizat al fiecăreia e identic, caracter cu caracter, cu partea
+    lui SQL din fișier — testele pot verifica egalitatea directă, fără să mai
+    simuleze normalizarea aici (care ar fi exact a doua implementare interzisă
+    la `bin/generate-migrations-manifest.ts`)."""
+    return (
+        "-- @guard table foo\n"
+        "CREATE TABLE foo (id INT);\n"
+        "-- @guard table bar\n"
+        "CREATE TABLE bar (id INT);\n"
+    )
+
+
+def _fixture_statement_offsets() -> tuple[int, int]:
+    """Offset-urile (octeți) ale celor două `;` din `_fixture_migration_sql`.
+    ASCII curat, deci indexul de caracter Python e chiar offset-ul de octet."""
+    content = _fixture_migration_sql()
+    first_end = content.index(";") + 1
+    second_end = content.index(";", first_end) + 1
+    return first_end, second_end
+
+
+def _write_migration_fixture(tmp_path: Path, statements: list[dict]) -> Path:
+    """Scrie un `aggregator/` minimal sub `tmp_path`, cu UN fișier de migrație
+    (`_fixture_migration_sql`) și `migrations-manifest.sources.json` cu
+    `statements` date de test. Fiecare test strică UN câmp direct în lista pe
+    care o dă, ca falsificarea să fie vizibilă în testul însuși, nu ascunsă
+    într-un generator comun."""
+    migrations_dir = tmp_path / "aggregator" / "migrations"
+    migrations_dir.mkdir(parents=True)
+    # `write_bytes`, nu `write_text`: pe Windows, modul text traduce `\n` în
+    # `\r\n` la scriere — offset-urile din `_fixture_statement_offsets` s-ar
+    # decala după primul `\n`, iar testul ar verifica altceva decât crede.
+    (migrations_dir / "0001_x.sql").write_bytes(_fixture_migration_sql().encode("utf-8"))
+    lib_dir = tmp_path / "aggregator" / "lib"
+    lib_dir.mkdir(parents=True)
+    sources = {"migrations": [{"file": "0001_x.sql", "statements": statements}]}
+    (lib_dir / "migrations-manifest.sources.json").write_text(
+        json.dumps(sources), encoding="utf-8")
+    return tmp_path
+
+
+def test_is_ordered_subsequence_examples() -> None:
+    """`_migration_statement_is_verified` leagă `sql`-ul normalizat de octeții
+    reali ai unei felii PRIN funcția asta, fără să parseze SQL. Dacă ar accepta
+    orice, verificarea de mai jos ar deveni o ușă; dacă ar respinge o
+    potrivire adevărată, ar deveni o gardă mereu roșie pe migrații reale."""
+    assert _is_ordered_subsequence("", "orice") is True
+    assert _is_ordered_subsequence("abc", "a__b__c") is True
+    assert _is_ordered_subsequence("abc", "a__c__b") is False  # ordinea contează
+    assert _is_ordered_subsequence("abc", "ab") is False  # lipsește un caracter
+    assert _is_ordered_subsequence("abc", "") is False
+
+
+def test_migration_hash_derivation_is_none_without_a_sources_file(tmp_path) -> None:
+    """Ce previne: dacă `migrations-manifest.sources.json` lipsește (cineva a
+    șters generatul, sau nu l-a comis), apelantul NU are voie să creadă
+    manifestul „curat" — trebuie să vadă `None` (nimic verificat), nu mulțimea
+    goală tratată ca „am verificat și n-am găsit nimic de exemptat"."""
+    (tmp_path / "aggregator" / "lib").mkdir(parents=True)
+    assert _real_migration_statement_hashes(repo=tmp_path) is None
+
+
+def test_migration_hash_derivation_is_none_on_malformed_json(tmp_path) -> None:
+    """Ce previne: un `migrations-manifest.sources.json` stricat la o scriere
+    întreruptă (proces omorât la jumătatea `writeFileSync`) nu are voie să fie
+    citit ca „zero migrații, nimic de verificat" — e „n-am putut citi",
+    tratat identic cu lipsa fișierului, nu ca mulțime goală validă."""
+    lib_dir = tmp_path / "aggregator" / "lib"
+    lib_dir.mkdir(parents=True)
+    (lib_dir / "migrations-manifest.sources.json").write_text("{not json", encoding="utf-8")
+    assert _real_migration_statement_hashes(repo=tmp_path) is None
+
+
+def test_migration_hash_derivation_verifies_real_untouched_statements(tmp_path) -> None:
+    """Ce previne: dacă subsecvența sau verificarea offset-urilor devine PREA
+    strictă, instrucțiuni SQL reale, nefalsificate, ar pica verificarea — iar
+    apelantul le-ar raporta drept „hexa nu s-a putut verifica", înecând mesajul
+    real sub zeci de rânduri identice pe orice checkout curat, inclusiv al
+    operatorului. Exact tiparul din CLAUDE.md: o gardă prea strictă pe lucru
+    corect e o gardă pe care cineva o comentează la 22:00."""
+    first_end, second_end = _fixture_statement_offsets()
+    statements = [
+        {"index": 1, "sql": "CREATE TABLE foo (id INT)", "sourceStart": 0, "sourceEnd": first_end},
+        {"index": 2, "sql": "CREATE TABLE bar (id INT)",
+         "sourceStart": first_end, "sourceEnd": second_end},
+    ]
+    repo = _write_migration_fixture(tmp_path, statements)
+    result = _real_migration_statement_hashes(repo=repo)
+    assert result == frozenset({
+        hashlib.sha256(b"CREATE TABLE foo (id INT)").hexdigest(),
+        hashlib.sha256(b"CREATE TABLE bar (id INT)").hexdigest(),
+    })
+
+
+def test_migration_hash_derivation_rejects_fabricated_sql_text(tmp_path) -> None:
+    """Ce previne: un secret real lipit peste câmpul `sql` din
+    `migrations-manifest.sources.json` — o editare de mână, un merge prost
+    rezolvat — nu are voie să iasă drept sha256 verificat doar fiindcă cineva a
+    scris și un offset lângă el. Textul fabricat nu apare, în ordine, în
+    octeții reali ai feliei, deci `_is_ordered_subsequence` îl respinge — și,
+    fiindcă o instrucțiune stricată rupe verificarea restului fișierului (vezi
+    docstring-ul lui `_real_migration_statement_hashes`), nici instrucțiunea
+    REALĂ de dinaintea ei nu mai iese verificată."""
+    first_end, second_end = _fixture_statement_offsets()
+    fabricated = "SENTINEL_BEACON_SECRET=" + "a" * 40  # nu apare deloc în fișierul .sql
+    statements = [
+        {"index": 1, "sql": "CREATE TABLE foo (id INT)", "sourceStart": 0, "sourceEnd": first_end},
+        {"index": 2, "sql": fabricated, "sourceStart": first_end, "sourceEnd": second_end},
+    ]
+    repo = _write_migration_fixture(tmp_path, statements)
+    result = _real_migration_statement_hashes(repo=repo)
+    assert result is not None
+    assert hashlib.sha256(fabricated.encode("utf-8")).hexdigest() not in result
+    assert hashlib.sha256(b"CREATE TABLE foo (id INT)").hexdigest() not in result
+    assert result == frozenset()
+
+
+def test_migration_hash_derivation_rejects_an_offset_shifted_by_one_byte(tmp_path) -> None:
+    """Ce previne: un offset falsificat cu un singur octet ar tăia felia unei
+    instrucțiuni cu un caracter în minus sau în plus — genul de greșeală pe
+    care un merge prost rezolvat sau o editare de mână a `sources.json`-ului
+    l-ar produce. Feliile succesive trebuie să se ATINGĂ exact; un decalaj de
+    un octet rupe asta ÎNAINTE ca cineva să se uite la conținut."""
+    first_end, second_end = _fixture_statement_offsets()
+    statements = [
+        {"index": 1, "sql": "CREATE TABLE foo (id INT)", "sourceStart": 0, "sourceEnd": first_end},
+        # sourceStart cu un octet mai devreme decât sourceEnd-ul precedentei —
+        # feliile nu se mai ating.
+        {"index": 2, "sql": "CREATE TABLE bar (id INT)",
+         "sourceStart": first_end - 1, "sourceEnd": second_end},
+    ]
+    repo = _write_migration_fixture(tmp_path, statements)
+    result = _real_migration_statement_hashes(repo=repo)
+    assert result == frozenset()
+
+
+def test_real_migration_hashes_cover_every_hash_in_the_committed_manifest() -> None:
+    """Proba care contează pentru operator, izolată de restul suitei de
+    scanare: pe depozitul REAL, fără `node`, fiecare sha256 din
+    `migrations-manifest.ts` trebuie să se verifice din `sources.json` — altfel
+    `test_no_secrets_anywhere_including_fixtures` înghite mesajul real sub zeci
+    de „hexa neverificat" pe orice checkout curat, chiar și al operatorului.
+    Măsurat pe 23 septembrie 2026: 78 de instrucțiuni."""
+    manifest_text = (REPO / _MIGRATIONS_MANIFEST_REL).read_text(encoding="utf-8")
+    real_hashes = set(re.findall(r'sha256:\s*"([0-9a-f]{64})"', manifest_text))
+    assert len(real_hashes) == 78, (
+        f"numărul de hexa din manifest s-a schimbat ({len(real_hashes)}) — "
+        "actualizează măsurătoarea din docstring-ul ăstuia odată cu manifestul")
+    derived = _real_migration_statement_hashes()
+    assert derived is not None, "sources.json real lipsește sau e stricat"
+    lipsa = real_hashes - derived
+    assert not lipsa, (
+        f"{len(lipsa)} sha256 din manifestul REAL nu s-au putut verifica din "
+        "migrations-manifest.sources.json")
 
 
 # Fișierele din care se EXTRAG formele de probă, cu podeaua măsurată azi. Podeaua
@@ -1071,13 +1351,14 @@ def _scan_tree_for_secrets(
                 # DE CE, sub tăierea la 20 din mesajul de eșec al testului. O
                 # singură linie, care numără câte au rămas neverificate.
                 #
-                # Doar hexa e neverificabilă din lipsă de `node` — celelalte forme
-                # (base64, base32, orice altă formă din `SECRETS`) nu depind deloc
-                # de derivare, deci n-au voie să dispară odată cu ea. Trec mai
-                # departe prin `_unexempted_value_hits`, cu hexa scoasă din calcul
-                # aici ca să nu fie raportată A DOUA oară, individual, pe lângă
-                # linia de sumar. „N-am putut verifica” nu are voie să fie mai
-                # permisiv decât „am verificat” pentru NICIO formă.
+                # Doar hexa e neverificabilă când `migrations-manifest.sources.json`
+                # lipsește sau e stricat — celelalte forme (base64, base32, orice
+                # altă formă din `SECRETS`) nu depind deloc de derivare, deci n-au
+                # voie să dispară odată cu ea. Trec mai departe prin
+                # `_unexempted_value_hits`, cu hexa scoasă din calcul aici ca să nu
+                # fie raportată A DOUA oară, individual, pe lângă linia de sumar.
+                # „N-am putut verifica” nu are voie să fie mai permisiv decât
+                # „am verificat” pentru NICIO formă.
                 non_hex_per_version = [
                     (source, [hit for hit in hits if hit[1] != SHAPE_HEX])
                     for source, hits in per_version]
@@ -1087,10 +1368,10 @@ def _scan_tree_for_secrets(
                     default=0)
                 if gasite:
                     offenders.append(
-                        f"{rel} — {gasite} hexa de 64 nu s-au putut verifica: node "
-                        "sau aggregator/node_modules indisponibile aici, deci sha256-"
-                        "urile reale din aggregator/migrations/ nu s-au putut deriva "
-                        "— „neverificat”, nu „curat”")
+                        f"{rel} — {gasite} hexa de 64 nu s-au putut verifica: "
+                        f"{_MIGRATIONS_MANIFEST_SOURCES_REL} lipsește sau nu are forma "
+                        "așteptată, deci sha256-urile reale din aggregator/migrations/ "
+                        "nu s-au putut deriva — „neverificat”, nu „curat”")
             else:
                 offenders += _unexempted_value_hits(rel, per_version)
     except Exception as exc:

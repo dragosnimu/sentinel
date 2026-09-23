@@ -1,0 +1,553 @@
+{
+  "_comment": "GENERAT — nu edita manual. Regenerează cu `npm run generate-migrations-manifest`, din `aggregator/`. Citit doar de tests/security/test_repo_is_sanitised.py, ca să verifice sha256-urile din migrations-manifest.ts fără `node`. Vezi capul lui bin/generate-migrations-manifest.ts.",
+  "migrations": [
+    {
+      "file": "0001_core.sql",
+      "statements": [
+        {
+          "index": 1,
+          "sql": "CREATE TABLE instances ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT 'identitatea instalarii, /etc/sentinel/instance_id', label VARCHAR(190) NULL COMMENT 'nume afisat, ales de operator, NICIODATA cheie', enabled TINYINT(1) NOT NULL DEFAULT 1 COMMENT '0 = loturile ei se refuza, dar istoria ramane', ship_secret_enc VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NULL COMMENT 'AES-256-GCM; NU se scrie niciodata in clar', ship_secret_set_at DATETIME(6) NULL, first_seen_at DATETIME(6) NULL COMMENT 'primul lot acceptat; NULL = configurata, inca nimic', last_batch_at DATETIME(6) NULL, last_batch_seq BIGINT UNSIGNED NULL COMMENT 'ultimul batch_seq acceptat; scaderea lui e o reluare', last_source_ip INET6 NULL COMMENT 'de unde a venit ultimul lot; diagnostic, nu autorizare', created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6), PRIMARY KEY (id), UNIQUE KEY uk_instances_instance_id (instance_id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='o instalare Sentinel; secretele stau cifrate'",
+          "sourceStart": 0,
+          "sourceEnd": 6460
+        },
+        {
+          "index": 2,
+          "sql": "CREATE TABLE audit_entries ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, source_id BIGINT NOT NULL COMMENT 'audit_log.id de pe server; unic doar in cadrul instantei', at DATETIME(6) NOT NULL COMMENT 'UTC, convertit la ingestie', actor TEXT NOT NULL, source TEXT NOT NULL, operation TEXT NOT NULL, target TEXT NULL, params JSON NOT NULL, result TEXT NOT NULL, detail MEDIUMTEXT NULL, prev_hash VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL COMMENT 'entry_hash-ul randului anterior; NULL doar la primul', entry_hash VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, received_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), batch_seq BIGINT UNSIGNED NULL COMMENT 'lotul in care a sosit', PRIMARY KEY (id), UNIQUE KEY uk_audit_entries_source (instance_id, source_id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='replica audit_log; append-only, impus prin triggere'",
+          "sourceStart": 6460,
+          "sourceEnd": 9447
+        },
+        {
+          "index": 3,
+          "sql": "CREATE INDEX ix_audit_entries_instance_at ON audit_entries (instance_id, at)",
+          "sourceStart": 9447,
+          "sourceEnd": 9913
+        },
+        {
+          "index": 4,
+          "sql": "CREATE TRIGGER audit_entries_no_update BEFORE UPDATE ON audit_entries FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'audit_entries is append-only (UPDATE refused)'",
+          "sourceStart": 9913,
+          "sourceEnd": 11382
+        },
+        {
+          "index": 5,
+          "sql": "CREATE TRIGGER audit_entries_no_delete BEFORE DELETE ON audit_entries FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'audit_entries is append-only (DELETE refused)'",
+          "sourceStart": 11382,
+          "sourceEnd": 11608
+        },
+        {
+          "index": 6,
+          "sql": "CREATE TABLE sync_cursors ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, stream VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT 'audit_log, si restul fluxurilor din E3', last_source_id BIGINT NOT NULL DEFAULT 0 COMMENT 'cel mai mare source_id acceptat; filigranul ecouat', rows_ingested BIGINT UNSIGNED NOT NULL DEFAULT 0, last_batch_seq BIGINT UNSIGNED NULL, first_seen_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6), PRIMARY KEY (id), UNIQUE KEY uk_sync_cursors_stream (instance_id, stream) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='ce a ajuns, per instanta si flux; nu ce s-a trimis'",
+          "sourceStart": 11608,
+          "sourceEnd": 12992
+        }
+      ]
+    },
+    {
+      "file": "0002_chain.sql",
+      "statements": [
+        {
+          "index": 1,
+          "sql": "CREATE TABLE audit_chain_state ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, status VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT 'ok | broken | unknown; lipsa randului = neverificat', checked_links BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'cate legaturi s-au comparat la ultima rulare', verified_through BIGINT NULL COMMENT 'cel mai mare source_id pana la care lantul e legat', first_source_id BIGINT NULL COMMENT 'capatul de jos al copiei, fixat la prima verificare', first_prev_hash VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL, break_source_id BIGINT NULL COMMENT 'randul la care lantul nu se mai leaga', break_detail TEXT NULL, broken_at DATETIME(6) NULL COMMENT 'cand s-a vazut PRIMA oara, nu ultima rulare', last_run_at DATETIME(6) NOT NULL, last_run_kind VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT 'ingest | scheduled — cine a rulat verificarea', created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6), PRIMARY KEY (id), UNIQUE KEY uk_audit_chain_state_instance (instance_id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='verificarea lantului de audit; lipsa randului = neverificat'",
+          "sourceStart": 0,
+          "sourceEnd": 5090
+        }
+      ]
+    },
+    {
+      "file": "0003_entities.sql",
+      "statements": [
+        {
+          "index": 1,
+          "sql": "CREATE TABLE asset_entries ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, source_id BIGINT NOT NULL COMMENT 'assets.id de pe server', name TEXT NOT NULL, kind TEXT NOT NULL COMMENT 'web|service|container|database|host, fara CHECK', criticality SMALLINT NOT NULL, is_internet_exposed TINYINT(1) NOT NULL, protected TINYINT(1) NOT NULL COMMENT '1 = nicio procedura automata nu are voie sa-l atinga', first_seen DATETIME(6) NOT NULL, last_seen DATETIME(6) NOT NULL, received_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), batch_seq BIGINT UNSIGNED NULL, PRIMARY KEY (id), UNIQUE KEY uk_asset_entries_source (instance_id, source_id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='subset din assets; harta de infrastructura NU pleaca de pe server'",
+          "sourceStart": 0,
+          "sourceEnd": 7876
+        },
+        {
+          "index": 2,
+          "sql": "CREATE INDEX ix_asset_entries_exposed ON asset_entries (instance_id, is_internet_exposed, criticality)",
+          "sourceStart": 7876,
+          "sourceEnd": 8040
+        },
+        {
+          "index": 3,
+          "sql": "CREATE TABLE asset_tags ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, source_id BIGINT NOT NULL COMMENT 'assets.id de pe server', tag VARCHAR(190) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, PRIMARY KEY (id), UNIQUE KEY uk_asset_tags (instance_id, source_id, tag) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='assets.tags, desfasurat'",
+          "sourceStart": 8040,
+          "sourceEnd": 9686
+        },
+        {
+          "index": 4,
+          "sql": "CREATE TABLE actor_entries ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, actor_key VARCHAR(190) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, kind TEXT NOT NULL COMMENT 'ip|cluster, fara CHECK', killchain_stage SMALLINT NOT NULL, stage_entered_at DATETIME(6) NOT NULL, first_seen DATETIME(6) NOT NULL, last_seen DATETIME(6) NOT NULL, event_count BIGINT NOT NULL, detection_count BIGINT NOT NULL, is_known_scanner TINYINT(1) NOT NULL, risk_score SMALLINT NOT NULL, is_blocked TINYINT(1) NOT NULL, is_allowlisted TINYINT(1) NOT NULL, notes TEXT NULL, received_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), batch_seq BIGINT UNSIGNED NULL, PRIMARY KEY (id), UNIQUE KEY uk_actor_entries_source (instance_id, actor_key) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='replica actors; cheia sursei e actor_key, nu un id'",
+          "sourceStart": 9686,
+          "sourceEnd": 11379
+        },
+        {
+          "index": 5,
+          "sql": "CREATE INDEX ix_actor_entries_risk ON actor_entries (instance_id, risk_score)",
+          "sourceStart": 11379,
+          "sourceEnd": 11511
+        },
+        {
+          "index": 6,
+          "sql": "CREATE TABLE actor_ips ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, actor_key VARCHAR(190) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, ip INET6 NOT NULL, PRIMARY KEY (id), UNIQUE KEY uk_actor_ips (instance_id, actor_key, ip), KEY ix_actor_ips_ip (instance_id, ip) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='actors.member_ips, desfasurat; INET6 nativ'",
+          "sourceStart": 11511,
+          "sourceEnd": 12354
+        },
+        {
+          "index": 7,
+          "sql": "CREATE TABLE actor_attrs ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, actor_key VARCHAR(190) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, kind ENUM('country','asn','user_agent','ja4','reputation','targeted_asset') NOT NULL, value TEXT NOT NULL, value_hash BINARY(32) NOT NULL COMMENT 'SHA-256 peste value; calculat la ingestie', PRIMARY KEY (id), UNIQUE KEY uk_actor_attrs (instance_id, actor_key, kind, value_hash), KEY ix_actor_attrs_kind (instance_id, kind, value_hash) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='cinci tablouri de atribute + targeted_assets, un discriminator'",
+          "sourceStart": 12354,
+          "sourceEnd": 14229
+        },
+        {
+          "index": 8,
+          "sql": "CREATE TABLE detection_entries ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, source_id BIGINT NOT NULL COMMENT 'detections.id de pe server', ts DATETIME(6) NOT NULL, rule_id TEXT NOT NULL, rule_family TEXT NOT NULL, severity TEXT NOT NULL COMMENT 'info|low|medium|high|critical, fara CHECK', score DECIMAL(6,2) NULL COMMENT 'z-scor robust, calculat pe server', actor_key VARCHAR(190) CHARACTER SET ascii COLLATE ascii_bin NULL, asset_source_id BIGINT NULL, incident_source_id BIGINT NULL, src_ip INET6 NULL, dst_port INT NULL, evidence JSON NOT NULL, suppressed TINYINT(1) NOT NULL, suppress_reason TEXT NULL, received_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), batch_seq BIGINT UNSIGNED NULL, PRIMARY KEY (id), UNIQUE KEY uk_detection_entries_source (instance_id, source_id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='replica detections; referintele raman atarnate, fara chei straine'",
+          "sourceStart": 14229,
+          "sourceEnd": 16147
+        },
+        {
+          "index": 9,
+          "sql": "CREATE INDEX ix_detection_entries_ts ON detection_entries (instance_id, ts)",
+          "sourceStart": 16147,
+          "sourceEnd": 16283
+        },
+        {
+          "index": 10,
+          "sql": "CREATE INDEX ix_detection_entries_incident ON detection_entries (instance_id, incident_source_id)",
+          "sourceStart": 16283,
+          "sourceEnd": 16451
+        },
+        {
+          "index": 11,
+          "sql": "CREATE TABLE detection_events ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, detection_source_id BIGINT NOT NULL, event_source_id BIGINT NOT NULL COMMENT 'raw_events.id de pe server', PRIMARY KEY (id), UNIQUE KEY uk_detection_events (instance_id, detection_source_id, event_source_id), KEY ix_detection_events_event (instance_id, event_source_id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='detections.event_ids; motorul expedierii de dovezi din E4'",
+          "sourceStart": 16451,
+          "sourceEnd": 17389
+        },
+        {
+          "index": 12,
+          "sql": "CREATE TABLE incident_entries ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, source_id BIGINT NOT NULL COMMENT 'incidents.id de pe server', fingerprint VARCHAR(190) NOT NULL COMMENT 'NU e unica aici; vezi comentariul de deasupra', status TEXT NOT NULL COMMENT 'open|acknowledged|resolved|..., fara CHECK', severity TEXT NOT NULL, ai_severity TEXT NULL, ai_verdict JSON NULL, ai_confidence DECIMAL(3,2) NULL, ai_analyzed_at DATETIME(6) NULL, title TEXT NOT NULL, summary TEXT NULL, actor_key VARCHAR(190) CHARACTER SET ascii COLLATE ascii_bin NULL, asset_source_id BIGINT NULL, detection_count INT NOT NULL, created_at DATETIME(6) NOT NULL, first_detection_at DATETIME(6) NOT NULL, last_detection_at DATETIME(6) NOT NULL, acknowledged_by TEXT NULL, acknowledged_at DATETIME(6) NULL, resolved_at DATETIME(6) NULL, resolution_note TEXT NULL, notified_at DATETIME(6) NULL, received_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), batch_seq BIGINT UNSIGNED NULL, PRIMARY KEY (id), UNIQUE KEY uk_incident_entries_source (instance_id, source_id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='replica incidents; amprenta NU e unica aici, dinadins'",
+          "sourceStart": 17389,
+          "sourceEnd": 20416
+        },
+        {
+          "index": 13,
+          "sql": "CREATE INDEX ix_incident_entries_status ON incident_entries (instance_id, status(64), last_detection_at)",
+          "sourceStart": 20416,
+          "sourceEnd": 20587
+        },
+        {
+          "index": 14,
+          "sql": "CREATE INDEX ix_incident_entries_fingerprint ON incident_entries (instance_id, fingerprint, first_detection_at)",
+          "sourceStart": 20587,
+          "sourceEnd": 20918
+        },
+        {
+          "index": 15,
+          "sql": "CREATE TABLE incident_timeline_entries ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, source_id BIGINT NOT NULL COMMENT 'incident_timeline.id de pe server', incident_source_id BIGINT NOT NULL, at DATETIME(6) NOT NULL, kind TEXT NOT NULL COMMENT 'detection|action|note|ai_verdict|status', actor TEXT NULL, detail JSON NOT NULL, received_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), batch_seq BIGINT UNSIGNED NULL, PRIMARY KEY (id), UNIQUE KEY uk_incident_timeline_source (instance_id, source_id), KEY ix_incident_timeline_incident (instance_id, incident_source_id, at) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='replica incident_timeline; append-only la sursa'",
+          "sourceStart": 20918,
+          "sourceEnd": 21915
+        },
+        {
+          "index": 16,
+          "sql": "CREATE TABLE blocklist_entries ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, source_id BIGINT NOT NULL COMMENT 'blocklist.id de pe server', ip INET6 NOT NULL, prefix_len SMALLINT NULL COMMENT 'NULL = o singura adresa', net_start_bin VARBINARY(16) NULL, net_end_bin VARBINARY(16) NULL, cidr_text VARCHAR(45) NULL COMMENT 'forma citibila, pentru panou', reason TEXT NOT NULL, rule_id TEXT NULL, incident_source_id BIGINT NULL, actor_key VARCHAR(190) CHARACTER SET ascii COLLATE ascii_bin NULL, blocked_at DATETIME(6) NOT NULL, expires_at DATETIME(6) NULL COMMENT 'NULL = permanent', ttl_seconds INT NULL, hit_count BIGINT NOT NULL COMMENT 'citit din contorul nftables', last_hit_at DATETIME(6) NULL, created_by TEXT NOT NULL COMMENT 'auto|telegram:<id>|operator:<user>', active TINYINT(1) NOT NULL, unblocked_at DATETIME(6) NULL, unblocked_by TEXT NULL, unblock_reason TEXT NULL, received_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), batch_seq BIGINT UNSIGNED NULL, PRIMARY KEY (id), UNIQUE KEY uk_blocklist_entries_source (instance_id, source_id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='replica blocklist; unicitatea pe ip activ NU se recreeaza'",
+          "sourceStart": 21915,
+          "sourceEnd": 24691
+        },
+        {
+          "index": 17,
+          "sql": "CREATE INDEX ix_blocklist_entries_range ON blocklist_entries (instance_id, net_start_bin, net_end_bin)",
+          "sourceStart": 24691,
+          "sourceEnd": 24915
+        },
+        {
+          "index": 18,
+          "sql": "CREATE INDEX ix_blocklist_entries_active ON blocklist_entries (instance_id, active, blocked_at)",
+          "sourceStart": 24915,
+          "sourceEnd": 25079
+        }
+      ]
+    },
+    {
+      "file": "0004_health.sql",
+      "statements": [
+        {
+          "index": 1,
+          "sql": "CREATE TABLE selfcheck_state_entries ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, check_key VARCHAR(190) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL COMMENT 'selfcheck_state.key de pe server; KEY e rezervat aici', status TEXT NOT NULL COMMENT 'ok|degraded|down|unknown, fara CHECK', title TEXT NOT NULL, detail TEXT NOT NULL, facts JSON NOT NULL, since DATETIME(6) NOT NULL COMMENT 'de cand e in starea CURENTA; se misca doar cu status', last_seen DATETIME(6) NOT NULL, last_alert_at DATETIME(6) NULL, stale TINYINT(1) NOT NULL COMMENT '1 = ultima rulare a fost incompleta, cifra e ultima stiuta', received_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), batch_seq BIGINT UNSIGNED NULL, PRIMARY KEY (id), UNIQUE KEY uk_selfcheck_state_entries (instance_id, check_key) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='ultimul rezultat per verificare; randurile se compara, nu se acumuleaza'",
+          "sourceStart": 0,
+          "sourceEnd": 8029
+        },
+        {
+          "index": 2,
+          "sql": "CREATE TABLE selfcheck_run_entries ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, source_id BIGINT NOT NULL COMMENT 'selfcheck_runs.id de pe server', started_at DATETIME(6) NOT NULL, duration_ms INT NULL, worst_status TEXT NOT NULL, checks_run INT NOT NULL, checks_bad INT NOT NULL, received_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), batch_seq BIGINT UNSIGNED NULL, PRIMARY KEY (id), UNIQUE KEY uk_selfcheck_run_entries_source (instance_id, source_id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='cate o rulare de auto-verificare; scrisa o data, la sfarsit'",
+          "sourceStart": 8029,
+          "sourceEnd": 9065
+        },
+        {
+          "index": 3,
+          "sql": "CREATE INDEX ix_selfcheck_run_entries_recent ON selfcheck_run_entries (instance_id, started_at)",
+          "sourceStart": 9065,
+          "sourceEnd": 9397
+        },
+        {
+          "index": 4,
+          "sql": "CREATE TABLE availability_rollup_entries ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, asset_source_id BIGINT NOT NULL COMMENT 'assets.id de pe server; fara cheie straina', day DATE NOT NULL, samples INT NOT NULL, up_samples INT NOT NULL, degraded_samples INT NOT NULL, down_samples INT NOT NULL, uptime_pct DECIMAL(6,3) NULL COMMENT 'degradat conteaza ca sus; rotunjirea e a serverului', p50_latency_ms INT NULL, p95_latency_ms INT NULL, p99_latency_ms INT NULL, max_latency_ms INT NULL, incidents_count INT NOT NULL, longest_outage_s INT NOT NULL, received_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), batch_seq BIGINT UNSIGNED NULL, PRIMARY KEY (id), UNIQUE KEY uk_availability_rollup_entries (instance_id, asset_source_id, day) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='o zi per activ; percentilele sosesc calculate de pe server'",
+          "sourceStart": 9397,
+          "sourceEnd": 11267
+        },
+        {
+          "index": 5,
+          "sql": "CREATE INDEX ix_availability_rollup_entries_day ON availability_rollup_entries (instance_id, day)",
+          "sourceStart": 11267,
+          "sourceEnd": 11450
+        },
+        {
+          "index": 6,
+          "sql": "CREATE TABLE outage_entries ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, source_id BIGINT NOT NULL COMMENT 'outages.id de pe server', asset_source_id BIGINT NOT NULL COMMENT 'assets.id de pe server; fara cheie straina', started_at DATETIME(6) NOT NULL, ended_at DATETIME(6) NULL COMMENT 'NULL = inca in curs la ultima expediere', duration_s INT NULL, kind TEXT NOT NULL COMMENT 'down|degraded, fara CHECK', cause TEXT NULL, incident_source_id BIGINT NULL COMMENT 'incidents.id de pe server; fara cheie straina', planned TINYINT(1) NOT NULL COMMENT '1 = fereastra de mentenanta, nu strica disponibilitatea', received_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), batch_seq BIGINT UNSIGNED NULL, PRIMARY KEY (id), UNIQUE KEY uk_outage_entries_source (instance_id, source_id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='caderi ca randuri; se completeaza la revenire, deci flux mutabil'",
+          "sourceStart": 11450,
+          "sourceEnd": 13242
+        },
+        {
+          "index": 7,
+          "sql": "CREATE INDEX ix_outage_entries_asset ON outage_entries (instance_id, asset_source_id, started_at)",
+          "sourceStart": 13242,
+          "sourceEnd": 13401
+        },
+        {
+          "index": 8,
+          "sql": "CREATE TABLE event_rollup_1h_entries ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, bucket DATETIME(6) NOT NULL COMMENT 'inceputul orei, UTC', asset_source_id BIGINT NOT NULL COMMENT 'assets.id de pe server; fara cheie straina', source VARCHAR(190) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, action VARCHAR(190) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL, n BIGINT NOT NULL, uniq_src INT NOT NULL COMMENT 'maxim peste minute, nu suma; asa vine', bytes_in BIGINT NOT NULL, bytes_out BIGINT NOT NULL, p95_latency_ms INT NULL COMMENT 'calculat pe server', received_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), batch_seq BIGINT UNSIGNED NULL, PRIMARY KEY (id), UNIQUE KEY uk_event_rollup_1h_entries (instance_id, bucket, asset_source_id, source, action) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='contor orar, agregat pe server; replica nu reagrega nimic'",
+          "sourceStart": 13401,
+          "sourceEnd": 15435
+        },
+        {
+          "index": 9,
+          "sql": "CREATE INDEX ix_event_rollup_1h_entries_bucket ON event_rollup_1h_entries (instance_id, bucket, source)",
+          "sourceStart": 15435,
+          "sourceEnd": 15849
+        }
+      ]
+    },
+    {
+      "file": "0005_patch.sql",
+      "statements": [
+        {
+          "index": 1,
+          "sql": "CREATE TABLE scan_entries ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, source_id BIGINT NOT NULL COMMENT 'scans.id de pe server', scanner TEXT NOT NULL COMMENT 'dnf|trivy_fs|trivy_image|nuclei|semgrep|lynis|web_checks|tls', target TEXT NOT NULL COMMENT 'ce s-a scanat; vezi nota de granita din cap', asset_source_id BIGINT NULL COMMENT 'assets.id de pe server; fara cheie straina', status TEXT NOT NULL COMMENT 'running|completed|failed|timeout|skipped', started_at DATETIME(6) NOT NULL, finished_at DATETIME(6) NULL, duration_ms INT NULL, exit_code INT NULL, findings_count INT NOT NULL, new_findings INT NOT NULL, resolved_findings INT NOT NULL, db_version TEXT NULL, error TEXT NULL, triggered_by TEXT NOT NULL, received_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), batch_seq BIGINT UNSIGNED NULL, PRIMARY KEY (id), UNIQUE KEY uk_scan_entries_source (instance_id, source_id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='rulari de scanare; se completeaza la final, deci flux mutabil'",
+          "sourceStart": 0,
+          "sourceEnd": 8895
+        },
+        {
+          "index": 2,
+          "sql": "CREATE INDEX ix_scan_entries_recent ON scan_entries (instance_id, started_at)",
+          "sourceStart": 8895,
+          "sourceEnd": 9031
+        },
+        {
+          "index": 3,
+          "sql": "CREATE TABLE finding_entries ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, source_id BIGINT NOT NULL COMMENT 'findings.id de pe server', finding_key VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT 'sha256(scanner|activ|pachet|cve|locatie), calculat pe server', asset_source_id BIGINT NULL COMMENT 'assets.id de pe server; fara cheie straina', scanner TEXT NOT NULL, cve TEXT NULL, advisory_id TEXT NULL COMMENT 'ALSA-2026:1234, autoritar pe AlmaLinux', title TEXT NULL, description TEXT NULL, severity TEXT NOT NULL COMMENT 'info|low|medium|high|critical, fara CHECK', cvss DECIMAL(3,1) NULL, cvss_vector TEXT NULL, epss DECIMAL(5,4) NULL, kev TINYINT(1) NOT NULL, kev_due_date DATE NULL, package TEXT NULL, installed_version TEXT NULL, fixed_version TEXT NULL, location TEXT NULL COMMENT 'cale, imagine sau URL; vezi nota de granita din cap', ecosystem TEXT NULL COMMENT 'rpm|npm|pypi|composer|go|container', priority SMALLINT NOT NULL COMMENT '0-100, calculat pe server', status TEXT NOT NULL COMMENT 'open|patch_planned|patching|resolved|accepted_risk|deferred|false_positive', first_seen DATETIME(6) NOT NULL, last_seen DATETIME(6) NOT NULL, resolved_at DATETIME(6) NULL, resolution TEXT NULL COMMENT 'poate spune ca plasturele s-a aplicat si NU a rezolvat', deferred_until DATETIME(6) NULL, accepted_by TEXT NULL, accepted_reason TEXT NULL, requires_manual_intervention TINYINT(1) NOT NULL COMMENT '1 = activ protejat; niciun plan automat nu se genereaza', scan_source_id BIGINT NULL COMMENT 'scans.id de pe server; fara cheie straina', raw JSON NOT NULL COMMENT 'iesirea scanerului, ca blob; nu se despacheteaza aici', ai_assessment JSON NULL, ai_assessed_at DATETIME(6) NULL, received_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), batch_seq BIGINT UNSIGNED NULL, PRIMARY KEY (id), UNIQUE KEY uk_finding_entries_source (instance_id, source_id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='descoperiri deduplicate; se redeschid si se rezolva, deci flux mutabil'",
+          "sourceStart": 9031,
+          "sourceEnd": 12349
+        },
+        {
+          "index": 4,
+          "sql": "CREATE INDEX ix_finding_entries_open ON finding_entries (instance_id, status(64), priority)",
+          "sourceStart": 12349,
+          "sourceEnd": 12725
+        },
+        {
+          "index": 5,
+          "sql": "CREATE INDEX ix_finding_entries_key ON finding_entries (instance_id, finding_key)",
+          "sourceStart": 12725,
+          "sourceEnd": 12986
+        },
+        {
+          "index": 6,
+          "sql": "CREATE TABLE patch_plan_entries ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, source_id BIGINT NOT NULL COMMENT 'patch_plans.id de pe server', plan_uuid VARCHAR(36) CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT 'patch_plans.plan_id, uuid ca text', plan_hash VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL COMMENT 'sha256 peste continutul semantic al planului', plan JSON NOT NULL COMMENT 'doar pentru afisare; agregatorul nu executa asta niciodata', asset_source_id BIGINT NULL COMMENT 'assets.id de pe server; fara cheie straina', status TEXT NOT NULL COMMENT 'draft|validated|rejected_invalid|approved|scheduled|applying|applied|rolled_back|failed|rejected|expired', risk_level TEXT NULL COMMENT 'low|medium|high|critical, fara CHECK', blast_radius TEXT NULL, requires_reboot TINYINT(1) NOT NULL, reversible TINYINT(1) NOT NULL, estimated_downtime_s INT NULL, estimated_backup_mb INT NULL, confidence DECIMAL(3,2) NULL, validation_errors JSON NULL, validation_attempts SMALLINT NOT NULL, generated_by TEXT NULL, model TEXT NULL, prompt_version TEXT NULL, generation_ms INT NULL, created_at DATETIME(6) NOT NULL, approved_by TEXT NULL, approved_at DATETIME(6) NULL, scheduled_for DATETIME(6) NULL, rejected_by TEXT NULL, rejected_reason TEXT NULL, notified_at DATETIME(6) NULL, received_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), batch_seq BIGINT UNSIGNED NULL, PRIMARY KEY (id), UNIQUE KEY uk_patch_plan_entries_source (instance_id, source_id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='planuri de plasture; starea lor se schimba, deci flux mutabil'",
+          "sourceStart": 12986,
+          "sourceEnd": 15972
+        },
+        {
+          "index": 7,
+          "sql": "CREATE INDEX ix_patch_plan_entries_status ON patch_plan_entries (instance_id, status(64), created_at)",
+          "sourceStart": 15972,
+          "sourceEnd": 16144
+        },
+        {
+          "index": 8,
+          "sql": "CREATE TABLE patch_plan_findings ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, plan_source_id BIGINT NOT NULL COMMENT 'patch_plans.id de pe server', finding_source_id BIGINT NOT NULL COMMENT 'findings.id de pe server', PRIMARY KEY (id), UNIQUE KEY uk_patch_plan_findings (instance_id, plan_source_id, finding_source_id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='patch_plans.finding_ids, desfasurat; cine o scrie e nedecis'",
+          "sourceStart": 16144,
+          "sourceEnd": 18108
+        },
+        {
+          "index": 9,
+          "sql": "CREATE INDEX ix_patch_plan_findings_finding ON patch_plan_findings (instance_id, finding_source_id)",
+          "sourceStart": 18108,
+          "sourceEnd": 18281
+        },
+        {
+          "index": 10,
+          "sql": "CREATE TABLE patch_execution_entries ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, source_id BIGINT NOT NULL COMMENT 'patch_executions.id de pe server', plan_source_id BIGINT NOT NULL COMMENT 'patch_plans.id de pe server; fara cheie straina', mode TEXT NOT NULL COMMENT 'dry_run|apply, fara CHECK', status TEXT NOT NULL COMMENT 'running|succeeded|failed|rolled_back|rollback_failed|aborted', started_at DATETIME(6) NOT NULL, finished_at DATETIME(6) NULL, duration_ms INT NULL, restore_point_source_id BIGINT NULL COMMENT 'restore_points.id de pe server; tabela nu se replica', triggered_by TEXT NOT NULL, rollback_reason TEXT NULL COMMENT 'ce verificare a picat, sau ce pas a iesit nenul', rollback_at DATETIME(6) NULL, post_verification_passed TINYINT(1) NULL, result JSON NULL, error TEXT NULL, notified_at DATETIME(6) NULL, received_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), batch_seq BIGINT UNSIGNED NULL, PRIMARY KEY (id), UNIQUE KEY uk_patch_execution_entries_source (instance_id, source_id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='executii; se completeaza la final, deci flux mutabil'",
+          "sourceStart": 18281,
+          "sourceEnd": 20568
+        },
+        {
+          "index": 11,
+          "sql": "CREATE INDEX ix_patch_execution_entries_plan ON patch_execution_entries (instance_id, plan_source_id, started_at)",
+          "sourceStart": 20568,
+          "sourceEnd": 20760
+        },
+        {
+          "index": 12,
+          "sql": "CREATE TABLE patch_step_entries ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, source_id BIGINT NOT NULL COMMENT 'patch_steps.id de pe server', execution_source_id BIGINT NOT NULL COMMENT 'patch_executions.id de pe server; fara cheie straina', phase TEXT NOT NULL COMMENT 'preflight|backup|apply|health_check|rollback|post_verification', step_id TEXT NOT NULL COMMENT 'id-ul pasului din plan', seq INT NOT NULL, argv JSON NOT NULL COMMENT 'doar pentru afisare; agregatorul nu executa asta niciodata', cwd TEXT NULL COMMENT 'directorul comenzii; vezi nota de granita din cap', run_as TEXT NULL, started_at DATETIME(6) NOT NULL, finished_at DATETIME(6) NULL, duration_ms INT NULL, exit_code INT NULL, timed_out TINYINT(1) NOT NULL, stdout MEDIUMTEXT NULL, stderr MEDIUMTEXT NULL, status TEXT NOT NULL COMMENT 'running|ok|failed|skipped, fara CHECK', received_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), batch_seq BIGINT UNSIGNED NULL, PRIMARY KEY (id), UNIQUE KEY uk_patch_step_entries_source (instance_id, source_id) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='pasi de executie; rowul se completeaza la final, deci flux mutabil'",
+          "sourceStart": 20760,
+          "sourceEnd": 23292
+        },
+        {
+          "index": 13,
+          "sql": "CREATE INDEX ix_patch_step_entries_execution ON patch_step_entries (instance_id, execution_source_id, seq)",
+          "sourceStart": 23292,
+          "sourceEnd": 23548
+        }
+      ]
+    },
+    {
+      "file": "0006_incident_updated_at.sql",
+      "statements": [
+        {
+          "index": 1,
+          "sql": "ALTER TABLE incident_entries ADD COLUMN updated_at DATETIME(6) NULL COMMENT 'incidents.updated_at de pe server; ordinea de expediere, nu ora sosirii'",
+          "sourceStart": 0,
+          "sourceEnd": 2323
+        },
+        {
+          "index": 2,
+          "sql": "CREATE INDEX ix_incident_entries_updated ON incident_entries (instance_id, updated_at)",
+          "sourceStart": 2323,
+          "sourceEnd": 2797
+        }
+      ]
+    },
+    {
+      "file": "0007_incident_auto_action.sql",
+      "statements": [
+        {
+          "index": 1,
+          "sql": "ALTER TABLE incident_entries ADD COLUMN auto_action TEXT NULL COMMENT 'ce a facut agentul automat: blocare, izolare, nimic'",
+          "sourceStart": 0,
+          "sourceEnd": 1066
+        },
+        {
+          "index": 2,
+          "sql": "ALTER TABLE incident_entries ADD COLUMN auto_action_at DATETIME(6) NULL COMMENT 'cand; NULL = nicio actiune automata'",
+          "sourceStart": 1066,
+          "sourceEnd": 1243
+        }
+      ]
+    },
+    {
+      "file": "0008_auth.sql",
+      "statements": [
+        {
+          "index": 1,
+          "sql": "CREATE TABLE users ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, username VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, password_hash VARCHAR(255) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, role VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'viewer', disabled TINYINT(1) NOT NULL DEFAULT 0 COMMENT '1 = contul nu se mai poate autentifica; istoria ramane', totp_secret_enc TEXT NULL, totp_confirmed_at DATETIME(6) NULL, totp_last_counter BIGINT UNSIGNED NULL, failed_attempts INT UNSIGNED NOT NULL DEFAULT 0, locked_until DATETIME(6) NULL, last_login_at DATETIME(6) NULL, last_login_ip INET6 NULL, password_changed_at DATETIME(6) NOT NULL, created_at DATETIME(6) NOT NULL, PRIMARY KEY (id), UNIQUE KEY uk_users_username (username), CONSTRAINT ck_users_role CHECK (role IN ('owner', 'operator', 'viewer')) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='utilizatorii PANOULUI agregator; date locale, NU o replica a serverului'",
+          "sourceStart": 0,
+          "sourceEnd": 7325
+        },
+        {
+          "index": 2,
+          "sql": "CREATE TABLE sessions ( id CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, user_id BIGINT UNSIGNED NOT NULL, token_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, active_token_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NULL, csrf_token CHAR(43) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, pending_totp TINYINT(1) NOT NULL, created_ip INET6 NULL, user_agent VARCHAR(512) NULL, created_at DATETIME(6) NOT NULL, last_seen_at DATETIME(6) NOT NULL, expires_at DATETIME(6) NOT NULL, revoked_at DATETIME(6) NULL, revoked_reason VARCHAR(64) NULL, PRIMARY KEY (id), UNIQUE KEY uk_sessions_active_token (active_token_hash), KEY ix_sessions_user (user_id), KEY ix_sessions_expires (expires_at) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='sesiunile PANOULUI agregator; se stocheaza sha256 al jetonului'",
+          "sourceStart": 7325,
+          "sourceEnd": 11845
+        },
+        {
+          "index": 3,
+          "sql": "CREATE TRIGGER sessions_active_token_bi BEFORE INSERT ON sessions FOR EACH ROW SET NEW.active_token_hash = IF(NEW.revoked_at IS NULL, NEW.token_hash, NULL)",
+          "sourceStart": 11845,
+          "sourceEnd": 12688
+        },
+        {
+          "index": 4,
+          "sql": "CREATE TRIGGER sessions_active_token_bu BEFORE UPDATE ON sessions FOR EACH ROW SET NEW.active_token_hash = IF(NEW.revoked_at IS NULL, NEW.token_hash, NULL)",
+          "sourceStart": 12688,
+          "sourceEnd": 12901
+        },
+        {
+          "index": 5,
+          "sql": "CREATE TABLE login_attempts ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, at DATETIME(6) NOT NULL, username VARCHAR(64) NULL COMMENT 'ce s-a tastat, nu o identitate', ip INET6 NULL, user_agent VARCHAR(512) NULL, result VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, stage VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NULL, session_id CHAR(32) CHARACTER SET ascii COLLATE ascii_bin NULL, detail VARCHAR(255) NULL, PRIMARY KEY (id), KEY ix_login_attempts_ip_at (ip, at), KEY ix_login_attempts_username_at (username, at), CONSTRAINT ck_login_attempts_result CHECK ( result IN ('ok', 'bad_password', 'bad_totp', 'locked', 'unknown_user')), CONSTRAINT ck_login_attempts_stage CHECK ( stage IS NULL OR stage IN ('password', 'totp')) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='incercarile de autentificare pe PANOUL agregator; date locale'",
+          "sourceStart": 12901,
+          "sourceEnd": 15332
+        },
+        {
+          "index": 6,
+          "sql": "CREATE TABLE user_instances ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, user_id BIGINT UNSIGNED NOT NULL, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, role VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'viewer', granted_at DATETIME(6) NOT NULL, granted_by VARCHAR(64) NULL COMMENT 'cine a dat dreptul; pentru urma de audit', PRIMARY KEY (id), UNIQUE KEY uk_user_instances (user_id, instance_id), KEY ix_user_instances_instance (instance_id), CONSTRAINT ck_user_instances_role CHECK (role IN ('owner', 'operator', 'viewer')) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC COMMENT='ce instanta vede fiecare utilizator; lipsa randului = nicio instanta'",
+          "sourceStart": 15332,
+          "sourceEnd": 17707
+        }
+      ]
+    },
+    {
+      "file": "0009_auth_bounds.sql",
+      "statements": [
+        {
+          "index": 1,
+          "sql": "CREATE INDEX ix_login_attempts_at ON login_attempts (at)",
+          "sourceStart": 0,
+          "sourceEnd": 3716
+        },
+        {
+          "index": 2,
+          "sql": "ALTER TABLE login_attempts MODIFY COLUMN username VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL COMMENT 'ce s-a tastat, nu o identitate; octeti, ca users.username'",
+          "sourceStart": 3716,
+          "sourceEnd": 4464
+        },
+        {
+          "index": 3,
+          "sql": "ALTER TABLE login_attempts COMMENT = 'incercarile de autentificare pe PANOUL agregator; date locale. E STAREA celor trei limitatoare, nu doar o urma: se numara randurile cu result <> ok pe o fereastra alunecatoare de 15 minute (per ip, per nume, global). Retentia NU are voie sa stearga randuri mai noi de 15 minute - ar sterge chiar plafoanele, si tacut'",
+          "sourceStart": 4464,
+          "sourceEnd": 5017
+        },
+        {
+          "index": 4,
+          "sql": "ALTER TABLE users MODIFY COLUMN failed_attempts INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'INERTA din 2026-08-17: nimeni nu o scrie si nimeni nu o citeste. 0 NU inseamna zero esecuri; blocarea per cont e o fereastra peste login_attempts'",
+          "sourceStart": 5017,
+          "sourceEnd": 5704
+        },
+        {
+          "index": 5,
+          "sql": "ALTER TABLE users MODIFY COLUMN locked_until DATETIME(6) NULL COMMENT 'INERTA din 2026-08-17: nimeni nu o scrie si nimeni nu o citeste. NULL NU inseamna cont neblocat; vezi disabled'",
+          "sourceStart": 5704,
+          "sourceEnd": 5971
+        }
+      ]
+    },
+    {
+      "file": "0010_mutable_updated_at.sql",
+      "statements": [
+        {
+          "index": 1,
+          "sql": "ALTER TABLE finding_entries ADD COLUMN updated_at DATETIME(6) NULL COMMENT 'findings.updated_at de pe server; ordinea de expediere, nu ora sosirii'",
+          "sourceStart": 0,
+          "sourceEnd": 1662
+        },
+        {
+          "index": 2,
+          "sql": "CREATE INDEX ix_finding_entries_updated ON finding_entries (instance_id, updated_at)",
+          "sourceStart": 1662,
+          "sourceEnd": 1812
+        },
+        {
+          "index": 3,
+          "sql": "ALTER TABLE blocklist_entries ADD COLUMN updated_at DATETIME(6) NULL COMMENT 'blocklist.updated_at de pe server; ordinea de expediere, nu ora sosirii'",
+          "sourceStart": 1812,
+          "sourceEnd": 2019
+        },
+        {
+          "index": 4,
+          "sql": "CREATE INDEX ix_blocklist_entries_updated ON blocklist_entries (instance_id, updated_at)",
+          "sourceStart": 2019,
+          "sourceEnd": 2177
+        },
+        {
+          "index": 5,
+          "sql": "ALTER TABLE patch_plan_entries ADD COLUMN updated_at DATETIME(6) NULL COMMENT 'patch_plans.updated_at de pe server; ordinea de expediere, nu ora sosirii'",
+          "sourceStart": 2177,
+          "sourceEnd": 2388
+        },
+        {
+          "index": 6,
+          "sql": "CREATE INDEX ix_patch_plan_entries_updated ON patch_plan_entries (instance_id, updated_at)",
+          "sourceStart": 2388,
+          "sourceEnd": 2550
+        }
+      ]
+    },
+    {
+      "file": "0011_text_watermark.sql",
+      "statements": [
+        {
+          "index": 1,
+          "sql": "ALTER TABLE sync_cursors ADD COLUMN last_source_key VARCHAR(190) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NULL COMMENT 'filigranul ecouat, pentru fluxurile cu cheie text; vezi last_source_id'",
+          "sourceStart": 0,
+          "sourceEnd": 2491
+        }
+      ]
+    },
+    {
+      "file": "0012_selfcheck_updated_at.sql",
+      "statements": [
+        {
+          "index": 1,
+          "sql": "ALTER TABLE selfcheck_state_entries ADD COLUMN updated_at DATETIME(6) NULL COMMENT 'selfcheck_state.updated_at de pe server; ordinea de expediere'",
+          "sourceStart": 0,
+          "sourceEnd": 1204
+        },
+        {
+          "index": 2,
+          "sql": "CREATE INDEX ix_selfcheck_state_entries_updated ON selfcheck_state_entries (instance_id, updated_at)",
+          "sourceStart": 1204,
+          "sourceEnd": 1386
+        }
+      ]
+    },
+    {
+      "file": "0013_scans_updated_at.sql",
+      "statements": [
+        {
+          "index": 1,
+          "sql": "ALTER TABLE scan_entries ADD COLUMN updated_at DATETIME(6) NULL COMMENT 'scans.updated_at de pe server; ordinea de expediere, nu ora sosirii'",
+          "sourceStart": 0,
+          "sourceEnd": 1366
+        },
+        {
+          "index": 2,
+          "sql": "CREATE INDEX ix_scan_entries_updated ON scan_entries (instance_id, updated_at)",
+          "sourceStart": 1366,
+          "sourceEnd": 1689
+        }
+      ]
+    },
+    {
+      "file": "0014_rollup_updated_at.sql",
+      "statements": [
+        {
+          "index": 1,
+          "sql": "ALTER TABLE event_rollup_1h_entries ADD COLUMN updated_at DATETIME(6) NULL COMMENT 'event_rollup_1h.updated_at de pe server; ordinea de expediere'",
+          "sourceStart": 0,
+          "sourceEnd": 1601
+        },
+        {
+          "index": 2,
+          "sql": "CREATE INDEX ix_event_rollup_1h_entries_updated ON event_rollup_1h_entries (instance_id, updated_at)",
+          "sourceStart": 1601,
+          "sourceEnd": 1783
+        }
+      ]
+    },
+    {
+      "file": "0015_login_history.sql",
+      "statements": [
+        {
+          "index": 1,
+          "sql": "CREATE TABLE login_session_entries ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, source_id BIGINT NOT NULL COMMENT 'login_sessions.id de pe instanță', session_key VARCHAR(32) NOT NULL COMMENT 'ses de la nucleu; unic pe pornire', username VARCHAR(128) NULL COMMENT 'NULL = nucleul n-a putut rezolva un cont', auid VARCHAR(32) NULL, src_ip INET6 NULL, terminal VARCHAR(64) NULL COMMENT 'pts0 = om; ssh = script', interactive TINYINT(1) NOT NULL DEFAULT 0, opened_at DATETIME(6) NOT NULL, closed_at DATETIME(6) NULL, closed_inferred TINYINT(1) NOT NULL DEFAULT 0 COMMENT '1 = nu s-a văzut nicio ieșire; momentul e ultima activitate', command_count INT NOT NULL DEFAULT 0, sudo_count INT NOT NULL DEFAULT 0, updated_at DATETIME(6) NOT NULL COMMENT 'ordinea de expediere', received_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), batch_seq BIGINT UNSIGNED NULL, UNIQUE KEY uk_login_session_entries (instance_id, source_id), KEY ix_login_session_entries_opened (instance_id, opened_at), KEY ix_login_session_entries_updated (instance_id, updated_at), KEY ix_login_session_entries_human (instance_id, interactive, opened_at) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+          "sourceStart": 0,
+          "sourceEnd": 3682
+        },
+        {
+          "index": 2,
+          "sql": "CREATE TABLE session_command_entries ( id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, instance_id VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL, source_id BIGINT NOT NULL COMMENT 'session_commands.id de pe instanță', session_source_id BIGINT NULL, session_key VARCHAR(32) NOT NULL, ts DATETIME(6) NOT NULL, username VARCHAR(128) NULL, exe VARCHAR(512) NULL, argv TEXT NOT NULL, cwd VARCHAR(1024) NULL, tty VARCHAR(64) NULL, pid INT NULL, ppid INT NULL COMMENT 'deosebește o comandă tastată de una pornită de un script', success TINYINT(1) NULL, received_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6), batch_seq BIGINT UNSIGNED NULL, UNIQUE KEY uk_session_command_entries (instance_id, source_id), KEY ix_session_command_entries_session (instance_id, session_source_id, source_id), KEY ix_session_command_entries_ts (instance_id, ts), KEY ix_session_command_entries_user (instance_id, username, ts) ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+          "sourceStart": 3682,
+          "sourceEnd": 5506
+        }
+      ]
+    },
+    {
+      "file": "0016_commands_purged.sql",
+      "statements": [
+        {
+          "index": 1,
+          "sql": "ALTER TABLE login_session_entries ADD COLUMN commands_purged BIGINT NOT NULL DEFAULT 0 COMMENT 'câte comenzi ale sesiunii a șters curățarea DE AICI; cumulat'",
+          "sourceStart": 0,
+          "sourceEnd": 1749
+        }
+      ]
+    }
+  ]
+}

@@ -70,6 +70,12 @@ export type Statement = {
   guardText: string;
   /** Linia pe care începe instrucțiunea, ca mesajele să fie găsibile. */
   line: number;
+  /** Indexul de caracter, în `text`, imediat DUPĂ `;`-ul care termină
+   *  instrucțiunea. Folosit doar de `bin/generate-migrations-manifest.ts`, ca
+   *  să poată scrie unde stă fiecare instrucțiune în fișierul `.sql` de pe
+   *  disc — vezi acolo de ce. Nu intră în `sha256` și nu schimbă nimic din
+   *  ce compară `lib/schema-guard.ts`. */
+  sourceEnd: number;
 };
 
 /** Identificatori SQL simpli. Nu e o măsură de securitate — gărzile pleacă spre
@@ -160,7 +166,7 @@ export function splitStatements(text: string, source: string): Statement[] {
   let line = 1;
   let i = 0;
 
-  const finish = (): void => {
+  const finish = (sourceEnd: number): void => {
     const sql = scan.out.join("").trim();
     const where = `${source}:${scan.startLine}`;
     if (!sql) {
@@ -187,6 +193,7 @@ export function splitStatements(text: string, source: string): Statement[] {
       guard: parseGuard(guardText, where),
       guardText,
       line: scan.startLine,
+      sourceEnd,
     });
     scan.out = [];
     scan.guards = [];
@@ -286,7 +293,9 @@ export function splitStatements(text: string, source: string): Statement[] {
     }
 
     if (ch === ";") {
-      finish();
+      // `i + 1`: poziția imediat după `;`, nu poziția lui `;` însuși — vezi
+      // `Statement.sourceEnd`.
+      finish(i + 1);
       i++;
       continue;
     }
