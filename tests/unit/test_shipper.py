@@ -1484,6 +1484,25 @@ RECEIVER_ONLY = {
     "ER_UNSUPPORTED_PS": "cod de eroare MariaDB la verificarea de sintaxă",
     "PROBE_NAME": "numele instrucțiunii pregătite la verificarea de sintaxă",
     "PROBE_VAR": "numele variabilei de sesiune la verificarea de sintaxă",
+    # lib/migrations-manifest.ts, lib/schema-guard.ts — garda de schemă, care
+    # decide ce SERVEȘTE agregatorul înainte de orice interogare, nu ce
+    # ACCEPTĂ dintr-un lot sosit. Expeditorul nu vede niciuna dintre ele: un
+    # lot ajunge pe `POST /api/sentinel/sync`, garda păzește `getPool()`.
+    "MIGRATIONS_MANIFEST": "lista migrațiilor cunoscute codului (fișier, index "
+                           "de instrucțiune, sha256), compilată static în bundle. "
+                           "checkSchemaGuard o compară cu schema_version ÎNAINTE "
+                           "de orice interogare — decide dacă agregatorul refuză "
+                           "SĂ SERVEASCĂ pe o schemă în urmă sau pe un manifest "
+                           "stricat, nu ce acceptă dintr-un lot sosit",
+    "MANIFEST_FILE_RE": "forma unui nume de fișier de migrație, verificată de "
+                        "invalidManifestReason DOAR pe MIGRATIONS_MANIFEST-ul "
+                        "compilat în bundle, ca să prindă un manifest stricat la "
+                        "un merge; nu se aplică vreodată unui octet venit de la "
+                        "expeditor",
+    "MANIFEST_SHA256_RE": "forma unei sume de control, verificată de aceeași "
+                          "invalidManifestReason pe același manifest compilat; "
+                          "idem — o gardă pe integritatea codului livrat, nu pe "
+                          "ce sosește într-un lot",
     # app/api/sentinel/sync/route.ts
     "DEFAULT_MAX_AGE_S": "implicit folosit DOAR când expeditorul nu trimite câmpul; "
                          "nu poate refuza nimic din ce a configurat cineva",

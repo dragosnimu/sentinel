@@ -319,6 +319,7 @@ care a ținut valorile nu mai e pe stivă.
 from __future__ import annotations
 
 import functools
+import json
 import os
 import re
 import shutil
@@ -605,6 +606,85 @@ VALUE_EXEMPT: dict[str, tuple[dict[str, int], str]] = {
         ({SHAPE_B64: 1}, "URL public de avizare GitHub din eșantionul trivy"),
 }
 
+# --- Scutire DERIVATĂ, nu declarată: manifestul de migrații -------------------
+#
+# `aggregator/lib/migrations-manifest.ts` are zeci de hexa de 64 de caractere —
+# forma exactă a unui secret — dar sunt sha256-uri peste instrucțiunile SQL din
+# `aggregator/migrations/*.sql`, care stau publice, în clar, chiar lângă ele.
+# Motivul pentru care fișierul e comis e în capul lui `bin/
+# generate-migrations-manifest.ts`: calea spre `migrations/` se îngheață la
+# compilare pe mașina de build, iar directorul ăla NU supraviețuiește
+# publicării, deci citirea de pe disc la servire a picat agregatorul 20+ ore.
+#
+# O scutire ca `VALUE_EXEMPT` de mai sus — un NUMĂR de hexa admise în fișier —
+# ar fi o ușă, nu o fereastră: ar admite ORICE 78 de hexa din fișierul ăsta,
+# inclusiv un secret strecurat în locul unui sha256, atâta timp cât numărul
+# total rămâne 78. Ce se verifică aici e mai tare: fiecare hexa din fișier
+# trebuie să FIE, ea însăși, sha256-ul unei instrucțiuni SQL reale — derivat,
+# nu declarat. O valoare care nu se potrivește cu nicio instrucțiune rămâne
+# neexemptată, oricât de „la număr" ar sta scutirea.
+#
+# Derivarea rulează codul SURSĂ, `discover()` din `lib/migrate.ts` (care
+# cheamă `splitStatements` din `lib/sql-statements.ts`) prin `node --import
+# tsx`, nu o a doua parsare SQL scrisă aici în Python. O a doua implementare a
+# segmentării în instrucțiuni ar fi exact al doilea punct orb: dacă cele două
+# ar diferi pe un caz de margine (un `;` într-un literal, un comentariu de
+# bloc), garda ar putea fie respinge o migrație reală, fie accepta un secret pe
+# care „segmentarea ei" l-ar fi clasificat greșit ca sha256 legitim. Rulând
+# chiar codul care produce manifestul, nu există a doua opinie de contrazis.
+_MIGRATIONS_MANIFEST_REL = "aggregator/lib/migrations-manifest.ts"
+
+# Scriptul rulează cu `--input-type=module`, ca `import` să funcționeze direct
+# din `-e` — testat manual: fără el, Node tratează `-e` ca CommonJS și
+# `import` e o eroare de sintaxă. `cwd=aggregator/` face `./lib/migrate.ts` să
+# se rezolve la fel cum se rezolvă din `bin/generate-migrations-manifest.ts`.
+_MIGRATION_HASH_SCRIPT = (
+    'import { discover, MIGRATIONS_DIR } from "./lib/migrate.ts";\n'
+    "const migrations = discover(MIGRATIONS_DIR);\n"
+    "const hashes = [];\n"
+    "for (const m of migrations) for (const s of m.statements) hashes.push(s.sha256);\n"
+    "process.stdout.write(JSON.stringify(hashes));\n"
+)
+
+
+@functools.lru_cache(maxsize=None)
+def _real_migration_statement_hashes() -> frozenset[str] | None:
+    """sha256-urile REALE ale instrucțiunilor SQL din `aggregator/migrations/`.
+
+    `None` dacă nu se pot deriva AICI — `node` lipsește, `aggregator/
+    node_modules` lipsește, procesul a picat sau ieșirea nu e JSON valid. Nu e
+    „fișierul e curat", e „n-am putut verifica": apelantul tratează `None` ca
+    mulțime goală de scutiri, deci fiecare hexa din manifest rămâne
+    NEexemptată — o gardă de scurgere care nu poate verifica autenticitatea
+    unei valori nu are voie s-o lase să treacă din lipsă de unealtă.
+
+    Cache fără argumente: procesul `node` costă, iar valoarea nu se schimbă în
+    timpul unei rulări de pytest — `aggregator/migrations/` nu se editează sub
+    picioarele suitei.
+    """
+    node = shutil.which("node")
+    if node is None:
+        return None
+    if not (REPO / "aggregator" / "node_modules").is_dir():
+        return None
+    try:
+        out = subprocess.run(
+            [node, "--import", "tsx", "--input-type=module", "-e", _MIGRATION_HASH_SCRIPT],
+            cwd=REPO / "aggregator", capture_output=True, encoding="utf-8",
+            errors="replace", timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0 or not out.stdout:
+        return None
+    try:
+        hashes = json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(hashes, list) or not all(isinstance(h, str) for h in hashes):
+        return None
+    return frozenset(hashes)
+
+
 # Fișierele din care se EXTRAG formele de probă, cu podeaua măsurată azi. Podeaua
 # e `cel puțin`: o formă nouă documentată trebuie să intre în corpus fără să
 # strice testul, dar una care dispare din extragere înseamnă că extractorul a
@@ -833,7 +913,8 @@ def _secret_shape(token: str) -> str | None:
     return None
 
 
-def _secret_value_hits(text: str) -> list[tuple[int, str, int]]:
+def _secret_value_hits(
+        text: str, exempt_tokens: frozenset[str] = frozenset()) -> list[tuple[int, str, int]]:
     """(linie, formă, lungime) pentru fiecare valoare de formă de secret din text.
 
     Niciodată valoarea. Mesajul de eșec al unei gărzi de scurgere nu are voie să
@@ -845,12 +926,22 @@ def _secret_value_hits(text: str) -> list[tuple[int, str, int]]:
     nesigură", aceeași sentinelă ca `_locations_of`, și pentru același motiv: o
     potrivire adevărată căreia nu i se poate atribui o linie nu are voie să
     devină o trecere tăcută.
+
+    `exempt_tokens` e pentru scutirea DERIVATĂ a manifestului de migrații: un
+    token exact egal cu unul din mulțime nu devine deloc o potrivire — nu se
+    numără, nu apare în `seen`, nu ajunge la a doua trecere. Implicit gol, deci
+    fiecare apelant existent se comportă identic. Tokenul intră și iese din
+    variabila locală `token` fără să treacă printr-un `assert`: cadrul ăsta nu
+    e niciodată pe stivă la eșecul unui test, din același motiv scris mai jos
+    pentru „niciodată valoarea".
     """
     hits: list[tuple[int, str, int]] = []
     seen: set[str] = set()
     for line_no, line in enumerate(text.splitlines(), 1):
         for m in _SECRET_RUN.finditer(line):
             token = m.group(0)
+            if token in exempt_tokens:
+                continue
             shape = _secret_shape(token)
             if shape:
                 hits.append((line_no, shape, len(token)))
@@ -860,7 +951,7 @@ def _secret_value_hits(text: str) -> list[tuple[int, str, int]]:
     if joined != text:
         for m in _SECRET_RUN.finditer(joined):
             token = m.group(0)
-            if token in seen:
+            if token in seen or token in exempt_tokens:
                 continue
             shape = _secret_shape(token)
             if shape:
@@ -963,9 +1054,45 @@ def _scan_tree_for_secrets(
             # Măsurat cu sonda `-l` de mai jos: cu comprehensiune, `pytest -l`
             # tipărea fișierul găsit. Aceeași notă e la `_scan_identity`.
             per_version = []
+            # Scutirea DERIVATĂ, doar pentru manifestul de migrații: fiecare hexa
+            # trebuie să FIE sha256-ul unei instrucțiuni SQL reale, nu doar să
+            # stea sub un plafon numărat. `derived is None` înseamnă „n-am putut
+            # verifica", nu „e curat" — vezi `_real_migration_statement_hashes`.
+            exempt_tokens: frozenset[str] = frozenset()
+            derived: frozenset[str] | None = None
+            if rel == _MIGRATIONS_MANIFEST_REL:
+                derived = _real_migration_statement_hashes()
+                exempt_tokens = derived if derived is not None else frozenset()
             for source, text in versions:
-                per_version.append((source, _secret_value_hits(text)))
-            offenders += _unexempted_value_hits(rel, per_version)
+                per_version.append((source, _secret_value_hits(text, exempt_tokens)))
+            if rel == _MIGRATIONS_MANIFEST_REL and derived is None:
+                # Fără derivare, fiecare hexa din fișier ar fi raportată individual
+                # — zeci de linii identice care ar îneca exact mesajul care spune
+                # DE CE, sub tăierea la 20 din mesajul de eșec al testului. O
+                # singură linie, care numără câte au rămas neverificate.
+                #
+                # Doar hexa e neverificabilă din lipsă de `node` — celelalte forme
+                # (base64, base32, orice altă formă din `SECRETS`) nu depind deloc
+                # de derivare, deci n-au voie să dispară odată cu ea. Trec mai
+                # departe prin `_unexempted_value_hits`, cu hexa scoasă din calcul
+                # aici ca să nu fie raportată A DOUA oară, individual, pe lângă
+                # linia de sumar. „N-am putut verifica” nu are voie să fie mai
+                # permisiv decât „am verificat” pentru NICIO formă.
+                non_hex_per_version = [
+                    (source, [hit for hit in hits if hit[1] != SHAPE_HEX])
+                    for source, hits in per_version]
+                offenders += _unexempted_value_hits(rel, non_hex_per_version)
+                gasite = max(
+                    (sum(1 for _, s, _ in hits if s == SHAPE_HEX) for _, hits in per_version),
+                    default=0)
+                if gasite:
+                    offenders.append(
+                        f"{rel} — {gasite} hexa de 64 nu s-au putut verifica: node "
+                        "sau aggregator/node_modules indisponibile aici, deci sha256-"
+                        "urile reale din aggregator/migrations/ nu s-au putut deriva "
+                        "— „neverificat”, nu „curat”")
+            else:
+                offenders += _unexempted_value_hits(rel, per_version)
     except Exception as exc:
         # Doar numele tipului: `str(exc)` al unei erori de regex citează tiparul,
         # iar `text`, `line` și `versions` sunt conținutul fișierului.
@@ -1770,12 +1897,17 @@ def _fabricate():
 # daca `from None` dispare vreodata din garda, ciotul asimetric ar fi a doua
 # scurgere descoperita in aceeasi zi. Ce nu se mai pastreaza e afirmatia ca
 # amandoua sunt necesare.
-def _boom(text):
+#
+# `exempt_tokens` acceptat si el, ca semnatura sa ramana identica cu
+# `_secret_value_hits` reala: garda apeleaza mereu cu doi parametri, iar un
+# ciot cu unul singur ar pica pe `TypeError` inainte sa apuce sa arunce ce
+# trebuie. Nu se goleste — nu e un secret, e o multime de sha256-uri publice.
+def _boom(text, exempt_tokens=frozenset()):
     text = None
     raise ValueError("crapa dinadins, ca sa se vada ce ramane in cadre")
 
 
-def _boom_hard(text):
+def _boom_hard(text, exempt_tokens=frozenset()):
     text = None
     raise SystemExit("nu e Exception, deci nu se converteste, deci cadrele raman")
 
@@ -1856,10 +1988,26 @@ def test_a_failing_scan_never_prints_the_value_under_showlocals(tmp_path) -> Non
     assert "scanarea arborelui" in out and "ValueError" in out, (
         f"scenariul cu `Exception` n-a trecut prin `except`, deci golirea "
         f"cadrului nu a fost pusă la încercare:\n{out[-2000:]}")
-    assert "SystemExit" in out, (
-        f"scenariul cu `BaseException` n-a rulat — el e singurul în care excepția "
-        f"NU se convertește, deci singurul care vede cadrele de sub bucla de "
-        f"scanare:\n{out[-2000:]}")
+    # NU `"SystemExit" in out`: cuvântul apare și într-un comentariu din chiar
+    # fișierul gărzii (linia despre „(SystemExit, Ctrl-C) se vede întreg"), pe
+    # care `--tb=long` îl tipărește ca parte din sursa unui cadru ORICE ar fi
+    # picat acolo. Măsurat de verificator: cu `_boom_hard` stricat pe un singur
+    # parametru, apelul ei crapă cu `TypeError` — convertit de gardă în
+    # `RuntimeError`, nu propagat ca `BaseException` — și totuși substring-ul
+    # "SystemExit" tot apărea în ieșire, din comentariu; aserțiunea rămânea
+    # verde deși scenariul 3 nu rulase cum trebuie.
+    #
+    # Linia `E       SystemExit: …` există DOAR când pytest formatează o
+    # excepție SystemExit chiar propagată — nu un comentariu din sursă și nu
+    # `RuntimeError: … TypeError` (care ar apărea aici ca `E       RuntimeError:
+    # …`). Regex, nu substring fix, fiindcă numărul de spații după `E` ține de
+    # adâncimea traceback-ului, nu e o constantă.
+    assert re.search(r"(?m)^E\s+SystemExit:", out), (
+        f"scenariul cu `BaseException` n-a produs o excepție SystemExit "
+        f"propagată — fie n-a rulat, fie a fost convertită (ex. `TypeError` "
+        f"dintr-o semnătură stricată a ciotului), deci excepția NU se mai "
+        f"comportă ca `BaseException` și verificarea de mai jos nu mai pune "
+        f"nimic la încercare:\n{out[-2000:]}")
 
     # Prefixul, nu valoarea întreagă: `-l` trunchiază șirurile lungi, iar o
     # scurgere trunchiată e tot o scurgere.
