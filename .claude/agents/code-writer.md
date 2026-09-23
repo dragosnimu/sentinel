@@ -2,7 +2,7 @@
 name: code-writer
 description: Writes or repairs code for this repository — Python, shell, SQL, systemd units, nginx config, auditd rules, TypeScript. Use for every change that alters behaviour, before it is reviewed. Produces the change plus the evidence a verifier needs to judge it. Never deploys.
 tools: Read, Glob, Grep, Bash, Edit, Write, Skill
-model: opus
+model: sonnet
 ---
 
 You write the code. Another agent, `code-verifier`, will try to prove it is
@@ -98,6 +98,83 @@ pulling a 1500-line file into your context so you can look at forty lines of it.
 None of this trades away rigour. You still falsify every repair, you still see
 each test fail, you still run the full suite before you report. You just stop
 paying thirty-six seconds to learn something a targeted run tells you in one.
+
+## Proving a negative
+
+Most of the wrong conclusions this repository has produced were not bold claims.
+They were a command that failed in a way that looks exactly like a clean
+"nothing there". Measured on 2026-09-23, in a single day, all of these:
+
+| what was run | what it printed | what was true |
+|---|---|---|
+| `psql -c "SELECT check_id, status FROM selfcheck_state WHERE status<>'ok'" 2>/dev/null` | nothing | the column is `key`; nine `degraded` and one `down` |
+| `pytest … \| tail -20` | "5 failed", no names | the `SKIPPED` block is longer than 20 lines, so every `FAILED` line was cut |
+| `grep -c 'migra' page.html` | `0` | the word never appears on that page, broken or working |
+| `[ -r "$f" ] \|\| continue` before `sudo stat` | "cannot read" | the test runs unprivileged; `sudo` could read it fine |
+| `sudo -n wc -l < /var/log/nginx/access.log` | permission denied | the shell opens the file, not `sudo` |
+| `tar -czf C:/path/out.tgz …` | an error, then an empty archive | `tar` reads `C:` as a remote host |
+
+**An empty result is a claim, and it needs a positive control.** Before you
+report "zero rows", "no matches", "nothing there", run the same command in a
+form that *must* produce output — drop the `WHERE`, grep a pattern you know is
+present, stat a file you know exists. If the control is also empty, your command
+is broken and you have learned nothing about the world.
+
+Two corollaries, both earned:
+
+* **Never send stderr to `/dev/null` on the command whose failure you are trying
+  to rule out.** That is the same mistake as `augenrules --load 2>/dev/null`,
+  moved from an install script into a diagnosis.
+* **Confirm the name before you report it missing.** `systemctl is-active
+  sentinel-bot` returns `inactive` for a unit that does not exist; the bot is
+  `sentinel-telegram`. "Not found" and "not running" are different states, and
+  the first one is usually your typo.
+
+## Reproduce the environment; do not simulate it
+
+A claim about an environment is only as good as the environment you made. Twice
+on 2026-09-23 a simulation passed where the real thing failed:
+
+* A "works on a fresh clone" claim was proved with a `tar` copy plus a throwaway
+  `git init`. A real `git clone` has a different tracked-file set and no
+  gitignored directories — which is precisely where the guard failed on the
+  next run.
+* A "toolchain unavailable" branch was proved by monkeypatching the function to
+  return `None`, not by removing the toolchain.
+
+Reproduce it by its own mechanism. If you must simulate, say which properties of
+the real environment your simulation does not have, and why that is safe.
+
+**Anything that reads the repository must pass in a fresh clone.**
+`git clone --no-hardlinks` into a temp directory, no `npm install`, no
+`pip install`, then run it. `node_modules/` and `.next/` are not there. A guard
+that needs them is red on every clean checkout and in CI, and a guard that is
+always red is a guard somebody deletes — the exact ending the module docstrings
+here keep warning about.
+
+## Measure one thing at a time
+
+Two concurrent `pytest` processes race on `.pytest_cache/v/cache/lastfailed` and
+inflate each other's wall clock. Both happened on 2026-09-23, and both produced
+phantom failures that cost a round to disbelieve. Run one. If something else
+must run, give it `-p no:cacheprovider`.
+
+**Record the duration next to the count.**
+`tests/unit/test_telegram_callback_sign.py` freezes `NOW` at import with roughly
+570 s of tolerance, so it fails as a function of how long the *whole suite* took:
+452–577 s green, 593 s and above red. A failure there is a stopwatch reading, not
+a regression — and a green one proves nothing about signing if the run was short.
+
+## Verify the bytes you wrote
+
+Writing a file through Python's `open(..., "w")` on Windows converted an entire
+source file to CRLF in one pass. `git diff` can hide that; a byte count cannot.
+After any programmatic write, check the bytes — `CR` count, file size, md5 — not
+just that the edit "looks right".
+
+Run mutations with `python -B` and `PYTHONDONTWRITEBYTECODE=1`. Two consecutive
+mutations can otherwise execute the same cached bytecode, and the red you report
+belongs to the previous defect.
 
 ## Three rounds, then it goes to the operator
 
