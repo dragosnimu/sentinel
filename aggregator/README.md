@@ -67,25 +67,42 @@ e cea din `watcher/INCARCARE-HOSTINGER.md`. Lista de fișiere de acolo **nu se
 aplică neschimbată aici**:
 
 ```
-app/  lib/  public/  migrations/
+app/  lib/  public/
 package.json  package-lock.json  tsconfig.json  next.config.mjs
 ```
 
-Diferența față de martor e `migrations/`, și e obligatorie, nu opțională.
-`lib/schema-guard.ts` verifică schema LA SERVIRE, prin `discover(MIGRATIONS_DIR)`
-din `lib/migrate.ts` — iar `MIGRATIONS_DIR` e calculat din `import.meta.url`,
-pe care compilarea îl înlocuiește cu calea absolută de pe mașina de BUILD. La
-runtime, deci, `discover()` face `readdirSync` pe `<rădăcina aplicației
-publicate>/migrations`. Fără `migrations/` în arhivă, garda nu poate citi
-directorul (`ENOENT`) chiar la prima cerere — vezi
-`kind: "migrations-unreadable"` din `lib/schema-guard.ts` pentru ce vede
-operatorul atunci și cum se deosebește de o bază picată.
+**`migrations/` nu mai e obligatorie în arhivă** — până pe 23 septembrie 2026
+era, și exact lipsa ei a ținut agregatorul căzut 20+ ore. `lib/schema-guard.ts`
+verifica schema LA SERVIRE prin `discover(MIGRATIONS_DIR)` din `lib/migrate.ts`
+— iar `MIGRATIONS_DIR` e calculată din `import.meta.url`, pe care compilarea o
+înlocuiește cu calea ABSOLUTĂ de pe mașina de BUILD. Pe găzduire build-ul
+rulează în `<domeniu>/hbuilds/source/`, director care NU supraviețuiește
+publicării — măsurat, cu două fișiere fără de care build-ul n-ar fi putut
+rula, dispărute după un build reușit. Calea înghețată arăta deci spre un
+director șters, garda pica pe `ENOENT` la prima cerere care atingea baza,
+`POST /login` răspundea 503, iar toate fluxurile de expediere de pe ambele
+gazde Sentinel au rămas blocate.
 
-`bin/` (inclusiv `bin/migrate.ts`, care rulează efectiv migrațiile) **nu**
-intră în arhivă — rămâne neschimbat față de martor. Migrarea se rulează de pe
-mașina operatorului, cu `npm run migrate`, spre baza de la distanță (vezi
-„Rulare" mai sus); pe găzduire nu rulează niciodată `bin/migrate.ts`, doar
-citește conținutul din `migrations/` ca să-l compare cu registrul.
+Fixul: `lib/schema-guard.ts` nu mai citește nimic de pe disc la servire. Ce
+compară cu `schema_version` — numele fișierului, indexul instrucțiunii,
+sha256 — e `lib/migrations-manifest.ts`, GENERAT din `migrations/` și COMIS în
+depozit (`npm run generate-migrations-manifest`, din `aggregator/`, după orice
+migrație nouă sau editată). Fiind un `import` static, ajunge compilat direct
+în bundle-ul JS pe care Next îl produce pe mașina de build — nu depinde de ce
+supraviețuiește pe disc după aceea. `tests/migrations-manifest.test.ts`
+verifică la fiecare `npm test` că manifestul comis n-a rămas în urma
+directorului real. Un manifest gol sau stricat e `kind: "manifest-invalid"`
+din `lib/schema-guard.ts` — distinct de o bază picată sau de o migrație
+lipsă, vezi capul fișierului.
+
+A rămâne `migrations/` în arhivă nu strică nimic (nimic din cod n-o citește la
+servire), dar nu mai e nevoie s-o ții acolo dinadins.
+
+`bin/` (inclusiv `bin/migrate.ts`, care rulează efectiv migrațiile, și
+`bin/generate-migrations-manifest.ts`) **nu** intră în arhivă — rămâne
+neschimbat față de martor. Migrarea se rulează de pe mașina operatorului, cu
+`npm run migrate`, spre baza de la distanță (vezi „Rulare" mai sus); pe
+găzduire nu rulează niciodată `bin/migrate.ts`.
 
 ## Configurație
 

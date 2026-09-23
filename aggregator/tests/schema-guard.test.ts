@@ -7,7 +7,16 @@
  * `checkSchemaGuard` rulează împotriva unui `FakeDb` care doar RĂSPUNDE la
  * interogările de gardă și de registru, exact ca dublul din `tests/migrate.test.ts`
  * — vezi capul aceluia pentru ce nu se poate afirma fără MariaDB la capăt
- * (`information_schema` chiar are coloanele cerute, șamd.).
+ * (`information_schema` chiar are coloanele cerute, șamd.). Manifestul dat lui
+ * `checkSchemaGuard` e construit AICI, ca date — `checkSchemaGuard` nu mai
+ * citește nimic de pe disc, deci nu are ce fixtură de fișiere să i se dea; suma
+ * de control „corectă" pentru un caz e orice șir de 64 hex care se potrivește
+ * cu ce pune testul în registrul fals — vezi capul lui `lib/schema-guard.ts`
+ * pentru de ce (incidentul din 23 septembrie 2026).
+ *
+ * `tests/migrations-manifest.test.ts` probează cealaltă jumătate, care AICI nu
+ * se poate: că `lib/migrations-manifest.ts` comis chiar corespunde cu
+ * `migrations/` de pe disc.
  *
  * `withSchemaGuard` se probează cu un pool fals minimal — nu mysql2 — fiindcă
  * proprietatea de verificat (memoizare, care refuzuri se țin minte și care nu)
@@ -16,15 +25,14 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
+import { createHash } from "node:crypto";
 
 import {
   SchemaGuardError, checkSchemaGuard, schemaGuardMessage,
 } from "../lib/schema-guard";
 import { withSchemaGuard } from "../lib/db";
 import type { Db } from "../lib/migrate";
+import type { ManifestMigration } from "../lib/migrations-manifest";
 import type { SchemaGuardResult } from "../lib/schema-guard";
 import type { Pool } from "../lib/db";
 
@@ -32,19 +40,22 @@ import type { Pool } from "../lib/db";
 // checkSchemaGuard — fixtures
 // ---------------------------------------------------------------------------
 
-function tmp(): string {
-  return mkdtempSync(path.join(tmpdir(), "agg-schema-guard-"));
+/** Un șir de 64 hex, cu forma pe care un sha256 real ar avea-o — dar derivat
+ *  dintr-un cuvânt-cheie, nu dintr-un fișier SQL: `checkSchemaGuard` nu mai
+ *  citește SQL, doar compară șiruri cu ce pune registrul, deci testele n-au
+ *  nevoie de instrucțiuni reale, doar de forma corectă. */
+function sha(seed: string): string {
+  return createHash("sha256").update(seed).digest("hex");
 }
 
-function fixture(dir: string, file: string, body: string): void {
-  writeFileSync(path.join(dir, file), body, { encoding: "utf8" });
-}
+const SHA1 = sha("statement-1");
+const SHA2 = sha("statement-2");
 
 /** O migrație cu DOUĂ instrucțiuni, ca „lipsește a doua" să se poată deosebi
  *  de „lipsește tot fișierul". */
-const TWO_STATEMENTS =
-  "-- @guard table t1\nCREATE TABLE t1 (id INT);\n" +
-  "-- @guard table t2\nCREATE TABLE t2 (id INT);\n";
+const TWO_STATEMENTS: ManifestMigration[] = [
+  { file: "0001_core.sql", statements: [{ index: 1, sha256: SHA1 }, { index: 2, sha256: SHA2 }] },
+];
 
 type Script = {
   /** `1`/`0` = tabela schema_version există/lipsește; `"blind"` = niciun
@@ -68,9 +79,9 @@ class FakeDb implements Db {
     if (sql.includes("FROM schema_version")) {
       const file = String(params[0]);
       const rows: Record<string, unknown>[] = [];
-      for (const [key, sha] of this.script.ledger ?? []) {
+      for (const [key, sha256] of this.script.ledger ?? []) {
         const [f, idx] = key.split("#");
-        if (f === file) rows.push({ stmt_index: idx, stmt_sha256: sha });
+        if (f === file) rows.push({ stmt_index: idx, stmt_sha256: sha256 });
       }
       return rows;
     }
@@ -82,17 +93,6 @@ class FakeDb implements Db {
   }
 }
 
-/** Suma de control reală a instrucțiunii `n` din `TWO_STATEMENTS`, citită prin
- *  `discover()` — nu recalculată aici, ca sha256-ul din test să nu poată
- *  diverge de cel pe care runner-ul chiar îl scrie. */
-async function realSha(dir: string, file: string, index: number): Promise<string> {
-  const { discover } = await import("../lib/migrate");
-  const [migration] = discover(dir).filter((m) => m.file === file);
-  const stmt = migration.statements.find((s) => s.index === index);
-  if (!stmt) throw new Error(`nicio instrucțiune #${index} în ${file}`);
-  return stmt.sha256;
-}
-
 // ---------------------------------------------------------------------------
 // checkSchemaGuard
 // ---------------------------------------------------------------------------
@@ -100,16 +100,11 @@ async function realSha(dir: string, file: string, index: number): Promise<string
 test("schema la zi: garda trece și numără instrucțiunile confirmate", async () => {
   // Falsă dacă garda ar refuza o schemă corectă — ar transforma orice deploy
   // normal într-o pană totală.
-  const dir = tmp();
-  fixture(dir, "0001_core.sql", TWO_STATEMENTS);
-  const sha1 = await realSha(dir, "0001_core.sql", 1);
-  const sha2 = await realSha(dir, "0001_core.sql", 2);
-
   const db = new FakeDb({
     schemaVersionTable: 1,
-    ledger: new Map([["0001_core.sql#1", sha1], ["0001_core.sql#2", sha2]]),
+    ledger: new Map([["0001_core.sql#1", SHA1], ["0001_core.sql#2", SHA2]]),
   });
-  const result = await checkSchemaGuard(db, dir);
+  const result = await checkSchemaGuard(db, TWO_STATEMENTS);
   assert.deepEqual(result, { ok: true, appliedStatements: 2 });
 });
 
@@ -118,11 +113,8 @@ test("bază complet goală: schema_version lipsește, nu e «schemă veche»", a
   // instalare vs. unul de „ai uitat o migrație" pe o gazdă în producție sunt
   // răspunsuri diferite pentru operator. Amestecate, cineva caută o migrație
   // lipsă pe o instalare care pur și simplu n-a pornit încă.
-  const dir = tmp();
-  fixture(dir, "0001_core.sql", TWO_STATEMENTS);
-
   const db = new FakeDb({ schemaVersionTable: 0 });
-  const result = await checkSchemaGuard(db, dir);
+  const result = await checkSchemaGuard(db, TWO_STATEMENTS);
   assert.deepEqual(result, { ok: false, kind: "not-installed" });
 });
 
@@ -130,15 +122,11 @@ test("o migrație neaplicată: outdated, cu fișierul și indexul exact", async 
   // ESTE eșecul din §Partea 1: cod care cere o coloană pe care schema n-o are
   // încă. Falsă dacă garda ar trece cu instrucțiuni lipsă din registru, sau
   // dacă n-ar spune CARE migrație lipsește.
-  const dir = tmp();
-  fixture(dir, "0001_core.sql", TWO_STATEMENTS);
-  const sha1 = await realSha(dir, "0001_core.sql", 1);
-
   const db = new FakeDb({
     schemaVersionTable: 1,
-    ledger: new Map([["0001_core.sql#1", sha1]]), // #2 lipsește
+    ledger: new Map([["0001_core.sql#1", SHA1]]), // #2 lipsește
   });
-  const result = await checkSchemaGuard(db, dir);
+  const result = await checkSchemaGuard(db, TWO_STATEMENTS);
   assert.equal(result.ok, false);
   if (result.ok) throw new Error("unreachable");
   assert.equal(result.kind, "outdated");
@@ -150,110 +138,118 @@ test("o migrație neaplicată: outdated, cu fișierul și indexul exact", async 
 test("information_schema orb: unknown, nu «bine» și nu «lipsește»", async () => {
   // A treia stare, distinctă de primele două: „nu se poate ști" nu are voie
   // să treacă drept „e în regulă" — regula din CLAUDE.md, aplicată aici.
-  const dir = tmp();
-  fixture(dir, "0001_core.sql", TWO_STATEMENTS);
-
   const db = new FakeDb({ schemaVersionTable: "blind" });
-  const result = await checkSchemaGuard(db, dir);
+  const result = await checkSchemaGuard(db, TWO_STATEMENTS);
   assert.equal(result.ok, false);
   if (result.ok) throw new Error("unreachable");
   assert.equal(result.kind, "unknown");
 });
 
-test("director de migrații lipsă (ENOENT): stare distinctă, nu excepție brută", async () => {
-  // Eșecul din constatarea Părții 1: arhiva de livrare nu conține `migrations/`,
-  // deci `discover()` moare pe ENOENT la primul contact cu baza. Fără starea
-  // asta, `withSchemaGuard` propaga excepția brută, iar operatorul vedea
-  // „ENOENT: no such file or directory" în locul unde se aștepta un verdict
-  // despre schemă — arată ca o gazdă stricată, nu ca o arhivă incompletă.
-  const missing = path.join(tmp(), "nu-exista-niciodata");
+test("manifest complet gol: stare distinctă, nu «schemă la zi» pe zero " +
+     "instrucțiuni cunoscute", async () => {
+  // Eșecul din constatarea Părții 1, forma nouă: un `lib/migrations-manifest.ts`
+  // gol (generator care n-a rulat niciodată, sau o rescriere manuală greșită)
+  // NU are voie să treacă tăcut ca „nimic de verificat" — cu zero migrații
+  // cunoscute, bucla de comparație n-ar găsi nimic de raportat și ar întoarce
+  // `ok: true` pe ORICE bază, oricât de veche.
   const db = new FakeDb({ schemaVersionTable: 1 }); // n-ar trebui interogată deloc
-  const result = await checkSchemaGuard(db, missing);
-  assert.deepEqual(result, { ok: false, kind: "migrations-unreadable", dir: missing });
-  assert.deepEqual(db.asked, [], "checkSchemaGuard a interogat baza înainte să știe că poate citi migrațiile");
+  const result = await checkSchemaGuard(db, []);
+  assert.deepEqual(result, { ok: false, kind: "manifest-invalid", detail: "lib/migrations-manifest.ts e gol" });
+  assert.deepEqual(db.asked, [], "checkSchemaGuard a interogat baza înainte să valideze manifestul");
 });
 
-test("calea e un fișier, nu director (ENOTDIR): aceeași stare distinctă", async () => {
-  // A doua formă a aceleiași cauze: `dir` există, dar nu e director (de pildă
-  // o legătură greșită în scriptul de livrare). `readdirSync` dă ENOTDIR, nu
-  // ENOENT — dacă am fi verificat doar codul dintâi, cazul ăsta ar fi rămas
-  // să iasă ca excepție brută.
-  const dir = tmp();
-  fixture(dir, "chiar-un-fisier.txt", "continut");
-  const notADir = path.join(dir, "chiar-un-fisier.txt");
+test("manifest cu un nume de fișier invalid: aceeași stare distinctă", async () => {
+  // A doua formă a aceleiași cauze: manifestul nu e gol, dar o intrare din el
+  // nu are forma unei migrații (`NNNN_nume.sql`) — semn că ceva a scris sau a
+  // rescris fișierul generat pe alt drum decât `bin/generate-migrations-manifest.ts`.
+  const bad: ManifestMigration[] = [{ file: "nu-e-o-migratie.sql", statements: [{ index: 1, sha256: SHA1 }] }];
   const db = new FakeDb({ schemaVersionTable: 1 });
-  const result = await checkSchemaGuard(db, notADir);
-  assert.deepEqual(result, { ok: false, kind: "migrations-unreadable", dir: notADir });
+  const result = await checkSchemaGuard(db, bad);
+  assert.equal(result.ok, false);
+  if (result.ok) throw new Error("unreachable");
+  assert.equal(result.kind, "manifest-invalid");
+  if (result.kind !== "manifest-invalid") throw new Error("unreachable");
+  assert.match(result.detail, /nu-e-o-migratie\.sql/);
 });
 
-test("director prezent dar fără nicio migrație: rămâne eroarea de cod, " +
-     "NU se confundă cu «migrații lipsă»", async () => {
-  // Deosebirea pe care garda de test trebuie s-o facă: un director care EXISTĂ
-  // dar e gol (sau are doar bootstrap-ul) e un defect în migrații — verificat
-  // deja de `migrate.ts:168` cu un `MigrationError` propriu — nu o livrare
-  // incompletă. Dacă prinderea din `checkSchemaGuard` ar fi lăsată să înghită
-  // ORICE eroare din `discover()`, cazul ăsta ar deveni tăcut «arhiva nu are
-  // migrations/» în loc să rămână eroarea lui reală, iar operatorul ar căuta
-  // în arhiva de livrare o cauză care e de fapt un director gol pe bază.
-  const dir = tmp(); // gol — niciun fișier de migrație
+test("manifest cu o migrație fără nicio instrucțiune: aceeași stare distinctă", async () => {
+  const bad: ManifestMigration[] = [{ file: "0001_core.sql", statements: [] }];
   const db = new FakeDb({ schemaVersionTable: 1 });
-  await assert.rejects(
-    checkSchemaGuard(db, dir),
-    (err: unknown) => err instanceof Error && /nicio migrație/.test(err.message),
-  );
+  const result = await checkSchemaGuard(db, bad);
+  assert.equal(result.ok, false);
+  if (result.ok) throw new Error("unreachable");
+  assert.equal(result.kind, "manifest-invalid");
+  if (result.kind !== "manifest-invalid") throw new Error("unreachable");
+  assert.match(result.detail, /0001_core\.sql/);
 });
 
-test("mesajul stării «migrations-unreadable» numește directorul și arhiva, " +
-     "nu baza de date", () => {
+test("manifest cu un index de instrucțiune invalid: aceeași stare distinctă", async () => {
+  // `0` (sau negativ, sau ne-întreg) nu poate fi poziția niciunei instrucțiuni
+  // reale — `splitStatements` numerotează de la 1. Un index de genul ăsta
+  // trădează un manifest scris de mână, nu generat.
+  const bad: ManifestMigration[] = [{ file: "0001_core.sql", statements: [{ index: 0, sha256: SHA1 }] }];
+  const db = new FakeDb({ schemaVersionTable: 1 });
+  const result = await checkSchemaGuard(db, bad);
+  assert.equal(result.ok, false);
+  if (result.ok) throw new Error("unreachable");
+  assert.equal(result.kind, "manifest-invalid");
+});
+
+test("manifest cu un sha256 invalid: aceeași stare distinctă", async () => {
+  const bad: ManifestMigration[] = [{ file: "0001_core.sql", statements: [{ index: 1, sha256: "nu-e-hex" }] }];
+  const db = new FakeDb({ schemaVersionTable: 1 });
+  const result = await checkSchemaGuard(db, bad);
+  assert.equal(result.ok, false);
+  if (result.ok) throw new Error("unreachable");
+  assert.equal(result.kind, "manifest-invalid");
+});
+
+test("mesajul stării «manifest-invalid» explică livrarea, nu baza de date", () => {
   // Operatorul care citește „baza de date nu răspunde" caută în locul greșit
-  // — exact simptomul din constatare. Mesajul trebuie să spună «arhivă», nu
-  // să lase impresia unei baze picate.
-  const dir = path.join("cale", "de", "test", "migrations");
-  const msg = schemaGuardMessage({ ok: false, kind: "migrations-unreadable", dir });
-  assert.ok(msg.includes(dir), "mesajul nu numește directorul care lipsește");
-  assert.match(msg, /arhiv/i);
+  // — exact simptomul din constatare. Mesajul trebuie să numească manifestul
+  // și scriptul de regenerare, nu să lase impresia unei baze picate.
+  const msg = schemaGuardMessage({
+    ok: false, kind: "manifest-invalid", detail: "lib/migrations-manifest.ts e gol",
+  });
+  assert.match(msg, /manifest/i);
+  assert.match(msg, /npm run generate-migrations-manifest/);
   // Nu se confundă cu celelalte trei stări — nici în formă, nici în conținut.
   assert.doesNotMatch(msg, /nu e instalată/);
   assert.doesNotMatch(msg, /nu se poate verifica/);
   assert.doesNotMatch(msg, /în urma codului/);
 });
 
-test("withSchemaGuard: directorul de migrații lipsă rămâne refuzat, fără să " +
-     "recitească directorul la fiecare interogare", async () => {
+test("withSchemaGuard: manifestul stricat rămâne refuzat, fără să se " +
+     "revalideze la fiecare interogare", async () => {
   // Lipiciozitatea cerută: dacă starea asta s-ar comporta ca «unknown», un
-  // deploy cu arhivă incompletă ar re-parcurge sistemul de fișiere la fiecare
-  // cerere din panou, în loc să refuze o dată și clar. Rulează `checkSchemaGuard`
-  // REAL (nu un dublu care doar întoarce «migrations-unreadable») ca proba să
-  // treacă prin `discover()` adevărat, nu printr-o presupunere despre el.
-  const missing = path.join(tmp(), "nu-exista-niciodata");
+  // deploy cu manifest gol ar re-parcurge validarea la fiecare cerere din
+  // panou, în loc să refuze o dată și clar. Rulează `checkSchemaGuard` REAL
+  // (nu un dublu care doar întoarce «manifest-invalid») ca proba să treacă
+  // prin `invalidManifestReason` adevărat, nu printr-o presupunere despre el.
   let calls = 0;
   const check = async (db: Db): Promise<SchemaGuardResult> => {
     calls++;
-    return checkSchemaGuard(db, missing);
+    return checkSchemaGuard(db, []);
   };
   const raw = fakeRawPool();
   const pool = withSchemaGuard(raw, check);
 
   await assert.rejects(pool.query("SELECT 1"), SchemaGuardError);
   await assert.rejects(pool.query("SELECT 2"), SchemaGuardError);
-  assert.equal(calls, 1, "directorul de migrații lipsă a fost re-verificat în loc să rămână ținut minte");
+  assert.equal(calls, 1, "manifestul stricat a fost revalidat în loc să rămână ținut minte");
   assert.deepEqual(raw.queries, [], "interogări au ajuns la pool-ul brut cât garda refuza");
 });
 
 test("instrucțiune consemnată cu altă sumă de control: istorie rescrisă, " +
      "raportată separat de cea neaplicată", async () => {
-  const dir = tmp();
-  fixture(dir, "0001_core.sql", TWO_STATEMENTS);
-  const sha2 = await realSha(dir, "0001_core.sql", 2);
-
   const db = new FakeDb({
     schemaVersionTable: 1,
     ledger: new Map([
       ["0001_core.sql#1", "0".repeat(64)], // sumă falsă: fișierul a fost editat
-      ["0001_core.sql#2", sha2],
+      ["0001_core.sql#2", SHA2],
     ]),
   });
-  const result = await checkSchemaGuard(db, dir);
+  const result = await checkSchemaGuard(db, TWO_STATEMENTS);
   assert.equal(result.ok, false);
   if (result.ok) throw new Error("unreachable");
   assert.equal(result.kind, "outdated");

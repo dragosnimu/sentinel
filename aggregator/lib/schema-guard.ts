@@ -18,6 +18,32 @@
  * încrede în ce a consemnat `migrate.ts`, care la rândul lui nu consemnează
  * nimic fără să fi confirmat efectul. Vezi capul lui `lib/migrate.ts`.
  *
+ * ## Al doilea eșec pe care îl previne: o cale înghețată la compilare
+ *
+ * Măsurat pe 23 septembrie 2026: o versiune anterioară citea, la fiecare
+ * cerere, `discover(MIGRATIONS_DIR)` de pe disc — `MIGRATIONS_DIR` fiind
+ * calculată din `import.meta.url`, pe care compilarea o îngheață la calea
+ * ABSOLUTĂ de pe mașina de build. Pe găzduire build-ul rulează în
+ * `<domeniu>/hbuilds/source/`, care NU supraviețuiește publicării. Calea
+ * înghețată arăta deci spre un director șters, garda pica pe `ENOENT` la
+ * primul contact cu baza, `POST /login` răspundea 503, iar toate fluxurile de
+ * expediere de pe ambele gazde Sentinel au rămas blocate 20+ ore.
+ *
+ * Fișierul ăsta nu mai citește NIMIC de pe disc. Ce compară garda cu
+ * `schema_version` — numele fișierului, indexul instrucțiunii, sha256 — e
+ * `MIGRATIONS_MANIFEST` din `lib/migrations-manifest.ts`: DATĂ, importată
+ * static, deci compilată direct în bundle-ul JS de Next, nu citită la runtime.
+ * Manifestul e GENERAT din `migrations/`, comis în depozit — vezi
+ * `bin/generate-migrations-manifest.ts` — și verificat împotriva directorului
+ * real la fiecare `npm test`, în `tests/migrations-manifest.test.ts`, ca
+ * desincronizarea (migrație nouă negenerată, instrucțiune editată după
+ * generare) să pice suita, nu garda de la trei gazde distanță.
+ *
+ * `bin/migrate.ts` rămâne pe drumul vechi, dinadins: el chiar APLICĂ SQL-ul,
+ * deci are nevoie de fișierele reale, nu doar de sumele lor de control. Rulează
+ * de pe mașina operatorului, unde `MIGRATIONS_DIR` e o cale reală, nu una
+ * înghețată la compilarea unui bundle care va călători în altă parte.
+ *
  * ## Trei stări, nu două
  *
  * O bază complet goală (nicio migrație rulată vreodată) și o bază în urmă cu
@@ -30,6 +56,12 @@
  * „bază veche" — e necunoscut, iar CLAUDE.md e explicit că „necunoscut" și
  * „bine" nu au voie să arate la fel.
  *
+ * O a patra stare, distinctă și de-astea trei: manifestul compilat în bundle
+ * poate fi el însuși gol sau stricat — un merge prost rezolvat, un generator
+ * vechi rulat peste un `lib/` incomplet. Nu e „schemă veche" (schema n-a fost
+ * măcar întrebată) și nu e „necunoscut" (nu e o problemă trecătoare de rețea —
+ * nu se rezolvă singură cât procesul trăiește). Vezi `kind: "manifest-invalid"`.
+ *
  * ## Cine cheamă garda, și de ce nu poate fi ocolită din greșeală
  *
  * `withSchemaGuard` din `lib/db.ts` învelește pool-ul REAL (nu dublurile de
@@ -40,8 +72,10 @@
  * `tests/migrate.test.ts`.
  */
 
-import { MIGRATIONS_DIR, discover, guardPresent } from "./migrate";
+import { guardPresent } from "./migrate";
 import type { Db } from "./migrate";
+import { MIGRATIONS_MANIFEST } from "./migrations-manifest";
+import type { ManifestMigration } from "./migrations-manifest";
 
 /** O instrucțiune dintr-o migrație cunoscută codului, identificată ca în
  *  registru: fișierul plus indexul instrucțiunii înăuntrul lui. */
@@ -54,14 +88,15 @@ export type SchemaGuardResult =
   | { ok: false; kind: "not-installed" }
   /** Nu se poate ști. Nu se confundă cu „bine". */
   | { ok: false; kind: "unknown"; detail: string }
-  /** `discover(dir)` a picat pe ENOENT/ENOTDIR: directorul de migrații nu
-   *  există pe mașina care servește, sau nu e director. NU e o stare a
-   *  schemei — schema n-a fost măcar întrebată — e o eroare de împachetare a
-   *  livrării: `migrations/` n-a ajuns în arhiva urcată pe găzduire. Spre
-   *  deosebire de `unknown`, cauza nu se rezolvă singură cât trăiește
-   *  procesul (nu e un blip trecător de rețea), deci `withSchemaGuard` din
-   *  `lib/db.ts` o ține minte la fel ca `not-installed` și `outdated`. */
-  | { ok: false; kind: "migrations-unreadable"; dir: string }
+  /** `MIGRATIONS_MANIFEST` (`lib/migrations-manifest.ts`) e gol sau nu are
+   *  forma așteptată — vezi `invalidManifestReason` mai jos pentru ce anume se
+   *  verifică. NU e o stare a schemei — schema n-a fost măcar întrebată — e un
+   *  defect în bundle-ul livrat: manifestul comis nu s-a regenerat, sau
+   *  s-a rupt la un merge. Spre deosebire de `unknown`, cauza nu se rezolvă
+   *  singură cât trăiește procesul (nu e un blip trecător de rețea), deci
+   *  `withSchemaGuard` din `lib/db.ts` o ține minte la fel ca `not-installed`
+   *  și `outdated`. */
+  | { ok: false; kind: "manifest-invalid"; detail: string }
   /** `schema_version` există, dar codul cunoaște instrucțiuni pe care
    *  registrul nu le are consemnate (`missing`) — sau le are consemnate cu
    *  altă sumă de control decât fișierul de azi, adică migrația a fost
@@ -70,31 +105,67 @@ export type SchemaGuardResult =
    *  `auditLedger` din `lib/migrate.ts`. */
   | { ok: false; kind: "outdated"; missing: StatementRef[]; changed: StatementRef[] };
 
+/** Nume de fișier de migrație valid — aceeași formă ca `NAME_RE` din
+ *  `lib/migrate.ts`, repetată aici dinadins: cele două module nu au voie să
+ *  depindă unul de constanta privată a celuilalt, iar forma e stabilă (fixată
+ *  în `splitStatements`/`discover` de multă vreme). */
+const MANIFEST_FILE_RE = /^\d{4}_[a-z0-9_]+\.sql$/;
+const MANIFEST_SHA256_RE = /^[0-9a-f]{64}$/;
+
+/**
+ * Manifestul e cod generat (`bin/generate-migrations-manifest.ts`), dar tot
+ * poate ajunge stricat pe drumul până la bundle: un merge prost rezolvat, un
+ * `lib/migrations-manifest.ts` gol scris de o rulare întreruptă. Un manifest
+ * gol sau cu forma greșită NU are voie să treacă drept „nimic de verificat" —
+ * cu zero migrații cunoscute, bucla de mai jos n-ar găsi nimic de comparat și
+ * ar întoarce `ok: true` pe ORICE bază, oricât de veche.
+ *
+ * Întoarce un mesaj când manifestul e stricat, `null` când e valid — aceeași
+ * formă ca `missingSqlModes` din `lib/db.ts`, pentru același motiv: apelantul
+ * nu trebuie să deosebească „nimic de raportat" de „un tablou gol de motive".
+ */
+function invalidManifestReason(manifest: readonly ManifestMigration[]): string | null {
+  if (!Array.isArray(manifest) || manifest.length === 0) {
+    return "lib/migrations-manifest.ts e gol";
+  }
+  for (const migration of manifest) {
+    if (!migration || typeof migration.file !== "string" ||
+        !MANIFEST_FILE_RE.test(migration.file)) {
+      return `un fișier din manifest n-are un nume valid de migrație: ` +
+             `${JSON.stringify(migration?.file)}`;
+    }
+    if (!Array.isArray(migration.statements) || migration.statements.length === 0) {
+      return `${migration.file}: nicio instrucțiune consemnată în manifest`;
+    }
+    for (const stmt of migration.statements) {
+      if (!stmt || !Number.isInteger(stmt.index) || stmt.index < 1) {
+        return `${migration.file}: index de instrucțiune invalid în manifest ` +
+               `(${JSON.stringify(stmt?.index)})`;
+      }
+      if (typeof stmt.sha256 !== "string" || !MANIFEST_SHA256_RE.test(stmt.sha256)) {
+        return `${migration.file} #${stmt.index}: sha256 invalid în manifest`;
+      }
+    }
+  }
+  return null;
+}
+
 /**
  * Verifică schema curentă contra migrațiilor cunoscute codului.
  *
  * NU rulează nimic și nu scrie nimic — o singură gardă de tabelă plus câte o
  * interogare pe registru per migrație cunoscută, aceeași formă ca `ledgerFor`
- * din `lib/migrate.ts`. Cade pe `discover()` dacă directorul de migrații e
- * stricat pe FOND — un fișier cu numele greșit, o versiune dublată — e o
- * eroare de cod, nu o stare de schemă, deci nu se transformă într-un
- * `SchemaGuardResult`. Singura excepție e când directorul însuși lipsește
- * (ENOENT) sau nu e director (ENOTDIR): aia nu e un defect în migrații, e
- * livrarea care nu l-a trimis — vezi `kind: "migrations-unreadable"`.
+ * din `lib/migrate.ts`. Sursa migrațiilor cunoscute e `MIGRATIONS_MANIFEST`,
+ * nu discul — vezi capul fișierului pentru de ce. Dacă manifestul însuși e
+ * gol sau stricat, asta nu e un defect în migrații și nu e o stare a schemei —
+ * e livrarea care n-a regenerat manifestul, sau l-a rupt la un merge — vezi
+ * `kind: "manifest-invalid"`.
  */
 export async function checkSchemaGuard(
-  db: Db, dir: string = MIGRATIONS_DIR,
+  db: Db, manifest: readonly ManifestMigration[] = MIGRATIONS_MANIFEST,
 ): Promise<SchemaGuardResult> {
-  let migrations: ReturnType<typeof discover>;
-  try {
-    migrations = discover(dir);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException | null)?.code;
-    if (code === "ENOENT" || code === "ENOTDIR") {
-      return { ok: false, kind: "migrations-unreadable", dir };
-    }
-    throw err;
-  }
+  const invalid = invalidManifestReason(manifest);
+  if (invalid) return { ok: false, kind: "manifest-invalid", detail: invalid };
 
   const tablePresent = await guardPresent(db, { kind: "table", table: "schema_version" });
   if (tablePresent === false) return { ok: false, kind: "not-installed" };
@@ -107,7 +178,7 @@ export async function checkSchemaGuard(
   const changed: StatementRef[] = [];
   let appliedStatements = 0;
 
-  for (const migration of migrations) {
+  for (const migration of manifest) {
     const rows = await db.all(
       "SELECT stmt_index, stmt_sha256 FROM schema_version WHERE migration = ?",
       [migration.file]);
@@ -155,10 +226,11 @@ export function schemaGuardMessage(
     case "unknown":
       return `schema agregatorului nu se poate verifica: ${result.detail}. ` +
              "Nu se servesc cereri către bază pe o presupunere.";
-    case "migrations-unreadable":
-      return `directorul de migrații nu poate fi citit (${result.dir}). ` +
-             "Asta nu e baza de date căzută — arhiva de livrare probabil nu " +
-             "conține migrations/. Vezi lista din aggregator/README.md.";
+    case "manifest-invalid":
+      return `manifestul de migrații compilat în cod e stricat: ${result.detail}. ` +
+             "Asta nu e baza de date căzută și nu e o migrație lipsă — e un " +
+             "defect de livrare: rulează `npm run generate-migrations-manifest` " +
+             "din aggregator/, comite lib/migrations-manifest.ts și republică.";
     case "outdated": {
       const parts: string[] = [];
       if (result.missing.length) {
