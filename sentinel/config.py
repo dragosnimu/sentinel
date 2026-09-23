@@ -588,9 +588,38 @@ class SelfcheckSilenceConfig:
     journald reader's own cursor instead — see `CURSOR_BACKED_SOURCES` and
     `_journald_reader` in checks.py — which answers "is the reader still
     reading?" without needing anyone to have typed anything.
+
+    `nginx` is a field for a different reason than the ones above: it is a
+    LIVE ONE, still here, but no verdict reads it any more. On 23 Sep 2026
+    nginx moved to `CURSOR_BACKED_SOURCES` in checks.py too — a quiet PRIVATE
+    dashboard (n8n) and a dead reader over a busy PUBLIC site (production)
+    both produce zero rows, and a threshold on elapsed time cannot tell them
+    apart; the collector's own cursor against the file can, on either host.
+    Unlike `sshd`, this field cannot simply be deleted: `nginx: 180` has
+    shipped in `deploy/config/sentinel.yaml.tmpl` since S9, and the installer
+    never rewrites a live `sentinel.yaml` — so any host installed from the
+    CURRENT template carries the key on disk forever after. Neither host
+    running today actually LOADS it yet (read on both, 23 Sep 2026: neither
+    `sentinel.yaml` has a `selfcheck.max_silence_min` section at all — both
+    predate S9), but this is not "for a future install" in the sense of being
+    safely away from today: both hosts already have `/etc/sentinel/
+    sentinel.yaml.new` on disk since 22 Sep 2026 (production 10:43, n8n
+    10:39), written by `install_config`, with `max_silence_min:` at line 422 —
+    and the installer's own instructions tell the operator to review it with
+    `diff -u sentinel.yaml sentinel.yaml.new` and move it into place. The field
+    is one `mv` away from being loaded on either host TODAY, not shielded by
+    however long the operator has not gotten to it yet. Deleting it would turn
+    `ConfigError: unknown configuration key … 'nginx'` into a startup failure
+    the moment either `.new` file is adopted. It stays, accepted and silently
+    unused; see `NAMED_SILENCE_SOURCES` in checks.py for where it is excluded
+    from the verdict it would otherwise still drive by virtue of just being a
+    field here.
     """
     auditd: int = 60      # cron, logins, privilege use
-    nginx: int = 180      # a low-traffic site can genuinely be quiet
+    # See the class docstring above: kept for config compatibility with
+    # already-deployed sentinel.yaml files, read by nothing — nginx is judged
+    # on its tailer's cursor instead (`CURSOR_BACKED_SOURCES` in checks.py).
+    nginx: int = 180
     default: int = 180    # any collector with no field of its own above
 
 

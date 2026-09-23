@@ -2567,15 +2567,37 @@ def test_a_stream_that_is_up_to_date_is_ok(monkeypatch):
     exact ca o instalare pe care expedierea n-a fost pornită niciodată. Scrisă ca
     listă fixă, aserțiunea ar fi devenit falsă la al doilea flux fără să spună
     nimic despre proprietate; scrisă din `STREAMS`, rămâne despre ea.
+
+    Un flux ajuns până la detectorul de înțepenire vine acum însoțit și de
+    cheia lui de acolo (`ship:lag:<flux>:stall`), emisă cu `ok` chiar și pe
+    fluxuri niciodată blocate — altfel o revenire adevărată n-ar avea pe ce
+    cheie să fie anunțată. `audit_log` e singurul flux din fixtura asta cu
+    cursor scris (`cursors={"ship:audit_log": 9}`); restul ies mai devreme, pe
+    ramura „nu a început" (`item.cursor is None`), și nu ajung la detector —
+    n-au de ce să aibă companion. Vezi
+    `test_a_cleared_stall_re_emits_ok_on_the_same_key` din `test_selfcheck.py`.
+
+    Lista rămâne exactă, nu de apartenență: rezultatul e determinist — un
+    companion `:stall` numai pentru `audit_log`, în urma cheii lui principale
+    — deci o cheie în plus sau dublată tot trebuie să pice testul ăsta, nu
+    doar una lipsă.
     """
     _secrets(monkeypatch)
     db = _DB(rows=[_row(9)], cursors={"ship:audit_log": 9})
     results = _lag(db, _lag_cfg())
-    assert [r.key for r in results] == [f"ship:lag:{s.name}" for s in shipper.STREAMS], \
-        "verificarea nu emite exact o cheie pentru fiecare flux înregistrat"
+    expected = []
+    for s in shipper.STREAMS:
+        expected.append(f"ship:lag:{s.name}")
+        if s.name == "audit_log":
+            expected.append(f"ship:lag:{s.name}:stall")
+    assert [r.key for r in results] == expected, (
+        "verificarea nu emite exact o cheie per flux, plus companionul de "
+        "înțepenire pentru fluxul ajuns la detector")
     audit = next(r for r in results if r.key == "ship:lag:audit_log")
     assert audit.status == "ok"
     assert audit.facts["pending"] == 0
+    stall = next(r for r in results if r.key == "ship:lag:audit_log:stall")
+    assert stall.status == "ok"
 
 
 def test_rows_written_a_moment_ago_are_not_a_backlog(monkeypatch):
@@ -2831,7 +2853,7 @@ def test_a_backlog_that_becomes_unreadable_is_not_announced_as_a_recovery(monkey
     summary = run(runner.run_and_alert(db, cfg))
     assert summary["recovered"] == [], summary
     assert "Revenit la normal" not in db.notifications[-1], db.notifications[-1]
-    assert "Nu se mai raportează" in db.notifications[-1]
+    assert "Constatări care nu se mai raportează" in db.notifications[-1]
 
 
 def test_unreadable_secrets_are_not_reported_as_a_missing_key(monkeypatch):

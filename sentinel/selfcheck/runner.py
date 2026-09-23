@@ -256,7 +256,26 @@ def format_alert(bad: list[CheckResult], recovered: list[CheckResult],
         # stopped covering it (a unit disabled in config, a source past the
         # 30-day window). The age is the age of the finding — never printed as
         # if it were the length of an outage.
-        lines.append("⚪ <b>Nu se mai raportează</b>")
+        #
+        # The heading used to be "Nu se mai raportează" — no subject of its
+        # own, sitting right under "Instanță: <nume>" at the top of the
+        # message. Read in sequence the two lines parse as one sentence about
+        # the INSTANCE ("Instanță: productie … nu se mai raportează"), which is
+        # the opposite of what withdrawal means and exactly the reading an
+        # operator gave it on 23 September 2026, four hours after a real
+        # 20-hour outage. `bad` and `recovered` above name their subject
+        # ("Sentinel funcționează degradat", "Revenit la normal" continuing the
+        # same implied subject) — withdrawal breaks that chain by referring to
+        # something else (the findings, not the instance), so it cannot borrow
+        # the ellipsis; it has to say the subject itself. "Constatări" carries
+        # it.
+        #
+        # ⚪, kept: it already means "unknown" everywhere else in this file
+        # (`_EMOJI["unknown"]`), and that is exactly what a withdrawal is — not
+        # proven fixed (🟢 is reserved for a finding this run actually saw turn
+        # `ok`, see the stall recovery above) and not proven broken (🔴/🟡).
+        # Painting it either color would assert more than the check knows.
+        lines.append("⚪ <b>Constatări care nu se mai raportează</b>")
         lines.append("   <i>verificarea nu mai produce constatările de mai jos — "
                      "fie condiția a dispărut, fie nu mai sunt acoperite</i>")
         for w in withdrawn:

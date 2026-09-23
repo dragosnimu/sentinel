@@ -415,8 +415,15 @@ intel:
 # jurnalul cald), deci sshd, sudo și su sunt judecate pe cursorul cititorului
 # de journald, nu pe tăcerea rândului — vezi docs/OPERARE.md §8.
 #
-# Ridică `nginx` (sau `default`, pentru orice colector fără câmp propriu aici)
-# doar pe un site cu adevărat cu trafic redus, unde tăcerea normală trece de
+# `nginx` de mai jos NU mai decide nimic (23 sep 2026): a trecut lângă sshd,
+# judecat pe cursorul cititorului față de fișier, nu pe tăcerea rândului —
+# aceeași distincție ca mai sus, între un panou nevizitat și un cititor mort.
+# Câmpul a rămas pe disc doar ca să nu transforme o gazdă deja instalată cu
+# el în `ConfigError: unknown key 'nginx'`; ridicarea valorii lui aici nu
+# schimbă nimic în verdict.
+#
+# Ridică `default` (sau adaugă un câmp propriu pentru un colector NOU) doar
+# pe un site cu adevărat cu trafic redus, unde tăcerea normală trece de
 # valoarea implicită și verificarea acuză un colector care de fapt funcționează.
 selfcheck:
   max_silence_min:

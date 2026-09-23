@@ -80,8 +80,15 @@ def _cfg(**over):
         # rămas în urmă ar face grupul „ingest” să pice pe altceva decât pe ce se
         # testează. `journald` și `flush_interval_ms` sunt citite direct de
         # `_journald_reader`, din același motiv.
-        ingest=SimpleNamespace(suricata=True, journald=True,
-                               flush_interval_ms=1000),
+        #
+        # `nginx: False` aici — spre deosebire de `Config()`-ul real, unde e
+        # `True` implicit — dinadins, ca dublul de mai jos: majoritatea
+        # testelor din fișierul ăsta nu au nimic de-a face cu nginx și n-au
+        # niciun fișier real de arătat lui `_nginx_reader`. Testele care CHIAR
+        # testează `ingest:nginx` folosesc `_nginx_cfg`, mai jos, care îl
+        # pornește peste un fișier adevărat din `tmp_path`.
+        ingest=SimpleNamespace(suricata=True, journald=True, nginx=False,
+                               nginx_log_paths=[], flush_interval_ms=1000),
         suricata=SimpleNamespace(enabled=False,
                                  eve_path="/var/log/suricata/eve.json"),
         # `_silence_limit`/`_all_quiet_down_min` citesc secțiunea asta DIRECT —
@@ -834,7 +841,8 @@ def test_journald_disabled_in_config_says_so_instead_of_being_unknown_forever(mo
     «nu știu» permanent, care arată ca o verificare stricată."""
     built = _fake_journal(monkeypatch, _busy_journal())
     cfg = _cfg()
-    cfg.ingest = SimpleNamespace(suricata=True, journald=False, flush_interval_ms=1000)
+    cfg.ingest = SimpleNamespace(suricata=True, journald=False, nginx=False,
+                                 nginx_log_paths=[], flush_interval_ms=1000)
     db = _DB(rows=[_source("auditd", 2), _source("nginx", 2)], row=None)
     results = run(checks.check_ingest_sources(db, cfg))
     sshd = next(r for r in results if r.key == "ingest:sshd")
@@ -976,20 +984,31 @@ def test_silence_exactly_at_the_limit_is_not_yet_down():
     assert not any(r.key == "ingest:all" for r in results)
 
 
-def test_a_raised_nginx_threshold_from_configuration_reaches_the_verdict():
-    """`selfcheck.max_silence_min.nginx: 1440` trebuie SĂ SCHIMBE verdictul
-    real pentru un nginx tăcut de 4 ore — altfel secțiunea din sentinel.yaml
-    există în fișier și nu face nimic, exact defectul pe care Change 2 îl
-    repară."""
-    cfg = _cfg()
-    cfg.selfcheck = SimpleNamespace(max_silence_min=SimpleNamespace(
-        auditd=60, nginx=1440, default=1440))
-    db = _DB(rows=[_source("auditd", 5), _source("nginx", 4 * 60)])
-    results = run(checks.check_ingest_sources(db, cfg))
-    nginx = next(r for r in results if r.key == "ingest:nginx")
-    assert nginx.status == "ok", (
-        "pragul ridicat din configurație nu a ajuns la verdict — nginx tăcut "
-        "4 ore a fost acuzat oricum, sub pragul implicit de 180 de minute")
+def test_the_row_silence_threshold_no_longer_governs_nginx():
+    """`selfcheck.max_silence_min.nginx` used to be the knob this test proved
+    live (Change 2, Aug 2026: a raised value had to reach the verdict). It
+    stopped being true on 23 Sep 2026 — see the measurement above
+    `CURSOR_BACKED_SOURCES` in checks.py: nginx moved there, so no
+    `max_silence_min.nginx` value, raised or not, changes `ingest:nginx` any
+    more. The field stays on `SelfcheckSilenceConfig` only so already-deployed
+    `sentinel.yaml` files keep loading (`nginx: 180` has shipped in
+    `deploy/config/sentinel.yaml.tmpl` since S9, and a live config is never
+    rewritten) — what actually keeps it from quietly driving a verdict again
+    is its exclusion from `NAMED_SILENCE_SOURCES`, asserted here.
+
+    The mechanism that replaced it is proved below, in the nginx cursor
+    section: a caught-up cursor after eleven hours of row silence stays `ok`
+    (the n8n case), and a frozen cursor over a file that kept growing is
+    still `down` regardless of what this field says.
+    """
+    assert "nginx" not in checks.NAMED_SILENCE_SOURCES, (
+        "nginx a revenit în lista de praguri pe tăcere — verdictul lui ar "
+        "veni din nou din cât de recent a scris cineva pe site, nu din "
+        "cititor")
+    assert "nginx" in checks.CURSOR_BACKED_SOURCES
+    # Câmpul chiar mai există și se mai poate încărca — ștergerea lui ar
+    # opri fiecare gazdă instalată cu `nginx: 180` deja scris pe disc.
+    assert SelfcheckSilenceConfig(nginx=1440).nginx == 1440
 
 
 def test_one_source_past_its_own_limit_is_blamed_even_if_others_are_merely_quiet():
@@ -1018,37 +1037,46 @@ def test_one_source_past_its_own_limit_is_blamed_even_if_others_are_merely_quiet
 def test_a_real_fault_is_never_withdrawn_by_a_single_sudo_keystroke():
     """Pana de 21 de ore cu un `sudo` tastat la ora 20 nu mai trece prin
     fereastra 5–60: cu un singur prag, `sudo` la 30 de minute ține
-    `ingest:auditd/nginx` acuzate pe nume în tot restul penei — niciodată nu
-    dispar de pe panou, care ar fi anunțat operatorului 55 de minute de
-    recuperare în mijlocul unei pene totale."""
+    `ingest:auditd` acuzat pe nume în tot restul penei — niciodată nu dispare
+    de pe panou, care ar fi anunțat operatorului 55 de minute de recuperare
+    în mijlocul unei pene totale.
+
+    Doar `auditd` mai e verificat aici pe rând: `nginx` e cursor-backed din
+    23 sep 2026 (vezi `CURSOR_BACKED_SOURCES`) și, în dublul de configurație
+    de mai jos (`_cfg()`), oprit — verdictul lui propriu nu mai vine din
+    rândul ăsta. Rândul `nginx` rămâne în interogare doar ca să contribuie la
+    `freshest`/`others_are_live`, ceea ce testul de mai jos nu verifică."""
     db = _DB(rows=[_source("auditd", 1260), _source("nginx", 1260),
                    _source("sshd", 1260), _source("sudo", 30)])
     results = run(checks.check_ingest_sources(db, _cfg()))
-    for source in ("auditd", "nginx"):
-        r = next((x for x in results if x.key == f"ingest:{source}"), None)
-        assert r is not None and r.status == "down", (
-            f"ingest:{source} a dispărut de pe panou — o pană de 21h ascunsă "
-            f"de un singur «sudo» la 30 de minute")
+    auditd = next((x for x in results if x.key == "ingest:auditd"), None)
+    assert auditd is not None and auditd.status == "down", (
+        "ingest:auditd a dispărut de pe panou — o pană de 21h ascunsă de un "
+        "singur «sudo» la 30 de minute")
     sudo = next(r for r in results if r.key == "ingest:sudo")
     assert sudo.status == "ok" and not sudo.bad
 
 
 def test_a_dead_journald_reader_is_blamed_even_beside_a_live_cursor_source():
-    """`journald` (auditd, nginx) mort de 4 ore lângă un rând `suricata` vechi
-    de 20 de minute nu mai dispare în `ingest:all`: cu un singur prag, rândul
-    suricata ține pragul comun jos, iar auditd/nginx rămân acuzate pe nume —
-    nu se pierd sub «ingest:all», care pe gazda de producție ar fi ascuns
-    exact colectorul mort."""
+    """`journald` (auditd) mort de 4 ore lângă un rând `suricata` vechi de
+    20 de minute nu mai dispare în `ingest:all`: cu un singur prag, rândul
+    suricata ține pragul comun jos, iar auditd rămâne acuzat pe nume — nu se
+    pierde sub «ingest:all», care pe gazda de producție ar fi ascuns exact
+    colectorul mort.
+
+    `nginx` a ieșit din verificarea pe nume aici pentru același motiv ca mai
+    sus: e cursor-backed și oprit în dublul de configurație, deci verdictul
+    lui propriu (`ok`, „oprit în configurație”) nu mai are legătură cu vârsta
+    rândului."""
     db = _DB(rows=[_source("auditd", 240), _source("nginx", 240),
                    _source("sshd", 240), _source("suricata", 20)])
     results = run(checks.check_ingest_sources(db, _cfg()))
-    for source in ("auditd", "nginx"):
-        r = next((x for x in results if x.key == f"ingest:{source}"), None)
-        assert r is not None and r.status == "down", (
-            f"ingest:{source} nu a fost acuzat lângă un rând suricata recent")
+    auditd = next((x for x in results if x.key == "ingest:auditd"), None)
+    assert auditd is not None and auditd.status == "down", (
+        "ingest:auditd nu a fost acuzat lângă un rând suricata recent")
     assert not any(r.key == "ingest:all" for r in results), (
-        "fiecare colector mort e deja acuzat pe nume — «ingest:all» n-ar "
-        "adăuga nimic, ar dubla verdictul")
+        "colectorul mort e deja acuzat pe nume — «ingest:all» n-ar adăuga "
+        "nimic, ar dubla verdictul")
 
 
 def test_all_quiet_threshold_is_pinned_to_the_smallest_per_source_limit():
@@ -1358,16 +1386,19 @@ def test_suricata_is_not_judged_against_its_neighbours_any_more():
 def test_the_neighbour_comparison_still_covers_the_row_driven_collectors():
     """Reparația nu are voie să însemne „taci peste tot".
 
-    auditd și nginx AU prins pana reală de 21 de ore, și rândul lor chiar e
-    proporțional cu traficul. Pragurile lor rămân — configurabile acum, dar
-    tot per-sursă. sshd a ieșit din listă fiindcă rândul lui nu mai e, singur,
-    dovada de viață (vezi `SelfcheckSilenceConfig`).
+    auditd A prins pana reală de 21 de ore, iar rândul lui chiar e proporțional
+    cu traficul, deci pragul lui rămâne — configurabil acum, dar tot pe nume.
+    sshd ȘI nginx au ieșit din listă: sshd fiindcă rândul lui nu mai e, singur,
+    dovada de viață (vezi `SelfcheckSilenceConfig`); nginx fiindcă rândul lui e
+    proporțional cu traficul, dar traficul unei gazde poate fi legitim zero
+    (n8n, panou privat) — vezi comentariul de deasupra `CURSOR_BACKED_SOURCES`
+    din checks.py pentru măsurătoarea de pe 23 sep 2026.
     """
-    for source in ("auditd", "nginx"):
-        assert source in checks.NAMED_SILENCE_SOURCES, (
-            f"{source} și-a pierdut pragul de tăcere — verificarea care a prins "
-            f"pata oarbă de 21 de ore nu-l mai acoperă")
+    assert "auditd" in checks.NAMED_SILENCE_SOURCES, (
+        "auditd și-a pierdut pragul de tăcere — verificarea care a prins "
+        "pata oarbă de 21 de ore nu-l mai acoperă")
     assert "sshd" not in checks.NAMED_SILENCE_SOURCES
+    assert "nginx" not in checks.NAMED_SILENCE_SOURCES
 
 
 def test_suricata_turned_off_in_config_says_so_instead_of_vanishing(tmp_path):
@@ -1398,8 +1429,8 @@ def test_the_toggle_in_ingest_decides_whether_the_cursor_is_read_at_all(tmp_path
     """
     path, inode, size = _eve(tmp_path, 4096)
     cfg = _suricata_cfg(path)
-    cfg.ingest = SimpleNamespace(suricata=False, journald=False,
-                                 flush_interval_ms=1000)
+    cfg.ingest = SimpleNamespace(suricata=False, journald=False, nginx=False,
+                                 nginx_log_paths=[], flush_interval_ms=1000)
     db = _DB(rows=[_source("nginx", 1)], row=_cursor_row(f"{inode}:{size}", 90.0))
     results = run(checks.check_ingest_sources(db, cfg))
 
@@ -1431,6 +1462,330 @@ def test_the_cursor_verdict_survives_the_no_rows_at_all_branch(tmp_path):
         "zile», deci runner-ul retrage constatarea despre cititorul eve.json")
     assert any(r.key == "ingest:any" and r.status == "down" for r in results), (
         "ramura de pană totală de colectare nu mai raportează nimic")
+
+
+# --- nginx: același cititor generalizat pe mai multe fișiere ---------------
+#
+# Măsurat pe n8n, 23 septembrie 2026, 09:55 UTC, ca root — ziua în care
+# `ingest:nginx` a raportat `down`, „🔴 SENTINEL NU FUNCȚIONEAZĂ COMPLET”, cu
+# sfatul `systemctl restart sentinel-ingest`, peste un colector care în chiar
+# acel moment prelua evenimente de la auditd:
+#
+#   * /var/log/nginx/sentinel-access.log: 13 349 octeți, 71 de linii, ultima
+#     scriere 22 sep 22:10 UTC — 11h45m înainte de rulare;
+#   * collector_cursors[nginx:/var/log/nginx/sentinel-access.log] =
+#     „2359886:13349” — inod:offset, cu offsetul EGAL cu mărimea fișierului:
+#     cititorul citise tot ce exista;
+#   * ultimele cereri din fișier: GET / și GET /login la 01:09-01:10 ora
+#     locală, de la reverse-proxy-ul propriu al operatorului — panoul n8n e
+#     privat, deschis o dată pe zi;
+#   * sentinel-ingest activ din 06:42, auditd la 09:55:30, detectorul la
+#     09:55:02 — orice altă sursă vie în aceeași secundă.
+#
+# Testele de mai jos sunt perechea „tăcere legitimă / cititor mort” pentru
+# nginx, la fel ca la suricata și sshd mai sus.
+def _access_log(tmp_path, size: int, name: str = "access.log"):
+    """Un access log adevărat de `size` octeți. Întoarce (cale, inod, mărime).
+
+    Fișier real, nu un dublu: `_nginx_path_state` compară mărimea și inodul
+    REALE cu offsetul din cursor, iar un dublu ar lăsa netestat exact
+    `_stat_size_inode`."""
+    import os as _os
+
+    p = tmp_path / name
+    p.write_bytes(b"x" * size)
+    st = _os.stat(p)
+    return str(p), st.st_ino, st.st_size
+
+
+def _nginx_cfg(path_or_paths, **over):
+    cfg = _cfg(**over)
+    paths = [path_or_paths] if isinstance(path_or_paths, str) else list(path_or_paths)
+    cfg.ingest = SimpleNamespace(suricata=True, journald=True, nginx=True,
+                                 nginx_log_paths=paths, flush_interval_ms=1000)
+    return cfg
+
+
+def test_a_caught_up_nginx_cursor_after_eleven_hours_of_row_silence_is_ok(tmp_path):
+    """Cazul de azi, cu numerele reale măsurate pe n8n. Vechea verificare
+    (rând tăcut peste pragul de 180 de minute) acuza un colector care citise
+    deja tot fișierul — traficul vizitatorilor era folosit drept puls, iar un
+    panou nevizitat arăta identic cu un colector mort."""
+    path, inode, size = _access_log(tmp_path, 13349)
+    idle_min = 11 * 60 + 45
+    db = _DB(rows=[_source("auditd", 1), _source("nginx", idle_min)],
+             row=_cursor_row(f"{inode}:{size}", idle_min))
+    results = run(checks.check_ingest_sources(db, _nginx_cfg(path)))
+
+    nginx = next(r for r in results if r.key == "ingest:nginx")
+    assert nginx.status == "ok", (
+        f"un cititor care a citit tot fișierul a fost raportat mort: "
+        f"{nginx.detail}")
+    assert not nginx.bad
+
+
+def test_a_frozen_nginx_cursor_over_a_growing_file_is_down(tmp_path):
+    """Perechea cazului de mai sus: cititorul chiar a murit peste un fișier pe
+    care nginx continuă să-l scrie. Fișierul crește, cursorul stă — proba pe
+    care verificarea trebuie să continue s-o prindă, ca `ingest:suricata` mai
+    sus."""
+    path, inode, size = _access_log(tmp_path, 400_000)
+    db = _DB(rows=[_source("nginx", 90), _source("auditd", 1)],
+             row=_cursor_row(f"{inode}:0", 34.0))
+    results = run(checks.check_ingest_sources(db, _nginx_cfg(path)))
+
+    nginx = next(r for r in results if r.key == "ingest:nginx")
+    assert nginx.status == "down", nginx.detail
+    assert "sentinel-ingest" in nginx.action
+    assert nginx.facts["unread_bytes"] == size
+
+
+def test_a_missing_nginx_cursor_is_unknown_not_ok(tmp_path):
+    """„Nu știu” și „e bine” nu au voie să arate la fel — vezi motivul identic
+    la `test_a_missing_suricata_cursor_is_unknown_not_ok`."""
+    path, _inode, _size = _access_log(tmp_path, 4096)
+    db = _DB(rows=[_source("auditd", 1)], row=None)
+    results = run(checks.check_ingest_sources(db, _nginx_cfg(path)))
+
+    nginx = next(r for r in results if r.key == "ingest:nginx")
+    assert nginx.status == "unknown", "lipsa cursorului a fost citită ca sănătate"
+
+
+def test_an_empty_nginx_cursor_is_unknown_not_ok(tmp_path):
+    path, _inode, _size = _access_log(tmp_path, 4096)
+    db = _DB(rows=[_source("auditd", 1)], row=_cursor_row("", 5.0))
+    results = run(checks.check_ingest_sources(db, _nginx_cfg(path)))
+
+    nginx = next(r for r in results if r.key == "ingest:nginx")
+    assert nginx.status == "unknown"
+
+
+def test_a_malformed_nginx_cursor_is_unknown_not_ok(tmp_path):
+    path, _inode, _size = _access_log(tmp_path, 4096)
+    db = _DB(rows=[_source("auditd", 1)], row=_cursor_row("not-a-cursor", 5.0))
+    results = run(checks.check_ingest_sources(db, _nginx_cfg(path)))
+
+    nginx = next(r for r in results if r.key == "ingest:nginx")
+    assert nginx.status == "unknown"
+
+
+def test_an_unreadable_nginx_file_is_unknown_not_a_verdict(tmp_path):
+    """`_nginx_path_state` verificat direct: `nginx_log_paths` se rezolvă
+    printr-un glob, deci un fișier devenit ilizibil ÎNTRE glob și stat nu se
+    poate provoca portabil printr-un test care trece prin
+    `check_ingest_sources`. Ramura e aceeași ca la suricata: cu fișierul și
+    cursorul necomparabile, verdictul e „nu știu”, nu o ghicire."""
+    path = str(tmp_path / "nu-exista" / "access.log")
+    db = _DB(row=_cursor_row("123:456", 40.0))
+    status, detail, _facts = run(checks._nginx_path_state(db, path))
+    assert status == "unknown"
+    assert "nu s-a putut citi" in detail
+
+
+def test_a_rotated_nginx_log_the_reader_never_picked_up_is_down(tmp_path):
+    """Rotația pe care cititorul n-a urmat-o — aceeași pată oarbă ca la
+    suricata: fără ramura `rotated`, `mărime - offset` ar ieși dintr-un
+    calcul fals și verificarea ar raporta „la zi”."""
+    path, inode, size = _access_log(tmp_path, 8192)
+    db = _DB(rows=[_source("nginx", 120), _source("auditd", 1)],
+             row=_cursor_row(f"{inode + 1}:900000", 34.0))
+    results = run(checks.check_ingest_sources(db, _nginx_cfg(path)))
+
+    nginx = next(r for r in results if r.key == "ingest:nginx")
+    assert nginx.status == "down"
+    assert nginx.facts["rotated"] is True
+    assert nginx.facts["unread_bytes"] == size
+
+
+def test_a_truncated_nginx_log_the_reader_never_rewound_is_down(tmp_path):
+    """`logrotate` cu `copytruncate` sub același inod — scăderea directă ar
+    ieși negativă și n-ar trece de niciun prag fără ramura `truncated`."""
+    path, inode, size = _access_log(tmp_path, 300_000)
+    db = _DB(rows=[_source("nginx", 120), _source("auditd", 1)],
+             row=_cursor_row(f"{inode}:900000", 34.0))
+    results = run(checks.check_ingest_sources(db, _nginx_cfg(path)))
+
+    nginx = next(r for r in results if r.key == "ingest:nginx")
+    assert nginx.status == "down"
+    assert nginx.facts["truncated"] is True and nginx.facts["unread_bytes"] == size
+
+
+def test_nginx_turned_off_in_config_says_so_instead_of_vanishing(tmp_path):
+    """Aceeași alegere ca la `ship:lag`/suricata: dezactivarea se spune, nu se
+    arată printr-un spațiu gol în panou."""
+    path, inode, size = _access_log(tmp_path, 4096)
+    cfg = _nginx_cfg(path)
+    cfg.ingest.nginx = False
+    db = _DB(rows=[_source("auditd", 1)], row=_cursor_row(f"{inode}:{size}", 0.5))
+    results = run(checks.check_ingest_sources(db, cfg))
+
+    nginx = next(r for r in results if r.key == "ingest:nginx")
+    assert nginx.status == "ok" and nginx.facts["configured"] is False
+
+
+def test_no_nginx_files_match_the_glob_is_unknown_not_silence(tmp_path):
+    """Un glob care nu potrivește nimic nu e „nimic de raportat” — configurația
+    cere colectarea, dar n-are ce cursor să compare."""
+    cfg = _nginx_cfg(str(tmp_path / "nu-exista-deloc-*.log"))
+    db = _DB(rows=[_source("auditd", 1)], row=None)
+    results = run(checks.check_ingest_sources(db, cfg))
+
+    nginx = next(r for r in results if r.key == "ingest:nginx")
+    assert nginx.status == "unknown"
+
+
+def test_the_nginx_cursor_verdict_survives_the_no_rows_at_all_branch(tmp_path):
+    """Aceeași grijă ca la suricata: ramura „niciun rând în 30 de zile” iese
+    devreme și nu are voie să piardă verdictul pe cursor."""
+    path, inode, size = _access_log(tmp_path, 4096)
+    db = _DB(rows=[], row=_cursor_row(f"{inode}:{size}", 0.5))
+    results = run(checks.check_ingest_sources(db, _nginx_cfg(path)))
+
+    nginx = next((r for r in results if r.key == "ingest:nginx"), None)
+    assert nginx is not None and nginx.status == "ok"
+    assert any(r.key == "ingest:any" and r.status == "down" for r in results)
+
+
+def test_multiple_tailed_files_the_worst_one_decides(tmp_path):
+    """`nginx_log_paths` e o listă de glob-uri — un host cu mai multe vhost-uri
+    poate urmări mai multe fișiere. Un singur cititor mort trebuie să tragă
+    verdictul în jos chiar dacă restul sunt la zi, altfel un al doilea fișier
+    sănătos ar ascunde primul.
+
+    Fișierul căzut stă la MIJLOC în ordinea alfabetică (`a`, `b` căzut, `c`),
+    dinadins: cu doar două fișiere, cel căzut ar fi fost și primul, și ultimul
+    din `states` — orice implementare care ia poziția în loc de stare
+    (`list(states)[-1]`, `next(iter(states))`, `max(states)` pe chei) ar fi
+    nimerit din întâmplare. Cu trei fișiere și cel căzut la mijloc, doar
+    verificarea care compară STAREA fiecăruia mai poate nimeri."""
+    ok_path, ok_inode, ok_size = _access_log(tmp_path, 4096, name="a-access.log")
+    dead_path, dead_inode, _dead_size = _access_log(
+        tmp_path, 400_000, name="b-access.log")
+    ok2_path, ok2_inode, ok2_size = _access_log(tmp_path, 2048, name="c-access.log")
+    cfg = _nginx_cfg(str(tmp_path / "*-access.log"))
+
+    by_name = {
+        f"nginx:{ok_path}": _cursor_row(f"{ok_inode}:{ok_size}", 0.2),
+        f"nginx:{dead_path}": _cursor_row(f"{dead_inode}:0", 34.0),
+        f"nginx:{ok2_path}": _cursor_row(f"{ok2_inode}:{ok2_size}", 0.1),
+    }
+
+    class _MultiDB(_DB):
+        async def fetchrow(self, sql, *a):
+            self.sql.append(sql)
+            return by_name.get(a[0] if a else None)
+
+    db = _MultiDB(rows=[_source("nginx", 1), _source("auditd", 1)])
+    results = run(checks.check_ingest_sources(db, cfg))
+
+    nginx = next(r for r in results if r.key == "ingest:nginx")
+    assert nginx.status == "down", nginx.detail
+    assert dead_path in nginx.detail and ok_path in nginx.detail and ok2_path in nginx.detail, (
+        "detaliul trebuie să numească TOATE cele trei fișiere, nu doar pe cel căzut")
+    # `_nginx_reader` promite explicit că `facts` vin din fișierul cu starea
+    # cea mai rea, nu din primul sau ultimul din glob și nu din cheia maximă —
+    # `a-access.log` (`ok_path`) e primul alfabetic, `c-access.log` (`ok2_path`)
+    # e ultimul și e și cheia lexicografic maximă, dar cel viu e `b-access.log`
+    # (`dead_path`), la mijloc, cu 400 000 de octeți necitiți. Dacă `worst_path`
+    # ar lua orice cheie din `states` care nu depinde de STARE (de exemplu
+    # `next(iter(states))`, `list(states)[-1]` sau `max(states)`), `facts` ar
+    # arăta un fișier SĂNĂTOS — `unread_bytes` 0 — în timp ce verdictul rămâne
+    # `down`; un operator care se uită doar la `facts` din panou ar fi mințit
+    # despre care fișier a picat.
+    assert nginx.facts["unread_bytes"] == 400_000, (
+        "facts trebuie să vină din fișierul CĂZUT (b-access.log), nu din "
+        "primul, ultimul sau cel cu cheia maximă din glob")
+
+
+# --- garda punctului orb: o sursă nouă nu are voie să cadă neclasificată ----
+def test_every_collector_source_is_classified_somewhere():
+    """Punctul orb generalizat: nginx a scăpat fiindcă `source="nginx"` exista
+    într-un colector real, dar nu aparținea niciunei mulțimi din checks.py —
+    pragul implicit de tăcere l-a prins, tăcut, cu mecanismul greșit pentru ce
+    era. O sursă nouă care nu e clasificată de NIMENI trebuie să pice AICI, nu
+    să apară ca o alarmă falsă pe o gazdă vie, luni mai târziu.
+
+    Rundele 1 și 2 scanau colectoarele după `Event(source=…)` prin AST, ca să
+    deriveze CE se emite azi. Amândouă au pierdut, fiindcă „ce sintaxă poate
+    produce un `source=`” nu e o listă închisă: poziția din semnătură
+    (`Event(ts, "apache", "request", …)`), un apel prin atribut
+    (`_ev.Event(source=…)`), un `**{"source": …}`, un alias de import
+    (`E = Event`), un colector dintr-un subdirector pe care `glob("*.py")` nu
+    îl vede, un al doilea regex undeva în pachet — runda 2 a închis o parte
+    din ele, și tot a mai rămas o formă. Un scanner de sintaxă pierde mereu
+    fiindcă sintaxa nu se termină.
+
+    De aceea garda de mai jos nu mai citește codul colectoarelor ca să
+    ghicească ce emit — citește `SOURCES` din `sentinel/model/event.py`, care
+    e impusă de `Event.__post_init__` la RULARE, indiferent cum a fost
+    construit `Event`-ul. Orice sursă declarată acolo trebuie să fie, exact:
+    fie clasificată (`NAMED_SILENCE_SOURCES` / `CURSOR_BACKED_SOURCES` /
+    `HUMAN_DRIVEN` / `DEFAULT_JUDGED_SOURCES`), fie numită, cu motiv, în
+    `DECLARED_NOT_EMITTED_SOURCES` — a treia stare („nu e nicăieri”) nu
+    există, verificat prin egalitate de mulțimi, nu prin scanare de cod. Cele
+    șase forme de sintaxă de mai sus devin toate IRELEVANTE pentru garda asta:
+    orice ar scrie un colector nou, dacă valoarea nu e deja pe `SOURCES`,
+    `Event.__post_init__` o respinge singur la rulare; dacă e deja pe
+    `SOURCES` (una din cele cinci declarate-dar-neemise azi), scanarea
+    sintaxei n-ar fi contat oricum — decizia de clasificare a rămas pe
+    dezvoltatorul care scrie colectorul, la fel cum a rămas pentru fiecare
+    sursă clasificată deja aici.
+
+    O scanare AST rămâne mai jos, dar demovată la verificare încrucișată, nu
+    sursă de adevăr: dacă găsește un `source="literal"` real într-un colector,
+    verifică doar că numele e un membru legitim al `SOURCES` — un typo acolo
+    ar da oricum `ValueError` la runtime, deci asta prinde din timp, nu
+    înlocuiește garda de mai sus. N-are nevoie să vadă toate formele, fiindcă
+    nimic din ea nu mai decide clasificarea.
+    """
+    from pathlib import Path
+
+    from sentinel.model.event import SOURCES
+
+    classified = (checks.NAMED_SILENCE_SOURCES | checks.CURSOR_BACKED_SOURCES
+                 | checks.HUMAN_DRIVEN | checks.DEFAULT_JUDGED_SOURCES)
+    declared_not_emitted = set(checks.DECLARED_NOT_EMITTED_SOURCES)
+    unclassified = set(SOURCES) - classified
+
+    assert unclassified == declared_not_emitted, (
+        f"set(SOURCES) - classified e {sorted(unclassified)}, dar "
+        f"DECLARED_NOT_EMITTED_SOURCES numește {sorted(declared_not_emitted)} "
+        f"— orice sursă din Event.SOURCES trebuie fie clasificată (NAMED_"
+        f"SILENCE_SOURCES / CURSOR_BACKED_SOURCES / HUMAN_DRIVEN / DEFAULT_"
+        f"JUDGED_SOURCES), fie numită cu motiv în DECLARED_NOT_EMITTED_"
+        f"SOURCES — o sursă care cade prin amândouă e exact punctul orb în "
+        f"care a picat nginx până pe 23 sep 2026")
+
+    # Verificare încrucișată, deliberat slabă (vezi docstring): un `source=`
+    # literal găsit într-un colector trebuie să fie un membru real al
+    # `SOURCES`. Nu încearcă să vadă toate formele de sintaxă — cele pe care
+    # nu le vede sunt pur și simplu absente din `found`, iar asta nu schimbă
+    # nimic din verificarea de mai sus.
+    collectors_dir = (Path(__file__).resolve().parents[2]
+                      / "sentinel" / "collectors")
+    found: set[str] = set()
+    for path in sorted(collectors_dir.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and getattr(node.func, "id", None) == "Event"):
+                continue
+            for kw in node.keywords:
+                if (kw.arg == "source" and isinstance(kw.value, ast.Constant)
+                        and isinstance(kw.value.value, str)):
+                    found.add(kw.value.value)
+
+    # Garda gărzii: dacă expresia de mai sus încetează să vadă `Event(source=…)`,
+    # bucla de mai jos rulează pe o mulțime goală și n-ar mai verifica nimic —
+    # exact tiparul „listă parametrizată ieșită goală și sărită tăcut” din
+    # CLAUDE.md. Scanarea de aici NU e sursa de adevăr pentru clasificare (vezi
+    # docstring), dar tot trebuie să găsească ceva ca să dovedească măcar că
+    # citește fișierele corecte.
+    assert found, "scanarea n-a găsit niciun `Event(source=…)` — verifică expresia AST"
+    assert found <= set(SOURCES), (
+        f"{sorted(found - set(SOURCES))} apare ca `source=` literal într-un "
+        f"colector, dar nu e pe `SOURCES` în sentinel/model/event.py — orice "
+        f"eveniment real de la sursa asta ridică ValueError la rulare")
 
 
 def test_no_events_at_all_is_reported():
@@ -2287,7 +2642,7 @@ def test_an_unreadable_install_tree_is_unknown_not_silence(monkeypatch, tmp_path
     monkeypatch.setattr(checks.Path, "rglob", _explode)
     monkeypatch.setattr(checks, "Path", lambda *a: lib)
 
-    results = run(checks.check_running_code_is_current())
+    results = run(checks.check_running_code_is_current(_StallDB()))
     assert [r.key for r in results] == ["code:current"]
     assert results[0].status == "unknown"
     assert not results[0].bad
@@ -2318,7 +2673,7 @@ def test_an_unreadable_proc_stat_is_unknown_not_silence(monkeypatch, tmp_path):
 
     monkeypatch.setattr(builtins, "open", _no_proc)
 
-    results = run(checks.check_running_code_is_current())
+    results = run(checks.check_running_code_is_current(_StallDB()))
     assert [r.key for r in results] == ["code:current"]
     assert results[0].status == "unknown"
     assert "/proc/stat" in results[0].detail
@@ -2328,7 +2683,154 @@ def test_a_missing_install_tree_stays_silent(monkeypatch, tmp_path):
     """Singura tăcere rămasă, și singura sigură: pe o gazdă fără arbore instalat
     cheia nu s-a emis niciodată, deci nu există constatare de retras."""
     monkeypatch.setattr(checks, "Path", lambda *a: tmp_path / "nu-exista")
-    assert run(checks.check_running_code_is_current()) == []
+    assert run(checks.check_running_code_is_current(_StallDB())) == []
+
+
+def _stale_install(tmp_path, code_mtime=2_000_000.0):
+    """Un arbore instalat al cărui `.py` are un mtime controlat de test."""
+    import os
+
+    lib = tmp_path / "lib" / "sentinel"
+    lib.mkdir(parents=True)
+    f = lib / "x.py"
+    f.write_text("# cod", encoding="utf-8")
+    os.utime(f, (code_mtime, code_mtime))
+    return lib
+
+
+def _patch_boot(monkeypatch, btime=1_000_000):
+    """`/proc/stat` fals, cu `btime` controlat — restul fișierelor citite normal."""
+    import builtins
+    import io
+
+    real_open = builtins.open
+
+    def _fake_open(path, *a, **k):
+        if str(path) == "/proc/stat":
+            return io.StringIO(f"btime {btime}\n")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", _fake_open)
+
+
+def test_a_single_stale_look_is_not_yet_a_finding(monkeypatch, tmp_path):
+    """Fereastra normală a unui deploy: pasul 24 copiază, pasul 32 repornește pe
+    rând, iar autodiagnosticul poate bate ÎN mijlocul ei. O singură privire cu
+    servicii stale nu are voie să sune — asta e exact alarma falsă măsurată pe
+    n8n, de două ori într-o zi, cu toate cele șase servicii deja repornite la
+    secunde după."""
+    lib = _stale_install(tmp_path)
+    monkeypatch.setattr(checks, "Path", lambda *a: lib)
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "5000000")  # 5s de la boot
+    _patch_boot(monkeypatch)
+
+    results = run(checks.check_running_code_is_current(_StallDB()))
+    assert [r.key for r in results] == ["code:current"]
+    assert results[0].status == "unknown", "prima privire a sunat ca o degradare"
+    assert not results[0].bad
+    assert results[0].facts["looks"] == 1
+
+
+def test_a_second_consecutive_stale_look_is_the_finding(monkeypatch, tmp_path):
+    """Ce prinde verificarea: un serviciu lăsat pe cod vechi RĂMÂNE așa la
+    nesfârșit — nimic nu-l repornește singur. A doua privire consecutivă, pe
+    ACEEAȘI instalare, e semnalul care desparte asta de un deploy obișnuit
+    prins din mers; fereastra reală măsurată (sub 2 minute pe ambele gazde de
+    producție) e de trei ori mai scurtă decât intervalul de 5 minute dintre
+    două priviri, deci un deploy normal nu ajunge niciodată la a doua."""
+    lib = _stale_install(tmp_path)
+    monkeypatch.setattr(checks, "Path", lambda *a: lib)
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "5000000")
+    _patch_boot(monkeypatch)
+
+    db = _StallDB()
+    first = run(checks.check_running_code_is_current(db))
+    assert first[0].status == "unknown"
+
+    second = run(checks.check_running_code_is_current(db))
+    assert second[0].status == "degraded", "a doua privire la rând nu a fost prinsă"
+    assert second[0].bad
+    assert second[0].facts["looks"] == 2
+    assert "systemctl restart" in second[0].action
+
+
+def test_a_healthy_look_resets_the_stale_counter(monkeypatch, tmp_path):
+    """Un deploy care se termină NU are voie să lase un contor pregătit —
+    altfel următorul deploy obișnuit ar moșteni o privire străină și ar suna
+    din prima lui privire reală, nu din a doua."""
+    lib = _stale_install(tmp_path)
+    monkeypatch.setattr(checks, "Path", lambda *a: lib)
+    _patch_boot(monkeypatch)
+
+    db = _StallDB()
+
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "5000000")  # stale
+    first = run(checks.check_running_code_is_current(db))
+    assert first[0].status == "unknown"
+    assert db.store["code:current:stale"]["events_seen"] == 1
+
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "0")  # „nu a pornit”: sănătos
+    healthy = run(checks.check_running_code_is_current(db))
+    assert healthy[0].status == "ok"
+    assert db.store["code:current:stale"]["events_seen"] == 0, (
+        "revenirea la sănătos nu a resetat contorul")
+
+    # A treia privire, din nou stale, pe ACEEAȘI instalare: dacă resetul de mai
+    # sus n-a funcționat, asta ar veni deja „degraded" (a treia la rând).
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "5000000")
+    third = run(checks.check_running_code_is_current(db))
+    assert third[0].status == "unknown", "contorul nu s-a resetat cu adevărat"
+    assert third[0].facts["looks"] == 1
+
+
+def test_a_new_deploy_does_not_inherit_the_previous_ones_stale_look(monkeypatch, tmp_path):
+    """Două instalări diferite pot cădea în aceeași fereastră de 5 minute — de
+    exemplu o corecție rapidă trimisă imediat după alta. Fără să lege
+    numărătoarea de instalarea CONCRETĂ (`code_mtime`), a doua ar moșteni
+    privirea primeia și ar suna „degradat" din propria ei primă privire, pe
+    propriul ei deploy transitoriu — exact alarma falsă pe care pragul de două
+    priviri există s-o oprească, doar mutată pe alt deploy."""
+    import os
+
+    lib = _stale_install(tmp_path, code_mtime=2_000_000.0)
+    monkeypatch.setattr(checks, "Path", lambda *a: lib)
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "5000000")
+    _patch_boot(monkeypatch)
+
+    db = _StallDB()
+    first = run(checks.check_running_code_is_current(db))
+    assert first[0].status == "unknown"
+
+    # O instalare NOUĂ, în aceeași fereastră: fișierele au alt mtime.
+    os.utime(lib / "x.py", (3_000_000.0, 3_000_000.0))
+
+    second = run(checks.check_running_code_is_current(db))
+    assert second[0].status == "unknown", (
+        "a doua instalare a moștenit numărătoarea primeia")
+    assert second[0].facts["looks"] == 1
+
+
+def test_the_stale_look_counter_survives_a_selfcheck_restart(monkeypatch, tmp_path):
+    """Contorul stă în `collector_cursors`, nu în memoria procesului — la fel ca
+    `ship:<flux>:stall` și `BEACON_REFUSALS_BEFORE_FINDING`. Dacă ar fi ținut
+    într-o variabilă locală, o repornire a `sentinel-selfcheck` exact între cele
+    două priviri ar uita prima și n-ar mai escalada niciodată o instalare care
+    chiar a rămas blocată peste o repornire de-astea."""
+    lib = _stale_install(tmp_path)
+    monkeypatch.setattr(checks, "Path", lambda *a: lib)
+    monkeypatch.setattr(checks, "_systemctl", lambda *a: "5000000")
+    _patch_boot(monkeypatch)
+
+    db1 = _StallDB()
+    first = run(checks.check_running_code_is_current(db1))
+    assert first[0].status == "unknown"
+
+    # „Procesul repornește": un client nou, aceeași bază de date dedesubt.
+    db2 = _StallDB()
+    db2.store = db1.store
+    second = run(checks.check_running_code_is_current(db2))
+    assert second[0].status == "degraded", (
+        "contorul nu a supraviețuit peste o repornire a procesului")
 
 
 def test_an_unreadable_ruleset_still_reports_the_blocklist_comparison(monkeypatch):
@@ -2371,8 +2873,57 @@ def test_the_operator_is_told_the_red_line_is_gone(monkeypatch):
     assert db.notifications, "nimeni nu i-a spus operatorului"
     text = db.notifications[-1]
     assert "Toate sursele au amuțit" in text
-    assert "Nu se mai raportează" in text
+    # Subiectul e „Constatări", nu instanța: mesajul e trimis sub antetul
+    # „Instanță: <nume>", iar o frază fără subiect propriu ("Nu se mai
+    # raportează") citită imediat după acel antet se poate parsa ca despre
+    # instanță, nu despre constatare — exact citirea greșită din 23 septembrie
+    # 2026 (patru ore după o pană reală de 20 de ore).
+    assert "Constatări care nu se mai raportează" in text
     assert "Revenit la normal" not in text, "afirmă mai mult decât se știe"
+
+
+def test_the_withdrawal_heading_names_the_finding_not_the_instance():
+    """Titlul retragerii era „⚪ Nu se mai raportează" — fără subiect propriu.
+
+    Fiecare mesaj trimis de agentul ăsta e stampilat pe primul rând cu
+    „Instanță: <nume>" (`sentinel/telegram/identity.py`). Citită imediat sub
+    acel rând, o frază fără subiect propriu se leagă gramatical de el:
+    „Instanță: productie … nu se mai raportează" citește ca „instanța nu se
+    mai raportează" — exact opusul retragerii (care e despre o CONSTATARE, nu
+    despre gazdă) și exact citirea pe care a dat-o operatorul pe 23 septembrie
+    2026, patru ore după o pană reală de 20 de ore.
+
+    Aserțiunea e pe mesajul ASAMBLAT de `format_alert`, lipit sub stampila de
+    instanță așa cum ajunge la operator — nu pe o constantă din `runner.py`,
+    ca reformularea să nu poată trece testul doar fiindcă cele două citesc
+    aceeași sursă.
+
+    O singură aserțiune, pe fraza întreagă și îngroșată — nu perechea
+    negativă/pozitivă de dinainte ("Nu se mai raportează</b>" not in heading,
+    "Constatări" in heading), care lăsa un gol între ele: negativa era legată
+    de `</b>`, deci pica doar dacă titlul revenea EXACT la textul vechi, cu
+    tot cu etichetă; pozitiva nu ținea deloc la formatare. O mutație care
+    scoate doar `<b>…</b>` din titlu — subiectul „Constatări" rămâne, doar
+    accentul vizual dispare — trecea nevăzută pe lângă amândouă: pozitiva o
+    ignora, iar negativa nu mai găsea substring-ul ei (cu „Nu" cu literă mare,
+    care oricum nu apare în textul curent — „nu" e cu literă mică). Aserțiunea
+    de-acum verifică fraza întreagă, inclusiv `<b>`/`</b>`, deci prinde și
+    pierderea subiectului, și pierderea formatării.
+    """
+    from sentinel.selfcheck import runner
+
+    withdrawn = [{"key": "ship:lag:event_rollup_1h:stall",
+                 "title": "Expedierea fluxului „event_rollup_1h” s-a înțepenit",
+                 "status": "degraded", "since": None}]
+    text = runner.format_alert(bad=[], recovered=[], state={}, withdrawn=withdrawn)
+    stamped = "Instanță: productie (1c39ad90)\n\n" + text
+
+    heading = next(l for l in stamped.splitlines() if "⚪" in l)
+    assert "<b>Constatări care nu se mai raportează</b>" in heading, (
+        f"titlul retragerii nu (mai) numește constatarea, cu accentul vizual pe "
+        f"care îl au celelalte titluri din mesaj — citit sub stampila de "
+        f"instanță pare o afirmație despre gazdă, nu despre constatare: "
+        f"{heading!r}")
 
 
 def test_a_withdrawn_ok_row_is_not_announced(monkeypatch):
@@ -3719,7 +4270,11 @@ def test_session_commands_thirty_minutes_behind_but_advancing_is_not_a_finding(m
         _patch_ship(monkeypatch, [_sc_lag(cursor, pending=5, oldest_min=30)])
         results = run(checks.check_ship_lag(db, cfg))
 
-    assert not any(r.key.endswith(":stall") for r in results), (
+    # Cursorul avansează la fiecare rulare, deci cheia `:stall` NU are voie să
+    # fie `degraded` — dar e emisă totuși, cu `ok`, ca runner-ul să poată
+    # anunța o revenire adevărată dacă flux ar fi fost înțepenit înainte.
+    stall = _key(results, "ship:lag:session_commands:stall")
+    assert stall is not None and stall.status == "ok", (
         "un flux care se scurge normal a fost numit înțepenit")
     r = _key(results, "ship:lag:session_commands")
     assert r is not None and r.status == "ok", (
@@ -3739,7 +4294,9 @@ def test_session_commands_seven_hours_behind_is_an_age_finding(monkeypatch):
         _patch_ship(monkeypatch, [_sc_lag(cursor, pending=5, oldest_min=420)])
         results = run(checks.check_ship_lag(db, cfg))
 
-    assert not any(r.key.endswith(":stall") for r in results)
+    stall = _key(results, "ship:lag:session_commands:stall")
+    assert stall is not None and stall.status == "ok", (
+        "cursorul avansează — nu are voie să fie numit înțepenit")
     r = _key(results, "ship:lag:session_commands")
     assert r is not None and r.status == "degraded"
     assert "rămas în urmă" in r.title
@@ -3770,6 +4327,104 @@ def test_a_cursor_frozen_while_the_backlog_grows_is_a_stall(monkeypatch):
         "a raportat si constatarea de varsta pe un flux sub pragul de 6h")
 
 
+def test_a_cleared_stall_re_emits_ok_on_the_same_key(monkeypatch):
+    """Ce se strică pentru operator dacă asta pică: o revenire din înțepenire
+    redevine RETRAGERE („⚪ Nu se mai raportează") în loc de REVENIRE („🟢
+    Revenit la normal"), fiindcă înainte de reparație cheia `:stall` era
+    emisă DOAR cât timp fluxul era înghețat — o dezghețare o făcea pur și
+    simplu să dispară din rulare. Măsurat pe 23 septembrie 2026: 20 de
+    înțepeniri reale s-au stins peste zi, iar operatorul a citit retragerea
+    ca pe o veste proastă, la patru ore după o pană reală de 20 de ore.
+
+    Rulează verificarea pe o stare cu stall (3 priviri înghețate, restanța
+    crescând), apoi pe una fără (cursorul a avansat), și confirmă că a doua
+    rulare produce `ok` pe ACEEAȘI cheie — nu absența ei.
+    """
+    db = _StallDB()
+    cfg = _ship_cfg()
+    results = []
+    for pending in (5, 40, 120):
+        _patch_ship(monkeypatch, [_sc_lag(200, pending=pending, oldest_min=30)])
+        results = run(checks.check_ship_lag(db, cfg))
+    stalled = _key(results, "ship:lag:session_commands:stall")
+    assert stalled is not None and stalled.status == "degraded", (
+        "pregătirea nu a produs o înțepenire — testul de revenire nu testează nimic")
+
+    _patch_ship(monkeypatch, [_sc_lag(260, pending=5, oldest_min=2)])
+    results2 = run(checks.check_ship_lag(db, cfg))
+
+    recovered = _key(results2, "ship:lag:session_commands:stall")
+    assert recovered is not None, (
+        "cheia :stall a dispărut din rulare când fluxul s-a dezghețat — "
+        "runner-ul o va citi drept RETRAGERE, nu revenire")
+    assert recovered.status == "ok", (
+        f"fluxul dezghețat nu a produs 'ok' pe cheia lui: {recovered.status}")
+
+
+def test_a_stall_recovery_is_announced_as_recovered_not_withdrawn(monkeypatch):
+    """Aceeași cauză, văzută prin `runner.run_and_alert`, unde se decide de
+    fapt ce citește operatorul. `_key(...).status == "ok"` de mai sus arată că
+    verificarea produce faptul corect; testul ăsta arată că runner-ul îl
+    clasează corect — în `recovered`, nu în `withdrawn` — și că mesajul
+    trimis spune „Revenit la normal”, nu „Constatări care nu se mai
+    raportează”.
+    """
+    from sentinel.selfcheck import runner
+
+    stall_key = "ship:lag:session_commands:stall"
+    stalled = CheckResult(
+        stall_key, "Expedierea fluxului „session_commands” s-a înțepenit",
+        "degraded", detail="cursorul a rămas pe loc 3 rulări la rând")
+
+    db = _StateDB()
+    monkeypatch.setattr(runner, "run_groups", _outcome([_LIVE, stalled]))
+    run(runner.run_and_alert(db, _cfg()))
+    db.notifications.clear()
+
+    recovered_result = CheckResult(
+        stall_key, "Expedierea fluxului „session_commands” nu e înțepenită", "ok",
+        detail="cursorul nu e înghețat")
+    monkeypatch.setattr(runner, "run_groups", _outcome([_LIVE, recovered_result]))
+    summary = run(runner.run_and_alert(db, _cfg()))
+
+    assert summary["recovered"] == [stall_key], (
+        f"o revenire reală a fost clasată greșit: {summary}")
+    assert summary["withdrawn"] == [], (
+        f"revenirea a fost clasată drept retragere: {summary}")
+    text = db.notifications[-1]
+    assert "Revenit la normal" in text
+    assert "Constatări care nu se mai raportează" not in text
+
+
+def test_a_stream_gone_unreadable_is_not_reported_as_a_stall_recovery(monkeypatch):
+    """Un flux care iese din citire (`ship:lag:<flux>:unreadable`) nu are voie
+    să apară drept revenire a înțepenirii — asta AR fi confirmarea intenției
+    (verificarea „a rulat fără eroare pe stall") în locul efectului (fluxul
+    e acum ilizibil, nu vindecat). Cheia `:stall` trebuie pur și simplu să nu
+    mai fie emisă în runda în care fluxul devine ilizibil, ca runner-ul s-o
+    citească drept RETRAGERE, nu revenire.
+    """
+    db = _StallDB()
+    cfg = _ship_cfg()
+    results = []
+    for pending in (5, 40, 120):
+        _patch_ship(monkeypatch, [_sc_lag(200, pending=pending, oldest_min=30)])
+        results = run(checks.check_ship_lag(db, cfg))
+    assert _key(results, "ship:lag:session_commands:stall").status == "degraded"
+
+    broken = StreamLag(stream="session_commands", cursor=200, floor=None,
+                       pending=120, oldest_pending_min=30,
+                       error="relation \"session_commands\" does not exist")
+    _patch_ship(monkeypatch, [broken])
+    results2 = run(checks.check_ship_lag(db, cfg))
+
+    assert _key(results2, "ship:lag:session_commands:stall") is None, (
+        "un flux devenit ilizibil a mai emis cheia :stall — poate fi citit "
+        "greșit drept revenire")
+    unreadable = _key(results2, "ship:lag:session_commands:unreadable")
+    assert unreadable is not None and unreadable.status == "unknown"
+
+
 def test_a_frozen_cursor_with_a_backlog_that_does_not_grow_is_not_a_stall(monkeypatch):
     """Falsul pozitiv măsurat pe 28 august, verbatim: „deși 1 randuri asteapta".
 
@@ -3781,6 +4436,11 @@ def test_a_frozen_cursor_with_a_backlog_that_does_not_grow_is_not_a_stall(monkey
 
     Ce ține în picioare acoperirea: un rând care chiar nu pleacă îmbătrânește, și
     de asta răspunde pragul de VÂRSTĂ, cu întrebarea potrivită.
+
+    De la 23 septembrie 2026, cheia `:stall` nu mai lipsește pe cazul ăsta — se
+    scrie `ok` la fiecare privire în care `is_stalled` e fals, ca dispariția ei
+    să nu mai fie citită drept retragere (vezi `test_a_cleared_stall_re_emits_ok_on_the_same_key`).
+    Ce rămâne testat aici e că fluxul NU e numit înțepenit, nu că cheia lipsește.
     """
     db = _StallDB()
     cfg = _ship_cfg()
@@ -3790,7 +4450,8 @@ def test_a_frozen_cursor_with_a_backlog_that_does_not_grow_is_not_a_stall(monkey
                     [_sc_lag(56882, pending=1, oldest_min=5, stream="incidents")])
         results = run(checks.check_ship_lag(db, cfg))
 
-    assert not any(r.key.endswith(":stall") for r in results), (
+    stall = _key(results, "ship:lag:incidents:stall")
+    assert stall is not None and stall.status == "ok", (
         "un flux cu un singur rând restant, care nu se înmulțește, a fost numit "
         "înțepenit")
     r = _key(results, "ship:lag:incidents")
@@ -3821,7 +4482,8 @@ def test_a_mutable_stream_whose_watermark_advances_is_not_a_stall(monkeypatch):
         _patch_ship(monkeypatch, [item])
         results = run(checks.check_ship_lag(db, cfg))
 
-    assert not any(r.key.endswith(":stall") for r in results), (
+    stall = _key(results, "ship:lag:incidents:stall")
+    assert stall is not None and stall.status == "ok", (
         "un flux mutabil al cărui filigran înaintează a fost numit înțepenit "
         "fiindcă doar jumătatea-cheie a cursorului arăta la fel")
 
@@ -3858,6 +4520,11 @@ def test_a_stall_is_not_declared_inside_one_shipping_round(monkeypatch):
     `interval_s` de 10 minute pus de operator, pragul cade SUB o singură rundă
     normală, iar constatarea s-ar aprinde pe purtarea corectă a mecanismului.
     Aceeași podea o are deja pragul de vârstă.
+
+    De la 23 septembrie 2026, `:stall` se scrie `ok` chiar și sub podeaua asta —
+    vezi `test_a_frozen_cursor_with_a_backlog_that_does_not_grow_is_not_a_stall`
+    pentru motiv. Ce testează linia de mai jos e că nicio apariție a cheii nu e
+    `degraded`, nu că cheia lipsește.
     """
     db = _StallDB()
     cfg = _cfg(ship=SimpleNamespace(enabled=True, url="https://agg.invalid",
@@ -3867,7 +4534,8 @@ def test_a_stall_is_not_declared_inside_one_shipping_round(monkeypatch):
         _patch_ship(monkeypatch, [_sc_lag(200, pending=pending, oldest_min=12)])
         results = run(checks.check_ship_lag(db, cfg))
 
-    assert not any(r.key.endswith(":stall") for r in results), (
+    stall = _key(results, "ship:lag:session_commands:stall")
+    assert stall is not None and stall.status == "ok", (
         "constatarea de înțepenire s-a aprins înainte să fi trecut trei runde de "
         "expediere — pe un interval lung, asta e funcționarea normală")
 
@@ -3914,7 +4582,10 @@ def test_a_cursor_that_advances_a_little_each_run_is_never_a_stall(monkeypatch):
     for cursor in (100, 101, 102, 103, 104):
         _patch_ship(monkeypatch, [_sc_lag(cursor, pending=5, oldest_min=400)])
         results = run(checks.check_ship_lag(db, cfg))
-        if any(r.key.endswith(":stall") for r in results):
+        stall = _key(results, "ship:lag:session_commands:stall")
+        assert stall is not None and stall.status == "ok", (
+            "cheia de înțepenire lipsește sau nu e ok pe un cursor care avansează")
+        if stall.bad:
             saw_stall = True
 
     assert not saw_stall, (
@@ -3940,7 +4611,8 @@ def test_another_stream_keeps_the_fifteen_minute_age_threshold(monkeypatch):
     assert r is not None and r.status == "degraded", (
         "20 de minute pe un flux obișnuit nu a mai fost o constatare — harta de "
         "excepții a slăbit pragul altui flux decât cel numit")
-    assert not any(x.key.endswith(":stall") for x in results)
+    stall = _key(results, "ship:lag:incidents:stall")
+    assert stall is not None and stall.status == "ok"
 
 
 def test_the_stall_counter_resets_when_the_cursor_moves_again(monkeypatch):
@@ -3961,7 +4633,8 @@ def test_the_stall_counter_resets_when_the_cursor_moves_again(monkeypatch):
     _patch_ship(monkeypatch, [_sc_lag(305, pending=5, oldest_min=30)])
     results = run(checks.check_ship_lag(db, cfg))
 
-    assert not any(r.key.endswith(":stall") for r in results), (
+    stall = _key(results, "ship:lag:session_commands:stall")
+    assert stall is not None and stall.status == "ok", (
         "un flux care a înaintat din nou e încă raportat înțepenit")
     assert db.store["ship:session_commands:stall"]["events_seen"] == 0, (
         "contorul de rulări-fără-mișcare nu a revenit la zero după ce cursorul s-a mișcat")
@@ -3989,7 +4662,8 @@ def test_a_registry_row_written_before_the_baseline_existed_forces_a_reset(monke
 
     results = run(checks.check_ship_lag(db, cfg))
 
-    assert not any(r.key.endswith(":stall") for r in results), (
+    stall = _key(results, "ship:lag:session_commands:stall")
+    assert stall is not None and stall.status == "ok", (
         "rândul lăsat de versiunea dinainte a fost citit ca o măsurătoare proprie, "
         "iar prima rulare după deploy a alarmat pe o creștere de la un zero fabricat")
     mark = db.store["ship:session_commands:stall"]
@@ -4041,6 +4715,10 @@ def test_the_second_consecutive_look_is_not_yet_a_stall(monkeypatch):
     priviri înseamnă un cursor nemișcat de ~15 minute. Aprinsă la a doua, aceeași
     alertă ar pleca după ~5 minute — adică peste o singură rundă de expediere care
     poate fi doar înceată, și atunci constatarea se aprinde pe funcționarea normală.
+
+    De la 23 septembrie 2026, a doua privire scrie `ok` pe `:stall` (nu mai
+    lipsește — vezi `test_a_frozen_cursor_with_a_backlog_that_does_not_grow_is_not_a_stall`),
+    deci ce se verifică e statusul, nu prezența cheii.
     """
     db = _StallDB()
     cfg = _ship_cfg()
@@ -4049,7 +4727,8 @@ def test_the_second_consecutive_look_is_not_yet_a_stall(monkeypatch):
         _patch_ship(monkeypatch, [_sc_lag(200, pending=pending, oldest_min=30)])
         results = run(checks.check_ship_lag(db, cfg))
 
-    assert not any(r.key.endswith(":stall") for r in results), (
+    stall = _key(results, "ship:lag:session_commands:stall")
+    assert stall is not None and stall.status == "ok", (
         "constatarea de înțepenire s-a aprins la a doua privire — alerta pleacă "
         "după ~5 minute în loc de ~15")
 

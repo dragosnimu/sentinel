@@ -55,6 +55,7 @@ from typing import Any, Callable, Literal
 
 import yaml
 
+from sentinel.collectors import nginx_tail
 from sentinel.collectors.journald_reader import REBUILD_AFTER_EMPTY_POLLS
 from sentinel.config import (
     CONFIG_PATH,
@@ -413,8 +414,31 @@ def _silence_limit(cfg: Config, source: str) -> int:
 # kind of duplication `test_all_quiet_threshold_is_pinned_to_the_smallest_
 # per_source_limit` exists to catch — a second list that can silently drift
 # from the fields that actually exist.
+#
+# `nginx` is excluded too, alongside `default`, even though the field is still
+# on the dataclass. It moved to `CURSOR_BACKED_SOURCES` below (n8n, 23 Sep
+# 2026 — see there for the measurement), so no verdict reads it any more, but
+# the field itself cannot simply be deleted the way `sshd`'s was: unlike sshd,
+# `nginx: 180` has SHIPPED in `deploy/config/sentinel.yaml.tmpl` since S9, and
+# `install_config` never rewrites a live `sentinel.yaml` (see `install.sh`) —
+# so any host installed with the CURRENT template carries the key on disk
+# forever after. Neither host actually running today LOADS it yet (read on
+# both, 23 Sep 2026: neither `/etc/sentinel/sentinel.yaml` has a
+# `selfcheck.max_silence_min` section at all — both predate S9), but that is
+# not the same as "safe for now": both hosts already have `/etc/sentinel/
+# sentinel.yaml.new` on disk since 22 Sep 2026 (production 10:43, n8n 10:39),
+# with `max_silence_min:` at line 422, and the installer tells the operator to
+# `diff -u sentinel.yaml sentinel.yaml.new` and move it into place. The field
+# is one `mv` away from being loaded on either host TODAY, not shielded by a
+# future install that has not happened yet. Deleting the field from the
+# dataclass turns `ConfigError: unknown configuration key … 'nginx'` into a
+# startup failure the moment either `.new` file is adopted — a worse outage
+# than the one this change fixes. The field stays, accepted and silently
+# unused; the exclusion below is what keeps it from quietly re-entering
+# row-silence judgment through the automatic derivation.
 NAMED_SILENCE_SOURCES: frozenset[str] = frozenset(
-    f.name for f in dc_fields(SelfcheckSilenceConfig) if f.name != "default")
+    f.name for f in dc_fields(SelfcheckSilenceConfig)
+    if f.name not in ("default", "nginx"))
 
 # S9: `check_ingest_sources`'s query used to scan `raw_events` over the last
 # 30 DAYS — `retention.raw_events_days`'s own default — to compute one
@@ -477,10 +501,16 @@ RAW_EVENTS_INGEST_SCAN_HOURS = 48
 # See `test_all_quiet_threshold_is_pinned_to_the_smallest_per_source_limit`.
 #
 # Config-driven, like `_silence_limit` above: reads the operator's configured
-# per-source numbers, not the shipped defaults, so an operator who raises
-# `nginx` to 1440 minutes on a genuinely low-traffic site also raises how long
-# the WHOLE host may be quiet before `ingest:all` fires — the two questions
-# share one floor for the reason argued above, and that must stay true whether
+# per-source numbers, not the shipped defaults, over `NAMED_SILENCE_SOURCES` —
+# which excludes `nginx` (see the field's exclusion above, 23 Sep 2026): nginx
+# moved to `CURSOR_BACKED_SOURCES` and no longer drives any silence-based
+# verdict, so raising `nginx.max_silence_min` no longer changes this floor.
+# Measured today, with the shipped `SelfcheckSilenceConfig` (`auditd` the only
+# named field left): raising `auditd` to 1440 minutes raises this floor to
+# 1440; raising or lowering `nginx` leaves it at 60, the `auditd` default —
+# confirming the claim this comment used to make about `nginx` is false now.
+# If another named field is ever added, it joins `auditd` in this floor for
+# the same reason auditd is here: the two questions share one floor whether
 # the numbers come from the defaults or from sentinel.yaml.
 def _all_quiet_down_min(cfg: Config) -> int:
     limits = cfg.selfcheck.max_silence_min
@@ -526,7 +556,45 @@ def _all_quiet_down_min(cfg: Config) -> int:
 # never quiet": the journald reader's own cursor against the entry that
 # follows it in the journal, which is true regardless of whether anyone is
 # currently attacking.
-CURSOR_BACKED_SOURCES = frozenset({"suricata", "sshd"})
+#
+# `nginx` joined third, on 23 Sep 2026, and it is a THIRD failure mode again —
+# not suricata's (rows not proportional to traffic) and not sshd's (traffic
+# adversarial): nginx's rows ARE ordinary, proportional traffic, which is
+# exactly why the row-silence table above used to carry it at 180 minutes.
+# What breaks that premise is who visits. Measured on n8n, 23 Sep 2026, 09:55
+# UTC, as root:
+#
+#   * /var/log/nginx/sentinel-access.log: 13 349 bytes, 71 lines, last write
+#     22 Sep 22:10 UTC — 11h45m before the check ran;
+#   * collector_cursors[nginx:/var/log/nginx/sentinel-access.log] =
+#     "2359886:13349" — inode:offset, and the offset equals the file's exact
+#     size: the reader has read every byte that exists;
+#   * the last requests in the file are GET / and GET /login at 01:09–01:10
+#     local time, from the operator's own reverse proxy — the private
+#     dashboard n8n serves is opened once a day;
+#   * sentinel-ingest active since 06:42, auditd rows at 09:55:30, detect
+#     events at 09:55:02 — every other source alive in the same second.
+#
+# The check fired `down`, "🔴 SENTINEL NU FUNCȚIONEAZĂ COMPLET", and advised
+# `systemctl restart sentinel-ingest` — against a collector that was, at that
+# exact moment, taking events from auditd. Silence here was not a broken
+# collector; it was nobody visiting a page nobody visits often.
+#
+# Why not `HUMAN_DRIVEN` instead, which already reports "quiet" as `ok`
+# unconditionally: because on PRODUCTION nginx serves the operator's own
+# public sites, where a reader that dies while requests keep arriving is a
+# real blind spot — the exact fault this whole set of exemptions exists to
+# keep catching, not to wave through. `HUMAN_DRIVEN` never looks at the file;
+# it would report `ok` on elapsed time alone whether or not eleven hours of
+# UNREAD requests sat behind a dead tailer. A verdict picked by the SOURCE'S
+# NAME cannot be right on both hosts at once — production and n8n disagree on
+# whether nginx silence is meaningful, for reasons that have nothing to do
+# with the collector. The cursor comparison below does not have that problem:
+# "has every byte the file holds been read" is the same question, with the
+# same right answer, regardless of how many bytes there were to read — a
+# quiet private dashboard and a busy public site are told apart by the same
+# measurement, not by which one they are.
+CURSOR_BACKED_SOURCES = frozenset({"suricata", "sshd", "nginx"})
 
 # Sources whose events exist only when a HUMAN acts. Silence here is not
 # evidence of anything: a server nobody logged into for a day produces zero
@@ -579,6 +647,75 @@ CURSOR_BACKED_SOURCES = frozenset({"suricata", "sshd"})
 # empty while the reader itself kept advancing. Catching that needs the reader
 # to report what it saw and discarded, which it does not currently track.
 HUMAN_DRIVEN = frozenset({"sudo", "su"})
+
+# Sources deliberately left OUTSIDE all three sets above — not an oversight,
+# a decision recorded here so the next one has to be recorded too. See
+# `test_every_collector_source_is_classified_somewhere` in test_selfcheck.py:
+# it walks `sentinel/collectors/*.py` for every literal `source=` an `Event`
+# is ever built with and fails if one is not accounted for by
+# `NAMED_SILENCE_SOURCES`, `CURSOR_BACKED_SOURCES`, `HUMAN_DRIVEN`, or here —
+# which is exactly the gap `nginx` fell through until 23 Sep 2026: a real
+# collector, producing a real `source=` string, judged by neither an explicit
+# threshold nor a cursor, just the same `default` row-silence fallback
+# `_silence_limit` hands anything unnamed.
+#
+# `conntrack` is the one source that genuinely belongs here rather than in
+# either judged set: `ConntrackSampler` takes a snapshot of the kernel's
+# current connection table on its own cadence (see `services/ingest_service.py`
+# — "No cursor: each sample is a self-contained snapshot… there is nothing to
+# resume from"). There is no `collector_cursors` row to compare against a
+# file, so `CURSOR_BACKED_SOURCES`'s mechanism does not apply; and a sample is
+# not human-triggered, so `HUMAN_DRIVEN`'s "silence is never evidence of
+# anything" does not apply either. Row-silence on the `default` threshold is
+# the correct judgment for it, not a fallback nobody chose.
+DEFAULT_JUDGED_SOURCES = frozenset({"conntrack"})
+
+# `Event.SOURCES` (sentinel/model/event.py) is enforced by `__post_init__` for
+# EVERY way an `Event` can be built — positional, keyword, `**kwargs`, through
+# an import alias, from a module in a subdirectory glob misses, from a second
+# regex nobody thought to grep for. A scanner that tries to enumerate every
+# call site that could produce a `source=` chases that syntax forever and
+# always loses (round 1 and round 2 of this file's own history, both closed a
+# form and both left another open — see
+# `test_every_collector_source_is_classified_somewhere`). So the gate moved:
+# instead of asking "does any collector emit this today", it asks "does
+# `SOURCES` account for this at all" — `set(SOURCES) - classified` MUST equal
+# exactly the five names below, no more and no fewer, checked by set equality
+# in the test, not by scanning code that constructs the values.
+#
+# Each is declared on `SOURCES` — so `Event.__post_init__` accepts it, so
+# nothing stops a future collector from using it — but no collector emits it
+# TODAY (verified by grepping every `Event(` call in `sentinel/collectors/` on
+# 23 Sep 2026, the day this constant was written; see the reason next to each
+# name for why it exists on `SOURCES` at all despite that).
+#
+# A source leaving this dict without landing in `NAMED_SILENCE_SOURCES`,
+# `CURSOR_BACKED_SOURCES`, `HUMAN_DRIVEN`, or `DEFAULT_JUDGED_SOURCES` fails
+# the equality check above — same for a source arriving on `SOURCES` for the
+# first time. Neither case depends on catching the collector that started
+# emitting it: whoever writes that collector is expected to make the same
+# judgment call this file made for every other source and move it out of
+# here, in the same change — this constant cannot force that by itself, the
+# way it cannot force anyone to read a comment. What it DOES force
+# mechanically is that the name cannot just sit unmentioned on `SOURCES`
+# while a real collector emits it under nobody's judgment, the way `nginx`
+# did until 23 Sep 2026 — because moving a name out of this dict without
+# giving it a classification is what the equality check catches.
+DECLARED_NOT_EMITTED_SOURCES: dict[str, str] = {
+    "apache": "on SOURCES for a host that might one day run Apache instead "
+              "of nginx; this deployment only ever runs nginx",
+    "docker": "in the architecture diagram (docs/ARHITECTURA.md, §2, "
+              "\"docker events\") as a planned ingest path; no "
+              "`sentinel/collectors/docker*.py` exists yet",
+    "fim": "planned file-integrity-monitoring collector; no "
+           "`sentinel/collectors/fim*.py` exists yet",
+    "internal": "reserved for events Sentinel synthesizes about itself, not "
+                "read from an external log; nothing constructs one today",
+    "journald": "the generic bucket name for `journald`-sourced events; "
+                "every real journald reader tags the SPECIFIC source instead "
+                "(`sshd`, `sudo`, `su`, `auditd` — see system.py, sshd.py, "
+                "auditd.py) so this literal is never actually used",
+}
 
 
 def _ago(minutes: float) -> str:
@@ -816,6 +953,194 @@ async def _suricata_reader(db: Database, cfg: Config,
                    f"ls -l {path}",
             facts={"eve_size": size, "quiet_min": int(idle_min)}),
     ]
+
+
+# Same backstop as `SURICATA_PARTIAL_LINE_BYTES`, same reasoning:
+# `nginx_tail.read_new_lines` stops at the last `\n`, so a live reader leaves
+# behind at most one line that has been started and not yet terminated. A
+# combined-format access-log line runs to a few hundred bytes; 64 KiB is far
+# above that and far below any real burst.
+NGINX_PARTIAL_LINE_BYTES = 64 * 1024
+
+
+async def _nginx_path_state(db: Database, path: str) -> tuple[Status, str, dict[str, Any]]:
+    """One tailed access-log file's state, as `(status, detail, facts)` — the
+    per-file half of `_nginx_reader` below, same measurement
+    `_suricata_reader` makes for `eve.json`: the collector's stored offset
+    against the file's actual size, never the age of the last ROW.
+
+    The cursor lives under `nginx:{path}` in `collector_cursors` — one row per
+    tailed file, because `cfg.ingest.nginx_log_paths` is a glob and a host can
+    tail more than one access log (see `_nginx_cursors` in
+    `services/ingest_service.py`).
+    """
+    row = await db.fetchrow(
+        "SELECT cursor, EXTRACT(EPOCH FROM (now() - updated_at))/60 AS minute "
+        "FROM collector_cursors WHERE name = $1",
+        f"nginx:{path}")
+    if row is None:
+        return ("unknown",
+                f"{path}: nu există cursorul „nginx:{path}” în collector_cursors "
+                f"— nu s-a citit niciodată, ori rândul a fost șters",
+                {"cursor": None})
+
+    cursor = str(row["cursor"] or "")
+    idle_min = float(row["minute"] or 0)
+    # NULL sau șir gol: rândul există, poziția nu — vezi aceeași ramură în
+    # `_journald_reader` pentru motivul pentru care asta e „nu știu", nu un
+    # cursor obișnuit care s-ar potrivi din întâmplare cu offsetul 0.
+    if not cursor:
+        return ("unknown",
+                f"{path}: cursorul e gol — nu există poziție salvată de "
+                f"comparat cu fișierul, iar rândul a fost atins ultima oară "
+                f"acum {_ago(idle_min)}",
+                {"cursor": None, "cursor_idle_min": int(idle_min)})
+
+    stat = await asyncio.to_thread(_stat_size_inode, path)
+    parsed = _tail_cursor(cursor)
+    if stat is None or parsed is None:
+        why = (f"{path} nu s-a putut citi" if stat is None
+               else f"cursorul „{cursor}” nu are forma <inod>:<offset>")
+        return ("unknown",
+                f"{why} — nu se poate spune dacă mai citește cineva",
+                {"cursor": cursor, "cursor_idle_min": int(idle_min)})
+
+    size, inode = stat
+    c_inode, c_offset = parsed
+    rotated = c_inode != inode
+    # Aceeași ramură ca la suricata: offsetul dincolo de capăt înseamnă fișier
+    # tăiat sub același inod (`logrotate` cu `copytruncate`), iar fără ramura
+    # asta `size - c_offset` ar ieși negativ și n-ar trece de niciun prag.
+    truncated = not rotated and c_offset > size
+    unread = size if (rotated or truncated) else size - c_offset
+    facts: dict[str, Any] = {
+        "cursor": cursor, "cursor_idle_min": int(idle_min),
+        "unread_bytes": unread, "rotated": rotated, "truncated": truncated,
+    }
+    if rotated or truncated or unread > NGINX_PARTIAL_LINE_BYTES:
+        if rotated:
+            what = (f"fișierul s-a rotit (inod {inode}, cursorul e pe "
+                     f"{c_inode}) și cei {unread} de octeți ai lui n-au fost "
+                     f"citiți")
+        elif truncated:
+            what = (f"fișierul a fost tăiat sub cursor (offset {c_offset}, "
+                     f"mărime {size}) și cei {unread} de octeți de acum n-au "
+                     f"fost citiți")
+        else:
+            what = f"au rămas {unread} de octeți necitiți"
+        return ("down",
+                f"{path}: offsetul stă pe loc de {_ago(idle_min)}, iar {what}",
+                facts)
+
+    # Offsetul e la capătul fișierului (sau la un rest sub un rând netermintat):
+    # colectorul a citit tot ce există ACUM. Cât de demult a fost asta e o
+    # măsură a tăcerii site-ului/panoului, nu a colectorului — vezi
+    # `CURSOR_BACKED_SOURCES` pentru cazul care a cerut exact distincția asta.
+    return ("ok",
+             f"{path}: cititorul e la zi (offset {c_offset} din {size} "
+             f"octeți), ultima scriere acum {_ago(idle_min)}",
+             facts)
+
+
+async def _nginx_reader(db: Database, cfg: Config,
+                        row_minutes: float | None) -> list[CheckResult]:
+    """Is the nginx access-log tailer still reading? — asked of the offset
+    against the file, never of how long ago a ROW arrived. See
+    `CURSOR_BACKED_SOURCES` above for the n8n measurement (23 Sep 2026) that
+    forced this: `ingest:nginx` fired `down`, "🔴 SENTINEL NU FUNCȚIONEAZĂ
+    COMPLET", and advised restarting a collector that was, at that moment,
+    taking events from auditd — the row-silence check had no way to tell "the
+    reader died" from "nobody visited a private dashboard for eleven hours",
+    because it never looked at the file, only at the clock.
+
+    Same four states `_suricata_reader` answers for `eve.json`, generalized
+    over every file `cfg.ingest.nginx_log_paths` resolves to — a glob, so a
+    host can tail more than one access log (rare in this deployment: every
+    vhost template points `access_log` at the same shared
+    `sentinel-access.log`, but the config shape does not promise exactly one):
+
+    * **caught up** — the stored offset equals the file's current size. `ok`,
+      however long ago that was: the quiet-host case, and the entire point of
+      this function existing.
+    * **frozen behind a file that grew** — the reader stopped advancing over
+      bytes nginx kept writing. `down`; `systemctl restart sentinel-ingest`
+      is the correct advice here, unlike in the case above.
+    * **rotated or truncated under the stored inode** and never picked up —
+      the same blind spot `_suricata_reader` guards against, `down` for the
+      same reason.
+    * **cursor missing, empty, or the file unreadable** — `unknown`, said out
+      loud, never folded into `ok`.
+
+    Unlike `_suricata_reader`, there is no cursor-freshness fast path before
+    stat'ing the file: that shortcut exists there to skip a stat when the
+    offset moved inside the last few minutes, but nginx's files are typically
+    one, sometimes a handful, and a stat per path on a 5-minute timer is not a
+    cost worth a second branch to avoid.
+
+    Worst status across the tailed files decides the ONE key this emits
+    (`ingest:nginx`) — `down` beats `unknown` beats `ok`, via `_RANK`, same
+    order `worst()` uses everywhere else in this module. The detail lists
+    every file; the flat `facts` (`cursor`, `unread_bytes`, …) come from
+    whichever file produced the worst status, so a single-file host — the
+    normal case here — gets the same flat shape `_suricata_reader` does.
+
+    Why this is not simply `nginx` folded into `HUMAN_DRIVEN` instead: that
+    set reports `ok` unconditionally, on elapsed time alone, with no
+    comparison to the file at all. On PRODUCTION nginx serves the operator's
+    own public sites, where a reader that dies while requests keep arriving is
+    a real blind spot — exactly the fault this file exists to keep catching.
+    `HUMAN_DRIVEN` would report `ok` whether or not hours of UNREAD requests
+    sat behind a dead tailer, on either host, because it never asks the file.
+    A verdict chosen by the source's NAME cannot be right for both hosts at
+    once: production and n8n disagree about whether nginx silence means
+    anything, for reasons that have nothing to do with the collector. The
+    cursor comparison this function makes does not have that problem — "has
+    every byte the file holds been read" has the same right answer on a quiet
+    private dashboard and a busy public site, because it never asks how busy
+    the site is, only whether the reader kept up with whatever it wrote.
+    """
+    if not cfg.ingest.nginx:
+        return [CheckResult(
+            "ingest:nginx", "Colector „nginx”", "ok",
+            detail="oprit în configurație — pe gazda asta nu se citesc "
+                   "jurnalele nginx",
+            facts={"configured": False})]
+
+    note = (f" · ultimul rând nginx acum {_ago(row_minutes)}"
+            if row_minutes is not None
+            else " · niciun rând nginx în fereastra de scanare")
+
+    paths = nginx_tail.expand_paths(cfg.ingest.nginx_log_paths)
+    if not paths:
+        return [CheckResult(
+            "ingest:nginx", "Nu pot spune dacă „nginx” mai e citit", "unknown",
+            detail=f"niciun fișier nu se potrivește cu "
+                   f"{cfg.ingest.nginx_log_paths}{note}",
+            action="ls -l /var/log/nginx/",
+            facts={"configured": True, "paths": []})]
+
+    states = {p: await _nginx_path_state(db, p) for p in paths}
+    worst_status = min((s for s, _, _ in states.values()),
+                       key=lambda s: _RANK.get(s, 2))
+    detail = "; ".join(d for _, d, _ in states.values()) + note
+    worst_path = next(p for p, (s, _, _) in states.items() if s == worst_status)
+    facts: dict[str, Any] = dict(states[worst_path][2])
+    facts["path_count"] = len(paths)
+
+    if worst_status == "down":
+        return [CheckResult(
+            "ingest:nginx", "Colectorul „nginx” nu mai citește logul", "down",
+            detail=detail,
+            action="systemctl restart sentinel-ingest ; "
+                   "journalctl -u sentinel-ingest -n 100",
+            facts=facts)]
+    if worst_status == "unknown":
+        return [CheckResult(
+            "ingest:nginx", "Nu pot spune dacă „nginx” mai e citit", "unknown",
+            detail=detail, action="journalctl -u sentinel-ingest -n 100",
+            facts=facts)]
+    return [CheckResult("ingest:nginx", "Colector „nginx”", "ok",
+                        detail=detail, facts=facts)]
 
 
 # How long the FIRST UNREAD entry — the one immediately after the collector's
@@ -1327,6 +1652,14 @@ async def check_ingest_sources(db: Database, cfg: Config) -> list[CheckResult]:
     their verdict is produced here — not skipped — so the `ingest:*` namespace
     still has exactly one author.
 
+    `nginx` is in that set for a reason distinct from suricata's or sshd's
+    (see the comment above `CURSOR_BACKED_SOURCES` for all three): its rows
+    genuinely ARE proportional to ordinary traffic, which is exactly why
+    silence in them is ambiguous — a dead reader and a page nobody visited
+    both produce zero rows, and only the cursor against the file tells them
+    apart. "Proportional to traffic" turned out not to be the same question as
+    "safe to judge by row silence".
+
     One floor, `_all_quiet_down_min(cfg)`, decides both "is this source blamed
     by name?" and "has everyone gone quiet?" — see the comment above it for why
     a second, shorter number used for the first question opened a band in
@@ -1352,6 +1685,7 @@ async def check_ingest_sources(db: Database, cfg: Config) -> list[CheckResult]:
     cursor_backed = [
         *await _suricata_reader(db, cfg, ages.get("suricata")),
         *await _journald_reader(db, cfg, ages.get("sshd")),
+        *await _nginx_reader(db, cfg, ages.get("nginx")),
     ]
 
     if not rows:
@@ -1822,7 +2156,35 @@ async def check_alerting(db: Database, cfg: Config) -> list[CheckResult]:
         facts={"blocked": 0, "held": held})]
 
 
-async def check_running_code_is_current() -> list[CheckResult]:
+# Câte priviri consecutive ale autodiagnosticului trebuie să vadă servicii
+# pornite ÎNAINTEA ultimei instalări înainte ca asta să fie numită degradare.
+#
+# Măsurat pe ambele gazde de producție, din `journalctl` real, pe zece
+# instalări separate din 14-17 septembrie 2026:
+# fereastra de la copierea pachetului (pasul 24 din install.sh — mtime-ul
+# fișierelor din `/opt/sentinel/lib`) până la repornirea ULTIMULUI serviciu
+# (pasul 32) a fost între 1m39s și 1m55s de fiecare dată, pe amândouă gazdele.
+# Alarma din care s-a cerut pragul ăsta a căzut exact în mijlocul unei ferestre
+# de-astea: privirea de la 12:21:39 UTC, la 14 secunde după copiere, cu
+# `executor` deja repornit și restul încă vechi.
+#
+# O fereastră de sub două minute încape de peste trei ori într-un interval de
+# 5 minute (`sentinel-selfcheck.timer`, `OnUnitActiveSec=5min`), deci DOUĂ
+# priviri consecutive nu pot cădea amândouă în interiorul ei — a doua privire
+# vede stare stale doar dacă instalarea chiar nu mai avansează, adică exact
+# starea pe care verificarea asta există s-o prindă. Nu trei, ca la
+# `STALL_RUNS_BEFORE_FINDING`: acolo podeaua suplimentară exista pentru un flux
+# cu volum mic care ar putea sta legitim nemișcat câteva runde; aici fereastra
+# reală măsurată e de trei ori mai scurtă decât UN interval, deci a doua
+# privire e deja o marjă, nu un prag optimist.
+#
+# Dacă un deploy viitor capătă un pas lung între 24 și 32 (o migrare mare, de
+# exemplu) care împinge fereastra reală peste 5 minute, numărul ăsta trebuie
+# remăsurat — vezi nota din raportul care a adăugat pragul.
+CODE_STALE_LOOKS_BEFORE_FINDING = 2
+
+
+async def check_running_code_is_current(db: Database) -> list[CheckResult]:
     """Are the daemons running the code that is installed?
 
     A deploy copies files; only a restart makes a process use them. When those
@@ -1833,6 +2195,16 @@ async def check_running_code_is_current() -> list[CheckResult]:
     Found the hard way — the installer restarted two of six units, so four ran
     the previous release after every upgrade until someone happened to restart
     them.
+
+    A single stale look is NOT reported as `degraded`. The installer copies the
+    package (step 24) and only then restarts services one by one (step 32),
+    which means every deploy passes through a few minutes where this is
+    genuinely, transiently true. Measured on both production hosts (see
+    `CODE_STALE_LOOKS_BEFORE_FINDING` above): that window closes in under two
+    minutes, well inside one 5-minute self-check interval. A service left on
+    old code because a deploy forgot to restart it stays stale forever — only
+    the SECOND consecutive look, keyed to the same install (`code_mtime`), can
+    tell the two apart without waiting long enough to matter to the operator.
     """
     lib = Path("/opt/sentinel/lib/sentinel")
     if not lib.exists():
@@ -1878,15 +2250,57 @@ async def check_running_code_is_current() -> list[CheckResult]:
         if code_mtime > started_at + 5:
             stale.append(unit)
 
+    # Priviri consecutive care văd ACEEAȘI instalare (`code_mtime`) cu servicii
+    # stale, ținute în `collector_cursors` sub `code:current:stale` — aceeași
+    # mașinărie ca detectorul de înțepenire de mai jos (`ship:<flux>:stall`).
+    # Semnătura e legată de `code_mtime`, nu doar de „a fost stale", ca un
+    # deploy nou care începe chiar în fereastra de 5 minute a unuia vechi să nu
+    # moștenească numărătoarea aceluia — vezi comentariul de la poziție, la
+    # detectorul de expediere, pentru exact același motiv.
+    stall_key = "code:current:stale"
+    signature = f"{code_mtime:.6f}"
+    prev = await db.fetchrow(
+        "SELECT cursor, events_seen FROM collector_cursors WHERE name = $1",
+        stall_key)
+    if not stale:
+        looks = 0
+    elif prev is not None and prev["cursor"] == signature:
+        looks = int(prev["events_seen"] or 0) + 1
+    else:
+        looks = 1
+    await db.execute(
+        """
+        INSERT INTO collector_cursors (name, cursor, events_seen, updated_at)
+        VALUES ($1, $2::text, $3::bigint, now())
+        ON CONFLICT (name) DO UPDATE
+            SET cursor = $2::text,
+                events_seen = $3::bigint,
+                updated_at = now()
+        """,
+        stall_key, signature, looks)
+
     if not stale:
         return [CheckResult("code:current", "Codul care rulează", "ok",
                             detail="toate serviciile rulează versiunea instalată")]
+
+    names = ', '.join(u.replace('sentinel-', '').replace('.service', '') for u in stale)
+    if looks < CODE_STALE_LOOKS_BEFORE_FINDING:
+        # Prima privire pe instalarea asta. Poate fi un deploy în curs — vezi
+        # fereastra măsurată la `CODE_STALE_LOOKS_BEFORE_FINDING` — deci NU e o
+        # afirmație că e în regulă (`ok` ar fi minciuna exact opusă), dar nici
+        # nu e încă o degradare confirmată.
+        return [CheckResult(
+            "code:current", "Servicii care ar putea rula cod vechi", "unknown",
+            detail=f"{names} au pornit înaintea ultimei instalări — prima "
+                   f"privire; nu e o afirmație că e o problemă, poate fi un "
+                   f"deploy încă în curs de repornire",
+            facts={"stale": stale, "looks": looks})]
     return [CheckResult(
         "code:current", "Servicii care rulează cod vechi", "degraded",
-        detail=f"{', '.join(u.replace('sentinel-', '').replace('.service', '') for u in stale)}"
-               f" — pornite înaintea ultimei instalări",
+        detail=f"{names} — pornite înaintea ultimei instalări, văzut la "
+               f"{looks} priviri la rând",
         action="systemctl restart " + " ".join(stale),
-        facts={"stale": stale})]
+        facts={"stale": stale, "looks": looks})]
 
 
 # ---------------------------------------------------------------------------
@@ -2097,10 +2511,27 @@ async def check_ship_lag(db: Database, cfg: Config) -> list[CheckResult]:
     wrong. See the head of `sentinel/report/shipper.py` for why the watermark is
     not rewound automatically.
 
-    Every branch returns exactly one key per stream and never an empty list. An
-    empty list is not a state; it is the absence of one, and on a complete run
-    the reconciler deletes what was not emitted — so the check would vanish from
-    the panel rather than say anything. See the `if not lags` branch below.
+    No stream ever returns an empty list. An empty list is not a state; it is
+    the absence of one, and on a complete run the reconciler deletes what was
+    not emitted — so the check would vanish from the panel rather than say
+    anything. See the `if not lags` branch below.
+
+    Key count per stream is not fixed, and has not been "exactly one" since the
+    stall detector below learned to announce its own recovery. A stream that
+    exits before the detector — unreadable, no maintained watermark, never
+    started, clock skewed — returns exactly one key of its own. A stream that
+    reaches the detector returns TWO: `ship:lag:<stream>` for the backlog and
+    `ship:lag:<stream>:stall` for whether the cursor is frozen, `ok` on every
+    look that is not itself the stall finding. The one exception is the stall
+    finding itself — there the `:stall` key alone stands for the stream, and
+    the loop moves on (`continue`) before the backlog key would be computed.
+    The `ok` on every non-stalled look, rather than only the first one, is
+    deliberate: before 23 September 2026 it was written once and then withheld
+    for as long as the cursor stayed frozen below the stall threshold, so a
+    stream sitting one or two looks under it made the key blink out of
+    `results` and back on the next run — `checks_run` oscillating 74→73→74
+    with nothing having actually withdrawn — while `/selfcheck` announced a
+    withdrawal that never happened. See `is_stalled` below for what changed.
     """
     from sentinel.report import shipper
 
@@ -2200,8 +2631,8 @@ async def check_ship_lag(db: Database, cfg: Config) -> list[CheckResult]:
             # reală care devine necitibilă ar fi anunțată operatorului ca 🟢
             # revenire, iar restanța ar rămâne acolo, nevăzută, cât timp baza nu
             # se repară. Cu cheia asta separată, cea veche nu mai e emisă, deci
-            # dispariția ei se anunță ca RETRAGERE — „Nu se mai raportează" —,
-            # care e adevărul.
+            # dispariția ei se anunță ca RETRAGERE — „Constatări care nu se
+            # mai raportează" —, care e adevărul.
             results.append(CheckResult(
                 f"ship:lag:{item.stream}:unreadable",
                 f"{title} nu se poate măsura", "unknown",
@@ -2347,10 +2778,17 @@ async def check_ship_lag(db: Database, cfg: Config) -> list[CheckResult]:
         # o gazdă cu `interval_s` mare, trei priviri pot cădea între două runde
         # normale de expediere, și atunci constatarea s-ar aprinde pe purtarea
         # corectă a mecanismului. Aceeași podea o are pragul de vârstă de mai jos.
+        #
+        # Calculate AICI, înaintea deciziei, nu doar ca prag pentru `degraded`:
+        # de la 23 septembrie 2026 aceleași trei condiții decid ȘI dacă privirea
+        # asta e „înțepenit", vezi mai jos.
         waited_min = item.oldest_pending_min or 0.0
         min_wait_min = max(STALL_MIN_WAIT_MIN,
                            STALL_MIN_ROUNDS_WAITED * cfg.ship.interval_s / 60)
         grew_by = item.pending - pending_at_freeze
+        is_stalled = bool(
+            item.pending and prior_frozen_looks + 1 >= STALL_RUNS_BEFORE_FINDING
+            and grew_by > 0 and waited_min >= min_wait_min)
 
         # Privirea curentă e a `prior_frozen_looks + 1`-a în aceeași poziție.
         # `degraded`, NU `down`, dinadins și în ciuda faptului că e mai grav decât
@@ -2361,8 +2799,7 @@ async def check_ship_lag(db: Database, cfg: Config) -> list[CheckResult]:
         # funcționează, doar copia din afară nu mai crește. Gravitatea suplimentară
         # o poartă cheia și titlul distinct („s-a înțepenit" vs „a rămas în urmă")
         # și prinderea în minute, nu status-ul.
-        if (item.pending and prior_frozen_looks + 1 >= STALL_RUNS_BEFORE_FINDING
-                and grew_by > 0 and waited_min >= min_wait_min):
+        if is_stalled:
             results.append(CheckResult(
                 f"ship:lag:{item.stream}:stall",
                 f"{title} s-a înțepenit", "degraded",
@@ -2389,6 +2826,46 @@ async def check_ship_lag(db: Database, cfg: Config) -> list[CheckResult]:
                        "lost_below_cursor": item.lost_below_cursor}))
             continue
 
+        # Nu e înțepenit — fie fiindcă `is_stalled` chiar nu e adevărat, fie
+        # fiindcă e sub oricare din cele trei podele. Cheia `:stall` răspunde la
+        # o singură întrebare, „e fluxul înțepenit ACUM?”, iar `is_stalled` de
+        # mai sus E definiția întrebării ăsteia. Când răspunsul e „nu”, `ok` aici
+        # nu e o presupunere — e chiar negarea condiției pe care tocmai am
+        # verificat-o.
+        #
+        # Până pe 23 septembrie 2026 rândul ăsta se scria DOAR când
+        # `prior_frozen_looks == 0` (cursorul chiar avansase, ori nu mai era
+        # nimic în așteptare, ori era prima privire). Sub prag — înghețat 1-2
+        # priviri, ori peste prag dar cu restanța fără creștere, ori peste prag
+        # dar sub podeaua de timp — nu se scria nimic, cu motivul că „ok" ar fi
+        # fals fiindcă poziția CHIAR nu s-a mișcat. Motivul ăla confunda „poziția
+        # nu s-a mișcat" cu „fluxul e înțepenit" — sunt întrebări diferite, iar
+        # cheia pune a doua, nu prima. Tăcerea din runda aia ștergea rândul din
+        # `selfcheck_state` (vezi `_reconcile_state`), iar runda următoare — dacă
+        # tot sub prag — îl scria la loc: `checks_run` oscila (74→73→74) fără ca
+        # nimic real să se fi retras, iar `views.cmd_selfcheck` anunța „o
+        # constatare s-a retras sau o sursă a ieșit din acoperire” pentru o
+        # oscilație internă, nu pentru o retragere. Cu `ok` scris la fiecare
+        # privire în care `is_stalled` e fals — inclusiv sub prag —, rândul nu
+        # mai dispare niciodată cât timp fluxul e citibil, deci oscilația și
+        # propoziția falsă dispar amândouă. Un flux devenit NECITIBIL tot nu
+        # ajunge aici (vezi `item.error` mai sus, care face `continue`), deci un
+        # flux ce iese din citire tot nu e raportat drept revenire.
+        #
+        # Nu se adaugă la `results` ACUM: apelanții (vezi `test_shipper.py`)
+        # citesc `results[0]` ca fiind cheia principală a fluxului
+        # (`ship:lag:<flux>`), cea calculată mai jos. Rândul ăsta e adăugat DUPĂ
+        # ea, la fiecare ieșire posibilă din funcție de-acum încolo, ca ordinea
+        # să rămână „cheia principală întâi".
+        stall_result = CheckResult(
+            f"ship:lag:{item.stream}:stall", f"{title} nu e înțepenită", "ok",
+            detail=f"cursorul fluxului „{item.stream}” nu e înțepenit: fie a "
+                   f"avansat, fie nu mai are ce înainta, fie restanța nu crește, "
+                   f"fie nu s-a strâns încă destul de mult timp",
+            facts={"cursor": item.cursor, "position": position,
+                   "pending": item.pending, "stall_runs": prior_frozen_looks + 1,
+                   "grew_by": grew_by})
+
         # Pragul de vârstă, pe flux: fluxul enumerat în hartă își primește pragul
         # lui, restul rămân la `SHIP_LAG_GRACE_MIN`. Podeaua de trei runde ține în
         # picioare pentru un operator care setează un `interval_s` lung — un prag
@@ -2404,6 +2881,7 @@ async def check_ship_lag(db: Database, cfg: Config) -> list[CheckResult]:
                 detail=f"la zi, până la id {item.cursor}{floor_note}",
                 facts={"cursor": item.cursor, "pending": 0, "floor": item.floor,
                        "lost_below_cursor": item.lost_below_cursor}))
+            results.append(stall_result)
             continue
 
         minutes = item.oldest_pending_min or 0.0
@@ -2417,6 +2895,7 @@ async def check_ship_lag(db: Database, cfg: Config) -> list[CheckResult]:
                        f"expediere, cel mai vechi de {_ago(minutes)}{floor_note}",
                 facts={"cursor": item.cursor, "pending": item.pending,
                        "lost_below_cursor": item.lost_below_cursor}))
+            results.append(stall_result)
             continue
 
         # Un sfat separat pentru fluxurile de agregate (`ROLLUP`), care spunea
@@ -2464,6 +2943,7 @@ async def check_ship_lag(db: Database, cfg: Config) -> list[CheckResult]:
             facts={"cursor": item.cursor, "pending": item.pending,
                    "oldest_min": int(minutes),
                    "lost_below_cursor": item.lost_below_cursor}))
+        results.append(stall_result)
     return results
 
 
