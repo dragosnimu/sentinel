@@ -651,13 +651,19 @@ HUMAN_DRIVEN = frozenset({"sudo", "su"})
 # Sources deliberately left OUTSIDE all three sets above — not an oversight,
 # a decision recorded here so the next one has to be recorded too. See
 # `test_every_collector_source_is_classified_somewhere` in test_selfcheck.py:
-# it walks `sentinel/collectors/*.py` for every literal `source=` an `Event`
-# is ever built with and fails if one is not accounted for by
-# `NAMED_SILENCE_SOURCES`, `CURSOR_BACKED_SOURCES`, `HUMAN_DRIVEN`, or here —
-# which is exactly the gap `nginx` fell through until 23 Sep 2026: a real
-# collector, producing a real `source=` string, judged by neither an explicit
-# threshold nor a cursor, just the same `default` row-silence fallback
-# `_silence_limit` hands anything unnamed.
+# it takes every name on `Event.SOURCES` and checks, by set equality, that it
+# is either classified (`NAMED_SILENCE_SOURCES`, `CURSOR_BACKED_SOURCES`,
+# `HUMAN_DRIVEN`, `DEFAULT_JUDGED_SOURCES` below) or named, with a reason, in
+# `DECLARED_NOT_EMITTED_SOURCES` further down — no third, unaccounted-for
+# state exists. An AST walk over `sentinel/collectors/*.py` still runs
+# alongside that, but only as a cross-check now, not the decision: it confirms
+# a literal `source=` it happens to see is a real member of `SOURCES` and is
+# not also claimed `DECLARED_NOT_EMITTED` (see the comment above that dict for
+# why the walk stopped being authoritative). The equality is what CLOSES the
+# gap `nginx` fell through until 23 Sep 2026 — that gap was a real collector,
+# producing a real `source=` string, judged by neither an explicit threshold
+# nor a cursor, just the same `default` row-silence fallback `_silence_limit`
+# hands anything unnamed.
 #
 # `conntrack` is the one source that genuinely belongs here rather than in
 # either judged set: `ConntrackSampler` takes a snapshot of the kernel's
@@ -692,11 +698,15 @@ DEFAULT_JUDGED_SOURCES = frozenset({"conntrack"})
 # A source leaving this dict without landing in `NAMED_SILENCE_SOURCES`,
 # `CURSOR_BACKED_SOURCES`, `HUMAN_DRIVEN`, or `DEFAULT_JUDGED_SOURCES` fails
 # the equality check above — same for a source arriving on `SOURCES` for the
-# first time. Neither case depends on catching the collector that started
-# emitting it: whoever writes that collector is expected to make the same
-# judgment call this file made for every other source and move it out of
-# here, in the same change — this constant cannot force that by itself, the
-# way it cannot force anyone to read a comment. What it DOES force
+# first time. The cross-check walk catches the commonest way a collector
+# starts emitting a name that is still declared here — `Event(..., source="x")`
+# with the literal at the keyword — but only that way: positional, `**kwargs`,
+# and an expression like `system.py`'s own `source=m["svc"]` all pass it
+# unseen. So the walk narrows the gap; it does not close it, and this constant
+# cannot force the judgment by itself, the way it cannot force anyone to read
+# a comment. Whoever writes that collector is expected to make the same
+# judgment call this file made for every other source and move the name out of
+# here, in the same change. What this constant DOES force
 # mechanically is that the name cannot just sit unmentioned on `SOURCES`
 # while a real collector emits it under nobody's judgment, the way `nginx`
 # did until 23 Sep 2026 — because moving a name out of this dict without

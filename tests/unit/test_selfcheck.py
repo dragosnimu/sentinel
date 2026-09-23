@@ -1723,13 +1723,18 @@ def test_every_collector_source_is_classified_somewhere():
     `HUMAN_DRIVEN` / `DEFAULT_JUDGED_SOURCES`), fie numită, cu motiv, în
     `DECLARED_NOT_EMITTED_SOURCES` — a treia stare („nu e nicăieri”) nu
     există, verificat prin egalitate de mulțimi, nu prin scanare de cod. Cele
-    șase forme de sintaxă de mai sus devin toate IRELEVANTE pentru garda asta:
-    orice ar scrie un colector nou, dacă valoarea nu e deja pe `SOURCES`,
-    `Event.__post_init__` o respinge singur la rulare; dacă e deja pe
-    `SOURCES` (una din cele cinci declarate-dar-neemise azi), scanarea
-    sintaxei n-ar fi contat oricum — decizia de clasificare a rămas pe
-    dezvoltatorul care scrie colectorul, la fel cum a rămas pentru fiecare
-    sursă clasificată deja aici.
+    șase forme de sintaxă de mai sus rămân IRELEVANTE pentru DECIZIA de
+    clasificare: orice ar scrie un colector nou, dacă valoarea nu e deja pe
+    `SOURCES`, `Event.__post_init__` o respinge singur la rulare; iar dacă e
+    deja pe `SOURCES`, cine scrie colectorul e cel care alege unde o mută, la
+    fel ca pentru fiecare sursă clasificată deja aici. Dar dacă noul colector
+    scrie `source="x"` cu literal la cuvânt-cheie — forma comună, singura pe
+    care scanarea de mai jos o vede — și `x` e deja pe `SOURCES` ca una din
+    cele cinci declarate-dar-neemise azi, scanarea CHIAR contează: prinde
+    exact contradicția, aici, înainte să ajungă prag implicit pe o gazdă vie.
+    Ea vede azi, ca literali cu cuvânt-cheie, toate cele șapte surse chiar
+    emise (`auditd`, `conntrack`, `nginx`, `sshd`, `suricata`, `su`, `sudo`);
+    nu vede poziționalul sau `**kwargs`, și acolo tot scapă.
 
     O scanare AST rămâne mai jos, dar demovată la verificare încrucișată, nu
     sursă de adevăr: dacă găsește un `source="literal"` real într-un colector,
@@ -1786,6 +1791,32 @@ def test_every_collector_source_is_classified_somewhere():
         f"{sorted(found - set(SOURCES))} apare ca `source=` literal într-un "
         f"colector, dar nu e pe `SOURCES` în sentinel/model/event.py — orice "
         f"eveniment real de la sursa asta ridică ValueError la rulare")
+
+    # Aceeași scanare, îndreptată acum și spre DECLARED_NOT_EMITTED_SOURCES:
+    # dacă un `source=` literal găsit mai sus e ȘI cheie acolo, afirmația „nu
+    # e emisă azi” e falsă chiar acum — fie fiindcă un colector existent a
+    # fost mutat greșit în dicționar, fie fiindcă un colector nou a fost
+    # scris pentru un nume rămas „declarat-neemis”. O sursă prinsă aici ar fi
+    # judecată pe pragul implicit din `_silence_limit`, exact mecanismul care
+    # a scăpat `nginx` până pe 23 sep 2026.
+    #
+    # Limita e aceeași ca la `found` de mai sus: prinde doar forma comună,
+    # `Event(..., source="x", …)` cu literal la cuvânt-cheie. Un colector care
+    # trece `source` pozițional sau prin `**kwargs` tot ar scăpa neobservat —
+    # nu se încearcă închiderea și a acelei forme (vezi docstring-ul funcției:
+    # o scanare de sintaxă nu se termină niciodată).
+    #
+    # Forma a treia nu e ipotetică, e deja în arbore: `system.py:88` scrie
+    # `source=m["svc"]`, o expresie, deci scanarea n-o vede. Acolo nu doare,
+    # fiindcă regexul îngustează `svc` la `sudo|su|sshd`, toate clasificate și
+    # toate prezente și ca literali în alte apeluri. E exemplul de ținut minte
+    # când cineva se întreabă cât acoperă de fapt aserțiunea de mai jos.
+    assert not (found & set(checks.DECLARED_NOT_EMITTED_SOURCES)), (
+        f"{sorted(found & set(checks.DECLARED_NOT_EMITTED_SOURCES))} apare ca "
+        f"`source=` literal într-un colector real, dar DECLARED_NOT_EMITTED_"
+        f"SOURCES pretinde că nu e emisă azi — mută sursa în NAMED_SILENCE_"
+        f"SOURCES / CURSOR_BACKED_SOURCES / HUMAN_DRIVEN / DEFAULT_JUDGED_"
+        f"SOURCES, după cum e emisă")
 
 
 def test_no_events_at_all_is_reported():
