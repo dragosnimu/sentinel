@@ -3367,7 +3367,7 @@ install_sentinel_nginx_snippets() {
 # installer reported success at every step.
 #
 # GUESSING THE NAME WAS REJECTED AS THE REPAIR, and that is the part worth
-# keeping. `hostname -f` on that host is n8n.cryptoitdata.eu; the operator
+# keeping. `hostname -f` on that host is n8n.example.com; the operator
 # reaches it at n8n.srv1051579.hstgr.cloud. A vhost named after the guess
 # routes nothing, the deny block still wins, and the operator still gets 444 —
 # the same outage, produced by its own fix. Widening server_name with a guessed
@@ -5667,7 +5667,7 @@ main() {
     # Fără --domain NU EXISTĂ nume: vhost-ul e `default_server` și răspunde la
     # orice Host, deci singurul lucru adevărat de tipărit e o adresă a gazdei.
     # Un `hostname -f` aici ar fi chiar ghicitul care a produs pana — pe gazda
-    # de producție întoarce n8n.cryptoitdata.eu, iar operatorul ajunge la
+    # de producție întoarce n8n.example.com, iar operatorul ajunge la
     # mașină prin cu totul alt nume. Nota din report_closing_facts spune că
     # merge orice Host, deci adresa nu e o îngustare, e un exemplu care chiar
     # se deschide.

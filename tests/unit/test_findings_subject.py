@@ -5,12 +5,14 @@ le pot asocia". Datele erau deja acolo — `scanner` și `location` — dar pagi
 tipărea numele intern al scanerului (`trivy_image`), care spune cum a fost
 găsită constatarea, nu pe ce stă.
 
-Fixturile de aici nu sunt inventate: sunt perechile (scaner, location) măsurate
-pe cele două gazde la 21 septembrie 2026, inclusiv cazurile incomode —
-`location` NULL pe cele 477 de constatări `dnf`, un nume gol de imagine fără tag
-și fără slash (`traefik`, `bet-deploy-bet-alert-worker`), o cale cu spații în ea
-(`dragos.nimu/BET calculator/bet-deploy/package-lock.json`) și o referință de
-imagine care CONȚINE un slash fără să fie o cale (`snipe/snipe-it:latest`).
+Fixturile de aici reproduc formele (scaner, location) măsurate pe cele două
+gazde la 21 septembrie 2026, inclusiv cazurile incomode — `location` NULL pe
+cele 477 de constatări `dnf`, un nume gol de imagine fără tag și fără slash
+(`traefik`, `bet-deploy-bet-alert-worker`), o cale cu spații în ea
+(`exemplu.demo/ACME calculator/acme-deploy/package-lock.json` — contul și
+numele proiectului sunt fabricate, spațiul din numele directorului e forma
+reală) și o referință de imagine care CONȚINE un slash fără să fie o cale
+(`snipe/snipe-it:latest`).
 """
 
 from __future__ import annotations
@@ -114,11 +116,12 @@ def test_aplicatia_e_numita_scurt_nu_prin_calea_intreaga():
 
 
 def test_calea_cu_spatii_nu_rupe_numele_aplicatiei():
-    """Calea reală de pe producție are un spațiu în ea („BET calculator"). O
-    despărțire pe spații — sau pe orice altceva decât separatorul de cale — ar
-    scoate un nume trunchiat pentru cele 64 de constatări npm de acolo."""
-    s = describe("trivy_fs", "dragos.nimu/BET calculator/bet-deploy/package-lock.json")
-    assert s.label == "Aplicație · bet-deploy (package-lock.json)"
+    """Forma reală de pe producție are un spațiu într-un director strămoș
+    („ACME calculator"). O despărțire pe spații — sau pe orice altceva decât
+    separatorul de cale — ar scoate un nume trunchiat pentru cele 64 de
+    constatări npm de acolo."""
+    s = describe("trivy_fs", "exemplu.demo/ACME calculator/acme-deploy/package-lock.json")
+    assert s.label == "Aplicație · acme-deploy (package-lock.json)"
 
 
 def test_spatiul_din_chiar_numele_aplicatiei_nu_taie_eticheta():
@@ -126,13 +129,13 @@ def test_spatiul_din_chiar_numele_aplicatiei_nu_taie_eticheta():
 
     Testul de deasupra NU poate prinde o despărțire pe spații: spațiul lui stă
     într-un director strămoș, iar un `location.split()[-1]` naiv ar scoate
-    exact aceeași etichetă — verificat, mutația trece netăiată. Aici „BET
-    calculator" (nume real de director de pe producție) e chiar componenta care
-    ajunge în etichetă, deci o despărțire pe spații ar afișa „calculator", o
-    aplicație care nu există pe gazdă.
+    exact aceeași etichetă — verificat, mutația trece netăiată. Aici „ACME
+    calculator" (formă reală de director de pe producție) e chiar componenta
+    care ajunge în etichetă, deci o despărțire pe spații ar afișa „calculator",
+    o aplicație care nu există pe gazdă.
     """
-    s = describe("trivy_fs", "dragos.nimu/BET calculator/package-lock.json")
-    assert s.label == "Aplicație · BET calculator (package-lock.json)"
+    s = describe("trivy_fs", "exemplu.demo/ACME calculator/package-lock.json")
+    assert s.label == "Aplicație · ACME calculator (package-lock.json)"
 
 
 def test_calea_cu_contrabara_nu_ramane_intreaga_in_coloana():
@@ -152,7 +155,7 @@ def test_calea_cu_contrabara_nu_ramane_intreaga_in_coloana():
 
 @pytest.mark.parametrize("location,expected", [
     # Calea absolută: componenta goală de la început nu devine numele aplicației.
-    ("/var/www/procure360/composer.lock", "Aplicație · procure360 (composer.lock)"),
+    ("/var/www/acme360/composer.lock", "Aplicație · acme360 (composer.lock)"),
     # Un singur nivel: nu există director părinte de arătat, deci nu se inventează.
     ("composer.lock", "Aplicație · composer.lock"),
     # Relativă: „.." nu e numele unei aplicații.

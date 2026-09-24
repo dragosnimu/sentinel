@@ -25,9 +25,14 @@ raportează nimic, iar tăcerea ei arată identic cu „e curat".
 ## Limita cunoscută: verificarea pe valoare are nevoie de magazia locală
 
 `test_no_value_from_the_local_secret_store_appears_in_the_tree` compară arborele
-cu valorile reale din `secrets/.env.local` — fișier ignorat de git, deci absent
-pe o clonă proaspătă. Acolo testul se raportează SKIP, nu verde: „n-am putut
-verifica" și „e curat" sunt stări diferite.
+cu valorile reale din fișierele magaziei `secrets/` — director ignorat de git
+(`secrets/*`, cu excepția documentației din `.gitkeep`), deci gol pe o clonă
+proaspătă. Acolo testul se raportează SKIP, nu verde: „n-am putut verifica" și
+„e curat" sunt stări diferite. Magazia poate conține mai multe fișiere — câte
+unul per gazdă monitorizată — iar lista lor se derivă din director, nu dintr-un
+nume fixat: un fișier fixat ar deveni exact orbirea măsurată pe 23 septembrie
+2026, când despărțirea magaziei unice în câte una per gazdă (`47e96e2`) a lăsat
+garda uitându-se după un fișier care nu mai există.
 
 `addopts` din `pyproject.toml` conține `-rfEs` tocmai ca MOTIVUL skip-ului să
 apară. Fără el, tot semnalul pe o altă mașină era cifra „1 skipped" dintr-o linie
@@ -241,8 +246,10 @@ identice ca formă. Garda pe formă a domeniului rămâne exact atât cât poate
 acoperi, subdomeniul, și spune asta în docstring-ul ei, ca nimeni să n-o creadă
 completă.
 
-Valorile vin din aceeași magazie locală, `secrets/.env.local`, sub două chei noi
-(`IDENTITY_KEYS`). Nu se inventează un al doilea mecanism: e același fișier,
+Valorile vin din aceeași magazie locală, `secrets/`, sub două chei noi
+(`IDENTITY_KEYS`) — căutate în FIECARE fișier din director, fiindcă cheile
+astea pot exista într-un singur fișier al magaziei (unul vechi, păstrat) și
+lipsi din celelalte. Nu se inventează un al doilea mecanism: același director,
 același parser, aceeași disciplină „valorile nu părăsesc cadrul".
 
 Diferența față de restul magaziei: cheile astea nu sunt secrete pe care le
@@ -945,6 +952,31 @@ def test_migration_hash_derivation_rejects_an_offset_shifted_by_one_byte(tmp_pat
     assert result == frozenset()
 
 
+def test_migration_hash_derivation_rejects_a_sourceend_past_the_file(tmp_path) -> None:
+    """Ce previne: `file_bytes[start:end]` nu ridică nicio eroare pentru un `end`
+    mai mare decât fișierul — se comportă identic cu `file_bytes[start:]`, adică
+    TRUNCHIAZĂ tăcut. Dacă `sql`-ul declarat e conținutul REAL, rămas după
+    trunchiere (aici e, dinadins, ca eșecul să vină STRICT din verificarea de
+    limită, nu dintr-o nepotrivire de conținut), un `sourceEnd` stricat —
+    offset falsificat sau entrie coruptă în `sources.json` — ar trece
+    verificarea din pură coincidență, în loc să oprească fișierul întreg ca
+    neverificat, așa cum face orice alt offset falsificat de aici."""
+    first_end, _ = _fixture_statement_offsets()
+    real_len = len(_fixture_migration_sql().encode("utf-8"))
+    statements = [
+        {"sql": "CREATE TABLE foo (id INT)", "sourceStart": 0, "sourceEnd": first_end},
+        # sourceEnd cu mult dincolo de sfârșitul fișierului real; sql-ul rămâne
+        # totuși cel corect pentru coada trunchiată.
+        {"sql": "CREATE TABLE bar (id INT)", "sourceStart": first_end,
+         "sourceEnd": real_len + 1000},
+    ]
+    repo = _write_migration_fixture(tmp_path, statements)
+    result = _real_migration_statement_hashes(repo=repo)
+    assert result == frozenset(), (
+        "un sourceEnd dincolo de sfârșitul fișierului a fost totuși acceptat ca "
+        "instrucțiune verificată")
+
+
 def test_real_migration_hashes_cover_every_hash_in_the_committed_manifest() -> None:
     """Proba care contează pentru operator, izolată de restul suitei de
     scanare: pe depozitul REAL, fără `node`, fiecare sha256 din
@@ -983,10 +1015,45 @@ _FORM_SOURCES: dict[str, tuple[int, str]] = {
 }
 
 # Magazia locală de secrete: singurul loc din care se pot afla valorile reale
-# fără să le scriu aici. E ignorată de git prin `.gitignore`, iar testul verifică
-# asta înainte s-o citească — dacă ajunge vreodată urmărită, sursa de adevăr a
-# gărzii ar fi ea însăși scurgerea.
-SECRET_STORE = ("secrets/.env.local",)
+# fără să le scriu aici. E un DIRECTOR, nu un fișier — `secrets/*` e ignorat de
+# git prin `.gitignore`, cu excepția `.gitkeep`, care e documentație urmărită,
+# nu o sursă de valori. Poate conține mai multe fișiere, câte unul per gazdă
+# monitorizată (`.env.local.productie`, `.env.local.n8n`, copii vechi păstrate
+# ca `.env.local.productie.invechit-19aug` — vezi `scripts/secrets-init.sh`).
+#
+# Lista fișierelor se DERIVĂ din director la fiecare rulare, prin
+# `_secret_store_files`, nu se scrie de mână aici: patru nume fixate ar fi
+# devenit exact orbirea măsurată pe 23 septembrie 2026, când despărțirea
+# magaziei unice în câte una per gazdă (`47e96e2`, „Un fișier de secrete per
+# gazdă") a lăsat testul uitându-se după un fișier care nu mai există — două
+# teste săreau tăcut de atunci, cu propriul lor mesaj de „nu e o trecere" pe
+# care nu-l citea nimeni. Un al cincilea fișier, la următoarea gazdă, ar fi
+# fost la fel de invizibil pentru o listă fixă.
+SECRET_STORE_DIR = "secrets"
+
+
+def _secret_store_files(repo: Path = REPO) -> tuple[str, ...]:
+    """Fișierele reale din `secrets/`, derivate din director — vezi comentariul
+    de deasupra pentru motiv.
+
+    Tuplu GOL dacă directorul lipsește (clonă proaspătă, nimic de protejat
+    acolo) SAU dacă există dar nu conține decât `.gitkeep` — ambele cazuri
+    înseamnă „nimic de citit", iar apelantul (testele de mai jos) le tratează
+    ca SKIP legitim, nu ca trecere.
+
+    Sortată: mesajele de eșec trebuie să fie deterministe între rulări, nu
+    dependente de ordinea în care sistemul de fișiere întoarce `iterdir()`.
+
+    `repo`: parametrizat pentru falsificare, ca la `_real_migration_statement_hashes`
+    — altfel un test al derivării ar trebui să scrie peste `secrets/` real.
+    """
+    directory = repo / SECRET_STORE_DIR
+    if not directory.is_dir():
+        return ()
+    names = sorted(
+        entry.name for entry in directory.iterdir()
+        if entry.is_file() and entry.name != ".gitkeep")
+    return tuple(f"{SECRET_STORE_DIR}/{name}" for name in names)
 
 # Identitatea operatorului, în aceeași magazie și din același motiv. Valoarea e
 # o listă despărțită prin virgulă, ca operatorul să poată adăuga al doilea cont
@@ -2349,9 +2416,9 @@ def test_the_witness_domain_is_not_named_anywhere() -> None:
 
 # --- Valoarea reală: ce stă în magazia locală nu are voie în arbore ----------
 #
-# Verificarea asta nu ghicește. Ori valoarea din `secrets/.env.local` apare în
-# text, ori nu apare — deci n-are nici fals-pozitive de explicat, nici forme
-# ratate din cauza numelui de lângă. Ce poate rata sunt REPREZENTĂRI ale
+# Verificarea asta nu ghicește. Ori valoarea dintr-un fișier al magaziei
+# `secrets/` apare în text, ori nu apare — deci n-are nici fals-pozitive de
+# explicat, nici forme ratate din cauza numelui de lângă. Ce poate rata sunt REPREZENTĂRI ale
 # aceleiași valori, iar alea se enumeră mai jos și se verifică separat.
 
 # Sub șase caractere o valoare se potrivește peste tot și verificarea ar deveni
@@ -2535,20 +2602,36 @@ def _identity_values(sources: tuple[str, ...]) -> tuple[dict[str, list[str]], li
     la secrete e doar că aici lipsa cheii e ea însăși o problemă: un secret pe
     care magazia nu-l are chiar nu există, dar operatorul are întotdeauna un nume
     de utilizator.
+
+    Intrările se ADUNĂ din toate sursele care definesc o cheie, nu doar din
+    ultima. Măsurat pe magazia reală: `SANITISE_USERNAMES`/`SANITISE_DOMAINS`
+    trăiesc doar în UNUL dintre fișierele ei — un `dict.update()` simplu peste
+    sursele succesive ar fi corect cât timp o singură sursă definește cheia, dar
+    ar deveni o pierdere tăcută în clipa în care DOUĂ fișiere o definesc cu liste
+    diferite: ar rămâne doar intrările ultimei surse procesate.
     """
     found: dict[str, list[str]] = {}
     problems: list[str] = []
-    raw: dict[str, str] = {}
+    entries_by_key: dict[str, list[str]] = {key: [] for key in IDENTITY_KEYS}
+    defined_in_any_source: dict[str, bool] = {key: False for key in IDENTITY_KEYS}
     for source_rel in sources:
-        raw.update(_secret_store_values(source_rel))
+        raw = _secret_store_values(source_rel)
+        for key in IDENTITY_KEYS:
+            if key not in raw:
+                continue
+            defined_in_any_source[key] = True
+            entries_by_key[key].extend(
+                e.strip() for e in raw[key].split(",") if e.strip())
 
     where = " / ".join(sources)
     for key, what in IDENTITY_KEYS.items():
-        if key not in raw:
+        if not defined_in_any_source[key]:
             problems.append(f"{key} lipsește din {where} — pune acolo {what}")
             continue
-        entries = [e.strip() for e in raw[key].split(",")]
-        entries = [e for e in entries if e]
+        # `dict.fromkeys`, nu `set`: păstrează ordinea, iar aceeași intrare
+        # repetată în două fișiere (același cont, listat de două ori) nu are
+        # voie să ceară de două ori aceeași căutare.
+        entries = list(dict.fromkeys(entries_by_key[key]))
         if not entries:
             problems.append(
                 f"{key} există în {where} dar nu conține nicio intrare — {what}")
@@ -2610,6 +2693,36 @@ def _scan_identity(sources: tuple[str, ...]) -> tuple[list[str], list[str]]:
     return offenders, problems
 
 
+def _collect_secret_store_values(
+        sources: tuple[str, ...]) -> tuple[list[tuple[str, str, str]], list[str]]:
+    """([(cheie, fișier_sursă, valoare), ...], chei_prea_scurte), din TOATE `sources`.
+
+    Extrasă din `_scan_secret_store` ca să poată fi condusă pe surse fabricate
+    în test, fără să scaneze arborele real — același motiv pentru care
+    `_scan_tree_for_secrets` ia enumerarea și cititorul ca argumente.
+
+    LISTĂ, nu `dict` indexat pe nume de cheie. Magazia are un fișier per gazdă
+    monitorizată, iar aceeași cheie (`SENTINEL_DB_PASSWORD`, de exemplu) poartă
+    o valoare DIFERITĂ în fiecare fișier. Un `dict[cheie]` ar păstra o singură
+    valoare — a ultimului fișier din `sources` — și ar opri tăcut verificarea
+    pentru toate celelalte: exact contrariul cerinței „rulează pe toate
+    fișierele găsite, nu doar pe unul".
+    """
+    values: list[tuple[str, str, str]] = []
+    too_short: list[str] = []
+    for source_rel in sources:
+        for key, value in _secret_store_values(source_rel).items():
+            # Vezi comentariul de la `IDENTITY_KEYS`: alea sunt liste, nu
+            # valori, și au testul lor.
+            if key in IDENTITY_KEYS:
+                continue
+            if len(value) < MIN_SEARCHABLE_SECRET:
+                too_short.append(f"{key} ({source_rel})")
+            else:
+                values.append((key, source_rel, value))
+    return values, too_short
+
+
 def _scan_secret_store(sources: tuple[str, ...]) -> tuple[list[str], list[str]]:
     """(scurgeri, chei necăutabile) — ȘIRURI deja formatate, niciodată valori.
 
@@ -2628,25 +2741,16 @@ def _scan_secret_store(sources: tuple[str, ...]) -> tuple[list[str], list[str]]:
     care cineva depanează garda. `BaseException` nu se transformă în altceva
     (un Ctrl-C trebuie să rămână Ctrl-C), doar se golește și se re-aruncă.
     """
-    values: dict[str, tuple[str, str]] = {}
+    values: list[tuple[str, str, str]] = []
     too_short: list[str] = []
     offenders: list[str] = []
     key = value = src = text = None
     try:
-        for source_rel in sources:
-            for key, value in _secret_store_values(source_rel).items():
-                # Vezi comentariul de la `IDENTITY_KEYS`: alea sunt liste, nu
-                # valori, și au testul lor.
-                if key in IDENTITY_KEYS:
-                    continue
-                if len(value) < MIN_SEARCHABLE_SECRET:
-                    too_short.append(f"{key} ({source_rel})")
-                else:
-                    values[key] = (source_rel, value)
+        values, too_short = _collect_secret_store_values(sources)
 
         for rel in _tracked_files():
             for source, text in _contents(rel):
-                for key, (src, value) in values.items():
+                for key, src, value in values:
                     for line_no in _locations(text, value):
                         where = f"{rel}:{line_no}" if line_no else f"{rel} (linie nesigură)"
                         offenders.append(
@@ -2655,13 +2759,13 @@ def _scan_secret_store(sources: tuple[str, ...]) -> tuple[list[str], list[str]]:
         # Doar numele tipului: `str(exc)` al unei erori de regex citează tiparul,
         # iar tiparul e construit din valoare.
         name = type(exc).__name__
-        values = {}
+        values = []
         key = value = src = text = None
         raise RuntimeError(f"scanarea magaziei de secrete a eșuat: {name}") from None
     except BaseException:
         # Ctrl-C, SystemExit, orice altceva care nu e `Exception`. Nu se
         # convertește — se golește cadrul și se lasă să plece mai departe.
-        values = {}
+        values = []
         key = value = src = text = None
         raise
     return offenders, too_short
@@ -2728,6 +2832,88 @@ def test_the_value_matcher_sees_through_every_rewriting_of_the_same_value() -> N
     assert _locations("""K = 'a" "b'""", 'a" "b') == [1]
 
 
+def test_secret_store_files_are_derived_from_the_directory_not_a_fixed_list(
+        tmp_path) -> None:
+    """Ce previne: patru nume scrise de mână în `SECRET_STORE`, ca înainte de
+    23 septembrie 2026 — al cincilea fișier, la o gazdă viitoare, ar fi fost
+    invizibil pentru o listă fixă, exact orbirea care a lăsat garda tăcută după
+    despărțirea magaziei unice în câte un fișier per gazdă (`47e96e2`).
+
+    Trei stări, toate măsurate direct pe un director fabricat: lipsă, prezent
+    dar gol de fișiere reale (doar `.gitkeep`), și cu fișiere — inclusiv unul cu
+    un nume pe care codul nu l-a văzut niciodată scris nicăieri.
+    """
+    # Director lipsă — clonă proaspătă.
+    assert _secret_store_files(repo=tmp_path) == ()
+
+    store_dir = tmp_path / SECRET_STORE_DIR
+    store_dir.mkdir()
+    # `.gitkeep` e documentație urmărită în git, nu o sursă de valori.
+    (store_dir / ".gitkeep").write_text("doc\n", encoding="utf-8")
+    assert _secret_store_files(repo=tmp_path) == (), (
+        ".gitkeep singur nu are voie să conteze ca magazie cu conținut")
+
+    # Un fișier cu un nume pe care codul nu-l cunoaște dinainte: dovada că lista
+    # vine din director, nu dintr-un tipar de nume fixat.
+    (store_dir / ".env.local").write_text("X=1\n", encoding="utf-8")
+    (store_dir / "un-nume-nemaivazut-niciodata.env").write_text("Y=2\n", encoding="utf-8")
+    files = _secret_store_files(repo=tmp_path)
+    assert set(files) == {
+        f"{SECRET_STORE_DIR}/.env.local",
+        f"{SECRET_STORE_DIR}/un-nume-nemaivazut-niciodata.env",
+    }, files
+
+
+def test_collect_secret_store_values_keeps_every_source_not_just_the_last(
+        tmp_path) -> None:
+    """Ce previne: magazia are un fișier per gazdă monitorizată, iar aceeași
+    cheie (`SENTINEL_DB_PASSWORD`, de exemplu) poartă o valoare diferită în
+    fiecare fișier. Un `dict` indexat pe nume de cheie ar păstra o singură
+    valoare — a ultimului fișier procesat — și ar scoate tăcut din verificare
+    valorile tuturor celorlalte fișiere: o parolă scursă dintr-un fișier mai
+    vechi n-ar mai fi căutată deloc în arbore.
+    """
+    first = tmp_path / "store.a.env"
+    second = tmp_path / "store.b.env"
+    first.write_text("SENTINEL_DB_PASSWORD=parola-veche-de-test-1\n", encoding="utf-8")
+    second.write_text("SENTINEL_DB_PASSWORD=parola-noua-de-test-2\n", encoding="utf-8")
+
+    values, too_short = _collect_secret_store_values((str(first), str(second)))
+
+    assert too_short == [], too_short
+    found = {value for _, _, value in values}
+    assert "parola-veche-de-test-1" in found, (
+        "valoarea primului fișier a dispărut — a doua sursă cu aceeași cheie a "
+        "acoperit-o tăcut")
+    assert "parola-noua-de-test-2" in found
+    assert len(values) == 2, values
+
+
+def test_identity_values_merge_entries_from_every_source_not_just_the_last(
+        tmp_path) -> None:
+    """Ce previne: pe magazia reală, `SANITISE_USERNAMES`/`SANITISE_DOMAINS`
+    trăiesc doar într-UNUL dintre fișierele ei (un fișier vechi, păstrat). Un
+    `dict.update()` simplu peste sursele succesive e corect cât timp o singură
+    sursă definește cheia — dar dacă vreodată DOUĂ fișiere ar defini-o cu liste
+    diferite, ar păstra doar intrările ultimei surse procesate, iar contul din
+    prima sursă n-ar mai fi căutat deloc în arbore.
+    """
+    first = tmp_path / "old.env"
+    second = tmp_path / "new.env"
+    first.write_text(
+        f"SANITISE_USERNAMES={_STANDIN_USER}\nSANITISE_DOMAINS={_STANDIN_DOMAIN}\n",
+        encoding="utf-8")
+    second.write_text("SANITISE_USERNAMES=alt-cont-de-test\n", encoding="utf-8")
+
+    found, problems = _identity_values((str(first), str(second)))
+
+    assert problems == [], problems
+    assert _STANDIN_USER in found["SANITISE_USERNAMES"], (
+        "intrarea din primul fișier a dispărut când al doilea a redefinit cheia")
+    assert "alt-cont-de-test" in found["SANITISE_USERNAMES"]
+    assert found["SANITISE_DOMAINS"] == [_STANDIN_DOMAIN]
+
+
 @pytest.mark.skipif(
     shutil.which("git") is None,
     reason="fără git nu se pot enumera fișierele care ar pleca într-un push, "
@@ -2740,24 +2926,26 @@ def test_no_value_from_the_local_secret_store_appears_in_the_tree() -> None:
     uitat la el. Singur nu deschide nimic (mai trebuie și jetonul botului), dar e
     un identificator stabil al persoanei într-un depozit public, iar acolo rămâne
     și după ce e șters din arbore. Aceeași verificare acoperă parola bazei,
-    jetonul, cheia API și PIN-ul, fiindcă toate stau în același fișier.
+    jetonul, cheia API și PIN-ul, fiindcă toate stau în magazia locală — pe
+    fiecare fișier al ei, câte unul per gazdă monitorizată.
 
     Mesajul de eșec numește cheia și locul, niciodată valoarea: un test de
     scurgere care tipărește secretul în propria ieșire îl mută dintr-un loc
     privat în altul public.
     """
-    for src in SECRET_STORE:
-        if not (REPO / src).is_file():
-            pytest.skip(
-                f"{src} lipsește, deci verificarea pe valoare NU s-a făcut — nu e "
-                "o trecere. Pe o clonă proaspătă e normal; înainte de push, rulează "
-                "pe mașina care are magazia de secrete.")
+    sources = _secret_store_files()
+    if not sources:
+        pytest.skip(
+            f"{SECRET_STORE_DIR}/ nu conține niciun fișier, deci verificarea pe "
+            "valoare NU s-a făcut — nu e o trecere. Pe o clonă proaspătă e normal; "
+            "înainte de push, rulează pe mașina care are magazia de secrete.")
+    for src in sources:
         # Dacă sursa de adevăr ajunge urmărită, ea e scurgerea, nu ce caută ea.
         assert _gitignore_problem(src) is None, _gitignore_problem(src)
 
     # Valorile trăiesc și mor în cadrul de mai jos. Aici nu ajunge decât text
     # deja formatat, ca `-l` să n-aibă ce scoate la iveală.
-    offenders, too_short = _scan_secret_store(SECRET_STORE)
+    offenders, too_short = _scan_secret_store(sources)
 
     assert not offenders, (
         "valori reale din magazia de secrete, în arborele publicabil:\n  "
@@ -2923,25 +3111,28 @@ def test_no_operator_identity_appears_in_the_tree() -> None:
 
     Mesajul de eșec numește cheia și locul, niciodată valoarea.
     """
-    for src in SECRET_STORE:
-        if not (REPO / src).is_file():
-            pytest.skip(
-                f"{src} lipsește, deci verificarea pe identitate NU s-a făcut — nu "
-                "e o trecere. Pe o clonă proaspătă e normal: acolo nu există nimic "
-                "de protejat. Înainte de push, rulează pe mașina operatorului.")
+    sources = _secret_store_files()
+    if not sources:
+        pytest.skip(
+            f"{SECRET_STORE_DIR}/ nu conține niciun fișier, deci verificarea pe "
+            "identitate NU s-a făcut — nu e o trecere. Pe o clonă proaspătă e "
+            "normal: acolo nu există nimic de protejat. Înainte de push, rulează "
+            "pe mașina operatorului.")
+    for src in sources:
         assert _gitignore_problem(src) is None, _gitignore_problem(src)
 
-    offenders, problems = _scan_identity(SECRET_STORE)
+    offenders, problems = _scan_identity(sources)
 
     report: list[str] = []
     if problems:
         report.append("NU S-A VERIFICAT — magazia locală nu spune ce să caute:")
         report += [f"  - {p}" for p in problems]
         report.append(
-            "Pune-le în " + " / ".join(SECRET_STORE) + ", câte o listă despărțită "
-            "prin virgulă per cheie. Fișierul e ignorat de git, deci valorile nu "
-            "ajung în depozit. deploy/install.sh le primește pe stdin ca pe orice "
-            "altă linie și avertizează o dată per cheie că nu le scrie — corect, "
+            "Pune-le în " + " / ".join(sources) + " (sau într-un fișier nou sub "
+            f"{SECRET_STORE_DIR}/), câte o listă despărțită prin virgulă per "
+            "cheie. Fișierele sunt ignorate de git, deci valorile nu ajung în "
+            "depozit. deploy/install.sh le primește pe stdin ca pe orice altă "
+            "linie și avertizează o dată per cheie că nu le scrie — corect, "
             "n-au ce căuta pe server.")
     if offenders:
         report.append("identitatea operatorului, în arborele publicabil:")

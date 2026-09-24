@@ -11,7 +11,7 @@ pe port, iar instalatorul raporta succes la fiecare pas.
 Ce previn testele de aici, în termeni de operator: **o configurație în care
 fiecare cerere e refuzată trebuie să facă un test să pice.** Nu „vhost-ul are
 numele X" — asta a fost prima reparație, și era tot o ghicire: `hostname -f` pe
-gazda aia întoarce `n8n.cryptoitdata.eu`, iar operatorul ajunge la mașină prin
+gazda aia întoarce `n8n.example.com`, iar operatorul ajunge la mașină prin
 `n8n.srv1051579.hstgr.cloud`. Un vhost botezat după ghiceală nu rutează nimic,
 blocul de refuz câștigă în continuare, iar operatorul primește tot 444 — aceeași
 pană, produsă de reparația ei.
@@ -856,7 +856,7 @@ def _run_banner_host(tmp_path: Path, *, domain: str, ip_body: str) -> str:
 
 def test_without_a_domain_the_banner_prints_an_address_not_a_guessed_name(tmp_path):
     """Ghicirea numelui e chiar cauza penei, și bara era locul unde se vedea:
-    `hostname -f` pe gazda de producție întoarce `n8n.cryptoitdata.eu`, iar
+    `hostname -f` pe gazda de producție întoarce `n8n.example.com`, iar
     operatorul ajunge la mașină prin alt nume. Fără `--domain` vhost-ul răspunde
     la orice Host, deci o adresă a gazdei e singurul URL care chiar se deschide.
 
