@@ -5,8 +5,10 @@
  * prin `curl` sau prin jurnalul expeditorului, fără acces la agregator:
  *
  *   500  nu sunt configurat (secret principal lipsă, cheie lipsă sau ilizibilă)
+ *   500  schema agregatorului e neinstalată, în urmă, sau manifestul livrat e
+ *        stricat — o reîncercare nu repară niciuna dintre astea
  *   500  lotul a rulat și efectul nu se confirmă — NU s-a preluat nimic
- *   503  baza nu răspunde
+ *   503  baza nu răspunde, sau schema nu s-a putut verifica ACUM (trecător)
  *   401  te-am refuzat (cheie, semnătură sau identitate)
  *   413  lot prea mare — nimic nu s-a scris și nimic nu s-a tăiat
  *   413  plic care se desface peste plafon — nimic nu s-a citit din el
@@ -196,6 +198,77 @@ test("o bază care nu răspunde dă 503, nu „instanță necunoscută”", asyn
   await withServer({ failOn: "SELECT enabled, ship_secret_enc FROM instances" });
   const res = await POST(syncRequest({}));
   assert.equal(res.status, 503);
+  // O cădere AUTENTICĂ de driver/conexiune trebuie să rămână despre bază —
+  // altfel reparația de la garda de schemă a inversat defectul, nu l-a reparat.
+  assert.deepEqual(await res.json(), { error: "baza de date nu răspunde" });
+});
+
+// ---------------------------------------------------------------------------
+// Garda de schemă, deosebită de o bază căzută
+//
+// Măsurat 23 septembrie 2026: catch-ul din pasul 1 turtea și `SchemaGuardError`
+// în „baza de date nu răspunde”, iar toate cele 11 fluxuri de expediere, pe
+// ambele gazde, au stat înțepenite 20+ ore în timp ce operatorul căuta o bază
+// perfect sănătoasă — cauza reală era directorul de migrații necitibil la
+// construire. `lib/schema-guard.ts` compune deja mesajul corect; testele de
+// aici verifică doar că mesajul ACELA ajunge pe fir, nu unul inventat aici.
+// ---------------------------------------------------------------------------
+
+test("o schemă neinstalată numește schema, nu baza de date — și nu se reîncearcă", async () => {
+  await withServer({ schemaGuardFailure: { ok: false, kind: "not-installed" } });
+  const res = await POST(syncRequest({}));
+  const body = await res.json() as { error?: string };
+  // 500, nu 503: `npm run migrate` repară asta, o reîncercare a expeditorului
+  // n-o repară niciodată — vezi „nu sunt configurat” mai sus, din același motiv.
+  assert.equal(res.status, 500);
+  assert.ok(body.error?.includes("schema"),
+            `corpul nu numește schema, ci: ${JSON.stringify(body)}`);
+  assert.ok(!body.error?.includes("baza de date"),
+            `corpul tot mai vorbește despre „baza de date”: ${JSON.stringify(body)}`);
+});
+
+test("o schemă în urma codului (migrație neaplicată) e 500, cu detaliul din gardă", async () => {
+  await withServer({
+    schemaGuardFailure: {
+      ok: false, kind: "outdated",
+      missing: [{ migration: "0009_exemplu.sql", index: 1 }], changed: [],
+    },
+  });
+  const res = await POST(syncRequest({}));
+  const body = await res.json() as { error?: string };
+  assert.equal(res.status, 500);
+  assert.ok(body.error?.includes("0009_exemplu.sql"),
+            `corpul nu poartă detaliul gărzii: ${JSON.stringify(body)}`);
+});
+
+test("un manifest de migrații stricat e 500, numit „defect de livrare”, nu „bază căzută”", async () => {
+  await withServer({
+    schemaGuardFailure: {
+      ok: false, kind: "manifest-invalid", detail: "lib/migrations-manifest.ts e gol",
+    },
+  });
+  const res = await POST(syncRequest({}));
+  const body = await res.json() as { error?: string };
+  assert.equal(res.status, 500);
+  assert.ok(body.error?.includes("defect de livrare"),
+            `corpul nu spune că e un defect de livrare: ${JSON.stringify(body)}`);
+});
+
+test("o schemă „nu se poate verifica acum” rămâne 503 — poate fi trecătoare", async () => {
+  // Diferă de „not-installed”/„outdated”/„manifest-invalid”: aici garda nu
+  // ține minte refuzul (vezi `withSchemaGuard`), deci o reîncercare CHIAR poate
+  // să repare — de-aia rămâne 503, ca o bază căzută, nu 500.
+  await withServer({
+    schemaGuardFailure: {
+      ok: false, kind: "unknown",
+      detail: "tabela schema_version nu se poate citi din information_schema",
+    },
+  });
+  const res = await POST(syncRequest({}));
+  const body = await res.json() as { error?: string };
+  assert.equal(res.status, 503);
+  assert.ok(body.error?.includes("nu se poate verifica"),
+            `corpul nu numește garda de schemă: ${JSON.stringify(body)}`);
 });
 
 test("cheia din BAZĂ e chiar cea folosită la verificare", async () => {

@@ -117,6 +117,7 @@ import {
 } from "@/lib/ingest";
 import { verifyAfterIngest } from "@/lib/chain";
 import { applyPrune, checkPruneList } from "@/lib/prune";
+import { SchemaGuardError } from "@/lib/schema-guard";
 import { SIGNATURE_HEADER, signatureValid } from "@/lib/signature";
 import { knownStreamNames, streamFor } from "@/lib/streams";
 import type { Db } from "@/lib/migrate";
@@ -262,6 +263,25 @@ export async function POST(req: Request) {
   try {
     key = await lookupInstanceKey(db, instanceId, box);
   } catch (err) {
+    // Măsurat 23 septembrie 2026: acest catch turtea și `SchemaGuardError`
+    // în „baza de date nu răspunde", iar toate cele 11 fluxuri de expediere,
+    // pe ambele gazde, au căutat ore în șir o bază perfect sănătoasă — cauza
+    // reală era directorul de migrații necitibil la construire. Garda de
+    // schemă (`lib/schema-guard.ts`) compune deja mesajul corect; el se pune
+    // pe fir aici, NU se scrie a doua oară — un al doilea text s-ar putea
+    // despărți tăcut de primul.
+    if (err instanceof SchemaGuardError) {
+      // `unknown` = nu s-a putut întreba schema ACUM (posibil trecător,
+      // `withSchemaGuard` nu ține minte starea asta) → 503, se reîncearcă.
+      // Orice alt fel — manifest stricat, schemă neinstalată sau în urmă —
+      // NU se repară prin reîncercare, ci prin `npm run migrate` sau o
+      // republicare; 503 acolo ar ține expeditorul să reîncerce la nesfârșit
+      // ceva ce reîncercarea nu poate repara, exact ca `nu sunt configurat`
+      // de mai jos (pasul 1, `key.reason === "unconfigured"`).
+      const status = err.result.kind === "unknown" ? 503 : 500;
+      console.error(`[aggregator] ${err.message}`);
+      return reject(status, err.message);
+    }
     // O bază care nu răspunde NU e „instanță necunoscută". Confundate, toate
     // serverele sănătoase ar primi 401 iar operatorul ar căuta o cheie greșită.
     console.error("[aggregator] nu pot citi instanțele:", (err as Error).message);

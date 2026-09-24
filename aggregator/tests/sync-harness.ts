@@ -72,6 +72,7 @@ import zlib from "node:zlib";
 
 import { SecretBox } from "../lib/crypto";
 import { closePool, getPool } from "../lib/db";
+import { SchemaGuardError } from "../lib/schema-guard";
 import { SHIP_SECRET_FIELD } from "../lib/ship-keys";
 import { streamFor } from "../lib/streams";
 import {
@@ -81,6 +82,7 @@ import {
 import { discover } from "../lib/migrate";
 import type { Row } from "./sql-reading";
 import type { Pool, PooledConnection } from "../lib/db";
+import type { SchemaGuardResult } from "../lib/schema-guard";
 
 /** Secretul principal de test: 64 de caractere, evident false. */
 export const MASTER = "0".repeat(32) + "abcdefabcdefabcdefabcdefabcdef12";
@@ -184,6 +186,16 @@ export type FakeOptions = {
    * mulțimile se CONTOPESC, tăcut.
    */
   skipDelete?: boolean;
+  /**
+   * Simulează refuzul GĂRZII DE SCHEMĂ, nu al bazei — vezi `lib/schema-guard.ts`
+   * și `withSchemaGuard` din `lib/db.ts`. `useFakeServer` dă acest dublu direct
+   * drept fabrică a pool-ului (`factory` la `getPool`), deci învelișul real al
+   * gărzii nu se pune deloc peste el (vezi comentariul de la `getPool`) — nu
+   * există alt fel de a provoca `SchemaGuardError` de aici. Aruncă înaintea
+   * oricărei interogări, la fel cum `ensure()` din `lib/db.ts` respinge TOATĂ
+   * interogarea, nu doar prima.
+   */
+  schemaGuardFailure?: Extract<SchemaGuardResult, { ok: false }>;
 };
 
 type CursorRow = {
@@ -308,6 +320,7 @@ export class FakeServer implements Pool {
 
   async query(sql: string, params: unknown[] = []): Promise<[unknown, unknown]> {
     this.asked.push(sql);
+    if (this.opts.schemaGuardFailure) throw new SchemaGuardError(this.opts.schemaGuardFailure);
     if (this.opts.failOn && sql.startsWith(this.opts.failOn)) {
       throw new Error("serverul a refuzat interogarea");
     }
