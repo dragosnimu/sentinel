@@ -3368,7 +3368,7 @@ install_sentinel_nginx_snippets() {
 #
 # GUESSING THE NAME WAS REJECTED AS THE REPAIR, and that is the part worth
 # keeping. `hostname -f` on that host is n8n.example.com; the operator
-# reaches it at n8n.srv1051579.hstgr.cloud. A vhost named after the guess
+# reaches it at n8n.example.net. A vhost named after the guess
 # routes nothing, the deny block still wins, and the operator still gets 444 —
 # the same outage, produced by its own fix. Widening server_name with a guessed
 # LIST (short name, FQDN, public IP) is worse: putting the address there hands
@@ -4711,7 +4711,7 @@ audit_rule_signatures() {
 
 # The rules THIS host can load, and the lines whose path does not resolve.
 #
-# MEASURED on the Ubuntu 24.04.4 VM (10.30.1.134) on 26 August 2026, before any
+# MEASURED on the Ubuntu 24.04.4 VM (192.0.2.134) on 26 August 2026, before any
 # of this was written:
 #
 #   * `-a never,exit -F dir=/nonexistent` is REFUSED by the kernel with
@@ -5383,7 +5383,8 @@ Rolled back. Compare ${STATE_MARKERS}/baseline-services.txt with the current sta
 # using. It never returned, so neither branch below ever printed, and every
 # deploy was killed by hand at step 39 — which skipped deploy.sh's cleanup of
 # /tmp/sentinel-deploy-*, and that is how three copies of credentiale.txt sat
-# world-readable on the host for nine days (docs/INTARIRE.md §0).
+# world-readable on the host for nine days (measured; the hardening log that
+# records it is kept off this public repository).
 NOTIFY_TIMEOUT_S=60
 
 step_notify() {

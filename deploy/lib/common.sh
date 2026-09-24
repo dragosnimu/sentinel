@@ -330,7 +330,7 @@ erau deja marcați și NU au rulat:"
 #
 # The cost the operator accepted is `suricata-update` plus a `suricata -T` over
 # the whole ruleset on every deploy. MEASURED on the 24.04.4 test VM
-# (10.30.1.134) on 27 August 2026, same code, same host, back to back: a
+# (192.0.2.134) on 27 August 2026, same code, same host, back to back: a
 # change-nothing deploy took 332 s with this entry and 148 s without it. So the
 # entry costs about 3 minutes, and 132 s of that is `suricata -T` alone, timed
 # on its own. That is the figure the decision was taken on; if it grows much
