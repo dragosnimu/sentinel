@@ -8,7 +8,7 @@ găsită constatarea, nu pe ce stă.
 Fixturile de aici reproduc formele (scaner, location) măsurate pe cele două
 gazde la 21 septembrie 2026, inclusiv cazurile incomode — `location` NULL pe
 cele 477 de constatări `dnf`, un nume gol de imagine fără tag și fără slash
-(`traefik`, `bet-deploy-bet-alert-worker`), o cale cu spații în ea
+(`traefik`, `acme-deploy-acme-alert-worker`), o cale cu spații în ea
 (`exemplu.demo/ACME calculator/acme-deploy/package-lock.json` — contul și
 numele proiectului sunt fabricate, spațiul din numele directorului e forma
 reală) și o referință de imagine care CONȚINE un slash fără să fie o cale
@@ -80,7 +80,7 @@ def test_scanerul_de_sistem_ramane_in_detaliu():
     "postgres:16-alpine",
     "snipe/snipe-it:latest",          # slash, dar e o referință, nu o cale
     "docker.n8n.io/n8nio/n8n",        # registru + cale + nume, pe gazda Ubuntu
-    "bet-deploy-bet-alert-worker",    # nume gol: fără tag, fără slash
+    "acme-deploy-acme-alert-worker",  # nume gol: fără tag, fără slash
     "traefik",
 ])
 def test_containerul_isi_numeste_imaginea_intreaga(reference):
@@ -159,7 +159,11 @@ def test_calea_cu_contrabara_nu_ramane_intreaga_in_coloana():
     # Un singur nivel: nu există director părinte de arătat, deci nu se inventează.
     ("composer.lock", "Aplicație · composer.lock"),
     # Relativă: „.." nu e numele unei aplicații.
-    ("../bet-deploy/package-lock.json", "Aplicație · bet-deploy (package-lock.json)"),
+    ("../acme-deploy/package-lock.json", "Aplicație · acme-deploy (package-lock.json)"),
+    # Cazul de mai sus NU prinde un filtru slăbit la doar `p not in (".",)`:
+    # „..” cade pe parts[-3], iar parts[-2] rămâne „acme-deploy” oricum. Aici
+    # „..” ajunge chiar pe parts[-2] — dacă nu e scos, devine numele aplicației.
+    ("../package-lock.json", "Aplicație · package-lock.json"),
     ("./package-lock.json", "Aplicație · package-lock.json"),
 ])
 def test_forme_de_cale_care_nu_trebuie_sa_produca_un_nume_fals(location, expected):
@@ -173,13 +177,13 @@ def test_un_scaner_nou_nu_e_ghicit_ca_una_din_cele_trei():
     """Se vor adăuga scanere. Unul clasificat din inerție drept „Sistem de
     operare" e mai rău decât unul necunoscut: operatorul ar căuta pachetul pe
     gazdă și n-ar găsi nimic, fără să afle vreodată că pagina a ghicit."""
-    s = describe("nessus", "10.30.1.248")
+    s = describe("nessus", "198.51.100.248")
     assert s.kind == KIND_UNKNOWN
     assert "Sistem de operare" not in s.label
     assert "Container" not in s.label and "Aplicație" not in s.label
     # Valorile brute rămân vizibile: sunt singurul lucru pe care se mai poate
     # sprijini cineva când clasificarea nu are un răspuns.
-    assert "nessus" in s.label and "10.30.1.248" in s.label
+    assert "nessus" in s.label and "198.51.100.248" in s.label
 
 
 def test_scanerul_lipsa_nu_devine_o_categorie():

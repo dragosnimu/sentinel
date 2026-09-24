@@ -1,5 +1,5 @@
 """Trei pași care raportau succes fără să se uite la rezultat, măsurați pe un
-Ubuntu 24.04.4 real (10.30.1.134, suricata 7.0.3, nginx 1.24, auditd 3.1.2).
+Ubuntu 24.04.4 real (192.0.2.134, suricata 7.0.3, nginx 1.24, auditd 3.1.2).
 
 Ce s-a văzut pe mașină, în ordinea în care s-a văzut:
 
@@ -113,9 +113,9 @@ def _distro_call(tmp_path: Path, family: str, call: str,
 def _suricata_harness(
         tmp_path: Path, *, family: str = "debian", argv: str | None,
         host_ifaces: tuple[str, ...] = ("lo", "enp0s3"),
-        dump_home_net: str | None = "[10.30.1.134]",
+        dump_home_net: str | None = "[192.0.2.134]",
         eve_bytes: int = 0, eve_grows: bool = False,
-        want_iface: str = "enp0s3", want_ip: str = "10.30.1.134",
+        want_iface: str = "enp0s3", want_ip: str = "192.0.2.134",
         bpf_file: str = "") -> subprocess.CompletedProcess:
     """Rulează `suricata_report_effect` LIVRATĂ peste un proces inventat.
 
@@ -193,7 +193,7 @@ exit 0
 
 GOOD_ARGV = ("/usr/bin/suricata -D -c /etc/suricata/suricata.yaml "
              "--pidfile /run/suricata.pid --af-packet=enp0s3 "
-             "--set vars.address-groups.HOME_NET=[10.30.1.134]")
+             "--set vars.address-groups.HOME_NET=[192.0.2.134]")
 
 # Exact ce rula pe VM: argv-ul împachetat de Debian, fără nimic din ce scrisese
 # instalatorul în /etc/default/suricata.
@@ -431,7 +431,7 @@ def test_a_suricata_still_running_the_previous_argv_is_restarted(tmp_path):
     — e chiar exemplul din CLAUDE.md. Procesul rămâne pe argv-ul deploy-ului
     anterior, jurnalul spune „enabled", și noile setări nu ajung nicăieri."""
     proc = _needs_restart(tmp_path, MEASURED_BROKEN_ARGV,
-                          "--af-packet=enp0s3 --set vars.address-groups.HOME_NET=[10.30.1.134]")
+                          "--af-packet=enp0s3 --set vars.address-groups.HOME_NET=[192.0.2.134]")
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.startswith("RESTART:"), proc.stdout
 
@@ -1010,7 +1010,7 @@ def test_the_shipped_rules_file_is_fully_recognised(tmp_path):
 # ===========================================================================
 # Pasul 37 — o regulă `-F dir=` cu calea absentă nu mai ia cu ea restul
 # ===========================================================================
-# Măsurat pe VM (10.30.1.134) pe 26 august 2026, ÎNAINTE de reparație:
+# Măsurat pe VM (192.0.2.134) pe 26 august 2026, ÎNAINTE de reparație:
 #
 #   * `-a never,exit -F dir=/nonexistent` e refuzată de nucleu cu
 #     „Error sending add rule data request (No such file or directory)";
@@ -1213,7 +1213,7 @@ exit 0
     _stub(binpath, "suricata", f"exit {test_rc}\n")
     _stub(binpath, "ip", """
 case "$*" in
-    *"route show default"*) echo "default via 10.30.1.1 dev enp0s3 proto dhcp" ;;
+    *"route show default"*) echo "default via 192.0.2.1 dev enp0s3 proto dhcp" ;;
     *"addr show"*)          echo "2: enp0s3 inet 203.0.113.9/24 scope global enp0s3" ;;
 esac
 exit 0

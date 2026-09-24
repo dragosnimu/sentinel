@@ -75,7 +75,7 @@ UFW_ACTIVE_PORT_OPEN = UFW_ACTIVE_ONLY_SSH + """8443/tcp                   ALLOW
 8443/tcp (v6)              ALLOW IN    Anywhere (v6)
 """
 
-UFW_ACTIVE_PORT_SCOPED = UFW_ACTIVE_ONLY_SSH + """8443                       ALLOW IN    10.30.1.132
+UFW_ACTIVE_PORT_SCOPED = UFW_ACTIVE_ONLY_SSH + """8443                       ALLOW IN    192.0.2.132
 """
 
 UFW_ACTIVE_NEIGHBOURING_PORT = UFW_ACTIVE_ONLY_SSH + """84430/tcp                  ALLOW IN    Anywhere
@@ -162,7 +162,7 @@ def test_an_open_port_passes(tmp_path):
 
 
 def test_a_rule_scoped_to_one_address_also_passes(tmp_path):
-    """`ufw allow from 10.30.1.132 to any port 8443` e răspunsul corect pentru
+    """`ufw allow from 192.0.2.132 to any port 8443` e răspunsul corect pentru
     un panou care nu trebuie expus. Dacă verificarea l-ar respinge, ar cere
     operatorului să deschidă portul mai larg decât vrea."""
     fails, _, out = _run(tmp_path, status=UFW_ACTIVE_PORT_SCOPED)

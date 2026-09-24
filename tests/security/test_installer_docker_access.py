@@ -23,7 +23,7 @@ Fiecare test de mai jos rulează FUNCȚIILE LIVRATE din `deploy/install.sh`, cu
 `docker` și `runuser` momeli executabile pe PATH, și se uită la ce a rămas în
 `DOCKER_ACCESS_STATE`, în `SCAN_CONTAINERS` și în ce s-a chemat.
 
-Ce e MĂSURAT pe VM-ul de test (10.30.1.134, Ubuntu 24.04.4, docker 29.1.3,
+Ce e MĂSURAT pe VM-ul de test (192.0.2.134, Ubuntu 24.04.4, docker 29.1.3,
 28 august 2026) și ce e doar reprodus de momeli:
 
   * măsurat: `docker version --format '{{.Server.Version}}'` ca un utilizator din

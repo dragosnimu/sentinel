@@ -12,7 +12,7 @@ Ce previn testele de aici, în termeni de operator: **o configurație în care
 fiecare cerere e refuzată trebuie să facă un test să pice.** Nu „vhost-ul are
 numele X" — asta a fost prima reparație, și era tot o ghicire: `hostname -f` pe
 gazda aia întoarce `n8n.example.com`, iar operatorul ajunge la mașină prin
-`n8n.srv1051579.hstgr.cloud`. Un vhost botezat după ghiceală nu rutează nimic,
+`n8n.example.net`. Un vhost botezat după ghiceală nu rutează nimic,
 blocul de refuz câștigă în continuare, iar operatorul primește tot 444 — aceeași
 pană, produsă de reparația ei.
 
