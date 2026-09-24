@@ -57,19 +57,19 @@ from sentinel.model.event import Event  # noqa: E402
 NOW = datetime(2026, 9, 16, 9, 0, tzinfo=timezone.utc)
 
 
-def _login(key: str, ts: datetime, user: str = "dragos") -> Event:
+def _login(key: str, ts: datetime, user: str = "acme-deploy") -> Event:
     return Event(ts=ts, source="auditd", action="login", username=user,
                  src_ip="198.51.100.7",
                  raw={"record_type": "USER_LOGIN", "ses": key, "res": "success",
                       "terminal": "ssh", "auid": "1000"})
 
 
-def _logout(key: str, ts: datetime, user: str = "dragos") -> Event:
+def _logout(key: str, ts: datetime, user: str = "acme-deploy") -> Event:
     return Event(ts=ts, source="auditd", action="logout", username=user,
                  raw={"record_type": "USER_END", "ses": key, "terminal": "ssh"})
 
 
-def _command(key: str, ts: datetime, argv: str, user: str = "dragos") -> Event:
+def _command(key: str, ts: datetime, argv: str, user: str = "acme-deploy") -> Event:
     return Event(ts=ts, source="auditd", action="command", username=user,
                  raw={"record_type": "SYSCALL", "ses": key, "argv": argv,
                       "exe": "/usr/bin/ls", "ppid": "100", "success": "yes",

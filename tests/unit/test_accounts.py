@@ -17,7 +17,7 @@ NORMAL = """\
 root:x:0:0:root:/root:/bin/bash
 daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
 nginx:x:990:990:Nginx web server:/var/lib/nginx:/sbin/nologin
-dragos:x:1000:1000::/home/dragos:/bin/bash
+acme-deploy:x:1000:1000::/home/acme-deploy:/bin/bash
 """
 
 WITH_SECOND_ROOT = NORMAL + "backdoor:x:0:0::/root:/bin/bash\n"

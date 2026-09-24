@@ -239,7 +239,7 @@ async def privilege_escalation(db: Database, cursor: int) -> list[DetectionSpec]
 # comentariul de-acolo, 28 august 2026): forma veche cerea doar COEXISTENȚA —
 # aceeași adresă avea ≥5 eșecuri în fereastră ȘI o reușită oarecare — nu
 # CAUZALITATEA. Pe gazda asta asta a însemnat un „🔴 Autentificare reușită de
-# la un atacator" pentru o sesiune de deploy: trei refuzuri pe `dragos`,
+# la un atacator" pentru o sesiune de deploy: trei refuzuri pe `acme-ops`,
 # `deploy` și `admin`, apoi o reușită pe `sentinel-deploy` de pe ACEEAȘI
 # adresă — alt cont, deci nimic spart. Reluată peste 30 de zile de date reale,
 # regula veche a dat zero rânduri: nu e o pană în așteptare, e o mină care n-a

@@ -137,7 +137,7 @@ def test_a_successful_login_after_a_burst_of_failures_is_critical():
 
 def test_failures_on_other_accounts_do_not_taint_a_different_accounts_success():
     """Defectul reparat pe 30 august 2026, exact ca la `insights.posture`:
-    trei refuzuri pe `dragos`, `deploy` și `admin`, apoi o reușită pe
+    trei refuzuri pe `acme-ops`, `deploy` și `admin`, apoi o reușită pe
     `sentinel-deploy` de pe ACEEAȘI adresă — alt cont, deci nimic spart. Nu e
     incident, fiindcă eșecurile de pe contul care a reușit sunt zero.
 

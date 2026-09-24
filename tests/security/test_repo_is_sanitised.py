@@ -311,6 +311,42 @@ Rămân neacoperite, știut:
     scoasă, cuvântul se adaugă pur și simplu în `SANITISE_DOMAINS` — garda îl
     caută atunci ca pe orice altă valoare, fără nicio schimbare de cod.
 
+### Singura scutire: nota de drepturi de autor din `LICENSE`
+
+Pe 24 septembrie 2026 magazia locală a căpătat și contul de shell care apărea
+deja de șase ori în arbore (căi `/home/…`, fixturi de test) — reparat prin
+înlocuire, nu prin scutire, fiindcă alea sunt scurgeri, nu identitate declarată.
+Al șaptelea loc unde numele operatorului apărea era altfel: `LICENSE:3`, nota
+de drepturi de autor, unde numele are voie și trebuie să stea — e chiar rostul
+liniei.
+
+Nu se scutește fișierul, se scutește PERECHEA (fișier, cheie), în
+`IDENTITY_EXEMPT`, cu aceeași formă ca `VALUE_EXEMPT` de mai sus și aceeași
+regulă de numărare (`_unexempted_identity_hits`): egalitate pe maximul dintre
+disc și index, iar depășirea se raportează întreagă. O îngustare de tipar
+(„nu prinde numele dacă e precedat de „Copyright (c)"") ar fi tăcută și
+globală — exact tiparul pe care restul fișierului îl respinge peste tot. O
+scutire pe fișier întreg ar fi la fel de largă în altă direcție: ar lăsa
+numele să apară A DOUA OARĂ în `LICENSE`, pe orice altă linie, fără ca garda
+să mai vadă ceva. Scutirea pe (fișier, cheie, NUMĂR) prinde ambele găuri: un
+nume adăugat în orice alt fișier nu are nicio intrare în `IDENTITY_EXEMPT`,
+deci numărul permis e zero; un al doilea nume în `LICENSE` urcă numărul găsit
+la 2, care nu mai e egal cu 1, deci cade — raportat întreg, ca la valoare.
+
+Rămâne o gaură, măsurată nu presupusă, pe care numărul singur n-o închide: nota
+de drepturi de autor ȘTEARSĂ din `LICENSE:3` și numele mutat pe orice ALTĂ
+linie a aceluiași fișier (o cale de exemplu într-un comentariu) lasă numărul
+total tot 1 — egal cu cel permis, deci tăcut, deși fișierul nu mai conține ce
+scutirea pretinde că acoperă. Motivul pentru care asta contează: linia 3 e
+singura din `LICENSE` unde numele are voie să stea; oriunde altundeva e chiar
+scurgerea pe care restul fișierului o caută. De aceea `IDENTITY_EXEMPT` poartă,
+pe lângă număr, o ANCORĂ — o expresie regulată aplicată liniei apariției, nu
+valorii ei. O apariție se lasă tăcută numai dacă și linia ei se potrivește cu
+ancora; alta, chiar dacă numărul total rămâne la plafon, rămâne raportată. Asta
+nu e „îngustarea de tipar" respinsă mai sus: matcherul de identitate tot vede
+valoarea oriunde, pe orice linie, în orice fișier — ancora nu-l atinge, doar
+restrânge ce dintr-un fișier deja NUMIT se consideră acoperit.
+
 ## Valorile reale nu au voie să existe într-o variabilă locală de test
 
 `pytest -l` (`--showlocals`) randează variabilele locale ale FIECĂRUI cadru din
@@ -612,6 +648,40 @@ VALUE_EXEMPT: dict[str, tuple[dict[str, int], str]] = {
     # o adresă publică, iar avizul din spatele ei e fabricat.
     "tests/unit/test_scan_trivy_image.py":
         ({SHAPE_B64: 1}, "URL public de avizare GitHub din eșantionul trivy"),
+}
+
+# Scutiri NUMITE pentru garda de identitate — aceeași formă ca `VALUE_EXEMPT`
+# de deasupra (fișier -> {cheie IDENTITY_KEYS: (număr permis, ANCORA de linie)},
+# motiv), aceeași egalitate pe MAXIMUL dintre disc și index, din
+# `_unexempted_identity_hits`.
+#
+# ANCORA e o expresie regulată aplicată textului LINIEI pe care stă o apariție,
+# nu tiparului de identitate: câte o apariție e „acoperită" de scutire doar dacă
+# linia ei se potrivește cu ancora. Fără ea numărul singur nu leagă scutirea de
+# LOC — măsurat pe 24 septembrie 2026: nota de drepturi de autor ștearsă din
+# `LICENSE:3` ȘI numele mutat pe altă linie (o cale în comentariu, de exemplu)
+# lasă numărul total tot 1, deci o scutire care compară doar cifra tace, deși
+# fișierul nu mai conține ce scutirea pretinde că acoperă.
+#
+# Asta NU e „îngustarea de tipar" pe care restul fișierului o respinge (vezi mai
+# sus, „nu prinde numele dacă e precedat de «Copyright (c)»"): matcherul de
+# identitate tot potrivește valoarea ORIUNDE în arbore, pe orice linie, în orice
+# fișier — ancora nu-l atinge. Ea restrânge doar CE anume dintr-un fișier deja
+# NUMIT în `IDENTITY_EXEMPT` se lasă tăcut, exact ca perechea (fișier, cheie) de
+# mai jos, dusă cu un pas mai departe: (fișier, cheie, LOC).
+#
+# O singură intrare azi, și una singură ar trebui să fie suficientă multă
+# vreme: nota de drepturi de autor din `LICENSE` conține numele operatorului
+# ÎN CLAR, dinadins — e chiar rostul liniei. Scutirea e pe fișier, pe cheie ȘI pe
+# linia care poartă nota — un nume adăugat pe orice ALTĂ linie a `LICENSE` (sau
+# în orice alt fișier) nu se potrivește cu ancora, deci rămâne raportat chiar
+# dacă numărul total nu s-a mișcat; iar un al doilea nume, chiar pe linia
+# ancorată, urcă numărul găsit peste cel permis și cade cu tot raportul — vezi
+# docstring-ul funcției pentru de ce „depășirea se raportează întreagă" e corect
+# aici la fel ca la `VALUE_EXEMPT`.
+IDENTITY_EXEMPT: dict[str, tuple[dict[str, tuple[int, str]], str]] = {
+    "LICENSE": ({"SANITISE_USERNAMES": (1, r"^Copyright \(c\) \d{4} ")},
+                "nota de drepturi de autor a operatorului"),
 }
 
 # --- Scutire DERIVATĂ, nu declarată: manifestul de migrații -------------------
@@ -2027,11 +2097,20 @@ def test_every_value_exemption_still_earns_its_place() -> None:
     `aggregator/tests/register.test.ts` a intrat fără să le miște. Corectate
     odată cu clauza UUID, care a adus a doua. Un număr rămas în urmă e cum se
     reintroduce un bug reparat — cineva aliniază codul la comentariu.
+
+    Aserțiunea „fișier scutit dar neenumerat" acoperă și `IDENTITY_EXEMPT`, nu
+    doar `VALUE_EXEMPT`: o scutire de identitate spre un fișier redenumit sau
+    scris greșit (`LICENSE.old` în loc de `LICENSE`) nu era vizitată NICIODATĂ
+    de `_unexempted_identity_hits` — funcția iterează pe `_tracked_files()`, nu
+    pe cheile `IDENTITY_EXEMPT`, deci o scutire moartă rămânea o gaură deschisă
+    pentru orice fișier care ar primi din nou numele ăla. Găsit de verificator
+    la runda 2, ca oglindă directă a lipsei aceleiași aserțiuni pentru
+    `VALUE_EXEMPT`, corectată mai sus în aceeași rundă.
     """
     if shutil.which("git") is None:
         pytest.skip("fără git nu se pot enumera fișierele, deci nici scutirile")
 
-    numite = set(VALUE_EXEMPT)
+    numite = set(VALUE_EXEMPT) | set(IDENTITY_EXEMPT)
     enumerate_ = set(_tracked_files())
     lipsa = sorted(numite - enumerate_)
     assert not lipsa, (
@@ -2050,6 +2129,29 @@ def test_every_value_exemption_still_earns_its_place() -> None:
                 "o scutire scrisă greșit nu stinge nimic și nici nu spune asta")
             if count and not gasit.get(shape):
                 moarte.append(f"{rel} ({shape}, scutit {count}) — „{why}”")
+
+    # Oglinda pentru `IDENTITY_EXEMPT`: fiecare cheie trebuie să numească o
+    # ANCORĂ — o expresie regulată validă care se potrivește cu cel puțin o
+    # linie din fișierul de azi. Fără asta, o scutire ancorată la o linie care
+    # a dispărut (nota de drepturi de autor reformatată, de exemplu) ar deveni
+    # o ușă tăcută: numărul rămâne corect, dar ancora nu mai leagă nimic real.
+    for rel, (allowance, why) in IDENTITY_EXEMPT.items():
+        linii: list[str] = []
+        for _, text in _contents(rel):
+            linii.extend(text.splitlines())
+        for key, (count, anchor) in allowance.items():
+            assert key in IDENTITY_KEYS, (
+                f"{rel}: scutirea numește cheia „{key}”, care nu există în "
+                "IDENTITY_KEYS — o scutire scrisă greșit nu stinge nimic")
+            assert anchor, (
+                f"{rel}/{key}: scutire de identitate FĂRĂ ancoră de linie — "
+                "numărul singur nu leagă scutirea de un loc, vezi docstring-ul "
+                "lui `IDENTITY_EXEMPT`")
+            rx = re.compile(anchor)
+            if count and not any(rx.search(linie) for linie in linii):
+                moarte.append(f"{rel}/{key} — ancora „{anchor}” nu se mai "
+                              f"potrivește cu nicio linie din fișier — „{why}”")
+
     assert not moarte, (
         "scutiri care nu mai sting nimic. Ori fișierul s-a curățat și scutirea "
         "trebuie ștearsă, ori garda a încetat să vadă forma aia — a doua e "
@@ -2130,6 +2232,22 @@ def test_no_secrets_anywhere_including_fixtures() -> None:
 # rămână recunoscibilă după primele caractere, altfel sonda ar căuta ceva ce
 # trunchierea a tăiat și ar raporta „curat" fără să se fi uitat.
 _PROBE_HEX_64 = ("9876543210" * 7)[:64]
+
+# Valoarea de probă pentru drumul de IDENTITATE al sondei `-l`, mai jos. Nu
+# `_PROBE_HEX_64`: cele două sonde trebuie să dovedească independent că
+# valoarea LOR nu ajunge în ieșire — o singură constantă comună ar lăsa o
+# scurgere pe un singur drum să treacă neobservată dacă cealaltă verificare o
+# acoperă din întâmplare. Literă+cifră, nu numai cifre: un nume de cont arată
+# așa, nu ca un secret hexazecimal.
+#
+# FĂRĂ liniuțe și fără punct, dinadins — `_identity_matcher` scapă valoarea
+# CARACTER CU CARACTER (`rewritten`, mai jos în fișier), iar `re.escape` pune
+# `\` înaintea liniuței chiar și în Python 3.7+. Măsurat: cu o liniuță în
+# probă, tiparul compilat ajunge în ieșire ca `cont\-fabricat…` — și o
+# verificare `valoare in out` scrisă fără backslash-uri NU-l vede, deși
+# valoarea tot a ajuns acolo. O probă alfanumerică pură nu se sparge la
+# scăpare, deci o verificare simplă pe substring rămâne validă.
+_PROBE_IDENTITY_USER = "cont9917fabricatpentrusonda"
 
 
 def test_the_assembled_guard_reports_a_fabricated_tree() -> None:
@@ -2275,6 +2393,60 @@ def test_garda_iese_fortat_in_timpul_scanarii():
     _fabricate()
     garda._secret_value_hits = _boom_hard
     garda.test_no_secrets_anywhere_including_fixtures()
+
+
+# --- Drumul de IDENTITATE, aceeasi disciplina, alt cadru ---------------------
+#
+# Runda 2 a livrat exact varianta pe care sonda de mai sus o falsifica — dar
+# pentru VALOARE, nu pentru identitate. Cadrul care crapa la runda 2 era
+# `_unexempted_identity_hits`, apelat direct din bucla lui `_scan_identity`, cu
+# textul liniei legat in el; verificatorul a aratat ca fara un test care sa
+# conduca EXACT drumul asta sub `-l`, golirea din `_scan_identity` era o
+# aparare pe care nimeni n-o vedea disparand. `_identity_values` e inlocuita
+# fiindca magazia locala reala nu exista pe masina care ruleaza sonda — o
+# clona proaspata n-are `secrets/`.
+def _payload_identitate():
+    return "SANITISE_USERNAMES=" + {valoare_identitate} + "\\n"
+
+
+def _fabricate_identitate():
+    garda._identity_values = lambda sources: (
+        dict(SANITISE_USERNAMES=[{valoare_identitate}]), [])
+    garda._tracked_files = lambda: ["proba-identitate.env"]
+    garda._contents = lambda rel: [("disc", _payload_identitate())]
+
+
+# Aceeasi asimetrie ca la `_boom`/`_boom_hard` de mai sus, si din acelasi
+# motiv: `_boom_identitate` nu are nevoie sa-si goleasca parametrul, fiindca
+# `Exception` se converteste in garda si cadrul ei nu ajunge in traceback-ul
+# tiparit de `-l`. Pastrata simetrica dinadins, ca sa nu se repete confuzia pe
+# care comentariul vechi de mai sus o descrie.
+def _boom_identitate(rel, per_version):
+    per_version = None
+    raise ValueError("crapa dinadins, ca sa se vada ce ramane in cadre")
+
+
+def _boom_identitate_hard(rel, per_version):
+    per_version = None
+    raise SystemExit("nu e Exception, deci nu se converteste, deci cadrele raman")
+
+
+def test_garda_identitate_pica_pe_arbore_fabricat():
+    _fabricate_identitate()
+    offenders, problems = garda._scan_identity(("sursa-fabricata",))
+    assert not offenders, "\\n  " + "\\n  ".join(offenders)
+
+
+def test_garda_identitate_crapa_in_timpul_scanarii():
+    _fabricate_identitate()
+    garda._unexempted_identity_hits = _boom_identitate
+    garda._scan_identity(("sursa-fabricata",))
+
+
+def test_garda_identitate_iese_fortat_in_timpul_scanarii():
+    _fabricate_identitate()
+    garda._unexempted_identity_hits = _boom_identitate_hard
+    garda._scan_identity(("sursa-fabricata",))
 '''
 
 
@@ -2292,8 +2464,8 @@ def test_a_failing_scan_never_prints_the_value_under_showlocals(tmp_path) -> Non
     `-l`, peste un arbore fabricat cu o valoare de probă, și se citește ieșirea.
     O aserțiune că bucla „stă într-un ajutor" ar fi confirmarea intenției.
 
-    Trei scenarii, fiindcă sunt trei căi prin care valoarea ajunge într-un
-    traceback:
+    Trei scenarii pe FIECARE din cele două drumuri (valoare și identitate),
+    fiindcă sunt trei căi prin care o valoare ajunge într-un traceback:
 
       - aserțiunea care pică normal — cadrul scanării s-a întors deja;
       - scanarea care crapă cu un `Exception` — cadrul ei e în traceback, dar
@@ -2301,18 +2473,29 @@ def test_a_failing_scan_never_prints_the_value_under_showlocals(tmp_path) -> Non
       - scanarea care iese cu un `BaseException` (SystemExit, Ctrl-C) — aia NU se
         convertește, deci traceback-ul păstrează și cadrele de dedesubt.
 
-    Al treilea a găsit singurul defect adevărat al reparației ăsteia, și l-a
-    găsit după ce mutația pe al doilea trecuse VERDE: o comprehensiune de listă
-    are cadrul ei, pe care golirea din `except` nu-l atinge, iar variabila ei de
-    ciclu era textul fișierului. Sub `Exception` nu se vedea, fiindcă `raise …
-    from None` aruncă traceback-ul vechi; sub `SystemExit` se vedea întreg.
-    Măsurat, nu dedus — prima oară comentariul de la buclă a spus că sonda l-a
-    prins, și nu era adevărat.
+    Al treilea de pe drumul de VALOARE a găsit singurul defect adevărat al
+    reparației ăsteia, și l-a găsit după ce mutația pe al doilea trecuse VERDE:
+    o comprehensiune de listă are cadrul ei, pe care golirea din `except` nu-l
+    atinge, iar variabila ei de ciclu era textul fișierului. Sub `Exception` nu
+    se vedea, fiindcă `raise … from None` aruncă traceback-ul vechi; sub
+    `SystemExit` se vedea întreg. Măsurat, nu dedus — prima oară comentariul de
+    la buclă a spus că sonda l-a prins, și nu era adevărat.
+
+    Drumul de IDENTITATE s-a adăugat la runda 3, cu exact defectul care a
+    respins runda 2: `_unexempted_identity_hits` primea textul liniei — nu doar
+    numărul ei — ca ancora din `IDENTITY_EXEMPT` să poată fi verificată acolo,
+    iar cadrul funcției ăsteia rămânea pe stivă, cu textul legat, când funcția
+    ÎNSĂȘI crăpa. Sonda de mai jos conduce `_scan_identity` direct, nu prin
+    `test_no_operator_identity_appears_in_the_tree`: aia are nevoie de o
+    magazie locală reală și ar sări (SKIP) pe o clonă proaspătă, exact ce
+    sonda asta nu-și poate permite — și pune boom/boom_hard pe
+    `_unexempted_identity_hits`, cadrul care a picat runda 2.
     """
     probe = tmp_path / "test_sonda_showlocals.py"
     probe.write_bytes(_SHOWLOCALS_PROBE.format(
         modul=repr(str(Path(__file__).resolve())),
-        valoare=repr(_PROBE_HEX_64)).encode("utf-8"))
+        valoare=repr(_PROBE_HEX_64),
+        valoare_identitate=repr(_PROBE_IDENTITY_USER)).encode("utf-8"))
 
     # `PYTHONIOENCODING` explicit: pe Windows, stdout-ul unui proces-copil legat
     # la o conductă se codifică cu cp1252, iar diacriticele din mesajele gărzii
@@ -2330,12 +2513,30 @@ def test_a_failing_scan_never_prints_the_value_under_showlocals(tmp_path) -> Non
     # goală, sau un pytest care n-a rulat nimic, ar face restul o bifă verde pe
     # nimic — și exact așa arată o sondă stricată.
     assert run.returncode != 0, f"sonda nu a picat, deci n-are ce inspecta:\n{out[-2000:]}"
-    assert "3 failed" in out, f"sonda n-a rulat toate scenariile:\n{out[-2000:]}"
+    # Șase, nu trei: trei scenarii pe drumul de valoare, trei pe cel de
+    # identitate. Un total mai mic ar însemna că unul din cele două drumuri
+    # n-a rulat deloc — exact ce s-a întâmplat runda trecută cu identitatea.
+    assert "6 failed" in out, f"sonda n-a rulat toate scenariile:\n{out[-2000:]}"
     assert "proba-scurgere.env:1" in out, (
-        f"garda n-a raportat fișierul fabricat, deci eșecul inspectat e altul:\n{out[-2000:]}")
+        f"garda de VALOARE n-a raportat fișierul fabricat, deci eșecul "
+        f"inspectat pe drumul ăsta e altul:\n{out[-2000:]}")
+    assert "proba-identitate.env:1" in out, (
+        f"garda de IDENTITATE n-a raportat fișierul fabricat, deci eșecul "
+        f"inspectat pe drumul ăsta e altul:\n{out[-2000:]}")
     assert "scanarea arborelui" in out and "ValueError" in out, (
-        f"scenariul cu `Exception` n-a trecut prin `except`, deci golirea "
-        f"cadrului nu a fost pusă la încercare:\n{out[-2000:]}")
+        f"scenariul cu `Exception` pe drumul de valoare n-a trecut prin "
+        f"`except`, deci golirea cadrului nu a fost pusă la încercare:\n"
+        f"{out[-2000:]}")
+    assert "scanarea identității" in out, (
+        f"scenariul cu `Exception` pe drumul de identitate n-a trecut prin "
+        f"`except`, deci golirea lui `rx` nu a fost pusă la încercare:\n"
+        f"{out[-2000:]}")
+    # Numai `rx` e apărat aici, și numai el are ce apăra: `per_version` și `hits`
+    # se golesc și ele în `except`, dar tuplurile lor poartă `(int, cheie, bool)`
+    # — niciun text. Măsurat de verificator pe 24 septembrie 2026: scoasă
+    # golirea lui `rx`, testul ăsta se înroșește și tipărește tiparul compilat cu
+    # valoarea; scoase golirile celorlalte două, rămâne verde. Sunt cod inert
+    # ținut pentru simetrie cu `_scan_tree_for_secrets`, nu apărare.
     # NU `"SystemExit" in out`: cuvântul apare și într-un comentariu din chiar
     # fișierul gărzii (linia despre „(SystemExit, Ctrl-C) se vede întreg"), pe
     # care `--tb=long` îl tipărește ca parte din sursa unui cadru ORICE ar fi
@@ -2349,20 +2550,28 @@ def test_a_failing_scan_never_prints_the_value_under_showlocals(tmp_path) -> Non
     # excepție SystemExit chiar propagată — nu un comentariu din sursă și nu
     # `RuntimeError: … TypeError` (care ar apărea aici ca `E       RuntimeError:
     # …`). Regex, nu substring fix, fiindcă numărul de spații după `E` ține de
-    # adâncimea traceback-ului, nu e o constantă.
-    assert re.search(r"(?m)^E\s+SystemExit:", out), (
-        f"scenariul cu `BaseException` n-a produs o excepție SystemExit "
-        f"propagată — fie n-a rulat, fie a fost convertită (ex. `TypeError` "
-        f"dintr-o semnătură stricată a ciotului), deci excepția NU se mai "
-        f"comportă ca `BaseException` și verificarea de mai jos nu mai pune "
-        f"nimic la încercare:\n{out[-2000:]}")
+    # adâncimea traceback-ului, nu e o constantă. DOUĂ apariții, nu una — câte
+    # o ieșire forțată pe fiecare drum; o singură apariție ar însemna că unul
+    # din cele două `_boom_*_hard` n-a propagat ca `BaseException`.
+    system_exits = re.findall(r"(?m)^E\s+SystemExit:", out)
+    assert len(system_exits) == 2, (
+        f"{len(system_exits)} excepții SystemExit propagate, nu 2 — un drum "
+        f"(valoare sau identitate) n-a produs-o pe a lui: fie n-a rulat, fie a "
+        f"fost convertită (ex. `TypeError` dintr-o semnătură stricată a "
+        f"ciotului), deci NU se mai comportă ca `BaseException` și verificarea "
+        f"pe cadrul păstrat nu mai pune nimic la încercare:\n{out[-2000:]}")
 
     # Prefixul, nu valoarea întreagă: `-l` trunchiază șirurile lungi, iar o
-    # scurgere trunchiată e tot o scurgere.
+    # scurgere trunchiată e tot o scurgere. Ambele valori, fiindcă ambele
+    # drumuri au propriul lor cadru de apărat.
     assert _PROBE_HEX_64[:24] not in out, (
-        "`pytest -l` a tipărit valoarea găsită de gardă — un test de scurgere "
-        "care își tipărește propriul secret îl mută dintr-un loc privat în "
-        "altul public")
+        "`pytest -l` a tipărit valoarea găsită de garda de VALOARE — un test "
+        "de scurgere care își tipărește propriul secret îl mută dintr-un loc "
+        "privat în altul public")
+    assert _PROBE_IDENTITY_USER[:16] not in out, (
+        "`pytest -l` a tipărit valoarea găsită de garda de IDENTITATE — un "
+        "test de scurgere care își tipărește propriul cont îl mută dintr-un "
+        "loc privat în altul public")
 
 
 def test_the_witness_domain_is_not_named_anywhere() -> None:
@@ -2650,6 +2859,123 @@ def _identity_values(sources: tuple[str, ...]) -> tuple[dict[str, list[str]], li
     return found, problems
 
 
+def _anchored_hit(
+        line_no: int, line_text: str, anchor_rx: "re.Pattern[str] | None") -> bool:
+    """True doar dacă apariția stă pe o linie REALĂ care se potrivește cu ancora.
+
+    Extrasă din `_unexempted_identity_hits` la runda 3: verdictul se calculează
+    AICI, în cadrul care are textul liniei, nu în cadrul care primește doar
+    numărul apariției — vezi docstring-ul de mai jos pentru motiv. Semnătura ia
+    `anchor_rx` deja compilat, nu textul ancorei: apelantul îl compilează o
+    singură dată per (fișier, cheie), nu per apariție.
+
+    `anchor_rx` e `None` când cheia n-are nicio ancoră în `IDENTITY_EXEMPT` —
+    atunci nimic nu se consideră ancorat, comportamentul de dinainte de ancoră.
+
+    Linia `0` (din `_locations_of`, literalii alăturați peste o linie nouă) nu
+    se poate lega de nicio ancoră: verificarea explicită `line_no != 0` NU e
+    redundantă cu faptul că apelantul trimite `line_text` gol pentru linia 0 —
+    dacă vreo ancoră viitoare s-ar potrivi și cu un text gol, potrivirea
+    implicită ar acoperi o apariție a cărei linie reală nimeni n-o cunoaște.
+    Ancorarea cere o linie identificată, nu o presupunere.
+    """
+    if anchor_rx is None or line_no == 0:
+        return False
+    return anchor_rx.search(line_text) is not None
+
+
+def _unexempted_identity_hits(
+        rel: str,
+        per_version: list[tuple[str, list[tuple[int, str, bool]]]]) -> list[str]:
+    """Aparițiile de identitate pe care scutirea numită a fișierului NU le acoperă.
+
+    Oglinda lui `_unexempted_value_hits`, de mai sus, pentru exact același motiv:
+    `IDENTITY_EXEMPT` e o scutire pe (fișier, cheie), nu pe fișier întreg — un
+    nume adăugat pe o linie NOUĂ a unui fișier deja scutit (`LICENSE`, pe altă
+    linie decât cea de copyright) trebuie să rămână vizibil, altfel scutirea ar
+    fi o ușă, nu o fereastră.
+
+    Egalitate pe MAXIMUL dintre versiuni (disc/index), din același motiv ca la
+    valoare: o editare în curs nu are voie să țipe la stare intermediară, dar o
+    valoare cu adevărat nouă tot nu are voie să treacă tăcută.
+
+    `per_version` poartă al treilea element din triplet ca verdict ANCORAT —
+    un `bool`, calculat de apelant cu `_anchored_hit` — nu textul liniei.
+    Runda 2 a livrat exact linia aici (`line_text`), ca ancora să poată fi
+    verificată în cadrul ăsta; verificatorul a arătat că, atunci când funcția
+    ÎNSĂȘI crapă, cadrul ei rămâne pe stivă cu textul legat, iar `pytest -l`
+    îl tipărește întreg. Verdictul boolean nu poartă text — n-are ce tipări,
+    indiferent unde crapă funcția asta. Vezi `_scan_identity`, care calculează
+    verdictul înainte de apel, exact acolo unde ține deja textul liniei sub
+    aceeași disciplină de golire ca `_scan_tree_for_secrets`.
+
+    O apariție se consideră acoperită de scutire doar dacă (a) numărul
+    apariițiilor ancorate rămâne egal cu cel permis ȘI (b) apariția însăși e
+    ancorată. O apariție NEancorată rămâne raportată INDIFERENT de numărul
+    total: fișierul tot poartă o scurgere, chiar dacă suma nu s-a mișcat. Fără
+    (b), nota de drepturi de autor ștearsă din `LICENSE:3` și numele reapărut
+    pe orice altă linie a fișierului ar lăsa numărul la 1 și garda ar tăcea —
+    măsurat, nu ipotetic.
+
+    Linie fără ancoră cerută (cheie fără intrare în `allowance`, deci `allowed`
+    e 0): nu poate exista apariție „acoperită", orice hit e raportat — la fel ca
+    înainte de ancoră.
+    """
+    allowance, why = IDENTITY_EXEMPT.get(rel, ({}, ""))
+    keys = set(allowance) | {key for _, hits in per_version for _, key, _ in hits}
+
+    out: list[str] = []
+    for key in sorted(keys):
+        allowed, anchor = allowance.get(key, (0, ""))
+
+        if not anchor:
+            # Nicio ancoră pentru cheia asta — fie fișierul n-are nicio scutire
+            # pentru ea (`allowed` e 0), fie o scutire viitoare ar alege să nu
+            # lege un LOC. Comportamentul e cel dinainte de ancoră: egalitate pe
+            # numărul total, fără nicio verificare de linie.
+            counts = [sum(1 for _, k, _ in hits if k == key) for _, hits in per_version]
+            if max(counts, default=0) != allowed:
+                note = (f" — scutirea „{why}” cere {allowed} din {key}, maximul "
+                        f"între versiuni e {max(counts, default=0)}") \
+                    if rel in IDENTITY_EXEMPT else ""
+                for source, hits in per_version:
+                    for line_no, k, _ in hits:
+                        if k != key:
+                            continue
+                        where = f"{rel}:{line_no}" if line_no else f"{rel} (linie nesigură)"
+                        out.append(f"{where} ({source}) — o intrare din {key}{note}")
+        else:
+            anchored_counts = [
+                sum(1 for _, k, anchored in hits if k == key and anchored)
+                for _, hits in per_version]
+            anchored_ok = max(anchored_counts, default=0) == allowed
+
+            for source, hits in per_version:
+                for line_no, k, anchored in hits:
+                    if k != key:
+                        continue
+                    if anchored_ok and anchored:
+                        # Acoperită: numărul de pe linia ancorată e cel permis,
+                        # ȘI apariția asta chiar stă pe ea.
+                        continue
+                    where = f"{rel}:{line_no}" if line_no else f"{rel} (linie nesigură)"
+                    if anchored:
+                        note = (f" — scutirea „{why}” cere {allowed} din {key} "
+                                f"pe linia ancorată, maximul între versiuni e "
+                                f"{max(anchored_counts, default=0)}")
+                    else:
+                        note = (f" — scutirea „{why}” e legată de linia ce se "
+                                f"potrivește cu „{anchor}”; asta nu se potrivește")
+                    out.append(f"{where} ({source}) — o intrare din {key}{note}")
+
+        if not any(k == key for _, hits in per_version for _, k, _ in hits):
+            # Scutire care nu mai stinge nimic: fișierul s-a curățat, sau garda
+            # a încetat să vadă cheia. A doua arată identic cu un depozit curat.
+            out.append(f"{rel} — nicio potrivire pentru {key}, dar scutirea "
+                       f"„{why}” cere {allowed}")
+    return out
+
+
 def _scan_identity(sources: tuple[str, ...]) -> tuple[list[str], list[str]]:
     """(apariții, probleme) — ȘIRURI deja formatate, niciodată valori.
 
@@ -2658,12 +2984,43 @@ def _scan_identity(sources: tuple[str, ...]) -> tuple[list[str], list[str]]:
     a ținut numele de utilizator nu are voie să mai fie pe stivă când pică
     aserțiunea. Numele operatorului e mai puțin periculos decât o parolă și
     exact la fel de inutil de publicat.
+
+    `IDENTITY_EXEMPT` se aplică pe (fișier, cheie) — vezi
+    `_unexempted_identity_hits` — nu prin filtrarea listei brute de aici: filtrul
+    trebuie să vadă TOATE aparițiile unui fișier deodată, ca să poată compara
+    numărul lor cu numărul permis.
+
+    Verdictul ANCORAT (`_anchored_hit`) se calculează AICI, cât timp `line_text`
+    e încă în cadrul ăsta, și se trece mai departe ca `bool` — nu textul liniei.
+    Runda 2 trimitea textul până în `_unexempted_identity_hits`, ca ancora să
+    poată fi verificată acolo; verificatorul a arătat că, atunci când funcția
+    aia crapă, cadrul ei rămâne pe stivă cu textul legat, și `pytest -l` îl
+    tipărește — un al doilea loc de golit, pe lângă cel de-aici, pe care nimic
+    nu-l apăra. Calculat aici, verdictul scoate textul din drumul CĂTRE filtru,
+    care e locul unde cioturile sondei îl fac să crape.
+
+    Ce NU face: textul tot pleacă din cadrul ăsta, în jos. Măsurat de verificator
+    pe 24 septembrie 2026, cu un `BaseException` ridicat în fiecare, sub
+    `pytest -l --full-trace`:
+
+    * `_anchored_hit` ține linia;
+    * `_locations_of` ține TOT textul fișierului plus tiparul cu valoarea;
+    * `_identity_matcher` ține valoarea;
+    * `_identity_values` ține toate perechile din magazie, nu doar identitatea.
+
+    Ultimele trei există și la `HEAD` și țin strict mai mult decât primul, deci
+    verdictul mutat aici nu a înrăutățit nimic — dar nici nu a închis clasa.
+    Golirea disciplinată e doar în cadrul ăsta; cadrele apelate sunt în afara ei,
+    iar singurul declanșator găsit e un semnal asincron cu `--full-trace`. Dacă
+    asta trebuie închis, e o decizie de proiectare peste toate patru, nu o
+    resetare în plus.
     """
     found: dict[str, list[str]] = {}
     problems: list[str] = []
     offenders: list[str] = []
     matchers: list[tuple[str, re.Pattern[str]]] = []
-    key = value = text = None
+    key = value = text = lines = line_text = None
+    per_version = hits = rx = None
     try:
         found, problems = _identity_values(sources)
         # Buclă explicită, nu comprehensiune: o comprehensiune are cadrul EI, pe
@@ -2673,22 +3030,44 @@ def _scan_identity(sources: tuple[str, ...]) -> tuple[list[str], list[str]]:
             for value in entries:
                 matchers.append((key, _identity_matcher(value)))
         for rel in _tracked_files():
+            # Ancorele fișierului ăstuia, compilate o singură dată — nu per
+            # apariție. `IDENTITY_EXEMPT` e o constantă a depozitului, nu o
+            # valoare a operatorului: tiparul ei n-are nevoie de golire.
+            allowance, _why = IDENTITY_EXEMPT.get(rel, ({}, ""))
+            anchors = {k: re.compile(a) for k, (_, a) in allowance.items() if a}
+            per_version: list[tuple[str, list[tuple[int, str, bool]]]] = []
             for source, text in _contents(rel):
+                # `lines`, ca ancora din `IDENTITY_EXEMPT` să se aplice pe
+                # LINIA apariției, nu doar pe numărul ei. Conține exact aceleași
+                # valori ca `text`, deci intră sub aceeași disciplină de golire
+                # de mai jos.
+                lines = text.splitlines()
+                hits: list[tuple[int, str, bool]] = []
                 for key, rx in matchers:
                     for line_no in _locations_of(text, rx):
-                        where = f"{rel}:{line_no}" if line_no else f"{rel} (linie nesigură)"
-                        offenders.append(f"{where} ({source}) — o intrare din {key}")
+                        line_text = lines[line_no - 1] if line_no else ""
+                        anchored = _anchored_hit(line_no, line_text, anchors.get(key))
+                        hits.append((line_no, key, anchored))
+                per_version.append((source, hits))
+            offenders += _unexempted_identity_hits(rel, per_version)
     except Exception as exc:
         # Doar numele tipului. `str(exc)` al unei erori de regex citează tiparul,
         # iar tiparul e construit din valoare — și tot din valoare e construit
-        # `matchers`, prin `.pattern`, deci și el se golește.
+        # `matchers`, prin `.pattern`, deci și el se golește. `rx` poartă ACELAȘI
+        # tipar, separat, cât timp bucla de mai sus e încă pe cadrul ăsta —
+        # ultima valoare iterată din `matchers` rămâne legată de `rx` chiar și
+        # după ce bucla s-a terminat, până la următoarea atribuire. Golit din
+        # exact motivul pentru care sora `_scan_tree_for_secrets` golește
+        # `per_version`: o variabilă de buclă care supraviețuiește buclei.
         name = type(exc).__name__
         found, matchers, entries = {}, [], None
-        key = value = text = None
+        key = value = text = lines = line_text = None
+        per_version = hits = rx = None
         raise RuntimeError(f"scanarea identității a eșuat: {name}") from None
     except BaseException:
         found, matchers, entries = {}, [], None
-        key = value = text = None
+        key = value = text = lines = line_text = None
+        per_version = hits = rx = None
         raise
     return offenders, problems
 
@@ -2887,6 +3266,152 @@ def test_collect_secret_store_values_keeps_every_source_not_just_the_last(
         "acoperit-o tăcut")
     assert "parola-noua-de-test-2" in found
     assert len(values) == 2, values
+
+
+def test_unexempted_identity_hits_on_a_fabricated_tree() -> None:
+    """`_unexempted_identity_hits` însăși, nu prin `_scan_identity` — care are
+    nevoie de magazia locală și deci nu rulează pe o clonă proaspătă.
+
+    Verificatorul care a respins runda 1 a arătat că garda de VALOARE are un
+    test cu arbore fabricat (`test_the_assembled_guard_reports_a_fabricated_tree`)
+    și oglinda ei de identitate n-avea NICIUNUL: singurul apelant al funcției
+    era `_scan_identity`, iar singurul test care-l exercita era arborele real,
+    care e curat — deci orice mutație în aritmetica scutirii (`==`→`<=`,
+    `max`→`min`, o cheie greșită) trecea verde. Testul ăsta e falsificat cu
+    exact mutațiile alea: `if True: continue` scute tot, `max`→`min` scapă
+    disc-1/index-2, o cheie schimbată nu mai stinge nimic.
+
+    Se folosește chiar intrarea `LICENSE` din `IDENTITY_EXEMPT`, nu una scrisă
+    de mână: aritmetica se verifică pe forma reală, nu pe o formă convenabilă
+    care ar putea diverge de ce e scutit azi.
+
+    De la runda 3, `_unexempted_identity_hits` nu mai primește textul liniei —
+    primește verdictul ANCORAT, deja calculat, ca la runda reală (`_scan_identity`
+    îl calculează cu `_anchored_hit`, vezi testul dedicat ei mai jos). Aici se
+    calculează la fel, cu `_anchored_hit` peste ancora reală, ca aritmetica
+    scutirii să tot fie verificată pe forma de azi, nu pe o presupunere despre
+    ea.
+    """
+    allowance, why = IDENTITY_EXEMPT["LICENSE"]
+    key = "SANITISE_USERNAMES"
+    allowed, anchor = allowance[key]
+    assert allowed == 1 and anchor, (
+        "scutirea LICENSE nu mai are forma (permis=1, ancoră) pe care se "
+        "sprijină testul ăsta — actualizează-l odată cu scutirea")
+    anchor_rx = re.compile(anchor)
+
+    # O linie care SE potrivește cu ancora (an oarecare, nu neapărat 2026: se
+    # verifică forma, nu anul curent) și una care NU se potrivește.
+    anchored_line = "Copyright (c) 2019 Cineva Altcineva"
+    other_line = "See /home/exemplu-cont-fabricat/README for the licence terms"
+    assert re.search(anchor, anchored_line) and not re.search(anchor, other_line), (
+        "liniile de probă nu se potrivesc cu forma reală a ancorei — testul nu "
+        "mai probează ce trebuie")
+    ANCORAT = _anchored_hit(3, anchored_line, anchor_rx)
+    NEANCORAT = _anchored_hit(10, other_line, anchor_rx)
+    assert ANCORAT is True and NEANCORAT is False, (
+        "_anchored_hit nu mai distinge liniile de probă — vezi mai sus")
+
+    # 1. Exact cât acoperă scutirea, pe linia ancorată: tăcere.
+    assert _unexempted_identity_hits(
+        "LICENSE", [("disc", [(3, key, ANCORAT)])]) == []
+
+    # 2. Depășire pe linia ancorată — se raportează ÎNTREG, nu doar surplusul:
+    #    care anume e „în plus" nu se poate ști dintr-un număr.
+    doua_ancorate = [("disc", [(3, key, ANCORAT), (5, key, ANCORAT)])]
+    peste = _unexempted_identity_hits("LICENSE", doua_ancorate)
+    assert len(peste) == 2 and all("LICENSE:" in o for o in peste), peste
+
+    # 3. Maximul dintre versiuni, NU minimul: disc are 1 (acoperit dacă privit
+    #    singur), index are 2. Cu `min`, 1 == permis și garda ar tăcea; cu
+    #    `max`, 2 != permis și raportează pe amândouă versiunile — 1 + 2 = 3.
+    disc_index = [("disc", [(3, key, ANCORAT)]),
+                  ("index", [(3, key, ANCORAT), (7, key, ANCORAT)])]
+    disc1_index2 = _unexempted_identity_hits("LICENSE", disc_index)
+    assert len(disc1_index2) == 3, (
+        "disc=1/index=2 cu permis=1 trebuie raportat — o implementare care "
+        "compară pe MINIM ar tăcea aici" + repr(disc1_index2))
+
+    # 4. Numărul total stă la plafon (1), dar apariția e pe o linie GREȘITĂ —
+    #    nota de copyright ștearsă, numele mutat în altă parte. Un filtru care
+    #    verifică doar cifra tace; ăsta trebuie să raporteze, fiindcă apariția
+    #    nu stă pe linia pe care scutirea o acoperă. `anchored_ok` e FALS aici
+    #    (numărul ancorat, 0, nu e cel permis, 1) — nu pune la încercare
+    #    verificarea PROPRIE a apariției, doar plafonul; vezi cazul 7.
+    mutat = _unexempted_identity_hits(
+        "LICENSE", [("disc", [(10, key, NEANCORAT)])])
+    assert len(mutat) == 1 and "LICENSE:10" in mutat[0] and "nu se potrivește" in mutat[0], mutat
+
+    # 5. Nicio potrivire pentru cheia scutită: fișierul s-a curățat, sau garda
+    #    a orbit. A doua e indistinctibilă de un depozit curat dacă nu se cere
+    #    explicit ca scutirea să mai stingă ceva.
+    goala = _unexempted_identity_hits("LICENSE", [("disc", [])])
+    assert len(goala) == 1 and "nicio potrivire" in goala[0] and key in goala[0], goala
+
+    # 6. Fișier nescutit: orice apariție se raportează necondiționat, fără nicio
+    #    mențiune de scutire în mesaj.
+    nescutit = _unexempted_identity_hits(
+        "alt-fisier.py", [("disc", [(1, key, False)])])
+    assert len(nescutit) == 1 and "scutirea" not in nescutit[0], nescutit
+
+    # 7. Plafonul ATINS (o apariție ancorată, exact cea permisă) ȘI o A DOUA
+    #    apariție a ACELEIAȘI chei, pe altă linie, NEancorată — în același
+    #    fișier. Aici `anchored_ok` e ADEVĂRAT (numărul ancorat, 1, e cel
+    #    permis), spre deosebire de cazul 4 — deci pune la încercare exact
+    #    verificarea proprie a apariției (`and anchored`), nu doar plafonul.
+    #    Mutația `if anchored_ok and anchored: continue` → `if anchored_ok:
+    #    continue` ar tăcea la ORICE apariție din fișier în clipa în care
+    #    plafonul e atins — inclusiv la asta, care n-are nicio legătură cu nota
+    #    de copyright — și niciunul din cazurile 1-6 n-o prinde: măsurat de
+    #    verificator, „32 passed" cu mutația asta înăuntru.
+    la_plafon_plus_altundeva = [("disc", [(3, key, ANCORAT), (10, key, NEANCORAT)])]
+    peste_plafon = _unexempted_identity_hits("LICENSE", la_plafon_plus_altundeva)
+    assert len(peste_plafon) == 1 and "LICENSE:10" in peste_plafon[0], (
+        "apariția de pe linia neancorată a tăcut deși era însoțită de una "
+        "ancorată care atingea singură plafonul — exact mutația "
+        "`if anchored_ok:` fără `and anchored`: " + repr(peste_plafon))
+
+
+def test_anchored_hit_never_trusts_an_unsafe_line() -> None:
+    """`_anchored_hit` nu are voie să lege ancora de o linie pe care n-o cunoaște.
+
+    Linia `0` vine din `_locations_of` când o valoare apare doar prin lipirea a
+    doi literali peste o linie nouă: potrivirea e reală, dar nu se poate atribui
+    unei linii anume. Ancora e o expresie regulată aplicată LINIEI — fără
+    verificarea explicită `line_no != 0`, o ancoră care s-ar potrivi (acum, sau
+    printr-o schimbare viitoare) cu textul gol folosit pentru linia nesigură ar
+    acoperi o apariție a cărei poziție reală nimeni n-o cunoaște.
+
+    Falsificat cu mutația care scoate `line_no != 0` din `_anchored_hit`: fără
+    ea, verificarea de mai jos ar deveni `anchor_rx.search("")`, care — cu
+    ancora aleasă dinadins să se potrivească textului gol — întoarce potrivire,
+    și testul ar trece cu rezultatul GREȘIT. Măsurat de verificator: fără
+    verificarea de linie, „32 passed" — nimic altceva din suită nu observă
+    diferența.
+    """
+    # Cum apare linia 0 în practică: doi literali lipiți peste o linie nouă,
+    # exact forma pe care `_ADJACENT_QUOTES` o recunoaște.
+    text = 'a = "proba" +\n    "continuare"\n'
+    rx = re.compile(re.escape("probacontinuare"))
+    locatii = _locations_of(text, rx)
+    assert locatii == [0], (
+        "fixtura nu mai produce linia nesigură — testul ăsta nu mai probează "
+        "ce trebuie: " + repr(locatii))
+
+    # Ancoră aleasă dinadins să se potrivească textului GOL pe care apelantul
+    # real îl trimite pentru linia 0 (`lines[line_no - 1] if line_no else ""`),
+    # ca diferența de mai jos să vină STRICT din verificarea lui `line_no`, nu
+    # din conținutul liniei.
+    anchor_rx = re.compile(r"^$")
+    assert anchor_rx.search("") is not None, "ancora de probă nu se potrivește cu gol"
+
+    assert _anchored_hit(0, "", anchor_rx) is False, (
+        "linia nesigură (0) s-a considerat ancorată")
+    # Martor pozitiv: pe o linie REALĂ (nenulă), cu ACELAȘI text gol, ancora
+    # chiar se leagă — proba de mai sus nu era falsă doar fiindcă textul e gol.
+    assert _anchored_hit(3, "", anchor_rx) is True, (
+        "ancora nu s-a legat nici pe o linie reală, cu text identic — proba nu "
+        "demonstrează nimic despre linia 0")
 
 
 def test_identity_values_merge_entries_from_every_source_not_just_the_last(
