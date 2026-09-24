@@ -150,3 +150,13 @@ docs/Sentinel-fisa-produs-*.pptx
 # continut de repository. Fara asta, `test_every_enumerated_file_can_be_read`
 # le enumereaza ca fisiere si pica fiindca nu poate citi un director.
 .claude/worktrees/
+
+# Jurnalele de întărire, scoase din depozit pe 24 septembrie 2026 la cererea
+# operatorului. Motivul nu e un nume scăpat, ci ce sunt ele prin natura lor: un
+# inventar de recunoaștere al gazdei — versiuni exacte ale aplicațiilor (inclusiv
+# una ieșită din suport), porturi deschise pe 0.0.0.0, versiunea de kernel,
+# socketuri php-fpm. Cine le citește află mai mult decât ar afla scanând, și fără
+# să lase urme în jurnale. Repository-ul e public; fișierele rămân pe disc,
+# fiindcă sunt documente de operare și îi folosesc operatorului zilnic.
+docs/INTARIRE.md
+docs/INTARIRE-APLICATII-WEB.md

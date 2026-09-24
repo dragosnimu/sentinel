@@ -17,8 +17,8 @@ Two costs, and the second is the expensive one:
 
   * every deploy hung here and was killed by hand;
   * `scripts/deploy.sh` removes /tmp/sentinel-deploy-* only on the success
-    path, so the kill skipped it. docs/INTARIRE.md §0 records three of those
-    directories left on the host, each holding credentiale.txt at mode 644 with
+    path, so the kill skipped it. Three of those directories were left on the
+    host, each holding credentiale.txt at mode 644 with
     the Anthropic key, the bot token and the chat id — readable by every local
     account for nine days.
 
