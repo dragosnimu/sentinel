@@ -1,6 +1,6 @@
 """Steagul care spunea „nginx era aici dinainte" despre nginx-ul pus de noi.
 
-Măsurat pe VM (10.30.1.134, Ubuntu 24.04.4) pe 26 august 2026:
+Măsurat pe VM (192.0.2.134, Ubuntu 24.04.4) pe 26 august 2026:
 
 `step_packages` întreba `pkg_installed nginx || systemctl is-active --quiet
 nginx` și, dacă da, adăuga `NGINX_WAS_PREEXISTING=1` în `preflight.env`.
