@@ -22,45 +22,57 @@ KEY = b"testing-key-not-a-real-secret"
 OTHER_KEY = b"a-different-key-entirely"
 
 
-#: Un moment „acum" fix, ca testele să nu depindă de ceasul mașinii care le
-#: rulează — dar suficient de aproape de real încât `Expired`/`ttl_s` să se
-#: comporte ca în producție, nu ca la un moment arbitrar din trecut.
-NOW = int(time.time())
+@pytest.fixture
+def now() -> int:
+    """Ceasul „acum", luat la RULAREA testului, nu la colectarea fișierului.
+
+    Fostul `NOW = int(time.time())` la nivel de modul se evalua o singură
+    dată, la import — adică la începutul suitei. `verify_ip_action` compară
+    `issued_at` cu ceasul REAL din momentul verificării; diferența dintre
+    „acum" înghețat la import și „acum" real creștea cu durata suitei rulate
+    până la fișierul ăsta. Peste ~580s depășea `ttl_s=600` folosit în
+    `test_a_button_within_the_ttl_is_accepted`, transformând testul într-un
+    cronometru al suitei, nu o verificare a semnăturii — verde sau roșu după
+    cât a durat restul suitei, nu după ce face codul. Luat aici, o dată pe
+    test, diferența dintre fixture și verificare rămâne de ordinul
+    milisecundelor, indiferent cât a durat tot ce a rulat înainte.
+    """
+    return int(time.time())
 
 
-def test_a_signed_block_round_trips():
+def test_a_signed_block_round_trips(now):
     data = cs.sign_ip_action("blk", KEY, "203.0.113.7", 3600, ref=42,
-                             issued_at=NOW)
+                             issued_at=now)
     ip, ttl, ref, issued = cs.verify_ip_action(data, KEY, ttl_s=600)
     assert ip == "203.0.113.7"
     assert ttl == 3600
     assert ref == 42
-    assert issued == NOW
+    assert issued == now
 
 
-def test_a_signed_unblock_round_trips_with_ipv6():
+def test_a_signed_unblock_round_trips_with_ipv6(now):
     data = cs.sign_ip_action("unblk", KEY, "2001:db8::1", 0, ref=7,
-                             issued_at=NOW)
+                             issued_at=now)
     ip, ttl, ref, issued = cs.verify_ip_action(data, KEY, ttl_s=600)
     assert ip == "2001:db8::1"
     assert ttl == 0
     assert ref == 7
 
 
-def test_data_starts_with_the_literal_the_handler_pattern_matches():
+def test_data_starts_with_the_literal_the_handler_pattern_matches(now):
     """`on_callback` e rutat de un `CallbackQueryHandler(pattern=r"^(blk:|unblk:|...)")`
     — dacă encodarea ar schimba prefixul, butonul n-ar mai ajunge nicăieri."""
-    blk = cs.sign_ip_action("blk", KEY, "203.0.113.7", 60, issued_at=NOW)
-    unblk = cs.sign_ip_action("unblk", KEY, "203.0.113.7", 0, issued_at=NOW)
+    blk = cs.sign_ip_action("blk", KEY, "203.0.113.7", 60, issued_at=now)
+    unblk = cs.sign_ip_action("unblk", KEY, "203.0.113.7", 0, issued_at=now)
     assert blk.startswith("blk:")
     assert unblk.startswith("unblk:")
 
 
 # --- falsificare: o semnătură modificată nu trebuie să treacă niciodată -----
-def test_a_tampered_ip_is_rejected():
+def test_a_tampered_ip_is_rejected(now):
     """Exact atacul pe care semnătura există să-l oprească: cineva schimbă
     IP-ul din payload, sperând că botul îl acceptă necontrolat."""
-    data = cs.sign_ip_action("blk", KEY, "203.0.113.7", 3600, issued_at=NOW)
+    data = cs.sign_ip_action("blk", KEY, "203.0.113.7", 3600, issued_at=now)
     action, ip_b64, ttl_b36, ref_b36, issued_b36, sig = data.split(":")
     forged_ip_b64 = cs._encode_ip("198.51.100.99")
     forged = ":".join((action, forged_ip_b64, ttl_b36, ref_b36, issued_b36, sig))
@@ -68,33 +80,33 @@ def test_a_tampered_ip_is_rejected():
         cs.verify_ip_action(forged, KEY, ttl_s=600)
 
 
-def test_a_tampered_ttl_is_rejected():
-    data = cs.sign_ip_action("blk", KEY, "203.0.113.7", 60, issued_at=NOW)
+def test_a_tampered_ttl_is_rejected(now):
+    data = cs.sign_ip_action("blk", KEY, "203.0.113.7", 60, issued_at=now)
     action, ip_b64, ttl_b36, ref_b36, issued_b36, sig = data.split(":")
     forged = ":".join((action, ip_b64, cs._b36(999_999), ref_b36, issued_b36, sig))
     with pytest.raises(cs.BadSignature):
         cs.verify_ip_action(forged, KEY, ttl_s=600)
 
 
-def test_signed_with_a_different_key_is_rejected():
+def test_signed_with_a_different_key_is_rejected(now):
     """Cheia trebuie să fie chiar cea din `secrets.env` — o cheie greșită (sau
     a altei instanțe, dacă ar fi comună) nu are voie să pară validă."""
-    data = cs.sign_ip_action("blk", KEY, "203.0.113.7", 3600, issued_at=NOW)
+    data = cs.sign_ip_action("blk", KEY, "203.0.113.7", 3600, issued_at=now)
     with pytest.raises(cs.BadSignature):
         cs.verify_ip_action(data, OTHER_KEY, ttl_s=600)
 
 
-def test_missing_key_is_rejected_not_treated_as_unsigned():
-    data = cs.sign_ip_action("blk", KEY, "203.0.113.7", 3600, issued_at=NOW)
+def test_missing_key_is_rejected_not_treated_as_unsigned(now):
+    data = cs.sign_ip_action("blk", KEY, "203.0.113.7", 3600, issued_at=now)
     with pytest.raises(cs.BadSignature):
         cs.verify_ip_action(data, None, ttl_s=600)
 
 
-def test_garbage_ip_field_with_an_otherwise_valid_signature_is_malformed():
+def test_garbage_ip_field_with_an_otherwise_valid_signature_is_malformed(now):
     """O semnătură validă peste niște câmpuri stricate nu are voie să treacă
     de verificare doar fiindcă etichetele se potrivesc — codul trebuie să mai
     și DECODEZE ce a semnat, nu doar să confirme cine a semnat."""
-    fields = ("blk", "not-valid-base64!!", cs._b36(0), cs._b36(0), cs._b36(NOW))
+    fields = ("blk", "not-valid-base64!!", cs._b36(0), cs._b36(0), cs._b36(now))
     sig = cs._b64(cs._mac(KEY, *fields))
     forged = ":".join((*fields, sig))
     with pytest.raises(cs.Malformed):
@@ -111,15 +123,15 @@ def test_wrong_field_count_is_malformed_not_a_crash():
 
 
 # --- expirare -----------------------------------------------------------
-def test_an_expired_button_is_rejected():
-    old = NOW - 1000
+def test_an_expired_button_is_rejected(now):
+    old = now - 1000
     data = cs.sign_ip_action("blk", KEY, "203.0.113.7", 3600, issued_at=old)
     with pytest.raises(cs.Expired):
         cs.verify_ip_action(data, KEY, ttl_s=600)
 
 
-def test_a_button_within_the_ttl_is_accepted():
-    recent = NOW - 30
+def test_a_button_within_the_ttl_is_accepted(now):
+    recent = now - 30
     data = cs.sign_ip_action("blk", KEY, "203.0.113.7", 3600, issued_at=recent)
     ip, *_ = cs.verify_ip_action(data, KEY, ttl_s=600)
     assert ip == "203.0.113.7"
@@ -151,8 +163,8 @@ def test_an_absurd_ref_is_refused_at_construction_not_sent_broken():
                           ref=36 ** 20, issued_at=int(time.time()))
 
 
-def test_ipv4_round_trips_compactly():
-    data = cs.sign_ip_action("unblk", KEY, "198.51.100.7", 0, issued_at=NOW)
+def test_ipv4_round_trips_compactly(now):
+    data = cs.sign_ip_action("unblk", KEY, "198.51.100.7", 0, issued_at=now)
     ip, *_ = cs.verify_ip_action(data, KEY, ttl_s=600)
     assert ip == "198.51.100.7"
     assert len(data) < 64
@@ -188,41 +200,41 @@ def test_fewer_than_six_fields_is_malformed():
 # `nteu:<id secvențial>`, iar `on_callback` executa `block_and_terminate` pe
 # orice sesiune ghicită — inclusiv una de pe o adresă din allowlist, unde
 # efectul e să-ți închizi singur propriul SSH.
-def test_a_signed_nteu_round_trips():
-    data = cs.sign_session_action(KEY, 4711, issued_at=NOW)
+def test_a_signed_nteu_round_trips(now):
+    data = cs.sign_session_action(KEY, 4711, issued_at=now)
     session_id, issued = cs.verify_session_action(data, KEY, ttl_s=600)
     assert session_id == 4711
-    assert issued == NOW
+    assert issued == now
 
 
-def test_nteu_starts_with_the_literal_the_handler_pattern_matches():
-    data = cs.sign_session_action(KEY, 1, issued_at=NOW)
+def test_nteu_starts_with_the_literal_the_handler_pattern_matches(now):
+    data = cs.sign_session_action(KEY, 1, issued_at=now)
     assert data.startswith("nteu:")
 
 
-def test_nteu_fits_comfortably_in_the_64_byte_budget():
-    data = cs.sign_session_action(KEY, 999_999_999_999, issued_at=NOW)
+def test_nteu_fits_comfortably_in_the_64_byte_budget(now):
+    data = cs.sign_session_action(KEY, 999_999_999_999, issued_at=now)
     assert len(data.encode("utf-8")) <= 64, (len(data), data)
 
 
-def test_a_tampered_nteu_session_id_is_rejected():
+def test_a_tampered_nteu_session_id_is_rejected(now):
     """Exact atacul pe care semnătura există să-l oprească: cineva schimbă
     id-ul sesiunii din payload, sperând să termine o sesiune arbitrară."""
-    data = cs.sign_session_action(KEY, 100, issued_at=NOW)
+    data = cs.sign_session_action(KEY, 100, issued_at=now)
     action, id_b36, issued_b36, sig = data.split(":")
     forged = ":".join((action, cs._b36(999), issued_b36, sig))
     with pytest.raises(cs.BadSignature):
         cs.verify_session_action(forged, KEY, ttl_s=600)
 
 
-def test_nteu_signed_with_a_different_key_is_rejected():
-    data = cs.sign_session_action(KEY, 100, issued_at=NOW)
+def test_nteu_signed_with_a_different_key_is_rejected(now):
+    data = cs.sign_session_action(KEY, 100, issued_at=now)
     with pytest.raises(cs.BadSignature):
         cs.verify_session_action(data, OTHER_KEY, ttl_s=600)
 
 
-def test_nteu_missing_key_is_rejected_not_treated_as_unsigned():
-    data = cs.sign_session_action(KEY, 100, issued_at=NOW)
+def test_nteu_missing_key_is_rejected_not_treated_as_unsigned(now):
+    data = cs.sign_session_action(KEY, 100, issued_at=now)
     with pytest.raises(cs.BadSignature):
         cs.verify_session_action(data, None, ttl_s=600)
 
@@ -232,28 +244,28 @@ def test_nteu_wrong_field_count_is_malformed_not_a_crash():
         cs.verify_session_action("nteu:onlyonefield", KEY, ttl_s=600)
 
 
-def test_nteu_wrong_prefix_is_malformed():
+def test_nteu_wrong_prefix_is_malformed(now):
     """Un `blk:`-shaped payload de patru câmpuri nu are voie să se
     verifice ca `nteu:` doar fiindcă numărul de câmpuri se potrivește."""
-    fields = ("blk", cs._b36(1), cs._b36(NOW))
+    fields = ("blk", cs._b36(1), cs._b36(now))
     sig = cs._b64(cs._mac(KEY, *fields))
     forged = ":".join((*fields, sig))
     with pytest.raises(cs.Malformed):
         cs.verify_session_action(forged, KEY, ttl_s=600)
 
 
-def test_an_expired_nteu_button_is_rejected():
-    old = NOW - 1000
+def test_an_expired_nteu_button_is_rejected(now):
+    old = now - 1000
     data = cs.sign_session_action(KEY, 100, issued_at=old)
     with pytest.raises(cs.Expired):
         cs.verify_session_action(data, KEY, ttl_s=600)
 
 
-def test_an_nteu_button_within_a_seven_day_ttl_is_accepted():
+def test_an_nteu_button_within_a_seven_day_ttl_is_accepted(now):
     """Butonul e gândit să fie apăsat ore mai târziu — TTL-ul folosit la
     verificare (`bot.NTEU_TTL_S`) e mult mai lung decât cel implicit pentru
     `blk:`/`unblk:` (600s)."""
-    hours_ago = NOW - 6 * 3600
+    hours_ago = now - 6 * 3600
     data = cs.sign_session_action(KEY, 100, issued_at=hours_ago)
     session_id, _ = cs.verify_session_action(data, KEY, ttl_s=7 * 86_400)
     assert session_id == 100
