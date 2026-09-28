@@ -70,6 +70,12 @@ def test_the_snapshot_step_reruns_even_when_it_is_marked_done() -> None:
     out = _sh(
         f'set -euo pipefail\n'
         f'export SENTINEL_STATE_DIR="$(mktemp -d)"\n'
+        # SENTINEL_INSTALL_STATE_DIR alături de SENTINEL_STATE_DIR: STATE_MARKERS
+        # vine din primul, nu din al doilea, de la 8 sep 2026 — common.sh moare
+        # dacă vede starea redirecționată fără ca directorul de instalare s-o
+        # urmeze, ca acest harness să nu scrie în /var/lib/sentinel-install REAL
+        # pe o mașină unde rulează ca root.
+        f'export SENTINEL_INSTALL_STATE_DIR="$(mktemp -d)"\n'
         f'source "{_posix(COMMON)}"\n'
         f'mkdir -p "$STATE_MARKERS"; touch "$STATE_MARKERS/18_snapshot"\n'
         f'step_done 18_snapshot || {{ echo "PREGATIRE-GRESITA"; exit 1; }}\n'
@@ -92,6 +98,12 @@ def test_a_step_that_is_not_always_is_still_skipped_when_done() -> None:
     out = _sh(
         f'set -euo pipefail\n'
         f'export SENTINEL_STATE_DIR="$(mktemp -d)"\n'
+        # SENTINEL_INSTALL_STATE_DIR alături de SENTINEL_STATE_DIR: STATE_MARKERS
+        # vine din primul, nu din al doilea, de la 8 sep 2026 — common.sh moare
+        # dacă vede starea redirecționată fără ca directorul de instalare s-o
+        # urmeze, ca acest harness să nu scrie în /var/lib/sentinel-install REAL
+        # pe o mașină unde rulează ca root.
+        f'export SENTINEL_INSTALL_STATE_DIR="$(mktemp -d)"\n'
         f'source "{_posix(COMMON)}"\n'
         f'mkdir -p "$STATE_MARKERS"; touch "$STATE_MARKERS/29_nftables"\n'
         f'corp() {{ echo "CORPUL-A-RULAT"; }}\n'

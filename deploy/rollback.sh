@@ -249,6 +249,28 @@ if [[ -d "${STATE_MARKERS}" ]]; then
     ok "install-step markers cleared — a reinstall starts from a clean slate"
 fi
 
+# The pre-8-Sep-2026 marker location survives on a host installed by the OLD
+# tree unless it is cleared here too. Nothing MOVES it into ${STATE_MARKERS}
+# any more — deploy/lib/common.sh deliberately abandons that location instead
+# of migrating it (three rounds tried to make the move safe; see the comment
+# on SENTINEL_INSTALL_STATE_DIR there) — but install.sh's
+# nginx_preexisting_resolve does still READ two things out of it as a
+# legacy-compat fallback (the write-once fact and, older still, a line in
+# preflight.env), specifically so a host's write-once record survives past
+# this fix. That fallback is exactly what would break the promise the block
+# above makes ("a reinstall starts from a clean slate") if this directory
+# were left behind: a --purge is supposed to mean the NEXT install observes
+# this host fresh, and a stale legacy fact would instead hand it yesterday's
+# answer. `_LEGACY_STATE_MARKERS` is the literal constant from lib/common.sh
+# (sourced above), not a re-derivation, so this stays correct if that path
+# ever moves again. `rm -rf` on a symlink removes the link itself, never
+# follows it — safe even if the legacy path is (or was left as) a symlink.
+if [[ -e "${_LEGACY_STATE_MARKERS}" || -L "${_LEGACY_STATE_MARKERS}" ]]; then
+    rm -rf -- "${_LEGACY_STATE_MARKERS}"
+    ok "legacy install-step markers (${_LEGACY_STATE_MARKERS}) cleared too — \
+otherwise the next install would still read a stale nginx_preexisting record out of it"
+fi
+
 # ---------------------------------------------------------------------------
 section "Rollback complet"
 

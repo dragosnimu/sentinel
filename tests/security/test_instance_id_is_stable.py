@@ -241,6 +241,13 @@ def run_sequence(tmp_path: Path, marked: bool) -> dict:
         cwd=str(REPO / "deploy"), capture_output=True, text=True,
         env={**os.environ, "NO_COLOR": "1",
              "SENTINEL_STATE_DIR": str(state).replace("\\", "/"),
+             # SENTINEL_INSTALL_STATE_DIR alături: STATE_MARKERS (unde
+             # `mkdir -p "$STATE_MARKERS"` de mai sus chiar scrie) vine din
+             # asta, nu din SENTINEL_STATE_DIR, de la 8 sep 2026 — fără ea,
+             # harness-ul ăsta ar scrie în /var/lib/sentinel-install REAL pe o
+             # mașină unde rulează ca root; common.sh moare acum exact pe
+             # combinația asta.
+             "SENTINEL_INSTALL_STATE_DIR": str(tmp_path / "install-state").replace("\\", "/"),
              "CFG": str(cfg).replace("\\", "/"),
              "CALLS": str(calls).replace("\\", "/")})
     return {

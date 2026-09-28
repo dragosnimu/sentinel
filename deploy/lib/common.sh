@@ -9,7 +9,61 @@ SENTINEL_CONFIG_DIR="${SENTINEL_CONFIG_DIR:-/etc/sentinel}"
 SENTINEL_STATE_DIR="${SENTINEL_STATE_DIR:-/var/lib/sentinel}"
 SENTINEL_BACKUP_DIR="${SENTINEL_BACKUP_DIR:-/var/backups/sentinel}"
 SENTINEL_USER="${SENTINEL_USER:-sentinel}"
-STATE_MARKERS="${SENTINEL_STATE_DIR}/.install-state"
+
+# NOT under SENTINEL_STATE_DIR. That directory is 0750 sentinel:sentinel (see
+# step_user_and_dirs below) so the service account can write its own runtime
+# state — geoip/, cursors/ — and that same write bit on the PARENT let it
+# rename `.install-state` out of the way and plant its own `preflight.env`
+# there, reproduced in a namespace: rename only needs write on the parent, not
+# on the entry being replaced. `resolve_config` in install.sh `source`s
+# preflight.env as root on every run, so a planted one is arbitrary code
+# execution as root — and on an upgrade, step 1 (which would have rewritten it
+# from a trusted preflight run) is marker-gated and skipped, so nothing
+# refreshes it first.
+#
+# A dedicated, root-owned directory whose PARENT (/var/lib) is also root-owned
+# closes the write-access route outright: `sentinel` has no write access to
+# /var/lib, so it cannot rename, replace, or plant anything at this path, full
+# stop — not "a check catches it afterwards", but "the primitive the first
+# three rounds each exploited (write access to a directory's parent) does not
+# exist here". `assert_root_owned_state_file`, further down, still checks
+# every file sourced from here anyway, because "cannot currently be planted"
+# is not the same claim as "was never planted before this fix shipped".
+#
+# What this directory deliberately does NOT do: reach back and rescue
+# anything that was already sitting at the pre-2026-09-08 location
+# (${SENTINEL_STATE_DIR}/.install-state, i.e. the sentinel-writable parent
+# above). Three rounds (8-9 Sep 2026) tried to make that migration safe — a
+# straight `mv`, then a by-name allowlist, then pinning the directory with
+# `cd -P` before iterating it — and each fix closed exactly the bypass found
+# in the round before it and no other: a planted symlink, then a root-owned
+# sibling directory renamed into place, then a symlink at the NEW path. The
+# shape common to all three is a root process being asked to decide, from
+# stat() results alone, whether something sitting in a directory a lower-
+# privileged account can rename into is trustworthy — and that decision does
+# not get safer by adding another stat() call, because the account being
+# defended against can always rename between the check and the use. See
+# docs/ARHITECTURA.md for the fuller argument.
+#
+# So: nothing reads the legacy location, ever, for any purpose, in this file
+# or in install.sh. Content already there is treated as absent, not migrated
+# and not laundered — nothing under a directory `sentinel` could write to was
+# ever trustworthy enough to promote into a root-only one just for having been
+# moved. The one-time cost on a host upgrading past this fix, and the single
+# case where that cost is not a plain re-run, are written up in
+# docs/ARHITECTURA.md and at nginx_preexisting_resolve in install.sh. Cleanup
+# of the legacy path on a full uninstall is still rollback.sh's job (it never
+# trusted the content either, only deletes it) — see the comment there.
+SENTINEL_INSTALL_STATE_DIR="${SENTINEL_INSTALL_STATE_DIR:-/var/lib/sentinel-install}"
+STATE_MARKERS="$SENTINEL_INSTALL_STATE_DIR"
+
+# Where markers lived before 2026-09-08. Deliberately NOT read by anything in
+# this file or in install.sh any more (see the comment above) — the only
+# remaining reader is rollback.sh's --purge cleanup, and nginx_preexisting_resolve's
+# narrow, non-executing fallback in install.sh (grep for one `KEY=[01]` line,
+# never `source`). Kept as a named constant, not a recomputed path, so both of
+# those stay correct if this path ever moves again.
+_LEGACY_STATE_MARKERS="${SENTINEL_STATE_DIR}/.install-state"
 
 # Ports Sentinel needs for itself.
 #
@@ -49,15 +103,120 @@ section() {
     printf '\n%s== %s ==%s\n' "$_C_BOLD" "$*" "$_C_RESET"
 }
 
+# A test harness that redirects SENTINEL_STATE_DIR into a temp dir but leaves
+# SENTINEL_INSTALL_STATE_DIR at the real default would have STATE_MARKERS
+# (derived from the LATTER, not the former, since 8 Sep 2026) still point at
+# the real /var/lib/sentinel-install on whatever machine runs it — writing
+# install markers, and (as root) a `migrated` marker or `preflight.env`, onto
+# the host instead of into the harness's own sandbox. Confirmed as a live bug
+# in this repository's own suite days after STATE_MARKERS stopped nesting
+# under SENTINEL_STATE_DIR. Production never overrides either variable, so
+# this never fires there; anything that deliberately wants an isolated state
+# tree sets both.
+if [[ "$SENTINEL_STATE_DIR" != "/var/lib/sentinel" \
+      && "$SENTINEL_INSTALL_STATE_DIR" == "/var/lib/sentinel-install" ]]; then
+    die "SENTINEL_STATE_DIR is overridden (${SENTINEL_STATE_DIR}) but \
+SENTINEL_INSTALL_STATE_DIR is not — state markers would still land in the \
+REAL ${SENTINEL_INSTALL_STATE_DIR} on this machine. Export \
+SENTINEL_INSTALL_STATE_DIR alongside SENTINEL_STATE_DIR (redirecting one \
+without the other is the bug, not a valid configuration)."
+fi
+
 # --------------------------------------------------------------------------
 # Idempotency
 # --------------------------------------------------------------------------
 # Every install step is guarded by a marker file. Re-running the installer is
 # safe and fast; --from-step N re-runs from a point; --force-step N[,N…] re-runs
 # the listed steps.
+
+# Creates $STATE_MARKERS if missing, and forces its mode/owner every time it
+# already exists too — `install -d` on an existing directory still applies
+# -m/-o/-g, unlike `mkdir -p`, which leaves a pre-existing directory's mode
+# alone. That matters here: this runs on every invocation (mark_done,
+# preflight.sh, and once explicitly at install.sh startup), so a directory
+# that somehow ended up looser than 0700 gets pulled back every time, not just
+# the first.
+ensure_state_markers_dir() {
+    # `install -d` and `chmod`/`chown` on an EXISTING path follow a symlink —
+    # they apply the mode/owner to whatever the link points at, not to the
+    # link itself. `[[ -L ]]` is bash's own lstat, so this check cannot be
+    # fooled by the same symlink it is here to catch. Refused loudly rather
+    # than silently chmod/chown-ing through it: the only legitimate way this
+    # path is ever a symlink is if something else planted it there first.
+    [[ -L "$STATE_MARKERS" ]] \
+        && die "${STATE_MARKERS} is a symlink — refusing to create it or chmod/chown \
+through it (that would apply 0700 root:root to whatever it points at, not to a \
+symlink). Remove it by hand and re-run: ls -la $(dirname "$STATE_MARKERS")"
+
+    if [[ "$(id -u)" == "0" ]]; then
+        install -d -m 0700 -o root -g root "$STATE_MARKERS"
+    else
+        # install.sh itself only ever runs under sudo (deploy.sh: `sudo -n
+        # ".../install.sh"`) — a non-root caller here is a test harness, not
+        # production. Ownership can't be forced without CAP_CHOWN, so this
+        # keeps the mode strict and leaves owner as whoever is running; the
+        # "refuse a non-root-owned file" property is exercised directly, with
+        # a faked `stat`, by the assert_root_owned_state_file tests instead of
+        # by this helper needing real root to be testable.
+        #
+        # mkdir + chmod, not `install -d -m`: measured on Git Bash / MSYS on
+        # Windows, `install -d -m 0700 DIR` reports "cannot change permissions"
+        # and exits nonzero even on a directory the SAME user just created —
+        # NTFS's POSIX-mode emulation does not support the verification `install`
+        # does internally, while a plain `chmod` on the same path exits 0 (its
+        # success is also only nominal there — Windows is never the deploy
+        # target, only where these tests run).
+        mkdir -p "$STATE_MARKERS"
+        chmod 0700 "$STATE_MARKERS"
+    fi
+}
+
+# A file under $STATE_MARKERS is `source`d as root by resolve_config on every
+# run. $STATE_MARKERS being 0700 root:root (ensure_state_markers_dir), AND its
+# parent (/var/lib) being root-owned, already stops `sentinel` from ever
+# placing anything at this path — there is no rename-the-parent primitive
+# available against a directory it has no write access to (see the comment on
+# SENTINEL_INSTALL_STATE_DIR above for why that is a structural difference
+# from the pre-2026-09-08 layout, not just another check).
+#
+# This still checks the file being sourced anyway, because "cannot currently
+# be planted" and "was never planted" are different claims: a file that
+# existed at this path (or, before 8-9 Sep 2026, was moved here unchanged)
+# before this fix shipped, or a $STATE_MARKERS that was somehow left looser
+# than 0700 by an older build, must not be trusted just for lstat'ing clean
+# today.
+assert_root_owned_state_file() {
+    local f="$1" owner parent parent_owner parent_mode
+
+    owner="$(stat -c '%u' "$f" 2>/dev/null)" \
+        || { warn "cannot stat ${f} — treating as untrusted, not as clean"; return 1; }
+    [[ "$owner" == "0" ]] \
+        || { warn "${f} is owned by uid ${owner}, not root — refusing to source it"; return 1; }
+
+    parent="$(dirname "$f")"
+    parent_owner="$(stat -c '%u' "$parent" 2>/dev/null)" \
+        || { warn "cannot stat ${parent} — treating as untrusted, not as clean"; return 1; }
+    parent_mode="$(stat -c '%a' "$parent" 2>/dev/null)" \
+        || { warn "cannot stat ${parent} — treating as untrusted, not as clean"; return 1; }
+    [[ "$parent_owner" == "0" ]] \
+        || { warn "${parent} is owned by uid ${parent_owner}, not root — refusing to source ${f}"; return 1; }
+    [[ "$parent_mode" == "700" ]] \
+        || { warn "${parent} is mode ${parent_mode}, not 0700 — refusing to source ${f}"; return 1; }
+
+    return 0
+}
+
 step_done() { [[ -f "${STATE_MARKERS}/$1" ]]; }
 
 mark_done() {
+    # Plain mkdir -p, not ensure_state_markers_dir: by the time ANY step can
+    # complete, install.sh's main() has already called ensure_state_markers_dir
+    # once, before `run_step 1`. mkdir -p on an existing directory does not
+    # touch its mode, so the 0700 root:root set at startup survives every later
+    # mark_done untouched — re-enforcing it dozens of times per run (once per
+    # step) would cost a heavier syscall for no additional protection, since
+    # nothing between steps can change $STATE_MARKERS itself back to being
+    # writable by anyone but root.
     mkdir -p "$STATE_MARKERS"
     date -u +%Y-%m-%dT%H:%M:%SZ > "${STATE_MARKERS}/$1"
 }
@@ -340,8 +499,31 @@ erau deja marcați și NU au rulat:"
 # RUNNING argv whether it already carries the options just written, so a re-run
 # that changes nothing leaves the daemon up. Observed on the VM, twice:
 # "suricata already runs with these options; not restarting it".
+#
+# `journal_storage` (41) is here for BOTH reasons at once. It carries repo
+# content — the size and time bounds it writes into journald.conf.d — and the
+# question it answers is not "was this done once" but "is this host keeping its
+# journal NOW", which changes without anyone re-running the installer: a
+# /var/log/journal removed to free disk, a `Storage=volatile` from a
+# configuration manager, a host installed before the step existed. It measures
+# that against the running daemon and is a genuine no-op — no restart, no
+# flush, no write — where the answer is already yes. See step 41 in install.sh.
+#
+# `telegram_owner` (42) is here for the SAME single reason `journal_storage`
+# has two of: it does not carry repo content — the value comes from a secret,
+# not a template — but the question it answers is "does allowed_user_ids
+# STILL narrow this chat to the owner NOW", not "was this done once". That
+# answer can go stale without anyone touching install.sh again: an operator
+# who hand-edits sentinel.yaml for an unrelated reason and clobbers the line,
+# a restore from a snapshot taken before this step ever ran, a host where the
+# secret only arrives on a LATER deploy than the one that first reaches step
+# 42. Marked done and skipped forever, the first of those would leave the
+# group from CLAUDE.md's opening example back in command of two production
+# hosts with every later deploy reporting green. It measures the live file
+# against the secret and is a genuine no-op — no write, no restart — when the
+# two already agree. See step 42 in install.sh.
 ALWAYS_STEPS="package claude_workspace configs migrate systemd start_services \
-nginx nginx_shared suricata auxiliary snapshot"
+nginx nginx_shared suricata auxiliary snapshot journal_storage telegram_owner"
 
 step_is_always() {
     case " ${ALWAYS_STEPS} " in *" $1 "*) return 0 ;; *) return 1 ;; esac

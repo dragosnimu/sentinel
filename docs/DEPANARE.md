@@ -87,7 +87,7 @@ systemctl show 'sentinel-*' -p MemoryCurrent --value
 sudo docker stats --no-stream 2>/dev/null
 
 # Ce rula înainte de instalare, și ce lipsește acum
-diff <(systemctl list-units --type=service --state=running --no-legend --plain | awk '{print $1}' | sort)      /var/lib/sentinel/.install-state/baseline-services.txt
+diff <(systemctl list-units --type=service --state=running --no-legend --plain | awk '{print $1}' | sort)      /var/lib/sentinel-install/baseline-services.txt
 ```
 
 Măsuri imediate:
@@ -118,10 +118,10 @@ Pe termen lung: adaugă 2 GB swap, sau mută Sentinel pe o gazdă cu mai mult RA
 ## 3. Instalarea a eșuat
 
 Instalatorul e numerotat pe pași, idempotent și reluabil. Markerii sunt în
-`/var/lib/sentinel/.install-state/`.
+`/var/lib/sentinel-install/`.
 
 ```bash
-ls /var/lib/sentinel/.install-state/    # ce a reușit
+ls /var/lib/sentinel-install/    # ce a reușit
 ```
 
 Dacă ai instalat cu wizard-ul, cea mai simplă reluare e chiar el — pașii deja
@@ -378,7 +378,7 @@ echo "=== MEM/DISK ==="  ; free -h; df -h /
 echo "=== NFT ==="       ; sudo nft list table inet sentinel | head -60
 echo "=== PORTS ==="     ; sudo ss -tlnp
 echo "=== CONFIG ==="    ; sudo /opt/sentinel/bin/sentinel config-check -v
-echo "=== BASELINE ===" ; diff <(systemctl list-units --type=service --state=running --no-legend --plain | awk '{print $1}' | sort) /var/lib/sentinel/.install-state/baseline-services.txt
+echo "=== BASELINE ===" ; diff <(systemctl list-units --type=service --state=running --no-legend --plain | awk '{print $1}' | sort) /var/lib/sentinel-install/baseline-services.txt
 echo "=== HARDENING ==="; systemd-analyze security 'sentinel-*' 2>/dev/null | head -20
 echo "=== ERRORS ==="    ; sudo journalctl -u 'sentinel-*' -p err -n 40 --no-pager
 EOF

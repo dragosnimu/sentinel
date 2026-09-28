@@ -624,6 +624,80 @@ arhivă coruptă — tot iese eșec real: prezența informativului nu maschează
 problema de lângă el. Vezi `_drill_had_nothing_to_prove` în
 `sentinel/selfcheck/checks.py`.
 
+### 3.20 Marcajele de instalare vechi nu se mai migrează — se abandonează
+
+Până pe 8 septembrie 2026, marcajele de instalare (`STATE_MARKERS`) stăteau la
+`/var/lib/sentinel/.install-state`, sub un director `0750 sentinel:sentinel`.
+Serviciul are nevoie de scriere pe părinte pentru propria stare de rulare
+(`geoip/`, `cursors/`) — dar același bit de scriere pe părinte îi dă și
+dreptul să redenumească `.install-state` din drum și să planteze acolo
+propriul `preflight.env`. `resolve_config` din `install.sh` face `source`
+peste fișierul ăla ca root, la fiecare rulare: un `preflight.env` plantat e
+execuție de cod arbitrar ca root, iar la o actualizare pasul care l-ar fi
+rescris dintr-o verificare de încredere e marcat deja făcut și e sărit, deci
+nimic nu-l reîmprospătează înainte de acel `source`.
+
+Reparația mută marcajele într-un director dedicat, `/var/lib/sentinel-install`
+— NU sub `/var/lib/sentinel`, ci alături de el, cu părintele (`/var/lib`)
+root-owned. Asta închide ruta de scriere structural: `sentinel` nu mai are
+niciun bit de scriere pe niciun strămoș al căii, deci nu mai poate nici
+redenumi, nici planta nimic acolo, indiferent de ce verificare ar mai exista
+deasupra.
+
+**Ce s-a respins: mutarea automată a marcajelor vechi.** Trei runde (8-9
+septembrie 2026) au încercat să facă sigură o migrare care mută conținutul
+vechii locații în cea nouă la prima instalare de după reparație, ca o gazdă
+existentă să nu piardă pașii deja făcuți:
+
+| Rundă | Ocolire găsită |
+|---|---|
+| 1 | Un symlink plantat la calea VECHE, urmat de `mv -f`, muta conținutul țintei alese de atacator în directorul nou, root-owned — și era re-armabil la fiecare rulare, fiindcă părintele rămânea scriibil |
+| 2 | Un director root-owned existent (`executor/`, creat pentru `audit.jsonl`-ul executorului), redenumit de `sentinel` peste calea veche, trecea orice verificare bazată doar pe proprietate — proprietatea era reală, doar numele mințea |
+| 3 | Un symlink plantat la calea NOUĂ (după ce prima migrare reușise), urmat din nou de operațiile ulterioare care presupuneau că o cale root-owned rămâne root-owned |
+
+Fiecare reparație a închis exact ocolirea rundei anterioare, și nici una alta
+— semnul că problema nu era o verificare insuficient de strictă, ci forma
+însăși: un proces root ia o decizie de încredere, din rezultatele unor
+`stat()`, despre ceva aflat într-un director pe care un cont mai puțin
+privilegiat îl poate redenumi oricând, inclusiv exact între verificare și
+folosire. Nicio verificare suplimentară nu închide o cursă pe care contul
+atacat o poate rearma la nesfârșit, cât timp mai deține scrierea pe părinte.
+
+**Decizia (13 septembrie 2026): nu se mai migrează nimic.** Directorul vechi
+e abandonat, nu curățat și nu mutat — conținutul lui e tratat ca absent, de
+oriunde ar citi altcineva altfel decât `install.sh`/`common.sh`. Nimic aflat
+sub un director scriibil de `sentinel` n-a fost vreodată suficient de
+încrezător ca să merite promovat într-un director root-only doar fiindcă a
+fost mutat acolo — migrarea încerca să spele exact ce mutarea locației (mai
+sus) a făcut deja de prisos.
+
+**Costul, scris ca atare:** o gazdă care se actualizează peste această
+reparație are marcajele „pierdute" la calea nouă, deci fiecare pas gardat de
+marcaj rulează încă o dată. Fiecare pas al instalatorului e scris să fie
+sigur la o rerulare — e chiar contractul mecanismului de idempotență (vezi
+`deploy/lib/common.sh`) — cu O SINGURĂ excepție, deja cunoscută și deja
+apărată separat: faptul write-once `nginx_preexisting` (vezi și §3.15,
+`nginx_preexisting_resolve` din `install.sh`), care decide dacă instalatorul
+are voie să editeze `nginx.conf`-ul operatorului. Pierderea lui ar fi
+periculoasă într-o singură direcție (o gazdă unde Sentinel a instalat propriul
+nginx ar fi redetectată drept „nginx era dinainte", ceea ce face instalatorul
+MAI conservator, nu mai puțin) — dar mecanismul are deja, dintr-o reparație
+anterioară (26 august 2026), o plasă de siguranță care citește direct calea
+veche pentru exact acest caz: un `head -1`/`grep` mărginit la o valoare „0"
+sau „1", niciodată un `source`. Extinsă acum să citească ambele forme istorice
+(faptul scris la vechea locație, și linia și mai veche din `preflight.env`),
+plasa asta rămâne sigură din exact motivul pentru care restul mecanismului nu
+e: nu ia nicio decizie de încredere structurală, doar extrage o valoare deja
+constrânsă la un bit înainte să fie folosită.
+
+`assert_root_owned_state_file` (verificarea de proprietate pe orice fișier
+sursat din noul director) rămâne neatinsă — apără un caz diferit și real:
+„nu pot verifica" tratat la fel ca „proprietar greșit", niciodată ca „e
+curat", pentru orice a rămas pe disc de la o versiune mai veche sau mai
+permisivă. Ocolirea rundei 2 (redenumirea unui director root-owned) NU ajunge
+la ea: acea verificare cere scriere pe PĂRINTELE noii locații, iar `sentinel`
+nu are niciuna.
+
 ---
 
 ## 4. Predicția — ce este de fapt

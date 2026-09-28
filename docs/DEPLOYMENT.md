@@ -1022,6 +1022,19 @@ nesfârșit; un refuz nu se mai reîncearcă automat, operatorul repară de mân
 șterge marcajul dacă vrea o privire în plus. Detalii în comentariul din
 `migrate_legacy_state_markers` (`deploy/lib/common.sh`).
 
+**Notă, 13 septembrie 2026 — migrarea a fost scoasă, nu re-reparată.** A treia
+rundă de mai sus a fost și ea ocolită (un symlink plantat la calea NOUĂ, după
+ce o migrare legitimă rulase deja). Trei runde, trei ocoliri diferite ale
+aceleiași forme — un proces root decizând, din `stat()`, dacă ceva aflat
+într-un director redenumibil de `sentinel` e de încredere — au dus la decizia
+de a scoate mecanismul, nu la o a patra variantă a lui. Marcajele vechi nu se
+mai mută nicăieri; conținutul lor e tratat ca absent. Costul: o gazdă care se
+actualizează peste reparație rerulează o dată fiecare pas gardat de marcaj —
+fiecare e scris să fie sigur la asta, cu o singură excepție cunoscută (faptul
+`nginx_preexisting`, care are propria lui plasă de siguranță, separată de
+migrare). Detalii complete, inclusiv costul și de ce e acceptat, în
+[ARHITECTURA.md §3.20](ARHITECTURA.md).
+
 **Gaură cunoscută, neînchisă:** `deploy/geoip/refresh.sh` e prins de regula
 `geoip/` din `.gitignore` (menită pentru datele MaxMind, nu pentru scriptul
 care le reîmprospătează) și n-a fost niciodată `git add`-uit — deci nu ajunge

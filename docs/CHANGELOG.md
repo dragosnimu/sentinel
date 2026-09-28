@@ -1,5 +1,140 @@
 # Changelog
 
+## 0.22.7 — Jurnalul supraviețuiește repornirii, botul ascultă doar de tine, iar marcajele de stare nu se mai mută
+
+Trei schimbări ale instalatorului care pleacă împreună, fiindcă trăiesc în
+aceleași fișiere.
+
+### Pasul 42 (`telegram_owner`) — grupul nu mai comandă botul
+
+Pe ambele gazde configurația vie avea pe listă doar un GRUP, cu
+`owner_chat_id` pus pe el și `allowed_user_ids` lipsă cu totul din fișier —
+deci verificarea era doar pe chat, iar **orice membru al grupului** putea
+bloca, debloca și aproba aplicări de patch-uri pe două gazde de producție.
+Codul care închide ușa exista deja și era corect; lipsea valoarea pe gazde,
+iar `install_config` refuză din construcție să rescrie o configurație vie.
+
+Pasul nou scrie **chirurgical** doar cheia aia, idempotent, fără să
+regenereze fișierul — o regenerare ar pune `beacon.enabled: false` și
+`ship.enabled: false` și ar opri martorul extern. Valoarea vine din secretul
+`TELEGRAM_OWNER_USER_ID`, pe stdin, niciodată prin argumente și niciodată în
+depozit: identificatorii de chat și de utilizator sunt date personale.
+
+Cheia a trebuit adăugată și în `OPERATOR_SECRET_KEYS`. Fără asta instalatorul
+o citea de pe stdin și o arunca tăcut, în timp ce livrarea scria
+`only in the local file (will be added)` — un mesaj despre intenție, nu
+despre efect.
+
+### Marcajele de stare — migrarea se șterge, nu se repară
+
+`.install-state` stătea sub un director în care contul `sentinel` poate
+redenumi, iar `preflight.env` de acolo e executat ca root la fiecare rulare.
+Mutarea lui lângă `/var/lib/sentinel`, sub un părinte al lui root, era
+reparația corectă și rămâne.
+
+Ce se șterge e **migrarea**: `migrate_legacy_state_markers` și cele șapte
+funcții ajutătoare. Trei runde au încercat s-o facă sigură și fiecare a fost
+bătută de altă ocolire a aceleiași verificări — symlink la calea veche, un
+director al lui root adus prin redenumire, symlink la calea nouă. Toate trei
+aveau aceeași formă: un proces root care decide din rezultate de `stat` dacă
+ceva aflat într-un director controlat de alt cont e demn de încredere. Forma
+aia nu se repară adăugând încă o verificare.
+
+Directorul vechi se abandonează pe loc. O gazdă care se actualizează re-rulează
+o dată pașii gardați de marcaj — toți verificați ca operații nule, cu o
+singură excepție numită în cod.
+
+Singura citire rămasă din locul vechi e mărginită: 64 de octeți, nu
+`head -1`, fiindcă `head -1` citește până la prima linie nouă și un fișier rar
+fără linii noi ar fi ținut instalatorul ore. Symlink-ul e refuzat explicit.
+
+Pe 10 septembrie 2026, la 07:59:41, gazda de producție a repornit prima oară în
+peste cinci zile și **toate** înregistrările de autentificare din 6-9 septembrie
+au dispărut: seqnum-id nou, boot-id nou, `journalctl --disk-usage` de la 149,1 M
+la 16,0 M, fereastra de istoric de la zero. Nimic nu era stricat — RHEL și
+derivatele livrează `Storage=auto` fără `/var/log/journal`, deci jurnalul stă în
+`/run` și moare cu gazda. Debian și Ubuntu creează directorul din pachet, motiv
+pentru care gazda n8n n-a arătat niciodată defectul, iar `grep -rn
+"var/log/journal\|Storage=" deploy/ scripts/ docs/` nu întorcea nimic.
+
+* **Pas nou, 41 (`journal_storage`), în `ALWAYS_STEPS`.** Întrebarea corectă nu e
+  „s-a făcut o dată" ci „gazda își ține jurnalul ACUM", iar răspunsul se schimbă
+  fără ca instalatorul să fie rulat: un director șters ca să se facă loc pe disc,
+  un `Storage=volatile` pus de un manager de configurație. Pasul măsoară asta la
+  fiecare deploy și e o operație complet nulă acolo unde răspunsul e deja „da" —
+  fără repornire, fără flush, fără scriere;
+* **Starea se citește de la demon, nu de pe disc.** `journalctl --header` spune
+  ce fișier e `ONLINE`, adică unde scrie journald chiar acum. Un
+  `/var/log/journal` creat de mână nu e o dovadă: journald scrie mai departe în
+  `/run` până e repornit și golit explicit. Trei răspunsuri, nu două —
+  `persistent`, `runtime` și `unknown`, iar pe `unknown` pasul **nu atinge
+  nimic**: o repornire a demonului de jurnalizare pe ghicite e mai rea decât un
+  jurnal volatil;
+* **Mărginit pe amândouă axele, cu numerele justificate.** `SystemMaxUse=2G` și
+  `MaxRetentionSec=30day`, plus `MaxFileSec=1day` fără de care retenția e
+  decorativă (șterge fișiere întregi, deci un fișier care acoperă toată fereastra
+  nu expiră niciodată). Baza de calcul e măsurată pe gazda care ÎL are deja
+  persistent și comprimat: 367,5 M pentru exact 7 zile, adică 52,5 MB/zi pe disc
+  la 46,95 MB/zi de octeți `-o export` — raport 1,12, fiindcă la scara asta
+  fișierele preformatate de 8 M și tabelele de dispersie costă mai mult decât
+  economisește compresia. Ritmul producției extrapolat cu raportul ăla dă
+  ~100 MB/zi, iar asta e o EXTRAPOLARE, nu o măsurătoare: ritmul pe disc al unui
+  jurnal care n-a fost niciodată pe disc nu se poate măsura. `SystemKeepFree`
+  rămâne la implicit, fiindcă 15 % din partiție e chiar ce apără PostgreSQL;
+* **Verificarea e pe efect, în cinci feluri.** Journald raportează singur, în
+  mesajul lui structurat de utilizare (SD_MESSAGE_JOURNAL_USAGE), calea folosită și
+  plafonul aplicat — deci plafonul se citește de la demon, nu din fișierul tocmai
+  scris. Pe lângă el: fișiere prezente, `journalctl -D` care chiar scoate o
+  intrare din ele, `/run` gol după flush. Pragul de TIMP e singurul citit din
+  configurație, fiindcă journald nu raportează retenția nicăieri până în ziua în
+  care chiar șterge — și e etichetat ca atare, nu strecurat printre cele măsurate;
+* **`systemctl start systemd-journal-flush` nu golește nimic.** E o unitate
+  oneshot care a rulat deja la boot și e `active (exited)`, deci pornirea ei e o
+  operație nulă care întoarce 0 — exact tiparul din CLAUDE.md, și chiar a făcut o
+  primă versiune a pasului să raporteze un flush care nu avusese loc. Se cheamă
+  `journalctl --flush`;
+* **Flush-ul invalidează cursorul colectorului, iar pasul îl repară exact.**
+  Măsurat pe AlmaLinux 9.8 / systemd 252-67.el9_8.4.alma.1 — build-ul exact al
+  producției: primul flush rescrie identificatorul de secvență al fiecărei intrări
+  mutate, deci din cursor se schimbă **doar** `s=`, iar `i=`, `b=`, `m=`, `t=` și
+  `x=` rămân octet cu octet aceleași. `_journal_first_unread` compară cursorul
+  salvat ca ȘIR, deci fără reparație fiecare instalare ar fi fabricat exact
+  critica falsă („colectorul sshd și-a pierdut poziția") pe care trei runde de
+  muncă tocmai o scoseseră. Poziția se mută pe cursorul nou al **aceleiași
+  intrări**, numai când identitatea intrării se potrivește exact, iar UPDATE-ul e
+  păzit de valoarea citită, fiindcă `sentinel-ingest` rulează în timpul
+  instalării și își avansează singur poziția. Dacă după poziția salvată urmează
+  altă intrare, rândul rămâne neatins și operatorul e anunțat: mutarea unui
+  cursor înainte peste intrări necitite e o gaură tăcută în dovezi.
+
+Neverificat, și rămâne așa până rulează pe gazdă: comportamentul sub SELinux
+`enforcing`. Producția are SELinux **dezactivat** (măsurat), deci calea care
+etichetează directorul și compară eticheta rezultată cu politica nu a fost
+executată nicăieri în afara momelilor din teste.
+
+* **Apelul pasului 41 e mutat înaintea celui pentru pasul 40 (`notify`).**
+  Numerele rămân 40/41/42 — `run_step` le compară pe astea, nu pe ordinea din
+  `main`, deci `docs/OPERARE.md` și `--force-step 41` din istoricul
+  operatorului rămân valide — dar ORDINEA DE RULARE devine 39, 41, 40, 42. În
+  runda 1, un `die` din pasul 41 cădea DUPĂ ce Telegram primise deja „Sentinel
+  installed”, iar fiindcă pasul e în `ALWAYS_STEPS`, o gazdă care nu reușește
+  să devină persistentă repeta minciuna la fiecare deploy. `die` rămâne `die`
+  — o verificare de efect care ar deveni doar un `warn` ar face exact linia de
+  succes a pasului condiționată de cine citește mai departe de ea, tiparul pe
+  care `tests/security/test_installer_journal_storage.py` §4 îl apără explicit
+  — dar costul lui `die` (oprește TOT instalatorul, inclusiv pasul 42 și orice
+  vine după, pe orice gazdă unde persistența nu se poate stabili) e o proprietate
+  a `run_step`/`die` comună celor ~42 de pași, nu ceva de rezolvat doar aici;
+  o redistribuire a ei rămâne o decizie separată.
+* **Momeala de `systemctl` din teste lega greșit „a repornit journald” de „a
+  cerut o repornire”.** Copia necondiționat `nrestarts.after` la orice apel
+  `systemctl restart systemd-journald`, deci un test care ar fi verificat
+  direct contorul NRestarts (nu doar absența textului „restart” din jurnalul
+  de apeluri) n-ar fi văzut nimic anormal la un mutant care repornește
+  journald și pe o gazdă deja persistentă. Momeala numără acum citirile lui
+  NRestarts, nu apelurile de restart, iar un test nou verifică exact ce
+  citește pasul crash-loop-ului: contorul, neatins, pe calea persistentă.
+
 ## 0.22.6 — Momeala nu mai spune că ești spart, iar garda pe comenzi chiar se uită
 
 Două lucruri, amândouă de aceeași formă: un text care AFIRMĂ ceva ce nu a

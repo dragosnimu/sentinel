@@ -665,7 +665,11 @@ sect "Regresie — ce rula înainte de instalare"
 # The check that matters most. Sentinel installing correctly while stopping
 # something the server was already doing is a failed deployment, not a partial
 # success — and the operator would find out from their users, not from here.
-baseline_dir=/var/lib/sentinel/.install-state
+# /var/lib/sentinel-install, not /var/lib/sentinel/.install-state: since
+# 8 Sep 2026 the install-state markers (including this baseline) live in their
+# own root-owned directory, not nested under /var/lib/sentinel — see
+# deploy/lib/common.sh for why the old nesting was a write-access hole.
+baseline_dir=/var/lib/sentinel-install
 
 if r "test -f ${baseline_dir}/baseline-services.txt"; then
     lost="$(r "comm -23 ${baseline_dir}/baseline-services.txt \

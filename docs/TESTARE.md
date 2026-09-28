@@ -33,11 +33,11 @@ oprește ceva ce serverul făcea deja este o fază eșuată.
 systemctl --failed
 diff <(systemctl list-units --type=service --state=running --no-legend --plain \
         | awk '{print $1}' | sort) \
-     /var/lib/sentinel/.install-state/baseline-services.txt
+     /var/lib/sentinel-install/baseline-services.txt
 
 # Porturile care ascultau înainte încă ascultă
 diff <(ss -tlnH | awk '{print $4}' | sed 's/.*://' | sort -un) \
-     /var/lib/sentinel/.install-state/baseline-ports.txt
+     /var/lib/sentinel-install/baseline-ports.txt
 
 # Containere sănătoase
 docker ps --filter health=unhealthy --format '{{.Names}}'
@@ -70,15 +70,22 @@ mypy sentinel executor
 **Singura excepție de la „fără skip":**
 `test_no_value_from_the_local_secret_store_appears_in_the_tree` și
 `test_no_operator_identity_appears_in_the_tree` compară arborele cu valorile
-reale din `secrets/.env.local`. Fișierul e ignorat de git, deci pe o clonă
-proaspătă lipsește, iar testele raportează SKIP cu motivul scris — `addopts`
-conține `-rfEs` tocmai ca motivul să apară în sumar.
+reale din magazia locală — **toate** fișierele din `secrets/`, derivate din
+director la rulare, nu un nume fix. Directorul e ignorat de git, deci pe o
+clonă proaspătă e gol, iar testele raportează SKIP cu motivul scris —
+`addopts` conține `-rfEs` tocmai ca motivul să apară în sumar.
+
+Numele fix a fost `secrets/.env.local` până pe 24 septembrie 2026. Fișierul
+ăla dispăruse în august, când magazia s-a împărțit pe gazde, iar cele două
+gărzi au sărit tăcut o lună și jumătate — timp în care contul de shell al
+operatorului și un domeniu real au intrat în depozitul public. De-aia lista se
+derivă acum, în loc să fie scrisă de mână.
 
 Skip-ul ăla înseamnă „n-am putut verifica", nu „e curat". Înainte de un push,
 rulează pe mașina care are magazia de secrete și confirmă că **nu** sunt sărite.
 Orice alt skip sub `-m security` e un defect.
 
-### Cheile de identitate din `secrets/.env.local`
+### Cheile de identitate din magazia locală
 
 `test_no_operator_identity_appears_in_the_tree` caută în arbore numele de
 utilizator și domeniul înregistrabil ale operatorului. Nu le poate ghici și nu

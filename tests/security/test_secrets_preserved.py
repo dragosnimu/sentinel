@@ -441,6 +441,30 @@ def test_a_shared_key_lands_on_a_host_that_never_had_it(tmp_path):
     assert out["keys"]["SENTINEL_SESSION_SECRET"] == "b" * 64
 
 
+def test_the_telegram_owner_id_lands_on_a_host_that_never_had_it(tmp_path):
+    """The failure this prevents: the operator adds TELEGRAM_OWNER_USER_ID to
+    secrets/.env.local (closing the exposure in CLAUDE.md's opening example —
+    a Telegram GROUP holding owner rights on production), the value reaches
+    this step on stdin, and the installer drops it as an unknown name. Step 42
+    (telegram_owner) would then find nothing to narrow `allowed_user_ids`
+    with, and print a clean warning about a secret that WAS in fact supplied —
+    the operator's fix silently going nowhere while the run reports success.
+
+    Value shaped like a Telegram user id — digits only — but not a real one;
+    see the module docstring on why every id here is invented.
+    """
+    out = run_step_secrets(tmp_path, HOST_SECRETS,
+                           {"TELEGRAM_OWNER_USER_ID": "987654321"})
+    assert out["keys"]["TELEGRAM_OWNER_USER_ID"] == "987654321", (
+        "the owner id was dropped as an unknown name; step 42 has nothing to narrow "
+        "allowed_user_ids with")
+    assert "TELEGRAM_OWNER_USER_ID" not in out["proc"].stderr, (
+        "the key landed but was also reported as refused")
+    # The keys already on the host are untouched by the new name.
+    assert out["keys"]["SENTINEL_BEACON_SECRET"] == "c" * 64
+    assert out["keys"]["TELEGRAM_CHAT_ID"] == "123456789"
+
+
 def test_a_shared_key_nobody_supplied_is_not_written_empty(tmp_path):
     """Adding names to OPERATOR_SECRET_KEYS must not create empty lines.
 

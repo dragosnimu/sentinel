@@ -63,8 +63,12 @@ def test_tmpfiles_reapply_runs_even_when_step_19_is_already_marked_done(tmp_path
     _write_stub(stubs, "install", LOGGING_STUB)
     _write_stub(stubs, "systemd-tmpfiles", LOGGING_STUB)
 
+    # No `.install-state` subdirectory: since 2026-09-08 markers live in their
+    # own root-owned directory (SENTINEL_INSTALL_STATE_DIR), not nested under
+    # SENTINEL_STATE_DIR — see deploy/lib/common.sh for why that nesting was
+    # the vulnerability being closed.
     state_dir = tmp_path / "state"
-    markers = state_dir / ".install-state"
+    markers = state_dir
     markers.mkdir(parents=True)
     (markers / "19_user_and_dirs").write_text("2026-08-01T00:00:00Z", encoding="utf-8")
 
@@ -82,7 +86,7 @@ def test_tmpfiles_reapply_runs_even_when_step_19_is_already_marked_done(tmp_path
 
     env = {**os.environ, "NO_COLOR": "1",
            "CALLS": str(calls).replace("\\", "/"),
-           "SENTINEL_STATE_DIR": str(state_dir).replace("\\", "/"),
+           "SENTINEL_INSTALL_STATE_DIR": str(state_dir).replace("\\", "/"),
            "PATH": str(stubs).replace("\\", "/") + os.pathsep + os.environ.get("PATH", "")}
 
     proc = subprocess.run([BASH, str(script).replace("\\", "/")],

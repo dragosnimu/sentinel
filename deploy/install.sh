@@ -348,22 +348,61 @@ step_preflight() {
 # Was nginx on this host before Sentinel touched it? One answer, from the record.
 #
 # The observation is only valid the first time it is made — step 20, before the
-# package install. Every run after that reads what was written down. Three
-# sources, in this order, and the order is the design:
+# package install. Every run after that reads what was written down. Four
+# sources, in this order, and the order is the design (most specific record
+# first):
 #
-#   1. the write-once fact. Once written, nothing changes it.
-#   2. the legacy NGINX_WAS_PREEXISTING= line in preflight.env, promoted into the
-#      fact. A host installed before the fact file existed has its only record
-#      there — on production that record is 1, and defaulting to 0 instead would
-#      hand step 33 permission to edit the operator's own nginx.conf. Promoting
-#      it also makes it survive the next --force-step 1, which rewrites
-#      preflight.env from scratch and would otherwise drop it.
-#   3. no line at all, on a host that has ALREADY run step 20. The silence is
-#      itself the record: the old code appended that line only when it FOUND
-#      nginx, so its absence after step 20 means nginx was not here. Written down
-#      rather than re-derived every run, because otherwise the next
-#      --force-step 20 would observe our own nginx and record 1 — the same bug,
-#      back through the migration gap.
+#   1. the write-once fact, at its CURRENT (2026-09-08 onward) location under
+#      $STATE_MARKERS. Once written there, nothing changes it.
+#   2. the SAME fact, still sitting at the location it was written to before
+#      2026-09-08 (${_LEGACY_STATE_MARKERS}/facts/…) — a host that already ran
+#      the fact-writing code but has not redeployed since the marker directory
+#      moved. Read directly and promoted into (1), never migrated: nothing
+#      renames or chmods this path, this is a bounded `head -c` of one file
+#      whose only valid contents are "0" or "1".
+#   3. the legacy NGINX_WAS_PREEXISTING= line in preflight.env, older still —
+#      a host installed before the fact file existed at all has its only
+#      record there. Read from the SAME legacy location as (2), for the same
+#      reason: nothing copies that file to the new, root-only directory any
+#      more (see the comment on SENTINEL_INSTALL_STATE_DIR in
+#      deploy/lib/common.sh — three rounds tried to make that copy safe and
+#      each was beaten by a different bypass of the same shape). Defaulting
+#      to 0 instead of reading this line, on a host whose only record of the
+#      answer IS this line, would hand step 33 permission to edit an
+#      operator's own nginx.conf — that is the failure this tier exists to
+#      prevent. Measured 2026-09-28, and NOT what an earlier draft of this
+#      comment claimed: /var/lib/sentinel-install does not exist on either
+#      live host, so tier (1) is EMPTY on both and THIS tier is the live path
+#      on the next deploy of each -- not a dormant compatibility branch. Both
+#      legacy facts read 0; neither preflight.env still has an
+#      NGINX_WAS_PREEXISTING line, so neither reaches tier (3).
+#
+#      A separate fact the operator must decide on, recorded here because
+#      this tier is what carries it forward: production's recorded 0 is
+#      WRONG. nginx was there first -- Sentinel's own first install logged
+#      "Package nginx-2:1.20.1-22 is already installed" on 2026-07-30, the
+#      rpm went in 2026-03-11, and one of the operator's own vhosts under
+#      /etc/nginx/conf.d/ dates from the same day. The 0 was written
+#      2026-08-28 by tier (4)'s
+#      silence rule, after preflight.env had already been rewritten. Harmless
+#      while production runs --nginx-mode shared, because step_nginx_shared
+#      never reads this flag; a future dedicated run would comment out
+#      `listen 80` in the operator's own nginx.conf, where that vhost lives.
+#   4. no record anywhere, on a host that has ALREADY run step 20. The silence
+#      is itself the record: the old code appended that line only when it
+#      FOUND nginx, so its absence after step 20 means nginx was not here.
+#      Written down rather than re-derived every run, because otherwise the
+#      next --force-step 20 would observe our own nginx and record 1 — the
+#      same bug, back through the gap.
+#
+# (2) and (3) read from ${_LEGACY_STATE_MARKERS}, a directory `sentinel` can
+# write to — but neither ever executes what it finds there, only extracts one
+# value already constrained to "0" or "1" by a regex before it is trusted for
+# anything. The worst a forged value achieves is Sentinel treating its own
+# nginx as the operator's (over-cautious) or the operator's nginx as its own
+# (the direction that matters) — bounded to that one reviewed decision, never
+# arbitrary code, which is what made trusting preflight.env's CONTENTS wholesale
+# (via `source`) the actual vulnerability this file's other defences close.
 #
 # Read from the FILE, not from the variable preflight.env sets: install.sh
 # initialises NGINX_WAS_PREEXISTING=0 at the top, so a variable test cannot tell
@@ -377,10 +416,38 @@ nginx_preexisting_resolve() {
         return 0
     fi
 
-    # grep and parameter expansion rather than a sed script: this line has been
-    # edited by hand more than once, and an escaping mistake here reads as "no
-    # legacy record" — which on production would mean "nginx is ours to edit".
-    if [[ -f "$env_file" ]]; then
+    # (2) — the fact, at the pre-2026-09-08 location. Never `source`d, never
+    # moved: a few bytes read out of one file, kept only if what they hold is
+    # exactly "0" or "1".
+    #
+    # `head -c`, not `head -1`: this directory is `sentinel`-writable, so
+    # `sentinel` can rename `.install-state` aside and plant a newline-less
+    # file here — a `truncate -s 16T` sparse file costs no disk blocks, and
+    # ext4 allows it. `head -1` scans for a newline byte that never arrives,
+    # so it would read to EOF (measured: 7.65s on a 3 GB sparse file, and
+    # nothing bounds how large the planted file claims to be) and the root
+    # installer would sit here on every deploy. `head -c` stops after a fixed
+    # number of bytes regardless of what lies beyond them — no real "0" or
+    # "1" answer is anywhere near that size, so nothing legitimate is cut
+    # short by it.
+    #
+    # `-L` refuses a symlink at this exact path: `-f` alone follows the link
+    # and would accept one pointed at any regular file `sentinel` can name —
+    # narrow (the value is still constrained to "0"/"1" below), but there is
+    # no reason to read through a link `sentinel` planted when reading the
+    # file it names directly costs nothing extra.
+    local legacy_fact="${_LEGACY_STATE_MARKERS}/facts/${NGINX_PREEXISTING_FACT}"
+    if [[ -f "$legacy_fact" && ! -L "$legacy_fact" ]]; then
+        local legacy_fact_value
+        legacy_fact_value="$(head -c 64 "$legacy_fact" 2>/dev/null | tr -d '[:space:]')"
+        [[ "$legacy_fact_value" =~ ^[01]$ ]] && legacy="$legacy_fact_value"
+    fi
+
+    # (3) — grep and parameter expansion rather than a sed script: this line
+    # has been edited by hand more than once, and an escaping mistake here
+    # reads as "no legacy record" — which on production would mean "nginx is
+    # ours to edit".
+    if [[ -z "$legacy" && -f "$env_file" ]]; then
         legacy="$(grep -E '^NGINX_WAS_PREEXISTING=[01][[:space:]]*$' "$env_file" | tail -1)"
         legacy="${legacy#NGINX_WAS_PREEXISTING=}"
         legacy="${legacy//[[:space:]]/}"
@@ -408,6 +475,17 @@ resolve_config() {
 
     local env_file="${STATE_MARKERS}/preflight.env"
     if [[ -f "$env_file" ]]; then
+        # This is sourced as root, unconditionally, on EVERY run. $STATE_MARKERS
+        # being 0700 root:root, with its parent (/var/lib) also root-owned,
+        # stops `sentinel` from ever placing a file at this path — this check
+        # exists anyway for what a build older than this fix left behind, or
+        # for a $STATE_MARKERS somehow left looser than 0700. "Unknown" is not
+        # "clean": a stat that fails is refused exactly like one that succeeds
+        # and says the wrong owner.
+        assert_root_owned_state_file "$env_file" || die "refusing to source \
+${env_file}: it or its directory is not root-owned/0700. This file is executed \
+as root on every install run; treat this as tampering to investigate, not as a \
+permissions slip to silence. See deploy/lib/common.sh's assert_root_owned_state_file."
         # shellcheck disable=SC1090
         source "$env_file"
     fi
@@ -417,7 +495,19 @@ resolve_config() {
     SURICATA_OK="${SURICATA_OK:-0}"
     MEM_AVAIL="${MEM_AVAIL:-0}"
     BPF_HINT="${BPF_HINT:-}"
-    NGINX_WAS_PREEXISTING="$(nginx_preexisting_resolve "$env_file")"
+    # The LEGACY path, not $env_file: nothing moves the pre-2026-09-08
+    # preflight.env into $STATE_MARKERS any more (see nginx_preexisting_resolve's
+    # own comment, and the one on SENTINEL_INSTALL_STATE_DIR in
+    # deploy/lib/common.sh), so a host installed before the fact file existed
+    # has its only record of this at the OLD location or nowhere. Passing that
+    # path here does not need a trust decision the way `source`ing it would:
+    # nginx_preexisting_resolve only ever `grep`s a `KEY=[01]` line out of it,
+    # never executes it, so the worst a hostile ${SENTINEL_USER} can do by
+    # planting one is make Sentinel wrongly cautious (treat its own nginx as
+    # the operator's) or, the direction that actually matters, wrongly
+    # confident (treat the operator's nginx as ours to edit) — bounded to that
+    # one already-reviewed value, not arbitrary code.
+    NGINX_WAS_PREEXISTING="$(nginx_preexisting_resolve "${_LEGACY_STATE_MARKERS}/preflight.env")"
 
     [[ -n "$cli_admin_ip" ]]    && ADMIN_IP="$cli_admin_ip"
     [[ -n "$cli_domain" ]]      && DOMAIN="$cli_domain"
@@ -1999,7 +2089,17 @@ GENERATED_SECRET_KEYS=(TELEGRAM_CALLBACK_HMAC_KEY SENTINEL_SESSION_SECRET)
 # Carrying keys forward fixed the destruction. It did not give either key a way
 # in, and a key with no way in is a key that gets placed by hand, once, by
 # whoever remembers.
+#
+# TELEGRAM_OWNER_USER_ID joined the list on 25 September 2026, for the same
+# structural reason, not a new one: step 42 (telegram_owner) needs it to
+# narrow `telegram.allowed_user_ids` on a live sentinel.yaml, exactly the way
+# step 22/27 need SENTINEL_DB_PASSWORD and TELEGRAM_BOT_TOKEN. Left off this
+# list, `read_stdin_secrets` would still read it off stdin into SECRETS, and
+# step_secrets would still silently drop it — the "will be added" line further
+# down would be lying to the operator about a key that never lands anywhere,
+# not just a lost rotation.
 OPERATOR_SECRET_KEYS=(ANTHROPIC_API_KEY TELEGRAM_BOT_TOKEN TELEGRAM_CHAT_ID
+                      TELEGRAM_OWNER_USER_ID
                       SENTINEL_DB_PASSWORD TELEGRAM_APPLY_PIN
                       SENTINEL_BEACON_SECRET SENTINEL_SHIP_SECRET)
 
@@ -3849,7 +3949,7 @@ ensure_placeholder_certificate() {
 
     openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
         -keyout "$key" -out "$cert" \
-        -subj "/CN=${DOMAIN:-$(hostname -f)}" >/dev/null 2>&1 \
+        -subj "/CN=${DOMAIN:-$(hostname -f 2>/dev/null || hostname)}" >/dev/null 2>&1 \
         || die "could not generate the placeholder certificate"
     chmod 0600 "$key"
     ok "placeholder self-signed certificate generated"
@@ -5452,6 +5552,1250 @@ above, from Telegram. Sentinel is installed, but it cannot reach you yet."
     esac
 }
 
+# --- 41 -------------------------------------------------------------------
+# Persistent, bounded journald storage.
+#
+# The fault this repairs is data loss, not a misconfiguration. RHEL and its
+# derivatives ship `Storage=auto` with no /var/log/journal, so the journal lives
+# in /run and is destroyed at every boot; Debian and Ubuntu create the directory
+# from the package, which is why the Ubuntu host never showed the problem and
+# why nothing in this repository had ever looked. Production rebooted on
+# 10 September 2026, its first boot in over five days, and every `Failed
+# password`, `Accepted publickey` and `Invalid user` line from 6-9 September
+# went with it: new seqnum-id, new boot-id, `journalctl --disk-usage` from
+# 149.1 M to 16.0 M, retained window back to zero. Sentinel's primary
+# authentication evidence lived only there.
+#
+# WHY THIS IS IN ALWAYS_STEPS
+#
+# A marker answers "was this done once". That is the wrong question here. The
+# right one is "is this host persistent NOW", and the answer changes without
+# anyone re-running the installer: a `Storage=volatile` dropped in by a
+# configuration manager, a /var/log/journal removed by somebody freeing disk, a
+# host installed before this step existed. `journal_storage_state` asks that
+# question of the running daemon on every deploy, and the step is a genuine
+# no-op — no restart, no flush, no write — on a host that is already right. The
+# cost there is one `journalctl --header` and one `journalctl -b`.
+#
+# The second reason is the rule ALWAYS_STEPS states for itself: the drop-in
+# below carries repo content — the bounds. Marker-gated, a host would keep
+# whatever numbers it was installed with and never a revision of them.
+#
+# WHY 41, AND WHY IT RUNS BEFORE 40 DESPITE THE NUMBER
+#
+# Step numbers are documentation: `--force-step N` appears in docs/OPERARE.md,
+# in docs/DEPANARE.md and in the operator's command history, so inserting a
+# number renumbers every step after it and invalidates all of them — the same
+# reason `ensure_instance_id` is not a step. `run_step` compares `--from-step`
+# and `--force-step` by the NUMBER passed in, never by where the call sits in
+# `main`, so the two are free to disagree — and they do, on purpose, below.
+#
+# A first version called this step AFTER 40 (`notify`), in numeric order. That
+# put a `die` in this step behind "Sentinel installed" already having gone to
+# Telegram — the FATAL was the truth and the Telegram message was not, and an
+# operator who saw both would have had to know to distrust the one that looked
+# like success. Since this step can legitimately die (below), and it is in
+# ALWAYS_STEPS so it dies again on the SAME host on every deploy until the
+# cause is fixed, that is not a one-off wrinkle — it is the message this step
+# will send on every failing run until someone reads the FATAL instead of the
+# "installed" that preceded it. The call below is moved ahead of 40's, so the
+# order actually executed is 39, 41, 40, 42: whatever this step has to say
+# about the evidence channel is said BEFORE Telegram claims the install
+# finished, not after.
+#
+# WHETHER IT SHOULD BE ABLE TO `die` AT ALL
+#
+# It still can, and that is a deliberate choice, not the leftover of the
+# ordering bug above. `journal_verify_persistent` dies only when the daemon
+# was just restarted and flushed FOR THIS and still is not writing where it
+# was asked to — the exact shape of "reload nginx returned 0 while the master
+# rejected the config": every exit code along the way was 0, and the only
+# thing that tells the truth is asking the daemon what it is actually doing.
+# A `warn` there would make this step's own SUCCESS output ("jurnalul
+# supraviețuiește acum repornirii") conditional on nobody reading past it, and
+# tests/security/test_installer_journal_storage.py already holds that
+# specific line to `returncode != 0` for exactly that reason (§4 in the
+# module docstring) — turning it into a warning would pass by not proving
+# anything, the fault this repository keeps re-finding in its own tests.
+#
+# What `die` costs here is real and is NOT this step's to spend alone: `die`
+# is `exit 1` on the whole `install.sh` process, so a host that never manages
+# to become persistent — SELinux denying the label, `/var/log` on a
+# read-only mount, a container without a real systemd-journald — fails this
+# step on EVERY deploy for as long as that is true, and with it every step
+# after it in EXECUTION order, including 42 and whatever is added later —
+# and, because of the reorder above, that now also includes 40 (`notify`):
+# on such a chronically failing host the end-to-end proof that the Telegram
+# channel works is never performed at all, not just delayed. That is a
+# property of `run_step`/`die` shared by all ~42 steps, not something
+# particular to 41, and changing it — e.g. letting `main` keep running past a
+# failed step and report a non-zero exit only at the end — is a change to how
+# EVERY step in this installer fails, decided once for all of them, not a
+# per-step patch smuggled in here. That redesign is not made in this change.
+JOURNAL_DIR="${JOURNAL_DIR:-/var/log/journal}"
+JOURNAL_RUNTIME_DIR="${JOURNAL_RUNTIME_DIR:-/run/log/journal}"
+JOURNALD_CONF="${JOURNALD_CONF:-/etc/systemd/journald.conf}"
+JOURNALD_CONF_DIR="${JOURNALD_CONF_DIR:-/etc/systemd/journald.conf.d}"
+JOURNALD_DROPIN="${JOURNALD_DROPIN:-${JOURNALD_CONF_DIR}/10-sentinel.conf}"
+MACHINE_ID_PATH="${MACHINE_ID_PATH:-/etc/machine-id}"
+
+# THE NUMBERS, AND WHAT THEY WERE CHOSEN AGAINST
+#
+# Measured on 10 September 2026, both hosts:
+#
+#   * n8n keeps exactly 7 days (`MaxRetentionSec=7day`; its own journal says
+#     "Retention time reached, rotating") in 367.5 M -> 52.5 MB/day ON DISK,
+#     with `Compress=yes`, out of 45 321 entries and 46.95 MB of `-o export`
+#     bytes per day. On-disk is therefore 1.12x the export bytes: at this scale
+#     journald's 8 M preallocated files and hash tables cost more than
+#     compression saves. That ratio is the one number here measured on a
+#     PERSISTENT, compressing journal — the case being configured.
+#   * production writes 3.72 MB/h of export bytes (4 076 entries/h), i.e.
+#     ~89 MB/day, so ~100 MB/day on disk by that ratio. That hour was the first
+#     after a boot and is the noisy end; the longer window — 149.1 M retained
+#     over 2.79 days at the /run cap — puts the steady state nearer 55 MB/day.
+#     100 MB/day is used below because it is the conservative one, and it is an
+#     EXTRAPOLATION, not a measurement: nobody can measure the on-disk rate of a
+#     journal that has never been on disk.
+#
+# SystemMaxUse=2G is then 20 days at the conservative rate and ~35 at the
+# observed one; 2.4 % of the 83 G free on production's `/`, 1 % of the
+# filesystem. MaxRetentionSec=30day is the other end: on a quiet host the time
+# bound binds first and the journal never reaches 2 G at all. Both are needed
+# and neither is decoration — an unbounded journal on a box that also runs the
+# PostgreSQL this product keeps everything in is a way to take the database
+# down, and a size-only bound on a quiet host keeps years of nothing.
+#
+# MaxFileSec=1day is what makes the time bound work at all: `MaxRetentionSec`
+# deletes whole FILES whose newest entry is older than the limit, so without a
+# rotation cadence a single file spanning the entire window never expires.
+# SystemMaxFileSize=128M gives 16 files at the cap instead of journald's default
+# 8 (SystemMaxUse/8), so vacuuming drops ~6 % of the history at a time, not 12 %.
+#
+# SystemKeepFree is deliberately NOT set. Its default — 15 % of the filesystem —
+# is what actually protects PostgreSQL from a journal that misbehaves, and any
+# value written here would be smaller than that on this host.
+JOURNAL_MAX_USE="${JOURNAL_MAX_USE:-2G}"
+JOURNAL_MAX_USE_BYTES="${JOURNAL_MAX_USE_BYTES:-2147483648}"
+JOURNAL_MAX_FILE_SIZE="${JOURNAL_MAX_FILE_SIZE:-128M}"
+JOURNAL_MAX_FILE_SEC="${JOURNAL_MAX_FILE_SEC:-1day}"
+JOURNAL_RETENTION="${JOURNAL_RETENTION:-30day}"
+
+# Bound keys an operator may have set for themselves. If ANY of them is set
+# outside our own drop-in, this step writes no numbers at all — see
+# `journal_operator_bounds`.
+JOURNAL_BOUND_KEYS="SystemMaxUse SystemKeepFree SystemMaxFileSize MaxRetentionSec MaxFileSec"
+
+# How long systemd-journald has to stay up after the restart before it counts as
+# started. See `journald_restart_and_settle` for why one `is-active` is not an
+# answer.
+JOURNALD_SETTLE_S="${JOURNALD_SETTLE_S:-5}"
+
+journal_machine_id() {
+    local mid=""
+    if [[ -r "$MACHINE_ID_PATH" ]]; then
+        mid="$(tr -dc '0-9a-f' < "$MACHINE_ID_PATH")" || mid=""
+    fi
+    [[ -n "$mid" ]] || return 1
+    printf '%s' "$mid"
+}
+
+# Where journald is writing RIGHT NOW, asked of journald.
+#
+# `journalctl --header` prints, per file, the path and the file's State. ONLINE
+# means the daemon currently holds that file open for writing, and that is the
+# observable which means "storage is persistent". A directory existing on disk
+# is not: /var/log/journal can be created by hand and journald will keep writing
+# to /run until it is restarted or flushed — the "a file on disk is not proof it
+# was loaded" row of CLAUDE.md's table.
+#
+# Three answers, never two:
+#
+#   persistent  an ONLINE file under $JOURNAL_DIR/<machine-id>/
+#   runtime     an ONLINE file under $JOURNAL_RUNTIME_DIR/<machine-id>/
+#   unknown     the machine id is unreadable, journalctl said nothing, or no
+#               file is ONLINE anywhere. NOT "runtime": acting on "I could not
+#               look" is how this step would come to restart systemd-journald on
+#               a host that was already right.
+journal_storage_state() {
+    local mid headers online
+    mid="$(journal_machine_id)" || { printf 'unknown'; return 0; }
+    headers="$(journalctl --header 2>/dev/null)" || headers=""
+    if [[ -z "$headers" ]]; then
+        printf 'unknown'
+        return 0
+    fi
+    online="$(printf '%s\n' "$headers" \
+        | awk '/^File path:/ { p = $3 } /^State:/ { if ($2 == "ONLINE") print p }')"
+    if printf '%s\n' "$online" | grep -q "^${JOURNAL_DIR}/${mid}/"; then
+        printf 'persistent'
+    elif printf '%s\n' "$online" | grep -q "^${JOURNAL_RUNTIME_DIR}/${mid}/"; then
+        printf 'runtime'
+    else
+        printf 'unknown'
+    fi
+}
+
+# journald's OWN report of the size cap it is enforcing, in bytes; empty when it
+# has not said.
+#
+# The source is systemd's SD_MESSAGE_JOURNAL_USAGE — the "System Journal (…) is
+# X, max Y" line — which carries MAX_USE, JOURNAL_NAME and JOURNAL_PATH as
+# STRUCTURED fields beside the human sentence. So this is the daemon reporting
+# what it DECIDED, rather than this script re-reading the file it has just
+# written, and it is not a grep over free text either.
+#
+# Selected by UNIT and not by that message's id: the id is an unbroken 32-hex
+# constant, and this repository's secret guard refuses runs of that shape in
+# shipped files — correctly, and it is not worth a named exemption when the
+# same entries are reachable without one. Measured: `-u systemd-journald`
+# scans 9 entries on production and 10 on the Ubuntu host, and the awk below
+# keeps only the System Journal ones, which no other message carries.
+#
+# Empty is reachable on a host whose uptime exceeds its own retention, since the
+# message is written when a journal is opened and can be vacuumed away later.
+# Empty is "I could not look", and the callers say so — except right after this
+# step restarts the daemon, where the message is seconds old and its absence
+# means the configuration was never read.
+journal_effective_max_use() {
+    journalctl -b -u systemd-journald -o export \
+        --output-fields=JOURNAL_NAME,JOURNAL_PATH,MAX_USE 2>/dev/null \
+    | awk '
+        function take() {
+            if (name == "System Journal" && max != "") last = max
+            name = ""; max = ""
+        }
+        /^JOURNAL_NAME=/ { name = substr($0, 14); next }
+        /^MAX_USE=/      { max  = substr($0, 9);  next }
+        /^$/             { take(); next }
+        END { take(); if (last != "") print last }' || true
+}
+
+# Bound settings an operator has written for themselves, one "file: KEY=value"
+# per line; empty when there are none.
+#
+# Our own drop-in is excluded, so this answers "did somebody else already decide
+# these numbers", not "did we". When it answers yes, this step writes no numbers
+# at all — a tuned journald.conf is a coherent whole, and half of it replaced by
+# ours is a configuration nobody designed. Same principle as `install_config`.
+journal_operator_bounds() {
+    local f key
+    for f in "$JOURNALD_CONF" "$JOURNALD_CONF_DIR"/*.conf \
+             /run/systemd/journald.conf.d/*.conf \
+             /usr/lib/systemd/journald.conf.d/*.conf; do
+        if [[ -f "$f" && "$f" != "$JOURNALD_DROPIN" ]]; then
+            for key in $JOURNAL_BOUND_KEYS; do
+                # `[^[:space:]]` after the `=`: a key with nothing after it means
+                # "use the default" and is not a bound. Production's journald.conf
+                # has exactly one uncommented line and it is of that shape
+                # (`Audit=`).
+                grep -hE "^[[:space:]]*${key}[[:space:]]*=[[:space:]]*[^[:space:]]" "$f" \
+                    2>/dev/null | sed "s|^|${f}: |" || true
+            done
+        fi
+    done
+}
+
+# Has somebody asked for a volatile journal on purpose? Prints the file saying so.
+#
+# An installer that quietly overrides a deliberate choice does it again at every
+# deploy, and the operator never finds out why their setting keeps losing.
+journal_storage_forced_volatile() {
+    local f
+    for f in "$JOURNALD_CONF" "$JOURNALD_CONF_DIR"/*.conf; do
+        if [[ -f "$f" && "$f" != "$JOURNALD_DROPIN" ]]; then
+            if grep -qE '^[[:space:]]*Storage[[:space:]]*=[[:space:]]*(volatile|none)' "$f"; then
+                printf '%s' "$f"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+# The drop-in's own text is ASCII, alone in this file: it is parsed by a daemon
+# at boot on hosts whose locale nobody here chose, and a journal that will not
+# start is the one failure this step must not be able to cause. The reasoning
+# lives in the comments above, in the repository, where it can be read.
+journal_dropin_body() {
+    local with_bounds="$1"
+    cat <<EOF
+# Scris de instalatorul Sentinel (pasul 41). Nu edita aici: fisierul e rescris
+# din depozit la fiecare deploy.
+#
+# Ca sa pui praguri proprii, scrie-le in ${JOURNALD_CONF} sau intr-un drop-in
+# separat. Instalatorul le vede si atunci nu mai scrie niciun prag aici, doar
+# linia Storage.
+#
+# De ce persistent: pe RHEL si derivate implicitul e jurnal in /run, deci
+# fiecare repornire sterge toate dovezile de autentificare. Pe 10 septembrie
+# 2026 productia a pierdut asa patru zile de sshd.
+[Journal]
+Storage=persistent
+EOF
+    if [[ "$with_bounds" == "yes" ]]; then
+        cat <<EOF
+# Marginit pe AMANDOUA axele: marimea apara partitia pe care sta PostgreSQL,
+# timpul tine fereastra de dovezi previzibila pe o gazda tacuta. MaxFileSec e
+# ce face pragul de timp sa functioneze: retentia sterge FISIERE intregi, deci
+# fara rotire zilnica un fisier care acopera toata fereastra nu expira niciodata.
+Compress=yes
+SystemMaxUse=${JOURNAL_MAX_USE}
+SystemMaxFileSize=${JOURNAL_MAX_FILE_SIZE}
+MaxFileSec=${JOURNAL_MAX_FILE_SEC}
+MaxRetentionSec=${JOURNAL_RETENTION}
+EOF
+    fi
+}
+
+# Writes the drop-in only when its content would change. Returns 0 when it wrote
+# something, 1 when the file was already exactly this.
+#
+# Overwritten rather than given the `install_config` treatment (a `.new`
+# alongside) on purpose: this file is ours, named ours, and carries repo
+# content. The operator's file is $JOURNALD_CONF, and `journal_operator_bounds`
+# is what keeps this one out of its way.
+journal_write_dropin() {
+    local body="$1" current="" tmp
+    if [[ -f "$JOURNALD_DROPIN" ]]; then
+        current="$(cat "$JOURNALD_DROPIN")" || current=""
+    fi
+    # String comparison, NOT `cmp`: diffutils is not on a minimal RHEL image and
+    # `cmp: command not found` made this report "changed" every single time —
+    # measured on a fresh AlmaLinux 9, where the second run rewrote a file that
+    # was already byte-identical and warned the operator about it. Both sides
+    # have had their trailing newlines stripped by `$( )`, so they compare on
+    # the same footing.
+    if [[ "$current" == "$body" ]]; then
+        return 1
+    fi
+    tmp="$(mktemp)"
+    printf '%s\n' "$body" > "$tmp"
+    install -D -m 0644 -o root -g root "$tmp" "$JOURNALD_DROPIN"
+    rm -f "$tmp"
+    return 0
+}
+
+journald_restarts() {
+    systemctl show systemd-journald -p NRestarts --value 2>/dev/null | tr -dc '0-9' || true
+}
+
+# Restart systemd-journald and prove it stayed up.
+#
+# A unit read as `active` once is not proof it is running: systemd-journald has
+# Restart=always, so a daemon dying on a configuration it cannot parse passes
+# through `active` on every lap of the loop. That is the "is-active checked
+# once" row of CLAUDE.md's table, and it is why this waits and then asks a
+# second, different question.
+#
+# NRestarts counts AUTOMATIC restarts, but an explicit `systemctl restart` —
+# ours, right above — does NOT leave it unchanged: it RESETS the counter to 0,
+# because systemd flushes n_restarts on the next non-automatic start. Measured
+# with a throwaway transient unit on systemd 255; NOT measured on production's
+# systemd-252-67.el9_8.6, so the reset there is relied on, not proven — but it
+# is the reading that matches the incident that put this step here: journald
+# was restarted by `dnf update` on 25 September 2026 and reads NRestarts=0
+# right now, not "unchanged from before the update". So "before == after" was
+# never the right question — a healthy host whose journald auto-restarted
+# earlier this boot has before > 0 and after == 0, and that FAILED the old
+# assertion. What has to hold after OUR restart and the settle window is
+# `after == 0`: anything else is an automatic restart that happened on our
+# watch, i.e. a live crash loop, regardless of what `before` was.
+journald_restart_and_settle() {
+    local before after waited=0
+    before="$(journald_restarts)"
+    systemctl restart systemd-journald || return 1
+    while (( waited < JOURNALD_SETTLE_S )); do
+        systemctl is-active --quiet systemd-journald || return 1
+        sleep 1
+        waited=$((waited + 1))
+    done
+    systemctl is-active --quiet systemd-journald || return 1
+    after="$(journald_restarts)"
+    if [[ -z "$before" || -z "$after" ]]; then
+        warn "systemd nu raportează NRestarts pentru systemd-journald, deci nu pot \
+spune dacă a repornit singur în cele ${JOURNALD_SETTLE_S}s de așteptare. Rămâne \
+neverificat, nu în regulă: journalctl -u systemd-journald -n 50"
+        return 0
+    fi
+    (( after == 0 )) || return 1
+    return 0
+}
+
+# The cursor journald hands back for the first entry at or after `$1`.
+#
+# `journalctl --cursor` positions AS CLOSE AS IT CAN and reads forward; it does
+# not fail on a cursor the journal no longer holds. So the only proof that a
+# stored position still exists is an entry carrying that very `__CURSOR`,
+# compared as a string — the same test `_journal_first_unread` makes in
+# sentinel/selfcheck/checks.py, on purpose, so the two cannot come to disagree
+# about what "the cursor is still there" means.
+#
+# `-n 1` is NOT usable here, and that is not a style preference: with
+# `--cursor … -n 1` journalctl prints the LAST entry of the journal and ignores
+# the cursor entirely. Measured — a cursor with a deliberately corrupted seqnum
+# id came back matching itself, i.e. that form of the probe would have reported
+# every cursor as valid, forever.
+journal_cursor_at() {
+    local out
+    out="$(journalctl --cursor "$1" -o export --output-fields=MESSAGE 2>/dev/null \
+           | grep -a -m1 '^__CURSOR=' || true)"
+    printf '%s' "${out#__CURSOR=}"
+}
+
+# Is this the shape of a journald cursor — six hex fields, named and in order?
+#
+# Checked byte by byte, NOT with `[[ =~ ]]`, and that is the whole point: bash's
+# bracket expressions follow the locale, so `[0-9a-f]` under a UTF-8 locale
+# matches fullwidth and Arabic-Indic digits as well. This repository has paid
+# for that hole once already. `tr -dc` filters BYTES, so "what survives the
+# filter is exactly what went in" is a whitelist in ANY locale — and, unlike a
+# regex with `LC_ALL=C` in front of it, it is a property a test can actually
+# exercise on a development machine. That matters more than it sounds: the
+# LC_ALL=C version of this function was written first, and no test on this
+# machine could be made to see it removed. A defence nobody can watch disappear
+# is not a defence.
+#
+# `set -f` in the subshell: the split below is deliberately unquoted, so without
+# it a cursor carrying a glob character would be expanded against the filesystem.
+journal_cursor_is_wellformed() {
+    (
+        set -f
+        local cursor="$1" part key val n=0
+        for part in ${cursor//;/ }; do
+            n=$((n + 1))
+            [[ "$part" == *=* ]] || exit 1
+            key="${part%%=*}"
+            val="${part#*=}"
+            [[ -n "$val" && "$val" == "$(printf '%s' "$val" | tr -dc '0-9a-f')" ]] || exit 1
+            case "${n}:${key}" in
+                1:s|2:i|3:b|4:m|5:t|6:x) ;;
+                *) exit 1 ;;
+            esac
+        done
+        (( n == 6 ))
+    )
+}
+
+# Everything after the seqnum id: the ENTRY's own identity — its sequence
+# number, boot id, monotonic and realtime timestamps, and the xor hash of its
+# fields. Two cursors with the same tail name the same entry.
+journal_cursor_identity() { printf '%s' "${1#*;}"; }
+
+journal_db_port() { pg_configured_port "$(pg_confdir)"; }
+
+sshd_cursor_stored() {
+    sudo -u postgres psql -p "$1" -d sentinel -tAc \
+        "SELECT cursor FROM collector_cursors WHERE name = 'sshd'" 2>/dev/null \
+        | tr -d '[:space:]' || true
+}
+
+# Moves the stored position to a cursor of the SAME entry. Prints "1" when a row
+# was updated.
+#
+# `WHERE … AND cursor = :'old'` is not belt and braces: sentinel-ingest is
+# running while this happens and writes the cursor of every entry it reads. If
+# it moved on by itself between the read and this write, its value is a fresh
+# valid one, and this must not put an older position back over it. The update
+# then affects no rows, which is the correct outcome and is reported as such.
+#
+# Wrapped in a SELECT because a bare `UPDATE … RETURNING 1` under `psql -tA`
+# prints TWO things — the returned row and the command tag — so the output was
+# "1UPDATE1" after whitespace was stripped, never "1". Measured on AlmaLinux 9:
+# the re-anchor did rewrite the row and then told the operator it had not.
+# `count(*)` over the update's own rows is one line, "0" or "1", and cannot be
+# read two ways.
+#
+# stderr is NOT discarded. A failing UPDATE here leaves the collector's position
+# unreadable to the selfcheck, and PostgreSQL's own words are the whole
+# diagnostic.
+sshd_cursor_reanchor() {
+    local port="$1" old="$2" new="$3" old_e new_e
+    old_e="$(pg_psql_set_escape "$old")"
+    new_e="$(pg_psql_set_escape "$new")"
+    sudo -u postgres psql -p "$port" -d sentinel -tA -v ON_ERROR_STOP=1 <<SQL | tr -d '[:space:]'
+\set old '${old_e}'
+\set new '${new_e}'
+WITH moved AS (
+  UPDATE collector_cursors SET cursor = :'new', updated_at = now()
+   WHERE name = 'sshd' AND cursor = :'old' RETURNING 1
+) SELECT count(*)::text FROM moved;
+SQL
+}
+
+# THE FLUSH MOVES EVERY CURSOR. Measured, not read out of a manual.
+#
+# On AlmaLinux 9.8 / systemd 252-67.el9_8.4.alma.1 — production's exact build —
+# a first-ever `journalctl --flush` rewrites the seqnum id of every entry it
+# copies:
+#
+#   before  s=795f11d7…;i=2bf;b=…;m=…;t=…;x=…
+#   after   s=7b34064c…;i=2bf;b=…;m=…;t=…;x=…
+#
+# Only `s=` changes; `i=`, `b=`, `m=`, `t=` and `x=` are byte-identical, because
+# they are the same entries — re-filed under the new system journal's own
+# sequence id. `_journal_first_unread` in sentinel/selfcheck/checks.py compares
+# the stored cursor as a STRING, so without this the very next selfcheck run
+# would find `collector_cursors.sshd` missing from the journal, report
+# `state=gone` -> `down`, and this step would manufacture on every install
+# exactly the false critical that three rounds of work have just removed.
+#
+# The repair is exact rather than approximate: a new cursor is accepted only
+# when its ENTRY IDENTITY is identical to the stored one, i.e. it names the same
+# entry. Anything else — the position genuinely gone, the journal rotated under
+# a stopped collector, a malformed value in the row — is left alone and said out
+# loud. Moving a cursor forward over entries nobody has read is a hole in the
+# record, and it would be a silent one.
+journal_reanchor_sshd_cursor() {
+    local port old new
+    if ! have psql; then
+        warn "psql lipsește, deci nu pot verifica poziția colectorului sshd după \
+flush. Dacă gazda are baza Sentinel, verific-o manual — vezi docs/OPERARE.md §9"
+        return 0
+    fi
+    port="$(journal_db_port)"
+    old="$(sshd_cursor_stored "$port")"
+    if [[ -z "$old" ]]; then
+        info "nu există (încă) o poziție sshd în collector_cursors — nimic de mutat"
+        return 0
+    fi
+    if ! journal_cursor_is_wellformed "$old"; then
+        warn "poziția sshd din collector_cursors nu are forma unui cursor journald \
+și nu o ating. Autoverificarea o va raporta: journalctl -u sentinel-ingest -n 100"
+        return 0
+    fi
+    new="$(journal_cursor_at "$old")"
+    if [[ "$new" == "$old" ]]; then
+        ok "poziția colectorului sshd a supraviețuit flush-ului neschimbată"
+        return 0
+    fi
+    if [[ -z "$new" ]] \
+       || [[ "$(journal_cursor_identity "$new")" != "$(journal_cursor_identity "$old")" ]]; then
+        warn "poziția colectorului sshd nu mai e în jurnal, iar ce urmează după ea e \
+ALTĂ intrare — nu o mut, fiindcă aș sări peste intrări pe care nu le-a citit \
+nimeni. Autoverificarea o raportează ca și-a pierdut poziția: \
+systemctl restart sentinel-ingest ; journalctl -u sentinel-ingest -n 100"
+        return 0
+    fi
+    if [[ "$(sshd_cursor_reanchor "$port" "$old" "$new")" == "1" ]]; then
+        ok "poziția colectorului sshd a fost re-ancorată pe ACEEAȘI intrare după \
+flush (s-a schimbat doar identificatorul de secvență al jurnalului)"
+    else
+        info "poziția sshd nu a fost rescrisă: colectorul a avansat-o singur între \
+citire și scriere, deci valoarea din bază e deja una proaspătă"
+    fi
+}
+
+# SELinux labelling for $1. Never fatal on its own — the persistence check is
+# what decides, and a mislabelled directory under enforcing shows up there as a
+# journald that did not move.
+journal_selinux_label() {
+    local dir="$1" want got
+    have selinuxenabled || return 0
+    if ! selinuxenabled; then
+        # Production is here: AlmaLinux 9 with SELinux Disabled (measured).
+        # `restorecon` refuses to run with the policy off, so the directory
+        # simply carries no label yet. That is neither a failure nor "fine", and
+        # it is said rather than skipped in silence.
+        info "SELinux e dezactivat: ${dir} nu primește etichetă acum. La repornirea \
+SELinux o pune relabelarea de la boot, ori restorecon -RF ${dir} manual"
+        return 0
+    fi
+    if ! have restorecon; then
+        warn "SELinux e activ dar restorecon lipsește; ${dir} rămâne cu eticheta \
+moștenită de la /var/log — verific-o cu: ls -Zd ${dir}"
+        return 0
+    fi
+    restorecon -RF "$dir" || warn "restorecon a eșuat pe ${dir}"
+    # Verified, not assumed: what the FILESYSTEM carries against what the POLICY
+    # asks for. `restorecon`'s exit code says a call was made, not that the label
+    # is right.
+    got="$(stat -c %C "$dir" 2>/dev/null || true)"
+    if have matchpathcon; then
+        want="$(matchpathcon -n "$dir" 2>/dev/null | tr -d '[:space:]' || true)"
+    else
+        want=""
+    fi
+    if [[ -n "$want" && -n "$got" && "$got" != "$want" ]]; then
+        warn "eticheta SELinux a lui ${dir} e ${got}, dar politica cere ${want}"
+    else
+        ok "SELinux: ${dir} poartă eticheta ${got:-necunoscută}"
+    fi
+}
+
+# Ownership and mode, checked and never widened.
+#
+# 2755 root:systemd-journal is systemd's own tmpfiles definition for this
+# directory, and the setgid bit is what makes the per-machine subdirectory
+# journald creates inside it group-owned by systemd-journal — which is how the
+# `sentinel` user reads the journal at all (step 19 puts it in that group). An
+# existing directory is NOT chmodded to match: an operator who tightened it gets
+# a warning, not a silent widening.
+journal_check_dir_mode() {
+    local dir="$1" mode owner
+    mode="$(stat -c %a "$dir" 2>/dev/null || true)"
+    owner="$(stat -c %U:%G "$dir" 2>/dev/null || true)"
+    if [[ -z "$mode" || -z "$owner" ]]; then
+        warn "nu pot citi drepturile lui ${dir} — neverificat"
+        return 0
+    fi
+    if [[ "$mode" == "2755" && "$owner" == "root:systemd-journal" ]]; then
+        ok "${dir} e ${mode} ${owner}"
+    else
+        warn "${dir} e ${mode} ${owner}, nu 2755 root:systemd-journal. Nu îl schimb \
+(o restrângere făcută de tine nu se desface de aici), dar dacă utilizatorul \
+sentinel nu mai citește jurnalul, ăsta e motivul"
+    fi
+}
+
+# Does the host now DEMONSTRATE persistence? Ends the run when it does not.
+#
+# Five separate facts, because each one alone has a way of being true while the
+# thing it stands for is false:
+#
+#   * journald reports an ONLINE file under $JOURNAL_DIR — the daemon is writing
+#     there, as opposed to a directory somebody created;
+#   * journal files exist in it;
+#   * `journalctl -D` reads history out of that directory ALONE, so the answer
+#     cannot be coming from /run;
+#   * nothing is left in the runtime directory, which is what makes the three
+#     above evidence rather than coincidence;
+#   * journald's own MAX_USE is no larger than what was asked for.
+journal_verify_persistent() {
+    local mid="$1" with_bounds="$2" state max_use digits f files=0
+    state="$(journal_storage_state)"
+    [[ "$state" == "persistent" ]] || die "journald tot nu scrie în ${JOURNAL_DIR}: \
+starea măsurată după repornire și flush e \"${state}\". Jurnalul rămâne volatil, \
+deci dovezile de autentificare tot dispar la repornire. Vezi: \
+journalctl --header | head -20 ; systemctl status systemd-journald"
+
+    for f in "${JOURNAL_DIR}/${mid}"/*.journal; do
+        if [[ -f "$f" ]]; then
+            files=$((files + 1))
+        fi
+    done
+    (( files > 0 )) || die "nu există niciun fișier de jurnal în ${JOURNAL_DIR}/${mid}/ \
+după flush — directorul e gol, deci nu s-a mutat nimic acolo"
+
+    [[ -n "$(journalctl -D "$JOURNAL_DIR" -n 1 -o cat 2>/dev/null)" ]] || die \
+"journalctl nu citește nicio intrare din ${JOURNAL_DIR} singur — fișierele sunt \
+acolo, dar nu conțin un jurnal lizibil"
+
+    for f in "${JOURNAL_RUNTIME_DIR}/${mid}"/*.journal; do
+        if [[ -f "$f" ]]; then
+            die "flush-ul nu a golit ${JOURNAL_RUNTIME_DIR}/${mid}/ — au rămas fișiere \
+acolo, deci o parte din istoric e tot volatilă"
+        fi
+    done
+
+    max_use="$(journal_effective_max_use)"
+    digits="$(printf '%s' "$max_use" | tr -dc '0-9')"
+    # Compared as strings, not with `[[ =~ ]]`: `[0-9]` is not ASCII under a
+    # UTF-8 locale, and an error inside `(( ))` returns 1 — which reads as
+    # "false" and would let a non-numeric value through the bound check below.
+    [[ -n "$digits" && "$digits" == "$max_use" ]] || die "journald nu a raportat un \
+MAX_USE numeric pentru jurnalul de sistem în boot-ul ăsta (a spus \"${max_use}\"), \
+deși tocmai a fost repornit — nu pot dovedi că pragul de mărime e în vigoare, iar \
+un jurnal nemărginit pe partiția bazei de date nu e o îmbunătățire"
+
+    if [[ "$with_bounds" == "yes" ]] && (( max_use > JOURNAL_MAX_USE_BYTES )); then
+        die "journald aplică un prag de ${max_use} octeți, mai mare decât cei \
+${JOURNAL_MAX_USE_BYTES} scriși în ${JOURNALD_DROPIN} — configurația nu a fost \
+citită. Vezi: systemd-analyze cat-config systemd/journald.conf"
+    fi
+    ok "journald raportează pragul efectiv de mărime: ${max_use} octeți"
+
+    # The time bound has NO runtime observable — journald reports its retention
+    # nowhere until the day it fires ("Retention time reached, rotating"). So
+    # this one is read back from the file and is LABELLED as read from the file,
+    # rather than being reported in the same breath as the measured one.
+    if [[ "$with_bounds" == "yes" ]]; then
+        if grep -qE "^MaxRetentionSec=${JOURNAL_RETENTION}\$" "$JOURNALD_DROPIN"; then
+            ok "pragul de timp e scris (MaxRetentionSec=${JOURNAL_RETENTION}) — journald \
+nu raportează retenția nicăieri până când chiar șterge, deci ăsta e citit din \
+configurație, nu măsurat"
+        else
+            die "${JOURNALD_DROPIN} nu conține MaxRetentionSec=${JOURNAL_RETENTION} \
+după scriere — jurnalul ar fi mărginit doar pe mărime"
+        fi
+    fi
+    return 0
+}
+
+step_journal_storage() {
+    local mid state operator_bounds with_bounds body volatile_file max_use
+
+    state="$(journal_storage_state)"
+    operator_bounds="$(journal_operator_bounds)"
+    with_bounds=yes
+    if [[ -n "$operator_bounds" ]]; then
+        with_bounds=no
+    fi
+    body="$(journal_dropin_body "$with_bounds")"
+
+    if [[ "$state" == "unknown" ]]; then
+        warn "nu pot citi unde scrie journald (journalctl --header nu a răspuns, ori \
+niciun fișier nu e ONLINE), deci nu ating nimic. O repornire a lui \
+systemd-journald pe o gazdă despre care nu știu nimic e mai rea decât un jurnal \
+volatil. Verifică manual: journalctl --header | head -20"
+        return 0
+    fi
+
+    if [[ "$state" == "persistent" ]]; then
+        mid="$(journal_machine_id)" || mid="?"
+        ok "jurnalul e deja persistent: journald scrie în ${JOURNAL_DIR}/${mid}/"
+        max_use="$(journal_effective_max_use)"
+        if [[ -n "$max_use" ]]; then
+            info "pragul de mărime raportat de journald: ${max_use} octeți"
+        fi
+        if [[ -n "$operator_bounds" ]]; then
+            ok "praguri puse de tine, lăsate neatinse:"
+            printf '%s\n' "$operator_bounds" | sed 's/^/      /'
+            return 0
+        fi
+        # Persistent and unbounded except for journald's built-in 4 G ceiling.
+        # The drop-in goes in so the NEXT journald start picks it up, and
+        # systemd-journald is deliberately NOT restarted: a restart on a host
+        # that already keeps its history is a change nobody asked for, for a cap
+        # that is already there. Said out loud instead of applied quietly.
+        if journal_write_dropin "$body"; then
+            warn "gazda ține jurnalul, dar fără praguri proprii. Am scris \
+${JOURNALD_DROPIN} (${JOURNAL_MAX_USE} / ${JOURNAL_RETENTION}) și NU repornesc \
+systemd-journald pe o gazdă care e deja în regulă — pragurile intră în vigoare la \
+următoarea pornire a lui journald. Ca să le aplici acum: systemctl restart \
+systemd-journald"
+        else
+            ok "${JOURNALD_DROPIN} e deja exact ăsta; nimic de făcut"
+        fi
+        return 0
+    fi
+
+    # state == runtime: this host loses its authentication history at every boot,
+    # and that is the whole reason this step exists.
+    mid="$(journal_machine_id)" || die "internal: starea jurnalului e \"runtime\", \
+dar ${MACHINE_ID_PATH} nu se poate citi"
+    info "journald scrie în ${JOURNAL_RUNTIME_DIR}/${mid}/ — jurnalul e volatil și \
+dispare la fiecare repornire, cu tot ce știe despre autentificări"
+
+    if volatile_file="$(journal_storage_forced_volatile)"; then
+        warn "${volatile_file} cere explicit un jurnal volatil. Nu îl suprascriu — \
+scoate linia Storage= de acolo și rulează din nou cu --force-step 41 dacă vrei ca \
+jurnalul să supraviețuiască repornirii"
+        return 0
+    fi
+
+    if [[ ! -d "$JOURNAL_DIR" ]]; then
+        install -d -m 2755 -o root -g systemd-journal "$JOURNAL_DIR" \
+            || die "nu pot crea ${JOURNAL_DIR}"
+        ok "creat ${JOURNAL_DIR}"
+    fi
+    journal_check_dir_mode "$JOURNAL_DIR"
+    journal_selinux_label "$JOURNAL_DIR"
+
+    if journal_write_dropin "$body"; then
+        ok "scris ${JOURNALD_DROPIN}"
+    else
+        info "${JOURNALD_DROPIN} era deja scris"
+    fi
+    if [[ "$with_bounds" == "no" ]]; then
+        warn "pragurile rămân ale tale (${operator_bounds//$'\n'/; }); am scris în \
+${JOURNALD_DROPIN} doar Storage=persistent"
+    fi
+
+    # journald reads its configuration only at startup — `systemctl show
+    # systemd-journald -p CanReload` answers no, measured — so the bounds need
+    # the restart. The flush needs it too, in the other direction: journald stays
+    # on runtime storage until it is ASKED, whatever the configuration says, and
+    # `systemctl start systemd-journal-flush` is not the way to ask. That unit is
+    # a oneshot which already ran at boot and is `active (exited)`, so starting it
+    # is a no-op returning 0 — measured, and it is what made a first draft of this
+    # step report a successful flush that had never happened.
+    journald_restart_and_settle \
+        || die "systemd-journald nu a rămas pornit după repornire — configurația din \
+${JOURNALD_DROPIN} e probabil respinsă. Vezi: journalctl -u systemd-journald -n 50 \
+; systemctl status systemd-journald"
+    journalctl --flush || die "journalctl --flush a eșuat; jurnalul rămâne în \
+${JOURNAL_RUNTIME_DIR}"
+
+    journal_verify_persistent "$mid" "$with_bounds"
+    ok "jurnalul supraviețuiește acum repornirii: ${JOURNAL_DIR}/${mid}/"
+
+    journal_reanchor_sshd_cursor
+}
+
+# --- 42 ---------------------------------------------------------------
+# Closes the exposure CLAUDE.md opens with: on every host installed before
+# `telegram.allowed_user_ids` existed, `allowed_chat_ids` names a GROUP and the
+# key that would narrow it to specific senders is ABSENT from the file, not
+# empty. `_authorized` in sentinel/telegram/bot.py already does the right
+# thing the moment the key is there — see its own docstring — so the only gap
+# left is that nothing ever puts it there on a host that predates it.
+#
+# `install_config` (step 26) will never close that gap on its own: it does not
+# touch a sentinel.yaml that differs from the template, on purpose — a full
+# rewrite on the two hosts this was found on would also flip
+# `beacon.enabled`/`ship.enabled` to false and stop the external witness (see
+# `install_config`'s own docstring). So this is a SECOND, narrower writer, for
+# ONE key, that never touches anything install_config would refuse to touch.
+#
+# SURGICAL, not a YAML round-trip. `yaml.safe_load` + `yaml.safe_dump` would
+# reorder keys, drop every comment that explains them, and possibly requote
+# list items — trading "we left your config alone" for "we touched all of
+# it, structurally". The functions below find exactly one line inside the
+# `telegram:` block (or exactly one place to insert one) and change nothing
+# else — see the read-back-and-diff test in
+# tests/security/test_telegram_owner_allowlist.py for what "nothing else"
+# means in practice.
+
+# Prints the leading whitespace `telegram:`'s children use, measured from the
+# sibling `enabled:` line — never hard-coded as two spaces. Every host that
+# reaches this step already satisfies "Sentinel refuses to start with
+# telegram.enabled and no chat ids" (deploy/config/sentinel.yaml.tmpl), so
+# `enabled:` is always there to measure from; a fixed guess would be a SECOND,
+# unchecked idea of the file's own formatting, and the two would disagree on
+# any sentinel.yaml this installer did not itself template.
+telegram_allowed_user_ids_indent() {
+    awk '
+        /^[^ \t#]/ { in_tg = ($0 ~ /^telegram:[ \t]*$/); next }
+        in_tg && match($0, /^[ \t]+enabled:/) {
+            print substr($0, 1, RLENGTH - length("enabled:"))
+            exit
+        }
+    ' "$1"
+}
+
+# True (exit 0) only when `allowed_user_ids:` is already there with NOTHING
+# after the colon on its own line, AND is followed by a block-sequence item
+# (`  - …`) at deeper indentation — the one shape this installer and the
+# template never write and therefore never learned to rewrite. Returning
+# "not ambiguous" (exit 1) is the default for every other case, including
+# "key absent", because absence is not this function's question to answer.
+telegram_allowed_user_ids_is_block_form() {
+    local yaml="$1" indent="$2"
+    awk -v indent="$indent" '
+        /^[^ \t#]/ { in_tg = ($0 ~ /^telegram:[ \t]*$/); next }
+        in_tg && !seen && index($0, indent "allowed_user_ids:") == 1 {
+            rest = substr($0, length(indent "allowed_user_ids:") + 1)
+            sub(/^[ \t]+/, "", rest); sub(/[ \t]+$/, "", rest)
+            seen = 1
+            if (rest == "") pending = 1
+            next
+        }
+        # `exit` from a main-loop action does not stop the program — it jumps
+        # to END, which then runs regardless. A first draft had an
+        # unconditional `exit 1` in END, which clobbered the `exit 0` set
+        # here on every genuinely block-form input and always reported
+        # "not ambiguous" — falsified by feeding it exactly that shape.
+        # `decided` is what makes END defer to a verdict already reached.
+        #
+        # Two shapes fall through this without stopping the search, both
+        # legal YAML: a blank or full-line-comment line between the key and
+        # its first item (the item is still the value of that key, not a
+        # reason to give up), and a sequence item at the OWN INDENT OF THE
+        # KEY itself — YAML never requires a block sequence to be indented
+        # past its parent key; assuming it always would be is what left this
+        # shape undetected. Missing either meant this function said "not
+        # block form" on a genuinely block-form file, and the rewrite path
+        # below then replaced the key line and left its items dangling as
+        # invalid YAML.
+        pending {
+            if ($0 ~ /^[ \t]*$/ || $0 ~ ("^" indent "[ \t]*#")) next
+            decided = 1
+            if ($0 ~ ("^" indent "(  )?-[ \t]")) exit 0
+            exit 1
+        }
+        END { if (!decided) exit 1 }
+    ' "$yaml"
+}
+
+# Prints the COMPLETE new file content on stdout — every line copied through
+# unchanged except the one that carries `allowed_user_ids`, which is either
+# rewritten in place or, if absent, appended as the last child of the
+# `telegram:` block. The caller decides whether anything actually changed by
+# comparing this output to the original file as STRINGS (never `cmp`:
+# diffutils is not on a minimal RHEL image — see journal_write_dropin's own
+# comment for the run that discovered this the hard way).
+#
+# A trailing `# comment` already on the `allowed_user_ids` line survives,
+# because an operator who annotated it by hand did not ask for the annotation
+# to be a casualty of narrowing who may act.
+#
+# Blank lines inside `telegram:` while the key is still unhandled are BUFFERED,
+# not printed immediately, and flushed only after the insertion (or at EOF).
+# Both live hosts separate `telegram:` from the next section with a blank
+# line, so without buffering the appended key would print right before that
+# blank line's next non-blank neighbour — the NEXT section's first key — and
+# land visually attached to the wrong block, valid YAML but wrong on sight to
+# whoever opens the file next. Buffering keeps the insertion adjacent to the
+# keys it actually belongs with and reproduces the blank line after it,
+# unmoved.
+telegram_allowed_user_ids_rewrite() {
+    local yaml="$1" indent="$2" newval="$3"
+    awk -v indent="$indent" -v newval="$newval" '
+        BEGIN { in_tg = 0; handled = 0; blanks = 0 }
+        function flush_blanks(    i) { for (i = 0; i < blanks; i++) print ""; blanks = 0 }
+        /^[ \t]*$/ && in_tg && !handled { blanks++; next }
+        /^[^ \t#]/ {
+            if (in_tg && !handled) {
+                print indent "allowed_user_ids: " newval
+                handled = 1
+            }
+            flush_blanks()
+            in_tg = ($0 ~ /^telegram:[ \t]*$/)
+            print
+            next
+        }
+        in_tg && !handled && index($0, indent "allowed_user_ids:") == 1 {
+            handled = 1
+            flush_blanks()
+            rest = substr($0, length(indent "allowed_user_ids:") + 1)
+            sub(/^[ \t]+/, "", rest)
+            comment = ""
+            if (substr(rest, 1, 1) == "[") {
+                close_at = index(rest, "]")
+                if (close_at > 0) {
+                    comment = substr(rest, close_at + 1)
+                    sub(/^[ \t]+/, "", comment)
+                }
+            } else if (substr(rest, 1, 1) == "#") {
+                comment = rest
+            }
+            out = indent "allowed_user_ids: " newval
+            if (comment != "") out = out "  " comment
+            print out
+            next
+        }
+        # Flushes here too, not just at the two explicit call sites above:
+        # any ordinary content line reached this far means the blank run
+        # that preceded it (if any) was a gap BETWEEN two real lines, not a
+        # trailing gap before the insertion point, and must reappear exactly
+        # where it was. Without this, every blank line anywhere inside
+        # telegram: before the key is found gets swept up into ONE buffer
+        # and dumped together wherever handling finally happens — deleting
+        # every interior blank line and duplicating the trailing one.
+        { flush_blanks(); print }
+        END {
+            if (in_tg && !handled) print indent "allowed_user_ids: " newval
+            flush_blanks()
+        }
+    ' "$yaml"
+}
+
+# Runs the codebase's OWN loader — sentinel.config.load_config, the exact
+# function sentinel-telegram calls at its own startup — against $1, and
+# confirms it deserialises telegram.allowed_user_ids to EXACTLY [$2].
+#
+# Not `sentinel config-check`: that proves the file is valid YAML that
+# satisfies the Config dataclass, which is necessary but not what this step
+# needs proof of. It needs proof that the specific key it just wrote is the
+# specific value it meant to write, through the same parsing the daemon uses
+# on itself — a syntax check alone would pass just as happily over a value
+# written to the wrong key, or coerced to the wrong id, and call it done.
+#
+# Exit status distinguishes three things, on purpose, the way this whole
+# repository insists "unknown" and "wrong" must stay distinguishable:
+#   0  confirmed — the file parses and the id matches
+#   1  the file is invalid, OR it is valid but the id does not match
+#   2  could not evaluate at all (the venv or sentinel.config is unreachable)
+# A caller that folded 2 into 1 would report "the config is wrong" about a
+# venv it never managed to ask.
+#
+# What that distinction does NOT cover: the python script below reaches its
+# own `sys.exit(2)` only once the interpreter is already running — if
+# "${SENTINEL_PREFIX}/venv/bin/python" itself does not exist, the shell fails
+# to exec it before any of that runs, and the whole command substitution
+# returns 127, a value this function never produces on purpose. The caller's
+# `elif (( rc != 0 ))` folds THAT into "candidatul respins de loaderul
+# Sentinel" — the same "config is wrong" misreport the paragraph above says
+# a caller must not make, just reached through an interpreter that was never
+# there to ask rather than through sentinel.config being unreachable inside
+# one that was. Left unreachable on purpose rather than given a real rc=127
+# branch: step_package (step 24, before this one on every install and every
+# redeploy) already dies on a missing or broken venv interpreter — see its
+# own `executor.policy is not importable` check — so no host that got this
+# far can hand step 42 an rc of 127 to mishandle.
+telegram_config_loads_with_owner() {
+    local path="$1" want="$2"
+    # PYTHONPATH set explicitly, the same as step_deploy_package's import
+    # check (:1765) and the `bin/sentinel` wrapper it writes (:1781) — the
+    # package lives at "${SENTINEL_PREFIX}/lib" with no site-packages install
+    # and no .pth, so a bare venv interpreter cannot see it. Without this,
+    # EVERY call here returns rc=2 on both live hosts, and the caller's rc=2
+    # branch was written to warn loudly about exactly that — but a step whose
+    # own verification path never once resolves the package it claims to
+    # check has not verified anything; it has confirmed its own intent to.
+    env PYTHONPATH="${SENTINEL_PREFIX}/lib" "${SENTINEL_PREFIX}/venv/bin/python" -c '
+import sys
+from pathlib import Path
+try:
+    from sentinel.config import load_config
+    from sentinel.errors import ConfigError
+except Exception as exc:
+    print(f"cannot import sentinel.config: {exc}", file=sys.stderr)
+    sys.exit(2)
+path, want = Path(sys.argv[1]), int(sys.argv[2])
+try:
+    cfg = load_config(path)
+except ConfigError as exc:
+    print(f"config invalid: {exc}", file=sys.stderr)
+    sys.exit(1)
+got = list(cfg.telegram.allowed_user_ids)
+if got != [want]:
+    print(f"telegram.allowed_user_ids parsed to {len(got)} id(s), not the one "
+          f"just written", file=sys.stderr)
+    sys.exit(1)
+' "$path" "$want"
+}
+
+step_telegram_owner() {
+    local target="${SENTINEL_CONFIG_DIR}/sentinel.yaml"
+    local user_id="${SECRETS[TELEGRAM_OWNER_USER_ID]:-}"
+    # Read from stdin FIRST, the file on disk SECOND — the same order and the
+    # same reason as everywhere else this pattern appears: an operator who
+    # supplies the key on a re-run where step 27 is already marked done (so
+    # its own write to secrets.env never runs this time) must still see this
+    # step act on it THIS run, not be told to also remember --force-step 27.
+    [[ -n "$user_id" ]] || user_id="$(existing_secret TELEGRAM_OWNER_USER_ID || true)"
+
+    if [[ -z "$user_id" ]]; then
+        warn "TELEGRAM_OWNER_USER_ID nu a fost furnizat — telegram.allowed_user_ids \
+NU e atins. Pe orice gazdă unde allowed_chat_ids conține un GRUP, oricine din grupul \
+ăla poate încă bloca, debloca și aproba patch-uri (docs/TELEGRAM.md §2, §8). Adaugă \
+TELEGRAM_OWNER_USER_ID în secrets/.env.local și repornește deploy-ul."
+        closing_note "Telegram: allowed_user_ids nu e restrâns (TELEGRAM_OWNER_USER_ID \
+lipsă din secrets) — orice membru al grupurilor din allowed_chat_ids poate acționa"
+        return 0
+    fi
+
+    # Spelled out digit by digit, not `[0-9]`, and LC_ALL=C set as a LOCAL —
+    # never `LC_ALL=C [[ …` as a prefix, which does nothing because `[[` is a
+    # keyword and takes no env assignment in front of it.
+    #
+    # Corrected 25 September 2026: an earlier version of this comment claimed
+    # `[0-9]` under a UTF-8 locale is a collation range that also matches
+    # fullwidth and Arabic-Indic digits. Measured directly on both live hosts
+    # (en_US.UTF-8, C.UTF-8, en_US.utf8, C; glibc 2.34 and 2.39, bytes of the
+    # fullwidth string confirmed ef bc 99 ef bc 91 ef bc 98): `[[ ９１８ =~
+    # ^[0-9]+$ ]]` is `nomatch` in every one of those combinations. `[0-9]`
+    # does not let a value like that through here, on either host, in any
+    # locale tried — the earlier claim was never checked against a real
+    # glibc and was wrong.
+    #
+    # The guard stays anyway, spelled out and under LC_ALL=C, for a reason
+    # that does not depend on that claim: `sentinel.config._coerce_list_items`
+    # already requires `isinstance(item, int)`, so `load_config` refuses a
+    # non-numeric id on its own, guard or no guard — but its message is
+    # "candidatul nu se încarcă…", which tells the operator nothing about
+    # WHAT is wrong with the secret. This regex exists to say that, before
+    # the file is even touched, not to stop something the loader would
+    # otherwise let through.
+    local LC_ALL=C
+    if [[ ! "$user_id" =~ ^[123456789][0123456789]*$ ]]; then
+        warn "TELEGRAM_OWNER_USER_ID nu arată ca un id numeric Telegram (cifre, fără \
+semn) — telegram.allowed_user_ids NU e atins. Corectează valoarea în \
+secrets/.env.local și repornește deploy-ul."
+        closing_note "Telegram: allowed_user_ids nu e restrâns (TELEGRAM_OWNER_USER_ID \
+nu arată ca un id numeric) — orice membru al grupurilor din allowed_chat_ids poate \
+acționa"
+        return 0
+    fi
+
+    if [[ ! -f "$target" ]]; then
+        warn "${target} nu există — pasul de configurare (26) trebuie să ruleze \
+întâi; allowed_user_ids NU e atins"
+        closing_note "Telegram: allowed_user_ids nu e restrâns (${target} nu există \
+încă) — orice membru al grupurilor din allowed_chat_ids poate acționa"
+        return 0
+    fi
+
+    # `|| indent=""`, not a bare assignment: under `set -e` (this whole
+    # installer runs under it, via common.sh) a plain `x="$(cmd)"` whose
+    # command exits non-zero kills the process right there, before the
+    # emptiness check below ever runs — turning an awk bug in this new code
+    # into a hard abort of the entire install instead of the graceful "cannot
+    # verify, do not touch it" this step exists to be.
+    local indent
+    indent="$(telegram_allowed_user_ids_indent "$target")" || indent=""
+    if [[ -z "$indent" ]]; then
+        warn "${target}: nu găsesc 'telegram: / enabled:' — structura nu e cea \
+așteptată, allowed_user_ids NU e atins"
+        closing_note "Telegram: allowed_user_ids nu e restrâns (${target} nu are \
+structura 'telegram: / enabled:' așteptată) — orice membru al grupurilor din \
+allowed_chat_ids poate acționa"
+        return 0
+    fi
+
+    if telegram_allowed_user_ids_is_block_form "$target" "$indent"; then
+        warn "${target}: allowed_user_ids e deja scris ca listă pe mai multe linii — \
+formă pe care acest pas nu o rescrie, ca să nu ghicească. Editeaz-o manual la o \
+singură linie 'allowed_user_ids: [...]' și rulează din nou cu --force-step 42."
+        closing_note "Telegram: allowed_user_ids nu e restrâns (scris ca listă pe mai \
+multe linii, pasul 42 nu îl rescrie) — orice membru al grupurilor din allowed_chat_ids \
+poate acționa"
+        return 0
+    fi
+
+    # `$(…)` strips EVERY trailing newline, not just one — so a file that
+    # ends "…\n\n" (a real trailing blank line; the live prod sentinel.yaml
+    # is exactly this shape) comes back from a bare `$(cat …)` with BOTH
+    # gone, indistinguishable from a file that ends "…\n". A hardcoded
+    # `printf '%s\n'` at write time then reliably puts back exactly one,
+    # silently deleting whichever blank line the operator's file actually
+    # had. Appending a byte `$(…)` cannot mistake for a newline, and never
+    # legal in this YAML, pins the true trailing bytes in place across the
+    # capture; stripping that one byte back off afterward is exact because
+    # nothing else in the file could have put it there.
+    local current desired eof_pin=$'\x01'
+    current="$(cat "$target" 2>/dev/null && printf '%s' "$eof_pin")" \
+        || {
+        warn "${target} nu poate fi citit — allowed_user_ids NU e atins"
+        closing_note "Telegram: allowed_user_ids nu e restrâns (${target} nu a putut fi \
+citit) — orice membru al grupurilor din allowed_chat_ids poate acționa"
+        return 0
+    }
+    current="${current%"$eof_pin"}"
+    # Same `set -e` reasoning as the indent lookup above: a failure here must
+    # warn and return, not take the whole install down with it. The `&&` before
+    # the pin (not `;`) matters just as much here: on a `;` a failing rewrite
+    # would still let `printf` run and succeed, so the command substitution's
+    # own exit status would report 0 and this `if !` would never fire.
+    if ! desired="$(telegram_allowed_user_ids_rewrite "$target" "$indent" "[${user_id}]" \
+            && printf '%s' "$eof_pin")"; then
+        warn "${target}: rescrierea lui allowed_user_ids a eșuat — NU e atins"
+        closing_note "Telegram: allowed_user_ids nu e restrâns (rescrierea a eșuat) — \
+orice membru al grupurilor din allowed_chat_ids poate acționa"
+        return 0
+    fi
+    desired="${desired%"$eof_pin"}"
+    if [[ -z "$desired" ]]; then
+        warn "${target}: rescrierea lui allowed_user_ids a produs un fișier gol — \
+NU e atins"
+        closing_note "Telegram: allowed_user_ids nu e restrâns (rescrierea a produs un \
+fișier gol) — orice membru al grupurilor din allowed_chat_ids poate acționa"
+        return 0
+    fi
+
+    if [[ "$current" == "$desired" ]]; then
+        ok "telegram.allowed_user_ids e deja restrâns la proprietar — nimic de făcut"
+        return 0
+    fi
+
+    local tmp="${target}.telegram_owner.tmp" rc=0
+    # No added trailing newline here: $desired already carries the exact
+    # trailing bytes telegram_allowed_user_ids_rewrite produced (preserved by
+    # the eof_pin capture above), which already mirrors the source file's own
+    # ending. Appending another '\n' unconditionally is the write-side half
+    # of the same bug the capture just fixed on the read side.
+    printf '%s' "$desired" > "$tmp"
+
+    # Validate the CANDIDATE, through the daemon's own loader, BEFORE it
+    # becomes the live file. A sentinel.yaml edited into invalid YAML and
+    # restarted into takes down the alerting channel — CLAUDE.md's own table
+    # has a row for exactly this mistake, made a different way.
+    telegram_config_loads_with_owner "$tmp" "$user_id" || rc=$?
+    if (( rc == 2 )); then
+        rm -f "$tmp"
+        warn "nu pot verifica ${target} prin propriul loader al Sentinel — venv-ul sau \
+sentinel.config nu se pot atinge de aici. allowed_user_ids NU e atins. Vezi mesajul \
+de mai sus."
+        closing_note "Telegram: allowed_user_ids nu e restrâns (loaderul Sentinel nu a \
+putut fi atins ca să valideze candidatul) — orice membru al grupurilor din \
+allowed_chat_ids poate acționa"
+        return 0
+    elif (( rc != 0 )); then
+        rm -f "$tmp"
+        warn "candidatul pentru ${target} nu se încarcă drept telegram.allowed_user_ids \
+= [${user_id}] prin propriul loader al Sentinel — NU e atins, fișierul rămâne cel \
+vechi. Vezi mesajul de mai sus."
+        closing_note "Telegram: allowed_user_ids nu e restrâns (candidatul respins de \
+loaderul Sentinel) — orice membru al grupurilor din allowed_chat_ids poate acționa"
+        return 0
+    fi
+
+    install -m 0640 -o root -g "${SENTINEL_USER}" "$tmp" "$target"
+    rm -f "$tmp"
+    ok "scris ${target}: telegram.allowed_user_ids restrâns la proprietar"
+
+    # Made discoverable on purpose, not left for whoever finds it later: pe
+    # ambele gazde vii, allowed_chat_ids conține DOAR grupul — niciun chat
+    # privat. Dacă id-ul furnizat aici e greșit, NIMENI, nici operatorul real,
+    # nu mai poate da comenzi în acel grup (`_authorized` din
+    # sentinel/telegram/bot.py îngustează pe expeditor și refuză pe oricine nu
+    # se potrivește) — dar alertele tot pleacă: `_broadcast` trimite pe
+    # `allowed_chat_ids` direct, fără să treacă prin `allowed_user_ids`, deci
+    # canalul de ieșire nu e atins. Raza exploziei e comenzile, nu alertele.
+    # Recuperarea nu trece prin bot: ssh pe gazdă, corectează
+    # TELEGRAM_OWNER_USER_ID în secrets/.env.local și redeployează (sau
+    # editează manual allowed_user_ids în ${target} și
+    # 'systemctl restart sentinel-telegram').
+    closing_note "Telegram: allowed_user_ids restrâns la un singur id. Dacă e greșit, \
+comenzile din grup sunt blocate pentru toată lumea (alertele tot pleacă) — recuperare: \
+ssh pe gazdă, corectează TELEGRAM_OWNER_USER_ID și redeployează, sau editează manual \
+${target} și repornește sentinel-telegram"
+
+    # Through `systemctl`, not `[[ -f /etc/systemd/system/… ]]` — the other
+    # hard-coded-path check this file uses elsewhere (step_start_services) is
+    # correct there and untested anywhere in this repository for exactly the
+    # reason a stub cannot reach a real path under /etc: this asks the one
+    # thing already crossing an executable boundary, which a test can replace.
+    if ! systemctl list-unit-files 'sentinel-telegram.service' --no-legend --no-pager \
+            2>/dev/null | grep -q .; then
+        info "sentinel-telegram.service nu e instalat — nimic de repornit"
+        return 0
+    fi
+    if ! systemctl is-active --quiet sentinel-telegram 2>/dev/null; then
+        info "sentinel-telegram nu rulează acum — fișierul e scris, valoarea nouă se \
+aplică la următoarea pornire a serviciului"
+        return 0
+    fi
+
+    systemctl restart sentinel-telegram || die "sentinel-telegram nu a pornit după \
+scrierea lui allowed_user_ids. journalctl -u sentinel-telegram -n 50"
+
+    # `systemctl restart` returning 0 spune doar că semnalul a plecat, nu că
+    # procesul a rămas pornit — aceeași poartă ca la pasul 32, cu același
+    # motiv: un proces care moare la pornire și e repornit de systemd trece
+    # prin `active` la fiecare ciclu, iar o verificare care se uită o dată îl
+    # prinde exact acolo.
+    local before now_state waited=0 nrestarts
+    before="$(systemctl show sentinel-telegram -p NRestarts --value 2>/dev/null)"
+    while (( waited < SERVICE_SETTLE_S )); do
+        sleep 1; waited=$((waited + 1))
+        now_state="$(systemctl is-active sentinel-telegram 2>/dev/null || true)"
+        if [[ "$now_state" != "active" ]]; then
+            journalctl -u sentinel-telegram -n 40 --no-pager >&2
+            die "sentinel-telegram nu a rămas pornit după schimbarea lui \
+allowed_user_ids: după ${waited}s e '${now_state:-necunoscut}'. Vezi \
+journalctl -u sentinel-telegram -n 50"
+        fi
+        nrestarts="$(systemctl show sentinel-telegram -p NRestarts --value 2>/dev/null)"
+        if [[ "$nrestarts" != "$before" ]]; then
+            journalctl -u sentinel-telegram -n 40 --no-pager >&2
+            die "sentinel-telegram se repornește în buclă după schimbarea lui \
+allowed_user_ids: ${before} → ${nrestarts} reporniri în ${waited}s"
+        fi
+    done
+
+    # Proof of EFFECT, not of the exit code above: re-read the file the
+    # unit was actually started against, through the same loader, one more
+    # time. The daemon loads its config once, at process start, and nothing
+    # between `install` and here touches this file again — so "the file on
+    # disk now parses to the id just written" and "the running process holds
+    # that id" are the same fact, not two that merely tend to agree.
+    rc=0
+    telegram_config_loads_with_owner "$target" "$user_id" || rc=$?
+    if (( rc != 0 )); then
+        die "sentinel-telegram a rămas pornit și stabil ${SERVICE_SETTLE_S}s, dar \
+${target} nu se mai încarcă drept telegram.allowed_user_ids = [${user_id}] prin \
+propriul loader al Sentinel. Verifică manual: \
+${SENTINEL_PREFIX}/bin/sentinel config-check -v"
+    fi
+
+    ok "sentinel-telegram repornit cu allowed_user_ids nou, activ și stabil \
+${SERVICE_SETTLE_S}s (${before:-?} reporniri) — verificat prin propriul loader al \
+Sentinel, nu prin codul de ieșire al restart-ului"
+}
+
 # ---------------------------------------------------------------------------
 # Ce mai stă între operator și panou — strâns pe parcurs, tipărit LA FINAL
 # ---------------------------------------------------------------------------
@@ -5576,6 +6920,23 @@ main() {
     lockout_warning
     confirm "Continui cu instalarea?" || die "aborted by the operator"
 
+    # Unconditional, before the first step_done check of any kind: creates
+    # $STATE_MARKERS (0700 root:root) before anything is written into it.
+    #
+    # An upgrade from a host installed before 2026-09-08 has its markers
+    # sitting at the OLD location (${SENTINEL_STATE_DIR}/.install-state,
+    # under a directory `sentinel` can write to) and this deliberately does
+    # NOT move them here. Three rounds tried to make that move safe and each
+    # was beaten by a different bypass of the same shape — see the comment on
+    # SENTINEL_INSTALL_STATE_DIR in deploy/lib/common.sh. The cost is that
+    # step_done sees nothing done and every marker-gated step below re-runs
+    # once on that host's first deploy past this fix. Every one of those
+    # steps is written to be safe to re-run (that is this whole mechanism's
+    # contract — see "Idempotency" in deploy/lib/common.sh); the one place a
+    # re-run is NOT a no-op is the write-once nginx_preexisting fact, handled
+    # separately at nginx_preexisting_resolve below.
+    ensure_state_markers_dir
+
     run_step  1 preflight         step_preflight
 
     # Unconditional, every run — NOT a step. It sets in-process state (PUBLIC_PORT,
@@ -5651,7 +7012,9 @@ main() {
     run_step 37 auxiliary         step_auxiliary
     run_step 38 smoke_test        step_smoke_test
     run_step 39 verify_intact     step_verify_nothing_broken
+    run_step 41 journal_storage   step_journal_storage
     run_step 40 notify            step_notify
+    run_step 42 telegram_owner    step_telegram_owner
 
     # Before the success banner, not after it: what the run declined to do, and
     # whether what it was told to force actually ran. `assert_forced_steps_ran`

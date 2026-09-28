@@ -253,15 +253,31 @@ oprit canalul într-o săptămână.
 selfcheck:
   max_silence_min:
     auditd: 60      # cron, logări, folosire de privilegii
-    nginx: 180       # un site cu trafic redus poate tăcea legitim mai mult
+    nginx: 180       # păstrat pentru compatibilitate — vezi nota de mai jos
     default: 180     # orice alt colector fără câmp propriu aici
 ```
 
-Ridică `nginx` (sau `default`) doar pe o gazdă unde ai văzut cu ochii tăi
-tăceri legitime mai lungi decât valoarea implicită — de exemplu un site cu
-trafic sezonier. O cheie scrisă greșit sub `max_silence_min` (ex. `ssh:` în
-loc de un câmp real) oprește pornirea cu `ConfigError`, nu se pierde tăcut:
-secțiunea e o structură tipizată, nu o hartă liberă.
+Ridică `default` doar pe o gazdă unde ai văzut cu ochii tăi tăceri legitime
+mai lungi decât valoarea implicită. O cheie scrisă greșit sub
+`max_silence_min` (ex. `ssh:` în loc de un câmp real) oprește pornirea cu
+`ConfigError`, nu se pierde tăcut: secțiunea e o structură tipizată, nu o
+hartă liberă.
+
+**`nginx` e acceptat aici, dar nu mai citit de nimic — la fel ca `sshd` mai
+jos, dintr-un motiv măsurat pe `n8n`, 23 septembrie 2026.** Verificarea veche
+raporta `ingest:nginx` drept `down` ("🔴 SENTINEL NU FUNCȚIONEAZĂ COMPLET",
+cu sfatul `systemctl restart sentinel-ingest`) pe un colector care, în
+momentul alertei, prelua în continuare evenimente de la `auditd`: panoul
+n8n e privat, vizitat o dată pe zi, iar `collector_cursors` arăta deja
+răspunsul — cursorul `<inod>:<offset>` avea offsetul EGAL cu mărimea
+fișierului, adică „am citit tot ce există". Pe producție, unde nginx
+servește site-urile publice, aceeași tăcere poate chiar însemna ceva — dar
+un colector mort peste un fișier care crește arată altfel (fișierul crește,
+cursorul stă pe loc), și exact asta prinde `ingest:nginx` acum, la fel ca
+`ingest:suricata`/`ingest:sshd`. Câmpul `nginx` de mai sus rămâne acceptat
+doar ca să nu strice instalările deja livrate cu el în `sentinel.yaml`
+(`install_config` nu rescrie un fișier viu); o valoare pusă aici nu mai
+schimbă niciun verdict.
 
 **`sshd` nu are un prag aici, dinadins.** Avea unul (180 minute), pe premisa
 „o gazdă expusă pe internet nu tace niciodată" — falsă pe o gazdă unde
@@ -347,6 +363,92 @@ sentinel reconcile --reapply    # inversul: reaplică blocările din bază
 `--reapply` există pentru cine nu vrea ca un reboot de la 4 dimineața să
 elibereze toți atacatorii. Nu e implicit, fiindcă pornirea lui elimină tăcut
 exact ieșirea de siguranță pe care se bazează restul designului.
+
+### Jurnalul trebuie să supraviețuiască repornirii — pasul 41
+
+Pe RHEL și derivate (AlmaLinux, Rocky, Fedora) implicitul distribuției e
+`Storage=auto` **fără** `/var/log/journal`, ceea ce înseamnă jurnal în `/run`,
+adică în RAM: la fiecare repornire dispare tot. Pentru Sentinel asta nu e o
+neplăcere, e pierderea sursei primare de dovezi — fiecare `Failed password`,
+`Accepted publickey` și `Invalid user` de care depinde detecția de forță brută
+și tot ce se construiește peste ea trăiește acolo și nicăieri altundeva.
+
+S-a întâmplat: pe **10 septembrie 2026, la 07:59:41**, producția a repornit
+prima oară în peste cinci zile, iar tot ce știa despre autentificări din 6-9
+septembrie a dispărut. `journalctl --disk-usage` a căzut de la 149,1 M la 16,0 M,
+seqnum-id și boot-id noi, fereastra de istoric de la zero. Nimic nu a alertat,
+fiindcă nimic nu era stricat — ăsta era comportamentul implicit al distribuției.
+Debian și Ubuntu creează directorul din pachet, de asta gazda n8n n-a avut
+niciodată problema.
+
+**Ce face pasul 41 (`journal_storage`), și numai când e nevoie:**
+
+* întreabă **demonul**, nu discul, unde scrie acum (`journalctl --header`, un
+  fișier în stare `ONLINE`). Un `/var/log/journal` creat de mână nu înseamnă
+  nimic: journald scrie mai departe în `/run` până e repornit și golit;
+* dacă gazda e deja persistentă, **nu face nimic** — nu repornește
+  `systemd-journald`, nu rescrie configurația, nu golește nimic. Dacă ai praguri
+  scrise de tine în `/etc/systemd/journald.conf`, le raportează și le lasă în
+  pace;
+* dacă nu e, creează `/var/log/journal` (2755 `root:systemd-journal`), scrie
+  `/etc/systemd/journald.conf.d/10-sentinel.conf`, repornește journald și golește
+  jurnalul din `/run` în `/var` cu `journalctl --flush`;
+* **verifică efectul**: journald raportează singur, în mesajul lui structurat de
+  utilizare, calea nouă și plafonul pe care îl aplică. Pasul cere ca fișierele să
+  fie acolo, ca `journalctl -D /var/log/journal` să scoată din ele o intrare, ca
+  în `/run` să nu mai fi rămas nimic, și ca plafonul raportat de journald să nu
+  fie mai mare decât cel cerut. Dacă vreuna nu ține, instalarea se oprește cu
+  FATAL. Numerotarea rămâne 40 (`notify`) înaintea lui 41 în documentație și în
+  `--force-step`, dar în `main()` pasul 41 rulează efectiv ÎNAINTEA pasului 40:
+  un FATAL de aici apare deci înainte ca Telegram să fi trimis „Sentinel
+  instalat", nu după — operatorul nu mai are de citit un mesaj de succes urmat
+  de o minciună.
+
+**Pragurile scrise, și de ce sunt două:**
+
+| Cheie | Valoare | De ce |
+|---|---|---|
+| `SystemMaxUse` | 2G | Un jurnal nemărginit pe partiția pe care stă PostgreSQL umple discul și cade baza în care Sentinel ține absolut tot. 2 G înseamnă ~20 de zile la ritmul măsurat conservator (~100 MB/zi) și ~35 la cel observat; 2,4 % din cei 83 G liberi |
+| `MaxRetentionSec` | 30day | Pe o gazdă tăcută pragul de mărime nu se atinge niciodată, deci fereastra de dovezi n-ar fi previzibilă. Ăsta o mărginește la capătul celălalt |
+| `MaxFileSec` | 1day | Fără el pragul de timp e decorativ: retenția șterge **fișiere întregi**, deci un fișier care acoperă toată fereastra nu expiră niciodată |
+| `SystemMaxFileSize` | 128M | 16 fișiere la plafon în loc de 8, deci curățarea aruncă ~6 % din istoric o dată, nu ~12 % |
+
+`SystemKeepFree` NU e scris: implicitul lui — 15 % din partiție — e chiar ce
+apără baza de date, iar orice valoare pusă de noi ar fi mai mică.
+
+**Cum verifici, oricând:**
+
+```bash
+# 1. Unde scrie journald ACUM (nu unde există un director):
+journalctl --header | grep -B5 'State: ONLINE' | grep 'File path'
+#    -> trebuie să spună /var/log/journal/<machine-id>/…, nu /run/log/journal/…
+
+# 2. Ce plafon aplică journald, după EL, nu după fișierul de configurație:
+journalctl -b -u systemd-journald --grep 'System Journal'
+#    -> "System Journal (/var/log/journal/…) is 57.9M, max 2.0G, 78.3G free."
+#    Dacă spune doar "Runtime Journal", gazda n-a trecut încă pe persistent.
+
+# 3. Cât istoric e păstrat, și cât ocupă:
+journalctl --disk-usage
+journalctl -o short-iso | head -1        # cea mai veche intrare păstrată
+
+# 4. Reaplicat manual, dacă a fost nevoie să schimbi ceva:
+sudo ./deploy/install.sh --force-step 41 …
+```
+
+Dacă (1) arată `/run/log/journal`, gazda își pierde istoricul la următoarea
+repornire, indiferent ce scrie în fișierele de configurație.
+
+**O notă despre poziția colectorului.** `journalctl --flush` rescrie
+identificatorul de secvență al fiecărei intrări pe care o mută — măsurat pe
+AlmaLinux 9.8 / systemd 252, unde din cursor se schimbă **doar** câmpul `s=`,
+restul (`i=`, `b=`, `m=`, `t=`, `x=`) rămâne identic. Cum autoverificarea
+compară cursorul salvat ca șir, fără nicio măsură pasul ar fi produs, la fiecare
+instalare, o alarmă „colectorul sshd și-a pierdut poziția". Pasul mută poziția
+din `collector_cursors` pe cursorul NOU al **aceleiași intrări**, și numai dacă
+identitatea intrării se potrivește exact; dacă după poziția salvată urmează altă
+intrare, nu atinge nimic și îți spune, fiindcă mutarea unui cursor înainte peste
+intrări necitite e o gaură tăcută în dovezi.
 
 ---
 

@@ -85,13 +85,20 @@ assert_forced_steps_ran
 def run_steps(tmp_path: Path, **env: str) -> tuple[subprocess.CompletedProcess, list[str]]:
     """Run three marked steps through the real run_step, return (proc, bodies-run)."""
     state = str(tmp_path / "state").replace("\\", "/")
+    # SENTINEL_INSTALL_STATE_DIR alongside SENTINEL_STATE_DIR: STATE_MARKERS
+    # (what run_step actually writes to) comes from the FORMER since 8 Sep
+    # 2026, not the latter — common.sh now dies if it sees the state dir
+    # redirected without the install-state dir following it, precisely so a
+    # harness like this one cannot write to the real /var/lib/sentinel-install
+    # on a machine that happens to run it as root.
+    install_state = str(tmp_path / "install-state").replace("\\", "/")
     log = str(tmp_path / "ran.log").replace("\\", "/")
     proc = subprocess.run(
         [BASH, "-c", STEPS_SCRIPT],
         cwd=LIB,
         capture_output=True,
         text=True,
-        env=_env(SENTINEL_STATE_DIR=state, LOG=log, **env),
+        env=_env(SENTINEL_STATE_DIR=state, SENTINEL_INSTALL_STATE_DIR=install_state, LOG=log, **env),
     )
     ran = Path(log).read_text(encoding="utf-8").split() if Path(log).exists() else []
     return proc, [line.split(":", 1)[1] for line in ran]
@@ -206,10 +213,11 @@ def test_an_unparsed_force_step_cannot_be_ignored(tmp_path):
     """
     script = STEPS_SCRIPT.replace('parse_force_steps "${FORCE_STEP:-}"', ":")
     state = str(tmp_path / "state").replace("\\", "/")
+    install_state = str(tmp_path / "install-state").replace("\\", "/")
     proc = subprocess.run(
         [BASH, "-c", script], cwd=LIB, capture_output=True, text=True,
-        env=_env(SENTINEL_STATE_DIR=state, LOG=str(tmp_path / "x.log"),
-                 FORCE_STEP="22,27"),
+        env=_env(SENTINEL_STATE_DIR=state, SENTINEL_INSTALL_STATE_DIR=install_state,
+                 LOG=str(tmp_path / "x.log"), FORCE_STEP="22,27"),
     )
     assert proc.returncode != 0
     assert "parse_force_steps" in proc.stderr

@@ -563,7 +563,14 @@ fi
 
 # Consumed by install.sh so the RAM gate decision and the traffic sample are
 # taken once rather than repeated per step.
-mkdir -p "$STATE_MARKERS"
+#
+# ensure_state_markers_dir, not `mkdir -p`: this file is `source`d as root by
+# install.sh's resolve_config on every run, so the directory it lands in must
+# be 0700 root:root even when preflight.sh is the FIRST thing ever run here
+# (standalone, via `scripts/deploy.sh --dry-run`, before install.sh has had a
+# chance to create it itself). `mkdir -p` on a fresh path takes the process
+# umask, which is not a security boundary.
+ensure_state_markers_dir
 printf 'SURICATA_OK=%d\nMEM_AVAIL=%d\nADMIN_IP=%s\nDOMAIN=%s\nBPF_HINT=%s\nPUBLIC_PORT=%s\n' \
     "$SURICATA_OK" "$MEM_AVAIL" "${PEER}" "${DOMAIN}" "${BPF_HINT:-}" "${SENTINEL_PUBLIC_PORT}" \
     > "${STATE_MARKERS}/preflight.env"
