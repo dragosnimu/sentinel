@@ -543,3 +543,48 @@ def test_an_unparseable_line_is_reported_by_line_number(tmp_path):
     combined = out["proc"].stdout + out["proc"].stderr
     assert "10" in combined and "line" in combined.lower()
     assert "this line is not" not in combined
+
+
+def test_secrets_array_stays_declared_after_the_step_ends(tmp_path):
+    """The production incident of 28 September 2026: step 27's own last line
+    used to be `unset SECRETS`, which throws away the `-A` (associative)
+    attribute along with the values, and bash never remembers it was there.
+    Every LATER step's `${SECRETS[$key]:-}` — step 42's included — then
+    mis-parses as an INDEXED-array reference whose subscript is evaluated as
+    arithmetic, so a bare key name like TELEGRAM_OWNER_USER_ID is read as a
+    shell variable and, under `set -u`, is `unbound variable` rather than the
+    empty default `:-` was meant to supply. `deploy/install.sh:6552` crashed
+    exactly this way on the live host.
+
+    This checks the ROOT CAUSE directly, at the point step 27 itself leaves
+    the array, rather than only at whichever later step happens to read it
+    today — a fix at step 42 alone (`secrets_get`, covered in
+    tests/security/test_telegram_owner_allowlist.py) would leave this same
+    trap for the NEXT step that ever reads `${SECRETS[...]}` after step 27,
+    and this is what would notice that regardless of which step it is."""
+    probe = tmp_path / "probe.txt"
+    script = tmp_path / "probe.sh"
+    script.write_text(
+        "source ./lib/common.sh\n" + step27_source() + "\n"
+        'chown() { :; }\nchmod() { :; }\nopenssl() { printf "%s" "FRESHLY-GENERATED"; }\n'
+        f'declare -A SECRETS=({" ".join(f"[{k}]={v!r}".replace(chr(39), chr(34)) for k, v in HOST_SECRETS.items())})\n'
+        'step_secrets\n'
+        f'declare -p SECRETS > "{probe.as_posix()}" 2>&1 '
+        f'|| printf "SECRETS_UNSET\\n" > "{probe.as_posix()}"\n',
+        encoding="utf-8", newline="\n")
+    cfg = tmp_path / "etc2"
+    cfg.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        [BASH, str(script).replace("\\", "/")],
+        cwd=REPO / "deploy", capture_output=True, text=True,
+        env={**os.environ, "NO_COLOR": "1",
+             "SENTINEL_CONFIG_DIR": str(cfg).replace("\\", "/"),
+             "SENTINEL_USER": "sentinel"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    result = probe.read_text(encoding="utf-8") if probe.exists() else "<no probe output>"
+    assert "SECRETS_UNSET" not in result, (
+        "step 27 left SECRETS unset instead of cleared-but-declared — every "
+        f"later step's ${{SECRETS[...]}} would mis-parse under set -u: {result}")
+    assert result.startswith("declare -A SECRETS="), (
+        f"SECRETS is no longer an associative array after step 27: {result}")

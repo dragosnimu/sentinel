@@ -2117,6 +2117,26 @@ existing_secret() {
     printf '%s' "${line#*=}"
 }
 
+# The other half of every "stdin first, then existing_secret" read: a lookup
+# into SECRETS that stays correct no matter what state the array is in —
+# declared with the key, declared without it, or not declared at all.
+#
+# A bare `${SECRETS[$key]:-}` cannot make that last guarantee: bash forgets
+# the `-A` (associative) attribute the instant the variable is unset, so once
+# that happens the SAME expression is reparsed as an INDEXED-array reference
+# and the subscript becomes an ARITHMETIC expression — a bare key name like
+# TELEGRAM_OWNER_USER_ID is then read as a shell variable, and under `set -u`
+# an undefined one is "unbound variable", not the empty default `:-` was
+# meant to supply. See the comment on `SECRETS=()` at the end of step 27 for
+# the incident this reproduces and why that step no longer unsets it — this
+# accessor exists anyway, so a step reading a secret never again depends on
+# remembering that.
+secrets_get() {
+    local key="$1"
+    [[ "$(declare -p SECRETS 2>/dev/null)" == "declare -A"* ]] || return 0
+    printf '%s' "${SECRETS[$key]:-}"
+}
+
 # Identitatea instalării: o valoare aleatoare, generată o dată și niciodată din
 # nou. Aceleași reguli ca la GENERATED_SECRET_KEYS de mai sus, din același
 # motiv: valoarea supraviețuiește instalării și altcineva o ține minte.
@@ -2406,7 +2426,28 @@ to ${target} on the host first; a later run will then carry it over."
         done
     fi
 
-    unset SECRETS
+    # Cleared, not unset. The values themselves must not linger for the rest
+    # of what can be a long-running process — that is the real reason this
+    # line exists — but `unset SECRETS` throws away the `-A` (associative)
+    # attribute along with the values, and bash does not remember it was ever
+    # there: a later `${SECRETS[$key]}` is then parsed as an INDEXED-array
+    # reference, whose subscript is evaluated as an ARITHMETIC expression, so
+    # a bare key name like TELEGRAM_OWNER_USER_ID is read as a shell
+    # variable — and under `set -u` (deploy/lib/common.sh) an undefined one is
+    # "unbound variable", not the empty string the trailing `:-` was meant to
+    # supply. That is exactly what step 42 hit on the production deploy of 28
+    # September 2026: `TELEGRAM_OWNER_USER_ID: unbound variable`, the KEY
+    # named in the error rather than the array, which is the tell.
+    #
+    # `SECRETS=()` empties the array (same effect: no value survives this
+    # step) while leaving the variable declared exactly as line ~249 left it,
+    # so every later `${SECRETS[...]}` keeps parsing as the associative
+    # lookup it was written as. Confirmed directly:
+    #   set -u; declare -A SECRETS=([A]=1); unset SECRETS
+    #   echo "${SECRETS[SOME_KEY]:-}"   # -> SOME_KEY: unbound variable
+    #   set -u; declare -A SECRETS=([A]=1); SECRETS=()
+    #   echo "${SECRETS[SOME_KEY]:-}"   # -> empty, as intended
+    SECRETS=()
 }
 
 # --- 28 -------------------------------------------------------------------
@@ -6549,7 +6590,8 @@ if got != [want]:
 
 step_telegram_owner() {
     local target="${SENTINEL_CONFIG_DIR}/sentinel.yaml"
-    local user_id="${SECRETS[TELEGRAM_OWNER_USER_ID]:-}"
+    local user_id
+    user_id="$(secrets_get TELEGRAM_OWNER_USER_ID)"
     # Read from stdin FIRST, the file on disk SECOND — the same order and the
     # same reason as everywhere else this pattern appears: an operator who
     # supplies the key on a re-run where step 27 is already marked done (so

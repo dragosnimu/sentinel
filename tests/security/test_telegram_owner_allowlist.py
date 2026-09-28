@@ -55,10 +55,12 @@ def _step42_source() -> str:
     return body
 
 
-# Sourced ahead of the step: `existing_secret` lives in step 27's own block,
-# not step 42's, and step_telegram_owner calls it as the fallback path when
-# the secret does not arrive on stdin this run.
-STEP42 = _func("existing_secret") + "\n" + _step42_source()
+# Sourced ahead of the step: `existing_secret` and `secrets_get` both live in
+# step 27's own block, not step 42's. `existing_secret` is the fallback path
+# when the secret does not arrive on stdin this run; `secrets_get` is what
+# step 42 reads SECRETS through in the first place — see its own comment in
+# install.sh for why a bare `${SECRETS[...]}` is not safe to inline here.
+STEP42 = _func("existing_secret") + "\n" + _func("secrets_get") + "\n" + _step42_source()
 
 
 def _write_exec(path: Path, body: str) -> None:
@@ -200,6 +202,7 @@ OWNER_ID = "918273645"  # invented, ten digits, never a real account
 
 def _run(tmp_path: Path, fixture: str | None, *, stdin_user_id: str | None,
           on_disk_secret: str | None = None,
+          secrets_unset: bool = False,
           telegram_unit_present: bool = False, telegram_unit_active: bool = False,
           is_active_output: str = "active", nrestarts_sequence: str = "0",
           restart_rc: int = 0, settle_s: int = 1,
@@ -233,7 +236,23 @@ def _run(tmp_path: Path, fixture: str | None, *, stdin_user_id: str | None,
     "rewrite succeeded but produced nothing" guard right after it — the two
     are different failure shapes in the source (nonzero exit vs. empty
     stdout) and need different stubs to tell apart.
+
+    `secrets_unset` reproduces the exact state that crash-looped the
+    production deploy of 28 September 2026: `SECRETS` not merely empty but
+    gone — `unset`, not `declare -A SECRETS=()`. Every other case in this
+    file (including `stdin_user_id=None`) still `declare -A SECRETS=()`s the
+    array before calling the step, which is a DIFFERENT state — bash still
+    knows it is associative — and stayed green the whole time step 42's
+    `${SECRETS[TELEGRAM_OWNER_USER_ID]:-}` was silently mis-parsing an
+    indexed-array subscript as arithmetic on a live host. `stdin_user_id`
+    must be `None` whenever this is set: on a real host `SECRETS` is unset by
+    step 27, which runs only once and, if it supplied a value that run,
+    already wrote it to secrets.env — nothing on this later step's own stdin.
     """
+    assert not (secrets_unset and stdin_user_id is not None), (
+        "secrets_unset reproduces a real host's state after step 27, where "
+        "nothing this step's own stdin supplies could still be sitting in "
+        "SECRETS — see this function's docstring")
     cfg = tmp_path / "etc"
     cfg.mkdir(parents=True, exist_ok=True)
     target = cfg / "sentinel.yaml"
@@ -335,7 +354,8 @@ source ./lib/common.sh
 {rewrite_override}
 closing_note() {{ printf 'CLOSING_NOTE:%s\\n' "$1" >> "$CALLS"; }}
 
-declare -A SECRETS=({'[TELEGRAM_OWNER_USER_ID]=' + repr(stdin_user_id).replace("'", '"') if stdin_user_id is not None else ''})
+{'unset SECRETS 2>/dev/null || true' if secrets_unset else
+ 'declare -A SECRETS=(' + ('[TELEGRAM_OWNER_USER_ID]=' + repr(stdin_user_id).replace("'", '"') if stdin_user_id is not None else '') + ')'}
 SERVICE_SETTLE_S={settle_s}
 step_telegram_owner
 """
@@ -759,6 +779,47 @@ def test_secret_falls_back_to_disk_when_stdin_is_empty(tmp_path):
     out = _run(tmp_path, FIXTURE_NO_KEY, stdin_user_id=None, on_disk_secret=OWNER_ID)
     assert out["proc"].returncode == 0, out["proc"].stderr
     assert f"[{OWNER_ID}]" in out["yaml"]
+
+
+def test_secrets_array_gone_still_finds_the_secret_on_disk(tmp_path):
+    """The production incident of 28 September 2026, reproduced exactly: step
+    27 has already run in this same install.sh process and left `SECRETS`
+    `unset` — not merely empty — by the time step 42 runs. A bare
+    `${SECRETS[TELEGRAM_OWNER_USER_ID]:-}` mis-parses under that condition
+    (bash forgets the `-A` attribute the moment the variable is unset, so the
+    subscript is read as arithmetic instead of a key) and dies with
+    `TELEGRAM_OWNER_USER_ID: unbound variable` before `existing_secret` is
+    ever called — exactly what `deploy/install.sh:6552` did on the live host,
+    with step 41 applied and step 42 crashing the whole install on its first
+    line. This is the case the previous fixtures in this file could not
+    reach: every one of them `declare -A SECRETS=()`s the array first, a
+    state bash still treats as associative and that the step's own code
+    already handled correctly."""
+    out = _run(tmp_path, FIXTURE_NO_KEY, stdin_user_id=None,
+               on_disk_secret=OWNER_ID, secrets_unset=True)
+    assert out["proc"].returncode == 0, (
+        f"step 42 crashed instead of falling back to the on-disk secret: "
+        f"{out['proc'].stderr}")
+    assert f"[{OWNER_ID}]" in out["yaml"]
+
+
+def test_secrets_array_gone_and_no_disk_secret_is_still_a_clean_noop(tmp_path):
+    """The other half of the same state: `SECRETS` gone AND nothing on disk
+    either — a fresh host's very first install, where step 27 ran, wrote
+    nothing (the operator supplied no TELEGRAM_OWNER_USER_ID), and cleared
+    itself before step 42 ever runs. This must produce the ordinary
+    "nothing to narrow, tell the operator" outcome, not a crash — the same
+    outcome `test_absent_secret_is_a_clean_noop` checks for the
+    `declare -A SECRETS=()` state, asserted again here for the state that
+    state does not cover."""
+    out = _run(tmp_path, FIXTURE_NO_KEY, stdin_user_id=None, secrets_unset=True)
+    assert out["proc"].returncode == 0, (
+        f"step 42 crashed instead of reporting a clean no-op: {out['proc'].stderr}")
+    assert out["yaml"] == FIXTURE_NO_KEY, "the file was touched with no secret supplied"
+    assert "TELEGRAM_OWNER_USER_ID" in out["proc"].stderr
+    assert "CLOSING_NOTE:" in out["calls"], "the operator is not told at the end of the run either"
+    assert "install " not in out["calls"]
+    assert "systemctl restart" not in out["calls"]
 
 
 def test_is_always_step(tmp_path):
