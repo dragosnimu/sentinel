@@ -886,6 +886,113 @@ async def expire_plans(db: Database) -> tuple[str, dict[str, Any]]:
             {"expired": n, "ttl_hours": patch_repo.PLAN_TTL_HOURS})
 
 
+# Câte planuri se enumeră într-un singur anunț. Prima trecere de după livrare
+# poate găsi o restanță mai mare decât încape într-un mesaj citibil; restul se
+# numără, nu se ascunde.
+RETIRED_NOTICE_MAX_LISTED = 10
+
+# `notifications.kind`: ce fel de veste e. Nu e în `quiet.NEVER_MUTED_KINDS`,
+# deci o fereastră de liniște o ȚINE până se ridică — e o veste bună, nu una
+# care să trezească pe cineva. Fără el rândul ar primi implicitul `selfcheck`.
+RETIRED_NOTICE_KIND = "patch_retired"
+
+
+def _retirement_notice(retired: list[dict[str, Any]]) -> tuple[str, str]:
+    """Titlul și textul anunțului pentru planurile retrase, într-un singur mesaj.
+
+    UN mesaj per trecere, cu toate planurile: prima rulare după livrare poate
+    retrage o restanță întreagă, iar un mesaj per plan ar fi exact zgomotul din
+    care operatorul a învățat să nu mai citească. Spune CE s-a retras, DE CE, și
+    ce NU s-a întâmplat (nimic pe server) — fără ultima, «plan retras» se poate
+    citi ca «plan aplicat».
+
+    Textul nu pretinde CUM s-a rezolvat constatarea (pachet scos, actualizat,
+    scaner care nu-l mai vede): scanerul știe doar că nu-l mai raportează
+    (`resolution = 'absent_from_latest_scan'`).
+    """
+    from html import escape
+
+    def esc(v: Any) -> str:
+        return escape(str(v), quote=False)
+
+    lines = ["<b>Planuri de patch retrase — nu mai aveau ce repara</b>", ""]
+    for plan in retired[:RETIRED_NOTICE_MAX_LISTED]:
+        parts = []
+        for f in plan["findings"]:
+            what = f"<code>{esc(f.get('package') or '?')}</code>"
+            if f.get("cve"):
+                what += f" ({esc(f['cve'])})"
+            if f.get("resolved_at") is not None:
+                what += f", rezolvat la {f['resolved_at']:%Y-%m-%d}"
+            parts.append(what)
+        lines.append(f"• #{plan['id']} — " + ("; ".join(parts) or "constatare rezolvată"))
+    hidden = len(retired) - RETIRED_NOTICE_MAX_LISTED
+    if hidden > 0:
+        lines.append(f"• …și încă {hidden}")
+    lines += [
+        "",
+        "Constatările pentru care fuseseră scrise sunt marcate rezolvate de "
+        "scaner, dar planurile rămăseseră „validate”: fereastra de reparare le "
+        "mai oferea, iar autoverificarea le mai socotea în așteptare. Acum "
+        "sunt marcate „expirat”, cu motivul pe rând. <b>Pe server nu s-a "
+        "schimbat nimic.</b>",
+        "",
+        "Dacă vulnerabilitatea reapare (de exemplu pachetul e reinstalat), "
+        "scanarea o redeschide și se poate cere un plan nou; cel vechi nu se "
+        "reînvie, fiindcă a fost scris pentru versiunile de atunci.",
+        "",
+        "Dacă autoverificarea anunță și ea, în câteva minute, că nu mai "
+        "raportează unul dintre planurile de mai sus, e același lucru — nu o a "
+        "doua problemă.",
+    ]
+    return "Planuri de patch retrase", "\n".join(lines)
+
+
+async def retire_plans(db: Database) -> tuple[str, dict[str, Any]]:
+    """Retrage planurile a căror constatare s-a rezolvat — și spune operatorului.
+
+    Retragerea (`patches.retire_moot_plans`) și anunțul se scriu ÎN ACEEAȘI
+    tranzacție. Un plan retras fără anunț ar dispărea din `/patches` fără nicio
+    urmă pentru un om care îl avea pe ecran; iar anunțul scris înaintea
+    retragerii ar putea promite ceva ce nu s-a întâmplat. Dacă inserarea în
+    `notifications` cade, retragerea se anulează cu ea, pasul apare ca EȘUAT în
+    raportul orei (iar unitatea iese nenul), și trecerea următoare o reia —
+    aceeași interogare, aceleași planuri, fiindcă predicatul se uită la stare.
+
+    Anunțul acoperă ce s-a schimbat ACUM. Autoverificarea are propriul canal:
+    cheia `patch_window:plan:<id>` dispare din rezultate (planul nu mai e
+    `validated`), iar dacă rândul ei era `degraded`, la trecerea următoare (5
+    minute) devine o retragere anunțată sub „Constatări care nu se mai
+    raportează". Textul de mai sus îl avertizează
+    pe operator că cele două sunt același lucru — nu putem face autoverificarea
+    să spună DE CE (nu citește motive), dar putem spune noi ce va urma.
+    """
+    from sentinel.db.repo import patches as patch_repo
+
+    async with db.transaction() as conn:
+        retired = await patch_repo.retire_moot_plans(conn)
+        if retired:
+            title, body = _retirement_notice(retired)
+            ids = [p["id"] for p in retired]
+            await conn.execute(
+                """
+                INSERT INTO notifications (channel, severity, kind, dedup_key, title, body)
+                VALUES ('telegram', 'low', $1::text, $2::text, $3::text, $4::text)
+                """,
+                RETIRED_NOTICE_KIND,
+                f"patches:retired:{','.join(str(i) for i in ids)}"[:180],
+                title, body)
+
+    ids = [p["id"] for p in retired]
+    if not retired:
+        return "niciun plan de patch de retras", {"retired": 0, "plan_ids": []}
+    log.warning("patch plans retired: their findings are resolved",
+                extra={"plans": ids})
+    listed = ", ".join(f"#{i}" for i in ids)
+    return (f"{len(ids)} planuri de patch retrase, constatările lor sunt rezolvate "
+            f"({listed})", {"retired": len(ids), "plan_ids": ids})
+
+
 # ---------------------------------------------------------------------------
 # 9. Incidente tăcute
 # ---------------------------------------------------------------------------
@@ -985,6 +1092,7 @@ async def run(db: Database, cfg: Config) -> Report:
     await _step(rep, "intel", refresh_intel(db))
     await _step(rep, "backups", prune_backups(db, cfg))
     await _step(rep, "expire_plans", expire_plans(db))
+    await _step(rep, "retire_plans", retire_plans(db))
     await _step(rep, "stale_incidents", close_stale_incidents(db, cfg))
     await _step(rep, "quiet_campaigns", quiet_campaigns(db))
     return rep

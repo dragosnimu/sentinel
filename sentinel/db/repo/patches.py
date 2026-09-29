@@ -303,6 +303,127 @@ async def expire_stale_plans(db: Database) -> int:
     return len(rows)
 
 
+# --- planuri fără obiect: constatarea lor s-a rezolvat ------------------------
+# Ce scrie retragerea pe rând. Constante și nu literali în interogare, ca
+# serviciul care anunță operatorul și testele să vorbească despre aceleași
+# valori, nu despre trei copii ale lor.
+#
+# `expired` și NU un status nou — vezi `retire_moot_plans` pentru rațiune. Aici
+# contează doar că e MOARTĂ în sensul `LIVE_PLAN_STATUSES`: un finding care se
+# redeschide poate primi un plan nou, iar cel vechi nu se mai învie.
+RETIRED_STATUS = "expired"
+RETIRED_BY = "sentinel-maintenance"
+RETIRED_REASON = ("toate constatările planului sunt rezolvate (findings.status = "
+                  "'resolved') — nu mai e nimic de aplicat")
+
+
+async def retire_moot_plans(db: Database) -> list[dict[str, Any]]:
+    """Retrage planurile `validated` ale căror constatări sunt TOATE rezolvate.
+
+    Ce era stricat: ciclul de viață al planului era decuplat de al constatării.
+    Scanerul închide un finding (`findings.mark_resolved_absent`), dar nimic nu
+    se uita la planurile scrise pentru el. Măsurat pe gazda de producție la 29
+    septembrie 2026: planul #10 (`webkit2gtk3-jsc`, CVE-2026-3909) rămăsese
+    `validated` la patru zile după ce operatorul scosese pachetul — fereastra îl
+    tot oferea, iar autoverificarea îl raporta din patru în patru ore ca
+    `patch_window:plan:10`. Singurul lucru care l-ar fi retras vreodată era
+    plafonul de 30 de zile din `expire_stale_window_candidates`, adică o
+    dispariție după VÂRSTĂ, indiferentă de faptul că nu mai avea obiect.
+
+    De ce AICI, ca interogare peste STARE, și nu ca reacție la un eveniment:
+
+      * un cârlig pe `mark_resolved_absent` (sau pe sfârșitul scanării) ar fi
+        chemat doar cu findingurile pe care scanarea CURENTĂ le închide, iar
+        findingul planului #10 fusese închis cu patru zile înainte și n-avea să
+        mai fie închis niciodată — reparația n-ar fi atins exact cazul care a
+        cerut-o. Predicatul de aici se uită la ce e adevărat ACUM, deci
+        recuperează singur și restanța, și orice finding închis pe altă cale
+        (o scanare căzută între închidere și cârlig, un `UPDATE` manual);
+      * fereastra săptămânală ar acoperi doar planurile AI și doar când rulează
+        (luni); `/patches`, `unnotified_plans` și butoanele deja trimise n-ar
+        fi atinse de nimic. Iar generarea nu poate ajuta: `generate_for_kev`
+        alege doar findinguri `open`, deci nu produce planuri noi pentru cele
+        rezolvate — problema sunt cele vechi.
+
+    Rulează orar, din `maintenance_service.retire_plans`, lângă `expire_plans`.
+
+    ## Status: `expired`, fără migrație
+
+    CHECK-ul din `0004_patch.sql` nu are un status „obsolet", iar unul nou ar
+    însemna o migrație plus lista de statusuri repetată în
+    `web/routers/patches.py`, în comentariul coloanei din agregator și în
+    testul care clasifică fiecare status ca viu sau mort. `expired` spune deja
+    ce e adevărat: faptele pe care a fost scris planul nu mai sunt cele de
+    acum. Și e status mort (nu e în `LIVE_PLAN_STATUSES`), deci
+    `generate_for_kev` și `/planifica` sunt din nou libere pentru același
+    finding.
+
+    MOTIVUL rămâne pe rând, în coloanele care se expediază deja către panoul
+    extern (`rejected_by`/`rejected_reason`, afișate lângă status în panoul
+    agregatorului): „expirat după 72 de ore" și „expirat fiindcă nu mai era
+    nimic de reparat" se deosebesc acolo, fără o coloană nouă care ar fi cerut
+    modificări în expeditor și în agregator. Numele coloanelor spun „rejected",
+    dar `status` rămâne `expired`, iar `rejected_by` e serviciul, nu un om —
+    cine numără respingerile operatorului trebuie să filtreze după status.
+
+    ## Ce NU retrage — fiecare punct e o gardă cu test
+
+      * `status = 'validated'` și atât. Un plan `approved`/`scheduled`/`applying`
+        are un om sau o execuție în spate; a-l schimba de sub ele ar fi o
+        decizie a altcuiva luată fără el. `approve_plan` verifică tot
+        `status = 'validated'` în propriul UPDATE, deci cine ajunge primul
+        câștigă, iar celălalt vede „planul nu mai e valabil".
+      * un plan cu `finding_ids` GOL. `NOT EXISTS` peste zero rânduri e
+        adevărat, deci fără `cardinality(...) > 0` ar fi retras orice plan
+        scris fără findinguri.
+      * un plan cu un id care NU există în `findings` (măsurat: planurile #2 și
+        #3 de pe gazdă au ids care nu mai sunt în tabel). `LEFT JOIN` +
+        `IS DISTINCT FROM 'resolved'` face ca „lipsește" să conteze ca
+        „nerezolvat": nu știm că s-a rezolvat, deci nu retragem. Un `JOIN`
+        obișnuit ar fi făcut invers.
+      * un plan cu MĂCAR un finding încă `open` (sau `deferred`,
+        `accepted_risk`, `false_positive`, `patching`). Retras doar când TOATE
+        sunt `resolved`. Azi fiecare plan are un singur finding
+        (`planner.generate` scrie `[finding_id]`), deci cazul cu mai multe e
+        acoperit de test, nu de date reale.
+
+    Un finding redeschis (pachet reinstalat, scanarea îl vede din nou →
+    `upsert_finding` îl pune `open`) NU învie planul: acesta a fost scris pentru
+    versiuni, cale de rollback și backup care nu mai sunt cele instalate. Se
+    întâmplă exact ce s-ar întâmpla fără plan — KEV primește unul proaspăt la
+    scanarea următoare, orice altceva la un `/planifica`.
+
+    Întoarce, pentru fiecare plan retras, id-ul și findingurile lui, ca
+    apelantul să poată spune operatorului CE a retras și DE CE. Lista goală
+    înseamnă „n-am avut ce retrage".
+    """
+    rows = await db.fetch(
+        """
+        UPDATE patch_plans SET status = 'expired',
+            rejected_by = $1, rejected_reason = $2
+        WHERE status = 'validated'
+          AND cardinality(finding_ids) > 0
+          AND NOT EXISTS (
+              SELECT 1 FROM unnest(patch_plans.finding_ids) AS fid
+              LEFT JOIN findings f ON f.id = fid
+              WHERE f.status IS DISTINCT FROM 'resolved')
+        RETURNING id, finding_ids
+        """,
+        RETIRED_BY, RETIRED_REASON)
+    if not rows:
+        return []
+
+    ids = sorted({int(f) for r in rows for f in r["finding_ids"]})
+    frows = await db.fetch(
+        "SELECT id, cve, package, resolved_at FROM findings WHERE id = ANY($1::bigint[])",
+        ids)
+    by_id = {int(r["id"]): dict(r) for r in frows}
+    return [{"id": int(r["id"]),
+             "finding_ids": [int(f) for f in r["finding_ids"]],
+             "findings": [by_id[int(f)] for f in r["finding_ids"] if int(f) in by_id]}
+            for r in rows]
+
+
 # --- executions -------------------------------------------------------------
 async def start_execution(db: Database, plan_db_id: int, *, mode: str,
                           triggered_by: str) -> int:
