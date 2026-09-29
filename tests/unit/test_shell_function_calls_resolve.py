@@ -177,6 +177,24 @@ BASH_BUILTINS = {
 # that mistake.
 # ---------------------------------------------------------------------------
 
+# SELinux tooling. NOT on every host: the AlmaLinux host has all of it
+# installed while SELinux is Disabled (libselinux-utils: selinuxenabled,
+# matchpathcon; policycoreutils: restorecon, setsebool), and the Ubuntu host
+# has none of it (measured 29 Sep 2026, `command -v` on both). One named set,
+# and EXTERNAL_COMMANDS and OPTIONAL_HOST_BINARIES below are both built from
+# it, so a name added here is declared as a binary AND put behind the guard
+# check; `test_optional_host_binaries_are_only_called_behind_a_presence_check`
+# asserts the second half, so editing OPTIONAL_HOST_BINARIES to leave one out
+# is red rather than silent.
+#
+# What that guard check proves, and what it does not: for each call to one of
+# these names, a `have NAME` or `command -v NAME` appears EARLIER in the
+# enclosing function — or, for code outside any function, anywhere after the
+# last function defined above it. It does NOT follow branches, so the check
+# can sit on the arm that does not run: `if have x; then :; else x; fi` passes.
+# Reading the guard against the branch is the reviewer's job.
+SELINUX_TOOLS = {"matchpathcon", "restorecon", "selinuxenabled", "setsebool"}
+
 EXTERNAL_COMMANDS = {
     # coreutils and friends — present on any host the installer supports
     "awk", "base64", "basename", "cat", "chmod", "chown", "cmp", "comm", "cp",
@@ -200,23 +218,13 @@ EXTERNAL_COMMANDS = {
     # interpreters and the operator-side tooling (scripts/ runs on Windows or
     # on the operator's shell, not on the monitored host)
     "bash", "git", "hostname", "jq", "python3", "scp", "ssh",
-    # SELinux tooling. NOT on every host: the AlmaLinux host has all of it
-    # installed while SELinux is Disabled (libselinux-utils: selinuxenabled,
-    # matchpathcon; policycoreutils: restorecon, setsebool), and the Ubuntu
-    # host has none of it (measured 29 Sep 2026, `command -v` on both). An
-    # entry here therefore means "a name the installer may call IF present",
-    # and that is enforced rather than promised:
-    # `test_optional_host_binaries_are_only_called_behind_a_presence_check`
-    # fails on any call to one of these that has no `have X` / `command -v X`
-    # earlier in the same function.
-    "matchpathcon", "restorecon", "selinuxenabled", "setsebool",
-}
+} | SELINUX_TOOLS
 
 #: The subset of EXTERNAL_COMMANDS that may be absent from a supported host,
-#: so an unguarded call ends the installer under `set -e`. Anything added to
-#: the SELinux group above belongs here too.
-OPTIONAL_HOST_BINARIES = {"matchpathcon", "restorecon", "selinuxenabled",
-                          "setsebool"}
+#: so an unguarded call ends the installer under `set -e`. It starts from
+#: SELINUX_TOOLS; a binary that is optional for another reason is added here,
+#: and it must already be in EXTERNAL_COMMANDS.
+OPTIONAL_HOST_BINARIES = set(SELINUX_TOOLS)
 
 # Every function in this repository's shell is snake_case, so a snake_case
 # word that resolves to nothing is overwhelmingly likely to be a function
@@ -930,9 +938,22 @@ def _flat_scan_line(line: str, quote: str | None) -> _FlatLine:
     """
     out = _FlatLine(quote=quote)
     i = 0
+    sep_end = -1        # index just past the last UNQUOTED `;` or `&` reached
     while i < len(line):
         c = line[i]
         if quote == "'":
+            if c == "'":
+                quote = None
+        elif quote == "$'":
+            # ANSI-C `$'…'`. Unlike a plain single quote, a backslash escapes
+            # the next character here, so `$'it\'s'` is ONE string. Without
+            # this branch the `\'` closed the string early, the real closing
+            # quote opened a phantom one, and every later line went `unknown`
+            # — measured, in a copy of the corpus: 1 to 16 floor definitions
+            # dropped, and in deploy/install.sh every other test stayed green.
+            if c == "\\":
+                i += 2
+                continue
             if c == "'":
                 quote = None
         elif quote == '"':
@@ -946,8 +967,27 @@ def _flat_scan_line(line: str, quote: str | None) -> _FlatLine:
                 out.continued = True
             i += 2
             continue
-        elif c == "#" and (i == 0 or line[i - 1] in " \t"):
-            break                            # rest of the line is a comment
+        elif c == "#" and (i == 0 or line[i - 1] in " \t" or sep_end == i):
+            # Rest of the line is a comment. `;` and `&` are metacharacters, so
+            # a `#` right behind one starts a word and therefore a comment:
+            # `cmd;# don't` has NO quote in it. `sep_end` rather than a look at
+            # the previous character, because `\;#` is one word (`find … \;#x`)
+            # and the `;` there was escaped. `)` is deliberately NOT here:
+            # `$(cmd)#x` is a word with a `#` in it, and a model that cannot
+            # tell that from `(cmd)# note` would guess — the one thing this
+            # model does not do. A `)#` comment with an apostrophe in it
+            # therefore still goes `unknown`, which the named drops in
+            # `test_the_floor_loses_exactly_the_definitions_written_down` catch.
+            break
+        elif c in ";&":
+            sep_end = i + 1
+        elif c == "$" and line.startswith("$'", i):
+            quote = "$'"
+            i += 2
+            continue
+        elif c == "$" and line.startswith("$$", i):
+            i += 2                           # the PID: `$$'x'` is a plain quote
+            continue
         elif line.startswith("<<<", i):
             i += 3                           # here-STRING: no body follows
             continue
@@ -1504,8 +1544,20 @@ def test_optional_host_binaries_are_only_called_behind_a_presence_check():
     `set -e`, a bare `restorecon -RF "$dir"` there is `command not found`,
     exit 127, and the deploy stops halfway through the journal step.
 
-    So the claim "guarded at the call site" is checked, not written down.
+    What this proves: every call to one of these names has a `have NAME` /
+    `command -v NAME` EARLIER in the enclosing function — or, for top-level
+    code, anywhere after the last function defined above it — and every name
+    in SELINUX_TOOLS is subject to that rule. What it does NOT prove: that the
+    check dominates the call. Branches are not followed, so
+    `if have x; then :; else x; fi`, `if ! have x; then :; fi; x` and a check
+    inside `$( … )` all pass. Top-level code is attributed to the last
+    function above it, so a bare call there is caught only while that function
+    has no check of its own. Those are held by review, not by this test.
     """
+    assert SELINUX_TOOLS <= OPTIONAL_HOST_BINARIES, (
+        "a SELinux tool is missing from OPTIONAL_HOST_BINARIES, so calls to it "
+        "are not being checked for a guard: "
+        f"{sorted(SELINUX_TOOLS - OPTIONAL_HOST_BINARIES)}")
     assert OPTIONAL_HOST_BINARIES <= EXTERNAL_COMMANDS
     called: set[str] = set()
     bare: list[str] = []
@@ -1550,6 +1602,25 @@ def test_the_presence_check_rule_accepts_only_a_check_for_that_name_in_that_func
     """
     text = f"{_SPINE}\n{body}\n"
     assert _unguarded_optional_calls(text) == expected
+
+
+@pytest.mark.parametrize("body", [
+    "f() { if have restorecon; then :; else restorecon -R /x; fi; }",
+    "f() { if ! have restorecon; then :; fi; restorecon -R /x; }",
+    'f() { x="$(have restorecon && echo y)"; restorecon -R /x; }',
+    # Top-level code belongs to the last function defined above it.
+    "g() { have restorecon; }\nrestorecon -R /x",
+])
+def test_the_presence_check_rule_is_presence_not_dominance(body):
+    """The limits the guard test's docstring states are the limits it has.
+
+    The docstring of the guard test says branches are not followed. If that
+    stops being true — someone teaches the rule about `else` arms — this goes
+    red and the docstring has to be rewritten to say what is proven now; and
+    if the docstring is never read, this is where an operator finds out that
+    `if have x; then :; else x; fi` was never a guarded call.
+    """
+    assert _unguarded_optional_calls(f"{_SPINE}\n{body}\n") == []
 
 
 #: The longest stretch of code lines the scanner may miss in one place.
@@ -1793,6 +1864,56 @@ def test_the_flat_model_is_not_fooled_by_an_apostrophe_in_a_comment():
     assert _flat_line_model("# Chart.js's ~200 KB\nmissing_one\n")[0] == {1, 2}
 
 
+def test_the_flat_model_reads_an_escaped_apostrophe_inside_an_ansi_c_string():
+    """`$'it\\'s'` is one string; reading it as three loses the rest of the file.
+
+    In a plain single quote a backslash is just a character, so the model
+    closed the string at `\\'` and opened a phantom one at the real closing
+    quote. Every line after it became `unknown`, the floor stopped checking the
+    functions defined below, and nothing was red. The scanner already reads
+    `$'…'` correctly; the oracle was the one behind.
+
+    Each red case below is a way a fix could be wrong the other way: plain
+    single quotes must NOT honour the backslash, and `$$'…'` is the PID
+    followed by a plain quote, not an ANSI-C string.
+    """
+    escaped = r"x=$'it\'s'" + "\nafter_it\n"
+    assert _flat_line_model(escaped) == ({1, 2}, set())
+    # A multi-line ANSI-C string carries its state across the newline, and the
+    # line that closes it is `unknown`, not code.
+    multi = "x=$'first\\n\nit" + r"\'s'" + "\nafter_it\n"
+    assert _flat_line_model(multi) == ({1, 3}, {2})
+    # Plain single quotes are unchanged: `\` does not escape, `'a\'` is closed.
+    plain = r"echo 'a\'" + "\nafter_it\n"
+    assert _flat_line_model(plain) == ({1, 2}, set())
+    # `$$` is the PID: what follows is a plain quote, closed at `\'`.
+    pid = r"echo $$'a\'" + "\nafter_it\n"
+    assert _flat_line_model(pid) == ({1, 2}, set())
+    # An unterminated ANSI-C string is still `unknown` for what follows it.
+    assert _flat_line_model("x=$'open\nafter_it\n") == ({1}, {2})
+
+
+def test_the_flat_model_reads_a_comment_that_follows_a_semicolon_or_an_ampersand():
+    """`cmd;# don't` has no quote in it, and the model must say so.
+
+    Bash reads `#` as the start of a comment wherever a word begins, and a
+    word begins right after `;` or `&`. The model required whitespace, so the
+    apostrophe opened a phantom quote and every later line went `unknown` —
+    the same consequence as the ANSI-C shape above, and for the same reason
+    invisible: nothing in the corpus does this today (0 occurrences), which is
+    why it needs a test of its own.
+
+    The red cases: an ESCAPED `\\;` is part of a word, so `#` behind it is not
+    a comment; and `)#` is left alone on purpose, because `$(cmd)#x` is a word.
+    """
+    assert _flat_line_model("step;# don't\nafter_it\n") == ({1, 2}, set())
+    assert _flat_line_model("step&# don't\nafter_it\n") == ({1, 2}, set())
+    assert _flat_line_model("a && b;;# don't\nafter_it\n") == ({1, 2}, set())
+    escaped = r"find . -exec x {} \;# 'not a comment" + "\nafter_it\n"
+    assert _flat_line_model(escaped) == ({1}, {2})
+    assert _flat_line_model("echo $(true)#'x\nafter_it\n") == ({1}, {2})
+
+
 @needs_git
 def test_the_flat_model_still_reads_most_of_each_script():
     """A blind oracle cannot contradict anything, and nothing says so.
@@ -1900,28 +2021,70 @@ def test_the_scanner_still_sees_every_function_definition():
                       + "\n".join(gaps))
 
 
+#: Every definition the unfiltered regex finds and the floor does not, each with
+#: the reason. This is the whole list, and it is compared for EQUALITY: a drop
+#: that is not written here turns the suite red, and so does an entry here that
+#: stopped being dropped. Both live inside single-quoted awk programs in
+#: deploy/install.sh — awk's text, not bash's. Note the two are NOT the same
+#: shape, and the distinction matters when someone edits this table: one is a
+#: definition, the other is three call sites.
+KNOWN_FLOOR_DROPS = {
+    ("deploy/install.sh", "take"):
+        "awk `function take()` — a DEFINITION, line 5805, inside `awk '…'` in "
+        "journal_effective_max_use",
+    ("deploy/install.sh", "flush_blanks"):
+        "the awk CALLS `flush_blanks()` at lines 6484, 6491 and 6520, standing "
+        "alone at line start inside `awk '…'` in "
+        "telegram_allowed_user_ids_rewrite. Not the definition: that reads "
+        "`function flush_blanks(    i)` and _FLOOR_DEFINITION requires `()`, "
+        "so the regex never matched it in the first place",
+}
+
+
 @needs_git
-def test_the_floor_does_not_lose_real_definitions():
+def test_the_floor_loses_exactly_the_definitions_written_down():
     """A floor that quietly stops looking is a test that passes over nothing.
 
-    Skipping quoted text must remove the awk functions and NOTHING else. The
-    unfiltered regex finds 263 definitions in the corpus (29 Sep 2026), two of
-    them awk; the filtered floor finds 261. If the line model ever starts
-    calling real command-level lines `unknown` — which is how it fails, by
-    design — the floor shrinks instead of turning red, and the only place that
-    shows is here. Losing more than 5% means the filter, not the shell, has
-    changed.
+    Skipping quoted text must remove the awk functions and NOTHING else. If the
+    line model ever calls real command-level lines `unknown` — which is how it
+    fails, by design — the floor shrinks instead of turning red, and this is
+    the only place that shows. The first version of this test allowed 5% of
+    the corpus to go missing, which was 11 definitions: one escaped apostrophe
+    in an ANSI-C string (`$'it\\'s'`) made the model lose the thread and drop
+    1 to 16 real definitions from one file (8 for `cmd;# don't` at one line of
+    deploy/install.sh, 11 in smoke-test.sh), the bound stayed green, and the
+    floor had silently stopped checking the last functions of that script.
+
+    So the drops are named. `unfiltered − filtered` must equal
+    `KNOWN_FLOOR_DROPS` exactly, per file: a definition the floor loses that
+    nobody wrote down is red until somebody either teaches the line model the
+    construct or writes the drop and its reason next to the others. Pairs of
+    (file, name), not bare names, so a function of the same name in another
+    file cannot vouch for one that went missing.
     """
     unfiltered_regex = re.compile(_FLOOR_DEFINITION.pattern, re.M)
-    unfiltered = filtered = 0
-    for text in _texts_at("HEAD").values():
-        unfiltered += len({m.group(1) for m in unfiltered_regex.finditer(text)})
-        filtered += len(_floor_definitions(text))
-    assert filtered <= unfiltered, "the filter added definitions the regex never had"
-    assert filtered >= 0.95 * unfiltered, (
-        f"the floor sees {filtered} definitions where an unfiltered regex sees "
-        f"{unfiltered}: the command-level filter is dropping real ones, so the "
-        "floor no longer checks the scanner over most of the corpus")
+    unfiltered: set[tuple[str, str]] = set()
+    filtered: set[tuple[str, str]] = set()
+    for path, text in _texts_at("HEAD").items():
+        unfiltered |= {(path, m.group(1)) for m in unfiltered_regex.finditer(text)}
+        filtered |= {(path, name) for name in _floor_definitions(text)}
+    assert unfiltered, "the unfiltered regex found no definitions in the whole corpus"
+    assert not filtered - unfiltered, (
+        "the filter added definitions the regex never had: "
+        f"{sorted(filtered - unfiltered)}")
+    dropped = unfiltered - filtered
+    unexpected = sorted(dropped - set(KNOWN_FLOOR_DROPS))
+    stale = sorted(set(KNOWN_FLOOR_DROPS) - dropped)
+    assert not unexpected, (
+        f"the floor dropped {len(unexpected)} definition(s) nobody wrote down: "
+        f"{unexpected}. That is the line model losing the thread (an unmodelled "
+        "quoting shape earlier in the file), not the shell changing: the floor "
+        "is no longer checking those functions. Teach `_flat_scan_line` the "
+        "construct, or — if the definition really is not shell — add it to "
+        "KNOWN_FLOOR_DROPS with the reason.")
+    assert not stale, (
+        f"KNOWN_FLOOR_DROPS lists {stale}, which the floor no longer drops: "
+        "remove the entry, or the list stops meaning anything")
 
 
 def _lines(*parts: str) -> str:
