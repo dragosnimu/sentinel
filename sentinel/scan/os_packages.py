@@ -63,6 +63,13 @@ The third member of the tuple is `facts`, exactly as in `trivy_fs.scan`: it
 carries `db_version` even on the error paths, so the `failed` row in `scans` says
 what metadata the answer was — or was not — drawn from.
 
+The rhel backend has a fourth outcome that looks like the second and is not:
+`dnf` exits 0 with ZERO lines both on a clean host and on a dnf that saw no
+advisory source at all (every repository disabled, or only repositories that
+carry no advisories). So an empty answer is believed only when a control proves
+dnf can see advisories — see `_installed_advisory_check`, which also says what
+that control does NOT catch. A non-empty answer proves itself and runs no control.
+
 Read-only throughout: this lists what security updates are AVAILABLE. It never
 installs anything — applying a fix is the patch pipeline (P9), behind explicit
 approval.
@@ -146,6 +153,20 @@ TIMEOUT_S = 300
 #: iar atunci un apel care ia plafonul celuilalt trece neobservat.
 APT_TIMEOUT_S = 180
 
+#: Cat asteptam dupa controlul pozitiv al lui dnf (`_installed_advisory_check`).
+#:
+#: Masurat pe gazda reala, 29 septembrie 2026, dnf 4.14.0: 1,4-2,8 secunde pentru
+#: `updateinfo list cves --security --installed` cu `-C` si cache-ul scanerului
+#: (18575 de linii, ~1,5 MB), 5,6 secunde de la un capat la altul cu `sudo` si
+#: pornirea procesului. Nu atinge reteaua si nu reconstruieste nimic, deci n-are
+#: cazul rau al lui dnf (87 s). Plafonul e ca sa prinda un proces ATARNAT — o
+#: incuietoare pe cache — nu ca sa margineasca o rulare normala; marja de ~20x e
+#: aceeasi logica ca la `fix_state.RPM_TIMEOUT_S`.
+#:
+#: Rand separat de `TIMEOUT_S`, dinadins: doua plafoane cu aceeasi cifra nu se pot
+#: deosebi intr-o proba, iar un apel care il ia pe al celuilalt trece neobservat.
+CONTROL_TIMEOUT_S = 60
+
 #: Cel mai rau caz al modulului, pentru bugetul unitatii.
 #:
 #: Pe o gazda ruleaza O SINGURA familie, deci costul modulului e plafonul
@@ -156,12 +177,14 @@ APT_TIMEOUT_S = 180
 #: (`test_scan_trivy_fs.py::test_the_measured_ceiling_fits_inside_the_unit_budget`).
 #:
 #: Backendul rhel are mai multe comenzi, nu una, si ruleaza una dupa alta: dnf,
-#: apoi `fix_state` citeste baza rpm ca sa deosebeasca „reparatia nu e
-#: instalata" de „e instalata, dar nu ruleaza inca". Plafoanele lor se ADUNA, nu
-#: se pierd in maxim. Un pas nou al backendului rhel isi adauga plafonul in
+#: apoi — DOAR cand dnf n-a raportat nimic — controlul pozitiv, apoi `fix_state`
+#: citeste baza rpm ca sa deosebeasca „reparatia nu e instalata" de „e instalata,
+#: dar nu ruleaza inca". Plafoanele lor se ADUNA, nu se pierd in maxim; controlul
+#: e numarat si cand nu ruleaza, fiindca bugetul se scrie pentru cel mai rau caz. Un pas nou al backendului rhel isi adauga plafonul in
 #: tuplul de mai jos si atat: suma, `WORST_CASE_TIMEOUT_S` si testul care o
 #: leaga de buget se deriva de aici.
-RHEL_STEP_CEILINGS_S: Final = (TIMEOUT_S, fix_state.WORST_CASE_TIMEOUT_S)
+RHEL_STEP_CEILINGS_S: Final = (TIMEOUT_S, CONTROL_TIMEOUT_S,
+                               fix_state.WORST_CASE_TIMEOUT_S)
 
 WORST_CASE_TIMEOUT_S = max(sum(RHEL_STEP_CEILINGS_S), APT_TIMEOUT_S)
 
@@ -290,6 +313,32 @@ async def _scan_dnf() -> tuple[list[dict[str, Any]], str | None, dict[str, Any]]
     # rulat pe o lista in care nu ai incredere ar produce verdicte pentru ceva ce
     # urmeaza sa fie aruncat — si ar consuma plafonul lui de timp pe degeaba.
     # Cine adauga un pas nou aici isi adauga si plafonul in `RHEL_STEP_CEILINGS_S`.
+    if not findings:
+        # Zero constatari. Doua feluri de zero se deosebesc doar prin ce a scris dnf:
+        nonblank = [ln.strip() for ln in out.splitlines() if ln.strip()]
+        if nonblank:
+            # (a) A scris ceva, iar NICIO linie nu se potriveste. O schimbare de
+            # format (sau o eroare scrisa pe stdout) ar da zero constatari dintr-o
+            # iesire ne-goala — acelasi inchis-in-masa ca la dnf orb, dar controlul
+            # de mai jos nu l-ar prinde, fiindca gazda are advisory-uri instalate.
+            # Controlul nu se ruleaza: nu el e intrebarea.
+            return [], (
+                f"dnf a scris {len(nonblank)} linii (cod {rc}), dar nicio linie nu se "
+                "potrivește cu formatul `CVE-… Severitate/Sec. pachet` pe care îl "
+                "parsează scanerul: formatul s-a schimbat sau dnf a scris o eroare pe "
+                "stdout. Zero constatări dintr-o ieșire ne-goală ar închide în masă tot "
+                f"ce e deschis. Prima linie: {nonblank[0][:120]!r}. "
+                "Scanarea NU s-a încheiat."), facts
+        # (b) N-a scris nimic. Gazda curata SAU dnf orb — vezi controlul. Rulat DOAR
+        # aici: o constatare parsata se dovedeste singura (dnf a citit advisory-uri),
+        # iar controlul nu depinde de numarul lor, de ce se rezolva sau de scanarile
+        # dinainte — scanarea 134 (0 constatari, 491 rezolvate) a fost corecta.
+        # Limitele controlului stau in docstring-ul lui, nu aici.
+        installed, refusal = await _installed_advisory_check()
+        if refusal:
+            return [], refusal, facts
+        log.info("dnf scan empty, confirmed by control",
+                 extra={"installed_advisory_lines": installed})
 
     # Dupa dnf si INAINTE de upsert: `raw` se rescrie la fiecare upsert, deci
     # dovada („ce a vazut scanarea") trebuie sa fie pe constatare cand ajunge in
@@ -298,6 +347,119 @@ async def _scan_dnf() -> tuple[list[dict[str, Any]], str | None, dict[str, Any]]
     facts["fix_state"] = await fix_state.annotate(findings)
     log.info("dnf scan parsed", extra={"findings": len(seen)})
     return findings, None, facts
+
+
+async def _installed_advisory_check() -> tuple[int, str | None]:
+    """Controlul pozitiv: poate dnf sa vada ADVISORY-URI pe gazda asta?
+
+    Intoarce `(linii recunoscute, eroare)`. `eroare is None` inseamna „da, le vede",
+    adica un raspuns gol de la interogarea principala inseamna „gazda e curata".
+    Orice alt raspuns inseamna „nu pot sa spun", si scanarea trebuie sa esueze, nu
+    sa incheie cu zero.
+
+    DE CE EXISTA. `dnf updateinfo list cves --security` iese cu 0 si zero linii si
+    cand gazda e curata, si cand dnf n-a vazut nicio sursa de advisory-uri (toate
+    depozitele dezactivate; doar depozite fara advisory-uri). Masurat pe gazda
+    reala, dnf 4.14.0:
+
+        scenariu                  `--available` (scanarea)   `--installed` (controlul)
+        gazda curata              rc 0, 0 linii              rc 0, 18575 linii
+        toate depozitele oprite   rc 0, 0 linii              0 linii  -> prins
+        doar depozite fara adv.   rc 0, 0 linii              0 linii  -> prins
+        director de cache gol     rc 1, eroare               rc 1, eroare
+        doar baseos               rc 0, 0 linii              10667 linii -> NEPRINS
+
+    Fara control, primul rand „rc 0, 0 linii" e citit de orchestrator ca „totul s-a
+    reparat" si inchide fiecare constatare deschisa: panou curat, gazda exploatabila.
+
+    `--installed` si nu `rpm -qa`: `rpm -qa` trece in FIECARE fals-gol reprodus
+    (pachetele exista oricum). Controlul trebuie sa treaca prin aceleasi metadate de
+    advisory pe care le foloseste scanarea, altfel nu dovedeste nimic despre ele.
+    `-C`: doar cache, fara retea — un control care iese in retea ar pica exact cand
+    reteaua e problema, si ar reconstrui metadatele (82 s masurate) in loc sa le judece.
+
+    Rulat DOAR cand interogarea principala n-a dat nimic (`_scan_dnf`). Nu depinde de
+    cate constatari a gasit scanarea, de cate se rezolva sau de scanarile anterioare, si
+    nu are voie sa depinda: scanarea 134 din productie a fost `completed`,
+    `findings_count 0`, `resolved_findings 491` — gazda repornise intr-un nucleu deja
+    instalat, iar cele 491 s-au inchis legitim. Nu exista nicio scanare ulterioara cu
+    constatari, fiindca gazda e curata; oricare dintre criteriile alea ar fi blocat
+    permanent un rezultat corect. Singura intrebare e „vede dnf advisory-uri?".
+
+    Cele doua garzi de FORMAT (aici si in `_scan_dnf`) exista din acelasi motiv: o
+    schimbare de format a iesirii dnf transforma o iesire ne-goala in zero constatari,
+    adica acelasi zero, doar ca nu vine din lipsa surselor. Cerem cel putin o linie care
+    se potriveste cu `_LINE` in controlul ne-gol — asta valideaza si parserul, pe singurul
+    lucru pe care il stim sigur ca exista.
+
+    CE CONTROLUL NU PRINDE, si nu pretinde ca prinde:
+
+      * un set PARTIAL de depozite. `baseos` singur are advisory-uri, deci controlul
+        trece (10667 linii masurate) — ce lipseste, AppStream sau EPEL, nu se vede;
+      * metadate VECHI dar descarcabile. `-C` nu reimprospateaza: un cache de acum doua
+        luni da un raspuns coerent si invechit; asta e treaba lui `dnf-makecache`;
+      * un dnf care iese cu 1 si iesire PARTIALA: verificarea `rc not in (0, 100) and
+        not out.strip()` din `_scan_dnf` il lasa sa treaca, iar controlul nu se ruleaza
+        cand iesirea are constatari;
+      * un depozit care cade INTRE cele doua procese: cele doua ruleaza separat, dupa
+        cache-ul de pe disc, iar controlul nu stie ce set a vazut interogarea;
+      * o gazda care chiar n-are NICIUN advisory instalat: controlul ei e gol, deci
+        scanarea ei ar esua PERMANENT. E un pret asumat, nu un accident (pe AlmaLinux 9
+        controlul are zeci de mii de linii): „nu vad nimic" si „nu e nimic" nu se pot
+        deosebi de aici. Cine ajunge pe o asemenea gazda decide el ce face;
+      * un advisory care NU declara niciun CVE structurat. Masurat pe productie,
+        29 sep 2026: `updateinfo list --security --installed` listeaza 2633 de
+        pachete, iar `list cves --security --installed` — interogarea pe care o
+        foloseste scanerul, si controlul asta odata cu ea — acopera 2623. Cele 10
+        care lipsesc sunt avize EPEL (de pilda cel pentru `libsodium`, cu CVE-ul
+        doar in titlul bug-ului, fara referinta structurata): nu tiparesc NIMIC sub
+        `list cves`. Deci un patch de securitate EPEL in asteptare arata identic cu
+        o gazda curata — interogarea principala da zero, controlul trece pe avizele
+        Alma, scanarea se incheie „curat". E chiar forma impotriva careia e scrisa
+        garda, intr-un colt pe care garda nu-l acopera. NU e introdus de schimbarea
+        asta; exista de cand scanerul intreaba `list cves`. Reparatia e o a doua
+        interogare la nivel de advisory (`list --security`), si e munca separata.
+
+    Si o dependenta care NU e in acest repository: `skip_if_unavailable=False` din
+    `/etc/dnf/dnf.conf` (verificat pe gazda, 29 septembrie 2026) e ce face ca un depozit
+    cazut sa dea rc != 0 in loc sa fie sarit tacut. Daca o schimba cineva, un depozit
+    cazut devine tacut, iar controlul nu-l prinde daca `baseos` a ramas.
+    """
+    rc, out, err = await _run([
+        "dnf", "-C", "-q", f"--setopt=cachedir={CACHE_DIR}",
+        "updateinfo", "list", "cves", "--security", "--installed"],
+        timeout=CONTROL_TIMEOUT_S)
+    if rc == 124 and err == "timeout":
+        return 0, (
+            f"controlul dnf pe pachetele instalate a depășit plafonul de "
+            f"{CONTROL_TIMEOUT_S} s. dnf n-a găsit nicio actualizare de securitate, "
+            "dar fără control nu se poate deosebi «gazdă curată» de «dnf care nu vede "
+            "nimic». Scanarea NU s-a încheiat: nu are zero vulnerabilități, nu are date.")
+    if rc != 0:
+        return 0, (
+            "controlul dnf pe pachetele instalate a eșuat "
+            f"({(err.strip() or f'dnf a ieșit cu {rc}')[:200]}). dnf n-a găsit nicio "
+            "actualizare de securitate, dar fără control nu se poate deosebi «gazdă "
+            "curată» de «dnf care nu vede nimic». Scanarea NU s-a încheiat: nu are zero "
+            "vulnerabilități, nu are date.")
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    if not lines:
+        return 0, (
+            "dnf n-a găsit nicio actualizare de securitate, dar nici controlul pe "
+            "pachetele deja instalate (`dnf -C updateinfo list cves --security "
+            "--installed`) n-a găsit vreun advisory: dnf n-a citit nicio sursă de "
+            "advisory-uri (depozite dezactivate sau fără metadate de securitate, ori "
+            "cache gol). Un raport gol ar arăta o gazdă curată fără s-o fi verificat "
+            "nimeni. Scanarea NU s-a încheiat: nu are zero vulnerabilități, nu are date.")
+    recognised = sum(1 for ln in lines if _LINE.match(ln))
+    if not recognised:
+        return 0, (
+            f"controlul dnf pe pachetele instalate a scris {len(lines)} linii, dar "
+            "nicio linie nu se potrivește cu formatul `CVE-… Severitate/Sec. pachet` "
+            "pe care îl parsează scanerul: formatul dnf s-a schimbat sau ieșirea nu e "
+            "cea așteptată, iar parserul n-ar citi corect nici rezultatul real. "
+            f"Prima linie: {lines[0][:120]!r}. Scanarea NU s-a încheiat.")
+    return recognised, None
 
 
 # ===========================================================================
