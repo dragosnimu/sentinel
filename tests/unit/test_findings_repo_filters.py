@@ -182,6 +182,9 @@ def test_get_finding_looks_up_by_key_not_by_position():
     sql, _ = db.only()
     assert "WHERE f.id = $1" in sql
     assert "LIMIT" not in sql
-    assert "status = 'open'" not in sql, (
+    # Doar clauza WHERE: SELECT-ul conține `f.status = 'open'` ca parte din
+    # indicatorul `fix_pending_reboot` (o expresie calculată, nu un filtru).
+    where = sql.split("WHERE f.id = $1", 1)[1]
+    assert "status = 'open'" not in where, (
         "un finding rezolvat trebuie să poată fi citit, altfel „nu există” și "
         "„s-a reparat” rămân același răspuns")

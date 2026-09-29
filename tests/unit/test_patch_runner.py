@@ -30,10 +30,16 @@ def _plan(*, with_rollback: bool = True) -> dict[str, Any]:
     """A plan that actually passes the real validator — otherwise these tests
     would only ever exercise the "invalid plan" branch.
 
-    Note three constraints the validator enforces and this fixture honours: a
+    Note four constraints the validator enforces and this fixture honours: a
     backup requires a disk_free preflight; a rollback step may not itself
-    trigger a rollback; and nothing may reference /var/backups/sentinel, which
-    is why restore_argv points at the extracted target rather than the archive.
+    trigger a rollback; nothing may reference /var/backups/sentinel, which is
+    why restore_argv points at the extracted target rather than the archive;
+    and (S3, 25 September 2026) a `dnf downgrade` rollback must pin a
+    version-release that a `pkg_version equals` preflight actually verifies —
+    `_validate_dnf_pin` refuses a bare `nginx` with no version the same way
+    `_validate_apt_pin` already refused an unpinned apt rollback. `_FakeExec`
+    answers the `rpm -q` this preflight compiles to with exactly this
+    version, so the check passes and the plan stays reversible.
     """
     return {
         "schema_version": 1,
@@ -48,6 +54,8 @@ def _plan(*, with_rollback: bool = True) -> dict[str, Any]:
             _check("pf_disk", {"kind": "disk_free", "path": "/var",
                                "min_bytes": 524288000}),
             _check("pf_conf", {"kind": "file_exists", "path": "/etc/nginx/nginx.conf"}),
+            _check("pf_pkgver", {"kind": "pkg_version", "name": "nginx",
+                                 "equals": "1.20.1-14.el9"}),
         ],
         "backup": [{"id": "bk1", "desc_ro": "salvez configurația nginx",
                     "kind": "path", "source": "/etc/nginx",
@@ -58,7 +66,7 @@ def _plan(*, with_rollback: bool = True) -> dict[str, Any]:
             _check("hc_unit", {"kind": "systemd", "unit": "nginx.service",
                                "expect_state": "active"}),
         ],
-        "rollback": ([_step("rb1", ["dnf", "-y", "downgrade", "nginx"],
+        "rollback": ([_step("rb1", ["dnf", "-y", "downgrade", "nginx-1.20.1-14.el9"],
                             on_failure="abort")] if with_rollback else []),
         "post_verification": [
             _check("pv_conf", {"kind": "command", "argv": ["nginx", "-t"],
@@ -111,6 +119,13 @@ class _FakeExec:
         stdout = ""
         if argv[:2] == ["systemctl", "is-active"]:
             stdout = "failed" if "systemctl" in self.fail_on else "active"
+        elif argv[:3] == ["rpm", "-q", "--qf"]:
+            # `_check_pkg_version` reads this via its EVR parser. `_plan()`'s
+            # nginx fixture pins its rollback to exactly this version-release
+            # and verifies it in a preflight, so answering with anything else
+            # here would make a fixture built to be reversible fail its own
+            # preflight instead.
+            stdout = "" if "rpm" in self.fail_on else "0:1.20.1-14.el9\n"
         return {"exit_code": code, "stdout": stdout, "stderr": "boom" if code else "",
                 "timed_out": False}
 

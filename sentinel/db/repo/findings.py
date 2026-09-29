@@ -165,6 +165,101 @@ async def mark_resolved_absent(db: Database, scanner: str, asset_id: int | None,
     return len(rows)
 
 
+# --- „reparația e pe disc, dar nu rulează încă" ------------------------------
+# Verdictul stă în `findings.raw.fix_state.state` (scris de
+# `sentinel.scan.fix_state`), NU în `status`. O constatare în starea asta e
+# `open`: gazda e exploatabilă până la repornire, iar orice cititor care numără
+# „deschise" și „KEV" (panoul, raportul zilnic, `ai/ask`, predicția de expunere)
+# trebuie să le numere. Mutarea în `deferred`, așa cum a făcut prima variantă,
+# ar fi scos din „KEV deschise" șapte constatări din care cinci erau chiar cele
+# încă exploatabile — un panou care spune „2 KEV" peste un nucleu vulnerabil.
+#
+# Cine trebuie să știe deosebirea nu e un cititor de numere, ci cel care ACȚIONEAZĂ
+# pe constatare: planificatorul (nu redactează un `dnf update` fără nimic de
+# instalat) și botul (`/planifica` explică de ce nu). Ei citesc predicatul de mai
+# jos — unul singur, ca cele patru locuri să nu ajungă să definească „în
+# așteptare" în patru feluri.
+FIX_PENDING_REBOOT = "pending_reboot"
+
+
+def pending_reboot_sql(alias: str = "") -> str:
+    """Expresia SQL booleană „constatarea e deschisă, iar reparația ei e instalată
+    dar nu rulează". Întotdeauna `true` sau `false`, niciodată NULL.
+
+    `COALESCE`: un rând fără `raw.fix_state` (orice constatare non-`dnf`, sau una
+    scrisă înaintea acestui mecanism) dă NULL la `#>>`, iar `NOT NULL` e NULL — un
+    `WHERE ... AND NOT <expresia>` ar arunca tăcut rândul din selecție. Lipsa
+    verdictului înseamnă „nu se știe că așteaptă", adică planificabil ca înainte.
+
+    `status = 'open'` e în expresie, nu la apelant: `raw` al unui rând REZOLVAT
+    nu se rescrie, deci păstrează ultimul verdict de dinainte de repornire. Fără
+    condiția asta un rând închis ar mai spune „așteaptă o repornire" o dată ce
+    dnf l-a scos din listă.
+
+    `alias` e prefixul tabelului cu punct final (`"f."`), sau gol.
+    """
+    return (f"COALESCE({alias}status = 'open' AND "
+            f"{alias}raw #>> '{{fix_state,state}}' = '{FIX_PENDING_REBOOT}', false)")
+
+
+async def previous_fix_states(db: Database, scanner: str, asset_id: int | None,
+                              keys: list[str]) -> dict[str, dict[str, Any]]:
+    """Ce știa scanarea trecută despre cheile astea: `{finding_key: {"status",
+    "fix_state"}}`, doar pentru rândurile care există.
+
+    Citită ÎNAINTE de upsert, fiindcă upsertul rescrie `raw` întreg. E singurul
+    loc unde verdictul de ieri mai există, iar `fix_state.reconcile` are nevoie
+    de el pentru trei lucruri: `unknown` să nu șteargă un „în așteptare" dovedit,
+    de când așteaptă (`since`) și care constatări au INTRAT acum în starea asta.
+    """
+    if not keys:
+        return {}
+    rows = await db.fetch(
+        """
+        SELECT finding_key, status, raw -> 'fix_state' AS fix_state
+        FROM findings
+        WHERE scanner = $1 AND asset_id IS NOT DISTINCT FROM $2
+          AND finding_key = ANY($3::text[])
+        """,
+        scanner, asset_id, list(keys))
+    out: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        fs = r["fix_state"]
+        if isinstance(fs, (str, bytes)):   # fără codec jsonb, asyncpg dă text
+            try:
+                fs = json.loads(fs)
+            except ValueError:
+                fs = None
+        out[r["finding_key"]] = {
+            "status": r["status"], "fix_state": fs if isinstance(fs, dict) else {}}
+    return out
+
+
+async def list_pending_reboot(db: Database, scanner: str,
+                              asset_id: int | None) -> list[dict[str, Any]]:
+    """Constatările deschise ale scanerului a căror reparație așteaptă o repornire,
+    citite din bază DUPĂ upsert — adevărul de acum, nu ce a calculat trecerea.
+
+    De aici pleacă și mesajul de „au intrat în așteptare", și reamintirea zilnică
+    pentru KEV: amândouă trebuie să descrie ce e în bază, inclusiv rândurile al
+    căror verdict a fost păstrat pentru că `rpm` n-a putut fi citit.
+    """
+    rows = await db.fetch(
+        f"""
+        SELECT f.id, f.finding_key, f.cve, f.package, f.severity, f.kev,
+               f.fixed_version, f.priority,
+               f.raw #>> '{{fix_state,installed}}' AS installed,
+               f.raw #>> '{{fix_state,running}}' AS running,
+               f.raw #>> '{{fix_state,since}}' AS since
+        FROM findings f
+        WHERE f.scanner = $1 AND f.asset_id IS NOT DISTINCT FROM $2
+          AND {pending_reboot_sql("f.")}
+        ORDER BY f.priority DESC, f.id
+        """,
+        scanner, asset_id)
+    return [dict(r) for r in rows]
+
+
 async def count_open_outside_severities(db: Database, scanner: str,
                                         asset_id: int | None, *,
                                         visible_severities: list[str],
@@ -338,10 +433,14 @@ async def get_finding(db: Database, finding_id: int) -> dict[str, Any] | None:
     dă eroare — dă un câmp care dispare tăcut din mesaj.
     """
     row = await db.fetchrow(
-        """
+        f"""
         SELECT f.id, f.cve, f.title, f.severity, f.cvss, f.epss, f.kev,
                f.priority, f.package, f.installed_version, f.fixed_version,
                f.location, f.ecosystem, f.scanner, f.status,
+               {pending_reboot_sql("f.")} AS fix_pending_reboot,
+               f.raw #>> '{{fix_state,installed}}' AS fix_installed,
+               f.raw #>> '{{fix_state,running}}' AS fix_running,
+               f.raw #>> '{{fix_state,since}}' AS fix_since,
                a.name AS asset_name
         FROM findings f LEFT JOIN assets a ON a.id = f.asset_id
         WHERE f.id = $1
@@ -384,7 +483,8 @@ async def list_open(db: Database, *, limit: int = 100, offset: int = 0,
         f"""
         SELECT f.id, f.cve, f.advisory_id, f.title, f.severity, f.cvss, f.epss,
                f.kev, f.priority, f.package, f.installed_version, f.fixed_version,
-               f.scanner, f.location, f.status, f.last_seen, a.name AS asset_name
+               f.scanner, f.location, f.status, f.last_seen, a.name AS asset_name,
+               {pending_reboot_sql("f.")} AS fix_pending_reboot
         FROM findings f LEFT JOIN assets a ON a.id = f.asset_id
         WHERE f.status = 'open'{clause}
         ORDER BY f.priority DESC, f.severity DESC, f.last_seen DESC, f.id DESC

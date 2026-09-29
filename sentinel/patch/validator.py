@@ -1028,32 +1028,16 @@ def _validate_coupling(
             )
 
     _validate_rollback_pin(rollback_steps, preflight, r)
+    _validate_downgrade_lives_in_rollback(backups, rollback_steps, r)
 
 
-def _validate_rollback_pin(
-    rollback_steps: list[dict[str, Any]],
-    preflight: list[dict[str, Any]],
-    r: ValidationResult,
-) -> None:
-    """An apt rollback may only pin a version the preflight actually checked.
-
-    The executor permits `--allow-downgrades` for exactly one purpose —
-    putting a package back on the version that was installed before the patch
-    — and it can only enforce the SHAPE of that: a pin is present. Whether the
-    pinned version is the one the plan verified was installed is a question
-    only the whole plan can answer, so it is answered here.
-
-    Without this, `rollback: apt-get -y install --allow-downgrades
-    openssl=1.0.2` validates clean in a plan whose preflight checked
-    `polkitd`: a "rollback" that downgrades an unrelated package to a version
-    nobody looked at, authorised by a button the operator pressed to undo
-    something else. The preflight `equals` is what makes the pin meaningful;
-    a pin without one is a version taken on the model's word.
-
-    Compared as literal strings, deliberately: both values are supposed to be
-    the same `installed_version` fact the planner injected into the prompt, so
-    any difference at all — an added epoch, a guessed revision — means one of
-    them did not come from the database.
+def _verified_pkg_versions(preflight: list[dict[str, Any]]) -> dict[str, str]:
+    """Package name -> version a `pkg_version{equals: ...}` preflight check
+    actually verifies is installed, read from the plan's OWN preflight
+    section — never from the finding row, never from the model's say-so
+    anywhere else. The one fact `_validate_rollback_pin` (is the pin
+    correct?) is allowed to trust: "verified" means a preflight `equals` says
+    so, and nothing else in the plan can promote a version to it.
     """
     verified: dict[str, str] = {}
     for item in preflight:
@@ -1063,53 +1047,266 @@ def _validate_rollback_pin(
         equals = check.get("equals")
         if isinstance(equals, str) and equals:
             verified[str(check.get("name"))] = equals
+    return verified
+
+
+def _validate_rollback_pin(
+    rollback_steps: list[dict[str, Any]],
+    preflight: list[dict[str, Any]],
+    r: ValidationResult,
+) -> None:
+    """A package-manager rollback may only pin a version the preflight
+    actually checked.
+
+    The executor permits `--allow-downgrades` (apt) and `downgrade` (dnf) for
+    exactly one purpose — putting a package back on the version that was
+    installed before the patch — and it can only enforce the SHAPE of that: a
+    pin is present. Whether the pinned version is the one the plan verified
+    was installed is a question only the whole plan can answer, so it is
+    answered here.
+
+    Without this, `rollback: apt-get -y install --allow-downgrades
+    openssl=1.0.2` validates clean in a plan whose preflight checked
+    `polkitd`: a "rollback" that downgrades an unrelated package to a version
+    nobody looked at, authorised by a button the operator pressed to undo
+    something else. The preflight `equals` is what makes the pin meaningful;
+    a pin without one is a version taken on the model's word.
+
+    dnf got no such check until 25 September 2026 — an asymmetry with real
+    cost on this project's own rhel/dnf production host: a `dnf downgrade`
+    rollback's pin went completely unverified.
+
+    What this proves is that the pin NAMES the version the preflight saw. It
+    does not prove that running the downgrade puts that version back — see
+    the note below `_validate_dnf_pin` for why that is a different claim.
+    """
+    verified = _verified_pkg_versions(preflight)
 
     for i, step in enumerate(rollback_steps):
         argv = step.get("argv")
         if not isinstance(argv, list) or not argv:
             continue
-        if str(argv[0]).rsplit("/", 1)[-1] not in ("apt", "apt-get"):
+        binary = str(argv[0]).rsplit("/", 1)[-1]
+        if binary in ("apt", "apt-get"):
+            _validate_apt_pin(argv, verified, i, r)
+        elif binary == "dnf":
+            _validate_dnf_pin(argv, verified, i, r)
+
+
+def _validate_apt_pin(
+    argv: list[Any], verified: dict[str, str], i: int, r: ValidationResult
+) -> None:
+    """Compared as literal strings, deliberately: both values are supposed to
+    be the same `installed_version` fact the planner injected into the
+    prompt, so any difference at all — an added epoch, a guessed revision —
+    means one of them did not come from the database."""
+    skip_next = False
+    # `part`, not `token`: with the obvious name, ruff reads `part == "-o"`
+    # as a hardcoded credential (S105) and the file stops being clean.
+    for part in argv[1:]:
+        if skip_next:
+            # The VALUE of `-o`, e.g. `Dpkg::Options::=--force-confold`.
+            # It is not a flag (no leading dash) and it does contain an
+            # `=`, so a loop that only looked at those two things read it
+            # as a pin of a package called `Dpkg` — a refusal on a plan
+            # the executor is perfectly happy with. Measured before this
+            # line existed.
+            skip_next = False
             continue
-        skip_next = False
-        # `part`, not `token`: with the obvious name, ruff reads `part == "-o"`
-        # as a hardcoded credential (S105) and the file stops being clean.
-        for part in argv[1:]:
-            if skip_next:
-                # The VALUE of `-o`, e.g. `Dpkg::Options::=--force-confold`.
-                # It is not a flag (no leading dash) and it does contain an
-                # `=`, so a loop that only looked at those two things read it
-                # as a pin of a package called `Dpkg` — a refusal on a plan
-                # the executor is perfectly happy with. Measured before this
-                # line existed.
-                skip_next = False
-                continue
-            if not isinstance(part, str):
-                continue
-            if part == "-o":
-                skip_next = True
-                continue
-            if part.startswith("-") or "=" not in part:
-                continue
-            name, _, version = part.partition("=")
-            name = name.split(":", 1)[0]
-            if name not in verified:
-                r.error(
-                    f"$.rollback[{i}].argv",
-                    "rollback_pin_unverified",
-                    f"this step pins {name!r} to {version!r}, but no preflight check "
-                    f"confirms which version of {name!r} is installed. A rollback to "
-                    "a version nothing verified can install something the host never "
-                    "had — add a pkg_version preflight with `equals`.",
-                )
-            elif verified[name] != version:
-                r.error(
-                    f"$.rollback[{i}].argv",
-                    "rollback_pin_mismatch",
-                    f"this step rolls {name!r} back to {version!r}, but the preflight "
-                    f"verifies the installed version is {verified[name]!r}. One of the "
-                    "two is not the version this host actually has, and the rollback "
-                    "is the half that runs when something has already gone wrong.",
-                )
+        if not isinstance(part, str):
+            continue
+        if part == "-o":
+            skip_next = True
+            continue
+        if part.startswith("-") or "=" not in part:
+            continue
+        name, _, version = part.partition("=")
+        name = name.split(":", 1)[0]
+        if name not in verified:
+            r.error(
+                f"$.rollback[{i}].argv",
+                "rollback_pin_unverified",
+                f"this step pins {name!r} to {version!r}, but no preflight check "
+                f"confirms which version of {name!r} is installed. A rollback to "
+                "a version nothing verified can install something the host never "
+                "had — add a pkg_version preflight with `equals`.",
+            )
+        elif verified[name] != version:
+            r.error(
+                f"$.rollback[{i}].argv",
+                "rollback_pin_mismatch",
+                f"this step rolls {name!r} back to {version!r}, but the preflight "
+                f"verifies the installed version is {verified[name]!r}. One of the "
+                "two is not the version this host actually has, and the rollback "
+                "is the half that runs when something has already gone wrong.",
+            )
+
+
+def _validate_dnf_pin(
+    argv: list[Any], verified: dict[str, str], i: int, r: ValidationResult
+) -> None:
+    """The dnf half of `_validate_apt_pin`'s rule, closing the asymmetry.
+
+    `dnf downgrade` carries no separator of its own between a package name
+    and its version-release — the recipe this project's own prompt teaches
+    writes `<pachet>-<versiune instalată>` (`_PLATFORM_PROMPT_FACTS['rhel']`),
+    and rpm package names can themselves contain dashes
+    (`webkit2gtk3-jsc`) — so a target is never split apart. Instead every
+    name/version pair preflight actually verified is RECONSTRUCTED as
+    `f"{name}-{version}"` and compared to the whole token. A target that is
+    exactly a verified bare package name (no version appended at all) is the
+    other failure the operator's own incident named: `dnf downgrade
+    webkit2gtk3-jsc` with no version steps back exactly one build, which is
+    not necessarily the version preflight verified was installed.
+    """
+    if "downgrade" not in argv:
+        return
+    idx = argv.index("downgrade")
+    targets = [a for a in argv[idx + 1:] if isinstance(a, str) and not a.startswith("-")]
+    for target in targets:
+        if target in verified:
+            r.error(
+                f"$.rollback[{i}].argv",
+                "rollback_pin_unverified",
+                f"{target!r} has no version pinned. `dnf downgrade {target}` with "
+                "a bare package name goes back exactly one build in the repo, "
+                "which is not necessarily the version preflight verified was "
+                f"installed — pin it as {target}-{verified[target]}.",
+            )
+            continue
+        if any(target == f"{name}-{version}" for name, version in verified.items()):
+            continue
+        same_name = next(
+            (name for name in verified if target.startswith(f"{name}-")), None)
+        if same_name is not None:
+            r.error(
+                f"$.rollback[{i}].argv",
+                "rollback_pin_mismatch",
+                f"this step rolls back to {target!r}, but the preflight verifies "
+                f"{same_name!r} is installed at {verified[same_name]!r}. One of "
+                "the two is not the version this host actually has, and the "
+                "rollback is the half that runs when something has already gone "
+                "wrong.",
+            )
+        else:
+            r.error(
+                f"$.rollback[{i}].argv",
+                "rollback_pin_unverified",
+                f"this step pins a downgrade to {target!r}, but no preflight "
+                "pkg_version check confirms which version is installed. A "
+                "rollback to a version nothing verified can install something "
+                "the host never had — add a pkg_version preflight with `equals`.",
+            )
+
+
+# ---------------------------------------------------------------------------
+# What this module can and cannot say about `risk.reversible`
+# ---------------------------------------------------------------------------
+# `risk.reversible` is the model's own claim and the ONLY field
+# `sentinel/patch/window.py`'s stage-1 gate reads before a terminal refusal.
+# Two designs for policing it were tried and both were wrong, in opposite
+# directions:
+#
+# * Round 1 OVERWROTE `false` with `true` whenever `rollback` was non-empty.
+#   Six schema-valid rollbacks (`systemctl restart nginx.service`, `dnf
+#   reinstall`, `dnf clean all`, the apply step run again, `dnf makecache`, a
+#   pin covering one of two packages) restored nothing and all said `true`.
+# * Round 2 REFUSED `false` whenever the rollback pinned a preflight-verified
+#   version for every package the apply step touched. That is necessary
+#   evidence of reversibility and not sufficient: `dnf downgrade` is
+#   `goal.install` of an older build (dnf 4.14.0-34.el9_8, `dnf/base.py:
+#   downgrade_to`), and for an INSTALL-ONLY package — `kernel`, `kernel-core`,
+#   `kernel-modules`…, `installonly_limit=3` on this host — install adds side
+#   by side. After `dnf -y update kernel`, `dnf -y downgrade kernel-<installed>`
+#   targets a build that is still installed; the new kernel stays installed
+#   and stays the boot default. Nothing is restored. That class was 100% of
+#   the plans of the week before (11-16, all KEV `kernel*`), so the rule would
+#   have forced an honest `false` toward `true` in exactly the cases where
+#   `true` is a lie, with the retry loop telling the model to. Would have, not
+#   did: the rule never ran in production, and those six actually store an
+#   empty `rollback` with a bare downgrade in `backup[].restore_argv` — the
+#   shape the check below refuses.
+#
+# What a validator can decide from the plan alone is what the plan SAYS, not
+# what the host will do. So it enforces only the directions it can observe:
+#
+#   * `reversible: true` needs a rollback, and every package pin in it must
+#     name a version the preflight verified — `rollback_required`,
+#     `_validate_apt_pin`, `_validate_dnf_pin`. Absence of evidence.
+#   * A package downgrade must not sit ONLY in `backup[].restore_argv` while
+#     `rollback` is empty — `_validate_downgrade_lives_in_rollback`, below.
+#     A shape defect, decidable without judging `reversible`.
+#
+# It deliberately says nothing about `reversible: false` when a rollback
+# exists: `rollback_on_irreversible` (a warning) is the honest place for
+# "the plan has a rollback and admits it may not restore".
+#
+# OPEN QUESTION, recorded and not built (operator's decision — it changes what
+# the planner is allowed to offer, not just what it may write): for an
+# install-only package the recipe (`planner._PLATFORM_PROMPT_FACTS['rhel']
+# ['rollback_argv']`) should probably not offer `dnf downgrade` as a rollback
+# at all, and this module should probably refuse `reversible: true` whose only
+# package rollback is a downgrade of an install-only package. Deciding "is X
+# install-only" needs `dnf.Base().conf.installonlypkgs` (a live read on the
+# host, not a constant) — a fact this module cannot get and must not guess.
+# Until then a `kernel*` plan that honestly declares `false` validates and
+# `window.py` refuses it, which is the correct outcome and the reason the
+# operator sees it.
+def _is_package_downgrade(argv: list[Any]) -> bool:
+    """True for the two downgrade forms the executor's grammar accepts: `dnf
+    ... downgrade ...` and `apt|apt-get ... --allow-downgrades ...`.
+    Deliberately literal — a token match, not a judgement about what the
+    command would do to the host."""
+    if not argv or not isinstance(argv[0], str):
+        return False
+    binary = argv[0].rsplit("/", 1)[-1]
+    if binary == "dnf":
+        return "downgrade" in argv
+    if binary in ("apt", "apt-get"):
+        return "--allow-downgrades" in argv
+    return False
+
+
+def _validate_downgrade_lives_in_rollback(
+    backups: list[dict[str, Any]],
+    rollback_steps: list[dict[str, Any]],
+    r: ValidationResult,
+) -> None:
+    """Refuse a package downgrade that exists only in `backup[].restore_argv`
+    while the plan's `rollback` is empty.
+
+    Plan #10 (webkit2gtk3-jsc, 25 September 2026), measured: `restore_argv`
+    was `["dnf", "-y", "downgrade", "webkit2gtk3-jsc"]`, `rollback` was `[]`,
+    `reversible` was `false`. The runner never executes `restore_argv` (it is
+    "the operator's documented manual path" — `runner._run_backup`), and the
+    rollback phase runs `rollback` only, so the undo the plan wrote could not
+    run on failure, and the plan was refused forever for being irreversible.
+    The undo was in the wrong section.
+
+    This fires on the SHAPE — a downgrade in `restore_argv`, no rollback steps
+    — and never reads `risk.reversible`, so it does not push the declaration
+    in either direction. Both ways out leave the model's claim its own:
+    move the downgrade into `rollback` (where `_validate_dnf_pin` /
+    `_validate_apt_pin` then hold its version to the preflight), or stop
+    presenting a manual downgrade as a restore command.
+    """
+    if rollback_steps:
+        return
+    for item in backups:
+        argv = item.get("restore_argv")
+        if isinstance(argv, list) and _is_package_downgrade(argv):
+            r.error(
+                f"$.backup[id={item.get('id')}].restore_argv",
+                "downgrade_only_in_backup_restore",
+                "restore_argv holds a package downgrade, but the plan's rollback "
+                "section is empty. Nothing runs restore_argv automatically, so "
+                "the automatic rollback would do nothing and the downgrade could "
+                "only ever be typed by hand. Put the downgrade in `rollback` "
+                "(pinned to a version a pkg_version preflight `equals` verifies), "
+                "or make restore_argv restore the captured artifact and describe "
+                "the manual downgrade in restore_instructions_ro. This error does "
+                "not say what risk.reversible should be.",
+            )
 
 
 def _validate_reboot_flag(

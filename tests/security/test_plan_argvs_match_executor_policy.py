@@ -555,6 +555,55 @@ def test_the_dpkg_options_value_is_not_mistaken_for_a_package_pin():
     assert result.valid, [e.as_dict() for e in result.errors]
 
 
+def test_a_dnf_rollback_pinned_to_a_different_version_than_preflight_verified_is_refused():
+    """The dnf half of `test_a_rollback_pinned_to_a_version_no_preflight_checked_is_refused`
+    above — same failure class, different name because this one pins a
+    version a preflight DID check, just not the one it verified was
+    installed (`rollback_pin_mismatch`), whereas that one pins a package no
+    preflight mentions at all (`rollback_pin_unverified`). Until 25 September
+    2026 `_validate_rollback_pin` only inspected apt/apt-get — a dnf
+    rollback's pin went completely unverified on this project's own rhel/dnf
+    production host, the one family that matters in practice here.
+    `GOOD_PLAN`'s preflight confirms nginx at `1.20.1-14.el9`; pinning the
+    rollback to a different build is exactly the class of mistake
+    `_validate_apt_pin` already refuses."""
+    plan = copy.deepcopy(GOOD_PLAN)
+    plan["rollback"][0]["argv"] = ["dnf", "-y", "downgrade", "nginx-1.18.0-1.el9"]
+
+    result = validate_plan(plan, platform_family="rhel")
+
+    assert not result.valid
+    assert "rollback_pin_mismatch" in {e.code for e in result.errors}
+
+
+def test_a_dnf_rollback_that_downgrades_an_unrelated_package_is_refused():
+    """`dnf downgrade openssl-1.0.2` in a plan about nginx: nothing but the
+    plan as a whole can catch this, since the executor's own grammar accepts
+    any pinned downgrade."""
+    plan = copy.deepcopy(GOOD_PLAN)
+    plan["rollback"][0]["argv"] = ["dnf", "-y", "downgrade", "openssl-1.0.2-1.el9"]
+
+    result = validate_plan(plan, platform_family="rhel")
+
+    assert not result.valid
+    assert "rollback_pin_unverified" in {e.code for e in result.errors}
+
+
+def test_a_bare_dnf_downgrade_with_no_version_is_refused():
+    """The exact shape measured in the operator's incident report: `dnf
+    downgrade <pkg>` with no version goes back exactly one build in the
+    repo, which is not necessarily the version preflight verified was
+    installed. A plan that can name the package must also name the version —
+    the preflight already proves it knows it."""
+    plan = copy.deepcopy(GOOD_PLAN)
+    plan["rollback"][0]["argv"] = ["dnf", "-y", "downgrade", "nginx"]
+
+    result = validate_plan(plan, platform_family="rhel")
+
+    assert not result.valid
+    assert "rollback_pin_unverified" in {e.code for e in result.errors}
+
+
 def test_a_refused_pkg_version_is_caught_even_with_no_platform_family():
     """`platform_family=None` is the standalone skill CLI, which genuinely
     does not know the host. Only `pkg_version`'s argv depends on the family,

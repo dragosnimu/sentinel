@@ -480,6 +480,80 @@ rămâne fixată dintr-o măsurătoare și din sursa lui apt, iar punctul 3 de m
 e ce transformă o presupunere greșită într-un eșec zgomotos în loc de o listă
 mai scurtă.
 
+### 3.17b Reparația instalată nu e reparația care rulează
+
+Măsurat pe producție la 29 septembrie 2026: 491 de constatări `dnf` deschise,
+toate pachete `kernel*`, iar reparația cea mai nouă de care aveau nevoie
+(5.14.0-687.51.1) era deja pe disc. `uname -r` arăta 687.46.1, cel mai vechi din
+cele trei nuclee instalate. `dnf --assumeno update kernel-core` răspundea „Nothing
+to do", iar planificatorul propunea totuși `dnf -y update kernel*` — cinci
+planuri (unul pe pachet), fiecare declarat nereversibil și refuzat de poarta de
+etapa 1, patru zile la rând. Planurile n-aveau ce instala; problema nu era
+patch-ul, ci o repornire.
+
+**De ce le listează `dnf` mai departe.** `updateinfo list --security` compară
+avizele cu pachetele cele mai noi instalate *plus* cele ale nucleului care
+rulează (`running_kernel_pkgs`, citit din sursa lui dnf de pe gazdă: toate
+pachetele cu același `SOURCERPM` ca nucleul curent). Cu nucleul vechi în
+execuție, avizele mai noi decât el rămân în listă oricâte nuclee noi s-ar
+instala. Deci scanarea nu greșea — nu avea cum să spună diferența.
+
+**Ce face acum.** `sentinel/scan/fix_state.py` citește o dată pe scanare
+`rpm -qa` (0,69 s, măsurat sub restricțiile unității) și `uname -r`, și dă fiecărei
+constatări `dnf` unul din trei verdicte, scris în `findings.raw.fix_state`:
+
+| Verdict | Dovada | Ce se întâmplă |
+|---|---|---|
+| `pending_reboot` | o instanță instalată ≥ versiunea care repară ȘI instanța din nucleul care rulează < ea | constatarea rămâne `open`; planificatorul nu redactează plan; `/planifica` explică |
+| `not_pending` | dovezile s-au citit și nu susțin starea (reparația nu e instalată, sau rulează deja și dnf o listează totuși) | verdictul înlocuiește pe cel vechi; constatarea redevine planificabilă |
+| `unknown` | dovezile nu s-au putut citi | **nu șterge** un `pending_reboot` dovedit ieri; peste nimic rămâne `unknown` (planificabil ca înainte) |
+
+**Statusul nu se mișcă.** Constatarea e `open` și numărată — inclusiv ca KEV: gazda
+rulează încă nucleul vulnerabil. Prima variantă o muta în `deferred` și ar fi scos
+din „KEV deschise" cinci din cele șapte, adică un panou cu „2 KEV" peste un nucleu
+cu un CVE exploatat activ (decizie a operatorului, 29 septembrie 2026: rămân
+numărate). Așa că nu există migrație, stare nouă sau grup nou în agregator, iar
+panoul, raportul zilnic, `ai/ask` și predicția de expunere merg neschimbate.
+
+**Cine citește verdictul.** Numai cine ACȚIONEAZĂ pe constatare, printr-un predicat
+unic, `findings.pending_reboot_sql` (`open` ȘI `raw.fix_state.state =
+'pending_reboot'`, niciodată NULL): `planner.generate_for_kev` (în SQL, ca rândurile
+astea — KEV, deci primele după prioritate — să nu ocupe cele trei sloturi ale
+trecerii), `planner.generate` (refuzul pentru `/planifica` și orice alt apelant),
+`/planifica`, `/vuln` și `/vulnerabilitati` (marca 🔁). Verdictul stă în `raw`, nu
+într-o coloană, deci nu e nevoie de migrație; costul e că upsertul rescrie `raw` la
+fiecare scanare, iar „`unknown` nu șterge" cere `fix_state.reconcile`, care citește
+verdictul de ieri ÎNAINTE de upsert și îl duce înainte. O coloană ar fi făcut asta
+de la sine (upsertul n-o atinge) și ar fi fost tipată, dar ar fi cerut o migrație.
+
+**Ce vede operatorul.** Constatarea nu mai are plan și nici refuzul care o făcea
+vizibilă, deci canalul Telegram e singurul ei semn de viață:
+
+  * **la intrarea în stare**, un mesaj integral: ce se închide (CVE-uri *distincte*,
+    cu KEV numite), ce e pe disc față de ce rulează, că gazda rămâne expusă și
+    constatările deschise până la repornire, că repornirea e decizia lui, și comanda
+    pentru ce Sentinel nu poate verifica — nucleul implicit la pornire (`/boot/grub2`
+    e 0700 root, iar `grubby --default-kernel` rulat neprivilegiat tipărește `/boot`
+    și iese cu 0);
+  * **în fiecare scanare** cât timp un KEV așteaptă, o reamintire scurtă (doar KEV,
+    „de N zile"), oprită de repornire — un mesaj trimis o singură dată se poate rata,
+    iar altfel un KEV ar fi `open`, numărat, fără plan și fără nicio veste;
+  * `/planifica <id>` refuză cu motivul adevărat (reparația e instalată, o repornire
+    o aplică), nu cu „nu mai e deschisă"; `/vuln` arată ce e pe disc, ce rulează și de
+    când; `/vulnerabilitati` marchează rândul cu 🔁.
+
+**Drumul înapoi.** După repornire nucleul care rulează are reparația, `dnf` nu mai
+listează avizul, iar scanarea închide singură constatarea (`mark_resolved_absent`) —
+nu există „redeschidere", fiindcă `status` n-a fost mutat. Verificat pe producție,
+29 septembrie 2026: 491 de constatări `dnf` rezolvate de scanarea de după repornire.
+
+**Ce NU face.** Nu repornește nimic. Nu generalizează la „bibliotecă actualizată,
+proces care o ține mapată": cazul acela e invers (dnf nu mai listează avizul, deci
+constatarea se închide prematur), iar `dnf needs-restarting` lucrează pe procese,
+nu pe CVE-uri — o decizie de proiectare separată. Nu grupează planurile pe
+tranzacție: dacă apare un kernel KEV cu reparația NEINSTALATĂ, planificatorul
+scrie din nou câte un plan pe pachet.
+
 ### 3.18 Al zecelea colector se uită la ce PLEACĂ, nu la ce intră
 
 Toate celelalte nouă mecanisme privesc înăuntru: sshd, nginx, Suricata, auditd.

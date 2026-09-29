@@ -26,12 +26,15 @@ made generic, the special case was the one that mattered.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from sentinel.config import Config
 from sentinel.db.engine import Database
 from sentinel.db.repo import findings as fx
 from sentinel.intel import kev
 from sentinel.logging_setup import get_logger
-from sentinel.scan import announce, os_packages, prioritize, trivy_fs, trivy_image
+from sentinel.scan import (
+    announce, fix_state, os_packages, prioritize, trivy_fs, trivy_image)
 
 log = get_logger(__name__)
 
@@ -76,6 +79,37 @@ async def run_all(db: Database, cfg: Config, *, triggered_by: str = "schedule") 
     if fresh:
         summary["announced"] = {"chats": await announce.announce(cfg, fresh),
                                 "findings": len(fresh)}
+
+    # Constatarile cu reparatia instalata, in asteptarea repornirii. Raman `open`
+    # si numarate (decizia operatorului), deci nu mai au nici planul, nici refuzul
+    # care le faceau vizibile: canalul asta e singurul lor semn de viata.
+    #
+    #   * cele INTRATE acum in starea asta: un mesaj integral, separat de
+    #     „vulnerabilitati noi" — nu sunt noi si nu cer un patch, cer o decizie;
+    #   * KEV-urile care asteapta de la o scanare anterioara: o reamintire scurta,
+    #     zilnica, doar pentru ce se exploateaza activ.
+    #
+    # `_pending` se scoate din rezultat ca sa nu ajunga, cu sute de randuri, in
+    # linia de jurnal a sumarului (`scan_service` logheaza tot sumarul).
+    entered: list[dict] = []
+    waiting_kev: list[dict] = []
+    running_kernel: str | None = None
+    for result in summary.values():
+        pending = result.pop("_pending", None) or {}
+        entered.extend(pending.get("entered") or [])
+        waiting_kev.extend(pending.get("waiting_kev") or [])
+        if (result.get("pending_reboot") or {}).get("running_kernel"):
+            running_kernel = result["pending_reboot"]["running_kernel"]
+    if entered:
+        summary["pending_reboot_announced"] = {
+            "chats": await announce.announce_pending_reboot(
+                cfg, entered, running=running_kernel),
+            "findings": len(entered)}
+    if waiting_kev:
+        summary["pending_reboot_reminded"] = {
+            "chats": await announce.announce_pending_reboot_reminder(
+                cfg, waiting_kev, running=running_kernel),
+            "findings": len(waiting_kev)}
     return summary
 
 
@@ -152,6 +186,19 @@ async def _run_os_packages(db: Database, family: str, triggered_by: str) -> dict
         cves = [f["cve"] for f in raw if f.get("cve")]
         kev_map = await kev.lookup(db, cves)
 
+        # Verdictul de ieri, citit INAINTE de upsert: upsertul rescrie `raw`, iar
+        # `reconcile` are nevoie de el ca `unknown` sa nu stearga un „in
+        # asteptare" dovedit, ca sa dea `since` si ca sa stie ce a INTRAT acum in
+        # starea asta. Doar cand scanerul a pus verdicte (dnf): calea apt nu
+        # face nicio interogare in plus.
+        annotated = any(isinstance((f.get("raw") or {}).get("fix_state"), dict)
+                        for f in raw)
+        previous = (await fx.previous_fix_states(
+            db, scanner, None, [f["finding_key"] for f in raw]) if annotated else {})
+        outcome = fix_state.reconcile(
+            raw, previous,
+            today=datetime.now(timezone.utc).date().isoformat())
+
         seen: list[str] = []
         # Constatarile NOI, pastrate intregi, nu doar numarate: mesajul de pe
         # Telegram are nevoie de CVE, pachet, versiuni si de steagul KEV, iar
@@ -173,14 +220,46 @@ async def _run_os_packages(db: Database, family: str, triggered_by: str) -> dict
                 new_items.append(dict(f))
             seen.append(f["finding_key"])
 
+        # Reparatia instalata, dar care nu ruleaza inca (vezi `fix_state`): NIMIC
+        # nu se muta in `status`. Constatarea ramane `open` si numarata; verdictul
+        # e deja in `raw.fix_state`, scris de upsert, si de acolo il citesc
+        # planificatorul si botul (`findings.pending_reboot_sql`).
+        #
+        # Cele noi care au intrat direct in asteptare NU se anunta ca
+        # „vulnerabilitati noi": mesajul acela cere o actiune (un patch), iar
+        # pentru ele nu exista niciuna. Le acopera mesajul despre repornire.
+        new_items = [f for f in new_items
+                     if f["finding_key"] not in outcome.newly_pending]
+        probe = (facts.get("fix_state") or {})
+        if outcome.newly_pending:
+            # WARNING: e o stare pe care operatorul trebuie sa o vada, nu un
+            # detaliu de scanare.
+            log.warning("constatari cu reparatia instalata, in asteptarea repornirii",
+                        extra={"findings": len(outcome.newly_pending),
+                               "running_kernel": probe.get("running_kernel")})
+        if outcome.cleared:
+            log.warning("constatari care nu mai sunt in asteptarea repornirii: "
+                        "reparatia nu e (sau nu mai e) instalata, deci planul de "
+                        "patch redevine raspunsul corect",
+                        extra={"findings": outcome.cleared})
+
         resolved = await fx.mark_resolved_absent(db, scanner, None, seen)
+        # Din baza, DUPA inchiderea a ce a disparut: adevarul de acum. Include si
+        # randurile al caror verdict a fost pastrat fiindca `rpm` n-a putut fi
+        # citit, iar cele rezolvate acum nu mai apar.
+        waiting = await fx.list_pending_reboot(db, scanner, None) if annotated else []
+        entered = [r for r in waiting if r["finding_key"] in outcome.newly_pending]
+        waiting_kev = [r for r in waiting
+                       if r.get("kev") and r["finding_key"] not in outcome.newly_pending]
         await fx.finish_scan(
             db, scan_id, status="completed", findings_count=len(raw),
             new_findings=new, resolved_findings=resolved, db_version=db_version)
         log.info("os package scan complete",
                  extra={"scanner": scanner, "findings": len(raw), "new": new,
                         "resolved": resolved, "kev": len(kev_map),
-                        "db_version": db_version})
+                        "db_version": db_version,
+                        "pending_reboot": len(waiting),
+                        "fix_state_unknown": outcome.unknown})
         return {"status": "completed", "scanner": scanner,
                 "findings": len(raw), "new": new,
                 "resolved": resolved, "kev": len(kev_map),
@@ -188,7 +267,17 @@ async def _run_os_packages(db: Database, family: str, triggered_by: str) -> dict
                 # Lista, nu doar numarul: `run_all` o duce la anunt. Ramane in
                 # sumar si cand e goala, ca apelantul sa nu trebuiasca sa
                 # deosebeasca „n-a fost nimic nou" de „scanarea asta nu spune".
-                "new_items": new_items}
+                "new_items": new_items,
+                # Doar numere in sumar; listele pleaca prin `_pending`, pe care
+                # `run_all` o scoate inainte ca sumarul sa ajunga in jurnal.
+                "pending_reboot": {"waiting": len(waiting),
+                                   "entered": len(entered),
+                                   "carried": outcome.carried,
+                                   "unknown": outcome.unknown,
+                                   "cleared": outcome.cleared,
+                                   "running_kernel": probe.get("running_kernel"),
+                                   "error": probe.get("error")},
+                "_pending": {"entered": entered, "waiting_kev": waiting_kev}}
     except Exception as exc:  # noqa: BLE001 - record and surface, do not crash the pass
         await fx.finish_scan(db, scan_id, status="failed", error=str(exc)[:500])
         log.error("os package scan crashed",

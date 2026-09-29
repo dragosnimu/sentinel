@@ -161,6 +161,14 @@ def _tradu_planner(sql: str) -> str:
     # dispare din interogare, testul o spune, nu potrivește pe altceva.
     assert "lower(trim(f.ecosystem)) = $1" in sql, (
         f"filtrul de ecosistem a dispărut din interogare: {sql!r}")
+    # Predicatul „reparația e instalată, dar nu rulează” (`pending_reboot_sql`):
+    # traducere MECANICĂ a căii jsonb din textul real, refuz zgomotos dacă
+    # predicatul a dispărut (vezi `test_patch_planner_kev._translate`).
+    assert "#>> '{fix_state,state}'" in sql, (
+        f"predicatul `pending_reboot_sql` a dispărut din interogare: {sql!r}")
+    sql = re.sub(r"(\w+\.raw) #>> '\{([^}]*)\}'",
+                 lambda m: f"json_extract({m.group(1)}, '$.{m.group(2).replace(',', '.')}')",
+                 sql)
     return (sql.replace(needle, "f.id = p.finding_id")
                .replace("$1", "?").replace("$2", "?"))
 
@@ -189,8 +197,9 @@ def _conn(status: str, *, origine: str = "ai_manual",
     conn.execute(f"CREATE TABLE patch_plans ({', '.join(coloane)}, "
                  "generated_by TEXT, finding_id INTEGER)")
     conn.execute("CREATE TABLE findings (id INTEGER, status TEXT, kev INTEGER, "
-                 "fixed_version TEXT, priority INTEGER, ecosystem TEXT)")
-    conn.execute("INSERT INTO findings VALUES (7, 'open', 1, '1.2.3', 5, ?)",
+                 "fixed_version TEXT, priority INTEGER, ecosystem TEXT, raw TEXT)")
+    conn.execute("INSERT INTO findings (id, status, kev, fixed_version, priority, "
+                 "ecosystem) VALUES (7, 'open', 1, '1.2.3', 5, ?)",
                  (ECOSISTEM,))
     conn.execute("INSERT INTO patch_plans (id, status, created_at, generated_by, "
                  "finding_id) VALUES (99, ?, ?, ?, 7)", (status, creat, origine))

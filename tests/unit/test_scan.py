@@ -180,12 +180,25 @@ def test_the_module_worst_case_is_derived_from_both_budgets():
     """
     from pathlib import Path
 
-    assert os_packages.WORST_CASE_TIMEOUT_S >= os_packages.TIMEOUT_S
+    from sentinel.scan import fix_state
+
+    # Backendul rhel are mai multe comenzi una după alta (dnf, apoi `rpm -qa` din
+    # `fix_state`, iar un pas viitor își adaugă plafonul în același tuplu), deci
+    # plafonul lui e suma lor, nu doar al lui dnf. Testul cere ca ele să FIE în
+    # tuplu — nu că tuplul are exact două elemente: un pas nou nu are de ce să
+    # atingă testul ăsta.
+    steps = os_packages.RHEL_STEP_CEILINGS_S
+    assert os_packages.TIMEOUT_S in steps
+    assert fix_state.WORST_CASE_TIMEOUT_S in steps
+    assert os_packages.WORST_CASE_TIMEOUT_S >= sum(steps)
+    assert os_packages.WORST_CASE_TIMEOUT_S >= (
+        os_packages.TIMEOUT_S + fix_state.WORST_CASE_TIMEOUT_S)
     assert os_packages.WORST_CASE_TIMEOUT_S >= os_packages.APT_TIMEOUT_S
 
     source = (Path(os_packages.__file__)).read_text(encoding="utf-8")
-    assert "WORST_CASE_TIMEOUT_S = max(TIMEOUT_S, APT_TIMEOUT_S)" in source, (
-        "`WORST_CASE_TIMEOUT_S` nu mai e derivat din amândouă plafoanele")
+    assert ("WORST_CASE_TIMEOUT_S = max(sum(RHEL_STEP_CEILINGS_S), "
+            "APT_TIMEOUT_S)") in source, (
+        "`WORST_CASE_TIMEOUT_S` nu mai e derivat din pașii rhel și din apt")
 
 
 def test_scanner_name_follows_the_family():
@@ -898,7 +911,14 @@ def test_rhel_scan_is_unchanged(monkeypatch):
         calls.append({"argv": argv, "timeout": timeout})
         return 100, _SAMPLE, ""
 
+    async def no_host():
+        # `fix_state` citeste `rpm -qa` si `uname -r`; testul asta e despre dnf,
+        # deci gazda nu se atinge — pe o masina cu rpm ar rula altfel de-adevaratelea.
+        from sentinel.scan import fix_state
+        return fix_state.HostState(error="stub: gazda nu se citeste in testul asta")
+
     monkeypatch.setattr(os_packages, "_run", fake_run)
+    monkeypatch.setattr(os_packages.fix_state, "read_host", no_host)
     findings, error, facts = _run(os_packages.scan("rhel"))
 
     assert [c["argv"] for c in calls] == [[

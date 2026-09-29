@@ -735,6 +735,7 @@ async def cmd_planifica(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     from sentinel.db.repo import findings as findings_repo
     from sentinel.db.repo import patches as patch_repo
     from sentinel.patch import planner
+    from sentinel.scan import fix_state
 
     cfg: Config = context.bot_data["cfg"]
     db: Database = context.bot_data["db"]
@@ -766,6 +767,17 @@ async def cmd_planifica(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if finding is None:
         await update.message.reply_text(
             f"Vulnerabilitatea #{finding_id} nu există. Lista: /vulnerabilitati")
+        return
+    if fix_state.is_pending_row(finding):
+        # Refuz cu motivul adevărat: constatarea e DESCHISĂ (gazda e expusă până
+        # la repornire), deci „nu mai e deschisă" ar fi fals. Reparația e pe disc
+        # și așteaptă o repornire; un plan ar rula un `dnf update` fără nimic de
+        # instalat — exact ce a produs patru zile de refuzuri pe 25-29 septembrie.
+        # `planner.generate` refuză la fel, pentru cine ajunge la el pe altă cale.
+        await update.message.reply_text(
+            f"Vulnerabilitatea #{finding_id} nu are nevoie de plan: "
+            f"{_esc(fix_state.PENDING_EXPLANATION_RO)}.\n"
+            f"Detalii: <code>/vuln {finding_id}</code>", parse_mode=ParseMode.HTML)
         return
     if finding.get("status") != "open":
         await update.message.reply_text(

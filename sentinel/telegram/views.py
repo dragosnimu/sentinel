@@ -34,6 +34,7 @@ from sentinel.db.repo import events as events_repo
 from sentinel.db.repo import findings as findings_repo
 from sentinel.intel.links import cve_html, cve_links
 from sentinel.logging_setup import get_logger
+from sentinel.scan import fix_state
 from sentinel.scan.subject import (KIND_APP, KIND_CONTAINER, KIND_LABELS, KIND_OS,
                                    KIND_UNKNOWN, categories, describe)
 from sentinel.util import tz
@@ -459,7 +460,10 @@ async def cmd_vulns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     blocks: list[list[str]] = []
     for r in rows:
-        kev = " 🔥" if r.get("kev") else ""
+        # 🔁 după 🔥: rămâne deschisă și numărată, dar reparația e pe disc și un
+        # plan n-are ce instala — vezi `findings.pending_reboot_sql`.
+        kev = (" 🔥" if r.get("kev") else "") + (
+            " 🔁" if fix_state.is_pending_row(r) else "")
         # `_trim` pe valoarea brută: `cve_html` escapează el ce primește.
         ref = cve_html(_trim(r.get("cve"), MAX_CVE_LIST),
                        rpm=(r.get("scanner") == "dnf"), kev=bool(r.get("kev")))
@@ -472,7 +476,9 @@ async def cmd_vulns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ])
 
     tail = ("\n/vuln &lt;id&gt; · /planifica &lt;id&gt; pentru un plan"
-            "\n<i>filtre: " + " · ".join(FILTER_WORDS) + "</i>")
+            + ("\n🔁 = reparația e instalată, așteaptă o repornire (nu se cere plan)"
+               if any(fix_state.is_pending_row(r) for r in rows) else "")
+            + "\n<i>filtre: " + " · ".join(FILTER_WORDS) + "</i>")
 
     # Bugetul se rezervă cu numerele CELE MAI MARI pe care le pot lua antetul
     # și nota de coadă (toate rândurile cerute, toate cele nearătate), deci
@@ -534,13 +540,28 @@ async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     deschisa = row.get("status") == "open"
+    # „Reparat, în așteptarea repornirii" e o constatare DESCHISĂ (gazda e expusă
+    # până la repornire), dar una la care un plan n-are ce face: se spune asta, nu
+    # „cere un plan". Predicatul e cel din SQL (`pending_reboot_sql`), nu o a
+    # doua definiție.
+    asteapta = fix_state.is_pending_row(row)
     rpm = row.get("scanner") == "dnf"
     lines = [
         f"{_SEV_EMOJI.get(row['severity'], '⚪')} <b>Vulnerabilitate #{row['id']}</b>"
         + (" · 🔥 <b>exploatată activ</b>" if row.get("kev") else ""),
         f"<b>{esc(row.get('title'))}</b>",
     ]
-    if not deschisa:
+    if asteapta:
+        lines.append(f"🔁 <i>{esc(fix_state.PENDING_EXPLANATION_RO)}.</i>")
+        dovada = [f"{eticheta}: <code>{esc(row[cheie])}</code>"
+                  for cheie, eticheta in (("fix_installed", "pe disc"),
+                                          ("fix_running", "rulează"))
+                  if row.get(cheie)]
+        if row.get("fix_since"):
+            dovada.append(f"văzută din {esc(row['fix_since'])}")
+        if dovada:
+            lines.append("   " + " · ".join(dovada))
+    elif not deschisa:
         lines.append(f"⚪ <i>Nu mai e deschisă (stare: {esc(row.get('status'))}) — "
                      f"ce urmează e ultima constatare, nu starea de acum.</i>")
     lines += [
@@ -560,7 +581,9 @@ async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines += ["", "<b>Detalii:</b> " + " · ".join(
             f'<a href="{url}">{esc(name)}</a>' for name, url in links)]
 
-    if not deschisa:
+    if asteapta:
+        lines.append("\n<i>Nu se cere plan: singurul pas rămas e repornirea.</i>")
+    elif not deschisa:
         lines.append("\n<i>Nu mai e deschisă — un plan pentru ea ar repara ceva "
                      "ce scanarea nu mai vede.</i>")
     elif row.get("fixed_version"):

@@ -80,6 +80,7 @@ from typing import Any, Final
 
 from sentinel.db.repo import findings as fx
 from sentinel.logging_setup import get_logger
+from sentinel.scan import fix_state
 
 log = get_logger(__name__)
 
@@ -153,7 +154,16 @@ APT_TIMEOUT_S = 180
 #: ridicarea unuia dintre plafoane sa nu treaca pe langa testul care leaga suma
 #: scanerelor de bugetul unitatii
 #: (`test_scan_trivy_fs.py::test_the_measured_ceiling_fits_inside_the_unit_budget`).
-WORST_CASE_TIMEOUT_S = max(TIMEOUT_S, APT_TIMEOUT_S)
+#:
+#: Backendul rhel are mai multe comenzi, nu una, si ruleaza una dupa alta: dnf,
+#: apoi `fix_state` citeste baza rpm ca sa deosebeasca „reparatia nu e
+#: instalata" de „e instalata, dar nu ruleaza inca". Plafoanele lor se ADUNA, nu
+#: se pierd in maxim. Un pas nou al backendului rhel isi adauga plafonul in
+#: tuplul de mai jos si atat: suma, `WORST_CASE_TIMEOUT_S` si testul care o
+#: leaga de buget se deriva de aici.
+RHEL_STEP_CEILINGS_S: Final = (TIMEOUT_S, fix_state.WORST_CASE_TIMEOUT_S)
+
+WORST_CASE_TIMEOUT_S = max(sum(RHEL_STEP_CEILINGS_S), APT_TIMEOUT_S)
 
 
 async def _run(argv: list[str], timeout: int,
@@ -271,8 +281,23 @@ async def _scan_dnf() -> tuple[list[dict[str, Any]], str | None, dict[str, Any]]
             "finding_key": fx.finding_key("dnf", None, name, cve, None),
             "raw": {"advisory_line": line.strip()},
         }
+    findings = list(seen.values())
+
+    # ORDINEA de aici conteaza. Orice refuz de a raporta lista asta ca „scanare
+    # reusita" (`return [], "<motiv>", facts` — aceeasi forma ca la esecul dnf de
+    # mai sus) trebuie sa vina AICI, dupa parsare si INAINTE de `annotate`:
+    # `annotate` citeste baza rpm si scrie verdicte pe fiecare constatare, deci
+    # rulat pe o lista in care nu ai incredere ar produce verdicte pentru ceva ce
+    # urmeaza sa fie aruncat — si ar consuma plafonul lui de timp pe degeaba.
+    # Cine adauga un pas nou aici isi adauga si plafonul in `RHEL_STEP_CEILINGS_S`.
+
+    # Dupa dnf si INAINTE de upsert: `raw` se rescrie la fiecare upsert, deci
+    # dovada („ce a vazut scanarea") trebuie sa fie pe constatare cand ajunge in
+    # baza. Nu schimba ce raporteaza dnf si nu poate pica scanarea — vezi
+    # `fix_state.annotate`.
+    facts["fix_state"] = await fix_state.annotate(findings)
     log.info("dnf scan parsed", extra={"findings": len(seen)})
-    return list(seen.values()), None, facts
+    return findings, None, facts
 
 
 # ===========================================================================

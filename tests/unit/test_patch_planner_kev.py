@@ -13,6 +13,7 @@ subinterogarea `NOT EXISTS` peste rânduri concrete.
 from __future__ import annotations
 
 import asyncio
+import re
 import sqlite3
 
 from sentinel.patch import planner
@@ -83,6 +84,17 @@ def _translate(sql: str) -> str:
     if "lower(trim(f.ecosystem)) = $1" not in sql:
         raise AssertionError(
             f"filtrul de ecosistem a dispărut din interogare: {sql!r}")
+    # Predicatul „reparația e instalată, dar nu rulează” (`pending_reboot_sql`):
+    # singura sintaxă PostgreSQL în plus e calea jsonb. O traducere MECANICĂ a
+    # textului real (nu un predicat rescris aici), ca rândurile fără `raw` sau cu
+    # alt verdict să treacă prin exact ce rulează codul. Refuză zgomotos dacă
+    # predicatul lipsește: fără el, bucla ar redacta iar planurile fără rost.
+    if "#>> '{fix_state,state}'" not in sql:
+        raise AssertionError(
+            f"predicatul `pending_reboot_sql` a dispărut din interogare: {sql!r}")
+    sql = re.sub(r"(\w+\.raw) #>> '\{([^}]*)\}'",
+                 lambda m: f"json_extract({m.group(1)}, '$.{m.group(2).replace(',', '.')}')",
+                 sql)
     return (sql.replace(needle, "f.id = p.finding_id")
                .replace("$1", "?").replace("$2", "?"))
 
@@ -99,9 +111,10 @@ def test_expired_plans_do_not_block_a_fresh_kev_plan():
 
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE findings (id INTEGER, status TEXT, kev INTEGER, "
-                 "fixed_version TEXT, priority INTEGER, ecosystem TEXT)")
+                 "fixed_version TEXT, priority INTEGER, ecosystem TEXT, raw TEXT)")
     conn.execute("CREATE TABLE patch_plans (finding_id INTEGER, status TEXT)")
-    conn.execute("INSERT INTO findings VALUES (1, 'open', 1, '1.2.3', 5, ?)",
+    conn.execute("INSERT INTO findings (id, status, kev, fixed_version, priority, "
+                 "ecosystem) VALUES (1, 'open', 1, '1.2.3', 5, ?)",
                  (ECOSISTEM,))
     conn.execute("INSERT INTO patch_plans VALUES (1, 'expired')")
 
@@ -122,9 +135,10 @@ def test_a_genuinely_live_plan_still_blocks_a_duplicate():
 
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE findings (id INTEGER, status TEXT, kev INTEGER, "
-                 "fixed_version TEXT, priority INTEGER, ecosystem TEXT)")
+                 "fixed_version TEXT, priority INTEGER, ecosystem TEXT, raw TEXT)")
     conn.execute("CREATE TABLE patch_plans (finding_id INTEGER, status TEXT)")
-    conn.execute("INSERT INTO findings VALUES (1, 'open', 1, '1.2.3', 5, ?)",
+    conn.execute("INSERT INTO findings (id, status, kev, fixed_version, priority, "
+                 "ecosystem) VALUES (1, 'open', 1, '1.2.3', 5, ?)",
                  (ECOSISTEM,))
     conn.execute("INSERT INTO patch_plans VALUES (1, 'validated')")
 

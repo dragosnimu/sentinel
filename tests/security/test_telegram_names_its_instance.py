@@ -30,7 +30,10 @@ PACHET = REPO / "sentinel"
 #: Cine are voie să cheme transportul direct, și în ce funcție. Fiecare
 #: intrare de aici a fost citită și marchează textul înainte de a-l trimite.
 APELANTI_CUNOSCUTI = {
-    ("scan/announce.py", "announce"),
+    # `_deliver`, nu `announce`: anunțul de vulnerabilități noi și cel despre
+    # reparațiile în așteptarea repornirii trec prin ACELAȘI drum — marcarea și
+    # verificarea livrării stau într-un singur loc, nu în două copii.
+    ("scan/announce.py", "_deliver"),
     ("selfcheck/runner.py", "_send_direct"),
     ("services/telegram_service.py", "_send_test"),
 }
