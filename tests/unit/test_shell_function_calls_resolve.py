@@ -180,8 +180,8 @@ BASH_BUILTINS = {
 EXTERNAL_COMMANDS = {
     # coreutils and friends — present on any host the installer supports
     "awk", "base64", "basename", "cat", "chmod", "chown", "cmp", "comm", "cp",
-    "cut", "date", "df", "dirname", "du", "find", "getent", "grep", "head", "id",
-    "install", "ln", "mkdir", "mktemp", "mv", "od", "readlink", "rm", "sed",
+    "cut", "date", "df", "dirname", "du", "env", "find", "getent", "grep", "head",
+    "id", "install", "ln", "mkdir", "mktemp", "mv", "od", "readlink", "rm", "sed",
     "seq", "sha256sum", "sleep", "sort", "stat", "tail", "tar", "timeout",
     "touch", "tr", "uniq", "unzip", "wc",
     # accounts, privilege, ACLs
@@ -200,9 +200,23 @@ EXTERNAL_COMMANDS = {
     # interpreters and the operator-side tooling (scripts/ runs on Windows or
     # on the operator's shell, not on the monitored host)
     "bash", "git", "hostname", "jq", "python3", "scp", "ssh",
-    # SELinux (RHEL family only; guarded at the call site)
-    "setsebool",
+    # SELinux tooling. NOT on every host: the AlmaLinux host has all of it
+    # installed while SELinux is Disabled (libselinux-utils: selinuxenabled,
+    # matchpathcon; policycoreutils: restorecon, setsebool), and the Ubuntu
+    # host has none of it (measured 29 Sep 2026, `command -v` on both). An
+    # entry here therefore means "a name the installer may call IF present",
+    # and that is enforced rather than promised:
+    # `test_optional_host_binaries_are_only_called_behind_a_presence_check`
+    # fails on any call to one of these that has no `have X` / `command -v X`
+    # earlier in the same function.
+    "matchpathcon", "restorecon", "selinuxenabled", "setsebool",
 }
+
+#: The subset of EXTERNAL_COMMANDS that may be absent from a supported host,
+#: so an unguarded call ends the installer under `set -e`. Anything added to
+#: the SELinux group above belongs here too.
+OPTIONAL_HOST_BINARIES = {"matchpathcon", "restorecon", "selinuxenabled",
+                          "setsebool"}
 
 # Every function in this repository's shell is snake_case, so a snake_case
 # word that resolves to nothing is overwhelmingly likely to be a function
@@ -1450,6 +1464,94 @@ def test_external_command_inventory_has_no_dead_entries():
         f"{unused}")
 
 
+def _unguarded_optional_calls(text: str) -> list[tuple[str, int]]:
+    """(name, line) of every call to an OPTIONAL_HOST_BINARIES name in `text`
+    that has no presence check of that name earlier in the same function.
+
+    A presence check is `have NAME` or `command -v NAME` — the two spellings the
+    corpus uses — found among the commands the scanner read between the start
+    of the enclosing function and the call. This is "a check exists in the
+    same function", not "the check dominates the call": `if have x; then :; fi;
+    x` passes. Proving dominance needs a control-flow graph; what this rules
+    out is the shape that shipped elsewhere, a call with no check anywhere near
+    it.
+    """
+    scan = _scan(text)
+    found: list[tuple[str, int]] = []
+    for call in scan.commands:
+        if call.name not in OPTIONAL_HOST_BINARIES:
+            continue
+        fn_start = max((o for o in scan.defs.values() if o <= call.offset),
+                       default=0)
+        checked = any(
+            fn_start <= g.offset < call.offset and call.name in g.args
+            and (g.name == "have" or (g.name == "command" and "-v" in g.args))
+            for g in scan.commands)
+        if not checked:
+            found.append((call.name, _line_of(text, call.offset)))
+    return found
+
+
+@needs_git
+def test_optional_host_binaries_are_only_called_behind_a_presence_check():
+    """`restorecon` is not installed on the Ubuntu host; an unguarded call ends the install.
+
+    Measured 29 Sep 2026: `selinuxenabled`, `restorecon`, `matchpathcon` and
+    `setsebool` are installed on the AlmaLinux host (SELinux Disabled) and on
+    the Ubuntu host `command -v` finds none of them. Listing them in
+    EXTERNAL_COMMANDS makes the resolution test green on both, which is
+    exactly why the listing alone proves nothing about Ubuntu: under
+    `set -e`, a bare `restorecon -RF "$dir"` there is `command not found`,
+    exit 127, and the deploy stops halfway through the journal step.
+
+    So the claim "guarded at the call site" is checked, not written down.
+    """
+    assert OPTIONAL_HOST_BINARIES <= EXTERNAL_COMMANDS
+    called: set[str] = set()
+    bare: list[str] = []
+    for path, text in sorted(_texts_at("HEAD").items()):
+        called |= {c.name for c in _scan(text).commands
+                   if c.name in OPTIONAL_HOST_BINARIES}
+        bare += [f"{path}:{line}: {name}"
+                 for name, line in _unguarded_optional_calls(text)]
+    assert called == OPTIONAL_HOST_BINARIES, (
+        "an optional binary with no call site left, or one this check never "
+        f"saw: {sorted(OPTIONAL_HOST_BINARIES ^ called)} — a guard nothing "
+        "exercises is not being verified")
+    assert not bare, (
+        "these binaries are missing on at least one supported host, and these "
+        "calls have no `have X` / `command -v X` earlier in the same function "
+        "— on that host the call is `command not found` and, under `set -e`, "
+        "the end of the installer:\n" + "\n".join(f"  {b}" for b in bare))
+
+
+@pytest.mark.parametrize("body,expected", [
+    ("f() { have restorecon || return 0; restorecon -R /x; }", []),
+    ("f() { command -v setsebool >/dev/null 2>&1 && setsebool -P a 1; }", []),
+    ("f() { if have matchpathcon; then matchpathcon -n /x; fi; }", []),
+    ("f() { restorecon -R /x; }", [("restorecon", 3)]),
+    # A check for a DIFFERENT name is not a check for this one.
+    ("f() { have matchpathcon; restorecon -R /x; }", [("restorecon", 3)]),
+    # Nor is the same name checked in another function...
+    ("g() { have restorecon; }\nf() { restorecon -R /x; }", [("restorecon", 4)]),
+    # ...nor a check that comes after the call.
+    ("f() { restorecon -R /x; have restorecon; }", [("restorecon", 3)]),
+    # A word argument is not a call: `have restorecon` alone runs nothing.
+    ("f() { have restorecon || return 0; }", []),
+])
+def test_the_presence_check_rule_accepts_only_a_check_for_that_name_in_that_function(
+        body, expected):
+    """The guard test above must be able to fail, and for the right reasons.
+
+    Each red case is a way the rule could pass over an unguarded call: a
+    check for another binary, a check that lives in a different function, a
+    check that only runs after the call. The green cases are the two spellings
+    the installer really uses.
+    """
+    text = f"{_SPINE}\n{body}\n"
+    assert _unguarded_optional_calls(text) == expected
+
+
 #: The longest stretch of code lines the scanner may miss in one place.
 #: Measured across the whole corpus on 21 Sep 2026: the longest is ONE line
 #: (deploy/install.sh:2003, a multi-line array literal the flat model does not
@@ -1719,6 +1821,51 @@ def test_the_flat_model_still_reads_most_of_each_script():
         + "\n".join(thin))
 
 
+#: A function definition as a flat regex sees it, anchored to the start of a
+#: line. It has no notion of quoting, which is the point of it — and also why
+#: it must only ever be applied to lines that `_flat_line_model` has proven are
+#: at command level (see `_floor_definitions`).
+_FLOOR_DEFINITION = re.compile(r"^[ \t]*(?:function[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)"
+                               r"[ \t]*\(\)[ \t]*\{?")
+
+
+def _floor_definitions(text: str) -> set[str]:
+    """Function names a flat regex finds at command level in `text`.
+
+    Only lines the line model calls `certain` are looked at. A line that begins
+    inside a single-quoted span, a heredoc body or an open `(` is `unknown`
+    there and is skipped here: `function take() {` on the inside of
+    `awk '…'` is awk, not shell, and bash never defines it. Before this
+    filter the floor counted those, and reported `take` and `flush_blanks` in
+    deploy/install.sh as definitions the scanner had "walked past" — the
+    scanner had been right both times.
+
+    Reusing the line model, rather than writing a second quote tracker, is
+    what keeps the boundaries decided in one place: an apostrophe in a comment,
+    one inside double quotes, `'\\''` inside a single-quoted program and a
+    quoted heredoc are all settled by `_flat_scan_line`, and pinned for the
+    floor by `test_the_floor_skips_quoted_text_and_only_quoted_text`.
+
+    The cost is sensitivity and it is bounded: a line the model gives up on
+    stops being checked. `test_the_floor_does_not_lose_real_definitions`
+    measures that, so a collapsing filter cannot quietly turn this floor into
+    a check of nothing.
+    """
+    certain, _unknown = _flat_line_model(text)
+    names: set[str] = set()
+    for number, line in enumerate(text.split("\n"), 1):
+        if number in certain:
+            match = _FLOOR_DEFINITION.match(line)
+            if match:
+                names.add(match.group(1))
+    return names
+
+
+def _floor_gaps(text: str, scanned_defs) -> list[str]:
+    """Definitions the floor sees at command level and the scanner did not."""
+    return sorted(_floor_definitions(text) - set(scanned_defs))
+
+
 @needs_git
 def test_the_scanner_still_sees_every_function_definition():
     """A lexer that desynchronises reports "all clear" about half a file.
@@ -1729,19 +1876,21 @@ def test_the_scanner_still_sees_every_function_definition():
     cannot desynchronise the same way, so the definitions it can see are a
     floor the scanner must reach.
 
+    28 Sep 2026: this went red on `take` and `flush_blanks`, the `function`
+    definitions of two awk programs inside single quotes in deploy/install.sh.
+    The scanner was right and the floor was wrong; the floor now reads only
+    command-level lines (`_floor_definitions`).
+
     Supplementary to the reach check above, not a substitute: this one is
     blind whenever the definitions all sit above the point where the scan came
     apart, which is exactly how vendor-assets got past it.
     """
-    definition = re.compile(r"^[ \t]*(?:function[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)"
-                            r"[ \t]*\(\)[ \t]*\{?", re.M)
     texts = _texts_at("HEAD")
     total = 0
     gaps: list[str] = []
     for path, text in texts.items():
-        by_regex = {m.group(1) for m in definition.finditer(text)}
-        total += len(by_regex)
-        for name in sorted(by_regex - set(_scan(text).defs)):
+        total += len(_floor_definitions(text))
+        for name in _floor_gaps(text, _scan(text).defs):
             gaps.append(f"{path}: {name}")
     assert total > 200, (
         f"only {total} function definitions found in the whole corpus — the "
@@ -1749,6 +1898,133 @@ def test_the_scanner_still_sees_every_function_definition():
     assert not gaps, ("the scanner walked past these definitions, so it was "
                       "not reading the file as shell at that point:\n"
                       + "\n".join(gaps))
+
+
+@needs_git
+def test_the_floor_does_not_lose_real_definitions():
+    """A floor that quietly stops looking is a test that passes over nothing.
+
+    Skipping quoted text must remove the awk functions and NOTHING else. The
+    unfiltered regex finds 263 definitions in the corpus (29 Sep 2026), two of
+    them awk; the filtered floor finds 261. If the line model ever starts
+    calling real command-level lines `unknown` — which is how it fails, by
+    design — the floor shrinks instead of turning red, and the only place that
+    shows is here. Losing more than 5% means the filter, not the shell, has
+    changed.
+    """
+    unfiltered_regex = re.compile(_FLOOR_DEFINITION.pattern, re.M)
+    unfiltered = filtered = 0
+    for text in _texts_at("HEAD").values():
+        unfiltered += len({m.group(1) for m in unfiltered_regex.finditer(text)})
+        filtered += len(_floor_definitions(text))
+    assert filtered <= unfiltered, "the filter added definitions the regex never had"
+    assert filtered >= 0.95 * unfiltered, (
+        f"the floor sees {filtered} definitions where an unfiltered regex sees "
+        f"{unfiltered}: the command-level filter is dropping real ones, so the "
+        "floor no longer checks the scanner over most of the corpus")
+
+
+def _lines(*parts: str) -> str:
+    return "\n".join(parts) + "\n"
+
+
+#: What the floor must count and what it must not. Each entry is shell text and
+#: the exact set of names `_floor_definitions` may return for it. `real` is a
+#: genuine definition on its own line AFTER the construct: a filter that
+#: mistakes where the construct ends drops it, and a floor that drops real
+#: definitions has been blunted, not fixed.
+_FLOOR_FIXTURES = {
+    "awk program with function definitions in single quotes": (
+        _lines("awk '", "  function take() {", "    n++", "  }",
+               "  BEGIN { take() }", "' f", "real() { :; }"),
+        {"real"}),
+    "awk program whose closing quote ends a line of code": (
+        _lines("cmd | awk '", "  function take() { x = 1 }",
+               "  END { take() }' || true", "real() { :; }"),
+        {"real"}),
+    "apostrophe in a full-line comment does not open a quote": (
+        # ONE apostrophe on purpose: a comment with two of them would balance
+        # out even if the comment rule were gone, and prove nothing.
+        _lines("# don't treat this as the start of a quoted span",
+               "real() { :; }"),
+        {"real"}),
+    "apostrophe in a trailing comment does not open a quote": (
+        _lines("helper   # don't", "real() { :; }"),
+        {"real"}),
+    "apostrophe inside double quotes does not open a quote": (
+        _lines('echo "it\'s fine"', "real() { :; }"),
+        {"real"}),
+    "an escaped apostrophe in an awk program stays inside it": (
+        # `'\''` closes the span, emits a literal quote, and reopens it: the
+        # next line is still inside the awk program.
+        _lines("awk '", "  BEGIN { print \"it'\\''s\" }",
+               "  function after_escape() { x = 1 }", "' f", "real() { :; }"),
+        {"real"}),
+    "an apostrophe inside a multi-line double-quoted string": (
+        # The double quote is what stays open across lines. The apostrophe in
+        # it is ONE, unpaired: a model that let it open a span would still be
+        # inside it at `end"` and lose `real`.
+        _lines("msg=\"line one 'quoted", "function in_dq() { x; }", "end\"",
+               "real() { :; }"),
+        {"real"}),
+    "double quotes inside single quotes do not close them": (
+        _lines("printf '%s\\n' 'say \"hi", "function inside_string() { x; }",
+               "bye\"'", "real() { :; }"),
+        {"real"}),
+    "quoted heredoc containing function definitions": (
+        _lines("cat <<'EOF'", "function in_heredoc() {", "other_in_heredoc() {",
+               "EOF", "real() { :; }"),
+        {"real"}),
+    "unquoted heredoc containing function definitions": (
+        _lines("cat <<EOF", "function in_heredoc() {", "other_in_heredoc() {",
+               "EOF", "real() { :; }"),
+        {"real"}),
+    "a definition inside a function body, after a quoted span": (
+        _lines("outer() {", "  awk '", "  function take() { x }", "  ' f",
+               "  inner() { :; }", "}"),
+        {"outer", "inner"}),
+    "the function-keyword form is a shell definition": (
+        _lines("function kw_style() {", "  :", "}"),
+        {"kw_style"}),
+    "a quote that never closes hides everything after it": (
+        _lines("awk '", "  function take() { x }", "real() { :; }"),
+        set()),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_FLOOR_FIXTURES))
+def test_the_floor_skips_quoted_text_and_only_quoted_text(name):
+    """The floor must skip awk, and must not skip the shell around it.
+
+    Both directions cost the operator something. Counting awk `function`
+    lines turned the committed suite red on correct shell (the failure this
+    replaces), and a suite that is red on correct shell gets its floor
+    deleted. Skipping too much — an apostrophe in a comment read as an
+    opening quote — leaves a floor that reports nothing while the scanner
+    loses definitions, which is a test that passes while checking nothing.
+
+    The last fixture is the accepted cost, written down: a quote that never
+    closes is invalid shell, and the floor stops claiming rather than guess.
+    """
+    text, expected = _FLOOR_FIXTURES[name]
+    assert _floor_definitions(text) == expected
+
+
+def test_the_floor_still_reports_a_definition_the_scanner_does_not_have():
+    """The comparison has to be able to fail, or the skip has blunted it.
+
+    Both halves: the floor lists the real definitions, and a scanner that
+    dropped one of them produces a gap naming exactly that one. Without the
+    second half, a filter that returned an empty set would pass every fixture
+    that expects `set()` and every comparison against it.
+    """
+    text = _lines("first() { :; }", "awk '", "  function take() { x }", "' f",
+                  "second() { :; }")
+    scan = _scan(text)
+    assert set(scan.defs) == {"first", "second"}
+    assert _floor_gaps(text, scan.defs) == []
+    assert _floor_gaps(text, {"first"}) == ["second"]
+    assert _floor_gaps(text, set()) == ["first", "second"]
 
 
 # --- the scanner, against hand-written shell -------------------------------
