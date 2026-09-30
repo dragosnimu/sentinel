@@ -34,6 +34,7 @@ import pytest
 
 from sentinel.db.repo import findings as fx
 from sentinel.scan import fix_state, orchestrator, os_packages
+from tests.unit._dnf_ceilings import dnf_ceiling_problems
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -175,16 +176,68 @@ def test_the_timeout_and_the_empty_control_are_told_apart(monkeypatch):
 
 
 def test_a_control_whose_lines_the_parser_cannot_read_makes_the_scan_fail(monkeypatch):
-    """Control non-gol, dar nicio linie nu se potrivește cu `_LINE`: dnf a schimbat
-    formatul ieșirii. Aceeași primejdie ca la interogarea principală — parserul ar
-    citi zero din orice — și validăm parserul pe singurul lucru pe care îl știm sigur
-    non-gol, lista instalată."""
+    """Control non-gol, dar nicio linie nu se potrivește cu `_ADVISORY_LINE`: dnf a
+    schimbat formatul ieșirii. Aceeași primejdie ca la interogarea principală —
+    parserul ar citi zero din orice — și validăm parserul interogării la nivel de aviz
+    (`_uncovered_advisories`, cel care chiar citește rezultatul) pe singurul lucru pe
+    care îl știm sigur non-gol, lista instalată (`list --security --installed`)."""
     host, findings, error, _ = _scan(
         monkeypatch, main=(0, "", ""),
         control=(0, "Updating Subscription Management repositories.\nfoo bar\n", ""))
 
     assert findings == [] and error
     assert "format" in error
+    assert host.annotated == []
+
+
+def _real_control_lines() -> list[str]:
+    """Linii REALE din `list --security --installed` (dnf 4.14.0, producție, 30 sept 2026)."""
+    fixtures = ROOT / "tests" / "fixtures" / "dnf-updateinfo"
+    lines: list[str] = []
+    for name in ("installed-alma-list-advisories.txt", "installed-epel-advisories.txt"):
+        lines += (fixtures / name).read_text(encoding="utf-8").splitlines()
+    return [ln for ln in lines if ln.strip()]
+
+
+@pytest.mark.parametrize("reshape", [
+    # coloane în stil dnf5: tipul și severitatea separate, o dată de emitere la coadă
+    lambda ln: ln.replace("/Sec.", " security ").rstrip() + "  2026-09-01",
+    # fără marcajul `/Sec.`, severitatea rămâne
+    lambda ln: ln.replace("/Sec.", ""),
+    # marcajul rămâne, se adaugă o coloană la coadă
+    lambda ln: ln.rstrip() + "  2026-09-01",
+    # marcajul și severitatea schimbate între ele
+    lambda ln: ln.replace("/Sec.", "").replace("  ", "  Sec./", 1),
+], ids=["dnf5-columns", "marker-gone", "extra-column", "swapped"])
+def test_a_control_of_plausible_lines_the_parser_cannot_read_is_refused(
+        monkeypatch, reshape):
+    """Garda de format a controlului trebuie să judece FORMA liniei, nu înfățișarea ei.
+
+    Ce se strică pentru operator dacă nu o face: dnf își schimbă coloanele, controlul
+    tipărește în continuare mii de linii ne-goale care încep cu `ALSA-` sau
+    `FEDORA-EPEL-`, o gardă care verifică doar „ne-goală", „destul de lungă",
+    „începe cu un prefix de aviz" sau „conține /Sec." le lasă să treacă, iar
+    `_uncovered_advisories` (același parser) citește apoi zero din ieșirea reală.
+    Verificarea dnf-ului orb a spus „dnf vede avize", și fiecare constatare deschisă
+    se închide pe o gazdă încă exploatabilă. Liniile de aici sunt cele REALE de pe
+    producție, remodelate, deci fiecare e ne-goală, lungă, cu prefix de aviz și
+    plauzibilă, iar niciuna nu se potrivește cu `_ADVISORY_LINE`. Liniile
+    neschimbate sunt controlul pozitiv."""
+    real = _real_control_lines()
+    assert len(real) >= 10, "fixturile sunt goale: testul n-ar judeca nimic"
+
+    _, _, accepted, _ = _scan(
+        monkeypatch, main=(0, "", ""), control=(0, "\n".join(real) + "\n", ""))
+    assert accepted is None, f"control pozitiv: liniile reale au fost refuzate: {accepted}"
+
+    host, findings, error, _ = _scan(
+        monkeypatch, main=(0, "", ""),
+        control=(0, "\n".join(reshape(ln) for ln in real) + "\n", ""))
+
+    assert not any(os_packages._ADVISORY_LINE.match(reshape(ln)) for ln in real), (
+        "liniile remodelate se potrivesc totuși cu `_ADVISORY_LINE`: cazul nu testează nimic")
+    assert findings == [] and error and "format" in error, error
+    assert f"{len(real)} linii" in error
     assert host.annotated == []
 
 
@@ -281,12 +334,18 @@ def test_the_controls_ceiling_is_part_of_the_worst_case():
 
 def test_the_control_asks_for_its_declared_ceiling_in_the_source():
     """Plafonul declarat trebuie să fie și cel cerut: un `timeout=30` scris de mână la
-    apel ar lăsa constanta din tuplu să mintă despre bugetul real."""
-    source = (ROOT / "sentinel" / "scan" / "os_packages.py").read_text(encoding="utf-8")
-    call = source[source.index("async def _installed_advisory_check"):]
-    call = call[:call.index("\n# ====")]
+    apel ar lăsa constanta din tuplu să mintă despre bugetul real.
 
-    assert "timeout=CONTROL_TIMEOUT_S" in call, call
+    Apelul se găsește după ce e scris în argv (`--installed`), nu după poziția lui
+    `_installed_advisory_check` față de bannerul `# ====` următor: forma veche tăia
+    sursa între cele două, așa că mutarea funcției la capătul fișierului o strica cu
+    `ValueError: substring not found`, fără ca vreun plafon să se schimbe — un eșec
+    care nu numea nimic și acuza ce nu trebuia. Citirea e a lui `_dnf_ceilings.py`, ca
+    în celelalte două teste de sursă; aici se cere doar rolul `control`."""
+    source = (ROOT / "sentinel" / "scan" / "os_packages.py").read_text(encoding="utf-8")
+    problems = dnf_ceiling_problems(source, role="control")
+
+    assert not problems, "\n".join(problems)
 
 
 # --- ordinea față de `annotate` --------------------------------------------------------------

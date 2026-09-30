@@ -32,6 +32,7 @@ import pytest
 
 from sentinel.db.repo.findings import finding_key
 from sentinel.scan import fix_state, orchestrator, os_packages, prioritize
+from tests.unit._dnf_ceilings import dnf_ceiling_problems
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "tests" / "fixtures" / "dnf-updateinfo"
@@ -626,12 +627,19 @@ def test_the_advisory_querys_ceiling_is_part_of_the_worst_case():
 
 def test_the_advisory_query_asks_for_its_declared_ceiling_in_the_source():
     """Plafonul declarat trebuie să fie și cel cerut: un `timeout=30` scris de mână la
-    apel ar lăsa constanta din tuplu să mintă despre bugetul real."""
-    source = (ROOT / "sentinel" / "scan" / "os_packages.py").read_text(encoding="utf-8")
-    body = source[source.index("async def _uncovered_advisories"):]
-    body = body[:body.index("\nasync def _installed_advisory_check")]
+    apel ar lăsa constanta din tuplu să mintă despre bugetul real, iar bugetul
+    unității (`TimeoutStartSec`) s-ar calcula pe un număr pe care apelul nu-l respectă.
 
-    assert "timeout=ADVISORY_TIMEOUT_S" in body, body[:400]
+    Apelul se găsește după ce e scris în argv (`-C`, fără `cves`, fără `--installed`),
+    nu după poziția funcției `_uncovered_advisories` în fișier: forma veche tăia
+    sursa între două nume de funcții, așa că o simplă mutare a lor pica testul fără
+    ca vreun plafon să se schimbe. Citirea e a lui `_dnf_ceilings.py`, aceeași ca în
+    `test_scan_cache_dir.py`; aici se cere doar rolul `advisory` — plafonul pierdut
+    al controlului îl numește testul de acolo, pe numele controlului."""
+    source = (ROOT / "sentinel" / "scan" / "os_packages.py").read_text(encoding="utf-8")
+    problems = dnf_ceiling_problems(source, role="advisory")
+
+    assert not problems, "\n".join(problems)
 
 
 # ===========================================================================
