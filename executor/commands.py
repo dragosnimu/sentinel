@@ -1,6 +1,6 @@
 """The complete set of privileged operations.
 
-Eight operations, and the list is deliberately short. Every one validates its
+Eighteen operations, and the list is deliberately short. Every one validates its
 arguments through `policy` before touching anything, and every one returns a
 plain dict that the executor serialises.
 
@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import policy
+import transient_unit
 from policy import PolicyRefusal
 
 
@@ -379,6 +380,13 @@ def op_patch_step_exec(args: dict[str, Any]) -> dict[str, Any]:
     The plan passed `sentinel/patch/validator.py` before an operator ever saw
     it. This re-validates anyway: that validator runs on the untrusted side of
     the boundary, and a step arriving here is a request, not a fact.
+
+    A package transaction (`transient_unit.is_transaction`) is not run here at
+    all: this process's sandbox is read-only exactly where a transaction writes,
+    so it is handed, still as the argv this function validated, to
+    `transient_unit.run`. That path enforces the plan binding and the audit
+    trail itself and refuses unless a set of facts about the host holds; read
+    its module docstring before touching this branch.
     """
     argv = policy.check_argv(args.get("argv"))
     timeout = int(args.get("timeout_s", 60))
@@ -389,8 +397,25 @@ def op_patch_step_exec(args: dict[str, Any]) -> dict[str, Any]:
     if cwd is not None:
         cwd = policy.check_path(cwd, purpose="run a command in")
 
+    transaction = transient_unit.is_transaction(argv)
+    if transaction and cwd is not None:
+        # Refused, not ignored: the working directory of a root unit is one of
+        # the things a request must not be able to choose, and a field that is
+        # silently dropped is one somebody will later start honouring.
+        raise PolicyRefusal("a package transaction takes no working directory; it "
+                            "always runs from /")
+
     if args.get("dry_run"):
-        return {"dry_run": True, "would_run": argv, "cwd": cwd, "timeout_s": timeout}
+        report = {"dry_run": True, "would_run": argv, "cwd": cwd, "timeout_s": timeout}
+        if transaction:
+            # A dry run spawns nothing, so without this it would say "fine" for
+            # a step the real run is going to refuse.
+            report["transaction"] = transient_unit.dry_run_report()
+        return report
+
+    if transaction:
+        return transient_unit.run(argv, timeout_s=timeout, plan_hash=args.get("plan_hash"),
+                                  step_index=args.get("step_index"), redact=_redact)
 
     result = _run(argv, timeout=timeout, cwd=cwd)
     return {"argv": argv, "cwd": cwd, **result}

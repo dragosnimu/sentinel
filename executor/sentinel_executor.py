@@ -51,6 +51,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import commands  # noqa: E402
 import policy  # noqa: E402
+import transient_unit  # noqa: E402
 from policy import PolicyRefusal  # noqa: E402
 
 SOCKET_PATH = os.environ.get("SENTINEL_EXECUTOR_SOCKET", "/run/sentinel/executor.sock")
@@ -65,6 +66,7 @@ MAX_CONCURRENT = 8
 _shutdown = threading.Event()
 _audit_lock = threading.Lock()
 _audit_prev_hash = "0" * 64
+_audit_write_failures = 0
 _slots = threading.Semaphore(MAX_CONCURRENT)
 
 
@@ -101,7 +103,7 @@ def _load_audit_chain() -> str:
 def audit(operation: str, target: str | None, params: dict[str, Any],
           result: str, detail: str | None, peer: dict[str, Any]) -> int:
     """Append one hash-chained audit record. Never raises into the request path."""
-    global _audit_prev_hash
+    global _audit_prev_hash, _audit_write_failures
 
     with _audit_lock:
         entry = {
@@ -136,8 +138,21 @@ def audit(operation: str, target: str | None, params: dict[str, Any],
             # it must be loud: an unaudited privileged action is exactly what
             # this file exists to prevent.
             log("error", "AUDIT WRITE FAILED", operation=operation, detail=str(exc))
+            _audit_write_failures += 1
 
         return entry["seq"]
+
+
+def _audit_transaction(event: str, result: str, detail: dict[str, Any]) -> bool:
+    before = _audit_write_failures
+    audit(f"transaction_{event}", transient_unit.UNIT_FULL, {}, result,
+          json.dumps(detail, sort_keys=True, separators=(",", ":")),
+          {"uid": 0, "pid": os.getpid()})
+    return _audit_write_failures == before
+
+
+def _wire_transaction_audit() -> None:
+    transient_unit.configure(AUDIT_PATH, _audit_transaction, _shutdown, log)
 
 
 # ---------------------------------------------------------------------------
@@ -459,7 +474,8 @@ def preflight() -> None:
     # If this file is writable by the sentinel user, the privilege split is a
     # fiction: whoever can write it can execute arbitrary code as root.
     for path in (Path(__file__), Path(__file__).parent / "policy.py",
-                 Path(__file__).parent / "commands.py"):
+                 Path(__file__).parent / "commands.py",
+                 Path(__file__).parent / "transient_unit.py"):
         try:
             stat = path.stat()
         except OSError:
@@ -481,6 +497,8 @@ def main() -> int:
 
     global _audit_prev_hash
     _audit_prev_hash = _load_audit_chain()
+    _wire_transaction_audit()
+    log("info", "package transaction state at startup", status=transient_unit.recover())
 
     # Before anything can be blocked, there has to be somewhere to put it.
     # A host that reboots comes back with no `inet sentinel` table, and every

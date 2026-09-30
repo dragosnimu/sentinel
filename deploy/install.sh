@@ -1808,7 +1808,7 @@ step_package() {
     # compromise of sentinel/ cannot reach into it.
     install -D -m 0755 -o root -g root \
         "${SRC_ROOT}/executor/sentinel_executor.py" "${SENTINEL_PREFIX}/libexec/sentinel_executor.py"
-    for f in commands.py policy.py; do
+    for f in commands.py policy.py transient_unit.py; do
         [[ -f "${SRC_ROOT}/executor/${f}" ]] && \
             install -D -m 0644 -o root -g root \
                 "${SRC_ROOT}/executor/${f}" "${SENTINEL_PREFIX}/libexec/${f}"

@@ -1306,6 +1306,17 @@ def _load_approval_key() -> str | None:
     return None
 
 
+def approval_key_path() -> Path:
+    """Where `register_plan_steps` looks for the approval key.
+
+    A function and not the constant, so a caller that asks "which file would an
+    approval be signed with" gets the answer for the path actually in force -
+    `transient_unit` probes this file, and a probe of a copy of the path would be
+    a check of the wrong file that reports it clean.
+    """
+    return _APPROVAL_KEY_PATH
+
+
 def _check_approval_token(plan_hash: Any, token: Any) -> None:
     if not isinstance(plan_hash, str) or not _PLAN_HASH_RE.match(plan_hash):
         raise PolicyRefusal("plan_hash must be a 64-character lowercase sha256 hex digest")
@@ -1411,3 +1422,39 @@ def lookup_registered_step(plan_hash: Any, step_index: Any, argv: list[str]) -> 
                 f"{plan_hash}; refusing rather than running something different from "
                 "what the operator saw"
             )
+
+
+def consume_registered_step(plan_hash: Any, step_index: Any, argv: list[str]) -> None:
+    """`lookup_registered_step`, and the approval is spent: the same step of the
+    same registration is refused the second time.
+
+    Only the transient-unit path calls this. A registration lets a step be
+    replayed until it expires, which is harmless for a command that runs inside
+    the executor's read-only sandbox and is not for one that runs as unconfined
+    root: the rollback step of an approved plan is a `dnf downgrade`, and
+    "approved once" must not mean "runnable at will for the next hour".
+
+    What it does NOT close: nothing here knows which phase a plan is in, so an
+    approved rollback step can still be run first, once, without the apply step
+    having failed. Only a registration that carries ordering could close that.
+    Re-registering the same `plan_hash` replaces the entry and so resets the
+    used marks - which needs a valid approval token, i.e. the approver.
+    """
+    lookup_registered_step(plan_hash, step_index, argv)
+    with _plan_registry_lock:
+        entry = _plan_registry.get(plan_hash)
+        if entry is None or entry["expires_at"] <= time.monotonic():
+            raise PolicyRefusal(f"the registration for {plan_hash} expired while the step was being consumed")
+        # Checked again under the lock that marks it: between `lookup_...` above
+        # and here the registration can have been replaced by another whose
+        # step at this index is a different command.
+        if entry["steps"][step_index] != list(argv):
+            raise PolicyRefusal(
+                f"argv for step {step_index} does not match what was approved for "
+                f"{plan_hash}; the registration was replaced while it was being consumed")
+        used = entry.setdefault("used", set())
+        if step_index in used:
+            raise PolicyRefusal(
+                f"step {step_index} of {plan_hash} has already been executed; an approval "
+                "runs one step once - approve the plan again to run it again")
+        used.add(step_index)
