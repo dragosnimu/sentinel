@@ -909,7 +909,9 @@ def test_rhel_scan_is_unchanged(monkeypatch):
 
     async def fake_run(argv, timeout, env=None):
         calls.append({"argv": argv, "timeout": timeout})
-        return 100, _SAMPLE, ""
+        # A doua interogare (la nivel de aviz, fara `cves`) are formatul ei si un
+        # test propriu: aici e despre interogarea CVE, deci aviz-urile sunt goale.
+        return (100, _SAMPLE, "") if "cves" in argv else (0, "", "")
 
     async def no_host():
         # `fix_state` citeste `rpm -qa` si `uname -r`; testul asta e despre dnf,
@@ -921,9 +923,13 @@ def test_rhel_scan_is_unchanged(monkeypatch):
     monkeypatch.setattr(os_packages.fix_state, "read_host", no_host)
     findings, error, facts = _run(os_packages.scan("rhel"))
 
-    assert [c["argv"] for c in calls] == [[
+    # Prima comanda e cea de dinainte de a doua interogare, neschimbata.
+    assert calls[0]["argv"] == [
         "dnf", "-q", f"--setopt=cachedir={os_packages.CACHE_DIR}",
-        "updateinfo", "list", "cves", "--security"]]
+        "updateinfo", "list", "cves", "--security"]
+    assert calls[0]["timeout"] == os_packages.TIMEOUT_S
+    assert [c["argv"][-2:] for c in calls[1:]] == [["list", "--security"]], (
+        "dupa interogarea CVE, singura comanda in plus e cea la nivel de aviz")
     assert facts["scanner"] == "dnf" and error is None
     # Four (CVE, package) pairs in the sample; the non-matching line is dropped.
     assert len(findings) == 4

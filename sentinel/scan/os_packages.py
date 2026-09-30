@@ -6,6 +6,7 @@ The backend is chosen from `platform.family` in the configuration — the value
 ever disagree on the host where it matters.
 
     rhel    `dnf updateinfo list cves --security`    CVE-level, vendor-authoritative
+            `dnf updateinfo list --security`         advisory-level, completes the above
     debian  `apt-get -s dist-upgrade`                package-level, NO CVE
 
 **The two families do not give the same quality of answer, and this module does
@@ -69,6 +70,33 @@ advisory source at all (every repository disabled, or only repositories that
 carry no advisories). So an empty answer is believed only when a control proves
 dnf can see advisories — see `_installed_advisory_check`, which also says what
 that control does NOT catch. A non-empty answer proves itself and runs no control.
+
+## Un aviz fara CVE structurat nu e un aviz care nu exista
+
+`list cves` tipareste doar avizele care declara un CVE ca referinta structurata
+(`dnf/cli/commands/updateinfo.py`, `display_list`: cu `with_cve` iau doar
+referintele de tip cve, plus cele de alt tip decat bugzilla — de acolo vin, dupa
+cod, ID-urile RHSA/ALSA de pe liniile Alma). Un aviz care poarta CVE-ul
+doar in titlul bug-ului nu tipareste NIMIC acolo. Masurat pe productie, 30 sep
+2026: `--installed` listeaza 10 pachete EPEL (`suricata`, `libsodium`, `libssh2`,
+...) sub `list --security` si zero sub `list cves --security`. Azi nu e nicio
+expunere — la pachetele in ASTEPTARE cele doua interogari dau aceleasi 8 pachete —
+dar prima actualizare de securitate EPEL pentru unul dintre ele ar fi aratat
+gazda curata.
+
+De aceea scanerul pune a doua interogare, `list --security`, si tine din ea doar
+ce prima nu poate reprezenta: liniile al caror pachet EXACT (nvra) nu are nicio
+linie CVE. Constatarea are `cve` NULL, `advisory_id` = avizul, iar `finding_key`
+se compune cu avizul in locul CVE-ului (`finding_key("dnf", None, pachet, aviz,
+None)` — aceeasi conventie ca `trivy_fs`, care pune GHSA in acelasi loc). Nu
+poate ciocni cu una cu CVE: al patrulea camp e un `CVE-…` intr-un caz si un ID de
+aviz in celalalt, iar o linie de aviz care incepe cu `CVE-` e refuzata, nu
+acceptata. Ce NU poate o constatare fara CVE: sa fie potrivita cu oglinda KEV
+(deci n-ajunge la `generate_for_kev` si nu primeste +25 la prioritate), sa aiba
+linkuri NVD/Red Hat/CISA in bot si in panou, sa fie legata de o sonda `cve_probe`
+in `predict.exposure`. Ce poate: sa apara in panou si in `/vulnerabilitati`, sa
+primeasca prioritate din severitatea avizului, sa fie anuntata pe Telegram, sa
+treaca prin `fix_state` si sa primeasca un plan la cerere (`/planifica <id>`).
 
 Read-only throughout: this lists what security updates are AVAILABLE. It never
 installs anything — applying a fix is the patch pipeline (P9), behind explicit
@@ -153,15 +181,31 @@ TIMEOUT_S = 300
 #: iar atunci un apel care ia plafonul celuilalt trece neobservat.
 APT_TIMEOUT_S = 180
 
+#: Cat asteptam dupa interogarea la nivel de aviz (`_uncovered_advisories`).
+#:
+#: Masurat pe gazda reala, 30 septembrie 2026, dnf 4.14.0, ca utilizatorul
+#: `sentinel`, cu `-C` si cache-ul scanerului: `updateinfo list --security` da
+#: 1,7-1,8 secunde, cu tot cu `sudo` si pornirea procesului (trei rulari). E o
+#: citire din cache, fara retea: n-are cazul rau al lui dnf principal (87 s), pentru
+#: ca acela reimprospateaza metadatele, iar asta ruleaza DUPA el si le citeste pe
+#: cele proaspete. Plafonul e ca sa prinda un proces ATARNAT — o incuietoare pe
+#: cache —, nu ca sa margineasca o rulare normala; aceeasi logica si aceeasi marja
+#: ca la `CONTROL_TIMEOUT_S`.
+#:
+#: Rand separat, dinadins: doua plafoane cu aceeasi cifra nu se pot deosebi intr-o
+#: proba, iar un apel care il ia pe al celuilalt trece neobservat.
+ADVISORY_TIMEOUT_S = 60
+
 #: Cat asteptam dupa controlul pozitiv al lui dnf (`_installed_advisory_check`).
 #:
-#: Masurat pe gazda reala, 29 septembrie 2026, dnf 4.14.0: 1,4-2,8 secunde pentru
-#: `updateinfo list cves --security --installed` cu `-C` si cache-ul scanerului
-#: (18575 de linii, ~1,5 MB), 5,6 secunde de la un capat la altul cu `sudo` si
-#: pornirea procesului. Nu atinge reteaua si nu reconstruieste nimic, deci n-are
-#: cazul rau al lui dnf (87 s). Plafonul e ca sa prinda un proces ATARNAT — o
-#: incuietoare pe cache — nu ca sa margineasca o rulare normala; marja de ~20x e
-#: aceeasi logica ca la `fix_state.RPM_TIMEOUT_S`.
+#: Masurat pe gazda reala, 30 septembrie 2026, dnf 4.14.0: 1,8-1,9 secunde pentru
+#: `updateinfo list --security --installed` cu `-C` si cache-ul scanerului
+#: (2654 de linii, 218 KB), cu tot cu `sudo` si pornirea procesului. Pe 29
+#: septembrie, cand controlul era `list cves --security --installed`: 1,4-2,8 s
+#: pentru 18575 de linii (~1,5 MB). Nu atinge reteaua si nu reconstruieste nimic,
+#: deci n-are cazul rau al lui dnf (87 s). Plafonul e ca sa prinda un proces
+#: ATARNAT — o incuietoare pe cache — nu ca sa margineasca o rulare normala; marja
+#: de ~20x e aceeasi logica ca la `fix_state.RPM_TIMEOUT_S`.
 #:
 #: Rand separat de `TIMEOUT_S`, dinadins: doua plafoane cu aceeasi cifra nu se pot
 #: deosebi intr-o proba, iar un apel care il ia pe al celuilalt trece neobservat.
@@ -177,14 +221,16 @@ CONTROL_TIMEOUT_S = 60
 #: (`test_scan_trivy_fs.py::test_the_measured_ceiling_fits_inside_the_unit_budget`).
 #:
 #: Backendul rhel are mai multe comenzi, nu una, si ruleaza una dupa alta: dnf,
-#: apoi — DOAR cand dnf n-a raportat nimic — controlul pozitiv, apoi `fix_state`
-#: citeste baza rpm ca sa deosebeasca „reparatia nu e instalata" de „e instalata,
-#: dar nu ruleaza inca". Plafoanele lor se ADUNA, nu se pierd in maxim; controlul
-#: e numarat si cand nu ruleaza, fiindca bugetul se scrie pentru cel mai rau caz. Un pas nou al backendului rhel isi adauga plafonul in
-#: tuplul de mai jos si atat: suma, `WORST_CASE_TIMEOUT_S` si testul care o
-#: leaga de buget se deriva de aici.
+#: apoi interogarea la nivel de aviz, apoi — DOAR cand ele n-au raportat nimic —
+#: controlul pozitiv, apoi `fix_state` citeste baza rpm ca sa deosebeasca
+#: „reparatia nu e instalata" de „e instalata, dar nu ruleaza inca". Plafoanele lor
+#: se ADUNA, nu se pierd in maxim; controlul e numarat si cand nu ruleaza, fiindca
+#: bugetul se scrie pentru cel mai rau caz. Un pas nou al backendului rhel isi
+#: adauga plafonul in tuplul de mai jos si atat: suma, `WORST_CASE_TIMEOUT_S` si
+#: testul care o leaga de buget se deriva de aici.
 RHEL_STEP_CEILINGS_S: Final = (TIMEOUT_S, CONTROL_TIMEOUT_S,
-                               fix_state.WORST_CASE_TIMEOUT_S)
+                               fix_state.WORST_CASE_TIMEOUT_S,
+                               ADVISORY_TIMEOUT_S)
 
 WORST_CASE_TIMEOUT_S = max(sum(RHEL_STEP_CEILINGS_S), APT_TIMEOUT_S)
 
@@ -248,6 +294,29 @@ _SEV = {"critical": "critical", "important": "high", "moderate": "medium", "low"
 _LINE = re.compile(
     r"^(?P<cve>CVE-\d{4}-\d+)\s+(?P<sev>\w+)/Sec\.\s+(?P<nvra>\S+)\s*$")
 
+# `dnf updateinfo list --security`, fara `cves`: un ID de aviz in loc de CVE.
+#   ALSA-2026:71700              Important/Sec.  kernel-5.14.0-687.52.1.el9_8.x86_64
+#   FEDORA-EPEL-2026-eb3474ffec  Important/Sec.  suricata-7.0.17-1.el9.x86_64
+# Cuvantul de severitate e `[^\s/]+`, nu `\w+`: dnf tipareste `Unknown/Sec.` cand
+# avizul n-are severitate (`SECURITY2LABEL.get(sev, 'Unknown/Sec.')` in
+# `display_list`), iar un cuvant pe care nu-l cunoastem nu are voie sa faca linia
+# sa dispara.
+_ADVISORY_LINE = re.compile(
+    r"^(?P<id>\S+)\s+(?P<sev>[^\s/]+)/Sec\.\s+(?P<nvra>\S+)\s*$")
+
+
+def _severity(word: str) -> tuple[str, bool]:
+    """Cuvantul de severitate al unui aviz -> (severitatea Sentinel, cunoscuta?).
+
+    Un cuvant necunoscut (`Unknown` — avizul n-are severitate —, sau o eticheta
+    tradusa ori nou aparuta) NU devine `info` si NU face scanarea sa pice: devine
+    `medium` cu `raw.severity_known = False`, perechea pe care `apt` si
+    `trivy_fs.map_severity` o folosesc pentru „negradat". `info` ar afirma „ne-am
+    uitat, e neglijabil", si ar disparea de sub orice filtru de triaj.
+    """
+    known = _SEV.get(word.lower())
+    return (known, True) if known else ("medium", False)
+
 
 def _split_nvra(nvra: str) -> tuple[str, str]:
     """openssl-libs-1:3.0.7-24.el9_5.x86_64 -> (name, version-release).
@@ -263,7 +332,9 @@ def _split_nvra(nvra: str) -> tuple[str, str]:
 
 
 async def _scan_dnf() -> tuple[list[dict[str, Any]], str | None, dict[str, Any]]:
-    """One finding per (CVE, package) that has a security update available."""
+    """One finding per (CVE, package) that has a security update available, plus
+    one per (advisory, package) for an advisory that declares no CVE at all —
+    see `_uncovered_advisories`."""
     facts = _facts("rhel")
     # `cachedir` explicit, si nu e un reglaj de viteza — e ce tine scanarea in
     # viata. Comentariul de aici spunea pana pe 21 august 2026 ca „scanerul
@@ -283,10 +354,14 @@ async def _scan_dnf() -> tuple[list[dict[str, Any]], str | None, dict[str, Any]]
         return [], (err.strip() or f"dnf exited {rc}")[:500], facts
 
     seen: dict[tuple[str, str], dict] = {}
+    # Pachetele EXACTE (nvra) pentru care interogarea CVE a produs cel putin o
+    # constatare: ce a doua interogare n-are voie sa mai repete.
+    cve_nvras: set[str] = set()
     for line in out.splitlines():
         m = _LINE.match(line.strip())
         if not m:
             continue
+        cve_nvras.add(m.group("nvra"))
         cve = m.group("cve")
         severity = _SEV.get(m.group("sev").lower(), "medium")
         name, fixed = _split_nvra(m.group("nvra"))
@@ -313,22 +388,37 @@ async def _scan_dnf() -> tuple[list[dict[str, Any]], str | None, dict[str, Any]]
     # rulat pe o lista in care nu ai incredere ar produce verdicte pentru ceva ce
     # urmeaza sa fie aruncat — si ar consuma plafonul lui de timp pe degeaba.
     # Cine adauga un pas nou aici isi adauga si plafonul in `RHEL_STEP_CEILINGS_S`.
+    nonblank = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    if not findings and nonblank:
+        # (a) A scris ceva, iar NICIO linie nu se potriveste. O schimbare de
+        # format (sau o eroare scrisa pe stdout) ar da zero constatari dintr-o
+        # iesire ne-goala — acelasi inchis-in-masa ca la dnf orb, dar controlul
+        # de mai jos nu l-ar prinde, fiindca gazda are advisory-uri instalate.
+        # Controlul nu se ruleaza: nu el e intrebarea. Se verifica INAINTE de a
+        # doua interogare, pe rezultatul primei singure: cu un format CVE stricat,
+        # `cve_nvras` ar fi gol si TOATE liniile de aviz ar parea neacoperite —
+        # scanarea ar inlocui tacut fiecare constatare cu CVE printr-una fara.
+        return [], (
+            f"dnf a scris {len(nonblank)} linii (cod {rc}), dar nicio linie nu se "
+            "potrivește cu formatul `CVE-… Severitate/Sec. pachet` pe care îl "
+            "parsează scanerul: formatul s-a schimbat sau dnf a scris o eroare pe "
+            "stdout. Zero constatări dintr-o ieșire ne-goală ar închide în masă tot "
+            f"ce e deschis. Prima linie: {nonblank[0][:120]!r}. "
+            "Scanarea NU s-a încheiat."), facts
+
+    # A doua interogare: avizele fara CVE structurat, pe care `list cves` nu le
+    # tipareste deloc. O eroare aici esueaza scanarea, nu o continua cu ce s-a
+    # adunat: constatarile fara CVE deja deschise NU sunt in `findings`, deci
+    # `mark_resolved_absent` le-ar inchide ca „disparute" pe o scanare care nu s-a
+    # uitat la ele.
+    uncovered, refusal = await _uncovered_advisories(cve_nvras)
+    if refusal:
+        return [], refusal, facts
+    findings += uncovered
+
     if not findings:
-        # Zero constatari. Doua feluri de zero se deosebesc doar prin ce a scris dnf:
-        nonblank = [ln.strip() for ln in out.splitlines() if ln.strip()]
-        if nonblank:
-            # (a) A scris ceva, iar NICIO linie nu se potriveste. O schimbare de
-            # format (sau o eroare scrisa pe stdout) ar da zero constatari dintr-o
-            # iesire ne-goala — acelasi inchis-in-masa ca la dnf orb, dar controlul
-            # de mai jos nu l-ar prinde, fiindca gazda are advisory-uri instalate.
-            # Controlul nu se ruleaza: nu el e intrebarea.
-            return [], (
-                f"dnf a scris {len(nonblank)} linii (cod {rc}), dar nicio linie nu se "
-                "potrivește cu formatul `CVE-… Severitate/Sec. pachet` pe care îl "
-                "parsează scanerul: formatul s-a schimbat sau dnf a scris o eroare pe "
-                "stdout. Zero constatări dintr-o ieșire ne-goală ar închide în masă tot "
-                f"ce e deschis. Prima linie: {nonblank[0][:120]!r}. "
-                "Scanarea NU s-a încheiat."), facts
+        # Zero constatari din ambele interogari, si nicio linie ilizibila. Ramane de
+        # deosebit ce a scris dnf — nimic:
         # (b) N-a scris nimic. Gazda curata SAU dnf orb — vezi controlul. Rulat DOAR
         # aici: o constatare parsata se dovedeste singura (dnf a citit advisory-uri),
         # iar controlul nu depinde de numarul lor, de ce se rezolva sau de scanarile
@@ -345,32 +435,156 @@ async def _scan_dnf() -> tuple[list[dict[str, Any]], str | None, dict[str, Any]]
     # baza. Nu schimba ce raporteaza dnf si nu poate pica scanarea — vezi
     # `fix_state.annotate`.
     facts["fix_state"] = await fix_state.annotate(findings)
-    log.info("dnf scan parsed", extra={"findings": len(seen)})
+    log.info("dnf scan parsed",
+             extra={"findings": len(findings), "cve_findings": len(seen),
+                    "advisory_only_findings": len(uncovered)})
     return findings, None, facts
+
+
+async def _uncovered_advisories(
+        cve_nvras: set[str]) -> tuple[list[dict[str, Any]], str | None]:
+    """Avizele de securitate pe care `list cves` nu le poate arata: cele fara CVE.
+
+    Intoarce `(constatari, eroare)`; `eroare` setata inseamna „nu pot spune", si
+    apelantul esueaza scanarea — vezi comentariul de la apel.
+
+    `cve_nvras` sunt pachetele exacte (nvra, cu epoch, cum le tipareste dnf) pentru
+    care interogarea CVE a dat cel putin o linie. O linie de aviz al carei nvra e in
+    multime e ACOPERITA: constatarea cu CVE exista deja, iar actualizarea la acel
+    nvra le inchide pe amandoua — a doua ar fi un duplicat. Regula e pe pachet exact
+    si nu pe ID de aviz, dinadins: `list cves` tipareste ID-ul avizului doar prin
+    referintele lui de alt tip decat cve/bugzilla, deci potrivirea pe ID ar depinde
+    de un accident al metadatelor Alma (un aviz Alma viitor fara ea ar aparea de doua
+    ori, in fiecare noapte). Ce costa regula pe nvra: un aviz FARA CVE care livreaza
+    acelasi nvra ca unul CU CVE nu apare separat — nu se pierde nicio actiune, dar
+    nici severitatea lui, daca ar fi mai mare. Masurat pe productie, 30 sep 2026, pe
+    2654 de linii `--installed`: zero perechi de acest fel; cele 10 neacoperite sunt
+    toate FEDORA-EPEL.
+
+    Cheia, severitatea si ce nu poate constatarea asta: docstring-ul modulului.
+
+    Strict pe format, spre deosebire de interogarea CVE, care tolereaza linii
+    straine (ea le amesteca cu ID-urile de aviz). Aici FIECARE linie nevida trebuie
+    sa fie `ID Severitate/Sec. nvra`: o linie sarita in tacere e un aviz care lipseste
+    din `findings`, iar `mark_resolved_absent` il inchide ca „reparat" daca era
+    deschis. Prea strict costa o scanare esuata, vizibila; prea lax costa o
+    constatare inchisa pe nedrept, invizibila. Un ID care incepe cu `CVE-` e refuzat
+    tot asa: ar fi cheia unei constatari cu CVE, adica un posibil duplicat al ei.
+
+    `-C`: doar cache-ul, pe care dnf-ul principal tocmai l-a reimprospatat — vezi
+    `ADVISORY_TIMEOUT_S`. Codul de iesire, spre deosebire de interogarea principala,
+    conteaza si cand exista iesire: una partiala ar lasa avize lipsa.
+    """
+    rc, out, err = await _run([
+        "dnf", "-C", "-q", f"--setopt=cachedir={CACHE_DIR}",
+        "updateinfo", "list", "--security"], timeout=ADVISORY_TIMEOUT_S)
+    if rc == 124 and err == "timeout":
+        return [], (
+            f"interogarea dnf la nivel de aviz (`list --security`) a depășit plafonul "
+            f"de {ADVISORY_TIMEOUT_S} s. Fără ea nu se poate ști dacă există avize de "
+            "securitate fără CVE structurat. Scanarea NU s-a încheiat: nu are zero "
+            "vulnerabilități, nu are date.")
+    if rc not in (0, 100):
+        return [], (
+            "interogarea dnf la nivel de aviz (`list --security`) a eșuat "
+            f"({(err.strip() or f'dnf a ieșit cu {rc}')[:200]}). Fără ea nu se poate "
+            "ști dacă există avize de securitate fără CVE structurat. Scanarea NU s-a "
+            "încheiat: nu are zero vulnerabilități, nu are date.")
+
+    seen: dict[tuple[str, str], dict[str, Any]] = {}
+    for raw_line in out.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        m = _ADVISORY_LINE.match(line)
+        if not m or m.group("id").upper().startswith("CVE-"):
+            return [], (
+                "interogarea dnf la nivel de aviz a scris o linie pe care parserul nu "
+                "o recunoaște (forma așteptată: `ID-aviz Severitate/Sec. pachet`): "
+                f"{line[:120]!r}. Formatul s-a schimbat sau dnf a scris o eroare pe "
+                "stdout; o linie sărită ar face un aviz să dispară, iar unul deschis "
+                "s-ar închide ca rezolvat. Scanarea NU s-a încheiat.")
+        nvra = m.group("nvra")
+        if nvra in cve_nvras:
+            continue        # acoperit: exista deja constatarea cu CVE
+        advisory = m.group("id")
+        name, fixed = _split_nvra(nvra)
+        if (advisory, name) in seen:
+            # Aceeasi linie de doua ori (masurat: 21 de dubluri) sau alt nvra al
+            # aceluiasi pachet, ca la cheia (CVE, pachet) de mai sus.
+            continue
+        severity, known = _severity(m.group("sev"))
+        raw: dict[str, Any] = {"advisory_line": line, "cve_known": False}
+        if not known:
+            raw["severity_known"] = False
+            raw["severity_word"] = m.group("sev")
+        seen[(advisory, name)] = {
+            "scanner": "dnf",
+            # Nul, ca la `apt` si la GHSA din `trivy_fs`: nu se inventeaza un CVE.
+            "cve": None,
+            "advisory_id": advisory,
+            "title": f"{advisory} în {name} (avizul nu declară niciun CVE)",
+            "description": (
+                f"Avizul de securitate {advisory} repară {name}"
+                + (f" în {fixed}" if fixed else "")
+                + ", dar nu declară niciun CVE structurat, așa că Sentinel nu îl "
+                "poate potrivi cu oglinda CISA KEV și nu poate lega constatarea de "
+                "un CVE. "
+                + ("" if known else
+                   f"Severitatea avizului ({m.group('sev')}) nu e una cunoscută: "
+                   "«medium» de mai sus e o valoare implicită, NU o evaluare. ")
+                + "Prioritatea vine doar din severitatea avizului."),
+            "severity": severity,
+            "package": name,
+            "fixed_version": fixed or None,
+            "ecosystem": "rpm",
+            "finding_key": fx.finding_key("dnf", None, name, advisory, None),
+            "raw": raw,
+        }
+    return list(seen.values()), None
 
 
 async def _installed_advisory_check() -> tuple[int, str | None]:
     """Controlul pozitiv: poate dnf sa vada ADVISORY-URI pe gazda asta?
 
     Intoarce `(linii recunoscute, eroare)`. `eroare is None` inseamna „da, le vede",
-    adica un raspuns gol de la interogarea principala inseamna „gazda e curata".
+    adica un raspuns gol de la interogarile principale inseamna „gazda e curata".
     Orice alt raspuns inseamna „nu pot sa spun", si scanarea trebuie sa esueze, nu
     sa incheie cu zero.
 
-    DE CE EXISTA. `dnf updateinfo list cves --security` iese cu 0 si zero linii si
+    DE CE EXISTA. `dnf updateinfo list [cves] --security` iese cu 0 si zero linii si
     cand gazda e curata, si cand dnf n-a vazut nicio sursa de advisory-uri (toate
     depozitele dezactivate; doar depozite fara advisory-uri). Masurat pe gazda
-    reala, dnf 4.14.0:
+    reala, dnf 4.14.0, cu `-C` si cache-ul scanerului:
 
-        scenariu                  `--available` (scanarea)   `--installed` (controlul)
-        gazda curata              rc 0, 0 linii              rc 0, 18575 linii
-        toate depozitele oprite   rc 0, 0 linii              0 linii  -> prins
-        doar depozite fara adv.   rc 0, 0 linii              0 linii  -> prins
-        director de cache gol     rc 1, eroare               rc 1, eroare
-        doar baseos               rc 0, 0 linii              10667 linii -> NEPRINS
+        scenariu                  scanarea (in asteptare)  `cves --installed`  `--installed`
+        gazda curata              rc 0, 0 linii            18575 linii         2654 linii
+        toate depozitele oprite   rc 0, 0 linii            0 linii             0 linii
+        doar depozite fara adv.   rc 0, 0 linii            0 linii             0 linii
+        director de cache gol     rc 1, eroare            rc 1, eroare        rc 1, eroare
+        doar baseos               rc 0, 0 linii            10667 linii         1365 linii
+        doar appstream            rc 0, 0 linii            7971 linii          1289 linii
+        doar epel                 —                        0 linii             10 linii
+
+    („doar depozite fara adv." = `docker-ce-stable`, `zabbix` sau `extras`, pe
+    rand: 0 si 0. Coloana `cves --installed` e controlul de pana pe 30 sept 2026;
+    `--installed` e cel de acum. Randul „doar epel" e motivul mutarii, mai jos.)
 
     Fara control, primul rand „rc 0, 0 linii" e citit de orchestrator ca „totul s-a
     reparat" si inchide fiecare constatare deschisa: panou curat, gazda exploatabila.
+
+    DE CE `list --security --installed`, si nu `list cves ...`. Controlul trebuie sa
+    treaca prin aceeasi interogare al carei raspuns gol il crede, iar raspunsul gol
+    de acum vine din DOUA interogari, `list cves` si `list` la nivel de aviz —
+    a doua e mai larga, deci e cea care o dovedeste pe cea mai stricta. Randul
+    „doar epel" arata diferenta: pe o gazda ale carei singure avize vizibile nu
+    declara CVE, `cves --installed` da zero — controlul vechi ar fi refuzat PERMANENT
+    o gazda pe care dnf o vede bine. Costul mutarii: controlul nu mai exercita `_LINE`
+    (linia CVE) pe iesire reala. O schimbare a formatului CVE pe o gazda curata nu se
+    vede pana apare un aviz in asteptare — dar pana atunci nu e nimic de citit gresit,
+    iar cand apare, garda (a) din `_scan_dnf` (iesire ne-goala, nicio potrivire) o
+    prinde inainte sa conteze. Controlul valideaza acum `_ADVISORY_LINE`, parserul pe
+    care se sprijina a doua interogare.
 
     `--installed` si nu `rpm -qa`: `rpm -qa` trece in FIECARE fals-gol reprodus
     (pachetele exista oricum). Controlul trebuie sa treaca prin aceleasi metadate de
@@ -378,7 +592,7 @@ async def _installed_advisory_check() -> tuple[int, str | None]:
     `-C`: doar cache, fara retea — un control care iese in retea ar pica exact cand
     reteaua e problema, si ar reconstrui metadatele (82 s masurate) in loc sa le judece.
 
-    Rulat DOAR cand interogarea principala n-a dat nimic (`_scan_dnf`). Nu depinde de
+    Rulat DOAR cand interogarile principale n-au dat nimic (`_scan_dnf`). Nu depinde de
     cate constatari a gasit scanarea, de cate se rezolva sau de scanarile anterioare, si
     nu are voie sa depinda: scanarea 134 din productie a fost `completed`,
     `findings_count 0`, `resolved_findings 491` — gazda repornise intr-un nucleu deja
@@ -389,36 +603,31 @@ async def _installed_advisory_check() -> tuple[int, str | None]:
     Cele doua garzi de FORMAT (aici si in `_scan_dnf`) exista din acelasi motiv: o
     schimbare de format a iesirii dnf transforma o iesire ne-goala in zero constatari,
     adica acelasi zero, doar ca nu vine din lipsa surselor. Cerem cel putin o linie care
-    se potriveste cu `_LINE` in controlul ne-gol — asta valideaza si parserul, pe singurul
-    lucru pe care il stim sigur ca exista.
+    se potriveste cu `_ADVISORY_LINE` in controlul ne-gol.
 
     CE CONTROLUL NU PRINDE, si nu pretinde ca prinde:
 
       * un set PARTIAL de depozite. `baseos` singur are advisory-uri, deci controlul
-        trece (10667 linii masurate) — ce lipseste, AppStream sau EPEL, nu se vede;
+        trece (1365 linii masurate) — ce lipseste, AppStream sau EPEL, nu se vede.
+        Conteaza mai mult de cand EPEL e sursa avizelor fara CVE: un EPEL cazut cu
+        `skip_if_unavailable=True` ar lasa exact acele avize nevazute, iar controlul
+        ar trece pe avizele Alma;
       * metadate VECHI dar descarcabile. `-C` nu reimprospateaza: un cache de acum doua
         luni da un raspuns coerent si invechit; asta e treaba lui `dnf-makecache`;
-      * un dnf care iese cu 1 si iesire PARTIALA: verificarea `rc not in (0, 100) and
-        not out.strip()` din `_scan_dnf` il lasa sa treaca, iar controlul nu se ruleaza
-        cand iesirea are constatari;
-      * un depozit care cade INTRE cele doua procese: cele doua ruleaza separat, dupa
-        cache-ul de pe disc, iar controlul nu stie ce set a vazut interogarea;
+      * un dnf care iese cu 1 si iesire PARTIALA la interogarea CVE: verificarea `rc not
+        in (0, 100) and not out.strip()` din `_scan_dnf` il lasa sa treaca, iar controlul
+        nu se ruleaza cand iesirea are constatari. (Interogarea la nivel de aviz e mai
+        stricta: acolo codul conteaza si cu iesire.);
+      * un depozit care cade INTRE procese: ele ruleaza separat, dupa cache-ul de pe
+        disc, iar controlul nu stie ce set a vazut fiecare;
       * o gazda care chiar n-are NICIUN advisory instalat: controlul ei e gol, deci
         scanarea ei ar esua PERMANENT. E un pret asumat, nu un accident (pe AlmaLinux 9
-        controlul are zeci de mii de linii): „nu vad nimic" si „nu e nimic" nu se pot
-        deosebi de aici. Cine ajunge pe o asemenea gazda decide el ce face;
-      * un advisory care NU declara niciun CVE structurat. Masurat pe productie,
-        29 sep 2026: `updateinfo list --security --installed` listeaza 2633 de
-        pachete, iar `list cves --security --installed` — interogarea pe care o
-        foloseste scanerul, si controlul asta odata cu ea — acopera 2623. Cele 10
-        care lipsesc sunt avize EPEL (de pilda cel pentru `libsodium`, cu CVE-ul
-        doar in titlul bug-ului, fara referinta structurata): nu tiparesc NIMIC sub
-        `list cves`. Deci un patch de securitate EPEL in asteptare arata identic cu
-        o gazda curata — interogarea principala da zero, controlul trece pe avizele
-        Alma, scanarea se incheie „curat". E chiar forma impotriva careia e scrisa
-        garda, intr-un colt pe care garda nu-l acopera. NU e introdus de schimbarea
-        asta; exista de cand scanerul intreaba `list cves`. Reparatia e o a doua
-        interogare la nivel de advisory (`list --security`), si e munca separata.
+        controlul are mii de linii): „nu vad nimic" si „nu e nimic" nu se pot deosebi de
+        aici. Cine ajunge pe o asemenea gazda decide el ce face.
+
+    (Pana pe 30 sept 2026 lista de aici avea si „un advisory care NU declara niciun CVE
+    structurat": zece avize EPEL invizibile sub `list cves`. Nu mai e o limita a
+    controlului — e treaba interogarii la nivel de aviz, `_uncovered_advisories`.)
 
     Si o dependenta care NU e in acest repository: `skip_if_unavailable=False` din
     `/etc/dnf/dnf.conf` (verificat pe gazda, 29 septembrie 2026) e ce face ca un depozit
@@ -427,7 +636,7 @@ async def _installed_advisory_check() -> tuple[int, str | None]:
     """
     rc, out, err = await _run([
         "dnf", "-C", "-q", f"--setopt=cachedir={CACHE_DIR}",
-        "updateinfo", "list", "cves", "--security", "--installed"],
+        "updateinfo", "list", "--security", "--installed"],
         timeout=CONTROL_TIMEOUT_S)
     if rc == 124 and err == "timeout":
         return 0, (
@@ -446,21 +655,24 @@ async def _installed_advisory_check() -> tuple[int, str | None]:
     if not lines:
         return 0, (
             "dnf n-a găsit nicio actualizare de securitate, dar nici controlul pe "
-            "pachetele deja instalate (`dnf -C updateinfo list cves --security "
+            "pachetele deja instalate (`dnf -C updateinfo list --security "
             "--installed`) n-a găsit vreun advisory: dnf n-a citit nicio sursă de "
             "advisory-uri (depozite dezactivate sau fără metadate de securitate, ori "
             "cache gol). Un raport gol ar arăta o gazdă curată fără s-o fi verificat "
             "nimeni. Scanarea NU s-a încheiat: nu are zero vulnerabilități, nu are date.")
-    recognised = sum(1 for ln in lines if _LINE.match(ln))
+    recognised = 0
+    for ln in lines:
+        m = _ADVISORY_LINE.match(ln)
+        if m and not m.group("id").upper().startswith("CVE-"):
+            recognised += 1
     if not recognised:
         return 0, (
             f"controlul dnf pe pachetele instalate a scris {len(lines)} linii, dar "
-            "nicio linie nu se potrivește cu formatul `CVE-… Severitate/Sec. pachet` "
+            "nicio linie nu se potrivește cu formatul `ID-aviz Severitate/Sec. pachet` "
             "pe care îl parsează scanerul: formatul dnf s-a schimbat sau ieșirea nu e "
             "cea așteptată, iar parserul n-ar citi corect nici rezultatul real. "
             f"Prima linie: {lines[0][:120]!r}. Scanarea NU s-a încheiat.")
     return recognised, None
-
 
 # ===========================================================================
 # debian — apt security pocket

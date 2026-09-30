@@ -398,6 +398,7 @@ Redenumită, cheia veche ar fi reconciliată afară și în locul ei ar apărea 
 | Familie | Scaner | Ce dă |
 |---|---|---|
 | rhel | `dnf updateinfo list cves --security` | CVE, severitatea din aviz, versiunea care repară |
+| rhel | `dnf updateinfo list --security` | avizele **fără CVE structurat** (EPEL), pe care `list cves` nu le tipărește: `cve` nul, `advisory_id` = avizul, fără potrivire KEV |
 | debian | `apt-get -s dist-upgrade` | pachetul și versiunea, **fără CVE, fără severitate** |
 
 Pe RHEL metadatele furnizorului sunt adevărul: știu despre remedieri

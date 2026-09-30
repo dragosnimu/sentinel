@@ -1,0 +1,6 @@
+RHSA-2024:9317  Low/Sec.       NetworkManager-1:1.48.10-2.el9_5.alma.1.x86_64
+CVE-2024-6501   Low/Sec.       NetworkManager-1:1.48.10-2.el9_5.alma.1.x86_64
+ALSA-2024:9317  Low/Sec.       NetworkManager-1:1.48.10-2.el9_5.alma.1.x86_64
+RHSA-2025:0377  Moderate/Sec.  NetworkManager-1:1.48.10-5.el9_5.x86_64
+CVE-2024-3661   Moderate/Sec.  NetworkManager-1:1.48.10-5.el9_5.x86_64
+ALSA-2025:0377  Moderate/Sec.  NetworkManager-1:1.48.10-5.el9_5.x86_64

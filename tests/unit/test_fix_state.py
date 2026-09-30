@@ -629,6 +629,10 @@ def test_a_refused_dnf_scan_never_reads_the_rpm_database(monkeypatch):
     assert calls == [], "`annotate` a rulat pe o scanare refuzată"
 
     async def working(argv, timeout, env=None):
+        # Doua interogari dnf: cea CVE are constatarea, cea la nivel de aviz (fara
+        # `cves`) nu are nimic de adaugat — ar fi fals sa-i dam aceeasi iesire.
+        if "cves" not in argv:
+            return 0, "", ""
         return 100, "CVE-2026-1111 Important/Sec.  kernel-core-5.14.0-687.47.1.el9_8.x86_64\n", ""
 
     monkeypatch.setattr(os_packages, "_run", working)

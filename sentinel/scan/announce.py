@@ -88,7 +88,11 @@ def build_message(findings: Sequence[dict[str, Any]], *, host: str) -> str:
     lines = [head, ""]
     for finding in ordered[:MAX_LISTED]:
         mark = "🔴" if finding.get("kev") else "•"
-        cve = _esc(finding.get("cve") or "fără CVE")
+        # Un aviz fără CVE structurat (`dnf list --security`, vezi
+        # `os_packages._uncovered_advisories`) are `cve` nul, dar are ID-ul avizului:
+        # mesajul e singurul loc unde operatorul află de el, iar „fără CVE" singur
+        # nu-i spune ce să caute.
+        cve = _esc(finding.get("cve") or finding.get("advisory_id") or "fără CVE")
         pkg = _esc(finding.get("package") or "?")
         installed = _esc(finding.get("installed_version") or "?")
         fixed = finding.get("fixed_version")

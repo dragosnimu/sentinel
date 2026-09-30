@@ -8,8 +8,11 @@ fiecare constatare deschisă — operatorul are un panou curat pe o gazdă
 exploatabilă. Măsurat pe gazda reală (dnf 4.14.0): patru scenarii de acest fel,
 toate cu rc 0 și zero linii.
 
-Controlul: `dnf -C ... --installed`, DOAR când interogarea principală n-a dat
-nimic. Pe o gazdă curată e non-gol (18575 de linii măsurate); pe un dnf orb e gol.
+Controlul: `dnf -C ... updateinfo list --security --installed`, DOAR când
+interogările principale n-au dat nimic. Pe o gazdă curată e non-gol (2654 de linii
+măsurate, 30 sept 2026); pe un dnf orb e gol. Până pe 30 sept 2026 controlul era
+`list cves --security --installed` (18575 de linii); a fost mutat pe interogarea
+la nivel de aviz, iar fișierul `test_scan_dnf_advisories.py` spune de ce.
 
 Capcana pe care testele de aici o țin sub observație: garda NU are voie să
 depindă de numărul de constatări, de câte se rezolvă, sau de scanările
@@ -34,13 +37,12 @@ from sentinel.scan import fix_state, orchestrator, os_packages
 
 ROOT = Path(__file__).resolve().parents[2]
 
-# Forma măsurată pe gazda reală a `--installed`: identificatori de advisory
-# (RHSA/ALSA) amestecați cu linii CVE. Doar cele CVE se potrivesc cu `_LINE`.
+# Forma măsurată pe gazda reală a `--installed`, la nivel de aviz: doar ID-uri de
+# advisory (ALSA). Liniile CVE din varianta `cves` nu mai sunt recunoscute de control.
 _INSTALLED = """\
-RHSA-2024:9317  Low/Sec.       NetworkManager-1:1.48.10-2.el9_5.alma.1.x86_64
-CVE-2024-6501   Low/Sec.       NetworkManager-1:1.48.10-2.el9_5.alma.1.x86_64
 ALSA-2024:9317  Low/Sec.       NetworkManager-1:1.48.10-2.el9_5.alma.1.x86_64
-CVE-2025-0001   Important/Sec. openssl-libs-1:3.5.5-1.el9_8.x86_64
+ALSA-2025:0377  Moderate/Sec.  NetworkManager-1:1.48.10-5.el9_5.x86_64
+ALSA-2025:0001  Important/Sec. openssl-libs-1:3.5.5-1.el9_8.x86_64
 """
 
 _AVAILABLE = ("CVE-2026-1111 Important/Sec.  "
@@ -52,19 +54,25 @@ def run(coro):
 
 
 class _Host:
-    """Doi „procese" dnf false și evidența a ce s-a cerut de la ele.
+    """Trei „procese" dnf false și evidența a ce s-a cerut de la ele: interogarea
+    CVE (`cves`), cea la nivel de aviz (fără `cves`) și controlul (`--installed`).
 
     Semnătura lui `fake_run` NU are implicit la `timeout`, ca `_run` adevărat:
-    un apel care uită plafonul pică aici, nu în producție.
+    un apel care uită plafonul pică aici, nu în producție. Interogarea la nivel de
+    aviz întoarce implicit „nimic", ca aceste teste să rămână despre ce erau —
+    interogarea principală și controlul; ce face ea are fișierul lui.
     """
 
-    def __init__(self, monkeypatch, *, main, control, stub_annotate=True):
+    def __init__(self, monkeypatch, *, main, control, stub_annotate=True,
+                 advisories=(0, "", "")):
         self.calls: list[dict] = []
         self.annotated: list[int] = []
 
         async def fake_run(argv, timeout, env=None):
             self.calls.append({"argv": argv, "timeout": timeout})
-            return control if "--installed" in argv else main
+            if "--installed" in argv:
+                return control
+            return main if "cves" in argv else advisories
 
         async def annotate(findings):
             self.annotated.append(len(findings))
@@ -77,6 +85,11 @@ class _Host:
     @property
     def controls(self) -> list[dict]:
         return [c for c in self.calls if "--installed" in c["argv"]]
+
+    @property
+    def advisory_queries(self) -> list[dict]:
+        return [c for c in self.calls
+                if "--installed" not in c["argv"] and "cves" not in c["argv"]]
 
 
 def _scan(monkeypatch, *, main, control=(0, "", "")):
@@ -124,8 +137,10 @@ def test_a_scan_with_findings_never_runs_the_control(monkeypatch):
         monkeypatch, main=(100, _AVAILABLE, ""), control=(1, "", "n-ar trebui chemat"))
 
     assert error is None and len(findings) == 1
-    assert len(host.calls) == 1 and host.controls == [], (
+    assert len(host.calls) == 2 and host.controls == [], (
         f"controlul a rulat pe o scanare cu constatări: {host.calls}")
+    assert len(host.advisory_queries) == 1, (
+        "singurele două procese sunt interogarea CVE și cea la nivel de aviz")
     assert host.annotated == [1]
 
 
@@ -204,8 +219,10 @@ def test_output_with_no_line_the_parser_recognises_is_refused(monkeypatch):
 
 def test_a_single_unmatched_line_among_matched_ones_is_still_tolerated(monkeypatch):
     """Garda de format cere ZERO potriviri, nu una fără potrivire. Ieșirea măsurată
-    amestecă linii RHSA/ALSA (care nu se potrivesc cu `_LINE`) cu cele CVE; un
-    refuz la prima linie străină ar face scanarea să pice în fiecare noapte."""
+    a interogării CVE amestecă linii RHSA/ALSA (care nu se potrivesc cu `_LINE`) cu
+    cele CVE; un refuz la prima linie străină ar face scanarea să pice în fiecare
+    noapte. (Interogarea la nivel de aviz e, dinadins, MAI strictă — vezi
+    `test_scan_dnf_advisories.py`; aici e vorba doar de cea CVE.)"""
     out = ("RHSA-2026:0001  Important/Sec.  kernel-core-5.14.0-687.47.1.el9_8.x86_64\n"
            + _AVAILABLE)
     host, findings, error, _ = _scan(monkeypatch, main=(100, out, ""))
@@ -239,6 +256,10 @@ def test_the_control_is_cache_only_and_uses_the_scanners_own_cache(monkeypatch):
     assert "--refresh" not in argv
     assert f"--setopt=cachedir={os_packages.CACHE_DIR}" in argv
     assert "--installed" in argv and "--security" in argv
+    assert "cves" not in argv, (
+        "controlul a revenit pe `list cves`: pe o gazdă ale cărei singure avize "
+        "vizibile n-au CVE (măsurat: doar EPEL, 0 linii sub `cves`, 10 fără) ar "
+        "refuza PERMANENT o gazdă pe care dnf o vede bine")
     assert host.controls[0]["timeout"] == os_packages.CONTROL_TIMEOUT_S, (
         "controlul își are plafonul lui, nu pe cel al dnf-ului principal")
 
@@ -255,7 +276,7 @@ def test_the_controls_ceiling_is_part_of_the_worst_case():
     assert os_packages.CONTROL_TIMEOUT_S in steps
     assert os_packages.WORST_CASE_TIMEOUT_S >= (
         os_packages.TIMEOUT_S + os_packages.CONTROL_TIMEOUT_S
-        + fix_state.WORST_CASE_TIMEOUT_S)
+        + os_packages.ADVISORY_TIMEOUT_S + fix_state.WORST_CASE_TIMEOUT_S)
 
 
 def test_the_control_asks_for_its_declared_ceiling_in_the_source():

@@ -381,7 +381,8 @@ def test_the_whole_chain_from_dnf_output_to_the_stored_verdict(monkeypatch):
                "openssl-libs\t1:3.5.5-1.el9_8\tx86_64\topenssl-3.5.5-1.el9_8.src.rpm\n")
 
     async def fake_dnf(argv, timeout, env=None):
-        return 100, dnf_out, ""
+        # A doua interogare (la nivel de aviz, fara `cves`) nu are nimic de adaugat.
+        return (100, dnf_out, "") if "cves" in argv else (0, "", "")
 
     async def fake_rpm():
         return 0, rpm_out, ""

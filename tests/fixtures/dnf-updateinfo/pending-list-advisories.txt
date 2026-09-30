@@ -1,0 +1,8 @@
+ALSA-2026:71700 Important/Sec. kernel-5.14.0-687.52.1.el9_8.x86_64
+ALSA-2026:71700 Important/Sec. kernel-core-5.14.0-687.52.1.el9_8.x86_64
+ALSA-2026:71700 Important/Sec. kernel-devel-5.14.0-687.52.1.el9_8.x86_64
+ALSA-2026:71700 Important/Sec. kernel-headers-5.14.0-687.52.1.el9_8.x86_64
+ALSA-2026:71700 Important/Sec. kernel-modules-5.14.0-687.52.1.el9_8.x86_64
+ALSA-2026:71700 Important/Sec. kernel-modules-core-5.14.0-687.52.1.el9_8.x86_64
+ALSA-2026:71700 Important/Sec. kernel-tools-5.14.0-687.52.1.el9_8.x86_64
+ALSA-2026:71700 Important/Sec. kernel-tools-libs-5.14.0-687.52.1.el9_8.x86_64
