@@ -4713,6 +4713,46 @@ def _intel_detail(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _lookups_view(age: float | None, attempt_age: float | None,
+                  detail: dict[str, Any]) -> tuple[bool, str, str]:
+    """Cum arată o sursă de căutări (Red Hat, OSV, Vulnrichment) când nimic nu e la termen.
+
+    Întoarce `(quiet, last_answer, looked)`. `quiet` = ultima trecere a ajuns la sursă și
+    n-avea nimic de cerut (`mirror.record_idle`: `detail.idle`), iar trecerea e recentă
+    (`VENDOR_DEGRADED_H`, aceeași limită ca înainte pentru „nicio trecere"). `last_answer` și
+    `looked` sunt cele două propoziții pe care le folosesc ramurile.
+
+    Fără asta, `last_ok_at` — moment al ultimului răspuns REAL — îmbătrânea în orice perioadă
+    liniștită (răspunsurile reținute sunt valabile 7 zile, sau 2 pentru cele neevaluate), iar
+    după 36 de ore de liniște verificarea suna „căutările eșuează" fără ca nimic să fi eșuat
+    (măsurat pe 2 octombrie 2026: ar fi sunat pe ambele gazde în dimineața de 4 octombrie,
+    cu următorul lot la termen abia după-amiază). Liniștea NU șterge pragul unei
+    surse care chiar eșuează: un eșec lasă CVE-urile la termen, trecerea următoare le cere iar
+    și nu mai e liniștită; `last_ok_at` nu se mișcă, iar `age` trece de prag ca înainte.
+    O liniște FĂRĂ trecere recentă (indicatorul `idle` e vechi) nu mai e liniște: e o trecere
+    care nu mai ajunge la sursă, și cade pe pragul vechi.
+    """
+    quiet = (detail.get("idle") is True and attempt_age is not None
+             and attempt_age <= VENDOR_DEGRADED_H)
+    if not quiet:
+        when = ("niciun răspuns primit vreodată" if age is None
+                else f"ultimul răspuns acum {_ago(age * 60)}")
+        return False, when, f"Căutările răspund ({when})"
+    real = ("încă nicio căutare n-a fost necesară" if age is None
+            else f"ultimul răspuns real acum {_ago(age * 60)}")
+    when = f"nimic la termen la ultima trecere (acum {_ago((attempt_age or 0) * 60)}); {real}"
+    return True, when, f"Căutările n-au avut nimic de cerut ({when})"
+
+
+def _idle_gone_note(detail: dict[str, Any], attempt_age: float | None) -> str:
+    """Când ultimul rând era „liniște" dar trecerea nu mai ajunge la sursă: spune-o, ca
+    „căutările eșuează" să nu trimită operatorul după o eroare care nu există."""
+    if detail.get("idle") is True and (attempt_age is None or attempt_age > VENDOR_DEGRADED_H):
+        when = "nu se știe de când" if attempt_age is None else f"de {_ago(attempt_age * 60)}"
+        return f", iar nicio trecere n-a mai ajuns la sursă ({when}): nu e o eroare a căutărilor"
+    return ""
+
+
 def _canary_state(row: dict[str, Any] | None,
                   age: float | None) -> tuple[str, str, dict[str, Any]]:
     """Ce poate afirma autoverificarea despre parserul CISA, din rândul controlului pozitiv.
@@ -4797,7 +4837,8 @@ async def check_risk_intel(db: Database) -> list[CheckResult]:
     rows = await db.fetch(
         """
         SELECT source, last_attempt_at, last_ok_at, last_error, detail,
-               EXTRACT(EPOCH FROM (now() - last_ok_at)) AS ok_age_s
+               EXTRACT(EPOCH FROM (now() - last_ok_at)) AS ok_age_s,
+               EXTRACT(EPOCH FROM (now() - last_attempt_at)) AS attempt_age_s
           FROM intel_state
          ORDER BY source
         """)
@@ -4806,6 +4847,10 @@ async def check_risk_intel(db: Database) -> list[CheckResult]:
 
     def _age_h(row: dict[str, Any]) -> float | None:
         age = row.get("ok_age_s")
+        return None if age is None else float(age) / 3600
+
+    def _attempt_age_h(row: dict[str, Any]) -> float | None:
+        age = row.get("attempt_age_s")
         return None if age is None else float(age) / 3600
 
     # --- trecerea de evaluare ---------------------------------------------------
@@ -4900,11 +4945,15 @@ async def check_risk_intel(db: Database) -> list[CheckResult]:
         age = _age_h(vr_row)
         detail_json = _intel_detail(vr_row.get("detail"))
         aborted = bool(detail_json.get("aborted"))
+        attempt_age = _attempt_age_h(vr_row)
+        quiet, last_answer, looked = _lookups_view(age, attempt_age, detail_json)
         from sentinel.intel.vulnrichment import CANARY_SOURCE
         canary_row = by_source.get(CANARY_SOURCE)
         canary, canary_text, canary_detail = _canary_state(
             canary_row, None if canary_row is None else _age_h(canary_row))
         facts = {"age_h": None if age is None else round(age, 1),
+                 "attempt_age_h": None if attempt_age is None else round(attempt_age, 1),
+                 "idle": quiet,
                  "error": vr_row.get("last_error"), "last": detail_json,
                  "canary": canary, "canary_detail": canary_detail}
         if canary == "blind":
@@ -4924,11 +4973,11 @@ async def check_risk_intel(db: Database) -> list[CheckResult]:
                        f"ipoteza „nu e în KEV”. Eroare: {canary_text}",
                 action="journalctl -u sentinel-maintenance -u sentinel-scan | grep -i 'parser orb'",
                 facts=facts))
-        elif age is None or age > VENDOR_DEGRADED_H or aborted:
+        elif aborted or (not quiet and (age is None or age > VENDOR_DEGRADED_H)):
             results.append(CheckResult(
                 "risk:vulnrichment", "CISA Vulnrichment — căutările eșuează", "degraded",
-                detail=("niciun răspuns primit vreodată" if age is None
-                        else f"ultimul răspuns acum {_ago(age * 60)}")
+                detail=last_answer
+                       + _idle_gone_note(detail_json, attempt_age)
                        + (", ultima trecere s-a oprit după eșecuri consecutive" if aborted else "")
                        + f". Ultima eroare: {str(vr_row.get('last_error') or '—')[:200]}. "
                        "CVE-urile noi rămân GRI („nu l-am întrebat”) până se vindecă.",
@@ -4940,8 +4989,7 @@ async def check_risk_intel(db: Database) -> list[CheckResult]:
             results.append(CheckResult(
                 "risk:vulnrichment", "CISA Vulnrichment — controlul pozitiv n-are candidate bune",
                 "degraded",
-                detail=f"{canary_text}. Căutările răspund (ultimul răspuns acum "
-                       f"{_ago(age * 60)}) și parserul NU e dat drept orb, dar niciuna dintre "
+                detail=f"{canary_text}. {looked} și parserul NU e dat drept orb, dar niciuna dintre "
                        "candidatele controlului nu mai are puncte CISA: până se înlocuiesc, "
                        "un parser care ar orbi de acum încolo n-ar mai fi semnalat.",
                 action="Înlocuiește candidatele din CANARY_CONTROL_CVES "
@@ -4952,8 +5000,7 @@ async def check_risk_intel(db: Database) -> list[CheckResult]:
             results.append(CheckResult(
                 "risk:vulnrichment", "CISA Vulnrichment — parserul nu se mai poate confirma",
                 "degraded",
-                detail=f"{canary_text}. Căutările răspund (ultimul răspuns acum "
-                       f"{_ago(age * 60)}), dar fără un control pozitiv nu se poate spune "
+                detail=f"{canary_text}. {looked}, dar fără un control pozitiv nu se poate spune "
                        "dacă parserul încă vede punctele CISA sau toate CVE-urile par "
                        "„neevaluate”.",
                 action="journalctl -u sentinel-maintenance -u sentinel-scan | grep -i 'control'",
@@ -4962,15 +5009,14 @@ async def check_risk_intel(db: Database) -> list[CheckResult]:
             results.append(CheckResult(
                 "risk:vulnrichment", "CISA Vulnrichment — parserul nu e încă confirmat",
                 "unknown",
-                detail=f"{canary_text}. Căutările răspund (ultimul răspuns acum "
-                       f"{_ago(age * 60)}), dar „parserul vede puncte CISA” nu e un fapt "
+                detail=f"{canary_text}. {looked}, dar „parserul vede puncte CISA” nu e un fapt "
                        "dovedit în acest moment.",
                 action="journalctl -u sentinel-maintenance -u sentinel-scan | grep -i 'control'",
                 facts=facts))
         else:
             results.append(CheckResult(
                 "risk:vulnrichment", "CISA Vulnrichment", "ok",
-                detail=f"ultimul răspuns acum {_ago(age * 60)}; {canary_text}"
+                detail=f"{last_answer}; {canary_text}"
                        + (f"; avertisment: {str(vr_row.get('last_error'))[:120]}"
                           if vr_row.get("last_error") else ""),
                 facts=facts))
@@ -4983,14 +5029,17 @@ async def check_risk_intel(db: Database) -> list[CheckResult]:
         age = _age_h(row)
         detail_json = _intel_detail(row.get("detail"))
         aborted = bool(detail_json.get("aborted"))
+        attempt_age = _attempt_age_h(row)
+        quiet, last_answer, _ = _lookups_view(age, attempt_age, detail_json)
         facts = {"age_h": None if age is None else round(age, 1),
-                 "error": row.get("last_error"), "last": detail_json}
+                 "attempt_age_h": None if attempt_age is None else round(attempt_age, 1),
+                 "idle": quiet, "error": row.get("last_error"), "last": detail_json}
         key = f"risk:{source}"
-        if age is None or age > VENDOR_DEGRADED_H or aborted:
+        if aborted or (not quiet and (age is None or age > VENDOR_DEGRADED_H)):
             results.append(CheckResult(
                 key, f"{label} — căutările eșuează", "degraded",
-                detail=("niciun răspuns primit vreodată" if age is None
-                        else f"ultimul răspuns acum {_ago(age * 60)}")
+                detail=last_answer
+                       + _idle_gone_note(detail_json, attempt_age)
                        + (", ultima trecere s-a oprit după eșecuri consecutive" if aborted else "")
                        + f". Ultima eroare: {str(row.get('last_error') or '—')[:200]}. "
                        "CVE-urile noi rămân fără scor (GRI) până se vindecă.",
@@ -4999,7 +5048,7 @@ async def check_risk_intel(db: Database) -> list[CheckResult]:
         else:
             results.append(CheckResult(
                 key, label, "ok",
-                detail=f"ultimul răspuns acum {_ago(age * 60)}"
+                detail=last_answer
                        + (f"; avertisment: {str(row.get('last_error'))[:120]}"
                           if row.get("last_error") else ""),
                 facts=facts))

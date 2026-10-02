@@ -29,10 +29,15 @@ class _DB:
         return self._rows
 
 
-def _row(source, ok_h=1.0, error=None, detail=None):
-    return {"source": source, "last_attempt_at": "x", "last_ok_at": None if ok_h is None else "x",
-            "last_error": error, "detail": json.dumps(detail or {}),
-            "ok_age_s": None if ok_h is None else ok_h * 3600}
+def _row(source, ok_h=1.0, error=None, detail=None, attempt_h=None):
+    """`attempt_h`: age of the last PASS (`last_attempt_at`); `None` leaves the column out,
+    as a row from before the quiet-pass record would."""
+    row = {"source": source, "last_attempt_at": "x", "last_ok_at": None if ok_h is None else "x",
+           "last_error": error, "detail": json.dumps(detail or {}),
+           "ok_age_s": None if ok_h is None else ok_h * 3600}
+    if attempt_h is not None:
+        row["attempt_age_s"] = attempt_h * 3600
+    return row
 
 
 def _by_key(results):
@@ -280,6 +285,103 @@ def test_a_vendor_never_asked_for_is_not_reported_at_all():
     """No Red Hat row on a host with no rpm findings is "not needed", not "down"."""
     out = _by_key(run(checks.check_risk_intel(_DB([_row("risk", 0.1), _row("epss", 1.0)]))))
     assert "risk:redhat" not in out and "risk:osv" not in out
+
+
+def _quiet(source, ok_h, attempt_h=0.2, **extra):
+    """A row as `mirror.record_idle` leaves it: the last REAL answer is `ok_h` old, the last
+    pass (which asked nobody) is `attempt_h` old."""
+    return _row(source, ok_h, detail={"idle": True, "asked": 0, **extra}, attempt_h=attempt_h)
+
+
+def test_a_quiet_week_is_not_a_failing_source_for_redhat_and_osv():
+    """The page that rang for nothing: the last real answer 40 hours ago (past the old
+    36-hour bound), the pass an hour ago, and it had nothing due. Nothing failed, so it is
+    `ok` and says why the answer is old. The SAME ages without the quiet record -- a pass
+    that asked and failed leaves `idle` unset -- are `degraded`: the bound did not move."""
+    rows = [_row("risk", 0.1), _quiet("redhat", 40.0), _quiet("osv", 100.0)]
+    out = _by_key(run(checks.check_risk_intel(_DB(rows))))
+    for key in ("risk:redhat", "risk:osv"):
+        assert out[key].status == "ok" and not out[key].bad, out[key].detail
+        assert "nimic la termen" in out[key].detail and "ultimul răspuns real" in out[key].detail
+        assert out[key].facts["idle"] is True
+    failing = [_row("risk", 0.1), _row("redhat", 40.0, error="HTTP 503", attempt_h=0.2),
+               _row("osv", 100.0, error="HTTP 503", attempt_h=0.2)]
+    out = _by_key(run(checks.check_risk_intel(_DB(failing))))
+    assert out["risk:redhat"].status == "degraded" and out["risk:osv"].status == "degraded"
+    assert out["risk:redhat"].facts["idle"] is False
+
+
+def test_a_quiet_record_whose_pass_is_old_is_not_a_quiet_source():
+    """`idle` only says what the LAST pass found. If that pass is itself older than the
+    bound, nothing has reached the source for a day and a half, and the check says so
+    instead of "ok": the quiet record does not outlive the pass that wrote it. Text says
+    the pass stopped; it must not send the operator after a lookup error that is not there."""
+    out = _by_key(run(checks.check_risk_intel(_DB(
+        [_row("risk", 0.1), _quiet("redhat", 80.0, attempt_h=checks.VENDOR_DEGRADED_H + 1)]))))
+    assert out["risk:redhat"].status == "degraded"
+    assert "nicio trecere" in out["risk:redhat"].detail
+    assert "nu e o eroare a căutărilor" in out["risk:redhat"].detail
+    inside = _by_key(run(checks.check_risk_intel(_DB(
+        [_row("risk", 0.1), _quiet("redhat", 80.0, attempt_h=checks.VENDOR_DEGRADED_H - 1)]))))
+    assert inside["risk:redhat"].status == "ok"
+
+
+def test_a_row_without_the_attempt_age_is_never_read_as_quiet():
+    """The check cannot know how old the pass is when the column is missing: "cannot read"
+    must not turn into "quiet". Same for an `idle` flag that is not literally true."""
+    no_age = _by_key(run(checks.check_risk_intel(_DB(
+        [_row("risk", 0.1), _row("redhat", 60.0, detail={"idle": True})]))))
+    assert no_age["risk:redhat"].status == "degraded"
+    for flag in ("true", 1, "yes"):
+        out = _by_key(run(checks.check_risk_intel(_DB(
+            [_row("risk", 0.1), _row("redhat", 60.0, detail={"idle": flag}, attempt_h=0.2)]))))
+        assert out["risk:redhat"].status == "degraded", flag
+
+
+def test_an_aborted_pass_is_never_quiet_whatever_else_the_row_says():
+    rows = [_row("risk", 0.1), _row("redhat", 1.0, error="HTTP 503", attempt_h=0.1,
+                                     detail={"idle": True, "aborted": True})]
+    out = _by_key(run(checks.check_risk_intel(_DB(rows))))
+    assert out["risk:redhat"].status == "degraded" and "eșecuri consecutive" in out["risk:redhat"].detail
+
+
+def test_an_aborted_vulnrichment_pass_is_never_quiet_either():
+    """Same rule on the CISA branch, which has its own copy of the condition."""
+    out = _by_key(run(checks.check_risk_intel(_DB(
+        [_row("risk", 0.1), _row("vulnrichment", 1.0, error="HTTP 503", attempt_h=0.1,
+                                 detail={"idle": True, "aborted": True}), _canary()]))))
+    assert out["risk:vulnrichment"].status == "degraded"
+    assert "eșecuri consecutive" in out["risk:vulnrichment"].detail
+
+
+def test_a_source_that_has_never_answered_but_had_nothing_to_ask_is_ok_and_does_not_crash():
+    """A quiet pass can create the row before any answer exists (every id filtered out):
+    `last_ok_at` is NULL. The old text formatted `age * 60` on that and would raise; the
+    honest reading is "nothing was due yet", not "never answered" (a failure) and not a
+    crashed check (which the runner would turn into `unknown` for the WHOLE `risk` group)."""
+    out = _by_key(run(checks.check_risk_intel(_DB(
+        [_row("risk", 0.1), _quiet("redhat", None), _quiet("osv", None),
+         _quiet("vulnrichment", None), _canary()]))))
+    for key in ("risk:redhat", "risk:osv", "risk:vulnrichment"):
+        assert out[key].status == "ok", (key, out[key].detail)
+        assert "nicio căutare n-a fost necesară" in out[key].detail
+
+
+def test_a_quiet_vulnrichment_still_answers_to_the_control():
+    """Quiet lookups say nothing about the PARSER, and the parser is what the key is for: a
+    blind control is `degraded` whatever the lookups row says, and an unconfirmed one is not
+    `ok`. The control row, not the lookups, decides these."""
+    ok = _vr_quiet(_canary())
+    assert ok.status == "ok" and "nimic la termen" in ok.detail and "CVE-2025-29927" in ok.detail
+    assert _vr_quiet(_canary("control_blind", ok_h=None, error="x")).status == "degraded"
+    assert _vr_quiet().status == "unknown"
+    exhausted = _vr_quiet(_canary("control_exhausted", ok_h=None, error="x"))
+    assert exhausted.status == "degraded" and "nimic de cerut" in exhausted.detail
+
+
+def _vr_quiet(*rows, lookups_h=60.0):
+    return _by_key(run(checks.check_risk_intel(_DB(
+        [_row("risk", 0.1), _quiet("vulnrichment", lookups_h), *rows]))))["risk:vulnrichment"]
 
 
 def test_the_check_is_registered():

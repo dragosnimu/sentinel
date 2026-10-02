@@ -151,16 +151,20 @@ CVE-uri, câteva evaluate): o regulă care ar judeca fiecare trecere separat ar 
 adică ar repeta minciuna jumătate din timp. De aceea dovada se PĂSTREAZĂ în rând
 (`exhausted_proof_at`, preluată de la trecerea precedentă): o trecere liniștită cu toate
 candidatele fără puncte rămâne `control_exhausted` cât timp dovada există, iar o trecere în
-care controlul nu s-a putut citi n-o șterge. Dovada o șterge doar un `control_ok` (candidatele
-au din nou puncte). Costul acceptat: într-o lume cu candidate epuizate, un parser care ar
-orbi DUPĂ dovadă rămâne sub `control_exhausted`. Alarma suna oricum `degraded`, dar cu
-diagnosticul greșit, **și înlocuirea candidatelor NU o repară**: dovada nu e legată de lista
-de candidate, iar într-o lume oarbă `control_ok` nu mai vine niciodată, deci n-are ce s-o
-șteargă. Măsurat pe 2 octombrie 2026, cu trei treceri după înlocuire: tot `control_exhausted`.
-Singurul indiciu rămâne `batch_with_points: 0` în `facts.canary_detail`. Reparația e să se
-păstreze lista de candidate lângă dovadă și să se arunce o dovadă înregistrată sub altă
-listă — nefăcută aici, fir separat. Până atunci cazul cere două defecte suprapuse
-(toate candidatele își pierd containerul ADP, și abia apoi se rupe parserul).
+care controlul nu s-a putut citi n-o șterge. Dovada o șterge un `control_ok` (candidatele
+au din nou puncte) sau o schimbare a listei. Ea spune „ACESTE candidate au rămas fără puncte", deci stă lângă lista sub
+care a fost scrisă (`exhausted_candidates`), iar `_previous_proof` aruncă o dovadă înregistrată
+sub altă `CANARY_CONTROL_CVES` (listele se compară ca mulțime: o reordonare nu schimbă ce s-a
+dovedit, o candidată adăugată sau scoasă da), ca și una fără listă, care nu poate fi legată de
+nimic. Fără legătura asta înlocuirea candidatelor nu repara nimic: într-o lume oarbă `control_ok`
+nu mai vine niciodată, deci nimic nu ștergea dovada, iar alarma spunea mai departe „înlocuiți
+candidatele" după ce fuseseră înlocuite (reprodus pe 2 octombrie 2026: trei treceri după
+înlocuire, tot `control_exhausted`). Acum prima trecere liniștită de după livrare, într-o lume
+oarbă, spune `control_blind`. Costul acceptat rămâne: într-o lume cu candidate epuizate, un
+parser care ar orbi DUPĂ dovadă rămâne sub `control_exhausted` până la înlocuirea
+candidatelor. Alarma sună oricum `degraded`, dar cu diagnosticul „înlocuiți
+candidatele"; cazul cere două defecte suprapuse (toate candidatele își pierd containerul ADP, și
+abia apoi se rupe parserul).
 
 **Controlul nu atârnă de un singur CVE.** O singură candidată fixată ar fi făcut ca, în
 ziua în care înregistrarea ei e retrasă, reevaluată sau își pierde containerul ADP,
@@ -433,6 +437,14 @@ def _detail_dict(value: Any) -> dict[str, Any]:
 async def _previous_proof(db: Database) -> str | None:
     """`exhausted_proof_at` din verdictul PRECEDENT al controlului, sau `None`.
 
+    Dovada spune „ACESTE candidate au rămas fără puncte", deci e valabilă doar pentru lista
+    sub care a fost scrisă (`exhausted_candidates`, lângă ea). Una scrisă sub altă
+    `CANARY_CONTROL_CVES` — operatorul a înlocuit candidatele și a livrat — se aruncă, și la fel
+    una fără listă (n-are cum să fie legată de nimic): fără ea, într-o lume oarbă nu mai vine
+    niciun `control_ok` care s-o șteargă, iar alarma ar spune la nesfârșit „înlocuiți
+    candidatele", după ce au fost înlocuite. Lista se compară ca MULȚIME: o reordonare nu
+    schimbă ce s-a dovedit; o candidată adăugată sau scoasă, da.
+
     `None` și când rândul nu se poate citi: un control fără dovadă păstrată cade pe
     `control_blind`, adică pe varianta zgomotoasă, nu pe cea care liniștește. Nu ridică.
     """
@@ -440,8 +452,16 @@ async def _previous_proof(db: Database) -> str | None:
         row = await mirror.state(db, CANARY_SOURCE)
     except Exception:  # noqa: BLE001 - controlul nu are voie să strice trecerea
         return None
-    proof = _detail_dict((row or {}).get("detail")).get("exhausted_proof_at")
-    return proof if isinstance(proof, str) and proof else None
+    detail = _detail_dict((row or {}).get("detail"))
+    proof = detail.get("exhausted_proof_at")
+    if not (isinstance(proof, str) and proof):
+        return None
+    recorded = detail.get("exhausted_candidates")
+    if not isinstance(recorded, list) or set(recorded) != set(CANARY_CONTROL_CVES):
+        log.info("Vulnrichment: dovada de epuizare a fost scrisă sub altă listă de candidate "
+                 "și se aruncă", extra={"detail": f"scrisă sub {recorded!r}"})
+        return None
+    return proof
 
 
 async def run_control(db: Database, http: httpx.AsyncClient | None, *, found: int = 0,
@@ -480,6 +500,9 @@ async def run_control(db: Database, http: httpx.AsyncClient | None, *, found: in
         "suspect_batch": suspect, "batch_found": found, "batch_with_points": with_points}
     if proof:
         detail["exhausted_proof_at"] = proof
+        # Lista sub care s-a dovedit: `_previous_proof` aruncă dovada dacă lista din cod s-a
+        # schimbat. O dovadă purtată de la trecerea precedentă a trecut deja de comparație.
+        detail["exhausted_candidates"] = list(CANARY_CONTROL_CVES)
     out: dict[str, Any] = {"canary": verdict, "suspect_batch": suspect}
     if ctl.verdict == "points":
         if suspect:

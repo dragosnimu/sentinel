@@ -9,6 +9,19 @@ scrie rezultatul în `intel_state` (`last_attempt_at`, `last_ok_at`,
 `last_error`), ca „sursa e căzută de nouă zile" să se poată deosebi de „sursa e
 la zi și doar nu are CVE-ul ăsta".
 
+Al patrulea fapt, măsurat pe 2 octombrie 2026: **„n-am avut nimic de cerut" și „am
+cerut și a eșuat" trebuie să arate diferit în `intel_state`**. O trecere în care
+nimic nu e la termen (răspunsurile reținute sunt încă proaspete: 7 zile pentru un CVE
+evaluat, 2 pentru unul neevaluat) nu primește niciun răspuns, deci `last_ok_at` nu
+se mișcă, iar autoverificarea îl citea ca „sursa nu mai răspunde de 36 de ore" —
+adică sună `degraded` după 36 de ore de liniște, nu după 36 de ore de eșec. Soluția
+nu e să se mute `last_ok_at` (ar însemna „sursa a răspuns acum", ceea ce nu s-a
+întâmplat: nimeni n-a întrebat): `record_idle` mișcă DOAR `last_attempt_at` și
+scrie `detail.idle = true`. `last_ok_at` rămâne „ultimul răspuns real"; trecerea
+liniștită e un fapt separat, cu vârsta ei, iar autoverificarea le citește pe amândouă.
+Un eșec nu poate trece drept liniște: ce a eșuat rămâne la termen, deci trecerea
+următoare cere din nou, iar o trecere care a cerut nu e niciodată `idle`.
+
 Nimic din fișierul ăsta nu ridică spre apelant: o oglindă care strică scanarea
 transformă o sursă opțională într-un mod de eșec.
 """
@@ -69,6 +82,28 @@ async def record(db: Database, source: str, *, ok: bool, error: str | None = Non
     succes PARȚIAL (unele căutări au răspuns, altele nu) își păstrează eroarea:
     „a mers pe jumătate" nu e „a mers".
     """
+    await _upsert(db, source, answered=ok,
+                  error=error[:300] if error else (None if ok else "eșec fără detalii"),
+                  detail=detail)
+
+
+async def record_idle(db: Database, source: str,
+                      detail: dict[str, Any] | None = None) -> None:
+    """Scrie că o trecere a ajuns la sursă și n-avea nimic de cerut. Niciodată nu ridică.
+
+    NU mișcă `last_ok_at`: el rămâne momentul ultimului răspuns REAL al sursei, iar o
+    trecere care n-a întrebat pe nimeni nu poate pretinde că sursa a răspuns. Mișcă
+    `last_attempt_at` (dovada că trecerea a ajuns aici, deci că tăcerea e liniște și nu
+    o trecere oprită) și șterge `last_error`: dacă ar fi rămas ceva de reluat, ar fi fost
+    la termen și trecerea n-ar fi fost liniștită. `detail` primește `idle: true`, singurul
+    semn pe care îl citește autoverificarea pentru a deosebi liniștea de un eșec.
+    """
+    await _upsert(db, source, answered=False, error=None,
+                  detail={**(detail or {}), "idle": True})
+
+
+async def _upsert(db: Database, source: str, *, answered: bool, error: str | None,
+                  detail: dict[str, Any] | None) -> None:
     try:
         await db.execute(
             """
@@ -81,9 +116,7 @@ async def record(db: Database, source: str, *, ok: bool, error: str | None = Non
                 last_error = $3,
                 detail = $4::jsonb
             """,
-            source, ok,
-            error[:300] if error else (None if ok else "eșec fără detalii"),
-            json.dumps(detail or {}))
+            source, answered, error, json.dumps(detail or {}))
     except Exception as exc:  # noqa: BLE001 - jurnalul stării nu are voie să strice scanarea
         log.warning("intel_state nu s-a putut scrie",
                     extra={"source": source, "detail": str(exc)[:200]})
@@ -202,11 +235,20 @@ async def run_lookups(db: Database, source: str, ids: list[str], fetch: VulnFetc
     (`vuln_intel`, Red Hat și OSV). O sursă cu altă formă de rând (Vulnrichment)
     își dă scrierea, iar restul regulilor — plafon, oprire după eșecuri, nicio
     cerere picată scrisă ca „nu există" — rămân aceleași, într-un singur loc.
+
+    Cu `ids` gol (nimic la termen) nu cere nimic și scrie `record_idle`, nu `record`:
+    „n-am avut ce întreba" nu e „sursa a răspuns" și nu e „sursa a eșuat".
     """
     write = store or (lambda d, vid, outcome: store_vuln(d, vid, source, outcome))
     summary: dict[str, Any] = {"asked": 0, "found": 0, "not_found": 0, "errors": 0,
-                               "deferred": 0, "aborted": False}
+                               "deferred": 0, "aborted": False, "idle": False}
     if not ids:
+        # Nimic la termen: nu e un răspuns (`last_ok_at` rămâne) și nu e un eșec; e o
+        # trecere liniștită, pe care autoverificarea trebuie s-o poată deosebi de un
+        # silențiu al trecerii. Fără rândul ăsta, 36 de ore fără CVE la termen sunau
+        # „căutările eșuează" pe două gazde în care nimic nu eșuase.
+        summary["idle"] = True
+        await record_idle(db, source, dict(summary))
         return summary
     owns = http is None
     http = http or client()

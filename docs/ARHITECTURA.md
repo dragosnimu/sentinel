@@ -756,13 +756,33 @@ răspunde una cu puncte (de regulă o cerere). Una retrasă, reevaluată sau fă
 dă alarmă; parserul e orb doar dacă TOATE candidatele citite vin fără puncte ȘI lotul gazdei nu
 a citit puncte: dacă le-a citit, verdictul e `control_exhausted` („înlocuiți `CANARY_CONTROL_CVES`",
 `degraded` după 3 ore fără confirmare), iar dovada se păstrează în rând (`exhausted_proof_at`) ca
-o trecere liniștită să nu repete minciuna. **CVE-2025-29927
+o trecere liniștită să nu repete minciuna — lângă lista sub care s-a dovedit
+(`exhausted_candidates`): o dovadă scrisă sub altă `CANARY_CONTROL_CVES` se aruncă, altfel
+înlocuirea candidatelor ar lăsa alarma să spună „înlocuiți candidatele" la nesfârșit. **CVE-2025-29927
 e o constatare deschisă pe producție**, nu „un CVE care nu e al gazdei" — controlul doar nu
 scrie nimic în `vulnrichment`. *Ce NU dovedește:* că parserul citește corect fiecare
 înregistrare; o schimbare care atinge doar unele înregistrări lasă controlul verde. Variantele
 respinse: o fereastră pe `fetched_at` (`store` păstrează punctele vechi cu `COALESCE`, deci într-o
 lume orbă fereastra ar arăta sănătos) și `blind` într-o cheie protejată în același rând (două
 vârste diferite într-un singur `last_ok_at`).
+
+**„N-am avut nimic de cerut" nu e „căutările eșuează".** Red Hat, OSV și CISA își păstrează
+răspunsurile 7 zile (2 pentru un CVE neevaluat), deci mult timp nimic nu e la termen, o trecere
+nu cere pe nimeni și nu primește niciun răspuns: `last_ok_at` stă pe loc, iar după
+`VENDOR_DEGRADED_H` (36 de ore) autoverificarea suna `degraded` fără ca ceva să fi eșuat.
+Măsurat pe 2 octombrie 2026: toate rândurile fuseseră cerute între 14:04 și 15:04, următorul
+lot era la termen în 4 octombrie după-amiaza, iar pragul cădea în aceeași dimineață, pe
+ambele gazde. Acum `mirror.run_lookups` scrie la o trecere fără nimic la termen
+`mirror.record_idle`: mișcă doar `last_attempt_at` și pune `detail.idle = true`, **nu**
+`last_ok_at` (nimeni n-a răspuns, deci n-are voie să pară că a răspuns). `check_risk_intel`
+citește ambele: o trecere liniștită RECENTĂ (`last_attempt_at` mai nou de 36 de ore) e `ok`, cu
+vârsta ultimului răspuns real în text; una al cărei `idle` e vechi înseamnă că trecerea nu mai
+ajunge la sursă și cade pe pragul vechi. Un eșec rămâne un eșec: ce n-a răspuns rămâne la
+termen, trecerea următoare cere iar și nu e liniștită, deci `last_ok_at` îmbătrânește ca
+înainte și `degraded` sună la 36 de ore de la ultimul răspuns real. EPSS (descărcare zilnică,
+`REFRESH_AFTER_H` = 20) și `risk` (`enrich._run` scrie `ok=True` la fiecare trecere) nu aveau
+defectul. *Ce NU acoperă:* o gazdă fără nicio constatare `rpm` / fără nicio dintre cele de
+cerut de OSV nu cheamă deloc `ensure`, deci nu scrie nici liniștea (vezi `scan/enrich.py`).
 
 **Euristica din vector (rezerva) față de valorile CISA.** Pe cele 189 de CVE-uri ale
 gazdei cu ambele (vector și valoare CISA): Automatable din vector se potrivește cu CISA în

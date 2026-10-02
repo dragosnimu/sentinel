@@ -533,6 +533,90 @@ def test_a_confirmation_clears_the_proof_so_a_later_real_blindness_is_still_blin
     assert _vulnrichment_check(db).status == "degraded"
 
 
+REPLACEMENT = ("CVE-2024-11111", "CVE-2024-22222", "CVE-2024-33333")
+
+
+def test_replacing_the_candidates_discards_a_proof_recorded_under_the_old_ones(monkeypatch):
+    """The false diagnosis that outlived its fix. The proof said "the OLD candidates are
+    spent"; the operator replaced `CANARY_CONTROL_CVES` and delivered. In a world that is
+    genuinely blind `control_ok` never comes, so nothing ever cleared the proof, and the
+    alarm kept saying "replace the candidates" for candidates that HAD just been replaced
+    (reproduced: three passes after the replacement, still `control_exhausted`). The action
+    it printed changed nothing, and the real cause -- a parser that sees no points -- was
+    filed under a list that did not need touching. After the replacement the first quiet pass
+    must say `control_blind`, with no proof carried."""
+    db = FakeDB()
+    first = _pass(db, _ids(1, 6), _service(stripped=ALL_STRIPPED, host_points=True))
+    assert first["canary"] == "control_exhausted"
+    assert _canary(db)["exhausted_candidates"] == list(vr.CANARY_CONTROL_CVES)
+    monkeypatch.setattr(vr, "CANARY_CONTROL_CVES", REPLACEMENT)
+    for n in range(3):
+        quiet = _pass(db, _ids(10 + 3 * n, 12 + 3 * n), _service(blind=True))
+        assert quiet["canary"] == "control_blind", f"pass {n + 1} after the replacement"
+        assert "exhausted_proof_at" not in _canary(db)
+        assert "CANARY_CONTROL_CVES" not in db.states[vr.CANARY_SOURCE][1]
+    assert _vulnrichment_check(db).action.startswith("journalctl"), (
+        "the operator was still sent to edit a list he had just edited")
+
+
+def test_a_proof_is_written_under_the_current_list_and_survives_while_the_list_is_unchanged(
+        monkeypatch):
+    """The other half, so the repair is not "never keep a proof". After a replacement a NEW
+    proof (the host's own CVEs parse to points, the new candidates do not) is tied to the new
+    list and survives the quiet passes that follow, exactly as the old one did."""
+    db = FakeDB()
+    monkeypatch.setattr(vr, "CANARY_CONTROL_CVES", REPLACEMENT)
+    stripped = frozenset(REPLACEMENT)
+    first = _pass(db, _ids(1, 6), _service(stripped=stripped, host_points=True))
+    assert first["canary"] == "control_exhausted"
+    assert _canary(db)["exhausted_candidates"] == list(REPLACEMENT)
+    quiet = _pass(db, _ids(7, 9), _service(stripped=stripped))
+    assert quiet["canary"] == "control_exhausted"
+    assert _canary(db)["exhausted_candidates"] == list(REPLACEMENT)
+
+
+def test_reordering_the_candidates_does_not_discard_the_proof(monkeypatch):
+    """Same three records in another order prove the same thing: they are all spent. Only a
+    different SET of candidates (one added, one swapped, one removed) is a different claim."""
+    db = FakeDB()
+    _pass(db, _ids(1, 6), _service(stripped=ALL_STRIPPED, host_points=True))
+    monkeypatch.setattr(vr, "CANARY_CONTROL_CVES", tuple(reversed(vr.CANARY_CONTROL_CVES)))
+    quiet = _pass(db, _ids(7, 9), _service(stripped=ALL_STRIPPED))
+    assert quiet["canary"] == "control_exhausted"
+    for changed in (vr.CANARY_CONTROL_CVES + ("CVE-2024-44444",),
+                    vr.CANARY_CONTROL_CVES[:2],
+                    vr.CANARY_CONTROL_CVES[:2] + ("CVE-2024-44444",)):
+        monkeypatch.setattr(vr, "CANARY_CONTROL_CVES", changed)
+        assert _pass(db, _ids(10, 12), _service(blind=True))["canary"] == "control_blind", changed
+        # restore a proof under the ORIGINAL list for the next variant
+        monkeypatch.setattr(vr, "CANARY_CONTROL_CVES", (FIRST, SECOND, THIRD))
+        _pass(db, _ids(13, 18), _service(stripped=ALL_STRIPPED, host_points=True))
+
+
+def test_a_proof_with_no_recorded_list_is_not_trusted():
+    """A row written by code that did not record the list (or edited by hand) cannot be tied
+    to anything. "Cannot tell" falls to the loud `control_blind`, as an unreadable row does."""
+    db = FakeDB()
+    _pass(db, _ids(1, 6), _service(stripped=ALL_STRIPPED, host_points=True))
+    detail = _canary(db)
+    del detail["exhausted_candidates"]
+    db.states[vr.CANARY_SOURCE] = (False, "x", json.dumps(detail))
+    assert _pass(db, _ids(7, 9), _service(stripped=ALL_STRIPPED))["canary"] == "control_blind"
+
+
+def test_the_proof_discarded_on_replacement_also_goes_through_an_unreadable_pass(monkeypatch):
+    """The carried-through path (`unreadable` keeps the proof) must apply the same rule, or
+    an outage of the CVE service right after the replacement would resurrect the old proof."""
+    db = FakeDB()
+    _pass(db, _ids(1, 6), _service(stripped=ALL_STRIPPED, host_points=True))
+    monkeypatch.setattr(vr, "CANARY_CONTROL_CVES", REPLACEMENT)
+    down = _pass(db, _ids(7, 9), _service(status={c: 503 for c in REPLACEMENT}))
+    assert down["canary"] == "control_unreadable"
+    assert "exhausted_proof_at" not in _canary(db)
+    back = _pass(db, _ids(10, 12), _service(blind=True))
+    assert back["canary"] == "control_blind"
+
+
 def test_an_unreadable_previous_verdict_falls_to_blind_not_to_exhausted():
     """If the row holding the proof cannot be read, "cannot tell" must not become the
     reassuring verdict: the pass says `control_blind`, loud, and the next one with a

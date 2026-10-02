@@ -18,7 +18,9 @@ Falsify (each turns a named test red):
     `test_every_column_the_shipper_sends_still_encodes`;
   * drop `AND risk_red_announced_at IS NULL` from the claim in
     `enrich._announce_red` -> `test_the_red_announcement_is_claimed_once_even_if_two_passes_race`;
-  * drop the `_differs` guard in `enrich._run` -> `test_a_pass_that_changes_nothing_writes_nothing`.
+  * drop the `_differs` guard in `enrich._run` -> `test_a_pass_that_changes_nothing_writes_nothing`;
+  * make `mirror.record_idle` move `last_ok_at`, or drop its `idle` flag ->
+    `test_a_quiet_pass_keeps_the_last_answer_and_a_failing_one_still_rings`.
 """
 
 from __future__ import annotations
@@ -629,6 +631,59 @@ def test_a_failed_refresh_keeps_the_last_success_and_records_the_error(pg_dsn):
         assert st["last_ok_at"] == ok_at and st["last_error"] == "HTTP 503"
         await mirror.record(db, "epss", ok=True)
         assert (await mirror.state(db, "epss"))["last_error"] is None
+    _run_async(pg_dsn, body)
+
+
+def test_a_quiet_pass_keeps_the_last_answer_and_a_failing_one_still_rings(pg_dsn):
+    """The page that would have rung for nothing, through the real SQL of `record_idle`
+    and the real age arithmetic of `check_risk_intel` (`now() - last_attempt_at`), which a fake
+    database cannot show. An answered pass; then 40 hours go by (every stored timestamp moved
+    back, because Postgres' clock cannot be); a pass with nothing due must leave `last_ok_at`
+    exactly where it was, move `last_attempt_at` to now, clear no answer into existence, and make
+    the check `ok`. Then a CVE arrives that the source fails on: asked, 503, `degraded`."""
+    from sentinel.selfcheck import checks
+    record = json.loads((Path(__file__).parent.parent / "fixtures" / "intel"
+                         / "redhat_CVE-2024-6501.json").read_text(encoding="utf-8"))
+    asked: list[str] = []
+
+    def client(up: bool) -> httpx.AsyncClient:
+        def handler(request: httpx.Request) -> httpx.Response:
+            asked.append(request.url.path)
+            return httpx.Response(200, json=record) if up else httpx.Response(503)
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def verdict(db):
+        return {r.key: r for r in await checks.check_risk_intel(db)}["risk:redhat"]
+
+    async def body(db):
+        await db.execute("INSERT INTO intel_state (source, last_attempt_at, last_ok_at) "
+                         "VALUES ('risk', now(), now())")
+        async with client(True) as http:
+            await redhat.ensure(db, {"CVE-2024-6501"}, http=http, pause_s=0)
+        assert len(asked) == 1
+        for sql in ("UPDATE intel_state SET last_attempt_at = last_attempt_at - interval '40 hours', "
+                    "last_ok_at = last_ok_at - interval '40 hours' WHERE source = 'redhat'",
+                    "UPDATE vuln_intel SET fetched_at = fetched_at - interval '40 hours'"):
+            await db.execute(sql)
+        before = await mirror.state(db, "redhat")
+        # 40 hours after the answer, with no quiet record: what the check said before the fix
+        assert (await verdict(db)).status == "degraded"
+        async with client(True) as http:
+            out = await redhat.ensure(db, {"CVE-2024-6501"}, http=http, pause_s=0)
+        assert out["asked"] == 0 and out["idle"] is True and len(asked) == 1
+        after = await mirror.state(db, "redhat")
+        assert after["last_ok_at"] == before["last_ok_at"], "a quiet pass moved the answer"
+        assert after["last_attempt_at"] > before["last_attempt_at"] + timedelta(hours=39)
+        assert after["last_error"] is None and json.loads(after["detail"])["idle"] is True
+        quiet = await verdict(db)
+        assert quiet.status == "ok" and "nimic la termen" in quiet.detail, quiet.detail
+        async with client(False) as http:
+            out = await redhat.ensure(db, {"CVE-2024-6501", "CVE-2026-0002"}, http=http,
+                                      pause_s=0)
+        assert out["asked"] == 1 and out["errors"] == 1 and out["idle"] is False
+        failed = await mirror.state(db, "redhat")
+        assert failed["last_ok_at"] == before["last_ok_at"] and failed["last_error"]
+        assert (await verdict(db)).status == "degraded"
     _run_async(pg_dsn, body)
 
 
