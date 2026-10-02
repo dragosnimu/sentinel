@@ -627,15 +627,30 @@ scos din decizie —, ci că **observația pe care EPSS-ul o contrazice n-a mai 
 reîmprospătată**. Dintre cele 196 de evaluări CISA ale gazdei, 75 au peste 180 de zile, 44
 peste un an, iar mediana e de 141 de zile.
 
-*Se aplică:* după coborârea pentru repornire (podeaua e podea, deci un rând reparat care
-așteaptă o repornire rămâne galben, cu 🔁), indiferent de misiune (la misiune mică, aceleași
-trei rânduri urcă tot la galben). *Nu se aplică:* unui **gri** (necunoscutul nu devine galben);
+*Se aplică:* ÎNAINTEA coborârii pentru repornire — runda 2 a pus-o după, iar podeaua
+re-ridica un rând reparat la galben: suprapunerea era singurul tip de rând a cărui culoare
+nu putea spune niciodată „reparația e instalată, lipsește o repornire", distincția pe care
+s-au dus patru zile. Acum întâi podeaua (Track → Attend), apoi coborârea pe rezultat
+(Attend → Track\*, verde, cu 🔁); înregistrarea păstrează ambii pași (`overlay`,
+`decision_before_reboot`), iar detaliul spune că Attend-ul de unde a coborât era al regulii
+Sentinel. Indiferent de misiune (la misiune mică, aceleași trei rânduri urcă tot la galben).
+*Nu se aplică:* unui **gri** (necunoscutul nu devine galben);
 unui CVE a cărui exploatare e deja `active` sau în KEV (nu e o observație contrazisă);
 unui CVE pe care CISA nu l-a evaluat (`kev_absent`: n-a existat nicio observație, doar
 presupunerea noastră — dacă ar trebui și acolo o podea EPSS e **altă decizie**; pe gazdă,
 niciunul din cele 395 de rânduri `kev_absent` nu are EPSS ≥ 0,5, deci azi întrebarea e
 teoretică); unui EPSS lipsă sau mai vechi decât `epss.MAX_AGE_DAYS` (nefolosit, ca peste
 tot). O evaluare CISA fără dată nu poate fi dovedită proaspătă și se tratează ca veche.
+
+*Podeaua are un plafon.* `attend` fix putea depăși verdictul CISA însuși: peste tabelul
+publicat sunt **șase celule** (Exploitation `none`/`poc` × `automatable = no` × impact parțial la
+misiune mică sau medie, sau total la misiune mică) în care arborele dă `track` chiar și cu
+Exploitation `active`, iar un galben acolo ar fi pretins mai mult decât CISA în cea mai rea
+observație posibilă. Podeaua unui rând e `min(attend, decide("active", automatable, impact,
+misiune))` (`risk._overlay_floor`); unde plafonul e `track` nu mai e nimic de urcat și rândul
+rămâne cum a decis arborele. Zero rânduri pe gazdă azi; un test fixează cele șase celule și
+verifică, pe toate cele 24, că decizia finală nu depășește niciodată arborele sub exploatare
+activă.
 
 *Cifra 0,5, măsurată pe cele 406 CVE-uri distincte deschise (403 au EPSS).* Primele valori
 sunt 0,99225 (CVE-2025-29927), 0,91969 (CVE-2023-45288), 0,5918 (CVE-2024-46982), apoi
@@ -658,13 +673,20 @@ fără a o mai citi acum; sursele CISA/FIRST/Red Hat/OSV, vii):*
 | medie | roșu 0 · galben 2 · gri 22 · verde 788 | roșu 0 · galben **5** · gri 22 · verde 785 | CVE-2025-29927, CVE-2023-45288, CVE-2024-46982: verde → galben |
 | mare | roșu 2 · galben 231 · gri 22 · verde 557 | roșu 2 · galben 231 · gri 22 · verde 557 | nimic: la misiune mare cele trei sunt deja Attend din arbore |
 
-*Ordinea, un efect de reținut:* în interiorul galbenului rândurile se ordonează tot după
-`probabilitate × impact`, iar un KEV are probabilitate 1,0 și CVSS 7,5–7,8 (scor 0,75–0,78),
-pe când CVE-2025-29927 are 0,992 × 9,1 = 0,903. Rezultatul: CVE-2025-29927 stă pe locul 1,
-**deasupra celor două CVE-uri din KEV** (locurile 2–3), CVE-2023-45288 pe locul 4, CVE-2024-46982
-pe 5; apoi cele 22 de rânduri gri. Nu e o greșeală de calcul, e regula de ordonare deja
-documentată; dacă operatorul vrea ca o exploatare *observată* să stea mereu deasupra uneia
-*prezisă*, e o a doua regulă.
+*Ordinea: observația înaintea previziunii (decizia operatorului, 2 octombrie 2026).* Cu
+ordonarea doar după `probabilitate × impact`, un KEV (probabilitate 1,0 × CVSS 7,5–7,8 = 0,75–0,78)
+stătea sub CVE-2025-29927 (0,992 × 9,1 = 0,903): pe cele 812 de rânduri, locul 1 la prioritate 77,
+deasupra celor două KEV de la 75 și 74. O previziune deasupra unei exploatări confirmate.
+Galbenul (60–79) are acum două jumătăți: **un Attend din arbore, 70–79, stă deasupra unuia urcat
+de regula Sentinel, 60–69** (`risk._BANDS`, `priority_of(..., lifted=True)`). Pe priorități și nu
+pe o cheie de sortare în plus, ca toți cititorii (`ORDER BY priority DESC` în Python și în
+TypeScript, Telegram, planificatorul) să rămână de acord fără să-și schimbe interogările; prețul
+e rezoluția, 10 trepte pe jumătate în loc de 20 pe bandă. Aceleași 812 de rânduri, după:
+KEV 77 și 77 (locurile 1–2, desfăcute de `risk_score`), CVE-2025-29927 pe 68 (locul 3),
+CVE-2023-45288 pe 66, CVE-2024-46982 pe 64, apoi cele 22 de rânduri gri (54–58). De reținut: un
+Attend din arbore nu înseamnă mereu „observat" (la misiune mare, `none,yes,partial,high` e
+Attend); regula e „decis de CISA înaintea celui ridicat de regula Sentinel", iar la misiune
+medie — singura de azi — un Attend din arbore are mereu o exploatare observată în spate.
 
 *Unde se spune pe ecran, ca regula Sentinel și nu a SSVC:* eticheta rândului („🟡 Attend —
 accelerat (regula Sentinel, nu SSVC)"), motivul scurt („regula Sentinel (EPSS)"), legenda
@@ -701,20 +723,46 @@ rămâne fără număr de ordonare.
 
 **Un parser orb arată ca „CISA n-a evaluat nimic".** Dacă CISA își schimbă `orgId`, rolul
 sau forma răspunsului, fiecare CVE ar părea neevaluat și Exploitation ar cădea pe
-`none` în tăcere. O trecere care primește cel puțin 20 de CVE-uri și niciun punct CISA
-devine **suspectă**, nu orbă: doar 7% dintre CVE-urile Debian au puncte CISA, deci un lot
-de 20–30 de CVE-uri noi de `linux-libc-dev` are zero puncte cu probabilitatea 0,93^20 ≈ 23%
-(0,93^30 ≈ 11%) fără ca parserul să fi greșit, iar alarma ar fi ținut `degraded` până la două zile
-(`UNENRICHED_DAYS`). O alarmă care sună după *compoziția* lotului învață operatorul s-o
-ignore. De aceea suspiciunea se verifică cu un **control pozitiv**: în aceeași trecere se
-cere LIVE de la serviciu un CVE cunoscut că poartă puncte (`CANARY_CONTROL_CVE`,
-CVE-2025-29927) și se trece prin același parser. Controlul DĂ puncte → lotul era doar
-neevaluat, nicio alarmă. Controlul vine FĂRĂ puncte → parser orb: `blind` în
-`intel_state`, iar autoverificarea (`risk:vulnrichment`) trece pe `degraded`. Controlul nu
-se poate citi (cerere picată, 404) → „nu se poate spune" nu e „în regulă": se marchează
-tot `blind`, cu motivul „nu se poate spune dacă e parser orb sau doar un lot neevaluat" în eroare. Controlul se cere live, nu din
-fixture: o înregistrare reținută doar ar dovedi că parserul înțelege formatul VECHI.
-Parserul e probat pe răspunsuri reale înregistrate (`tests/fixtures/intel/cveawg_*.json`).
+`none` în tăcere (presupunerea `kev_absent` hotărăște deja 395 din 812 rânduri). Prima
+alarmă avea două defecte, măsurate pe producție pe 2 octombrie 2026: **(1)** verdictul stătea
+în `intel_state.detail` al rândului `vulnrichment`, pe care `mirror.run_lookups` îl rescrie
+întreg la sfârșitul oricărei treceri — reprodus pe `FakeDB`-ul suitei: trecerea 1 (30 de
+CVE-uri, zero puncte) ridica alarma, trecerea 2 (5 CVE-uri, zero puncte) o ștergea, iar
+`enrich.run` rulează din oră în oră; **(2)** controlul se cerea doar când lotul avea cel puțin
+20 de CVE-uri `found` fără puncte, dar o trecere obișnuită cere ~5–6 (196 evaluate reluate
+săptămânal ≈ 1,2/oră + ~210 neevaluate reluate la două zile ≈ 4,4/oră). Rezultatul: „CISA
+Vulnrichment: ok" însemna „ultima trecere a primit răspunsuri", nu „parserul încă vede puncte".
+
+Forma de acum (`vulnrichment.run_control`, `checks._canary_state`): **un control pozitiv la
+FIECARE trecere**, indiferent de lot — un CVE despre care se știe că poartă puncte CISA trece
+live prin același parser; **verdictul stă pe rândul lui din `intel_state`**
+(`vulnrichment_canary`, migrația 0049), pe care căutările nu-l ating, iar `last_ok_at` al lui e
+ultima CONFIRMARE (controlul a dat puncte). Autoverificarea citește vechimea confirmării:
+„ok" = parserul a văzut puncte acum cel mult `CANARY_UNCONFIRMED_H` (3 ore). Controlul vine
+fără puncte → `degraded`, și rămâne așa până când o NOUĂ încercare a controlului dă puncte; nu
+poate fi citit → `unknown` cât confirmarea e mai nouă de `CANARY_UNREADABLE_H` (= 36 de ore,
+`VENDOR_DEGRADED_H`: aceeași pană a serviciului CVE nu sună mai devreme prin control decât prin
+căutări, pe aceeași cheie), apoi `degraded`; imediat dacă lotul aceleiași treceri era suspect
+(20+ CVE-uri, zero puncte: serviciul a răspuns, deci nu el e căzut) sau dacă nu există nicio
+confirmare — „nu se poate spune" nu e „în regulă". Trei ore (`CANARY_UNCONFIRMED_H`) rămân
+pentru ce operatorul poate repara: `control_ok` nereînnoit și `control_exhausted`. Compoziția lotului nu mai poate
+ridica alarma pe nedrept: doar 7% dintre CVE-urile Debian au puncte CISA, deci 20–30 de
+CVE-uri noi de `linux-libc-dev` au zero puncte cu probabilitatea 0,93^20 ≈ 23%, fără ca
+parserul să fi greșit.
+
+*Controlul nu atârnă de un singur CVE.* Sunt trei candidate (`CANARY_CONTROL_CVES`:
+CVE-2025-29927, CVE-2024-3094, CVE-2023-38545), cu fixture real fiecare; se întreabă pe rând până
+răspunde una cu puncte (de regulă o cerere). Una retrasă, reevaluată sau fără container ADP nu
+dă alarmă; parserul e orb doar dacă TOATE candidatele citite vin fără puncte ȘI lotul gazdei nu
+a citit puncte: dacă le-a citit, verdictul e `control_exhausted` („înlocuiți `CANARY_CONTROL_CVES`",
+`degraded` după 3 ore fără confirmare), iar dovada se păstrează în rând (`exhausted_proof_at`) ca
+o trecere liniștită să nu repete minciuna. **CVE-2025-29927
+e o constatare deschisă pe producție**, nu „un CVE care nu e al gazdei" — controlul doar nu
+scrie nimic în `vulnrichment`. *Ce NU dovedește:* că parserul citește corect fiecare
+înregistrare; o schimbare care atinge doar unele înregistrări lasă controlul verde. Variantele
+respinse: o fereastră pe `fetched_at` (`store` păstrează punctele vechi cu `COALESCE`, deci într-o
+lume orbă fereastra ar arăta sănătos) și `blind` într-o cheie protejată în același rând (două
+vârste diferite într-un singur `last_ok_at`).
 
 **Euristica din vector (rezerva) față de valorile CISA.** Pe cele 189 de CVE-uri ale
 gazdei cu ambele (vector și valoare CISA): Automatable din vector se potrivește cu CISA în

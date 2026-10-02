@@ -9,7 +9,13 @@ Failures this file prevents, in the operator's terms:
   * a request that merely FAILED written down as "CISA has no data";
   * a vocabulary word CISA's tree does not use (or a different tree's role) stored
     as if it were one of ours;
-  * a good evaluation overwritten with "nothing" by one truncated response.
+  * a good evaluation overwritten with "nothing" by one truncated response;
+  * the blind-parser alarm that rang once and was wiped by the next ordinary hourly
+    pass (so "CISA Vulnrichment: ok" meant "the last pass answered", not "the parser
+    still sees points"), or that was never evaluated at all because a normal pass asks
+    5-6 CVEs and the old trigger needed 20;
+  * a control pinned to one CVE that goes permanently "unreadable" the day that record
+    is withdrawn.
 """
 
 from __future__ import annotations
@@ -17,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -25,6 +32,7 @@ import httpx
 import pytest
 
 from sentinel.intel import mirror, vulnrichment as vr
+from sentinel.selfcheck import checks
 
 FIX = Path(__file__).parent.parent / "fixtures" / "intel"
 NOW = datetime(2026, 10, 2, 3, 15, tzinfo=timezone.utc)
@@ -140,6 +148,9 @@ class FakeDB:
         self.rows: dict[str, dict[str, Any]] = {}
         self.existing = existing or {}
         self.states: dict[str, tuple] = {}
+        #: `intel_state.last_ok_at` as `mirror.record` writes it: it moves only on a
+        #: success, so a failed attempt leaves the previous confirmation (or none).
+        self.confirmed: dict[str, bool] = {}
 
     async def fetch(self, sql: str, *args: Any):
         assert "FROM vulnrichment" in sql
@@ -153,6 +164,42 @@ class FakeDB:
         else:
             assert "INSERT INTO intel_state" in sql
             self.states[args[0]] = args[1:]
+            if args[1]:
+                self.confirmed[args[0]] = True
+
+    async def fetchrow(self, sql: str, *args: Any):
+        """`mirror.state`: the previous verdict row, as the database would give it."""
+        assert "FROM intel_state" in sql
+        if args[0] not in self.states:
+            return None
+        _ok, error, detail = self.states[args[0]]
+        return {"last_attempt_at": "x", "last_ok_at": "x" if self.confirmed.get(args[0]) else None,
+                "last_error": error, "detail": detail}
+
+    def intel_rows(self) -> list[dict[str, Any]]:
+        """`intel_state` as the self-check reads it, a fresh success being 6 minutes old."""
+        return [{"source": source, "last_attempt_at": "x",
+                 "last_ok_at": "x" if self.confirmed.get(source) else None,
+                 "last_error": error, "detail": detail,
+                 "ok_age_s": 360 if self.confirmed.get(source) else None}
+                for source, (_ok, error, detail) in self.states.items()]
+
+
+class _IntelDB:
+    """What `check_risk_intel` needs: the `intel_state` rows."""
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self._rows = rows
+
+    async def fetch(self, sql: str, *args: Any):
+        assert "FROM intel_state" in sql
+        return self._rows
+
+
+def _vulnrichment_check(db: FakeDB):
+    """The self-check's verdict on the source, from the state the passes left behind."""
+    out = _run(checks.check_risk_intel(_IntelDB(db.intel_rows())))
+    return {r.key: r for r in out}["risk:vulnrichment"]
 
 
 def _client(handler) -> httpx.AsyncClient:
@@ -190,7 +237,12 @@ def test_the_request_goes_to_the_cve_service_with_the_validated_id_only():
         return httpx.Response(404)
     _run(vr.ensure(FakeDB(), {"CVE-2025-29927", "../../etc/passwd", "CVE-2026-1 ", "ghsa-x"},
                    http=_client(handler), now=NOW, pause_s=0))
-    assert seen == ["https://cveawg.mitre.org/api/cve/CVE-2025-29927"]
+    # The host batch asks only the one valid id; the control (a fixed, trusted list, asked
+    # on every pass) adds its own candidates, and nothing else is ever requested.
+    allowed = {f"https://cveawg.mitre.org/api/cve/{c}"
+               for c in {"CVE-2025-29927", *vr.CANARY_CONTROL_CVES}}
+    assert set(seen) <= allowed and "https://cveawg.mitre.org/api/cve/CVE-2025-29927" in seen
+    assert not any("passwd" in u or "ghsa" in u or "CVE-2026-1" in u for u in seen)
 
 
 def test_an_unreadable_answer_is_an_error_and_a_network_exception_does_not_escape():
@@ -214,7 +266,9 @@ def test_a_dead_source_is_given_up_on_after_five_failures_in_a_row():
     ids = {f"CVE-2026-{n:04d}" for n in range(1, 21)}
     db = FakeDB()
     out = _run(vr.ensure(db, ids, http=_client(handler), now=NOW, pause_s=0))
-    assert len(seen) == mirror.MAX_CONSECUTIVE_ERRORS
+    host = [path for path in seen
+            if not any(path.endswith(c) for c in vr.CANARY_CONTROL_CVES)]
+    assert len(host) == mirror.MAX_CONSECUTIVE_ERRORS
     assert out["aborted"] is True and db.states["vulnrichment"][0] is False
 
 
@@ -222,126 +276,369 @@ def _unenriched_handler(request: httpx.Request) -> httpx.Response:
     return httpx.Response(200, json=_record("CVE-2025-40075"))
 
 
-def test_a_pass_that_gets_many_cves_and_no_cisa_points_is_marked_blind():
-    """The silent failure. 30 CVE records arrive, none with a CISA container: either
-    CISA stopped publishing (it did not) or the parser stopped seeing it. Without
-    this flag the pass reports success and every CVE reads as "not evaluated"."""
-    ids = {f"CVE-2026-{n:04d}" for n in range(1, 31)}
-    db = FakeDB()
-    out = _run(vr.ensure(db, ids, http=_client(_unenriched_handler), now=NOW, pause_s=0))
-    assert out["blind"] is True and out["with_points"] == 0
-    assert out["canary"] == "control_blind"
-    ok, error = db.states["vulnrichment"][0], db.states["vulnrichment"][1]
-    assert ok is False and "parserul" in error and vr.CANARY_CONTROL_CVE in error
-    assert json.loads(db.states["vulnrichment"][2])["blind"] is True
+FIRST, SECOND, THIRD = vr.CANARY_CONTROL_CVES
 
 
-def _batch_without_points_but_a_control_that_has_them(control_status: int = 200):
-    """A host batch of 30 CVEs CISA has not evaluated (the shape of a `linux-libc-dev`
-    bump: 7% of Debian kernel CVEs carry CISA points) while the control CVE, asked in
-    the same pass, answers like the real service does. Returns (summary, db, urls)."""
-    urls: list[str] = []
+def _service(*, blind: bool = False, status: dict[str, int] | None = None,
+             stripped: frozenset[str] = frozenset(), raises: frozenset[str] = frozenset(),
+             urls: list[str] | None = None, host_points: bool = False):
+    """The CVE service as seen by the pass. Host CVEs come back as CISA has not evaluated
+    them (the normal Debian-kernel shape); the control candidates carry their recorded
+    real points, unless the world is `blind` (nothing has points: a parser that no longer
+    finds the container), a candidate is `stripped` (still readable, points gone: re-scored
+    or withdrawn), `raises` (a network failure) or has an HTTP `status` of its own. With `host_points`
+    the host's own CVEs come back WITH CISA points: the parser demonstrably works."""
+    status = status or {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        urls.append(request.url.path.rsplit("/", 1)[-1])
-        if request.url.path.endswith(vr.CANARY_CONTROL_CVE):
-            if control_status != 200:
-                return httpx.Response(control_status)
-            return httpx.Response(200, json=_record("CVE-2025-29927"))
+        cve = request.url.path.rsplit("/", 1)[-1]
+        if urls is not None:
+            urls.append(cve)
+        if cve in raises:
+            raise httpx.ReadTimeout("slow")
+        if cve in status:
+            return httpx.Response(status[cve])
+        if cve in vr.CANARY_CONTROL_CVES:
+            if not blind and cve not in stripped:
+                return httpx.Response(200, json=_record(cve))
+        elif host_points:
+            return httpx.Response(200, json=_record(FIRST))
         return httpx.Response(200, json=_record("CVE-2025-40075"))
-    ids = {f"CVE-2026-{n:04d}" for n in range(1, 31)}
+    return handler
+
+
+def _ids(first: int, last: int) -> set[str]:
+    return {f"CVE-2026-{n:04d}" for n in range(first, last + 1)}
+
+
+def _pass(db: FakeDB, ids: set[str], handler, **kw):
+    return _run(vr.ensure(db, ids, http=_client(handler), now=NOW, pause_s=0, **kw))
+
+
+def _canary(db: FakeDB) -> dict[str, Any]:
+    return json.loads(db.states[vr.CANARY_SOURCE][2])
+
+
+def test_a_pass_that_gets_many_cves_and_no_cisa_points_is_marked_blind():
+    """The silent failure. 30 CVE records arrive, none with a CISA container, and the
+    control CVEs, which are known to carry points, come back without them too: either
+    CISA stopped publishing (it did not) or the parser stopped seeing it. Without this
+    flag the pass reports success and every CVE reads as "not evaluated"."""
     db = FakeDB()
-    out = _run(vr.ensure(db, ids, http=_client(handler), now=NOW, pause_s=0))
-    return out, db, urls
+    out = _pass(db, _ids(1, 30), _service(blind=True))
+    assert out["canary"] == "control_blind" and out["with_points"] == 0
+    ok, error, _ = db.states[vr.CANARY_SOURCE]
+    assert ok is False and "parserul" in error and FIRST in error
+    assert _canary(db)["canary"] == "control_blind"
+    assert _vulnrichment_check(db).status == "degraded"
+
+
+def test_a_blind_parser_is_still_blind_after_the_next_ordinary_pass():
+    """THE defect, reproduced with the suite's own fake database. Pass 1 (30 CVEs, zero
+    points) raised the alarm; pass 2 (5 CVEs, zero points) ended with `record(ok=True,
+    detail=<its own summary>)`, which replaces `intel_state.detail` wholesale, so the alarm
+    was gone and the self-check said "CISA Vulnrichment: ok" while every CVE still read
+    "CISA has evaluated nothing". The hourly pass is what runs in steady state: the alarm
+    lived at most one hour, in exactly the world it exists for. Both passes must end red."""
+    db = FakeDB()
+    blind = _service(blind=True)
+    first = _pass(db, _ids(1, 30), blind)
+    assert first["canary"] == "control_blind"
+    assert _vulnrichment_check(db).status == "degraded"
+    second = _pass(db, _ids(31, 35), blind)
+    # the thing that used to erase the alarm DID happen: the lookups row is a success
+    assert second["found"] == 5 and second["with_points"] == 0
+    assert db.states[vr.SOURCE][0] is True
+    # and the alarm survived it
+    assert second["canary"] == "control_blind"
+    assert _canary(db)["canary"] == "control_blind"
+    assert db.states[vr.CANARY_SOURCE][0] is False
+    check = _vulnrichment_check(db)
+    assert check.status == "degraded", "the success of an ordinary pass cleared the alarm"
+    assert "controlul pozitiv" in check.detail
+
+
+@pytest.mark.parametrize("batch", [0, 1, 5, vr.CANARY_MIN - 1, vr.CANARY_MIN + 10])
+def test_the_control_is_asked_on_every_pass_whatever_the_batch_holds(batch):
+    """A normal production pass asks 5-6 CVEs and the old trigger needed 20 found without
+    points, so in a blind world the verdict was almost never computed: "ok" meant "the last
+    pass answered". Now it is computed on every pass, including one with nothing due (all
+    fresh) and one of a single CVE. Healthy world: one extra request, verdict ok. Blind
+    world: the verdict is blind however few CVEs came."""
+    # batch 0 = nothing due: five CVEs, all fetched a moment ago
+    ids = _ids(1, batch or 5)
+    fresh = {c: {"status": "found", "exploitation": "none", "automatable": "yes",
+                 "technical_impact": "total", "fetched_at": NOW} for c in ids}
+    urls: list[str] = []
+    db = FakeDB(existing=fresh if batch == 0 else None)
+    healthy = _pass(db, ids, _service(urls=urls))
+    assert healthy["canary"] == "control_ok"
+    assert urls.count(FIRST) == 1 and len(urls) == batch + 1, (
+        "a healthy pass costs exactly one extra request")
+    assert _canary(db)["control_cve"] == FIRST
+    urls.clear()
+    blind = _pass(FakeDB(existing=fresh if batch == 0 else None), ids,
+                  _service(blind=True, urls=urls))
+    assert blind["canary"] == "control_blind"
+    assert {FIRST, SECOND, THIRD} <= set(urls)
+
+
+def test_only_a_confirmation_clears_the_alarm_not_a_pass_that_merely_answers():
+    """Blind, then a pass in which the control cannot be read (the CVE service answers the
+    host's CVEs but 503s the candidates), then a healthy one. The middle pass must not turn
+    the source green: nothing confirmed the parser. Only the third, which asks the control
+    and gets points, does."""
+    db = FakeDB()
+    _pass(db, _ids(1, 30), _service(blind=True))
+    assert _vulnrichment_check(db).status == "degraded"
+    down = _service(status={FIRST: 503, SECOND: 503, THIRD: 503})
+    mid = _pass(db, _ids(31, 36), down)
+    assert mid["canary"] == "control_unreadable" and mid["found"] == 6
+    assert _vulnrichment_check(db).status == "degraded", (
+        "a pass that only answered cleared an alarm nobody had disproved")
+    healed = _pass(db, _ids(37, 41), _service())
+    assert healed["canary"] == "control_ok"
+    assert _vulnrichment_check(db).status == "ok"
 
 
 def test_a_batch_without_points_is_not_a_blind_parser_when_the_control_still_has_points():
     """The false alarm this prevents: a `linux-libc-dev` bump brings 20-30 Debian
     kernel CVEs, of which CISA has evaluated about 7%, so the whole batch can come
-    back without points (0.93^20 is 23%) while the parser is perfectly fine. The old
-    canary called that "parser blind", marked the source `degraded` and, because
-    unevaluated CVEs are asked again only after two days, held it there. An alarm
-    that fires on the COMPOSITION of a batch trains the operator to ignore it, and
-    then the day the parser really is blind nobody reads it. The control CVE, asked
-    live in the same pass, tells the two apart."""
-    out, db, urls = _batch_without_points_but_a_control_that_has_them()
-    assert "blind" not in out
-    assert out["canary"] == "control_ok" and out["with_points"] == 0
-    assert vr.CANARY_CONTROL_CVE in urls, "the control was never asked: nothing was checked"
-    assert vr.CANARY_CONTROL_CVE not in db.rows, "the control is not a host CVE: never stored"
-    # The state the self-check reads is the normal pass's, not a `blind` one.
-    assert json.loads(db.states["vulnrichment"][2]).get("blind") is None
-    assert db.states["vulnrichment"][0] is True
-
-
-@pytest.mark.parametrize("status", [503, 404])
-def test_a_control_that_cannot_be_read_is_unknown_not_clean(status):
-    """If the control itself fails (a 503, or the record gone), nothing can be said
-    about the parser. "Cannot tell" must not be recorded as "fine": the old alarm
-    stays raised, and its text says the control was unreadable, so the operator can
-    tell this apart from a proven blind parser."""
-    out, db, _ = _batch_without_points_but_a_control_that_has_them(status)
-    assert out["blind"] is True and out["canary"] == "control_unreadable"
-    ok, error, detail = db.states["vulnrichment"]
-    assert ok is False and "nu se poate spune" in error and vr.CANARY_CONTROL_CVE in error
-    assert json.loads(detail)["blind"] is True
-
-
-def test_a_control_that_raises_does_not_escape_and_is_unknown():
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith(vr.CANARY_CONTROL_CVE):
-            raise httpx.ReadTimeout("slow")
-        return httpx.Response(200, json=_record("CVE-2025-40075"))
-    ids = {f"CVE-2026-{n:04d}" for n in range(1, 31)}
-    out = _run(vr.ensure(FakeDB(), ids, http=_client(handler), now=NOW, pause_s=0))
-    assert out["blind"] is True and out["canary"] == "control_unreadable"
-
-
-def _recording(urls: list[str], record: str):
-    def handler(request: httpx.Request) -> httpx.Response:
-        urls.append(request.url.path.rsplit("/", 1)[-1])
-        return httpx.Response(200, json=_record(record))
-    return handler
-
-
-def test_the_control_is_asked_only_when_the_batch_is_suspicious():
-    """No extra request on a normal pass: a small batch without points (five brand
-    new CVEs), or a big one that has them."""
+    back without points (0.93^20 is 23%) while the parser is perfectly fine. An alarm
+    that fires on the COMPOSITION of a batch trains the operator to ignore it, and then
+    the day the parser really is blind nobody reads it. The control CVE, asked live in
+    the same pass, tells the two apart."""
     urls: list[str] = []
-    small = {f"CVE-2026-{n:04d}" for n in range(1, 6)}
-    _run(vr.ensure(FakeDB(), small, http=_client(_recording(urls, "CVE-2025-40075")),
-                   now=NOW, pause_s=0))
-    assert vr.CANARY_CONTROL_CVE not in urls and len(urls) == 5
-    urls.clear()
-    big = {f"CVE-2026-{n:04d}" for n in range(1, 31)}
-    _run(vr.ensure(FakeDB(), big, http=_client(_recording(urls, "CVE-2025-29927")),
-                   now=NOW, pause_s=0))
-    assert vr.CANARY_CONTROL_CVE not in urls and len(urls) == 30
+    db = FakeDB()
+    out = _pass(db, _ids(1, 30), _service(urls=urls))
+    assert out["canary"] == "control_ok" and out["with_points"] == 0
+    assert out["suspect_batch"] is True
+    assert FIRST in urls, "the control was never asked: nothing was checked"
+    assert not (set(vr.CANARY_CONTROL_CVES) & set(db.rows)), (
+        "the control is not a host CVE: never stored")
+    assert db.states[vr.CANARY_SOURCE][0] is True
+    assert _vulnrichment_check(db).status == "ok"
 
 
-def test_the_control_cve_really_carries_points_in_the_recorded_service_response():
-    """The control is only a control if it parses to points. Checked against the
-    recorded real response, so a future edit of the constant to a CVE CISA has not
-    evaluated cannot turn every suspicious batch into a permanent false alarm."""
-    rec = vr.parse(_record(vr.CANARY_CONTROL_CVE))
-    assert rec is not None and (rec["exploitation"], rec["automatable"],
-                                rec["technical_impact"]) != (None, None, None)
+def test_the_control_is_never_stored_even_when_it_is_also_a_host_cve():
+    """CVE-2025-29927 is an open finding on the production host: the host batch asks it on
+    its own account and stores it as host data. The control path must add nothing: the same
+    CVE asked for the control is not written a second time, and a control candidate that
+    is NOT in the batch never appears in `vulnrichment`."""
+    db = FakeDB()
+    _pass(db, {FIRST, "CVE-2026-0001"}, _service())
+    assert set(db.rows) == {FIRST, "CVE-2026-0001"}
+    db2 = FakeDB()
+    _pass(db2, {"CVE-2026-0001"}, _service())
+    assert set(db2.rows) == {"CVE-2026-0001"}
+
+
+@pytest.mark.parametrize("how", ["404", "503", "stripped", "raises"])
+def test_one_retired_candidate_does_not_raise_the_alarm(how):
+    """The control used to be pinned to ONE live CVE. The day that record is withdrawn
+    (404), re-scored without its ADP container (found, no points) or briefly unreachable,
+    every suspect batch reported "control unreadable" forever. Now the next candidate is
+    asked; the parser is called blind only if EVERY candidate that can be read comes back
+    without points."""
+    kw = {"404": {"status": {FIRST: 404}}, "503": {"status": {FIRST: 503}},
+          "stripped": {"stripped": frozenset({FIRST})},
+          "raises": {"raises": frozenset({FIRST})}}[how]
+    db = FakeDB()
+    out = _pass(db, _ids(1, 30), _service(**kw))
+    assert out["canary"] == "control_ok"
+    detail = _canary(db)
+    assert detail["control_cve"] == SECOND and detail["asked"] == [FIRST, SECOND]
+    assert _vulnrichment_check(db).status == "ok"
+
+
+def test_the_parser_is_blind_only_when_every_readable_candidate_lacks_points():
+    db = FakeDB()
+    out = _pass(db, _ids(1, 3), _service(blind=True))
+    assert out["canary"] == "control_blind"
+    assert _canary(db)["asked"] == [FIRST, SECOND, THIRD]
+    # one unreadable, the others readable-without-points: still blind, and it says so
+    db2 = FakeDB()
+    out = _pass(db2, _ids(1, 3), _service(blind=True, status={FIRST: 404}))
+    assert out["canary"] == "control_blind"
+    error = db2.states[vr.CANARY_SOURCE][1]
+    assert SECOND in error and THIRD in error and FIRST in error
+
+
+ALL_STRIPPED = frozenset(vr.CANARY_CONTROL_CVES)
+
+
+def test_candidates_without_points_beside_a_host_batch_with_points_are_not_a_blind_parser():
+    """The false statement this prevents. All three candidates come back found-without-points
+    (re-scored, ADP container dropped) while the host's own CVEs in the SAME pass, through the
+    same parser, parse to points. The old verdict was `control_blind`: the self-check said
+    "the parser or the response shape has changed", and the operator hunted a parser bug that
+    does not exist and could only get out by editing the candidate list and deploying. It must
+    say what is true: the candidates are spent, replace them."""
+    db = FakeDB()
+    out = _pass(db, _ids(1, 6), _service(stripped=ALL_STRIPPED, host_points=True))
+    assert out["with_points"] == 6
+    assert out["canary"] == "control_exhausted"
+    detail = _canary(db)
+    assert detail["canary"] == "control_exhausted" and detail["exhausted_proof_at"]
+    assert "CANARY_CONTROL_CVES" in db.states[vr.CANARY_SOURCE][1]
+    assert "schimbat" not in db.states[vr.CANARY_SOURCE][1]
+    check = _vulnrichment_check(db)
+    assert check.status == "degraded"        # never confirmed: no clock to wait on
+    assert "CANARY_CONTROL_CVES" in check.action
+    assert "niciun punct SSVC în răspunsuri" not in check.title
+
+
+def test_the_same_candidates_on_a_quiet_pass_stay_exhausted_not_blind():
+    """The edge a per-pass rule gets wrong. Most hourly passes ask ~5 CVEs of which few have
+    points, so a batch with points is the exception. Pass 1 (batch with points) proves the
+    candidates are spent; pass 2 (a batch with none) cannot prove anything either way, and
+    judged alone it would say `control_blind` -- the same false "the parser broke", on every
+    quiet pass, flipping back on the next. The proof is kept in the row."""
+    db = FakeDB()
+    first = _pass(db, _ids(1, 6), _service(stripped=ALL_STRIPPED, host_points=True))
+    proof = _canary(db)["exhausted_proof_at"]
+    quiet = _pass(db, _ids(7, 12), _service(stripped=ALL_STRIPPED))
+    assert (first["canary"], quiet["canary"]) == ("control_exhausted", "control_exhausted")
+    assert quiet["with_points"] == 0
+    assert _canary(db)["exhausted_proof_at"] == proof
+    assert _vulnrichment_check(db).action.startswith("Înlocuiește")
+
+
+def test_the_proof_survives_a_pass_in_which_the_control_cannot_be_read():
+    """Exhausted, then an outage of the CVE service (all candidates 503), then the service
+    back with the candidates still spent and a quiet batch. Without carrying the proof
+    through the unreadable pass this is `control_blind` again."""
+    db = FakeDB()
+    _pass(db, _ids(1, 6), _service(stripped=ALL_STRIPPED, host_points=True))
+    proof = _canary(db)["exhausted_proof_at"]
+    down = _pass(db, _ids(7, 9), _service(status={c: 503 for c in vr.CANARY_CONTROL_CVES}))
+    assert down["canary"] == "control_unreadable"
+    assert _canary(db)["exhausted_proof_at"] == proof
+    back = _pass(db, _ids(10, 12), _service(stripped=ALL_STRIPPED))
+    assert back["canary"] == "control_exhausted"
+
+
+def test_a_confirmation_clears_the_proof_so_a_later_real_blindness_is_still_blind():
+    """The proof says "these candidates were spent", nothing more. Once a candidate gives
+    points again (a control_ok) the proof goes; if every candidate then loses its points on
+    a quiet pass, nothing separates a dead list from a blind parser and the answer is the
+    loud one, `control_blind`: the day the parser really breaks must not be filed under a
+    list that needs replacing."""
+    db = FakeDB()
+    _pass(db, _ids(1, 6), _service(stripped=ALL_STRIPPED, host_points=True))
+    assert _pass(db, _ids(7, 9), _service())["canary"] == "control_ok"
+    assert "exhausted_proof_at" not in _canary(db)
+    blind = _pass(db, _ids(10, 12), _service(stripped=ALL_STRIPPED))
+    assert blind["canary"] == "control_blind"
+    assert _vulnrichment_check(db).status == "degraded"
+
+
+def test_an_unreadable_previous_verdict_falls_to_blind_not_to_exhausted():
+    """If the row holding the proof cannot be read, "cannot tell" must not become the
+    reassuring verdict: the pass says `control_blind`, loud, and the next one with a
+    readable row can correct it."""
+    class Unreadable(FakeDB):
+        async def fetchrow(self, sql: str, *args: Any):
+            raise RuntimeError("connection reset")
+    db = Unreadable()
+    out = _pass(db, _ids(1, 3), _service(stripped=ALL_STRIPPED))
+    assert out["canary"] == "control_blind"
+
+
+def test_the_control_still_runs_when_the_lookups_of_the_same_pass_raise(monkeypatch):
+    """`ensure` documents that the control is asked on EVERY pass. The one way a pass gets
+    to the control after its lookups blew up is the `except` branch falling through; a
+    `return` there would leave the verdict untouched for as long as the lookups kept
+    failing, and the self-check would keep reading an hour-old "ok" (until the three-hour
+    bound) while nothing was being checked."""
+    async def boom(*a: Any, **k: Any):
+        raise RuntimeError("db went away")
+    monkeypatch.setattr(vr, "due", boom)
+    db = FakeDB()
+    out = _pass(db, _ids(1, 3), _service())
+    assert out["status"] == "failed" and "db went away" in out["error"]
+    assert db.states[vr.SOURCE][0] is False
+    assert out["canary"] == "control_ok"
+    assert db.states[vr.CANARY_SOURCE][0] is True
+
+
+@pytest.mark.parametrize("handler_kw", [
+    {"status": {c: s for c, s in zip(vr.CANARY_CONTROL_CVES, (503, 404, 429))}},
+    {"raises": frozenset(vr.CANARY_CONTROL_CVES)},
+])
+def test_a_control_that_cannot_be_read_is_unknown_not_clean(handler_kw):
+    """If every candidate fails (a 503, the records gone, a network error) nothing can be
+    said about the parser. "Cannot tell" must not be recorded as "fine" and must not look
+    like a proven blind parser either: it is its own verdict, with its reason, and the
+    exception raised by the transport does not escape the pass."""
+    db = FakeDB()
+    out = _pass(db, _ids(1, 30), _service(**handler_kw))
+    assert out["canary"] == "control_unreadable"
+    ok, error, _ = db.states[vr.CANARY_SOURCE]
+    assert ok is False and "nu se poate spune" in error and FIRST in error
+    assert db.confirmed.get(vr.CANARY_SOURCE) is None
 
 
 def test_a_small_pass_without_points_is_not_called_blind():
-    """Five brand-new CVEs CISA has not got to yet are normal; the canary needs a
-    sample big enough to mean something."""
-    ids = {f"CVE-2026-{n:04d}" for n in range(1, 6)}
-    out = _run(vr.ensure(FakeDB(), ids, http=_client(_unenriched_handler), now=NOW, pause_s=0))
-    assert "blind" not in out
+    """Five brand-new CVEs CISA has not got to yet are normal, whatever the control says:
+    the batch alone decides nothing."""
+    db = FakeDB()
+    out = _pass(db, _ids(1, 5), _service())
+    assert out["canary"] == "control_ok" and out["suspect_batch"] is False
+    assert _vulnrichment_check(db).status == "ok"
 
 
 def test_a_big_pass_with_points_is_not_blind():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=_record("CVE-2025-29927"))
-    ids = {f"CVE-2026-{n:04d}" for n in range(1, 31)}
-    out = _run(vr.ensure(FakeDB(), ids, http=_client(handler), now=NOW, pause_s=0))
-    assert "blind" not in out and out["with_points"] == 30
+    db = FakeDB()
+    out = _pass(db, _ids(1, 30), handler)
+    assert out["canary"] == "control_ok" and out["with_points"] == 30
+    assert out["suspect_batch"] is False
+
+
+def test_the_candidates_carry_points_in_the_recorded_service_responses():
+    """A control is only a control if it parses to points. Checked against recorded real
+    responses, one per candidate, so a future edit of the list to a CVE CISA has not
+    evaluated cannot turn every pass into a permanent false alarm, and there are several
+    of them so that one retirement is survivable."""
+    assert len(vr.CANARY_CONTROL_CVES) >= 2
+    assert len(set(vr.CANARY_CONTROL_CVES)) == len(vr.CANARY_CONTROL_CVES)
+    for cve in vr.CANARY_CONTROL_CVES:
+        assert mirror.CVE_ID.match(cve)
+        rec = vr.parse(_record(cve))
+        assert rec is not None and (rec["exploitation"], rec["automatable"],
+                                    rec["technical_impact"]) != (None, None, None), cve
+
+
+def test_the_cisa_container_is_found_when_it_is_not_the_first_adp_container():
+    """CVE-2023-38545 lists the CVE Program's own container before CISA's and a vendor's
+    after it: a parser that read `adp[0]` would see no points on a perfectly good
+    control and call itself blind."""
+    payload = _record("CVE-2023-38545")
+    names = [c["providerMetadata"]["shortName"] for c in payload["containers"]["adp"]]
+    assert names.index("CISA-ADP") not in (0, len(names) - 1)
+    assert vr.parse(payload)["exploitation"] == "poc"
+
+
+def test_the_canary_source_is_one_the_table_will_accept():
+    """`mirror.record` swallows a database error on purpose (a state log must not break a
+    scan), so a source name the `intel_state_source_check` constraint rejects is not an
+    error anywhere: the verdict is simply never written, and the self-check says
+    "unknown" for ever. Every source the code writes must be in the NEWEST definition of
+    the constraint."""
+    from sentinel.db import migrate
+    from sentinel.intel import epss, osv, redhat
+    latest = None
+    for path in sorted(migrate.MIGRATIONS_DIR.glob("*.sql")):
+        text = path.read_text(encoding="utf-8")
+        if "ADD CONSTRAINT intel_state_source_check" in text:
+            latest = text
+    assert latest is not None
+    clause = latest.split("ADD CONSTRAINT intel_state_source_check", 1)[1].split(";", 1)[0]
+    accepted = set(re.findall(r"'([a-z_]+)'", clause))
+    written = {epss.SOURCE, osv.SOURCE, redhat.SOURCE, vr.SOURCE, vr.CANARY_SOURCE, "risk"}
+    assert written <= accepted, written - accepted
 
 
 # ---------------------------------------------------------------------------

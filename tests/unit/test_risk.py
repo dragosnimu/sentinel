@@ -375,17 +375,103 @@ def test_an_undated_evaluation_is_treated_as_stale_not_as_fine():
     assert a.risk["overlay"]["observation_as_of"] is None
 
 
-def test_a_pending_reboot_does_not_cancel_the_floor():
-    """The floor is applied after the one-step reboot demotion: a fix installed
-    and waiting for a restart lowers the SSVC decision (Track stays Track), and
-    the overlay still says amber. The reboot line keeps naming the SSVC decision
-    it lowered, not the overlay's."""
-    a = risk.assess(finding(fix_pending_reboot=True),
-                    intel(vulnrichment=stale_photo(), epss={"CVE-2026-0001": epss(0.9)}))
-    assert (a.color, a.decision) == ("amber", "attend")
-    assert a.risk["reboot_pending"] is True
-    assert a.risk["decision_before_reboot"] == "track"
-    assert a.risk["overlay"]["ssvc_decision"] == "track"
+def test_the_floor_is_applied_before_the_reboot_demotion_so_the_overlay_can_say_reboot():
+    """An overlay-lifted Attend whose fix is installed and waiting for a restart must
+    drop one step like every other row. The floor used to be applied AFTER the
+    demotion, so the overlay was the one row type whose colour could never say "the
+    fix is installed, a reboot is pending": it stayed amber with the reboot mark while
+    a KEV row in the same state went down. Four days were spent on exactly that
+    distinction. Floor first (Track -> Attend), demotion on the result (Attend ->
+    Track*, green); the record keeps both steps so nothing is hidden."""
+    pending = risk.assess(finding(fix_pending_reboot=True),
+                          intel(vulnrichment=stale_photo(), epss={"CVE-2026-0001": epss(0.9)}))
+    assert (pending.color, pending.decision) == ("green", "track_star")
+    assert pending.risk["reboot_pending"] is True
+    assert pending.risk["decision_before_reboot"] == "attend"
+    assert pending.risk["overlay"]["ssvc_decision"] == "track"
+    # the same facts with the fix not waiting for a restart: still the lifted amber
+    live = risk.assess(finding(),
+                       intel(vulnrichment=stale_photo(), epss={"CVE-2026-0001": epss(0.9)}))
+    assert (live.color, live.decision) == ("amber", "attend")
+    # one step down, the same step a tree-decided Attend takes
+    tree_attend = risk.assess(finding(fix_pending_reboot=True),
+                              intel(vulnrichment=stale_photo(), epss={"CVE-2026-0001": epss(0.9)}),
+                              criticality=5)
+    assert tree_attend.decision == "track_star" and "overlay" not in tree_attend.risk
+    # a lowered row is no longer Attend: it must not keep the lifted amber band
+    assert (risk.priority_of(ssvc.TRACK_STAR, 0.0) <= pending.priority
+            <= risk.priority_of(ssvc.TRACK_STAR, 1.0))
+
+
+#: Cells (automatable, technical impact, mission) where the published tree says `track`
+#: even when Exploitation is `active`. Written out by hand, from the CISA table, NOT
+#: derived from `ssvc.TABLE`, so that a change to the table is seen here as a change.
+_TRACK_EVEN_IF_ACTIVE = {("no", "partial", "low"), ("no", "partial", "medium"),
+                         ("no", "total", "low")}
+_MISSION_CRITICALITY = {"low": 1, "medium": 3, "high": 5}
+
+
+def _overlay_cell(exploitation, automatable, technical, mission, **kw):
+    """One cell of the tree with everything the overlay needs: a CISA evaluation
+    older than 180 days (all three points published, so the cell is exactly the one
+    named) and a fresh EPSS of 0.99."""
+    photo = {"CVE-2026-0001": vr(exploitation, automatable, technical, at=TODAY_MINUS(543))}
+    return risk.assess(finding(**kw), intel(vulnrichment=photo,
+                                            epss={"CVE-2026-0001": epss(0.99)}),
+                       criticality=_MISSION_CRITICALITY[mission])
+
+
+def test_the_published_table_has_exactly_these_cells_where_active_is_still_track():
+    """The premise of the next two tests, checked against the table itself: if CISA
+    republishes the tree and this set changes, the bound must be looked at again."""
+    derived = {(a, t, m) for a in ssvc.AUTOMATABLE for t in ssvc.TECHNICAL_IMPACT
+               for m in ssvc.MISSION
+               if ssvc.decide("active", a, t, m) == ssvc.TRACK}
+    assert derived == _TRACK_EVEN_IF_ACTIVE
+
+
+@pytest.mark.parametrize("exploitation", ["none", "poc"])
+@pytest.mark.parametrize("automatable,technical,mission", sorted(_TRACK_EVEN_IF_ACTIVE))
+def test_the_floor_never_claims_more_than_the_tree_would_under_active_exploitation(
+        exploitation, automatable, technical, mission):
+    """Six cells, all `automatable: no`, where a fixed `attend` floor exceeded CISA's
+    own verdict: a stale `none`/`poc` beside EPSS 0.99 turned the row amber although
+    the tree says Track even if the CVE were confirmed exploited. Sentinel's rule is
+    its own, but it must not out-shout the tree under the worst observation: here the
+    floor is Track, so there is nothing to lift, no `overlay`, no amber."""
+    a = _overlay_cell(exploitation, automatable, technical, mission)
+    assert ssvc.decide("active", automatable, technical, mission) == ssvc.TRACK
+    assert a.decision in (ssvc.TRACK, ssvc.TRACK_STAR)
+    assert a.color == "green" and "overlay" not in a.risk
+
+
+def test_the_overlay_never_exceeds_the_tree_under_active_exploitation_in_any_cell():
+    """The property over the whole space the overlay can touch (stale none/poc x every
+    automatable x impact x mission, EPSS 0.99): the final decision is never above what
+    the tree would say with Exploitation `active`, and the rows the rule DOES lift are
+    exactly those where the tree under none/poc is below Attend and under active it
+    reaches it."""
+    lifted_cells = set()
+    for exploitation in ("none", "poc"):
+        for automatable in ssvc.AUTOMATABLE:
+            for technical in ssvc.TECHNICAL_IMPACT:
+                for mission in ssvc.MISSION:
+                    a = _overlay_cell(exploitation, automatable, technical, mission)
+                    worst = ssvc.decide("active", automatable, technical, mission)
+                    tree = ssvc.decide(exploitation, automatable, technical, mission)
+                    rank = ssvc.DECISIONS.index
+                    assert rank(a.decision) <= rank(worst), (exploitation, automatable,
+                                                            technical, mission)
+                    assert rank(a.decision) >= rank(tree)
+                    if "overlay" in a.risk:
+                        lifted_cells.add((exploitation, automatable, technical, mission))
+                        assert a.decision == "attend" == a.risk["overlay"]["floor"]
+    expected = {(e, a, t, m)
+                for e in ("none", "poc") for a in ssvc.AUTOMATABLE
+                for t in ssvc.TECHNICAL_IMPACT for m in ssvc.MISSION
+                if ssvc.DECISIONS.index(ssvc.decide(e, a, t, m)) < ssvc.DECISIONS.index("attend")
+                and ssvc.DECISIONS.index(ssvc.decide("active", a, t, m)) >= ssvc.DECISIONS.index("attend")}
+    assert lifted_cells == expected and lifted_cells, "the overlay lifted nothing at all"
 
 
 def test_the_overlay_row_sorts_with_the_amber_band_not_among_the_greens():
@@ -516,14 +602,53 @@ def test_grey_always_sorts_above_green_and_below_amber():
 
 def test_the_bands_do_not_overlap_and_stay_within_zero_to_hundred():
     seen = []
-    for dec in (ssvc.TRACK, ssvc.TRACK_STAR, None, ssvc.ATTEND, ssvc.ACT):
-        lo, hi = risk.priority_of(dec, 0.0), risk.priority_of(dec, 1.0)
+    for dec, lifted in ((ssvc.TRACK, False), (ssvc.TRACK_STAR, False), (None, False),
+                        (ssvc.ATTEND, True), (ssvc.ATTEND, False), (ssvc.ACT, False)):
+        lo = risk.priority_of(dec, 0.0, lifted=lifted)
+        hi = risk.priority_of(dec, 1.0, lifted=lifted)
         assert 0 <= lo <= hi <= 100
         seen.append((lo, hi))
     for (_, hi), (lo, _) in zip(seen, seen[1:]):
         assert hi < lo
     assert seen[-1][1] == 100
     assert risk.priority_of(None, None) == risk.UNASSESSED_PRIORITY == 40
+    # the two halves of amber together are the 60..79 band the migration documents
+    assert risk.priority_of(ssvc.ATTEND, 0.0, lifted=True) == 60
+    assert risk.priority_of(ssvc.ATTEND, 1.0) == 79
+
+
+def test_lifted_only_means_something_for_attend():
+    """`lifted` is a sub-band of amber; passing it for any other decision must not move
+    that decision into amber's priorities."""
+    for dec in (ssvc.ACT, ssvc.TRACK_STAR, ssvc.TRACK, None):
+        assert risk.priority_of(dec, 0.5, lifted=True) == risk.priority_of(dec, 0.5)
+
+
+def test_an_observed_exploitation_ranks_above_a_predicted_one():
+    """The operator's decision: what was OBSERVED goes before what is PREDICTED.
+    On the real host CVE-2025-29927 (EPSS 0.992 x CVSS 9.1 = 0.903, no observation
+    since 2025) stood 1st of 812 at priority 77, above both KEV rows (75 and 74),
+    because inside amber the order was probability x impact and a KEV is only 1.0 x
+    7.5. A forecast sat above a confirmed exploitation. Same facts here, through
+    `assess`: the KEV row must outrank the overlay row, and so must the WORST possible
+    tree-decided Attend outrank the BEST possible lifted one."""
+    vector = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
+    photo = {"CVE-2026-0001": vr("none", "yes", "total", at=TODAY_MINUS(542))}
+    lifted = risk.assess(finding(cvss=9.1, cvss_vector=vector),
+                         intel(vulnrichment=photo, epss={"CVE-2026-0001": epss(0.99225)}))
+    kev = risk.assess(finding(cvss=7.5, cvss_vector=WIDE_OPEN_DOS, kev=True),
+                      intel(kev={"CVE-2026-0001": date(2026, 10, 9)},
+                            epss={"CVE-2026-0001": epss(0.006)}))
+    assert (lifted.color, lifted.decision) == ("amber", "attend") and "overlay" in lifted.risk
+    assert (kev.color, kev.decision) == ("amber", "attend") and "overlay" not in kev.risk
+    assert lifted.score > kev.score, "the premise: the forecast scores higher"
+    assert kev.priority > lifted.priority
+    # not only for this pair: the whole range
+    assert risk.priority_of(ssvc.ATTEND, 0.0) > risk.priority_of(ssvc.ATTEND, 1.0, lifted=True)
+    # and the lifted row is still amber and still above every grey
+    assert 60 <= lifted.priority < 80 and lifted.priority > risk.priority_of(None, 1.0)
+
+
 
 
 # ---------------------------------------------------------------------------

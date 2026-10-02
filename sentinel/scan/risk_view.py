@@ -81,8 +81,10 @@ def overlay_of(risk: Mapping[str, Any] | None, color: str | None = None) -> Mapp
     """Înregistrarea `risk.overlay` dacă culoarea afișată E cea urcată de regulă.
 
     Cu `color` dat, înregistrarea se ia în seamă doar la galben: un `overlay` rămas
-    într-un rând a cărui culoare nu mai e cea a podelei (un rând stricat sau
-    citit pe jumătate) nu are voie să pună eticheta „regula Sentinel" pe un verde.
+    într-un rând a cărui culoare nu mai e cea a podelei nu are voie să pună eticheta
+    „regula Sentinel" pe un verde. Starea apare și fără un rând stricat: podeaua se aplică
+    înaintea coborârii pentru repornire, deci un rând urcat a cărui reparație așteaptă o
+    repornire e verde și își păstrează `overlay` în înregistrare.
     """
     if not isinstance(risk, Mapping):
         return None
@@ -261,9 +263,13 @@ def why_lines(risk: Mapping[str, Any] | None) -> list[str]:
     lines.append(f"{cvss_txt} · {epss_txt}")
     if risk.get("reboot_pending"):
         before = risk.get("decision_before_reboot")
+        # Un rând urcat de regula Sentinel și apoi coborât de repornire: „de la Attend" ar fi
+        # o decizie pe care SSVC singur nu a dat-o, deci se spune a cui era.
+        via = (f", urcat de {OVERLAY_TAG_RO}" if before == "attend"
+               and overlay_of(risk) is not None else "")
         lines.append("🔁 Reparația e instalată, lipsește o repornire: urgența a "
                      "coborât o treaptă"
-                     + (f" (de la {DECISION_LABEL_RO.get(before, before)})" if before else "")
+                     + (f" (de la {DECISION_LABEL_RO.get(before, before)}{via})" if before else "")
                      + "; importanța a rămas aceeași.")
     if risk.get("cve_via"):
         lines.append(f"CVE-ul vine din aliasul avizului {risk['cve_via']}.")

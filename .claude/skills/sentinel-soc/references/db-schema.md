@@ -190,9 +190,13 @@ order inside a colour. The old points formula (`scan/prioritize.py`) is gone.
 
 One rule is Sentinel's own and is NOT SSVC's or FIRST's: if CISA's Exploitation
 value (`none`/`poc`) is older than 180 days and the fresh EPSS is >= 0.5, the colour
-is floored at amber (`attend`), and `findings.risk.overlay` records
-`basis: epss_overlay`, the SSVC decision it overrode and the numbers applied. The
-`points` are never rewritten, and grey stays grey. Every surface labels such a row
+is floored at amber (`attend`) — but never above what the tree would say with
+Exploitation `active` for the same row (six table cells stay green) — and
+`findings.risk.overlay` records `basis: epss_overlay`, the SSVC decision it overrode and
+the numbers applied. The floor is applied BEFORE the pending-reboot demotion, so a lifted
+row with a pending reboot is Track* (green), like any other row one step down. Inside
+amber, tree-decided Attend rows have `priority` 70-79 and lifted ones 60-69: what was
+observed ranks above what is predicted. The `points` are never rewritten, and grey stays grey. Every surface labels such a row
 "regula Sentinel, nu SSVC". Technical Impact from a CVSS vector is `total` only
 when `C:H` AND `I:H` (CVSS `C:H` is total loss of the *component*, SSVC's `total` is
 of the *system*; CISA agrees with the "and" reading on 95% of the host's CVEs).

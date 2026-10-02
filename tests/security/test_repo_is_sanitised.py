@@ -549,6 +549,13 @@ VALUE_EXEMPT: dict[str, tuple[dict[str, int], str]] = {
         ({SHAPE_HEX: 1}, "identificatorul public al containerului CISA-ADP"),
     "tests/fixtures/intel/cveawg_CVE-2025-39964.json":
         ({SHAPE_HEX: 1}, "identificatorul public al containerului CISA-ADP"),
+    # Candidatele controlului pozitiv al parserului (`vulnrichment.CANARY_CONTROL_CVES`):
+    # același UUID, aceeași formă, aceeași dată în fiecare. UUID-urile celorlalți furnizori
+    # ADP din aceleași răspunsuri au fost scoase din fixturi, nu scutite.
+    "tests/fixtures/intel/cveawg_CVE-2024-3094.json":
+        ({SHAPE_HEX: 1}, "identificatorul public al containerului CISA-ADP"),
+    "tests/fixtures/intel/cveawg_CVE-2023-38545.json":
+        ({SHAPE_HEX: 1}, "identificatorul public al containerului CISA-ADP"),
     "tests/unit/test_signing.py": ({SHAPE_HEX: 5}, "vectori de aur canonici"),
     "tests/unit/test_beacon.py": ({SHAPE_HEX: 2}, "vector de aur canonic"),
     "aggregator/tests/canonical.test.ts": ({SHAPE_HEX: 4}, "vectori de aur canonici"),

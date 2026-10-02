@@ -246,6 +246,21 @@ def test_the_overlay_label_is_ignored_on_any_colour_it_does_not_explain():
     assert rv.headline("amber", "attend", {"overlay": "x"}) == "🟡 Attend — accelerat"
 
 
+@pytest.mark.parametrize("color", ["green", "red", "grey"])
+def test_the_overlay_guard_holds_when_colour_and_decision_disagree(color):
+    """The test above pairs each colour with the decision that goes with it, so
+    `headline`'s own `decision == "attend"` check turns the tag away first and the colour
+    guard inside `overlay_of` is never what stops it. A row whose decision says Attend
+    while its colour is not amber (a half-read replica, a row written by an older version)
+    reaches the guard itself: without it the operator reads "regula Sentinel" on a green
+    or a red, a lie about whose verdict that is. The Python/TypeScript parity test covers
+    this too, but it is skipped wherever `aggregator/node_modules` is absent (every clean
+    clone), which is exactly where nothing else would notice the guard gone."""
+    assert rv.overlay_of(OVERLAY_RISK, color) is None
+    assert rv.overlay_of(OVERLAY_RISK, "amber") is OVERLAY_RISK["overlay"]
+    assert "Sentinel" not in rv.headline(color, "attend", OVERLAY_RISK)
+
+
 def test_the_overlay_reason_fits_the_telegram_list_column_even_with_the_reboot_mark():
     """Telegram cuts the reason at `MAX_REASON_LIST` characters. A label cut in the
     middle ("regula Sentinel (EP") is worse than none."""
@@ -274,3 +289,23 @@ def test_the_detail_says_in_plain_words_whose_rule_it_is_why_and_what_ssvc_said(
     # No overlay, no sentence.
     plain = {k: v for k, v in OVERLAY_RISK.items() if k != "overlay"}
     assert not any("SENTINEL" in line for line in rv.why_lines(plain))
+
+
+def test_a_lifted_row_lowered_by_a_reboot_says_the_attend_it_fell_from_was_sentinels():
+    """The floor is applied before the reboot demotion, so a row Sentinel's rule lifted
+    to Attend and whose fix then waits for a restart is Track* (green) with `overlay` and
+    `decision_before_reboot = attend` in its record. The detail line "lowered one step
+    from Attend" would send the operator looking for a CISA verdict that was never given:
+    it must say the Attend was Sentinel's. A KEV row lowered from Act must not carry
+    that tag, and the green row must not wear the amber label."""
+    lowered = {**OVERLAY_RISK, "decision": "track_star", "reboot_pending": True,
+               "decision_before_reboot": "attend"}
+    line = next(x for x in rv.why_lines(lowered) if "repornire" in x)
+    assert "de la Attend — accelerat, urcat de regula Sentinel, nu SSVC" in line
+    assert "Sentinel" not in rv.headline("green", "track_star", lowered)
+    assert not any("SENTINEL" in x for x in rv.why_lines(lowered)), (
+        "the amber explanation belongs to an amber row")
+    kev = {"decision": "attend", "reboot_pending": True, "decision_before_reboot": "act",
+           "points": {"exploitation": {"value": "active", "basis": "kev"}}}
+    kev_line = next(x for x in rv.why_lines(kev) if "repornire" in x)
+    assert "Sentinel" not in kev_line and "de la Act — acum" in kev_line

@@ -894,7 +894,9 @@ export function findingsPage(view: FindingsView): string {
     "„regula Sentinel” a fost urcat acolo fiindcă EPSS ≥ 50% stă lângă o evaluare CISA de " +
     "peste 180 de zile; SSVC singur l-ar fi lăsat mai jos. " +
     "<strong>Gri înseamnă că lipsesc date, nu că e în regulă.</strong> Neaplicatele primele, apoi " +
-    "ordonate după culoare, apoi după probabilitate × impact. Replica nu recalculează " +
+    "ordonate după culoare, apoi după probabilitate × impact; în galben, un rând decis de " +
+    "arborele CISA stă înaintea unuia urcat de regula Sentinel (decizia CISA, înaintea " +
+    "estimării EPSS). Replica nu recalculează " +
     "nimic și nu amestecă serverele: culoarea unui rând e verdictul gazdei lui.</p>\n" +
     absent("findings", view.arrivals) +
     table(

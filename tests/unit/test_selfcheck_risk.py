@@ -39,6 +39,19 @@ def _by_key(results):
     return {r.key: r for r in results}
 
 
+def _canary(verdict="control_ok", ok_h=0.2, error=None, **detail):
+    """The control's own row (`vulnrichment_canary`): `ok_h` is the age of the last
+    CONFIRMATION (`last_ok_at`), not of the last attempt."""
+    return _row("vulnrichment_canary", ok_h, error=error,
+                detail={"canary": verdict, "control_cve": "CVE-2025-29927", **detail})
+
+
+def _vr(*rows, lookups_h=0.2):
+    """The state of the source: the lookups row plus whatever the control left."""
+    return _by_key(run(checks.check_risk_intel(_DB(
+        [_row("risk", 0.1), _row("vulnrichment", lookups_h), *rows]))))["risk:vulnrichment"]
+
+
 def test_no_evaluation_at_all_is_unknown_not_ok():
     """No row for `risk` means nothing has ever been evaluated: every finding is
     grey. "Nothing recorded" must not read as "nothing wrong"."""
@@ -49,7 +62,8 @@ def test_no_evaluation_at_all_is_unknown_not_ok():
 
 def test_a_healthy_pass_is_ok_and_names_the_grey_count_without_alarming():
     rows = [_row("risk", 0.5, detail={"colors": {"red": 1, "grey": 25, "green": 783}, "findings": 809}),
-            _row("epss", 5.0), _row("vulnrichment", 2.0), _row("redhat", 3.0), _row("osv", 3.0)]
+            _row("epss", 5.0), _row("vulnrichment", 2.0), _canary(), _row("redhat", 3.0),
+            _row("osv", 3.0)]
     out = _by_key(run(checks.check_risk_intel(_DB(rows))))
     assert {r.status for r in out.values()} == {"ok"}
     assert "risk:vulnrichment" in out      # the loop over sources must not skip it
@@ -98,28 +112,138 @@ def test_a_blind_vulnrichment_parser_degrades_even_though_the_source_answers():
     """The loud failure (HTTP 503) is easy. The quiet one is a 200 response whose
     CISA container the parser no longer finds: every CVE then reads "CISA has
     evaluated nothing", Exploitation falls to "not in KEV", and the pass reports
-    success. `ensure` marks it `blind` when 20+ CVEs arrive with zero points AND a
-    control CVE known to carry points did not confirm the parser (it came back
-    without points, or could not be read). The text says so: an operator who reads
-    "zero points" alone cannot tell this from a Debian batch."""
-    rows = [_row("risk", 0.1), _row("vulnrichment", 0.1, error="20 CVE-uri primite",
-                                    detail={"blind": True, "asked": 40,
-                                            "canary": "control_blind"})]
-    out = _by_key(run(checks.check_risk_intel(_DB(rows))))
-    assert out["risk:vulnrichment"].status == "degraded"
-    assert "zero puncte SSVC" in out["risk:vulnrichment"].detail
-    assert "controlul pozitiv" in out["risk:vulnrichment"].detail
+    success. The control (CVEs known to carry points, asked live on every pass) came back
+    without points. The text says so, and it says the alarm stays until a control
+    confirms the parser."""
+    out = _vr(_canary("control_blind", ok_h=None, error="controlul vine FĂRĂ puncte"))
+    assert out.status == "degraded"
+    assert "controlul pozitiv" in out.detail and "fără puncte SSVC" in out.detail
+    assert "până când o nouă încercare" in out.detail.lower()
+
+
+def test_the_lookups_succeeding_does_not_clear_a_blind_verdict():
+    """The lookups row is fresh and clean (an ordinary pass answered a minute ago); the
+    control row says blind. The check must read the control, not the lookups: this is the
+    pairing that used to say "ok" within the hour."""
+    out = _vr(_canary("control_blind", ok_h=None, error="x"), lookups_h=0.01)
+    assert out.status == "degraded"
+
+
+def test_ok_needs_a_confirmation_and_not_just_answers_from_the_source():
+    """"CISA Vulnrichment: ok" claims the parser still sees points. With no control row
+    that is not a fact, only the lookups answering: unknown, not ok."""
+    out = _vr()
+    assert out.status == "unknown" and "controlul pozitiv nu a rulat" in out.detail
+    ok = _vr(_canary())
+    assert ok.status == "ok" and "CVE-2025-29927" in ok.detail
+
+
+def test_an_ok_verdict_goes_stale_when_nothing_reconfirms_it():
+    """`control_ok` written 30 hours ago and no attempt since (the pass stopped reaching
+    the step, the source was switched off): the verdict is still "ok" in the row, but the
+    claim "the parser sees points" has no evidence younger than the bound."""
+    fresh = _vr(_canary(ok_h=checks.CANARY_UNCONFIRMED_H - 0.5))
+    assert fresh.status == "ok"
+    stale = _vr(_canary(ok_h=checks.CANARY_UNCONFIRMED_H + 0.5))
+    assert stale.status == "degraded" and "reconfirmat" in stale.detail
+
+
+def test_an_unreadable_control_is_unknown_for_as_long_as_the_lookups_branch_would_tolerate():
+    """The CVE service is outside the host: three hourly passes that cannot reach it are an
+    upstream fact the operator cannot fix, and `degraded` rings on Telegram. The lookups
+    branch of the SAME check key tolerates `VENDOR_DEGRADED_H` for the same fact, so the
+    control gets the same bound: `unknown` (not announced, not "ok") until then, `degraded`
+    after. Before this, three hours of an upstream outage paged the operator about something
+    nothing on the host could change, while the lookups stayed quiet for 36."""
+    recent = _vr(_canary("control_unreadable", ok_h=1.0, error="503"))
+    assert recent.status == "unknown" and "ultima confirmare acum" in recent.detail
+    just_past_three = _vr(_canary("control_unreadable", ok_h=checks.CANARY_UNCONFIRMED_H + 1,
+                                  error="503"))
+    assert just_past_three.status == "unknown" and not just_past_three.bad, (
+        "an upstream outage of four hours paged the operator")
+    inside = _vr(_canary("control_unreadable", ok_h=checks.VENDOR_DEGRADED_H - 1, error="503"))
+    assert inside.status == "unknown"
+    old = _vr(_canary("control_unreadable", ok_h=checks.VENDOR_DEGRADED_H + 1, error="503"))
+    assert old.status == "degraded"
+    never = _vr(_canary("control_unreadable", ok_h=None, error="503"))
+    assert never.status == "degraded" and "niciodată" in never.detail, (
+        "with no confirmation there is no start of the outage to measure from")
+
+
+def test_the_two_thresholds_for_one_external_fact_cannot_drift_apart():
+    """The control and the lookups both fail when the CVE service is down. If the control's
+    bound were shorter it would ring first and the operator would hear about one outage in
+    two voices; if longer, an outage the lookups already call degraded would show `unknown`
+    here. They are one number."""
+    assert checks.CANARY_UNREADABLE_H == checks.VENDOR_DEGRADED_H
+
+
+def test_an_outage_past_the_bound_is_one_alarm_not_two():
+    """Lookups AND control both past 36 hours (the service has been down for two days): the
+    key `risk:vulnrichment` carries ONE result, the lookups' one, not a second about the
+    control."""
+    out = run(checks.check_risk_intel(_DB([
+        _row("risk", 0.1), _row("vulnrichment", checks.VENDOR_DEGRADED_H + 2, error="HTTP 503"),
+        _canary("control_unreadable", ok_h=checks.VENDOR_DEGRADED_H + 2, error="503")])))
+    mine = [r for r in out if r.key == "risk:vulnrichment"]
+    assert len(mine) == 1 and mine[0].status == "degraded"
+    assert "căutările eșuează" in mine[0].title
+
+
+def test_an_unreadable_control_beside_a_suspect_batch_is_degraded_at_once():
+    """The old alarm, kept whole: 20+ CVEs and not one point, and the control cannot be
+    read to tell a Debian batch from a blind parser. That combination was "blind" before and
+    still is, whatever confirmation is on record. The service answered for 20+ CVEs in that
+    very pass, so it is not the upstream outage the grace period is for."""
+    out = _vr(_canary("control_unreadable", ok_h=0.5, error="503", suspect_batch=True))
+    assert out.status == "degraded"
+
+
+def test_an_ok_verdict_that_nothing_renews_still_goes_stale_at_three_hours():
+    """`stale` keeps the short bound: its cause is the hourly pass no longer reaching the
+    control, which is a fact about the host. Only the unreadable branch got the long one."""
+    assert _vr(_canary(ok_h=checks.CANARY_UNCONFIRMED_H + 0.5)).status == "degraded"
+    assert checks.CANARY_UNCONFIRMED_H < checks.CANARY_UNREADABLE_H
+
+
+def test_exhausted_candidates_name_the_list_to_replace_not_a_broken_parser():
+    """All three candidates lost their points while the host's own CVEs still parse to
+    points. Saying "the parser changed" (what `blind` says) sends the operator to the wrong
+    code. This says what to edit, and says the parser is not what is judged broken. Degraded
+    (it rings): nothing upstream will heal a spent candidate list, only the operator can,
+    and an `unknown` is never announced, so the lost cover would stay silent."""
+    old = _vr(_canary("control_exhausted", ok_h=checks.CANARY_UNCONFIRMED_H + 1,
+                      error="candidatele controlului au rămas fără puncte SSVC"))
+    assert old.status == "degraded"
+    assert "CANARY_CONTROL_CVES" in old.action
+    assert "NU e dat drept orb" in old.detail
+    assert "schimbat" not in old.detail and "formatul" not in old.detail
+    from sentinel.selfcheck import runner
+    text = runner.format_alert([old], [])
+    assert "CANARY_CONTROL_CVES" in text and "parser orb" not in text
+    never = _vr(_canary("control_exhausted", ok_h=None, error="x"))
+    assert never.status == "degraded"
+    fresh = _vr(_canary("control_exhausted", ok_h=1.0, error="x"))
+    assert fresh.status == "unknown" and not fresh.bad, (
+        "one pass of candidates without points (a record being re-scored) must not page")
+
+
+def test_a_blind_verdict_still_names_the_parser():
+    """The counterpart: `blind` keeps its own words, so the two states cannot be confused."""
+    out = _vr(_canary("control_blind", ok_h=None, error="x"))
+    assert "formatul" in out.detail and "CANARY_CONTROL_CVES" not in out.action
 
 
 def test_a_healthy_vulnrichment_is_ok_and_a_stale_or_aborted_one_degrades():
-    ok = _by_key(run(checks.check_risk_intel(_DB([_row("risk", 0.1), _row("vulnrichment", 2.0)]))))
-    assert ok["risk:vulnrichment"].status == "ok"
+    ok = _vr(_canary())
+    assert ok.status == "ok"
     stale = _by_key(run(checks.check_risk_intel(_DB(
-        [_row("risk", 0.1), _row("vulnrichment", checks.VENDOR_DEGRADED_H + 1, error="HTTP 503")]))))
+        [_row("risk", 0.1), _row("vulnrichment", checks.VENDOR_DEGRADED_H + 1, error="HTTP 503"),
+         _canary()]))))
     assert stale["risk:vulnrichment"].status == "degraded"
     aborted = _by_key(run(checks.check_risk_intel(_DB(
         [_row("risk", 0.1), _row("vulnrichment", 1.0, error="HTTP 503",
-                                 detail={"aborted": True})]))))
+                                 detail={"aborted": True}), _canary()]))))
     assert aborted["risk:vulnrichment"].status == "degraded"
     assert "eșecuri consecutive" in aborted["risk:vulnrichment"].detail
 

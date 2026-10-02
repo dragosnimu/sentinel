@@ -63,31 +63,116 @@ Trei stări, și nu sunt aceeași:
 ## Un parser orb arată ca „CISA n-a evaluat nimic"
 
 Dacă CISA își schimbă `orgId`, rolul sau forma `options`, fiecare răspuns devine
-„found fără puncte", iar Exploitation cade tăcut pe `none`. De aceea o trecere care
-primește cel puțin `CANARY_MIN` CVE-uri și NICIUN punct SSVC devine SUSPECTĂ.
+„found fără puncte", iar Exploitation cade tăcut pe `none`: presupunerea `kev_absent`
+hotărăște deja 395 din 812 rânduri pe producție, deci un parser orb ar muta tăcut
+jumătate din pagină. Alarma pentru asta a avut două defecte, ambele măsurate pe
+2 octombrie 2026, înainte de forma de azi:
 
-**Suspectă nu înseamnă orbă.** Doar 7% dintre CVE-urile Debian de nucleu au puncte
-CISA, deci un lot de 20–30 de CVE-uri noi de `linux-libc-dev` are zero puncte cu
-probabilitatea 0,93^20 ≈ 23% (0,93^30 ≈ 11%), fără ca parserul să fi greșit ceva; iar
-`UNENRICHED_DAYS` ar fi ținut `degraded` două zile. O alarmă care sună după
-COMPOZIȚIA lotului, nu după o stricăciune, învață operatorul s-o ignore. De aceea
-suspiciunea se verifică cu un CONTROL POZITIV: se cere de la serviciu, în aceeași
-trecere, un CVE despre care se știe că poartă puncte (`CANARY_CONTROL_CVE`) și se
-trece prin același parser.
+  * **Se ștergea singură în cel mult o oră.** Verdictul stătea în `intel_state.detail`
+    al rândului `vulnrichment`, iar `mirror.run_lookups` rescrie `detail` ÎNTREG la
+    sfârșitul oricărei treceri care a primit vreun răspuns. Reprodus: trecerea 1 (30 de
+    CVE-uri, zero puncte) ridica `blind`; trecerea 2 (5 CVE-uri, zero puncte) îl ștergea
+    și raporta `ok`. `enrich.run` rulează din oră în oră.
+  * **Nu se evalua aproape niciodată.** Controlul se cerea doar când lotul avea cel puțin
+    `CANARY_MIN` (20) CVE-uri `found` fără puncte. O trecere obișnuită de pe producție
+    cere ~5–6 CVE-uri (196 evaluate reluate săptămânal ≈ 1,2/oră, ~210 neevaluate reluate
+    la două zile ≈ 4,4/oră), deci într-o lume cu parserul orb pragul nu se atingea decât
+    la o scanare cu 20+ CVE-uri NOI deodată, iar trecerea de după o ștergea.
 
-  * controlul DĂ puncte → parserul vede formatul de azi, lotul era doar neevaluat:
-    nicio alarmă (`canary = "control_ok"` în rezumat);
-  * controlul vine FĂRĂ puncte → parser orb: `blind`, în `intel_state.detail`, iar
-    autoverificarea o ridică;
-  * controlul nu se poate citi (cerere picată, 404, răspuns ilizibil) → NU se poate
-    spune nimic, și „nu se poate spune" nu e „în regulă": se marchează `blind` cu
-    motivul „control indisponibil", ca o alarmă care poate fi falsă să nu fie
-    înlocuită cu o tăcere care poate fi falsă.
+Rezultat: „CISA Vulnrichment: ok” însemna „ultima trecere orară a primit răspunsuri”, nu
+„parserul încă vede puncte”. Forma de acum are două părți, și fiecare repară câte un
+defect:
 
-Controlul se cere LIVE, nu din fixture: o înregistrare reținută local doar ar dovedi
-că parserul încă înțelege formatul VECHI, adică exact ce nu e întrebarea. Parserul e
-probat pe înregistrări reale (`tests/fixtures/intel/cveawg_*.json`), nu pe unele scrise
-de mână.
+**1. Controlul pozitiv se cere la FIECARE trecere, indiferent de lot.** Un CVE despre
+care se știe că poartă puncte CISA trece live, prin același `fetch_one`, și dacă vine
+fără puncte, parserul e orb. Costă o cerere pe oră (limita serviciului: 25.000/min) și
+face ca verdictul să nu depindă de mărimea sau compoziția lotului: într-o lume orbă,
+fiecare trecere îl calculează. Compoziția lotului nu mai poate nici ridica alarma pe
+nedrept: 7% din CVE-urile Debian de nucleu au puncte, deci 20–30 de CVE-uri noi de
+`linux-libc-dev` vin fără niciunul cu probabilitatea 0,93^20 ≈ 23%, fără ca parserul să
+fi greșit ceva. Controlul trece LIVE, nu din fixture: o înregistrare reținută ar dovedi
+doar că parserul încă înțelege formatul VECHI, adică exact ce nu e întrebarea.
+
+**2. Verdictul stă pe rândul LUI din `intel_state`** (`CANARY_SOURCE`, migrația 0049), pe
+care `run_lookups` nu-l atinge. Un succes al căutărilor nu mai poate șterge un verdict
+de care nu e răspunzător; verdictul se schimbă doar când o NOUĂ încercare a controlului
+dă alt răspuns. `last_ok_at` al rândului e momentul ultimei CONFIRMĂRI (controlul a dat
+puncte), nu al ultimei treceri: autoverificarea citește vechimea confirmării, deci
+„ok” înseamnă „parserul a văzut puncte acum X”, cu X afișat și mărginit.
+
+Variantele respinse, ca să nu fie reinventate:
+
+  * *o măsurătoare pe fereastră* (câte CVE-uri `found` față de câte cu puncte, pe ultimele
+    24 de ore de `fetched_at`) — `store` păstrează punctele deja scrise
+    (`COALESCE`), deci într-o lume orbă rândurile reluate își mută `fetched_at` și
+    PĂSTREAZĂ punctele vechi: fereastra ar arăta sănătos tocmai când nu e;
+  * *`blind` într-o cheie pe care un succes nu o poate suprascrie, în același rând* —
+    merge, dar ar lăsa într-un singur rând două lucruri cu vârste diferite (ultima
+    trecere a căutărilor, ultima confirmare a parserului), iar `last_ok_at` nu ar putea
+    fi nici unul, nici celălalt fără o cheie în plus și un citit-apoi-scris.
+
+### Măsurat (2 octombrie 2026), pe cele 400 de CVE-uri deschise ale producției
+
+Răspunsurile reale ale serviciului reluate prin `vulnrichment.ensure` cu un ceas virtual de
+o oră pe trecere, într-o lume în care parserul devine orb din prima oră (`orgId`-ul CISA
+schimbat în toate răspunsurile). Două stări de plecare: *cohorte desincronizate* (starea
+stabilă, ~5,3 CVE cerute pe trecere, 72 de treceri) și *cohortele pornirii la rece* (toate
+cerute odată, cum e producția azi, 200 de treceri). Vechiul cod: verdictul calculat în
+**0 din 72** de treceri (starea stabilă) și în **4–5 din 200** (cohorte: abia la trecerea 48,
+când cele 207 CVE neevaluate ajung la termen); autoverificarea a spus „ok" **72 din 72**,
+respectiv 47 de ore, într-o lume cu parserul orb. Codul de acum: verdictul calculat în **72 din
+72** și **200 din 200**, `degraded` de la trecerea 1 și până la capăt. Simularea nu are CVE-uri noi
+aduse de scanări și nu are căderi de rețea; are răspunsuri reale, codul real al trecerii și SQL-ul
+real al `intel_state`.
+
+### Ce poate și ce nu poate spune controlul
+
+  * controlul DĂ puncte → parserul vede puncte pe o înregistrare vie (`control_ok`);
+  * toate candidatele citite vin FĂRĂ puncte → parser orb (`control_blind`) — dar numai dacă
+    nimic din aceeași trecere nu-l contrazice, vezi mai jos;
+  * toate candidatele citite vin fără puncte, DAR parserul a citit puncte pe înregistrările
+    gazdei (același parser, același minut, același drum) → nu parserul e orb, ci CANDIDATELE
+    au rămas fără puncte (`control_exhausted`);
+  * nicio candidată nu se poate citi (cerere picată, 404, răspuns ilizibil) →
+    `control_unreadable`: NU se poate spune nimic, iar „nu se poate spune” nu e „în
+    regulă”. Autoverificarea îl tratează ca pe un `unknown` cât confirmarea precedentă
+    e recentă (`checks.CANARY_UNCONFIRMED_H`: o pană scurtă a serviciului CVE nu e o
+    stricăciune a parserului), și ca pe `degraded` mai târziu — sau imediat, dacă lotul
+    aceleiași treceri era suspect (`CANARY_MIN` CVE-uri `found` și niciun punct: forma
+    alarmei de dinainte, păstrată întreagă).
+
+**„Orb” și „cele trei candidate au amuțit” sunt două fapte, iar aceeași trecere le deosebește.**
+Lotul gazdei trece prin același `fetch_one`: dacă a citit puncte (`with_points > 0`), parserul
+nu e orb, oricâte candidate vin fără. Verdictul `control_exhausted` cere altă acțiune decât
+`control_blind`: nu „parserul s-a stricat”, ci „înlocuiți `CANARY_CONTROL_CVES`”. Dovada vine
+doar de la loturile cu puncte, iar majoritatea trecerilor orare au un lot fără niciunul (~5
+CVE-uri, câteva evaluate): o regulă care ar judeca fiecare trecere separat ar spune
+`control_exhausted` la trecerea cu puncte și `control_blind` la următoarea liniștită,
+adică ar repeta minciuna jumătate din timp. De aceea dovada se PĂSTREAZĂ în rând
+(`exhausted_proof_at`, preluată de la trecerea precedentă): o trecere liniștită cu toate
+candidatele fără puncte rămâne `control_exhausted` cât timp dovada există, iar o trecere în
+care controlul nu s-a putut citi n-o șterge. Dovada o șterge doar un `control_ok` (candidatele
+au din nou puncte). Costul acceptat: într-o lume cu candidate epuizate, un parser care ar
+orbi DUPĂ dovadă rămâne sub `control_exhausted`. Alarma suna oricum `degraded`, dar cu
+diagnosticul greșit, **și înlocuirea candidatelor NU o repară**: dovada nu e legată de lista
+de candidate, iar într-o lume oarbă `control_ok` nu mai vine niciodată, deci n-are ce s-o
+șteargă. Măsurat pe 2 octombrie 2026, cu trei treceri după înlocuire: tot `control_exhausted`.
+Singurul indiciu rămâne `batch_with_points: 0` în `facts.canary_detail`. Reparația e să se
+păstreze lista de candidate lângă dovadă și să se arunce o dovadă înregistrată sub altă
+listă — nefăcută aici, fir separat. Până atunci cazul cere două defecte suprapuse
+(toate candidatele își pierd containerul ADP, și abia apoi se rupe parserul).
+
+**Controlul nu atârnă de un singur CVE.** O singură candidată fixată ar fi făcut ca, în
+ziua în care înregistrarea ei e retrasă, reevaluată sau își pierde containerul ADP,
+fiecare trecere să raporteze „control indisponibil” la nesfârșit. De aceea sunt
+`CANARY_CONTROL_CVES` candidate, întrebate pe rând până răspunde una cu puncte: una
+retrasă nu dă alarmă (costă o cerere în plus pe trecere), iar parserul e declarat orb
+doar dacă TOATE candidatele CITITE vin fără puncte. Candidatele au înregistrări reale
+în `tests/fixtures/intel/` și un test verifică că fiecare parsează la puncte.
+
+**Ce NU dovedește controlul**: că parserul citește corect fiecare înregistrare CVE. O
+schimbare care atinge doar unele înregistrări (alt rol pentru CVE-uri noi, de exemplu)
+lasă controlul verde. Dovedește că formatul pe care l-am citit până azi încă există.
 
 Nu ridică niciodată spre apelant: o sursă căzută lasă punctele neluate, iar de acolo
 iese gri, nu o scanare oprită.
@@ -95,6 +180,8 @@ iese gri, nu o scanare oprită.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -139,15 +226,31 @@ NOT_FOUND_DAYS = 7.0
 #: politețe, nu constrângere.
 BUDGET = 400
 PAUSE_S = 0.1
-#: De la câte CVE-uri `found` într-o trecere, zero puncte SSVC fac parserul SUSPECT
-#: (nu orb: vezi „Un parser orb arată ca «CISA n-a evaluat nimic»").
+#: De la câte CVE-uri `found` într-o trecere, zero puncte SSVC fac LOTUL suspect. De la
+#: aceeași valoare pornea, înainte, TOATĂ alarma; acum controlul se cere la fiecare
+#: trecere, iar suspiciunea a rămas pentru un singur lucru: un control care nu se poate
+#: citi, lângă un lot suspect, nu mai primește răgazul unui control care nu se poate
+#: citi lângă un lot obișnuit (vezi „Ce poate și ce nu poate spune controlul").
 CANARY_MIN = 20
-#: CVE-ul de control pozitiv: înregistrarea lui poartă un container CISA-ADP cu puncte
-#: SSVC (Exploitation `none`, Automatable `yes`, Technical Impact `total`, evaluat la
-#: 8 aprilie 2025), înregistrată în fixture-ul `cveawg_CVE-2025-29927.json`.
-#: Alegerea e a Sentinel; orice CVE evaluat de CISA ar merge, iar unul vechi și stabil
-#: e mai bun decât unul proaspăt, a cărui evaluare ar putea fi încă în curs.
-CANARY_CONTROL_CVE = "CVE-2025-29927"
+#: Rândul din `intel_state` pe care stă verdictul controlului, SEPARAT de `vulnrichment`
+#: ca succesul căutărilor (`run_lookups` rescrie `detail`-ul rândului lui) să nu-l poată
+#: șterge. Valoarea trebuie să fie și în CHECK-ul `intel_state_source_check`
+#: (migrația 0049); un test o verifică.
+CANARY_SOURCE = "vulnrichment_canary"
+#: Candidatele CONTROLULUI POZITIV, în ordinea în care se întreabă: înregistrări care
+#: poartă un container CISA-ADP cu puncte SSVC, fiecare cu fixture real în
+#: `tests/fixtures/intel/cveawg_<CVE>.json` (2 octombrie 2026):
+#:   * CVE-2025-29927 — Exploitation `none`, Automatable `yes`, Technical Impact `total`,
+#:     evaluat la 8 aprilie 2025;
+#:   * CVE-2024-3094 — `none` / `yes` / `total`, 2 aprilie 2024;
+#:   * CVE-2023-38545 — `poc` / `no` / `total`, 17 octombrie 2024, cu CISA-ADP între alte
+#:     containere ADP (parserul trebuie să-l găsească și când nu e primul).
+#: Alegerea e a Sentinel; orice CVE evaluat de CISA ar merge, iar unul vechi și stabil e mai
+#: bun decât unul proaspăt, a cărui evaluare ar putea fi încă în curs. **Candidatele NU sunt
+#: „CVE-uri care nu sunt ale gazdei": CVE-2025-29927 e o constatare deschisă pe producție.**
+#: Controlul nu o stochează ca dată a gazdei (nu scrie nimic în `vulnrichment`); dacă CVE-ul
+#: apare și printre cele ale gazdei, lotul îl cere separat, pe drumul lui obișnuit.
+CANARY_CONTROL_CVES = ("CVE-2025-29927", "CVE-2024-3094", "CVE-2023-38545")
 
 
 @dataclass(frozen=True)
@@ -253,29 +356,159 @@ async def fetch_one(http: httpx.AsyncClient, cve: str) -> mirror.Outcome:
     return mirror.Outcome("found", record)
 
 
-async def _control_result(http: httpx.AsyncClient | None) -> tuple[str, str | None]:
-    """Controlul pozitiv: `("points" | "blind" | "unreadable", motiv)`.
+@dataclass(frozen=True)
+class Control:
+    """Ce a spus controlul pozitiv la o trecere."""
+    verdict: str                 # "points" | "no_points" | "unreadable"
+    cve: str | None              # candidata care a dat puncte (doar la "points")
+    asked: tuple[str, ...]       # candidatele întrebate, în ordine
+    why: str | None              # motivul, la "unreadable" / "no_points"
 
-    Cere LIVE `CANARY_CONTROL_CVE` și îl trece prin `fetch_one` — același drum ca pe
-    orice CVE al gazdei — fără să scrie nimic în `vulnrichment` (nu e un CVE al
-    gazdei). Nu ridică.
+
+def _has_points(rec: dict[str, Any] | None) -> bool:
+    return any((rec or {}).get(k) is not None
+               for k in ("exploitation", "automatable", "technical_impact"))
+
+
+async def _control_result(http: httpx.AsyncClient | None, *,
+                          pause_s: float = PAUSE_S) -> Control:
+    """Controlul pozitiv: cere LIVE candidatele din `CANARY_CONTROL_CVES`, pe rând, prin
+    `fetch_one` — același drum ca pe orice CVE al gazdei — fără să scrie nimic în
+    `vulnrichment`. Nu ridică.
+
+    S-a oprit la prima care dă puncte: de regulă o singură cerere. Una citită dar FĂRĂ
+    puncte (retrasă, reevaluată, fără container ADP) nu hotărăște nimic singură, se trece
+    la următoarea; `no_points` înseamnă că toate cele CITITE vin fără (orb sau epuizate:
+    `run_control` deosebește cele două, cu lotul gazdei). Dacă niciuna n-a putut fi citită,
+    nu se poate spune nimic.
+
+    Costul în cel mai rău caz (serviciul căzut): `len(CANARY_CONTROL_CVES)` cereri de câte
+    `mirror.TIMEOUT_S`, adică 90 s, adăugate trecerii orare; unitatea de mentenanță are
+    `TimeoutStartSec=900`, iar trecerea de risc e ultimul ei pas.
     """
     owns = http is None
     client = http or mirror.client()
+    asked: list[str] = []
+    without_points: list[str] = []
+    unreadable: list[str] = []
     try:
-        outcome = await fetch_one(client, CANARY_CONTROL_CVE)
-    except Exception as exc:  # noqa: BLE001 - controlul nu are voie să strice trecerea
-        return "unreadable", f"{type(exc).__name__}: {exc}"[:120]
+        for index, cve in enumerate(CANARY_CONTROL_CVES):
+            if index and pause_s:
+                await asyncio.sleep(pause_s)
+            asked.append(cve)
+            try:
+                outcome = await fetch_one(client, cve)
+            except Exception as exc:  # noqa: BLE001 - controlul nu are voie să strice trecerea
+                unreadable.append(f"{cve}: {type(exc).__name__}: {exc}"[:120])
+                continue
+            if outcome.kind == "found":
+                if _has_points(outcome.record):
+                    return Control("points", cve, tuple(asked), None)
+                without_points.append(cve)
+            else:
+                unreadable.append(f"{cve}: {outcome.error or outcome.kind}"[:120])
     finally:
         if owns:
             await client.aclose()
-    if outcome.kind == "found":
-        rec = outcome.record or {}
-        if any(rec.get(k) is not None
-               for k in ("exploitation", "automatable", "technical_impact")):
-            return "points", None
-        return "blind", None
-    return "unreadable", (outcome.error or outcome.kind)[:120]
+    if without_points:
+        why = ("fără puncte: " + ", ".join(without_points)
+               + (f"; necitibile: {'; '.join(unreadable)}" if unreadable else ""))
+        return Control("no_points", None, tuple(asked), why[:300])
+    return Control("unreadable", None, tuple(asked), "; ".join(unreadable)[:300])
+
+
+def _detail_dict(value: Any) -> dict[str, Any]:
+    """`intel_state.detail` (jsonb) ca dict, oricum l-ar da driverul."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (str, bytes)):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+async def _previous_proof(db: Database) -> str | None:
+    """`exhausted_proof_at` din verdictul PRECEDENT al controlului, sau `None`.
+
+    `None` și când rândul nu se poate citi: un control fără dovadă păstrată cade pe
+    `control_blind`, adică pe varianta zgomotoasă, nu pe cea care liniștește. Nu ridică.
+    """
+    try:
+        row = await mirror.state(db, CANARY_SOURCE)
+    except Exception:  # noqa: BLE001 - controlul nu are voie să strice trecerea
+        return None
+    proof = _detail_dict((row or {}).get("detail")).get("exhausted_proof_at")
+    return proof if isinstance(proof, str) and proof else None
+
+
+async def run_control(db: Database, http: httpx.AsyncClient | None, *, found: int = 0,
+                      with_points: int = 0, pause_s: float = PAUSE_S) -> dict[str, Any]:
+    """Rulează controlul și scrie verdictul pe rândul `CANARY_SOURCE`. Nu ridică.
+
+    `found` / `with_points` sunt ale LOTULUI acestei treceri. Lotul nu hotărăște singur
+    verdictul (îl hotărăște controlul), dar are două roluri: un lot suspect (`CANARY_MIN`
+    CVE-uri și niciun punct) împreună cu un control necitibil e citit de autoverificare ca
+    „orb”, nu ca „necunoscut”; iar un lot CU puncte dovedește că parserul nu e orb, deci
+    candidate care vin toate fără puncte sunt `control_exhausted`, nu `control_blind` (vezi
+    „Orb” și „cele trei candidate au amuțit” în docstring-ul modulului, inclusiv de ce dovada
+    se păstrează de la o trecere la alta).
+    """
+    suspect = found >= CANARY_MIN and with_points == 0
+    try:
+        ctl = await _control_result(http, pause_s=pause_s)
+    except Exception as exc:  # noqa: BLE001 - nimic de aici nu are voie să strice trecerea
+        ctl = Control("unreadable", None, (), f"{type(exc).__name__}: {exc}"[:200])
+    verdict = {"points": "control_ok", "no_points": "control_blind",
+               "unreadable": "control_unreadable"}[ctl.verdict]
+    #: Când a citit parserul puncte pe o înregistrare a gazdei, cât timp candidatele nu mai
+    #: au. Se scrie doar sub `control_exhausted` și se poartă prin `control_unreadable`.
+    proof: str | None = None
+    if ctl.verdict == "no_points" and with_points > 0:
+        proof = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+        verdict = "control_exhausted"
+    elif ctl.verdict != "points":
+        proof = await _previous_proof(db)
+        if ctl.verdict == "no_points" and proof:
+            verdict = "control_exhausted"
+        elif ctl.verdict == "no_points":
+            proof = None
+    detail: dict[str, Any] = {
+        "canary": verdict, "control_cve": ctl.cve, "asked": list(ctl.asked),
+        "suspect_batch": suspect, "batch_found": found, "batch_with_points": with_points}
+    if proof:
+        detail["exhausted_proof_at"] = proof
+    out: dict[str, Any] = {"canary": verdict, "suspect_batch": suspect}
+    if ctl.verdict == "points":
+        if suspect:
+            log.info("Vulnrichment: lot fără puncte, dar controlul pozitiv le are "
+                     "(compoziția lotului, nu parser orb)",
+                     extra={"detail": f"{found} CVE-uri", "control": ctl.cve})
+        await mirror.record(db, CANARY_SOURCE, ok=True, error=None, detail=detail)
+        return out
+    batch = (f"; lotul acestei treceri: {found} CVE-uri primite și niciun punct"
+             if suspect else "")
+    if verdict == "control_exhausted":
+        # Acțiunea întâi: `mirror.record` taie la 300 de caractere, iar coada e `why`.
+        reason = ("candidatele controlului au rămas fără puncte SSVC: înlocuiți "
+                  f"CANARY_CONTROL_CVES. Parserul a citit puncte pe CVE-urile gazdei la "
+                  f"{proof}; {ctl.why}")
+        log.warning("Vulnrichment: candidatele controlului nu mai au puncte (parserul "
+                    "citește puncte pe CVE-urile gazdei)", extra={"detail": reason})
+    elif verdict == "control_blind":
+        reason = ("controlul pozitiv vine FĂRĂ puncte SSVC la toate candidatele citite "
+                  f"({ctl.why}), deși au puncte, iar lotul acestei treceri n-a dovedit "
+                  f"contrariul: parserul sau forma răspunsului s-a schimbat{batch}")
+        log.error("Vulnrichment: parser orb", extra={"detail": reason})
+    else:
+        reason = ("controlul pozitiv nu a putut fi citit "
+                  f"({ctl.why}): nu se poate spune dacă parserul vede punctele CISA{batch}")
+        log.warning("Vulnrichment: controlul pozitiv nu se poate citi",
+                    extra={"detail": reason})
+    await mirror.record(db, CANARY_SOURCE, ok=False, error=reason, detail=detail)
+    return out
 
 
 async def store(db: Database, cve: str, outcome: mirror.Outcome) -> None:
@@ -340,53 +573,34 @@ async def due(db: Database, cves: set[str], *, now: datetime | None = None) -> l
 async def ensure(db: Database, cves: set[str], *, http: httpx.AsyncClient | None = None,
                  now: datetime | None = None, budget: int = BUDGET,
                  pause_s: float = PAUSE_S) -> dict[str, Any]:
-    """Aduce de la CISA ce lipsește sau a îmbătrânit pentru `cves`. Nu ridică."""
+    """Aduce de la CISA ce lipsește sau a îmbătrânit pentru `cves`, apoi rulează controlul
+    pozitiv (la fiecare trecere, vezi docstring-ul modulului). Nu ridică."""
+    seen = {"found": 0, "with_points": 0}
     try:
         wanted = {c for c in cves if c and mirror.CVE_ID.match(c)}
         todo = await due(db, wanted, now=now)
-        seen = {"found": 0, "with_points": 0}
 
         async def _store(d: Database, cve: str, outcome: mirror.Outcome) -> None:
             await store(d, cve, outcome)
             if outcome.kind == "found":
                 seen["found"] += 1
-                rec = outcome.record or {}
-                if any(rec.get(k) is not None
-                       for k in ("exploitation", "automatable", "technical_impact")):
+                if _has_points(outcome.record):
                     seen["with_points"] += 1
 
         summary = await mirror.run_lookups(db, SOURCE, todo, fetch_one, http=http,
                                            budget=budget, pause_s=pause_s, store=_store)
         summary["wanted"] = len(wanted)
         summary["with_points"] = seen["with_points"]
-        if seen["found"] >= CANARY_MIN and seen["with_points"] == 0:
-            # Suspect, nu dovedit: un lot de CVE-uri Debian de nucleu arată la fel.
-            verdict, why = await _control_result(http)
-            if verdict == "points":
-                summary["canary"] = "control_ok"
-                log.info("Vulnrichment: lot fără puncte, dar controlul pozitiv le are "
-                         "(compoziția lotului, nu parser orb)",
-                         extra={"detail": f"{seen['found']} CVE-uri", **summary})
-            else:
-                summary["blind"] = True
-                summary["canary"] = ("control_blind" if verdict == "blind"
-                                     else "control_unreadable")
-                reason = (f"{seen['found']} CVE-uri primite și niciun punct SSVC CISA, "
-                          + (f"iar CVE-ul de control {CANARY_CONTROL_CVE}, care are puncte, "
-                             "vine și el fără: parserul sau forma răspunsului s-a schimbat"
-                             if verdict == "blind" else
-                             f"iar controlul pozitiv {CANARY_CONTROL_CVE} nu a putut fi "
-                             f"citit ({why}): nu se poate spune dacă e parser orb sau doar "
-                             "un lot neevaluat"))
-                log.error("Vulnrichment: parser orb", extra={"detail": reason, **summary})
-                await mirror.record(db, SOURCE, ok=False, error=reason,
-                                    detail=dict(summary))
-        return summary
     except Exception as exc:  # noqa: BLE001 - o sursă căzută nu strică scanarea
         reason = f"{type(exc).__name__}: {exc}"[:200]
         log.warning("Vulnrichment: trecere eșuată", extra={"detail": reason})
         await mirror.record(db, SOURCE, ok=False, error=reason)
-        return {"status": "failed", "error": reason}
+        summary = {"status": "failed", "error": reason}
+    # Controlul se rulează ORICARE ar fi fost lotul (inclusiv unul gol) și își scrie
+    # verdictul pe rândul lui; ordinea față de `run_lookups` nu mai contează.
+    summary.update(await run_control(db, http, found=seen["found"],
+                                     with_points=seen["with_points"], pause_s=pause_s))
+    return summary
 
 
 async def load(db: Database, cves: set[str]) -> dict[str, Row]:

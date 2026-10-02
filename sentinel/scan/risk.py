@@ -76,10 +76,18 @@ lucruri care sunt ALE NOASTRE și se numesc așa:
     deci cifra nu e „validată" de date, ci de înțelesul ei. Regula NU schimbă niciun
     punct de decizie (`points` rămâne ce a publicat CISA) și NU șterge decizia SSVC,
     scrisă în `risk.overlay.ssvc_decision`: ridică doar culoarea și o spune în
-    `risk.overlay` (`basis = epss_overlay`). Se aplică după coborârea pentru repornire
-    (podeaua e podea), nu se aplică unui gri (necunoscutul nu devine galben) și nici
+    `risk.overlay` (`basis = epss_overlay`). Se aplică ÎNAINTEA coborârii pentru repornire
+    (apoi repornirea coboară rezultatul, ca la orice alt rând: un rând urcat și reparat
+    care așteaptă o repornire iese verde, cu `overlay` și `decision_before_reboot` în
+    înregistrare), nu se aplică unui gri (necunoscutul nu devine galben) și nici
     unui CVE a cărui exploatare e deja `active`/KEV (nu e o observație contrazisă);
-    o evaluare CISA fără dată nu poate fi dovedită proaspătă, deci se tratează ca veche;
+    o evaluare CISA fără dată nu poate fi dovedită proaspătă, deci se tratează ca veche.
+    **Podeaua e un plafon, nu o valoare fixă:** `min(attend, ce ar decide arborele dacă
+    exploatarea ar fi `active`)` pentru același rând (`_overlay_floor`), deci regula Sentinel
+    nu pretinde niciodată mai mult decât CISA în cea mai rea observație posibilă (șase
+    celule din tabel, toate `automatable = no`, în care arborele dă `track` și chiar sub
+    exploatare activă; zero rânduri pe gazdă azi). Un rând urcat stă în jumătatea de jos a
+    galbenului (60–69), sub orice Attend din arbore (70–79): observația înaintea previziunii;
   * `UNPUBLISHED_EXPLOITATION` — ce punem când nici KEV, nici CISA nu spun nimic;
   * cât de des reluăm cererile către CISA (`vulnrichment.FOUND_DAYS` ș.a.), care
     mută doar CÂT DE REPEDE ajunge o evaluare nouă, nu ce decide arborele.
@@ -155,17 +163,41 @@ KEV_MAX_AGE_DAYS = 7
 #: dintr-o evaluare din 2025 rămâne veche.
 OVERLAY_MIN_AGE_DAYS = 180
 OVERLAY_MIN_EPSS = 0.5
-#: Podeaua: decizia nu coboară sub asta. `attend` = galben.
+#: Podeaua: decizia nu coboară sub asta. `attend` = galben. **E un plafon, nu o valoare
+#: fixă:** podeaua aplicată unui rând e `min(OVERLAY_FLOOR, decizia arborelui sub
+#: exploatare ACTIVĂ pentru ACELAȘI rând)` (`_overlay_floor`), ca regula Sentinel să nu
+#: poată pretinde niciodată mai mult decât ar spune CISA în cea mai rea observație posibilă.
 OVERLAY_FLOOR = ssvc.ATTEND
 OVERLAY_BASIS = "epss_overlay"
 
 GREY = "grey"
+#: Cheia benzii galbene urcate de regula Sentinel (nu o decizie SSVC: `risk.decision` rămâne
+#: `attend`). Vezi `_BANDS`.
+ATTEND_LIFTED = "attend_lifted"
 
 #: Benzile priorității 0..100: `(bază, lățime)`. Ordinea benzilor e ordinea în
-#: care se citește lista: Act > Attend > gri > Track* > Track.
+#: care se citește lista: Act > Attend > Attend urcat de regula Sentinel > gri > Track* >
+#: Track.
+#:
+#: **Galbenul are două jumătăți, și ordinea dintre ele e hotărâtă de operator: o
+#: exploatare OBSERVATĂ merge înaintea uneia PREZISE.** Un rând al cărui Attend iese din
+#: arborele CISA (70–79) stă deasupra unuia urcat de suprapunerea EPSS (60–69). Fără
+#: despărțirea asta, ordinea din interiorul benzii era `probabilitate × impact`, iar un EPSS
+#: de 0,99 × CVSS 9,1 (CVE-2025-29927, 0,903) bătea un KEV (1,0 × 7,5 = 0,75): predicția
+#: ajungea deasupra observației (prioritate 77 față de 75 și 74, pe producție). Pe
+#: priorități, nu pe o cheie de sortare în plus, ca toți cititorii (`ORDER BY priority DESC`
+#: în Python și în TypeScript, Telegram, planificatorul) să rămână de acord fără să-și
+#: schimbe interogările. Prețul: 10 trepte pe jumătate, nu 20 pe bandă. Banda întreagă a
+#: galbenului rămâne 60..79, cum scrie migrația 0047.
+#:
+#: Un Attend din arbore NU înseamnă mereu „observat" (la misiune mare, `none,yes,partial,high`
+#: e Attend); ordinea e „decis de CISA înaintea celui ridicat de regula Sentinel", iar la
+#: misiune medie — singura de azi — un Attend din arbore are mereu o exploatare observată în
+#: spate (KEV/CISA `active`, eventual coborât din Act de o repornire).
 _BANDS: dict[str, tuple[int, int]] = {
     ssvc.ACT: (80, 21),
-    ssvc.ATTEND: (60, 20),
+    ssvc.ATTEND: (70, 10),
+    ATTEND_LIFTED: (60, 10),
     GREY: (40, 20),
     ssvc.TRACK_STAR: (20, 20),
     ssvc.TRACK: (0, 20),
@@ -199,15 +231,22 @@ def mission_for(criticality: int) -> str:
     return "low" if criticality <= 2 else ("medium" if criticality == 3 else "high")
 
 
-def priority_of(decision: str | None, x: float | None) -> int:
+def priority_of(decision: str | None, x: float | None, *, lifted: bool = False) -> int:
     """`findings.priority` 0..100 din (decizie, număr 0..1).
 
     `decision` None = gri. `x` e scorul de ordonare (probabilitate × impact) sau,
     pentru gri, importanța; None se tratează ca 0. Priorități egale se desfac în
-    SQL prin `risk_score` (vezi `list_open`): aici rezoluția e de 20 de trepte pe
+    SQL prin `risk_score` (vezi `list_open`): aici rezoluția e de 10–20 de trepte pe
     bandă, nu de 20 de poziții în listă.
+
+    `lifted`: Attend-ul vine din suprapunerea EPSS (regula Sentinel), nu din arbore; stă
+    în jumătatea de jos a galbenului (vezi `_BANDS`). Nu are efect la alte decizii.
     """
-    base, width = _BANDS[decision if decision is not None else GREY]
+    if decision == ssvc.ATTEND and lifted:
+        key = ATTEND_LIFTED
+    else:
+        key = decision if decision is not None else GREY
+    base, width = _BANDS[key]
     value = 0.0 if x is None or not math.isfinite(x) else min(1.0, max(0.0, x))
     return base + int(round(value * (width - 1)))
 
@@ -354,28 +393,46 @@ def _alias_cve(f: Mapping[str, Any], intel: Intel) -> str | None:
     return next((a for a in row.aliases if a.startswith("CVE-")), None)
 
 
-def _epss_overlay(decision: str, basis: str | None, exploitation: str | None,
+def _overlay_floor(automatable: str, technical: str, mission: str) -> str:
+    """Podeaua suprapunerii pentru ACEST rând: `min(OVERLAY_FLOOR, ce ar decide arborele
+    SSVC dacă exploatarea ar fi `active`)`.
+
+    `attend` fix putea depăși verdictul CISA însuși. Peste tabelul publicat sunt șase
+    celule în care arborele dă `track` chiar și sub exploatare activă (`automatable = no`,
+    impact parțial la misiune mică/medie, sau total la misiune mică), iar podeaua `attend`
+    ar fi pretins la ele mai mult decât ar spune CISA în cea mai rea observație posibilă. Cu
+    plafonul, regula Sentinel nu poate urca un rând deasupra a ceea ce ar da arborele dacă
+    exploatarea ar fi chiar confirmată; unde plafonul e `track`, nu mai are ce urca.
+    """
+    worst_case = ssvc.decide("active", automatable, technical, mission)
+    rank = ssvc.DECISIONS.index
+    return min(OVERLAY_FLOOR, worst_case, key=rank)
+
+
+def _epss_overlay(decision: str, floor: str, basis: str | None, exploitation: str | None,
                   observed: date | None, epss_value: float | None,
                   today: date) -> dict[str, Any] | None:
     """Înregistrarea suprapunerii EPSS dacă se aplică lui `decision`, altfel `None`.
 
-    Condițiile, toate: decizia e sub podea; Exploitation vine de la CISA
-    (`basis = vulnrichment`) și nu e `active` (un `active` nu e contrazis de o
-    probabilitate mare, iar KEV nu e o fotografie veche); EPSS-ul e PROASPĂT (un EPSS
-    vechi nu se folosește, ca peste tot) și ≥ `OVERLAY_MIN_EPSS`; evaluarea are mai mult
-    de `OVERLAY_MIN_AGE_DAYS` zile. O evaluare fără dată nu poate fi dovedită proaspătă:
-    se tratează ca veche (`observation_age_days` e atunci `None`), nu ca „în regulă".
+    `decision` e decizia ARBORELUI (înainte de orice coborâre pentru repornire), iar
+    `floor` podeaua acestui rând (`_overlay_floor`). Condițiile, toate: decizia e sub
+    podea; Exploitation vine de la CISA (`basis = vulnrichment`) și nu e `active` (un
+    `active` nu e contrazis de o probabilitate mare, iar KEV nu e o fotografie veche);
+    EPSS-ul e PROASPĂT (un EPSS vechi nu se folosește, ca peste tot) și ≥ `OVERLAY_MIN_EPSS`;
+    evaluarea are mai mult de `OVERLAY_MIN_AGE_DAYS` zile. O evaluare fără dată nu poate fi
+    dovedită proaspătă: se tratează ca veche (`observation_age_days` e atunci `None`), nu ca
+    „în regulă".
     """
     if decision not in ssvc.DECISIONS or basis != "vulnrichment" or exploitation == "active":
         return None
-    if ssvc.DECISIONS.index(decision) >= ssvc.DECISIONS.index(OVERLAY_FLOOR):
+    if ssvc.DECISIONS.index(decision) >= ssvc.DECISIONS.index(floor):
         return None
     if epss_value is None or epss_value < OVERLAY_MIN_EPSS:
         return None
     age = None if observed is None else (today - observed).days
     if age is not None and age <= OVERLAY_MIN_AGE_DAYS:
         return None
-    return {"basis": OVERLAY_BASIS, "floor": OVERLAY_FLOOR, "ssvc_decision": decision,
+    return {"basis": OVERLAY_BASIS, "floor": floor, "ssvc_decision": decision,
             "epss": round(epss_value, 5),
             "observation_as_of": None if observed is None else observed.isoformat(),
             "observation_age_days": age,
@@ -491,22 +548,28 @@ def _assess(f: Mapping[str, Any], intel: Intel, *, exposed: bool,
     # (și că un gri „oricum Track" se poate citi repede).
     low, high = ssvc.decide_range(*points)
     decision: str | None = ssvc.decide(*points) if None not in points else None
+    # Regula Sentinel (NU SSVC): EPSS mare lângă o fotografie CISA veche. Se aplică
+    # ÎNAINTEA coborârii pentru repornire, ca ambele reguli să lucreze pe aceeași decizie
+    # și în aceeași ordine ca la un rând fără suprapunere: întâi „ce decizie e", apoi „reparația
+    # e instalată, așteaptă o repornire". Invers, podeaua re-ridica un rând reparat la galben
+    # și suprapunerea era singurul tip de rând a cărui culoare nu putea spune niciodată „e
+    # instalat, lipsește repornirea" — distincția pe care s-au dus patru zile de muncă. Un gri
+    # n-are decizie, deci rămâne gri.
+    overlay = None
+    lifted = False
+    if decision is not None:
+        overlay = _epss_overlay(
+            decision, _overlay_floor(automatable, technical, mission),
+            expl_basis, exploitation,
+            published.ssvc_at.date() if published is not None and published.ssvc_at else None,
+            epss_value, intel.today)
+        if overlay is not None:
+            decision, lifted = overlay["floor"], True
     before_reboot: str | None = None
     reboot = bool(f.get("fix_pending_reboot"))
     if decision is not None and reboot:
         before_reboot = decision
         decision = ssvc.demote(decision)
-    # Regula Sentinel (NU SSVC): EPSS mare lângă o fotografie CISA veche. După
-    # coborârea pentru repornire, ca podeaua să rămână podea; un gri n-are decizie,
-    # deci rămâne gri.
-    overlay = None
-    if decision is not None:
-        overlay = _epss_overlay(
-            decision, expl_basis, exploitation,
-            published.ssvc_at.date() if published is not None and published.ssvc_at else None,
-            epss_value, intel.today)
-        if overlay is not None:
-            decision = OVERLAY_FLOOR
     color = ssvc.COLOR_OF[decision] if decision is not None else GREY
 
     # ---- Axele și scorul ------------------------------------------------------
@@ -534,7 +597,7 @@ def _assess(f: Mapping[str, Any], intel: Intel, *, exposed: bool,
     if decision is None:
         priority = priority_of(None, importance)
     else:
-        priority = priority_of(decision, score)
+        priority = priority_of(decision, score, lifted=lifted)
 
     risk: dict[str, Any] = {
         "v": SCHEMA_VERSION,

@@ -892,6 +892,10 @@ def test_the_vulnrichment_table_refuses_what_is_not_the_coordinator_vocabulary(p
             await db.execute("INSERT INTO vulnrichment (cve, status, exploitation) "
                              "VALUES ('CVE-2026-0001', 'not_found', 'none')")
         await db.execute("INSERT INTO intel_state (source) VALUES ('vulnrichment')")
+        # the control's own row (migration 0049): without it `mirror.record` would be
+        # refused here and, because it swallows errors, the verdict would never be written
+        await db.execute("INSERT INTO intel_state (source) VALUES ($1)",
+                         vulnrichment.CANARY_SOURCE)
         with pytest.raises(asyncpg.CheckViolationError):
             await db.execute("INSERT INTO intel_state (source) VALUES ('cisa')")
     _run_async(pg_dsn, body)
@@ -944,6 +948,7 @@ def test_the_pass_asks_cisa_once_stores_the_points_and_decides_on_them(pg_dsn):
         payload = json.loads((Path(__file__).parent.parent / "fixtures" / "intel"
                               / "cveawg_CVE-2025-29927.json").read_text(encoding="utf-8"))
         return httpx.Response(200, json=payload)
+    control = f"https://cveawg.mitre.org/api/cve/{vulnrichment.CANARY_CONTROL_CVES[0]}"
 
     async def body(db):
         rid = await _finding(db, "k1", vector=WIDE_OPEN_TOTAL, cvss=9.8)
@@ -964,8 +969,58 @@ def test_the_pass_asks_cisa_once_stores_the_points_and_decides_on_them(pg_dsn):
             await http.aclose()
         state = await mirror.state(db, "vulnrichment")
         assert state is not None and state["last_ok_at"] is not None
+        canary = await mirror.state(db, vulnrichment.CANARY_SOURCE)
+        assert canary is not None and canary["last_ok_at"] is not None
+        assert json.loads(canary["detail"])["canary"] == "control_ok"
     _run_async(pg_dsn, body)
-    assert asked == ["https://cveawg.mitre.org/api/cve/CVE-2026-0001"], asked
+    # the host CVE once; the control (one request, on EVERY pass) twice; nobody else
+    assert asked == ["https://cveawg.mitre.org/api/cve/CVE-2026-0001", control, control], asked
+
+
+def test_a_blind_verdict_survives_an_ordinary_pass_in_the_real_table_and_only_a_confirmation_clears_it(
+        pg_dsn):
+    """The defect, through the real SQL of `mirror.record` (the fake database in the unit
+    tests cannot show what Postgres does with the upsert): the pass that raised the alarm
+    wrote `intel_state.detail`, and the next ordinary pass rewrote it. Now the verdict has
+    its own row. Blind world over two passes of different size, then a healed one: the
+    row stays unconfirmed (`last_ok_at` NULL) and carries the error until the control gets
+    points, and the self-check, reading the real rows, says degraded, degraded, ok."""
+    from sentinel.selfcheck import checks
+    fixtures = Path(__file__).parent.parent / "fixtures" / "intel"
+
+    def world(blind: bool):
+        def handler(request: httpx.Request) -> httpx.Response:
+            cve = request.url.path.rsplit("/", 1)[-1]
+            name = cve if (cve in vulnrichment.CANARY_CONTROL_CVES and not blind) else "CVE-2025-40075"
+            return httpx.Response(200, json=json.loads(
+                (fixtures / f"cveawg_{name}.json").read_text(encoding="utf-8")))
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def status(db):
+        out = {r.key: r for r in await checks.check_risk_intel(db)}
+        return out["risk:vulnrichment"].status
+
+    async def body(db):
+        big = {f"CVE-2026-{n:04d}" for n in range(1, 31)}
+        small = {f"CVE-2026-{n:04d}" for n in range(31, 36)}
+        await db.execute("INSERT INTO intel_state (source, last_attempt_at, last_ok_at) "
+                         "VALUES ('risk', now(), now())")
+        async with world(blind=True) as http:
+            await vulnrichment.ensure(db, big, http=http, pause_s=0)
+            assert await status(db) == "degraded"
+            await vulnrichment.ensure(db, small, http=http, pause_s=0)
+        lookups = await mirror.state(db, vulnrichment.SOURCE)
+        canary = await mirror.state(db, vulnrichment.CANARY_SOURCE)
+        assert lookups["last_ok_at"] is not None, "the ordinary pass really did succeed"
+        assert canary["last_ok_at"] is None and canary["last_error"]
+        assert json.loads(canary["detail"])["canary"] == "control_blind"
+        assert await status(db) == "degraded", "the success of an ordinary pass cleared the alarm"
+        async with world(blind=False) as http:
+            await vulnrichment.ensure(db, small, http=http, pause_s=0)
+        canary = await mirror.state(db, vulnrichment.CANARY_SOURCE)
+        assert canary["last_ok_at"] is not None and canary["last_error"] is None
+        assert await status(db) == "ok"
+    _run_async(pg_dsn, body)
 
 
 # --- a REAL shipped row, through the receiver's own validators ---------------------
@@ -1054,3 +1109,53 @@ def test_a_stale_cisa_observation_with_a_high_epss_lifts_the_row_and_the_lift_su
     assert data["overlay"]["ssvc_decision"] == "track"
     assert data["overlay"]["observation_as_of"] == "2025-04-08"
     assert _receiver_verdict([shipped]) == {"ok": True}
+
+
+def test_a_kev_row_outranks_an_epss_lifted_row_in_the_list_the_operator_reads(pg_dsn):
+    """The operator's rule, through the real SQL and the real list query: what was
+    OBSERVED goes before what is PREDICTED. A KEV row (1.0 x CVSS 7.5) and a row lifted by
+    the EPSS rule (0.99 x CVSS 9.1, scoring HIGHER) are written by `enrich.run`; the list
+    the operator reads (`list_open`, `ORDER BY priority DESC, risk_score DESC`) must put the
+    KEV row first. Before, the forecast stood 1st of 812 on the real host at priority 77,
+    above both KEV rows at 75 and 74."""
+    async def body(db):
+        kev = await _finding(db, "kev", cve="CVE-2026-9000", vector=WIDE_OPEN_DOS, cvss=7.5)
+        lifted = await _finding(db, "lifted", cve="CVE-2026-0001",
+                                vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N", cvss=9.1)
+        await _seed_epss(db, "CVE-2026-0001", 0.99225, 0.99936)
+        await _publish(db, "CVE-2026-0001", "none", "yes", "total",
+                       at=datetime(2025, 4, 8, 15, 16, tzinfo=timezone.utc))
+        await enrich.run(db, _cfg())
+        rows = await fx.list_open(db, limit=10)
+        return kev, lifted, [r["id"] for r in rows], {r["id"]: r for r in rows}
+
+    kev, lifted, order, by_id = _run_async(pg_dsn, body)
+    assert by_id[kev]["risk_color"] == by_id[lifted]["risk_color"] == "amber"
+    assert float(by_id[lifted]["risk_score"]) > float(by_id[kev]["risk_score"]), (
+        "the premise: the forecast scores higher than the observation")
+    assert by_id[kev]["priority"] > by_id[lifted]["priority"]
+    assert order.index(kev) < order.index(lifted)
+    assert 60 <= by_id[lifted]["priority"] < 70 and 70 <= by_id[kev]["priority"] < 80
+
+
+def test_a_lifted_row_with_a_pending_reboot_is_one_step_down_in_the_database_too(pg_dsn):
+    """The reboot demotion acts on the floor's result, in the row the operator sees: Track*
+    (green) with the reboot mark, the colour/decision CHECK accepting it, and the record
+    naming both steps. Checked through the real pending-reboot SQL (`fix_state` in `raw`)."""
+    async def body(db):
+        rid = await _finding(db, "k1", vector=WIDE_OPEN_TOTAL, cvss=9.1)
+        await db.execute(
+            "UPDATE findings SET raw = $2::jsonb WHERE id = $1", rid,
+            json.dumps({"fix_state": {"state": "pending_reboot"}}))
+        await _seed_epss(db, "CVE-2026-0001", 0.99225, 0.99936)
+        await _publish(db, "CVE-2026-0001", "none", "yes", "total",
+                       at=datetime(2025, 4, 8, 15, 16, tzinfo=timezone.utc))
+        await enrich.run(db, _cfg())
+        return await _row(db, rid)
+
+    row = _run_async(pg_dsn, body)
+    data = json.loads(row["risk"])
+    assert data["reboot_pending"] is True, "the premise: the real SQL saw the pending reboot"
+    assert (row["risk_color"], row["risk_decision"]) == ("green", "track_star")
+    assert data["decision_before_reboot"] == "attend"
+    assert data["overlay"]["ssvc_decision"] == "track"

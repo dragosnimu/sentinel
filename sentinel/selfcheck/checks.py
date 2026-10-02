@@ -4669,6 +4669,33 @@ EPSS_DEGRADED_H = 72
 #: Red Hat și OSV se cer doar pentru ce lipsește sau a îmbătrânit; un eșec care
 #: persistă o zi și jumătate înseamnă CVE-uri noi rămase fără scor.
 VENDOR_DEGRADED_H = 36
+#: Cât de veche poate fi ultima CONFIRMARE a controlului pozitiv (parserul a văzut puncte CISA
+#: pe o înregistrare vie) ca „ok" să rămână adevărat. Controlul se cere la fiecare trecere
+#: orară, deci trei ore înseamnă cel puțin două încercări fără confirmare, nu o amânare (ca la
+#: `RISK_PASS_DEGRADED_H`). Mărginește și „ok": un verdict `control_ok` fără nicio încercare
+#: nouă (trecerea nu mai rulează, sursa a fost oprită) nu poate rămâne „ok" la nesfârșit.
+#: Aceeași valoare, din același motiv, pentru `control_exhausted` (candidatele au rămas fără
+#: puncte): cauza e lista de candidate din cod, adică ceva ce operatorul poate schimba.
+CANARY_UNCONFIRMED_H = 3
+#: Cât poate dura un control `unreadable` — fără lot suspect în aceeași trecere — înainte să
+#: devină `degraded` și să sune pe Telegram. Alegerea nu se sprijină pe o măsurătoare (nimeni
+#: nu a putut măsura disponibilitatea reală a serviciului CVE: jurnalul gazdei e volatil, iar
+#: verificarea există de la 2 octombrie 2026), ci pe CINE POATE FACE CEVA cu alarma:
+#:   * `control_unreadable` fără lot suspect înseamnă că NICIUNA dintre cele trei cereri n-a
+#:     primit un răspuns citibil, iar cauza obișnuită e serviciul CVE însuși, în afara
+#:     gazdei. Operatorul nu poate vindeca asta; o alarmă care sună la trei ore pentru o pană
+#:     pe care n-o poate vindeca îl învață să nu mai citească alarmele (și `unknown` nu se
+#:     anunță, deci pana nu se pierde, doar nu sună încă);
+#:   * ramura căutărilor (`VENDOR_DEGRADED_H`) tolerează 36 de ore pentru ACELAȘI fapt extern,
+#:     pe aceeași cheie `risk:vulnrichment`. Două praguri pentru un fapt, iar cel strict sună,
+#:     ar fi spus operatorului două lucruri despre o singură pană. Cu aceeași valoare, cheia
+#:     are un singur rezultat pe rând: la 36 de ore operatorul află o dată, nu de două ori;
+#:   * dincolo de 36 de ore, „nu se poate spune" nu mai e o pană scurtă, iar acoperirea
+#:     parserului lipsește de o zi și jumătate: degraded.
+#: Ce NU primește răgazul ăsta, fiindcă pe ele operatorul poate acționa: `blind` (parserul),
+#: `unreadable` lângă un lot suspect (serviciul a răspuns pentru 20+ CVE-uri în aceeași trecere,
+#: deci nu el e căzut), `exhausted` și `stale` (trecerea nu mai ajunge la control).
+CANARY_UNREADABLE_H = VENDOR_DEGRADED_H
 
 
 def _intel_detail(value: Any) -> dict[str, Any]:
@@ -4684,6 +4711,69 @@ def _intel_detail(value: Any) -> dict[str, Any]:
             return {}
         return parsed if isinstance(parsed, dict) else {}
     return {}
+
+
+def _canary_state(row: dict[str, Any] | None,
+                  age: float | None) -> tuple[str, str, dict[str, Any]]:
+    """Ce poate afirma autoverificarea despre parserul CISA, din rândul controlului pozitiv.
+
+    Întoarce `(stare, text, detaliu)`, `stare` fiind una din:
+
+      * `ok` — ultima încercare a controlului a dat puncte, iar confirmarea e mai nouă de
+        `CANARY_UNCONFIRMED_H`;
+      * `blind` — controlul vine fără puncte la toate candidatele citite: parser orb;
+      * `exhausted` — toate candidatele citite vin fără puncte, dar lotul aceleiași treceri
+        (sau o trecere anterioară, păstrată în rând) a dovedit că parserul citește puncte:
+        NU parserul e orb, ci lista `CANARY_CONTROL_CVES` trebuie înlocuită. Se declară de la
+        `CANARY_UNCONFIRMED_H` fără confirmare (sau fără nicio confirmare); înainte, `unknown`.
+        Decizia `degraded` și nu `unknown`: nimic de pe gazdă nu e stricat, dar controlul nu
+        mai poate confirma nimic, iar spre deosebire de `unreadable` nimic din afară nu se
+        vindecă singur: doar operatorul înlocuiește lista. Un `unknown` nu se anunță, deci
+        pierderea acoperirii ar rămâne tăcută pe termen nelimitat;
+      * `unreadable` — controlul nu s-a putut citi, iar fie lotul aceleiași treceri era
+        suspect (serviciul a răspuns pentru 20+ CVE-uri: nu el e căzut), fie nu există nicio
+        confirmare (nu se poate măsura de când durează), fie ultima confirmare e mai veche
+        de `CANARY_UNREADABLE_H`: „nu se poate spune" nu e „în regulă". Până la acea vechime,
+        `unknown`: cauza obișnuită e în afara gazdei (vezi `CANARY_UNREADABLE_H`);
+      * `stale` — verdictul e `control_ok`, dar nicio încercare nouă nu l-a reconfirmat.
+        Pragul rămâne `CANARY_UNCONFIRMED_H`, nu 36 de ore: cauza e trecerea care nu mai
+        rulează, adică un fapt al gazdei;
+      * `unknown` — nu există verdict (controlul n-a rulat încă), sau n-a putut fi citit
+        (ori e epuizat) acum, dar o confirmare recentă există.
+
+    Verdictul stă pe un rând al lui (`vulnrichment_canary`), nu în `detail`-ul rândului
+    `vulnrichment`: o trecere obișnuită a căutărilor rescrie `detail` și ar fi șters alarma
+    (vezi `sentinel/intel/vulnrichment.py`).
+    """
+    if row is None:
+        return ("unknown", "controlul pozitiv nu a rulat încă: fără el, „parserul vede "
+                "puncte CISA” nu e un fapt, doar o presupunere", {})
+    detail = _intel_detail(row.get("detail"))
+    verdict = detail.get("canary")
+    if age is None:
+        last = "; controlul n-a confirmat niciodată parserul"
+    else:
+        last = f"; ultima confirmare acum {_ago(age * 60)}"
+    error = str(row.get("last_error") or "—")[:240]
+    if verdict == "control_blind":
+        return "blind", error, detail
+    if verdict == "control_unreadable":
+        if detail.get("suspect_batch") or age is None or age > CANARY_UNREADABLE_H:
+            return "unreadable", error + last, detail
+        return "unknown", error + last, detail
+    if verdict == "control_exhausted":
+        if age is None or age > CANARY_UNCONFIRMED_H:
+            return "exhausted", error + last, detail
+        return "unknown", error + last, detail
+    if verdict == "control_ok":
+        if age is None or age > CANARY_UNCONFIRMED_H:
+            when = f"ultima oară acum {_ago(age * 60)}" if age is not None else "cândva"
+            return "stale", (f"controlul a confirmat parserul {when}, dar nicio încercare "
+                             "mai nouă nu l-a reconfirmat: trecerea orară nu mai ajunge la "
+                             "el"), detail
+        return "ok", (f"controlul pozitiv ({detail.get('control_cve') or '?'}) a dat puncte "
+                      f"CISA acum {_ago(age * 60)}"), detail
+    return "unknown", "rândul controlului nu are un verdict citibil", detail
 
 
 async def check_risk_intel(db: Database) -> list[CheckResult]:
@@ -4810,23 +4900,28 @@ async def check_risk_intel(db: Database) -> list[CheckResult]:
         age = _age_h(vr_row)
         detail_json = _intel_detail(vr_row.get("detail"))
         aborted = bool(detail_json.get("aborted"))
-        blind = bool(detail_json.get("blind"))
+        from sentinel.intel.vulnrichment import CANARY_SOURCE
+        canary_row = by_source.get(CANARY_SOURCE)
+        canary, canary_text, canary_detail = _canary_state(
+            canary_row, None if canary_row is None else _age_h(canary_row))
         facts = {"age_h": None if age is None else round(age, 1),
-                 "error": vr_row.get("last_error"), "last": detail_json}
-        if blind:
+                 "error": vr_row.get("last_error"), "last": detail_json,
+                 "canary": canary, "canary_detail": canary_detail}
+        if canary == "blind":
             # Cel mai rău caz, și cel tăcut: parserul nu mai găsește punctele CISA,
             # deci fiecare CVE arată „CISA n-a evaluat nimic” și Exploitation cade
             # pe `none`. Nu e o sursă căzută — e o sursă care minte prin tăcere.
+            # Verdictul vine din controlul pozitiv, cerut la FIECARE trecere pe un rând
+            # al lui: o trecere obișnuită a căutărilor nu-l poate șterge.
             results.append(CheckResult(
                 "risk:vulnrichment", "CISA Vulnrichment — niciun punct SSVC în răspunsuri",
                 "degraded",
-                detail="ultima trecere a primit CVE-uri și zero puncte SSVC CISA, iar "
-                       "controlul pozitiv (un CVE care are puncte, cerut în aceeași trecere) "
-                       "n-a confirmat parserul — a venit și el fără puncte sau n-a putut fi "
-                       "citit, vezi eroarea: formatul "
+                detail="controlul pozitiv — CVE-uri despre care se știe că au puncte CISA, "
+                       "cerute live la fiecare trecere — vine fără puncte SSVC: formatul "
                        "răspunsului sau identificatorul containerului CISA s-a schimbat. "
+                       "Alarma rămâne până când o nouă încercare a controlului dă puncte. "
                        "Până se repară parserul, Exploitation pentru CVE-urile noi cade pe "
-                       f"ipoteza „nu e în KEV”. Eroare: {str(vr_row.get('last_error') or '—')[:200]}",
+                       f"ipoteza „nu e în KEV”. Eroare: {canary_text}",
                 action="journalctl -u sentinel-maintenance -u sentinel-scan | grep -i 'parser orb'",
                 facts=facts))
         elif age is None or age > VENDOR_DEGRADED_H or aborted:
@@ -4839,10 +4934,43 @@ async def check_risk_intel(db: Database) -> list[CheckResult]:
                        "CVE-urile noi rămân GRI („nu l-am întrebat”) până se vindecă.",
                 action="journalctl -u sentinel-maintenance -u sentinel-scan | grep -i 'căutări eșuate'",
                 facts=facts))
+        elif canary == "exhausted":
+            # Nu parserul e orb: lotul gazdei a citit puncte. Controlul n-are însă ce să mai
+            # confirme, iar un parser care ar orbi de acum încolo ar trece nesemnalat.
+            results.append(CheckResult(
+                "risk:vulnrichment", "CISA Vulnrichment — controlul pozitiv n-are candidate bune",
+                "degraded",
+                detail=f"{canary_text}. Căutările răspund (ultimul răspuns acum "
+                       f"{_ago(age * 60)}) și parserul NU e dat drept orb, dar niciuna dintre "
+                       "candidatele controlului nu mai are puncte CISA: până se înlocuiesc, "
+                       "un parser care ar orbi de acum încolo n-ar mai fi semnalat.",
+                action="Înlocuiește candidatele din CANARY_CONTROL_CVES "
+                       "(sentinel/intel/vulnrichment.py) cu CVE-uri evaluate de CISA, apoi "
+                       "livrează; nu e o defecțiune a parserului",
+                facts=facts))
+        elif canary in ("unreadable", "stale"):
+            results.append(CheckResult(
+                "risk:vulnrichment", "CISA Vulnrichment — parserul nu se mai poate confirma",
+                "degraded",
+                detail=f"{canary_text}. Căutările răspund (ultimul răspuns acum "
+                       f"{_ago(age * 60)}), dar fără un control pozitiv nu se poate spune "
+                       "dacă parserul încă vede punctele CISA sau toate CVE-urile par "
+                       "„neevaluate”.",
+                action="journalctl -u sentinel-maintenance -u sentinel-scan | grep -i 'control'",
+                facts=facts))
+        elif canary == "unknown":
+            results.append(CheckResult(
+                "risk:vulnrichment", "CISA Vulnrichment — parserul nu e încă confirmat",
+                "unknown",
+                detail=f"{canary_text}. Căutările răspund (ultimul răspuns acum "
+                       f"{_ago(age * 60)}), dar „parserul vede puncte CISA” nu e un fapt "
+                       "dovedit în acest moment.",
+                action="journalctl -u sentinel-maintenance -u sentinel-scan | grep -i 'control'",
+                facts=facts))
         else:
             results.append(CheckResult(
                 "risk:vulnrichment", "CISA Vulnrichment", "ok",
-                detail=f"ultimul răspuns acum {_ago(age * 60)}"
+                detail=f"ultimul răspuns acum {_ago(age * 60)}; {canary_text}"
                        + (f"; avertisment: {str(vr_row.get('last_error'))[:120]}"
                           if vr_row.get("last_error") else ""),
                 facts=facts))
