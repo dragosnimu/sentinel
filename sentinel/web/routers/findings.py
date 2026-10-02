@@ -1,4 +1,12 @@
-"""The Findings page: what the scanners found, ranked by priority.
+"""The Findings page: what the scanners found, with the SSVC traffic light.
+
+Each row carries a colour decided on the server (`sentinel/scan/risk.py`): red =
+CISA SSVC "Act", amber = "Attend", green = "Track", and GREY = not enough data to
+decide — never green. Rows are ordered by colour band, then by probability ×
+impact inside a band. The page says what it assumed (every finding is evaluated
+as Mission = medium, because no finding is bound to an inventory asset yet) and
+lets the operator filter by colour, with a count per colour that always mentions
+grey.
 
 Read-only. Titles/descriptions come from scanner output and vendor advisories;
 Jinja autoescaping renders all of it as text. Applying a fix is the patch
@@ -37,6 +45,7 @@ from sentinel.db.engine import Database
 from sentinel.db.repo import findings as fx
 from sentinel.db.repo import users as users_repo
 from sentinel.logging_setup import get_logger
+from sentinel.scan import enrich, risk, risk_view
 from sentinel.scan.subject import KIND_UNKNOWN, Category, categories, describe
 from sentinel.util.ids import parse_id
 from sentinel.web.deps import current_user, get_db
@@ -78,16 +87,20 @@ def _echo(value: str) -> str:
     return value if len(value) <= MAX_ECHO else value[:MAX_ECHO] + "…"
 
 
-def page_url(kind: str | None, page: int) -> str:
-    """Legătura către pagina asta, cu filtrul și numărul de pagină în ea.
+def page_url(kind: str | None, page: int, color: str | None = None) -> str:
+    """Legătura către pagina asta, cu filtrele și numărul de pagină în ea.
 
     Construită într-o funcție pură, nu prin lipirea de șiruri în șablon: o
     legătură greșită e un drum care nu duce nicăieri, iar drumul e chiar ce
-    lipsea.
+    lipsea. Filtrul de culoare călătorește împreună cu cel de categorie — o
+    pastilă de culoare care ar uita categoria alesă ar arunca operatorul în
+    altă listă.
     """
     query: dict[str, str] = {}
     if kind:
         query["asociat"] = kind
+    if color:
+        query["culoare"] = color
     if page > 1:
         query["pagina"] = str(page)
     return "/findings" + (f"?{urlencode(query)}" if query else "")
@@ -122,6 +135,44 @@ def resolve_page(raw: str | None, pages: int) -> tuple[int, str | None]:
     return wanted, None
 
 
+#: Culorile care se pot cere cu `?culoare=`. Vocabularul închis al lui `risk_color`;
+#: orice altceva e un parametru neînțeles, SPUS, nu ignorat.
+COLOR_FILTERS = ("red", "amber", "grey", "green")
+
+
+def _risk_view(row: dict[str, Any]) -> dict[str, Any]:
+    """Ce arată șablonul despre semaforul unui rând. Calculat AICI, nu în Jinja:
+    o ramură de șablon nu se poate falsifica singură, iar „gri înseamnă că lipsesc
+    date" e fix felul de regulă care nu are voie să se piardă în marcaj."""
+    import json
+
+    raw = row.get("risk")
+    if isinstance(raw, (str, bytes)):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = {}
+    data: dict[str, Any] = raw if isinstance(raw, dict) else {}
+    color = str(row.get("risk_color") or "grey")
+    if color not in risk_view.COLOR_EMOJI:
+        color = "grey"
+    decision = row.get("risk_decision")
+    why = risk_view.why_lines(data)
+    grey = risk_view.grey_reason(data) if color == "grey" else None
+    cvss = (risk_view.fmt_cvss(data.get("cvss")) if data.get("cvss")
+            else (f"CVSS {row['cvss']}" if row.get("cvss") else "fără CVSS"))
+    return {
+        "color": color,
+        "dot": risk_view.DOT_CLASS[color],
+        "label": risk_view.headline(color, decision, data),
+        "reason": grey if grey is not None else risk_view.one_liner(color, data),
+        "why": why,
+        "cvss": cvss,
+        "epss": risk_view.fmt_epss(row.get("epss"), row.get("epss_percentile")),
+        "reboot": bool(data.get("reboot_pending")),
+    }
+
+
 @router.get("/findings")
 async def findings_page(
     request: Request,
@@ -129,6 +180,7 @@ async def findings_page(
     db: Annotated[Database, Depends(get_db)],
     asociat: Annotated[str | None, Query()] = None,
     pagina: Annotated[str | None, Query()] = None,
+    culoare: Annotated[str | None, Query()] = None,
 ) -> Response:
     warnings: list[str] = []
 
@@ -146,7 +198,19 @@ async def findings_page(
     # `None` = fără filtru; lista (chiar goală) = numai scanerele categoriei.
     scanners = list(selected.scanners) if selected is not None else None
 
-    counts = await fx.open_counts(db, scanners=scanners)
+    color: str | None = None
+    if culoare is not None:
+        if culoare in COLOR_FILTERS:
+            color = culoare
+        else:
+            warnings.append(
+                f"Culoare necunoscută: „{_echo(culoare)}”. Se arată toate culorile.")
+    colors = [color] if color is not None else None
+
+    counts = await fx.open_counts(db, scanners=scanners, colors=colors)
+    # Pastilele de culoare descriu mulțimea filtrată pe categorie, FĂRĂ filtrul de
+    # culoare — altfel, odată apăsat „roșu", celelalte trei ar spune zero.
+    color_counts = await fx.risk_counts(db, scanners=scanners)
     total = int(counts.get("total", 0))
     pages = max(1, -(-total // PAGE_LIMIT))
     page, page_warning = resolve_page(pagina, pages)
@@ -154,9 +218,11 @@ async def findings_page(
         warnings.append(page_warning)
 
     offset = (page - 1) * PAGE_LIMIT
-    rows = await fx.list_open(db, limit=PAGE_LIMIT, offset=offset, scanners=scanners)
+    rows = await fx.list_open(db, limit=PAGE_LIMIT, offset=offset, scanners=scanners,
+                              colors=colors)
     for r in rows:
         r["sev_dot"] = _SEV_DOT.get(r["severity"], "off")
+        r["risk_view"] = _risk_view(r)
         # What the row is associated with — OS, container, application. Derived
         # here and not in the template: a branch inside Jinja cannot be
         # falsified on its own, and this one has four outcomes including "I
@@ -168,9 +234,16 @@ async def findings_page(
     # atunci chiar e ceva ce nimeni n-a clasificat.
     chips: list[dict[str, Any]] = [
         {"kind": c.kind, "label": c.label, "count": c.count,
-         "url": page_url(c.kind, 1),
+         "url": page_url(c.kind, 1, color),
          "active": selected is not None and selected.kind == c.kind}
         for c in cats if c.kind != KIND_UNKNOWN or c.count]
+
+    kind = selected.kind if selected else None
+    color_chips = [
+        {"color": c, "emoji": risk_view.COLOR_EMOJI[c],
+         "label": risk_view.COLOR_LABEL_RO[c], "count": int(color_counts.get(c, 0)),
+         "url": page_url(kind, 1, c), "active": color == c}
+        for c in COLOR_FILTERS]
 
     templates = request.app.state.templates
     return templates.TemplateResponse(
@@ -190,11 +263,18 @@ async def findings_page(
             "shown": len(rows),
             "primul": offset + 1, "ultimul": offset + len(rows),
             "pagina": page, "pagini": pages,
-            "prev_url": page_url(selected.kind if selected else None, page - 1) if page > 1 else None,
-            "next_url": page_url(selected.kind if selected else None, page + 1) if page < pages else None,
+            "prev_url": page_url(kind, page - 1, color) if page > 1 else None,
+            "next_url": page_url(kind, page + 1, color) if page < pages else None,
             "categorii": chips,
+            "culori": color_chips,
+            "culoare": color,
+            "url_toate_culorile": page_url(kind, 1),
+            # Ce s-a presupus pentru TOATE rândurile: misiunea activului. E cea
+            # mai consecventă intrare din arbore, deci se spune pe pagină, nu doar
+            # în cod.
+            "misiune": risk.mission_for(enrich.DEFAULT_CRITICALITY),
             "selectat": selected.label if selected is not None else None,
-            "url_toate": page_url(None, 1),
+            "url_toate": page_url(None, 1, color),
             "avertismente": warnings,
         },
     )

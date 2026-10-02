@@ -125,4 +125,11 @@ export const MIGRATIONS_MANIFEST: readonly ManifestMigration[] = [
   { file: "0016_commands_purged.sql", statements: [
     { index: 1, sha256: "830dcb3026d06738032974030a2aee396eb1d197b6a166e81ac772ef782105c2" },
   ] },
+  { file: "0017_finding_risk.sql", statements: [
+    { index: 1, sha256: "23e92939f95cbb077a0431aaab8fe5f8818e2da4551e99df2e2005442d4ab5c0" },
+    { index: 2, sha256: "7c1102c9c7fecc9a55961f32a7857ce87ce504d46d6233576d2e734c07afda2e" },
+    { index: 3, sha256: "5256cb37d609cb28fbc711738b4a491b346acecbc561f8fcee2b74a949d6799b" },
+    { index: 4, sha256: "bcc7ff00f7fdd6955f69c02d253b2c4858322354cfdb0f8487f404e32034e275" },
+    { index: 5, sha256: "fbe0daf87bab5aea8935e891f49d08d46413c1e2a283795a71b67dfb0cf8f3fb" },
+  ] },
 ];

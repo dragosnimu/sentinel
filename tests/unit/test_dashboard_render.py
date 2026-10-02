@@ -49,7 +49,8 @@ def _context(**over):
         ],
         "kpi": {"evenimente_24h": 103853, "ostile_24h": 100567, "atacatori_24h": 876,
                 "incidente_deschise": 537, "incidente_grave": 11,
-                "vuln_deschise": 0, "vuln_kev": 0, "blocate": 4},
+                "vuln_deschise": 0, "vuln_kev": 0, "vuln_rosii": 0, "vuln_galbene": 0,
+                "vuln_gri": 0, "blocate": 4},
         "deltas": {"ostile": {"dir": "up", "pct": 40, "text": "↑ 40%"},
                    "atacatori": {"dir": "down", "pct": 12, "text": "↓ 12%"}},
         "countries": [{"tara": "DE", "ev": 989, "ips": 47, "pct": 100},
@@ -217,6 +218,7 @@ def test_findings_page_renders():
     # NOT the authority on that shape — `tests/unit/test_findings_page.py`
     # drives the real handler through the real app, and a divergence between
     # the two is caught there, not here. This test stays on the markup.
+    from sentinel.scan import risk_view
     from sentinel.scan.subject import categories, describe
 
     html = _env().get_template("findings.html").render(
@@ -224,6 +226,11 @@ def test_findings_page_renders():
         primul=1, ultimul=1, pagina=1, pagini=1,
         prev_url=None, next_url=None, url_toate="/findings",
         selectat=None, avertismente=[],
+        culori=[{"color": c, "emoji": risk_view.COLOR_EMOJI[c],
+                 "label": risk_view.COLOR_LABEL_RO[c], "count": 0,
+                 "url": f"/findings?culoare={c}", "active": False}
+                for c in ("red", "amber", "grey", "green")],
+        culoare=None, url_toate_culorile="/findings", misiune="medium",
         categorii=[{"kind": c.kind, "label": c.label, "count": c.count,
                     "url": f"/findings?asociat={c.kind}", "active": False}
                    for c in categories({"dnf": 2})],
@@ -233,7 +240,10 @@ def test_findings_page_renders():
                "priority": 100, "package": "kernel", "installed_version": "1",
                "fixed_version": "2", "scanner": "dnf", "location": None,
                "status": "open", "last_seen": NOW, "asset_name": None,
-               "sev_dot": "bad", "subject": describe("dnf", None)}])
+               "sev_dot": "bad", "subject": describe("dnf", None),
+               "risk_view": {"color": "red", "dot": "bad", "label": "🔴 Act — acum",
+                             "reason": "KEV", "why": ["a", "b"], "cvss": "CVSS 9,8 (Red Hat)",
+                             "epss": "70,0%", "reboot": False}}])
     assert "CVE-2026-9538" in html and "kernel" in html
     # A dnf finding: Red Hat first (backport status is the real question here),
     # NVD alongside, and the KEV catalogue because this row is flagged kev.

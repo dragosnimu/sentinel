@@ -31,7 +31,8 @@ const SUMAR = {
   overview: {
     attackers: { now: 0, before: 0 }, detections: { now: 0, before: 0 },
     events: { now: 0, before: 0 }, incidentsOpen: 0, incidentsSevere: 0,
-    findingsOpen: 0, blocksActive: 0, bySeverity: [],
+    findingsOpen: 0, findingsByColor: { red: 0, amber: 0, green: 0, grey: 0 },
+    blocksActive: 0, bySeverity: [],
   },
   series: [], rankings: { attackers: [], rules: [], sources: [] },
   activity: [], truncated: [],

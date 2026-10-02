@@ -418,10 +418,10 @@ def parse(payload: dict[str, Any]) -> list[dict[str, Any]]:
                                       if isinstance(installed, str) and installed.strip()
                                       else None),
                 # Sirul gol al lui trivy inseamna „nu exista fix publicat", iar
-                # `prioritize.score` da +5 pentru un fix disponibil. Pastrat ca ""
-                # ar fi citit tot ca fals de Python, dar in baza si in panou ar
-                # arata ca o versiune goala — deci None, ca sa insemne acelasi
-                # lucru peste tot.
+                # planificatorul cere o versiune tinta. Pastrat ca "" ar fi citit
+                # tot ca fals de Python, dar in baza si in panou ar arata ca o
+                # versiune goala — deci None, ca sa insemne acelasi lucru peste
+                # tot.
                 "fixed_version": (fixed.strip()
                                   if isinstance(fixed, str) and fixed.strip()
                                   else None),

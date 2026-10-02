@@ -282,8 +282,8 @@ def test_the_same_advisory_seen_twice_collapses_to_one_row() -> None:
 def test_no_published_fix_is_none_rather_than_an_empty_version() -> None:
     """`"FixedVersion": ""` înseamnă „nu există fix", nu „versiunea e goală".
 
-    Eșecul pe care îl previne: `prioritize.score` adaugă +5 pentru o constatare
-    care se POATE repara, iar planificatorul de patch-uri cere o versiune țintă.
+    Eșecul pe care îl previne: planificatorul de patch-uri cere o versiune țintă
+    pentru o constatare care se POATE repara.
     Un șir gol scris în coloană arată în panou ca o versiune reală care lipsește
     la citire — iar un plan generat pentru ea n-ar avea către ce să actualizeze.
     """

@@ -65,6 +65,37 @@ care canalul e abandonat.
 
 ---
 
+### Când pleacă „Sesiune încheiată"
+
+În minute după ce ai închis terminalul, nu la douăsprezece ore.
+
+Rezumatul pleacă imediat ce rândul sesiunii primește `closed_at`. Ieșirea pe
+care ar trebui s-o scrie nucleul (`USER_LOGOUT`) aproape nu se scrie niciodată
+— măsurat pe gazdă pe 15 septembrie 2026, **toate cele 17 sesiuni închise
+fuseseră închise de măturătoarea de 12 ore**, niciuna de o ieșire văzută. De
+aceea sfârșitul unei sesiuni nu se mai așteaptă într-un jurnal, ci se observă:
+`sentinel-ingest` se uită la `/proc` și închide rândurile a căror sesiune de
+audit nu mai are niciun proces pe gazdă.
+
+Trei lucruri o pot întârzia, și toate trei se văd în `/selfcheck`, sub cheia
+`sessions:reaper`:
+
+  * **„nu pot vedea procesele gazdei"** — sub `ProtectProc=invisible` sau sub
+    un modul de securitate care refuză o citire, scanul nu e de încredere. NU
+    se închide nimic: o listă goală luată de bună ar închide toate sesiunile
+    gazdei deodată și ar trimite un rezumat pentru fiecare;
+  * **„aștept coada de audit"** — nu se închide o sesiune înainte ca
+    `audit.log` să fie citit dincolo de clipa în care s-a citit `/proc`.
+    Altfel rezumatul ar număra mai puține comenzi decât s-au rulat. Pe o gazdă
+    ocupată asta înseamnă o fracțiune de secundă; dacă ingestia rămâne în urmă
+    cu minute, atât întârzie și rezumatul, iar verificarea o spune cu cifra;
+  * **„n-a raportat niciodată"** — ingestia rulează cod dinaintea reaper-ului,
+    sau `auditd` e cerut în configurație și fișierul lui de jurnal lipsește.
+
+Plasa de dedesubt e neschimbată: un rând fără nicio activitate de
+douăsprezece ore se închide oricum, din bucla de detecție. Rezumatul lui
+spune „cel puțin" în dreptul duratei, fiindcă nimeni n-a văzut ieșirea.
+
 ## Butonul „Nu sunt eu"
 
 Face **două** lucruri: blochează adresa și **închide sesiunea**. Blocarea

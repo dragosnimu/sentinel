@@ -1,9 +1,16 @@
 """Run the enabled scanners, enrich, prioritise, and record.
 
 One pass = one timer firing. For each scanner: open a `scans` row, collect raw
-findings, enrich each with KEV, score it, upsert (dedup by finding_key), then
-mark anything the scanner used to report but no longer does as resolved. A single
+findings, mark the ones on CISA KEV, upsert (dedup by finding_key), then mark
+anything the scanner used to report but no longer does as resolved. A single
 scanner failing is recorded on its own row and does not stop the others.
+
+Scoring is NOT done per scanner. Once every scanner has written its findings, one
+pass (`enrich.run`) fetches the risk data (EPSS, the vendor's CVSS), decides the
+SSVC colour of every unresolved finding and writes only what changed. It lives
+outside the `_run_*` bodies because it is not about what a scanner saw: scores move
+when EPSS or KEV move, with or without a scan (the hourly maintenance runs the same
+pass), and it must cover findings whose scanner failed tonight.
 
 Three scanners are wired here: the OS package scanner, `trivy_fs` for the
 application dependencies it cannot see, and `trivy_image` for what the running
@@ -34,7 +41,7 @@ from sentinel.db.repo import findings as fx
 from sentinel.intel import kev
 from sentinel.logging_setup import get_logger
 from sentinel.scan import (
-    announce, fix_state, os_packages, prioritize, trivy_fs, trivy_image)
+    announce, enrich, fix_state, os_packages, trivy_fs, trivy_image)
 
 log = get_logger(__name__)
 
@@ -63,6 +70,27 @@ async def run_all(db: Database, cfg: Config, *, triggered_by: str = "schedule") 
         summary[trivy_fs.SCANNER] = await _run_trivy_fs(db, cfg, triggered_by)
     if cfg.scan.containers:
         summary[trivy_image.SCANNER] = await _run_trivy_image(db, triggered_by)
+
+    # Evaluarea riscului, DUPA scanere si INAINTE de planuri si anunt: planificatorul
+    # ordoneaza dupa `priority`, iar anuntul poarta culoarea fiecarei constatari
+    # noi. Constatarile NOI ale rularii (cheile lor) sunt anuntate de mesajul
+    # „vulnerabilitati noi", deci evaluarea nu le mai anunta a doua oara ca
+    # „devenite rosii". Nu ridica: o sursa cazuta lasa constatarile gri, nu scanarea
+    # esuata.
+    new_keys = {item["finding_key"]
+                for result in summary.values()
+                for item in (result.get("new_items") or [])
+                if item.get("finding_key")}
+    risk_summary = await enrich.run(db, cfg, new_keys=new_keys)
+    assessed = risk_summary.pop("assessed", {})
+    summary["risk"] = risk_summary
+    for result in summary.values():
+        for item in (result.get("new_items") or []):
+            a = assessed.get(item.get("finding_key"))
+            if a is not None:
+                item.update(risk_color=a.color, priority=a.priority, risk=a.risk,
+                            kev=item.get("kev") or a.kev, epss=a.epss,
+                            epss_percentile=a.epss_percentile)
 
     summary["patch_plans"] = await _draft_plans(db, cfg)
 
@@ -212,9 +240,9 @@ async def _run_os_packages(db: Database, family: str, triggered_by: str) -> dict
                 f["kev"] = True
                 f["kev_due_date"] = due
             f["scan_id"] = scan_id
-            # OS package findings are host-level; exposure/criticality use host
-            # defaults.
-            f["priority"] = prioritize.score(f, exposed=True, criticality=3)
+            # Fara prioritate aici: o calculeaza `enrich.run` dupa toate scanerele,
+            # cu criticitatea si expunerea implicite ale gazdei (vezi
+            # `enrich.DEFAULT_CRITICALITY`).
             if await fx.upsert_finding(db, f):
                 new += 1
                 new_items.append(dict(f))
@@ -330,11 +358,10 @@ async def _run_trivy_fs(db: Database, cfg: Config, triggered_by: str) -> dict:
                 f["kev"] = True
                 f["kev_due_date"] = kev_map.get(f["cve"])
             f["scan_id"] = scan_id
-            # Aceleasi implicite ca la dnf: constatarile astea sunt pe gazda care
-            # serveste siturile operatorului, deci expuse, cu criticitate neutra.
-            # Legarea lor de un `asset` anume ar cere o potrivire cale->activ, si
-            # una gresita ar muta o vulnerabilitate pe alt sistem.
-            f["priority"] = prioritize.score(f, exposed=True, criticality=3)
+            # Prioritatea o scrie `enrich.run`, cu aceleasi implicite pentru toate
+            # scanerele: gazda serveste siturile operatorului, deci expusa, cu
+            # criticitate neutra. Legarea de un `asset` anume ar cere o potrivire
+            # cale->activ, si una gresita ar muta o vulnerabilitate pe alt sistem.
             if await fx.upsert_finding(db, f):
                 new += 1
                 new_items.append(dict(f))
@@ -440,12 +467,11 @@ async def _run_trivy_image(db: Database, triggered_by: str) -> dict:
                 f["kev"] = True
                 f["kev_due_date"] = kev_map.get(f["cve"])
             f["scan_id"] = scan_id
-            # Aceleasi implicite ca la celelalte doua scanere: containerele de
-            # aici publica porturi catre siturile operatorului, deci expuse, cu
-            # criticitate neutra. Legarea de un `asset` anume ar cere o potrivire
+            # Prioritatea o scrie `enrich.run`. Containerele de aici publica
+            # porturi catre siturile operatorului, deci expuse, cu criticitate
+            # neutra; legarea de un `asset` anume ar cere o potrivire
             # imagine->activ, iar una gresita ar muta o vulnerabilitate pe alt
             # sistem.
-            f["priority"] = prioritize.score(f, exposed=True, criticality=3)
             if await fx.upsert_finding(db, f):
                 new += 1
                 new_items.append(dict(f))

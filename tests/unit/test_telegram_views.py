@@ -200,7 +200,8 @@ def test_dashboard_shows_only_insights_worth_colouring(monkeypatch):
 
 _KPI = {"evenimente_24h": 10, "ostile_24h": 5, "atacatori_24h": 2,
         "incidente_deschise": 1, "incidente_grave": 0, "vuln_deschise": 0,
-        "vuln_kev": 0, "blocate": 0}
+        "vuln_kev": 0, "vuln_rosii": 0, "vuln_galbene": 0, "vuln_gri": 0,
+        "blocate": 0}
 
 
 def _async(value):
@@ -238,8 +239,11 @@ class _Findings:
     Python si n-ar observa nimeni ca filtrul a ajuns dupa taiere.
 
     Ordonarea e numai (prioritate desc, id desc): corpusul e construit ca
-    severitatea si `last_seen` sa nu departajeze nimic, deci coincide cu
-    `ORDER BY f.priority DESC, f.severity DESC, f.last_seen DESC, f.id DESC`.
+    severitatea, `risk_score` si `last_seen` sa nu departajeze nimic, deci
+    coincide cu `ORDER BY f.priority DESC, f.risk_score DESC NULLS LAST,
+    f.severity DESC, f.last_seen DESC, f.id DESC`.
+
+    Culoarea unui rand fara `risk_color` e `grey`, ca `DEFAULT 'grey'` din 0047.
     """
 
     def __init__(self, rows):
@@ -247,7 +251,7 @@ class _Findings:
         self.calls: list[dict] = []
 
     @staticmethod
-    def _match(row, scanners, severities, kev_only) -> bool:
+    def _match(row, scanners, severities, kev_only, colors=None) -> bool:
         # `None` = fara filtru; lista goala = niciun rand. Aceeasi distinctie ca
         # `_scanner_clause`, fiindcă o categorie fara scanere trebuie sa dea zero
         # randuri, nu toate randurile.
@@ -255,31 +259,45 @@ class _Findings:
             return False
         if severities is not None and row["severity"] not in severities:
             return False
+        if colors is not None and (row.get("risk_color") or "grey") not in colors:
+            return False
         return not (kev_only and not row.get("kev"))
 
-    def _selected(self, scanners, severities, kev_only):
+    def _selected(self, scanners, severities, kev_only, colors=None):
         return [r for r in self.rows
                 if r["status"] == "open"
-                and self._match(r, scanners, severities, kev_only)]
+                and self._match(r, scanners, severities, kev_only, colors)]
 
     async def list_open(self, db, *, limit=100, offset=0, scanners=None,
-                        severities=None, kev_only=False):
+                        severities=None, colors=None, kev_only=False):
         self.calls.append({"limit": limit, "offset": offset, "scanners": scanners,
-                           "severities": severities, "kev_only": kev_only})
-        sel = sorted(self._selected(scanners, severities, kev_only),
+                           "severities": severities, "colors": colors,
+                           "kev_only": kev_only})
+        sel = sorted(self._selected(scanners, severities, kev_only, colors),
                      key=lambda r: (-r["priority"], -r["id"]))
         return sel[offset:offset + limit]
 
     async def open_counts(self, db, *, scanners=None, severities=None,
-                          kev_only=False):
-        sel = self._selected(scanners, severities, kev_only)
+                          colors=None, kev_only=False):
+        sel = self._selected(scanners, severities, kev_only, colors)
         counts: dict[str, int] = {}
         for r in sel:
             counts[r["severity"]] = counts.get(r["severity"], 0) + 1
         counts["total"] = len(sel)
-        counts["kev"] = sum(1 for r in self._selected(scanners, severities, False)
+        counts["kev"] = sum(1 for r in self._selected(scanners, severities, False, colors)
                             if r.get("kev"))
         return counts
+
+    async def risk_counts(self, db, *, scanners=None, severities=None,
+                          kev_only=False):
+        counts = {"red": 0, "amber": 0, "grey": 0, "green": 0}
+        for r in self._selected(scanners, severities, kev_only):
+            counts[r.get("risk_color") or "grey"] += 1
+        counts["total"] = sum(counts.values())
+        return counts
+
+    async def vendor_justification(self, db, row):
+        return None
 
     async def open_counts_by_scanner(self, db):
         out: dict[str, int] = {}
@@ -294,7 +312,7 @@ class _Findings:
 
     def install(self, monkeypatch):
         for name in ("list_open", "open_counts", "open_counts_by_scanner",
-                     "get_finding"):
+                     "get_finding", "risk_counts", "vendor_justification"):
             monkeypatch.setattr(views.findings_repo, name, getattr(self, name))
         return self
 
@@ -645,11 +663,33 @@ def test_antetul_numara_toate_severitatile_multimii(monkeypatch):
     _Findings(rows).install(monkeypatch)
     upd, msg = _update()
     run(views.cmd_vulns(upd, _ctx(None)))
-    pastile = msg.sent[0].splitlines()[1]
+    # Linia 1 e semaforul, linia 2 severitatile scanerului.
+    pastile = msg.sent[0].splitlines()[2]
 
     numere = [int(n) for n in re.findall(r"[⚪🔵🟡🟠🔴](\d+)", pastile)]
     assert sum(numere) == len(rows), (
         f"pastilele {pastile!r} insumeaza {sum(numere)} din {len(rows)} randuri")
+
+
+def test_semaforul_din_antet_numara_toate_culorile_si_pomeneste_griul(monkeypatch):
+    """Pastilele de culoare trebuie sa se adune la totalul multimii, iar gri sa
+    apara chiar si cu zero.
+
+    Eșecul pe care îl previne: un antet care enumera doar culorile nenule tace
+    despre „fara date" exact in ziua in care nu exista — iar apoi nimeni nu mai
+    stie ca tacerea inseamna zero, nu „nu s-a verificat".
+    """
+    culori = ["red", "amber", "green", "green", "green"]
+    rows = [{**_FINDING, "id": 10 + i, "risk_color": culori[i % 5],
+             "priority": 90 - i} for i in range(10)]
+    _Findings(rows).install(monkeypatch)
+    upd, msg = _update()
+    run(views.cmd_vulns(upd, _ctx(None)))
+    linia = msg.sent[0].splitlines()[1]
+    assert linia.startswith("Semafor: "), linia
+    numere = {k: int(n) for k, n in re.findall(r"(🔴|🟡|⚪|🟢) (\d+)", linia)}
+    assert sum(numere.values()) == len(rows), linia
+    assert numere == {"🔴": 2, "🟡": 2, "⚪": 0, "🟢": 6}, linia
 
 
 def test_bugetul_se_masoara_in_unitati_utf16(monkeypatch):
@@ -912,7 +952,7 @@ def test_detaliul_pastreaza_epss(monkeypatch):
     _Findings([{**_FINDING, "epss": 0.42}]).install(monkeypatch)
     upd, msg = _update()
     run(views.cmd_vuln(upd, _ctx(None, ["42"])))
-    assert "EPSS 42%" in msg.sent[0]
+    assert "EPSS 42,0%" in msg.sent[0]
 
 
 def test_a_finding_without_a_fix_does_not_offer_a_patch_plan(monkeypatch):

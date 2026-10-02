@@ -221,13 +221,15 @@
     {{ cov_note(overview.patches.coverage) }}
   </div>
 
-  <div class="kpi {{ 'kpi-bad' if overview.findings.kev else ('kpi-ok' if not overview.findings.open) }}">
+  <div class="kpi {{ 'kpi-bad' if (overview.findings.red or overview.findings.kev) else ('kpi-warn' if overview.findings.amber else ('kpi-ok' if not overview.findings.open)) }}">
     <div class="kpi-head"><span class="kpi-label">Vulnerabilități deschise</span></div>
     <div class="kpi-main"><span class="kpi-value">{{ overview.findings.open }}</span></div>
-    {# La fel: „deschise acum" e complet, „noi în {{ window }}" nu. #}
+    {# La fel: „deschise acum" e complet, „noi în {{ window }}" nu. Semaforul SSVC:
+       gri („fără date") apare mereu, chiar cu zero. #}
     <span class="kpi-note">
-      {%- if overview.findings.kev %}{{ overview.findings.kev }} exploatate activ
-      {%- else %}niciuna exploatată activ{% endif %} ·
+      {{ overview.findings.red }} roșii · {{ overview.findings.amber }} galbene ·
+      {{ overview.findings.grey }} fără date
+      {%- if overview.findings.kev %} · {{ overview.findings.kev }} KEV{% endif %} ·
       {{ overview.findings.new }} noi în {{ window }}{{ cov_inline(overview.findings.coverage) }}
     </span>
   </div>
@@ -267,10 +269,13 @@
 
   <section class="card">
     <h2>Vulnerabilități · ultimele {{ window }}</h2>
-    {# Primele trei rânduri sunt „acum" și complete; ultimele două sunt
+    {# Primele șase rânduri sunt „acum" și complete; ultimele două sunt
        ferestruite, deci doar ele poartă calificarea. #}
     <dl class="kv">
       <dt>Deschise acum</dt><dd>{{ overview.findings.open }}</dd>
+      <dt>🔴 Roșii (Act)</dt><dd>{{ overview.findings.red }}</dd>
+      <dt>🟡 Galbene (Attend)</dt><dd>{{ overview.findings.amber }}</dd>
+      <dt>⚪ Fără date (gri)</dt><dd>{{ overview.findings.grey }}</dd>
       <dt>Grave (high / critical)</dt><dd>{{ overview.findings.grave }}</dd>
       <dt>Exploatate activ (KEV)</dt><dd>{{ overview.findings.kev }}</dd>
       <dt>Apărute în fereastră</dt>

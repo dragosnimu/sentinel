@@ -68,9 +68,11 @@ def _selected(rows, *, limit=3) -> list[int]:
     run(planner.generate_for_kev(db, cfg=_cfg(), api_key="sk-test", limit=limit))
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE findings (id INTEGER, status TEXT, kev INTEGER, "
-                 "fixed_version TEXT, priority INTEGER, ecosystem TEXT, raw TEXT)")
+                 "fixed_version TEXT, priority INTEGER, ecosystem TEXT, raw TEXT, "
+                 "risk_score REAL)")
     conn.execute("CREATE TABLE patch_plans (finding_id INTEGER, status TEXT)")
-    conn.executemany("INSERT INTO findings VALUES (?, ?, 1, '1.2.3', ?, ?, ?)",
+    conn.executemany("INSERT INTO findings (id, status, kev, fixed_version, priority, "
+                     "ecosystem, raw) VALUES (?, ?, 1, '1.2.3', ?, ?, ?)",
                      [(i, st, pr, ECOSISTEM, raw) for i, st, pr, raw in rows])
     return [r[0] for r in conn.execute(_to_sqlite(db.sql), (ECOSISTEM, limit))]
 

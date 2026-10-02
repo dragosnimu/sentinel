@@ -924,6 +924,11 @@ async def generate_for_kev(db: Database, cfg: Config, api_key: str,
                     extra={"family": family})
         return []
 
+    # Ordinea: banda semaforului (`priority`), apoi `risk_score` în interiorul ei,
+    # apoi `id`. Un KEV poate fi verde (SSVC: activ + neautomatizabil + parțial =
+    # Track), iar verdele stă aproape tot la `priority` 0; fără departajare,
+    # `LIMIT` ar alege între ele arbitrar. NULLS LAST: Postgres pune NULL primul
+    # la DESC, deci rândurile nescorate ar trece înaintea celor scorate.
     rows = await db.fetch(
         f"""
         SELECT f.id, f.ecosystem FROM findings f
@@ -935,7 +940,8 @@ async def generate_for_kev(db: Database, cfg: Config, api_key: str,
               WHERE f.id = ANY(p.finding_ids)
                 AND p.status IN ({_LIVE_STATUS_LIST})
           )
-        ORDER BY f.priority DESC LIMIT $2
+        ORDER BY f.priority DESC, f.risk_score DESC NULLS LAST, f.id
+        LIMIT $2
         """,
         expected, limit)
 

@@ -52,6 +52,9 @@ import type { Arrival } from "./data/arrivals";
 import type { BlockSummary } from "./data/blocklist";
 import type { DetectionSummary } from "./data/detections";
 import type { FindingSummary } from "./data/findings";
+import { COLORS, COLOR_LABEL_RO } from "./finding-risk";
+import { GROUPS } from "./finding-groups";
+import type { RiskColor } from "./finding-risk";
 import type { PlanSummary } from "./data/patch-plans";
 import type { CheckState } from "./data/selfcheck";
 import type { LoginSession, SessionDetail } from "./data/logins";
@@ -327,6 +330,18 @@ function card(eticheta: string, valoare: string, sub: string, cls = ""): string 
     `<div class="card-sub">${escapeHtml(sub)}</div></div>\n`;
 }
 
+/**
+ * Sub-linia cardului de vulnerabilități: câte sunt roșii, galbene și FĂRĂ DATE.
+ *
+ * Gri apare mereu, ca și pe pagina serverului: „0 fără date" e un fapt, iar un
+ * card care ar tăcea despre gri ar arăta curat tocmai când nu se știe. Verdele nu
+ * se enumeră: e restul, adică „ciclul obișnuit de actualizare".
+ */
+function findingsCardSub(o: Summary["overview"]): string {
+  const c = o.findingsByColor;
+  return `${c.red} roșii · ${c.amber} galbene · ${c.grey} fără date`;
+}
+
 function cards(s: Summary): string {
   const o = s.overview;
   const att = trend(o.attackers);
@@ -345,7 +360,8 @@ function cards(s: Summary): string {
     card("Incidente deschise", String(o.incidentsOpen),
          `${o.incidentsSevere} grave`,
          o.incidentsSevere > 0 ? "card-alarma" : "") +
-    card("Vulnerabilitati", String(o.findingsOpen), "neaplicate inca") +
+    card("Vulnerabilitati", String(o.findingsOpen), findingsCardSub(o),
+         o.findingsByColor.red > 0 ? "card-alarma" : "") +
     card("Blocari active", String(o.blocksActive), "in vigoare acum") +
     "</div>\n" +
     `<p class="nota">Ferestrele: ${WINDOW_HOURS} de ore, comparate cu cele ` +
@@ -727,6 +743,10 @@ export type FindingsView = Chrome & {
   findings: FindingSummary[];
   counts: Record<string, number> & { total: number };
   group: string | null;
+  /** Filtrul pe culoare, sau `null`. Vine validat din rută (vocabular închis). */
+  color: RiskColor | null;
+  /** Pastilele de culoare, numărate în aceeași grupă ca tabelul. */
+  colors: Record<RiskColor, number>;
   /** Starea scanarii care produce cifrele. Vezi `scanAge`. */
   scan: ScanHealth;
 };
@@ -804,30 +824,94 @@ function groupFilters(view: FindingsView): string {
   return parts.join("");
 }
 
+/**
+ * Filtrele de culoare, ca LEGĂTURI, cu numărul fiecăreia — roșu, galben, gri,
+ * verde, în ordinea listei. Gri apare MEREU, chiar cu zero: „nimic fără date" e
+ * un fapt, iar o pastilă lipsă ar fi tăcere despre exact ce nu se știe.
+ *
+ * Numără doar constatările NEAPLICATE (culoarea nu se calculează pentru cele
+ * rezolvate), iar o pastilă restrânge lista la grupa „neaplicate": nu poartă
+ * `?grupa=`, fiindcă ar putea fi una în care culoarea nu are înțeles. Păstrează
+ * serverul ales.
+ */
+function colorFilters(view: FindingsView): string {
+  const base = withInstance("/panel/vulnerabilitati", view.selected);
+  const sep = base.includes("?") ? "&" : "?";
+  const keepGroup = "";
+  const joiner = sep;
+  const glyphs: Record<RiskColor, string> = {
+    red: "🔴", amber: "🟡", grey: "⚪", green: "🟢",
+  };
+  const parts = ['<nav class="filtre" aria-label="Culoare">\n'];
+  const total = COLORS.reduce((acc, c) => acc + view.colors[c], 0);
+  parts.push(`<a href="${base}${keepGroup}"` +
+             `${view.color === null ? ' class="aici" aria-current="page"' : ""}>` +
+             `Neaplicate, toate culorile <span class="nr">${total}</span></a>\n`);
+  for (const color of COLORS) {
+    const href = `${base}${keepGroup}${joiner}culoare=${color}`;
+    const here = view.color === color ? ' class="aici" aria-current="page"' : "";
+    parts.push(`<a href="${href}"${here}>${glyphs[color]} ` +
+               `${escapeHtml(COLOR_LABEL_RO[color])} ` +
+               `<span class="nr">${view.colors[color]}</span></a>\n`);
+  }
+  parts.push("</nav>\n");
+  return parts.join("");
+}
+
+/** Stările în care serverul încă evaluează o constatare. */
+const OPEN_STATUSES: ReadonlySet<string> = new Set(GROUPS.neaplicate);
+
+/**
+ * Celula „Risc": culoarea, decizia, și UN motiv.
+ *
+ * Agregatorul vede mai multe servere, așa că aici stă doar ce trebuie ca să
+ * decizi unde te uiți mai departe: de ce e culoarea asta într-o linie („KEV",
+ * „CISA: exploatat", „fără date CISA"). Cele patru puncte de decizie, cu sursa fiecăruia
+ * și justificarea furnizorului, rămân pe serverul însuși și în bot.
+ */
+function riskCell(f: FindingSummary): string {
+  // O constatare închisă nu mai e evaluată pe server: culoarea ei e cea implicită
+  // (gri) sau una veche, iar a o desena ar spune „fără date" despre ceva rezolvat.
+  if (!OPEN_STATUSES.has(f.status)) {
+    return `<td><span class="id">— (${escapeHtml(f.status)})</span></td>`;
+  }
+  const r = f.risk;
+  const strong = r.color === "red" || r.color === "amber";
+  const head = strong ? `<strong>${escapeHtml(r.headline)}</strong>` : escapeHtml(r.headline);
+  const why = r.greyReason ?? r.oneLiner;
+  return `<td>${head}<br><span class="id">${escapeHtml(why)}</span></td>`;
+}
+
 export function findingsPage(view: FindingsView): string {
   return page(view, "Vulnerabilitati",
-    "<h1>Vulnerabilitati</h1>\n" + scanAge(view) + groupFilters(view) +
+    "<h1>Vulnerabilitati</h1>\n" + scanAge(view) + groupFilters(view) + colorFilters(view) +
     // Ordinea e a serverului, și se spune: cine se uită la o listă sortată
     // altfel decât crede trage concluzii greșite despre ce e urgent.
-    '<p class="nota">Ordonate după <code>priority</code>, scorul calculat pe ' +
-    "server din severitate, EPSS și apartenența la catalogul KEV. Replica nu " +
-    "recalculează nimic — CVSS-ul singur prezice prost ce se atacă efectiv.</p>\n" +
+    '<p class="nota">Culoarea e decizia CISA SSVC calculată pe serverul fiecărui ' +
+    "rând (roșu = Act, galben = Attend, verde = Track), din exploatare " +
+    "(KEV, valorile publicate de CISA), vector CVSS și criticitatea activului — nu un prag. " +
+    "<strong>Singura excepție, a Sentinel și nu a SSVC:</strong> un rând galben marcat " +
+    "„regula Sentinel” a fost urcat acolo fiindcă EPSS ≥ 50% stă lângă o evaluare CISA de " +
+    "peste 180 de zile; SSVC singur l-ar fi lăsat mai jos. " +
+    "<strong>Gri înseamnă că lipsesc date, nu că e în regulă.</strong> Neaplicatele primele, apoi " +
+    "ordonate după culoare, apoi după probabilitate × impact. Replica nu recalculează " +
+    "nimic și nu amestecă serverele: culoarea unui rând e verdictul gazdei lui.</p>\n" +
     absent("findings", view.arrivals) +
     table(
-      "<th>Severitate</th><th>CVE</th><th>Pachet</th><th>Fix</th>" +
-      "<th>EPSS</th><th>KEV</th><th>Prioritate</th><th>Stare</th>",
+      "<th>Risc</th><th>Severitate</th><th>CVE</th><th>Pachet</th><th>Fix</th>" +
+      "<th>Importanță</th><th>EPSS</th><th>KEV</th><th>Stare</th>",
       view.findings.map((f) =>
-        "<tr>" + severityCell(f.severity) +
+        "<tr>" + riskCell(f) + severityCell(f.severity) +
         `<td>${escapeHtml(f.cve ?? "—")}<br>` +
         `<span class="id">${escapeHtml(f.scanner)}</span></td>` +
         `<td>${escapeHtml(f.packageName ?? "—")}<br>` +
         `<span class="id">${escapeHtml(f.installedVersion ?? "—")}</span></td>` +
         `<td>${escapeHtml(f.fixedVersion ?? "—")}</td>` +
-        `<td class="nr">${escapeHtml(f.epss ?? "—")}</td>` +
+        `<td class="nr">${escapeHtml(f.risk.cvss)}</td>` +
+        `<td class="nr">${escapeHtml(f.risk.epss)}</td>` +
         `<td>${f.kev
           ? `<strong>da</strong>${f.kevDueDate ? ` — ${escapeHtml(f.kevDueDate)}` : ""}`
           : "nu"}</td>` +
-        `<td class="nr">${f.priority}</td>` +
         `<td>${escapeHtml(f.status)}</td></tr>\n`),
       "nicio constatare"));
 }

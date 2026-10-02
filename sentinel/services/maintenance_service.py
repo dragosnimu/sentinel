@@ -855,6 +855,49 @@ async def refresh_intel(db: Database) -> tuple[str, dict[str, Any]]:
     return "; ".join(parts), {"kev": n, "reputation": rep}
 
 
+async def assess_risk(db: Database, cfg: Config) -> tuple[str, dict[str, Any]]:
+    """Trecerea de evaluare a riscului: EPSS, CVSS-ul furnizorului, semaforul SSVC.
+
+    Aceeași funcție ca la sfârșitul scanării (`sentinel/scan/enrich.py`), chemată și
+    de aici, din oră în oră, din două motive:
+
+      * scorurile se mișcă singure — EPSS se schimbă zilnic, un CVE intră în KEV între
+        două scanări — și o scanare care a eșuat sau n-a rulat azi nu trebuie să
+        lase culorile pe datele de ieri;
+      * prima evaluare de după livrare vine în maxim o oră, nu abia la 03:15.
+
+    Sursele au porți proprii (EPSS: o descărcare pe zi; Red Hat și OSV: doar ce
+    lipsește sau a îmbătrânit, cu plafon pe trecere), deci o oră fără nimic nou
+    înseamnă o citire și zero scrieri.
+
+    Ultimul pas din `run`, dinadins: face rețea, iar unitatea are
+    `TimeoutStartSec=900`. Retenția, agregatele și garda de disc trebuie să fi
+    terminat înainte ca o sursă lentă să poată ocupa timpul.
+
+    O trecere eșuată ridică, ca pasul să fie raportat ca eșuat (jurnal, raportul
+    rulării) — `enrich.run` nu ridică niciodată de la sine, deci eșecul de aici e
+    unul DECLARAT, nu o excepție scăpată.
+    """
+    from sentinel.scan import enrich
+
+    out = await enrich.run(db, cfg)
+    out.pop("assessed", None)
+    if out.get("status") != "completed":
+        raise RuntimeError(f"evaluarea de risc a eșuat: {out.get('error', '?')}")
+    colors = out.get("colors") or {}
+    detail = (f"{out['findings']} constatări evaluate "
+              f"({colors.get('red', 0)} roșii, {colors.get('amber', 0)} galbene, "
+              f"{colors.get('grey', 0)} fără date, {colors.get('green', 0)} verzi); "
+              f"{out['changed']} schimbate")
+    sources = {k: v.get("status") or ("aborted" if v.get("aborted") else "ok")
+               for k, v in (out.get("sources") or {}).items()}
+    failed = sorted(k for k, v in sources.items() if v in ("failed", "aborted"))
+    if failed:
+        detail += f"; surse cu probleme: {', '.join(failed)}"
+    return detail, {"findings": out["findings"], "changed": out["changed"],
+                    "colors": colors, "sources": sources}
+
+
 async def prune_backups(db: Database, cfg: Config) -> tuple[str, dict[str, Any]]:
     from sentinel.patch import backup
     n = await backup.prune(db, cfg)
@@ -1095,6 +1138,8 @@ async def run(db: Database, cfg: Config) -> Report:
     await _step(rep, "retire_plans", retire_plans(db))
     await _step(rep, "stale_incidents", close_stale_incidents(db, cfg))
     await _step(rep, "quiet_campaigns", quiet_campaigns(db))
+    # Ultimul: face rețea (vezi `assess_risk`), iar unitatea are un termen.
+    await _step(rep, "risk", assess_risk(db, cfg))
     return rep
 
 

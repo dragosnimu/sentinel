@@ -74,7 +74,11 @@ def _finding(**over) -> dict:
            "severity": "high", "cvss": 8.1, "epss": 0.2, "kev": False, "priority": 70,
            "package": "openssl", "installed_version": "1", "fixed_version": "2",
            "scanner": "dnf", "location": None, "status": "open", "last_seen": NOW,
-           "asset_name": None}
+           "asset_name": None,
+           # Coloanele semaforului, în forma în care le selectează `list_open`
+           # (0047): un rând fără ele n-ar mai fi forma reală.
+           "epss_percentile": None, "risk_color": "grey", "risk_decision": None,
+           "risk_score": None, "risk": {}}
     row.update(over)
     return row
 
@@ -165,6 +169,11 @@ class StubDB:
             rows = self._filter(self.all, scanners)
             return [{"severity": s, "n": n}
                     for s, n in Counter(r["severity"] for r in rows).items()]
+        if "GROUP BY risk_color" in sql:
+            scanners = a[0] if "ANY($1::text[])" in sql else None
+            rows = self._filter(self.all, scanners)
+            return [{"risk_color": c, "n": n}
+                    for c, n in Counter(r.get("risk_color") or "grey" for r in rows).items()]
         if "FROM findings f LEFT JOIN assets" in sql:
             if "coalesce(f.scanner, '') = ANY($1" in sql:
                 scanners, limit, offset = a[0], a[1], a[2]

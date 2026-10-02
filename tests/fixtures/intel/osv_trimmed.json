@@ -1,0 +1,86 @@
+{
+ "GHSA-2x7j-588g-ccc2": {
+  "id": "GHSA-2x7j-588g-ccc2",
+  "summary": "Nodemailer: Quadratic (O(n²)) time complexity in addressparser allows remote denial of service via a crafted address list",
+  "aliases": [
+   "CVE-2026-92596"
+  ],
+  "modified": "2026-09-17T11:56:03.050481347Z",
+  "published": "2026-09-08T21:33:17Z",
+  "database_specific": {
+   "github_reviewed_at": "2026-09-08T21:33:17Z",
+   "nvd_published_at": null,
+   "cwe_ids": [
+    "CWE-400",
+    "CWE-407"
+   ],
+   "severity": "HIGH",
+   "github_reviewed": true
+  },
+  "severity": [
+   {
+    "type": "CVSS_V3",
+    "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+   }
+  ]
+ },
+ "GHSA-2xp9-vwfh-vxw4": {
+  "id": "GHSA-2xp9-vwfh-vxw4",
+  "summary": "Next.js: Unauthenticated Remote Code Execution in Image Optimization API when AVIF files are used",
+  "modified": "2026-09-08T21:30:04.767189946Z",
+  "published": "2026-09-08T21:21:12Z",
+  "database_specific": {
+   "github_reviewed": true,
+   "github_reviewed_at": "2026-09-08T21:21:12Z",
+   "nvd_published_at": null,
+   "cwe_ids": [
+    "CWE-1395"
+   ],
+   "severity": "CRITICAL"
+  },
+  "severity": [
+   {
+    "type": "CVSS_V4",
+    "score": "CVSS:4.0/AV:N/AC:L/AT:P/PR:N/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H"
+   }
+  ]
+ },
+ "CVE-2024-22640": {
+  "id": "CVE-2024-22640",
+  "aliases": [
+   "GHSA-mx3p-fhpw-x6rv"
+  ],
+  "modified": "2026-08-12T03:51:38.871913505Z",
+  "published": "2024-04-19T00:00:00Z",
+  "database_specific": {
+   "cna_assigner": "mitre"
+  },
+  "severity": [
+   {
+    "type": "CVSS_V3",
+    "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+   }
+  ]
+ },
+ "CVE-2026-45067": {
+  "id": "CVE-2026-45067",
+  "summary": "Symfony: Email Header / SMTP Command Injection via CRLF in Symfony\\Component\\Mime\\Address",
+  "aliases": [
+   "GHSA-qpmx-3rfj-7rhv"
+  ],
+  "modified": "2026-08-12T03:51:23.946005367Z",
+  "published": "2026-07-14T17:41:53.874Z",
+  "database_specific": {
+   "cna_assigner": "GitHub_M",
+   "cwe_ids": [
+    "CWE-93"
+   ]
+  },
+  "severity": [
+   {
+    "type": "CVSS_V4",
+    "score": "CVSS:4.0/AV:N/AC:L/AT:P/PR:N/UI:N/VC:N/VI:L/VA:N/SC:N/SI:N/SA:N"
+   }
+  ]
+ }
+}

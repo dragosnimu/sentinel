@@ -34,7 +34,7 @@ from sentinel.db.repo import events as events_repo
 from sentinel.db.repo import findings as findings_repo
 from sentinel.intel.links import cve_html, cve_links
 from sentinel.logging_setup import get_logger
-from sentinel.scan import fix_state
+from sentinel.scan import fix_state, risk_view
 from sentinel.scan.subject import (KIND_APP, KIND_CONTAINER, KIND_LABELS, KIND_OS,
                                    KIND_UNKNOWN, categories, describe)
 from sentinel.util import tz
@@ -140,7 +140,9 @@ async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"Atacatori unici: {kpi['atacatori_24h']:,}{_delta(deltas, 'atacatori')}",
         f"Incidente deschise: <b>{kpi['incidente_deschise']}</b> "
         f"(grave: {kpi['incidente_grave']})",
-        f"Vulnerabilități: {kpi['vuln_deschise']} deschise · {kpi['vuln_kev']} KEV",
+        f"Vulnerabilități: {kpi['vuln_deschise']} deschise · 🔴 {kpi['vuln_rosii']} · "
+        f"🟡 {kpi['vuln_galbene']} · ⚪ {kpi['vuln_gri']} fără date · "
+        f"🔥 {kpi['vuln_kev']} KEV",
         f"IP-uri blocate: {kpi['blocate']}",
         f"Servicii: 🟢 {health.get('up', 0)} · 🔴 {health.get('down', 0)} · "
         f"⚪ {health.get('necunoscut', 0)}",
@@ -215,6 +217,11 @@ MAX_SUBJECT_DETAIL = 120
 #: dedesubt rămâne goală cu antetul spunând cinstit „0 afișate".
 MAX_FIELD_LIST = 56
 
+#: Cât din motivul culorii („KEV", „EPSS 92,0% 🔁", „fără EPSS") intră pe un rând.
+#: Vine dintr-un vocabular închis (`risk_view.one_liner`), deci e scurt prin
+#: construcție; plafonul e pentru ziua în care cineva îi adaugă o ramură nouă.
+MAX_REASON_LIST = 24
+
 #: Cât din identificatorul CVE intră pe un rând. Al patrulea câmp netrusted de
 #: pe rândul ăla, și singurul rămas nemărginit: `cve_html` cade pe
 #: `escape(str(cve))` pentru orice nu e un CVE bine format, fără plafon, iar o
@@ -248,10 +255,13 @@ class VulnFilter:
     kev_only: bool = False
     kind: str | None = None
     warning: str | None = None
+    #: Culoarea semaforului cerută (`red`/`amber`/`grey`/`green`), sau `None`.
+    colors: tuple[str, ...] | None = None
 
     @property
     def filtered(self) -> bool:
-        return self.severities is not None or self.kev_only or self.kind is not None
+        return (self.severities is not None or self.kev_only or self.kind is not None
+                or self.colors is not None)
 
 
 # Argumentele pe categorie oglindesc `?asociat=` din pagină, dar în cuvintele
@@ -266,8 +276,22 @@ class VulnFilter:
 #: `parse_vuln_filter`, ca fiecare categorie din `subject.KINDS` să fie
 #: accesibilă prin cel puțin unul dintre ele, și ca `HELP` să le listeze pe
 #: exact acestea.
-FILTER_WORDS: tuple[str, ...] = ("kev", "critice", "mari", "sistem", "container",
-                                 "aplicatie", "necunoscut")
+FILTER_WORDS: tuple[str, ...] = ("kev", "rosii", "galbene", "gri", "verzi", "critice",
+                                 "mari", "sistem", "container", "aplicatie",
+                                 "necunoscut")
+
+#: Cuvintele de culoare, în felul în care le tastează operatorul (cu și fără
+#: diacritice: un argument e text liber, nu un nume de comandă — doar numele
+#: comenzilor din `CommandHandler` trebuie să rămână ASCII).
+_COLOR_ARGS: dict[str, tuple[str, str]] = {
+    "rosii": ("red", "roșii"), "roșii": ("red", "roșii"), "rosu": ("red", "roșii"),
+    "roșu": ("red", "roșii"), "red": ("red", "roșii"),
+    "galbene": ("amber", "galbene"), "galben": ("amber", "galbene"),
+    "amber": ("amber", "galbene"),
+    "gri": ("grey", "fără date (gri)"), "grey": ("grey", "fără date (gri)"),
+    "gray": ("grey", "fără date (gri)"),
+    "verzi": ("green", "verzi"), "verde": ("green", "verzi"), "green": ("green", "verzi"),
+}
 
 _KIND_ARGS: dict[str, str] = {
     "sistem": KIND_OS, "os": KIND_OS, "sistem-de-operare": KIND_OS,
@@ -291,6 +315,10 @@ def parse_vuln_filter(arg: str) -> VulnFilter:
     if a in ("kev", "exploatate"):
         return VulnFilter("Vulnerabilități exploatate activ (KEV)",
                           "deschise exploatate activ", kev_only=True)
+    if a in _COLOR_ARGS:
+        color, label = _COLOR_ARGS[a]
+        return VulnFilter(f"Vulnerabilități {label}", f"deschise {label}",
+                          colors=(color,))
     if a in ("critice", "critical"):
         return VulnFilter("Vulnerabilități critice", "critice deschise",
                           severities=("critical",))
@@ -306,6 +334,21 @@ def parse_vuln_filter(arg: str) -> VulnFilter:
     return VulnFilter(
         "Vulnerabilități deschise", "deschise",
         warning=f"Filtru neînțeles: „{_echo(arg)}”. Se arată toate categoriile.")
+
+
+def _risk_dict(value: Any) -> dict[str, Any]:
+    """`findings.risk` ca dict, oricum l-ar da driverul (text jsonb sau dict)."""
+    import json
+
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (str, bytes)):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
 
 
 def _echo(value: str) -> str:
@@ -426,11 +469,17 @@ async def cmd_vulns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             scanners = list(cat.scanners)
 
     severities = list(sel.severities) if sel.severities is not None else None
+    colors = list(sel.colors) if sel.colors is not None else None
     counts = await findings_repo.open_counts(
+        db, scanners=scanners, severities=severities, colors=colors,
+        kev_only=sel.kev_only)
+    # Pastilele de culoare descriu mulțimea filtrată pe CELELALTE criterii, fără
+    # filtrul de culoare: altfel „/vulnerabilitati rosii" ar număra „🟡 0 · 🟢 0".
+    color_counts = await findings_repo.risk_counts(
         db, scanners=scanners, severities=severities, kev_only=sel.kev_only)
     rows = await findings_repo.list_open(
         db, limit=VULN_LIMIT, scanners=scanners, severities=severities,
-        kev_only=sel.kev_only)
+        colors=colors, kev_only=sel.kev_only)
     # Trei dus-întorsuri, nu o tranzacție: o scanare care se termină între ele
     # poate lăsa „20 afișate din 19" pentru o singură apăsare. Aceeași alegere
     # ca pagina — o tranzacție în jurul unei citiri costă mai mult decât cazul
@@ -451,6 +500,9 @@ async def cmd_vulns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _reply(update, clamp(warn_lines + empty))
         return
 
+    # Semaforul întâi: e răspunsul la „cât de rău e". Severitatea scanerului
+    # rămâne dedesubt, ca fapt separat — CVSS-ul singur nu decide culoarea.
+    head_colors = "Semafor: " + risk_view.counts_line(color_counts)
     head = " · ".join(
         f"{_SEV_EMOJI[s]}{counts[s]}"
         for s in ("critical", "high", "medium", "low", "info")
@@ -467,15 +519,22 @@ async def cmd_vulns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # `_trim` pe valoarea brută: `cve_html` escapează el ce primește.
         ref = cve_html(_trim(r.get("cve"), MAX_CVE_LIST),
                        rpm=(r.get("scanner") == "dnf"), kev=bool(r.get("kev")))
+        color = str(r.get("risk_color") or "grey")
+        risk = _risk_dict(r.get("risk"))
         blocks.append([
-            f"{_SEV_EMOJI.get(r['severity'], '⚪')} <b>#{r['id']}</b> {ref}{kev}",
+            f"{risk_view.COLOR_EMOJI.get(color, '⚪')} <b>#{r['id']}</b> {ref}{kev}",
             f"   <code>{_short(r.get('package') or r.get('location') or '?', MAX_FIELD_LIST)}</code>"
             f" → {_short(r.get('fixed_version') or 'fără fix cunoscut', MAX_FIELD_LIST)}"
-            f" · prio {r.get('priority', 0)}"
+            f" · {_short(risk_view.one_liner(color, risk), MAX_REASON_LIST)}"
             f" · {_subject_line(r, width=MAX_SUBJECT_LIST)}",
         ])
 
     tail = ("\n/vuln &lt;id&gt; · /planifica &lt;id&gt; pentru un plan"
+            "\n🔴 Act · 🟡 Attend · ⚪ fără date · 🟢 Track (CISA SSVC)"
+            + ("\n🟡 „regula Sentinel” = urcat de o regulă a Sentinel (EPSS mare lângă o "
+               "evaluare CISA veche), nu de SSVC și nu de FIRST"
+               if any(risk_view.overlay_of(_risk_dict(r.get("risk")), "amber") is not None
+                      for r in rows) else "")
             + ("\n🔁 = reparația e instalată, așteaptă o repornire (nu se cere plan)"
                if any(fix_state.is_pending_row(r) for r in rows) else "")
             + "\n<i>filtre: " + " · ".join(FILTER_WORDS) + "</i>")
@@ -489,7 +548,8 @@ async def cmd_vulns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         scope = f"{shown} afișate din {selected_total} {sel.scope}"
         if sel.filtered:
             scope += f" · {total_open} deschise în total"
-        return [*warn_lines, f"🛠️ <b>{sel.title}</b>", head, f"<i>{scope}</i>", ""]
+        return [*warn_lines, f"🛠️ <b>{sel.title}</b>", head_colors, head,
+                f"<i>{scope}</i>", ""]
 
     def _rest_note(shown: int) -> list[str]:
         missing = selected_total - shown
@@ -546,11 +606,31 @@ async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # doua definiție.
     asteapta = fix_state.is_pending_row(row)
     rpm = row.get("scanner") == "dnf"
+    color = str(row.get("risk_color") or "grey")
+    risk = _risk_dict(row.get("risk"))
     lines = [
-        f"{_SEV_EMOJI.get(row['severity'], '⚪')} <b>Vulnerabilitate #{row['id']}</b>"
+        f"{risk_view.COLOR_EMOJI.get(color, '⚪')} <b>Vulnerabilitate #{row['id']}</b>"
         + (" · 🔥 <b>exploatată activ</b>" if row.get("kev") else ""),
         f"<b>{esc(row.get('title'))}</b>",
+        f"<b>{esc(risk_view.headline(color, row.get('risk_decision'), risk))}</b>"
+        + (f" — {esc(risk_view.grey_reason(risk))}" if color == "grey" else ""),
+        *(f"   {esc(line)}" for line in risk_view.why_lines(risk)),
     ]
+    if not risk:
+        # Un rând încă neevaluat are totuși coloanele `cvss`/`epss` ale scanerului
+        # și ale unei trecerii anterioare: pe ecran trebuie să rămână, nu să dispară
+        # odată cu noul format.
+        lines.append("   " + esc(
+            (f"CVSS {row['cvss']}" if row.get("cvss") else "fără CVSS") + " · EPSS "
+            + risk_view.fmt_epss(row.get("epss"), row.get("epss_percentile"))))
+    try:
+        justification = await findings_repo.vendor_justification(db, row)
+    except Exception as exc:  # noqa: BLE001 - proza furnizorului e un bonus, niciodată un motiv de „fără răspuns"
+        log.warning("justificarea furnizorului nu s-a putut citi",
+                    extra={"detail": str(exc)[:160]})
+        justification = None
+    if justification:
+        lines.append(f"   <i>{esc(justification[1])}: {_short(justification[0], 400)}</i>")
     if asteapta:
         lines.append(f"🔁 <i>{esc(fix_state.PENDING_EXPLANATION_RO)}.</i>")
         dovada = [f"{eticheta}: <code>{esc(row[cheie])}</code>"
@@ -570,10 +650,7 @@ async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Pachet: <code>{esc(row.get('package') or '—')}</code>",
         f"Instalat: <code>{esc(row.get('installed_version') or '—')}</code>",
         f"Repară: <code>{esc(row.get('fixed_version') or 'necunoscut')}</code>",
-        f"Severitate: {esc(row['severity'])}"
-        + (f" · CVSS {row['cvss']}" if row.get("cvss") else "")
-        + (f" · EPSS {row['epss']:.0%}" if row.get("epss") else ""),
-        f"Prioritate: <b>{row.get('priority', 0)}</b> · scaner: {esc(row.get('scanner'))}",
+        f"Severitate scaner: {esc(row['severity'])} · scaner: {esc(row.get('scanner'))}",
     ]
     if row.get("asset_name"):
         lines.append(f"Asset: {esc(row['asset_name'])}")
@@ -700,7 +777,7 @@ HELP = """🛡️ <b>Sentinel — comenzi</b>
 /rezolva &lt;id&gt; · /fp &lt;id&gt; — închide, sau marchează fals-pozitiv
 
 <b>Vulnerabilități</b>
-/vulnerabilitati [kev|critice|mari|sistem|container|aplicatie|necunoscut] — findings deschise, prioritizate
+/vulnerabilitati [kev|rosii|galbene|gri|verzi|critice|mari|sistem|container|aplicatie|necunoscut] — findings deschise, după semaforul CISA SSVC
 /vuln &lt;id&gt; — detaliu, cu legături către NVD și Red Hat
 
 <b>Patch-uri</b>

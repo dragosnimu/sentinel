@@ -995,14 +995,32 @@ DETECTION_STREAM = Stream(
 # `raw` si `ai_assessment` sunt `jsonb`, deci pleaca drept text, ca `params`.
 # `raw` poarta iesirea bruta a scanerului - versiuni de pachete, cai de fisiere -
 # adica recunoastere, aceeasi nota ca la `INCIDENT_STREAM`.
+#
+# Semaforul (0047): `epss_percentile`, `risk_color`, `risk_decision`, `risk_score`
+# si `risk`. Trei lucruri care conteaza la expediere, fiecare cu efectul lui:
+#
+#   * `risk_score` si `epss_percentile` sunt `numeric`, NU `real`: `encode_value`
+#     refuza un `float` (nu se poate semna identic la ambele capete), iar o
+#     coloana refuzata opreste fluxul `findings` INTREG, vizibil doar ca o
+#     restanta in crestere in `ship:lag`. `Decimal` pleaca drept sir, exact.
+#     `tests/integration/test_risk_intel_pg.py` codifica un rand real cu ele;
+#   * `risk` e `jsonb`, deci text — si contine numai cifre, cuvinte dintr-un
+#     vocabular, id-uri, date si vectori CVSS (care circula deja in
+#     `cvss_vector`). Justificarea scrisa a furnizorului (proza Red Hat) ramane
+#     pe server: marginea agregatorului puncteaza continutul care seamana cu
+#     linii de comanda, iar patru aparitii opresc un flux definitiv;
+#   * coloanele sunt si la receptor: sosite inaintea migratiei lui, ar opri
+#     fluxul cu „camp necunoscut". Ordinea de livrare e scrisa in
+#     `aggregator/migrations/0017_finding_risk.sql`.
 FINDING_STREAM = Stream(
     name="findings",
     table="findings",
     columns=("id", "finding_key", "asset_id", "scanner", "cve", "advisory_id",
              "title", "description", "severity", "cvss", "cvss_vector",
-             "epss", "kev", "kev_due_date", "package", "installed_version",
-             "fixed_version", "location", "ecosystem", "priority", "status",
-             "first_seen", "last_seen", "resolved_at", "resolution",
+             "epss", "epss_percentile", "kev", "kev_due_date", "package",
+             "installed_version", "fixed_version", "location", "ecosystem",
+             "priority", "risk_color", "risk_decision", "risk_score", "risk",
+             "status", "first_seen", "last_seen", "resolved_at", "resolution",
              "deferred_until", "accepted_by", "accepted_reason",
              "requires_manual_intervention", "scan_id", "raw",
              "ai_assessment", "ai_assessed_at", "updated_at"),

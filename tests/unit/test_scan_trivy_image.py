@@ -195,7 +195,7 @@ def test_a_real_image_report_yields_the_columns_the_dashboard_shows() -> None:
     assert v["raw"]["image_os"] == "debian 12.11"
     assert v["raw"]["containers"] == ["web", "web-2"]
 
-    # Fără fix publicat: None, nu "" — `prioritize.score` dă +5 pentru un fix.
+    # Fără fix publicat: None, nu "" — planificatorul cere o versiune țintă.
     assert byid["CVE-2026-4002"]["fixed_version"] is None
     # UNKNOWN nu e „neglijabil": rămâne `medium`, cu steagul care spune că nu s-a
     # știut. Vezi `trivy_fs.map_severity`.

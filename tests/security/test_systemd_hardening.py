@@ -468,3 +468,70 @@ def test_no_unit_grants_a_capability_it_does_not_name():
                          if l.startswith("CapabilityBoundingSet=")), "")
         for cap in caps:
             assert cap in bounding, f"{name}: {cap} is ambient but not in the bounding set"
+
+
+# ---------------------------------------------------------------------------
+# Capability sets, pinned exactly — not merely "ambient is a subset of bounding"
+# ---------------------------------------------------------------------------
+# The subset check above passes when BOTH directives are changed to the SAME
+# wrong capability — measured directly: replacing selfcheck's CAP_NET_ADMIN
+# with CAP_SYS_ADMIN in both CapabilityBoundingSet and AmbientCapabilities
+# still leaves ambient ⊆ bounding true, and CAP_SYS_ADMIN is most of what
+# root's identity check exists to avoid granting — kernel module loading,
+# mount namespaces, ptrace across UIDs, disabling seccomp. A subset relation
+# says nothing about WHICH capability, so it cannot catch that swap. Equality
+# against a table written down here can.
+#
+# Every entry is (CapabilityBoundingSet, AmbientCapabilities) exactly as the
+# unit declares them — an absent AmbientCapabilities= line and an empty one
+# both mean "no ambient capability", so both read as an empty set here; that
+# collapse loses no distinction systemd itself makes.
+EXPECTED_CAPABILITIES: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+    "sentinel-ai":            (frozenset(), frozenset()),
+    "sentinel-beacon":        (frozenset(), frozenset()),
+    "sentinel-detect":        (frozenset(), frozenset()),
+    "sentinel-executor":      (frozenset({"CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_DAC_READ_SEARCH",
+                                           "CAP_CHOWN", "CAP_FOWNER", "CAP_SETUID", "CAP_SETGID",
+                                           "CAP_KILL", "CAP_AUDIT_CONTROL"}),
+                                frozenset({"CAP_NET_ADMIN"})),
+    "sentinel-health":        (frozenset(), frozenset()),
+    "sentinel-ingest":        (frozenset({"CAP_DAC_READ_SEARCH"}), frozenset({"CAP_DAC_READ_SEARCH"})),
+    "sentinel-maintenance":   (frozenset(), frozenset()),
+    "sentinel-patch-window":  (frozenset(), frozenset()),
+    "sentinel-reconcile":     (frozenset(), frozenset()),
+    "sentinel-restore-drill": (frozenset(), frozenset()),
+    "sentinel-scan":          (frozenset({"CAP_DAC_READ_SEARCH"}), frozenset({"CAP_DAC_READ_SEARCH"})),
+    "sentinel-selfcheck":     (frozenset({"CAP_NET_ADMIN"}), frozenset({"CAP_NET_ADMIN"})),
+    "sentinel-shipper":       (frozenset(), frozenset()),
+    "sentinel-telegram":      (frozenset(), frozenset()),
+    "sentinel-watchdog":      (frozenset({"CAP_NET_ADMIN"}), frozenset({"CAP_NET_ADMIN"})),
+    "sentinel-web":           (frozenset(), frozenset()),
+}
+
+
+def test_every_unit_has_an_entry_in_the_expected_capability_table():
+    """A unit missing here is a unit the equality check below silently skips —
+    the same shape of gap that once left sentinel-beacon out of every
+    hardening assertion in this file (see the module docstring)."""
+    missing = [n for n in ALL_UNITS if n not in EXPECTED_CAPABILITIES]
+    assert not missing, f"units with no entry in EXPECTED_CAPABILITIES: {missing}"
+    stale = [n for n in EXPECTED_CAPABILITIES if n not in ALL_UNITS]
+    assert not stale, f"EXPECTED_CAPABILITIES names units that no longer exist: {stale}"
+
+
+@pytest.mark.parametrize("name", ALL_UNITS)
+def test_capability_sets_match_the_expected_table_exactly(name):
+    """Equality, not subset — see the table's comment for the exact swap this
+    catches and the subset check above does not. Falsified by changing
+    selfcheck's CAP_NET_ADMIN to CAP_SYS_ADMIN in both directives, matching the
+    audit's exact reproduction."""
+    unit = _unit(name)
+    bounding = set(_one(unit, "CapabilityBoundingSet=").split())
+    ambient = set(_one(unit, "AmbientCapabilities=").split())
+    expected_bounding, expected_ambient = EXPECTED_CAPABILITIES[name]
+    assert bounding == expected_bounding, (
+        f"{name}: CapabilityBoundingSet is {bounding or set()}, expected "
+        f"{set(expected_bounding)}")
+    assert ambient == expected_ambient, (
+        f"{name}: AmbientCapabilities is {ambient or set()}, expected "
+        f"{set(expected_ambient)}")

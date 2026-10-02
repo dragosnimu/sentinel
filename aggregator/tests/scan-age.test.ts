@@ -145,7 +145,8 @@ async function render(scan: Awaited<ReturnType<typeof scanHealth>>): Promise<str
   return findingsPage({
     username: "operator", csrfToken: "x", instances: [], selected: INSTANCE,
     active: "/panel/vulnerabilitati", arrivals: new Map(),
-    findings: [], group: null,
+    findings: [], group: null, color: null,
+    colors: { red: 0, amber: 0, green: 0, grey: 0 },
     counts: { neaplicate: 31, rezolvate: 0, inchise: 0, total: 31 },
     scan,
   } as never);

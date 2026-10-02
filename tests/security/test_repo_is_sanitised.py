@@ -536,6 +536,19 @@ VALUE_EXEMPT: dict[str, tuple[dict[str, int], str]] = {
     # citește octeți produși de partea Python.
     "tests/fixtures/transport-envelope.json":
         ({SHAPE_HEX: 1, SHAPE_B64: 1}, "vector de aur al plicului de transport"),
+    # Identificatorul PUBLIC al containerului CISA-ADP din înregistrările CVE
+    # (`providerMetadata.orgId`, un UUID din registrul programului CVE). Nu e o
+    # cheie: e chiar valoarea după care `vulnrichment.parse` recunoaște containerul
+    # CISA, deci forma lui TREBUIE să fie cea reală — un UUID inventat ar proba un
+    # parser care nu mai găsește nimic. O dată în cod, o dată în fiecare răspuns
+    # real înregistrat care îl conține (celelalte UUID-uri și hash-uri din aceleași
+    # răspunsuri au fost scoase din fixturi, nu scutite).
+    "sentinel/intel/vulnrichment.py":
+        ({SHAPE_HEX: 1}, "identificatorul public al containerului CISA-ADP"),
+    "tests/fixtures/intel/cveawg_CVE-2025-29927.json":
+        ({SHAPE_HEX: 1}, "identificatorul public al containerului CISA-ADP"),
+    "tests/fixtures/intel/cveawg_CVE-2025-39964.json":
+        ({SHAPE_HEX: 1}, "identificatorul public al containerului CISA-ADP"),
     "tests/unit/test_signing.py": ({SHAPE_HEX: 5}, "vectori de aur canonici"),
     "tests/unit/test_beacon.py": ({SHAPE_HEX: 2}, "vector de aur canonic"),
     "aggregator/tests/canonical.test.ts": ({SHAPE_HEX: 4}, "vectori de aur canonici"),
@@ -1053,10 +1066,11 @@ def test_real_migration_hashes_cover_every_hash_in_the_committed_manifest() -> N
     `migrations-manifest.ts` trebuie să se verifice din `sources.json` — altfel
     `test_no_secrets_anywhere_including_fixtures` înghite mesajul real sub zeci
     de „hexa neverificat" pe orice checkout curat, chiar și al operatorului.
-    Măsurat pe 23 septembrie 2026: 78 de instrucțiuni."""
+    Măsurat pe 23 septembrie 2026: 78 de instrucțiuni; pe 2 octombrie 2026: 83
+    (cele 5 ale migrației 0017, `finding_risk`)."""
     manifest_text = (REPO / _MIGRATIONS_MANIFEST_REL).read_text(encoding="utf-8")
     real_hashes = set(re.findall(r'sha256:\s*"([0-9a-f]{64})"', manifest_text))
-    assert len(real_hashes) == 78, (
+    assert len(real_hashes) == 83, (
         f"numărul de hexa din manifest s-a schimbat ({len(real_hashes)}) — "
         "actualizează măsurătoarea din docstring-ul ăstuia odată cu manifestul")
     derived = _real_migration_statement_hashes()

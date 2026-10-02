@@ -31,7 +31,7 @@ from pathlib import Path
 import pytest
 
 from sentinel.db.repo.findings import finding_key
-from sentinel.scan import fix_state, orchestrator, os_packages, prioritize
+from sentinel.scan import fix_state, orchestrator, os_packages, risk
 from tests.unit._dnf_ceilings import dnf_ceiling_problems
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -388,19 +388,24 @@ def test_an_unknown_severity_word_is_medium_and_says_so(monkeypatch, word):
 # ===========================================================================
 # 5. Prioritatea și ce nu poate o constatare fără CVE
 # ===========================================================================
-def test_a_cve_less_finding_is_ranked_by_advisory_severity_and_never_as_kev(monkeypatch):
-    """Ce costă lipsa CVE-ului, ca număr: nicio potrivire KEV (deci fără +25), fără
-    EPSS/CVSS. `prioritize.score` nu se uită la `cve`, deci o constatare fără CVE
-    primește ce primește orice constatare `dnf` nefiind în KEV: severitatea avizului
-    + 10 (expusă) + 5 (fix disponibil). Important -> 68 + 10 + 5 = 83.
+def test_a_cve_less_finding_is_grey_ranked_above_green_and_never_as_kev(monkeypatch):
+    """Ce costa lipsa CVE-ului: nicio potrivire KEV, nicio cautare EPSS (ambele se
+    fac pe CVE) — deci exploatarea ei NU se poate decide, iar constatarea iese GRI,
+    cu motivul „lipsește CVE-ul". Gri, nu verde: un aviz fara CVE nu e unul sigur.
 
-    Ce se strică dacă cineva o face să nu fie clasabilă (prioritate 0/NULL): iese din
-    orice listă sortată după prioritate — vizibilă în tabel, invizibilă în practică."""
+    Ce se strica daca cineva o face sa nu fie clasabila (prioritate 0/NULL): iese din
+    orice lista sortata dupa prioritate — vizibila in tabel, invizibila in practica.
+    Banda gri e deasupra oricarui verde."""
     _, findings, _, _ = _scan(monkeypatch, advisories=(0, EPEL, ""))
     suricata = next(f for f in findings if f["package"] == "suricata")
-
-    assert prioritize.score(suricata, exposed=True, criticality=3) == 83
     assert suricata.get("kev") is None and suricata.get("epss") is None
+
+    a = risk.assess({**suricata, "risk": {}}, risk.Intel(kev_usable=True), exposed=True,
+                    criticality=3)
+    assert a.color == "grey" and a.decision is None
+    assert "cve" in a.risk["missing"]
+    assert a.kev is False
+    assert risk.priority_of("track_star", 1.0) < a.priority < risk.priority_of("attend", 0.0)
 
 
 class _Db:
@@ -456,11 +461,13 @@ def _orchestrate(monkeypatch, db, **kw):
     return out, kev_asked
 
 
-def test_the_orchestrator_stores_a_cve_less_finding_with_its_priority(monkeypatch):
+def test_the_orchestrator_stores_a_cve_less_finding_with_the_unassessed_priority(monkeypatch):
     """Lanțul întreg pe `_run_os_packages` real: constatarea fără CVE ajunge în bază
-    cu `cve` NULL, `advisory_id` completat și prioritatea calculată, iar căutarea KEV
-    nu primește niciodată un `None` (ar pica `= ANY($1::text[])` cu NULL în listă sau
-    ar potrivi ce nu trebuie)."""
+    cu `cve` NULL, `advisory_id` completat și prioritatea implicită a rândurilor
+    încă neevaluate (banda gri; numărul real îl scrie trecerea de evaluare,
+    `enrich.run`, după toate scanerele), iar căutarea KEV nu primește niciodată un
+    `None` (ar pica `= ANY($1::text[])` cu NULL în listă sau ar potrivi ce nu
+    trebuie)."""
     db = _Db()
     out, kev_asked = _orchestrate(monkeypatch, db, advisories=(0, EPEL, ""))
 
@@ -472,7 +479,8 @@ def test_the_orchestrator_stores_a_cve_less_finding_with_its_priority(monkeypatc
     # ordinea argumentelor din `upsert_finding`: cve=3, advisory_id=4, severity=7,
     # kev=11, priority=18
     assert row[3] is None and row[4] == "FEDORA-EPEL-2026-eb3474ffec"
-    assert row[7] == "high" and row[11] is False and row[18] == 83
+    assert row[7] == "high" and row[11] is False
+    assert row[18] == risk.UNASSESSED_PRIORITY == 40
 
 
 def test_a_failed_advisory_query_resolves_nothing(monkeypatch):

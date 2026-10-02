@@ -12,32 +12,23 @@ import inspect
 from types import SimpleNamespace
 
 from sentinel.db.repo.findings import finding_key
-from sentinel.scan import orchestrator, os_packages, prioritize
+from sentinel.scan import orchestrator, os_packages
 
 
 # --- prioritisation --------------------------------------------------------
-def test_kev_dominates_priority():
-    low_cvss_kev = {"severity": "medium", "cvss": 6.5, "kev": True}
-    high_cvss_no_kev = {"severity": "critical", "cvss": 9.8}
-    # A CVSS 6.5 being actively exploited should rival a 9.8 nobody exploits.
-    assert prioritize.score(low_cvss_kev, exposed=True) >= 78
-
-
-def test_epss_pushes_priority_up():
-    base = {"severity": "high", "cvss": 7.0}
-    with_epss = {**base, "epss": 0.9}
-    assert prioritize.score(with_epss) > prioritize.score(base)
-
-
-def test_exposure_and_criticality_matter():
-    f = {"severity": "high", "cvss": 7.0}
-    assert prioritize.score(f, exposed=True, criticality=5) > prioritize.score(f, exposed=False, criticality=1)
-
-
-def test_priority_is_clamped():
-    f = {"severity": "critical", "cvss": 10.0, "kev": True, "epss": 1.0, "fixed_version": "x"}
-    assert prioritize.score(f, exposed=True, criticality=5) == 100
-    assert prioritize.score({"severity": "info"}, criticality=1) >= 0
+# The 0..100 points formula that used to live here (`prioritize.score`) is gone:
+# the colour is the CISA SSVC decision, decided in `sentinel/scan/risk.py` and
+# tested in `tests/unit/test_risk.py`. What stays here is the one property of
+# the old tests that is about the SCAN rather than the formula.
+def test_the_scan_no_longer_computes_a_priority_of_its_own():
+    """A scanner that wrote `priority` would contradict the colour next to it
+    (the pass that decides the colour runs after every scanner). The three
+    `_run_*` bodies must not import or call a scoring function."""
+    source = inspect.getsource(orchestrator)
+    assert "prioritize" not in source.replace("prioritizeaza", "")
+    for body in (orchestrator._run_os_packages, orchestrator._run_trivy_fs,
+                 orchestrator._run_trivy_image):
+        assert 'f["priority"]' not in inspect.getsource(body)
 
 
 # --- dnf output parsing ----------------------------------------------------

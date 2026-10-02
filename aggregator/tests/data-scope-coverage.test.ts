@@ -80,7 +80,7 @@ import { visibleInstances } from "../lib/data/instances";
 import { arrivalsFor } from "../lib/data/arrivals";
 import { listDetections } from "../lib/data/detections";
 import { listBlocks } from "../lib/data/blocklist";
-import { countByGroup, listFindings } from "../lib/data/findings";
+import { countByColor, countByGroup, listFindings } from "../lib/data/findings";
 import { listPlans } from "../lib/data/patch-plans";
 import { listChecks } from "../lib/data/selfcheck";
 import * as loginsModule from "../lib/data/logins";
@@ -238,6 +238,26 @@ const PROBES: Record<string, ScopeProbe> = {
       if (counts.total === 0) return [];
       return [{ instance_id: INSTANCE_A, total: counts.total,
                 neaplicate: counts.neaplicate, rezolvate: counts.rezolvate }];
+    },
+    rows: (result) => result as unknown as Rows,
+  },
+
+  "lib/data/findings.ts::countByColor": {
+    seed(db) {
+      // Pastilele de culoare sunt tot date: un „🔴 2" care include rosul de pe
+      // celalalt server spune „ai doua critice" cand ai una, iar cifra aia sta
+      // langa un tabel care arata altceva.
+      db.addFinding(INSTANCE_A, { source_id: 11, status: "open", risk_color: "red" });
+      db.addFinding(INSTANCE_B, { source_id: 22, status: "open", risk_color: "red" });
+      db.addFinding(INSTANCE_B, { source_id: 23, status: "open", risk_color: "grey" });
+      return null;
+    },
+    call: async (db, scope) => {
+      const counts = await countByColor(db, scope, INSTANCE_A);
+      const total = counts.red + counts.amber + counts.green + counts.grey;
+      // Ca la `countByGroup`: ZERO inseamna niciun rand, nu un rand de zerouri.
+      if (total === 0) return [];
+      return [{ instance_id: INSTANCE_A, total, red: counts.red, grey: counts.grey }];
     },
     rows: (result) => result as unknown as Rows,
   },

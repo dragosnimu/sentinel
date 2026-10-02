@@ -388,6 +388,8 @@ pe a doua.
 | `finding_entries.location` | cale, imagine sau URL | fără ea constatarea nu e nici confirmabilă, nici reparabilă |
 | `scan_entries.target` | ce s-a scanat | la fel; un rând de scanare fără țintă nu spune nimic |
 | `patch_step_entries.cwd` | directorul comenzii | urma criminalistică a unui plasture eșuat |
+| `finding_entries.risk_color`, `finding_entries.risk_decision` | semaforul SSVC al gazdei (roșu/galben/gri/verde; act/attend/track*/track) | culoarea e tot ce citește operatorul din agregator despre cât de urgent e un rând |
+| `finding_entries.risk` | cele patru puncte de decizie și sursa lor, CVSS-ul ales, EPSS; **numai** cifre, cuvinte dintr-un vocabular, id-uri, date și vectori CVSS | enumerabilă prin construcție (`tests/unit/test_risk.py::test_risk_json_is_structured_facts_only…`): justificarea scrisă a furnizorului, care e proză, rămâne pe gazdă |
 
 Cazul pe care operatorul l-a decis explicit: recunoașterea scumpă e faptul că
 replica are constatările **deloc** — „gazda X are CVE-ul Y nepatchuit, expus în

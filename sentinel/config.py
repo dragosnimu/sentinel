@@ -564,6 +564,10 @@ class IntelConfig:
     geoip_db: str = "/var/lib/sentinel/geoip/dbip-asn-lite.mmdb"
     epss: bool = True
     kev: bool = True
+    #: Punctele SSVC publicate de CISA (`sentinel/intel/vulnrichment.py`). Oprită,
+    #: constatările cu CVE rămân fără Exploitation și ies gri, nu se întorc la o
+    #: deducție din EPSS.
+    vulnrichment: bool = True
 
 
 @dataclass

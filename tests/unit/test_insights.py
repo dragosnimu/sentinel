@@ -725,15 +725,52 @@ def test_campaign_insight_is_registered_in_collect():
 
 
 # --- vulnerability posture --------------------------------------------------
+def _fnd(**kw):
+    """Rândul pe care îl citește `_vuln_insight`, cu zero implicit."""
+    base = {"deschise": 0, "kev": 0, "rosii": 0, "galbene": 0, "gri": 0, "rezolvate": 0}
+    base.update(kw)
+    return _StubDB(row_map={"FROM findings": base})
+
+
 def test_kev_is_critical_and_outranks_the_rest():
-    db = _StubDB(row_map={"FROM findings": {"deschise": 50, "kev": 43, "rezolvate": 0}})
-    out = run(ins._vuln_insight(db))
+    out = run(ins._vuln_insight(_fnd(deschise=50, kev=43, rosii=2, galbene=3, gri=5)))
     assert out[0].level == "critical" and "43" in out[0].title
+    # The traffic light travels with the KEV card: a KEV can be green (partial,
+    # not automatable), and the card must not hide that.
+    assert "2 roșii, 3 galbene, 5 fără date" in out[0].detail
+
+
+def test_a_red_without_kev_is_critical_and_the_old_text_is_gone():
+    """A CVE with EPSS 0.99 and no KEV entry is red. The old card said "deschise,
+    niciuna exploatată activ" about exactly that case — false."""
+    out = run(ins._vuln_insight(_fnd(deschise=50, rosii=1, gri=4)))
+    assert out[0].level == "critical" and "roșii" in out[0].title
+    assert "niciuna exploatată" not in out[0].title + out[0].detail
+
+
+def test_amber_is_a_warning_and_mentions_grey():
+    out = run(ins._vuln_insight(_fnd(deschise=50, galbene=3, gri=25)))
+    assert out[0].level == "warning" and "galbene" in out[0].title
+    assert "25 constatări n-au date" in out[0].detail
+    # An amber can be Sentinel's own EPSS rule rather than the SSVC tree's, and the
+    # card that counts ambers as "Attend" must not let that pass for the published
+    # tree's verdict.
+    assert "regula Sentinel" in out[0].detail and "nu e decizia SSVC" in out[0].detail
+
+
+def test_nothing_urgent_is_not_a_warning_but_never_hides_the_grey():
+    """The 2 Oct 2026 shape: 783 green, 25 grey. Not an alarm (two days were
+    spent removing noise), but the grey must be named — it is not "fine"."""
+    out = run(ins._vuln_insight(_fnd(deschise=812, gri=25)))
+    assert out[0].level == "info"
+    assert "25 dintre ele sunt GRI" in out[0].detail
+    assert out[0].evidence["fara_date"] == 25
+    clean = run(ins._vuln_insight(_fnd(deschise=812)))
+    assert "GRI" not in clean[0].detail
 
 
 def test_clean_scan_is_reported_as_good_news():
-    db = _StubDB(row_map={"FROM findings": {"deschise": 0, "kev": 0, "rezolvate": 4716}})
-    out = run(ins._vuln_insight(db))
+    out = run(ins._vuln_insight(_fnd(rezolvate=4716)))
     assert out[0].level == "good"
 
 

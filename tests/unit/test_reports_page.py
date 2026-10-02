@@ -106,7 +106,8 @@ class StubDB:
             # -- overview ----------------------------------------------------
             "AS hostile": {"total": 1234, "hostile": 900},
             "AS succeeded": {"succeeded": 2, "failed": 1, "rolled_back": 0, "total": 3},
-            "AS deschise": {"deschise": 5, "kev": 1, "grave": 2, "noi": 3, "rezolvate": 4},
+            "AS deschise": {"deschise": 5, "kev": 1, "grave": 2, "rosii": 1, "galbene": 2,
+                            "gri": 1, "noi": 3, "rezolvate": 4},
         }
         self.lists = {
             "COALESCE(source, '')": event_rows or [],

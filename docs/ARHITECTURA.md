@@ -555,6 +555,304 @@ nu pe CVE-uri — o decizie de proiectare separată. Nu grupează planurile pe
 tranzacție: dacă apare un kernel KEV cu reparația NEINSTALATĂ, planificatorul
 scrie din nou câte un plan pe pachet.
 
+### 3.17c Semaforul de risc: arborele CISA SSVC, nu un prag
+
+**Ce era.** `findings.priority` era o sumă de puncte (bază + KEV + EPSS×20 +
+expunere + criticitate) tăiată la 100. Pe producție, la 2 octombrie 2026:
+6912 de constatări `dnf` fără niciun CVSS, nicio constatare cu EPSS (nimic nu
+populase coloana), iar 212 din cele 218 `dnf` deschise stăteau în aceeași găleată
+de 10 puncte (80–90). Un număr care nu mai deosebea nimic.
+
+**Ce e acum.** Culoarea (`risk_color`) e decizia arborelui **CISA SSVC**
+(`sentinel/scan/ssvc.py`, 36 de rânduri copiate din
+`cisa_coordinator_2_0_3.csv` al CERT/CC și păzite de un test care le compară cu
+fișierul publicat): roșu = *Act*, galben = *Attend*, verde = *Track* / *Track\**,
+**gri = nu se poate decide**. Nicio culoare nu iese dintr-un prag inventat aici.
+Cele patru puncte de decizie și de unde vin. **Fiecare își scrie sursa în
+`findings.risk` (`points.<punct>.basis`)**, iar o valoare luată de la CISA își scrie și
+ziua evaluării (`as_of`): e o fotografie, și trebuie să se vadă cât e de veche.
+
+| Punct | Sursa la noi (în ordine) |
+|---|---|
+| Exploitation | (1) în CISA KEV → `active`, `basis = kev`; (2) valoarea publicată de CISA (Vulnrichment: `none` / `poc` / `active`), `basis = vulnrichment`; (3) CISA n-a evaluat CVE-ul și nu e în KEV → `none`, `basis = kev_absent` (**presupunere a Sentinel**, vezi mai jos). **EPSS nu intră.** |
+| Automatable | valoarea publicată de CISA; doar dacă lipsește, vectorul CVSS (`AV:N/AC:L/PR:N/UI:N`; la v4 și `AT:N`, iar `AU` are prioritate): `basis = cvss_vector` |
+| Technical Impact | valoarea publicată de CISA; doar dacă lipsește, vectorul CVSS (`C:H` **și** `I:H` → `total`; SSVC vorbește despre *sistem*, CVSS `C:H` despre *componentă*, vezi „Euristica din vector" mai jos): `basis = cvss_vector` |
+| Mission and Well-Being | criticitatea activului (1–2 mică, 3 medie, 4–5 mare) — **decizia operatorului**; acum 3 pentru toate |
+
+Două axe, afișate separat: *importanța* (CVSS-ul sursei alese) și *urgența* (decizia;
+coborâtă o treaptă când reparația e instalată și lipsește doar o repornire —
+importanța nu se mișcă). Numărul de ordonare e `probabilitate × impact` (EPSS, sau
+1,0 pentru KEV sau pentru o exploatare activă publicată de CISA, înmulțit cu CVSS/10):
+o medie ar pune egal un CVSS 9,8 cu EPSS 0,001 și unul de 5,0 cu EPSS 0,6. Se
+folosește în interiorul unei culori, cum recomandă chiar documentația SSVC, **cu o
+singură excepție, a Sentinel și numită ca atare**: suprapunerea EPSS de mai jos.
+
+**De ce Exploitation nu vine din EPSS.** SSVC definește Exploitation ca stare
+*observată* (none / PoC / active); EPSS e o *previziune*. A deriva o observație dintr-o
+previziune e aceeași greșeală ca media dintre CVSS și EPSS. Prima variantă o făcea
+(`EPSS ≥ 0,90` → active, `≥ 0,50` → PoC) și cele două cifre erau alegerile noastre, nu
+reguli publicate: documentația SSVC (`using_epss/epss_probability.md`) pomenește 90%
+doar ca *exemplu* („let's say you decide…"), iar banda „more likely than not" (55–75%)
+are acolo efectul *PoC → Active*, nu *none → PoC*. Pragurile au fost **scoase**, nu
+doar etichetate. Măsurat pe CVE-urile gazdei (corpusul de mai jos), pragul greșea în
+ambele sensuri: cele trei CVE-uri din KEV au EPSS 0,006–0,014, iar două CVE-uri cu EPSS
+0,92 (CVE-2023-45288) și 0,99 (CVE-2025-29927) au la CISA `none`.
+
+**Costul, spus pe față — și ce s-a făcut cu el.** CVE-2025-29927 (ocolire de
+autentificare în Next.js, EPSS 0,992, exploit public) era singurul roșu al primei variante.
+CISA îl are `none` din 8 aprilie 2025: fotografia a rămas în urmă (542 de zile la 2
+octombrie 2026). După runda 2 era **verde (Track)**, și documentul spunea că „numărul
+de ordonare îl pune primul dintre verzi". **Fraza era falsă.** Măsurat pe cele 812 de
+rânduri deschise, rândul stătea pe locul **40**: sub cele 2 galbene, sub 22 de rânduri
+gri GHSA (prioritate 54–58) și sub 15 rânduri verzi Track\* (prioritate 20, față de 17
+al lui). Banda hotărăște înaintea numărului, iar Track\* are o bandă deasupra lui Track,
+deci un verde Track nu poate fi „primul" decât între Track-uri. Corectura nu e o frază
+mai bună, ci regula de mai jos: cu ea, rândul e **galben (Attend, `basis = epss_overlay`)**
+și stă pe locul **1** din 812 (prioritate 77, deasupra celor două KEV de la 74–75; vezi
+mai jos de ce).
+
+**Regula Sentinel: EPSS peste o fotografie CISA veche.** *Aprobată de operator la 180 de
+zile. **Nu e regulă SSVC și nu e regulă FIRST**: nicio sursă nu o spune, iar cele două cifre
+(180 de zile, EPSS ≥ 0,5) sunt ALE NOASTRE — după ce rundele 1 și 2 scoseseră două cifre
+EPSS ale Sentinel, aici revin două, la culoare în loc de punctul Exploitation.* Dacă
+evaluarea CISA a exploatării (`none` sau `poc`) are **mai mult de 180 de zile** ȘI EPSS-ul
+de azi (proaspăt) e **cel puțin 0,5**, culoarea nu coboară sub galben: decizia devine
+`attend`, iar `findings.risk.overlay` spune `basis = epss_overlay`, decizia pe care ar fi
+dat-o SSVC singur (`ssvc_decision`), vârsta și data fotografiei, EPSS-ul și cele două praguri
+aplicate. Punctele de decizie rămân neatinse (Exploitation rămâne `none`, de la CISA, cu data
+lui): suprapunerea nu rescrie o observație, ridică o culoare.
+
+*Ce o face apărabilă* nu e că EPSS e mare — asta singur e o previziune, exact ce am
+scos din decizie —, ci că **observația pe care EPSS-ul o contrazice n-a mai fost
+reîmprospătată**. Dintre cele 196 de evaluări CISA ale gazdei, 75 au peste 180 de zile, 44
+peste un an, iar mediana e de 141 de zile.
+
+*Se aplică:* după coborârea pentru repornire (podeaua e podea, deci un rând reparat care
+așteaptă o repornire rămâne galben, cu 🔁), indiferent de misiune (la misiune mică, aceleași
+trei rânduri urcă tot la galben). *Nu se aplică:* unui **gri** (necunoscutul nu devine galben);
+unui CVE a cărui exploatare e deja `active` sau în KEV (nu e o observație contrazisă);
+unui CVE pe care CISA nu l-a evaluat (`kev_absent`: n-a existat nicio observație, doar
+presupunerea noastră — dacă ar trebui și acolo o podea EPSS e **altă decizie**; pe gazdă,
+niciunul din cele 395 de rânduri `kev_absent` nu are EPSS ≥ 0,5, deci azi întrebarea e
+teoretică); unui EPSS lipsă sau mai vechi decât `epss.MAX_AGE_DAYS` (nefolosit, ca peste
+tot). O evaluare CISA fără dată nu poate fi dovedită proaspătă și se tratează ca veche.
+
+*Cifra 0,5, măsurată pe cele 406 CVE-uri distincte deschise (403 au EPSS).* Primele valori
+sunt 0,99225 (CVE-2025-29927), 0,91969 (CVE-2023-45288), 0,5918 (CVE-2024-46982), apoi
+**0,04561** (CVE-2022-41723), 0,04002, 0,03995… Golul e real și e cel mai larg din set
+(0,55): **orice prag din (0,0456; 0,5918] prinde aceleași trei CVE-uri**, deci 0,5 ar
+prinde aceleași rânduri ca 0,1. Dar golul e al gazdei, nu al lumii: în fișierul FIRST din
+1 octombrie (381.682 de CVE-uri), 30.661 (8,0%) au EPSS ≥ 0,05 și 4.317 (1,13%) au ≥ 0,5. Pe
+altă gazdă sau în altă zi, rândurile dintre 0,05 și 0,5 pot fi zeci, nu zero. **Ce cumpără
+cifra:** nu e validată de date, ci de înțeles („mai probabil decât nu"). Și mai e un
+detaliu: 0,5 stă la doar 0,09 sub cel mai slab din cele trei (CVE-2024-46982, 0,5918, 744 de
+zile): o scădere zilnică de EPSS cu 0,09 îl duce înapoi pe verde fără ca ceva să se fi
+reparat.
+
+*Efect, pe cele 812 de rânduri deschise (instantaneu citit de pe gazdă la 2 octombrie 2026,
+fără a o mai citi acum; sursele CISA/FIRST/Red Hat/OSV, vii):*
+
+| Misiune | Fără regulă | Cu regula | Ce se mută |
+|---|---|---|---|
+| mică | roșu 0 · galben 0 · gri 22 · verde 790 | roșu 0 · galben **3** · gri 22 · verde 787 | cele 3 CVE-uri, la galben |
+| medie | roșu 0 · galben 2 · gri 22 · verde 788 | roșu 0 · galben **5** · gri 22 · verde 785 | CVE-2025-29927, CVE-2023-45288, CVE-2024-46982: verde → galben |
+| mare | roșu 2 · galben 231 · gri 22 · verde 557 | roșu 2 · galben 231 · gri 22 · verde 557 | nimic: la misiune mare cele trei sunt deja Attend din arbore |
+
+*Ordinea, un efect de reținut:* în interiorul galbenului rândurile se ordonează tot după
+`probabilitate × impact`, iar un KEV are probabilitate 1,0 și CVSS 7,5–7,8 (scor 0,75–0,78),
+pe când CVE-2025-29927 are 0,992 × 9,1 = 0,903. Rezultatul: CVE-2025-29927 stă pe locul 1,
+**deasupra celor două CVE-uri din KEV** (locurile 2–3), CVE-2023-45288 pe locul 4, CVE-2024-46982
+pe 5; apoi cele 22 de rânduri gri. Nu e o greșeală de calcul, e regula de ordonare deja
+documentată; dacă operatorul vrea ca o exploatare *observată* să stea mereu deasupra uneia
+*prezisă*, e o a doua regulă.
+
+*Unde se spune pe ecran, ca regula Sentinel și nu a SSVC:* eticheta rândului („🟡 Attend —
+accelerat (regula Sentinel, nu SSVC)"), motivul scurt („regula Sentinel (EPSS)"), legenda
+listei din Telegram (numai când un astfel de rând e pe ecran), propoziția din `/vuln <id>`
+și din detaliul panoului (cu data, vârsta, EPSS-ul, pragurile și ce ar fi dat SSVC), nota
+paginii de vulnerabilități (serverul și agregatorul) și nota cardului „galbene" din
+analize.
+
+**Cifra Sentinel care a rămas:** `risk.UNPUBLISHED_EXPLOITATION = "none"`. Pe gazda de
+producție (2 octombrie 2026) CISA a publicat puncte pentru **196 din cele 406 CVE-uri
+distincte deschise = 48,3%**, iar acoperirea depinde de ecosistem, nu de gazdă: npm 78/78,
+composer 36/36, go 45/57, alpine 13/16, **deb 13/185 (7%)**, rpm 6/32 (19%). Pe rânduri,
+Exploitation vine din presupunerea `kev_absent` la **395 din 812 = 49%**. (O versiune
+anterioară a acestui text spunea 80%: era media unui eșantion de 78 de CVE-uri, în mare
+parte npm/composer, fără niciunul din cele 185 de CVE-uri Debian — în majoritate
+`linux-libc-dev` — pe care CISA nu le-a evaluat aproape deloc. Curba pe ani din eșantionul
+Red Hat de 320 de CVE-uri, 2019–2026, rămâne adevărată: 8–15% pe 2019–2021, 62–78% pe
+2022–2024, ~40% pe 2025–2026; cifra pe gazdă nu era.) Pentru restul, „nu e în KEV"
+înseamnă „nimeni nu l-a văzut exploatat activ" — nu spune nimic despre un exploit public,
+deci `none` e o presupunere, iar `basis = kev_absent` o spune. **Presupunerea hotărăște,
+așadar, despre jumătate din rânduri.** La misiune medie nu mută nicio culoare (între `none`
+și `poc` arborele schimbă doar Track ↔ Track\*, ambele verzi; la misiune mare un Track\*
+devine Attend). Cu `None`, toate aceste rânduri ar fi gri: 49% din pagină. Se schimbă într-un
+loc.
+
+**Gri nu e verde.** O decizie se ia numai cu toate cele patru puncte cunoscute.
+Lipsește unul — niciun vector și niciun punct publicat, un aviz fără CVE, oglinda KEV
+veche, sau CVE-ul pe care încă n-am apucat să-l întrebăm la CISA (rând absent: sursa
+e căzută sau trecerea n-a ajuns la el) — și constatarea e gri, cu motivul și cu cele
+două capete posibile („între Track și Attend") în `findings.risk`. Gri se ordonează
+deasupra verdelui. **„CISA n-a evaluat CVE-ul" nu e „necunoscut"**: e un răspuns (rândul
+există, fără puncte), și primește culoare. EPSS lipsă sau vechi nu mai face un rând gri;
+rămâne fără număr de ordonare.
+
+**Un parser orb arată ca „CISA n-a evaluat nimic".** Dacă CISA își schimbă `orgId`, rolul
+sau forma răspunsului, fiecare CVE ar părea neevaluat și Exploitation ar cădea pe
+`none` în tăcere. O trecere care primește cel puțin 20 de CVE-uri și niciun punct CISA
+devine **suspectă**, nu orbă: doar 7% dintre CVE-urile Debian au puncte CISA, deci un lot
+de 20–30 de CVE-uri noi de `linux-libc-dev` are zero puncte cu probabilitatea 0,93^20 ≈ 23%
+(0,93^30 ≈ 11%) fără ca parserul să fi greșit, iar alarma ar fi ținut `degraded` până la două zile
+(`UNENRICHED_DAYS`). O alarmă care sună după *compoziția* lotului învață operatorul s-o
+ignore. De aceea suspiciunea se verifică cu un **control pozitiv**: în aceeași trecere se
+cere LIVE de la serviciu un CVE cunoscut că poartă puncte (`CANARY_CONTROL_CVE`,
+CVE-2025-29927) și se trece prin același parser. Controlul DĂ puncte → lotul era doar
+neevaluat, nicio alarmă. Controlul vine FĂRĂ puncte → parser orb: `blind` în
+`intel_state`, iar autoverificarea (`risk:vulnrichment`) trece pe `degraded`. Controlul nu
+se poate citi (cerere picată, 404) → „nu se poate spune" nu e „în regulă": se marchează
+tot `blind`, cu motivul „nu se poate spune dacă e parser orb sau doar un lot neevaluat" în eroare. Controlul se cere live, nu din
+fixture: o înregistrare reținută doar ar dovedi că parserul înțelege formatul VECHI.
+Parserul e probat pe răspunsuri reale înregistrate (`tests/fixtures/intel/cveawg_*.json`).
+
+**Euristica din vector (rezerva) față de valorile CISA.** Pe cele 189 de CVE-uri ale
+gazdei cu ambele (vector și valoare CISA): Automatable din vector se potrivește cu CISA în
+151 de cazuri (80%); Technical Impact cu regula `C:H` **și** `I:H` în **179 (95%)**, cu
+regula `C:H` **sau** `I:H` în 149 (79%). Din cele 20 de CVE-uri cu `C:H` fără `I:H`, **19
+sunt `partial`** la CISA.
+
+*De ce „și", și de ce nu se schimbă la loc din textul definiției.* Definiția SSVC a lui
+`total` e „control total asupra comportamentului software-ului **sau** dezvăluirea totală a
+întregii informații **de pe sistem**" — două căi, și `C:H` pare a doua. Dar cele două scări
+nu măsoară același lucru: SSVC vorbește despre *sistem*, iar CVSS `C:H` e pierdere totală
+„în interiorul **componentei** afectate". Citit ca `total`, `C:H` supra-citește CVSS-ul;
+practica CISA e citirea apropiată de definiție, nu o abatere de ea. Rezerva a fost scrisă
+întâi cu „și", apoi schimbată în „sau" la instrucțiunea din runda 2 („definiția spune sau"),
+și **instrucțiunea a fost greșită**: corectată în runda 3, pe dovada de mai sus. Același
+text e în docstring-ul `cvss.py`, ca următorul care citește definiția să nu o schimbe la loc.
+
+*Pe gazdă schimbarea nu mută nicio culoare* (nici la misiune medie, nici la mare), fiindcă cu
+Exploitation `none` Technical Impact nu decide culoarea — arborele schimbă doar Track ↔
+Track\* —, iar singurele rânduri cu `poc` sau `active` au valoarea publicată de CISA. 21 de
+rânduri își schimbă doar valoarea *înregistrată* a Technical Impact (`total` → `partial`,
+`basis = cvss_vector`). Contează pentru un CVE neevaluat de CISA care e totuși în KEV.
+
+**Măsurat, cu limitele lui.** Până în runda 2 corpusul era cele 78 de CVE-uri-exemplu din
+`tests/fixtures/cvss_measured_pairs.csv` (constatări trivy reale, în mare parte npm/composer —
+de aici și acoperirea CISA de 80% care nu era a gazdei). Din runda 2 se măsoară pe **cele 812
+de rânduri deschise**, instantaneu citit de pe gazdă (doar citire, 2 octombrie 2026),
+încărcat într-un Postgres 16 de unică folosință cu migrațiile 0001–0048, cu sursele reale
+(CISA prin înregistrarea CVE, EPSS din 1 octombrie, Red Hat, OSV) și cu `enrich.run` real —
+nu cu o simulare a lui. Ce **nu** are măsurarea: starea gazdei de după instantaneu, și
+rulările cu `criticality` legat de un activ real (toate rândurile sunt `medium`, ca pe gazdă).
+
+| Misiune | Regula | roșu | galben | gri | verde |
+|---|---|---|---|---|---|
+| medie | runda 2 | 0 | 2 | 22 | 788 |
+| medie | runda 3 (cu suprapunerea EPSS) | **0** | **5** | 22 | 785 |
+| mare | runda 2 | 2 | 231 | 22 | 557 |
+| mare | runda 3 (cu suprapunerea EPSS) | 2 | 231 | 22 | 557 |
+
+Roșul gazdei la misiune medie e **zero**: singurul roșu al primei variante venea dintr-o
+previziune, iar acum e galben din regula Sentinel. Cele două galbene care erau deja sunt
+CVE-2026-53266 și CVE-2026-53362 (ambele KEV, `linux-libc-dev`).
+
+**⚠ Misiunea e intrarea cea mai grea, și e o decizie a operatorului.** Constatările
+primesc `criticality = 3` (medie) fiindcă legarea de un activ din inventar e muncă
+amânată. Aceleași 812 de rânduri, cu regula curentă (Exploitation din CISA/KEV, suprapunerea
+EPSS): misiune **mică** → 0 roșii, 3 galbene, 22 gri, 787 verzi; **medie** → 0 roșii, 5 galbene,
+22 gri, 785 verzi; **mare** → 2 roșii, 231 galbene, 22 gri, 557 verzi. (Cifrele din runda 1,
+cu Exploitation din EPSS — 4 roșii și 273 galbene la misiune mare — nu mai sunt valabile.)
+Diferența dintre medie și mare e de aproape 230 de rânduri: cine hotărăște misiunea hotărăște
+cea mai mare parte a paginii. Se schimbă într-un loc (`enrich.DEFAULT_CRITICALITY`), iar
+pagina spune pe față ce a presupus.
+
+**Alte lucruri pe care arborele le face și pe care operatorul trebuie să le știe:**
+
+  * **Un KEV poate fi verde.** `active / neautomatizabil / impact parțial / misiune
+    medie` e *Track*. KEV rămâne vizibil (🔥, antet, cardul KEV, mesajele de după
+    scanare, planificatorul, reamintirile de repornire), dar culoarea nu-l mai
+    urcă. Dacă se vrea „KEV ⇒ cel puțin galben", e o a doua regulă pusă peste arbore,
+    nu o schimbare în el.
+  * **Arborele CISA nu e singurul.** Pagina CISA îl descrie ca fiind pentru
+    vulnerabilități care privesc guvernul SUA; pentru cine *aplică* patch-uri, SEI are
+    arborele „Deployer" (expunerea sistemului, impactul uman) și CISA a publicat în 2026
+    BOD 26-04 (KEV, expus public, automatizabil, impact → 3 / 14 / 60 de zile). Alegerea
+    arborelui e a operatorului; tabelul e izolat într-un singur fișier ca să poată fi
+    înlocuit.
+  * **CISA publică cele trei puncte** (programul Vulnrichment, în înregistrarea CVE) și
+    le folosim întâi; vectorul CVSS rămâne doar rezerva pentru CVE-urile pe care CISA
+    nu le-a evaluat (`cvss.py`, euristici numite ca atare).
+
+**Surse, toate gratuite și fără cheie, oglindite local** (`sentinel/intel/`, ca
+`kev.py`: o cădere nu e o scanare eșuată, dar se scrie în `intel_state` și ajunge în
+autoverificare):
+
+  * **CISA Vulnrichment** — `https://cveawg.mitre.org/api/cve/<CVE>`: containerul
+    ADP „CISA-ADP" din înregistrarea CVE, o cerere pe CVE, doar pentru ce lipsește sau a
+    îmbătrânit (evaluat: 7 zile; existent dar neevaluat: 2 zile — cifre ale Sentinel,
+    mută doar cât de repede ajunge o evaluare nouă). Dă Exploitation, Automatable,
+    Technical Impact și **momentul evaluării din înregistrare** (`ssvc_at`). Răspunsurile
+    stau în tabela `vulnrichment`, deci trecerea de evaluare nu atinge rețeaua pentru ce
+    a fost deja întrebat. Un `found` fără puncte nu șterge puncte deja stocate.
+    **De ce nu `CVEProject/cvelistV5` (aceeași înregistrare, ca depozit git):** o clonă
+    completă are 3,0 GB (arhiva zilnică 618 MB); una parțială cu `sparse-checkout` pentru
+    80 de CVE-uri are 50 MB, crește cu ~10 MB pe zi și durează ~17 s la fiecare reîmprospătare
+    (un `fetch` fără nimic nou: 10–43 s), plus `git`, un director scriibil și lista de căi de
+    menținut — pentru exact aceleași trei valori. Per CVE: 19 s și 734 KiB pentru 80 de
+    înregistrări, zero disc. Nu se construiesc amândouă.
+  * **EPSS** — fișierul zilnic (2,7 MB, 381.000 de rânduri), nu API-ul pe CVE-uri.
+    API-ul **taie în tăcere**: o cerere cu 300 de CVE-uri a întors `HTTP 200` cu
+    `"data":[]`. Fișierul se refuză dacă e trunchiat, fără `score_date` sau sub 100.000
+    de rânduri; se păstrează doar CVE-urile cerute.
+  * **Red Hat** — o cerere pe CVE (`cve/<CVE>.json`; lista nu poate fi filtrată pe CVE
+    și n-are justificarea). Doar pentru ce lipsește sau a îmbătrânit; 1482 de cereri
+    secvențiale au durat 707 s, deci o trecere normală e câteva zeci. Dă CVSS, severitate,
+    avizul și **justificarea scrisă**, care rămâne pe server (se vede în `/vuln`).
+  * **OSV** — vectorul (nu scorul; îl calculăm pentru v3) și aliasurile CVE ale
+    avizelor GHSA. Forma „în bloc" (`querybatch`) răspunde la altă întrebare.
+  * Preferința: furnizorul înainte de rest (Red Hat pentru rpm), apoi dovada
+    scanerului, apoi OSV; **sursa care a decis se numește**. Scor și vector din
+    aceeași sursă, niciodată amestecate.
+
+**Cine rulează trecerea.** `sentinel/scan/enrich.py`, din două locuri: la sfârșitul
+scanării și din mentenanța orară (scorurile se mișcă și fără scanare; prima evaluare
+de după livrare vine în maxim o oră). Scrie **doar ce s-a schimbat**: un trigger
+ridică `updated_at` la orice UPDATE, iar expeditorul copiază după el.
+`upsert_finding` nu mai atinge `priority`/`epss`/`cvss`-ul adus de noi.
+
+**Anunțuri.** Doar *trecerile în roșu*, o singură dată pe constatare
+(`risk_red_announced_at`, revendicat atomic): prima evaluare a unui rând e punctul
+de plecare, nu o veste; o constatare nouă o anunță mesajul „vulnerabilități noi"
+(care îi poartă culoarea); un EPSS care oscilează nu redeschide canalul.
+
+**Trei suprafețe, aceeași culoare, cantități diferite.**
+
+| Suprafața | Ce arată | De ce |
+|---|---|---|
+| Telegram | semafor în antet, un punct colorat + un motiv scurt pe rând; în `/vuln` cele patru puncte, sursa CVSS, EPSS cu percentilă, justificarea furnizorului | câteva rânduri pe un telefon; detaliul se cere |
+| Panoul fiecărui server | tabel: culoare + decizie + motiv, CVSS cu sursă, EPSS cu percentilă, pastile de culoare (gri mereu), filtru `?culoare=`, presupunerea despre misiune | e locul unde se citește lista întreagă |
+| Agregatorul | culoare + decizie + un motiv, CVSS, EPSS; pastile și cardul de pe prima pagină | vede mai multe gazde; nu amestecă |
+
+Agregatorul **nu amestecă gazdele**: culoarea unui rând e verdictul gazdei lui (cu
+criticitatea, expunerea și repornirea ei). Un CVE reparat pe o gazdă și nu pe
+cealaltă apare ca două rânduri, fiecare cu starea lui; pastilele sunt per gazdă și
+niciun rând nu „se vindecă" pe baza altuia. `risk` nu poartă proză (doar cifre,
+vocabular, id-uri, vectori): marginea agregatorului puncteaza conținutul care seamănă
+cu linii de comandă, iar justificarea Red Hat rămâne pe server.
+
+**⚠ Ordinea de livrare.** Receptorul refuză un câmp necunoscut ȘI unul care lipsește.
+Deci: (1) agregatorul (migrația `0017_finding_risk.sql` + codul), apoi (2) fiecare
+server, pe rând. Cât timp un server n-a primit versiunea nouă, fluxul lui `findings`
+stă oprit (nu pierde nimic) și se vede în `ship:lag`. Același tipar ca la
+`updated_at` (migrația 0010 a agregatorului).
+
+**Ce a rămas deschis, fiindcă nu e o decizie a codului:** misiunea (de mai sus),
+arborele (de mai sus), KEV-ul verde, Vulnrichment, și acoperirea — niciun ecosistem
+`pip`/PyPI nu e scanat, nici venv-ul propriu al lui Sentinel, iar `trivy_fs` se uită
+doar la `scan.discovery_paths`. Nu s-a atins aici.
+
 ### 3.18 Al zecelea colector se uită la ce PLEACĂ, nu la ce intră
 
 Toate celelalte nouă mecanisme privesc înăuntru: sshd, nginx, Suricata, auditd.

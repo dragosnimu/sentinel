@@ -26,6 +26,28 @@
   {% if selectat %}<a href="{{ url_toate }}" class="pill pill-off">toate ×</a>{% endif %}
 </div>
 
+{# Semaforul: câte sunt în fiecare culoare, în mulțimea filtrată pe categorie.
+   Gri apare MEREU, chiar cu zero — „nimic fără date" e un fapt, iar o pastilă
+   lipsă ar fi tăcere despre exact ce nu se știe. Fiecare pastilă e și filtrul. #}
+<div class="statline">
+  {% for c in culori %}
+  <a href="{{ c.url }}" class="pill {{ 'pill-bad' if c.color == 'red' else ('pill-warn' if c.color == 'amber' else ('pill-ok' if c.color == 'green' else 'pill-off')) }}"
+     {% if c.active %}aria-current="page"{% endif %}>{{ c.emoji }} {{ c.count }} {{ c.label }}</a>
+  {% endfor %}
+  {% if culoare %}<a href="{{ url_toate_culorile }}" class="pill pill-off">toate culorile ×</a>{% endif %}
+</div>
+
+<p class="muted small">Culoarea e decizia <strong>CISA SSVC</strong> a fiecărei constatări (🔴 Act ·
+  🟡 Attend · 🟢 Track), din exploatare (KEV, valorile publicate de CISA), vectorul CVSS și
+  criticitatea activului — nu un prag. <strong>Singura excepție, a Sentinel și nu a SSVC:</strong>
+  un rând galben marcat „regula Sentinel” a fost urcat acolo fiindcă EPSS ≥ 50% stă lângă o
+  evaluare CISA de peste 180 de zile; SSVC singur l-ar fi lăsat mai jos.
+  <strong>⚪ Gri înseamnă că lipsesc date, nu că e în regulă.</strong> Ordinea: culoarea, apoi
+  probabilitate × impact. <strong>Presupunere:</strong> misiunea activului e
+  <strong>{{ {'low': 'mică', 'medium': 'medie', 'high': 'mare'}[misiune] }}</strong> pentru toate
+  constatările (niciuna nu e legată încă de un activ din inventar); pe o misiune mai mare, mai multe
+  rânduri urcă.</p>
+
 <div class="statline">
   {% if counts.critical %}<span class="pill pill-bad">{{ counts.critical }} critice</span>{% endif %}
   {% if counts.high %}<span class="pill pill-bad">{{ counts.high }} mari</span>{% endif %}
@@ -58,12 +80,14 @@
     <thead>
       {# „Asociat cu", nu „Scaner": numele scanerului spune CUM a fost găsită
          constatarea, nu PE CE stă. Scanerul rămâne în `title`. #}
-      <tr><th class="num">Prio</th><th>Sev.</th><th>CVE</th><th>Titlu</th><th>Pachet</th><th>Fix</th><th>Asociat cu</th></tr>
+      <tr><th>Risc</th><th>Sev.</th><th>CVE</th><th>Titlu</th><th>Pachet</th><th>Fix</th><th>Importanță</th><th>EPSS</th><th>Asociat cu</th></tr>
     </thead>
     <tbody>
     {% for r in rows %}
       <tr class="{{ 'row-bad' if r.severity in ('high','critical') or r.kev }}">
-        <td class="num mono"><strong>{{ r.priority }}</strong></td>
+        {# Celula „Risc": culoarea, decizia și UN motiv. Cele patru puncte de decizie,
+           cu baza fiecăruia, sunt în `title` și în /vuln <id> din bot. #}
+        <td title="{{ r.risk_view.why | join(' · ') }}"><span class="dot dot-{{ r.risk_view.dot }}"></span><strong>{{ r.risk_view.label }}</strong>{% if r.risk_view.reboot %} <span class="tag" title="Reparația e instalată, lipsește o repornire">🔁</span>{% endif %}<br><span class="muted small">{{ r.risk_view.reason }}</span></td>
         <td><span class="dot dot-{{ r.sev_dot }}"></span> {{ r.severity }}{% if r.kev %} <span class="tag" title="Exploatat activ (CISA KEV)">🔥</span>{% endif %}</td>
         <td class="mono nowrap">
           {{ vuln.cve_cell(r.cve, rpm=(r.scanner == 'dnf'), kev=r.kev) }}
@@ -73,6 +97,8 @@
         <td>{{ r.title }}</td>
         <td class="mono">{{ r.package or '—' }}</td>
         <td class="mono nowrap">{{ r.fixed_version or '—' }}</td>
+        <td class="small nowrap">{{ r.risk_view.cvss }}</td>
+        <td class="small nowrap">{{ r.risk_view.epss }}</td>
         <td class="small" title="{{ r.subject.detail }}">{{ r.subject.label }}</td>
       </tr>
     {% endfor %}

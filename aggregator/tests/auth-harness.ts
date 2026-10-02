@@ -454,15 +454,34 @@ function evalWhere(text: string, row: Row, cursor: Cursor, now: number): boolean
  * numerică pentru numere și lexicografică (UTF-16) pentru rest — vezi limita
  * scrisă în capul fișierului.
  */
-function sortRows(rows: Row[], order: string): Row[] {
+function sortRows(rows: Row[], order: string, orderParams: unknown[] = []): Row[] {
+  let at = 0;
   const keys = splitTop(order, ",").map((entry) => {
+    // `CASE WHEN col IN (?, ?) THEN 0 ELSE 1 END [DESC]` — „întâi rândurile al
+    // căror `col` e într-o listă", forma cu care `listFindings` pune neaplicatele
+    // înaintea rezolvatelor. Parametrii se consumă în ordinea apariției, ca la
+    // driver; un `?` fără parametru sau un parametru rămas pică, nu se ignoră.
+    const member = /^CASE WHEN (\w+) IN \(((?:\?, )*\?)\) THEN 0 ELSE 1 END(?: (ASC|DESC))?$/
+      .exec(entry.trim());
+    if (member) {
+      const n = member[2].split(", ").length;
+      const wanted = new Set(orderParams.slice(at, at + n).map(String));
+      assert.equal(wanted.size > 0 && at + n <= orderParams.length, true,
+                   "dublul: `CASE WHEN … IN (?)` din ORDER BY fără destui parametri");
+      at += n;
+      return {
+        value: (row: Row) => (wanted.has(String(row[member[1]])) ? 0 : 1),
+        desc: member[3] === "DESC",
+      };
+    }
     const parsed = /^(\w+)(?: (ASC|DESC))?$/.exec(entry.trim());
     if (!parsed) throw new Error(`dublul nu recunoaște ordonarea: „${entry.trim()}”`);
-    return { column: parsed[1], desc: parsed[2] === "DESC" };
+    return { value: (row: Row) => row[parsed[1]], desc: parsed[2] === "DESC" };
   });
+  assert.equal(at, orderParams.length, "dublul: parametri ORDER BY neconsumați");
   return [...rows].sort((left, right) => {
     for (const key of keys) {
-      const order = compareValues(left[key.column], right[key.column]);
+      const order = compareValues(key.value(left), key.value(right));
       if (order !== 0) return key.desc ? -order : order;
     }
     return 0;
@@ -627,9 +646,13 @@ export class FakeAuthDb implements AuthDb, Pool {
     const row: Row = {
       id: nextId(this.findingEntries), instance_id: instanceId, source_id: 1,
       scanner: "trivy", cve: "CVE-2026-0001", title: "ceva",
-      severity: "high", cvss: "7.5", epss: "0.1234", kev: 0,
+      severity: "high", cvss: "7.5", epss: "0.1234", epss_percentile: null, kev: 0,
       kev_due_date: null, package: "openssl", installed_version: "3.0.1",
-      fixed_version: "3.0.2", priority: 70, status: "open",
+      fixed_version: "3.0.2", priority: 70,
+      // Ca la `0017`: `risk_color` are DEFAULT 'grey', iar celelalte patru sunt
+      // NULL — un rand sosit inainte de migratie arata asa.
+      risk_color: "grey", risk_decision: null, risk_score: null, risk: null,
+      status: "open",
       first_seen: this.nowMs, last_seen: this.nowMs,
       ...over,
     };
@@ -945,10 +968,20 @@ export class FakeAuthDb implements AuthDb, Pool {
     }
 
     let order: string | null = null;
+    let orderParams: unknown[] = [];
     const orderAt = /\s+ORDER BY (.+)$/.exec(tail);
     if (orderAt) {
       tail = tail.slice(0, orderAt.index);
       order = orderAt[1];
+      // Parametrii din `ORDER BY` stau între cei din `WHERE` și `LIMIT`, în ordinea
+      // textului. Se despart de ai lui `WHERE`, altfel `checkGrammar` i-ar număra
+      // ca neconsumați.
+      const marks = (order.match(/\?/g) ?? []).length;
+      if (marks > 0) {
+        assert.ok(whereParams.length >= marks, "dublul: ORDER BY cu mai multe `?` decât parametri");
+        orderParams = whereParams.slice(whereParams.length - marks);
+        whereParams = whereParams.slice(0, whereParams.length - marks);
+      }
     }
 
     const whereAt = /^\s+WHERE (.+)$/.exec(tail);
@@ -976,7 +1009,7 @@ export class FakeAuthDb implements AuthDb, Pool {
       : this.table(table).filter(
         (row) => evalWhere(where, row, { params: whereParams, at: 0 }, this.nowMs));
 
-    if (order !== null) rows = sortRows(rows, order);
+    if (order !== null) rows = sortRows(rows, order, orderParams);
     if (limit !== null) rows = rows.slice(0, limit);
 
     // `SELECT <coloana>, COUNT(*) AS n ... GROUP BY <coloana>` — agregarea pe

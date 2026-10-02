@@ -4656,6 +4656,229 @@ async def check_reputation_feeds(db: Database) -> list[CheckResult]:
 
 
 # ---------------------------------------------------------------------------
+# Datele de risc: EPSS, Red Hat, OSV și trecerea de evaluare însăși
+# ---------------------------------------------------------------------------
+#: Trecerea de evaluare rulează din oră în oră (mentenanța) și la fiecare scanare.
+#: Trei ore fără succes înseamnă că a ratat cel puțin două ture, nu o amânare.
+RISK_PASS_DEGRADED_H = 3
+#: O zi întreagă: culorile sunt de ieri sau mai vechi, pe oricare dintre date.
+RISK_PASS_DOWN_H = 24
+#: EPSS e un fișier zilnic. Trei zile fără o descărcare reușită e o sursă căzută;
+#: la `epss.MAX_AGE_DAYS` valorile nu mai sunt folosite (constatările devin gri).
+EPSS_DEGRADED_H = 72
+#: Red Hat și OSV se cer doar pentru ce lipsește sau a îmbătrânit; un eșec care
+#: persistă o zi și jumătate înseamnă CVE-uri noi rămase fără scor.
+VENDOR_DEGRADED_H = 36
+
+
+def _intel_detail(value: Any) -> dict[str, Any]:
+    """`intel_state.detail` (jsonb) ca dict, oricum l-ar da driverul."""
+    import json
+
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (str, bytes)):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+async def check_risk_intel(db: Database) -> list[CheckResult]:
+    """Semaforul SSVC se hrănește din patru surse publice (CISA Vulnrichment, EPSS,
+    Red Hat, OSV) și o trecere de evaluare; fiecare își scrie ultima încercare în
+    `intel_state`, iar aici ajunge la operator.
+
+    Fără verificarea asta, o sursă căzută arată exact ca una la zi: oglinda
+    păstrează valorile vechi, constatările rămân colorate, iar singurul semn e o
+    culoare care nu s-a mai mișcat de zile. `sentinel/intel/mirror.py` scrie eșecul
+    anume ca să nu se piardă; aici se citește.
+
+    Ce NU face: nu alertează pe numărul de constatări GRI. Un gri e o stare cinstită
+    („lipsesc date"), nu o defecțiune, iar o alertă permanentă pe 25 de rânduri ar fi
+    zgomotul pe care operatorul tocmai l-a scos. Numărul stă în `facts`, lângă
+    verdictul trecerii.
+
+    Un rând care lipsește nu e „în regulă": fără rând pentru `risk` nu s-a făcut
+    nicio evaluare (toate constatările sunt gri), deci verdictul e `unknown`.
+    """
+    rows = await db.fetch(
+        """
+        SELECT source, last_attempt_at, last_ok_at, last_error, detail,
+               EXTRACT(EPOCH FROM (now() - last_ok_at)) AS ok_age_s
+          FROM intel_state
+         ORDER BY source
+        """)
+    by_source = {str(r["source"]): dict(r) for r in rows}
+    results: list[CheckResult] = []
+
+    def _age_h(row: dict[str, Any]) -> float | None:
+        age = row.get("ok_age_s")
+        return None if age is None else float(age) / 3600
+
+    # --- trecerea de evaluare ---------------------------------------------------
+    risk_row = by_source.get("risk")
+    if risk_row is None:
+        results.append(CheckResult(
+            "risk:pass", "Evaluarea riscului (semaforul SSVC)", "unknown",
+            detail="nicio trecere de evaluare nu s-a încheiat încă: toate constatările "
+                   "sunt GRI („fără date”) până la prima. Pornește din mentenanța orară "
+                   "și din scanarea nocturnă.",
+            action="journalctl -u sentinel-maintenance -n 80",
+            facts={}))
+    else:
+        age = _age_h(risk_row)
+        detail_json = _intel_detail(risk_row.get("detail"))
+        facts = {"colors": detail_json.get("colors"), "findings": detail_json.get("findings"),
+                 "age_h": None if age is None else round(age, 1)}
+        if age is None:
+            results.append(CheckResult(
+                "risk:pass", "Evaluarea riscului — nu s-a încheiat niciodată cu succes",
+                "degraded",
+                detail=f"ultima eroare: {str(risk_row.get('last_error') or '—')[:200]}",
+                action="journalctl -u sentinel-maintenance -n 80", facts=facts))
+        elif age > RISK_PASS_DOWN_H:
+            results.append(CheckResult(
+                "risk:pass", "Evaluarea riscului nu a mai rulat de peste o zi", "down",
+                detail=f"ultimul succes acum {_ago(age * 60)}: culorile de pe pagină, "
+                       f"din bot și de la martorul extern sunt vechi",
+                action="journalctl -u sentinel-maintenance -n 80", facts=facts))
+        elif age > RISK_PASS_DEGRADED_H:
+            results.append(CheckResult(
+                "risk:pass", "Evaluarea riscului a rămas în urmă", "degraded",
+                detail=f"ultimul succes acum {_ago(age * 60)}; rulează din oră în oră. "
+                       f"Ultima eroare: {str(risk_row.get('last_error') or '—')[:160]}",
+                action="journalctl -u sentinel-maintenance -n 80", facts=facts))
+        else:
+            grey = (detail_json.get("colors") or {}).get("grey") if detail_json else None
+            results.append(CheckResult(
+                "risk:pass", "Evaluarea riscului (semaforul SSVC)", "ok",
+                detail=f"ultima trecere acum {_ago(age * 60)}"
+                       + (f"; {grey} constatări sunt GRI (fără date suficiente) — "
+                          f"cifra e informativă, nu o defecțiune" if grey else ""),
+                facts=facts))
+
+    # --- EPSS ---------------------------------------------------------------------------
+    epss_row = by_source.get("epss")
+    if epss_row is None:
+        if risk_row is not None:
+            results.append(CheckResult(
+                "risk:epss", "EPSS nu s-a descărcat niciodată", "unknown",
+                detail="fără EPSS, constatările rămân colorate, dar fără număr de "
+                       "ordonare (`risk_score`): probabilitatea lipsește, iar în interiorul "
+                       "unei culori nu mai există ordine. Dacă `intel.enabled` sau "
+                       "`intel.epss` e `false` în configurație, așa trebuie să arate.",
+                action="journalctl -u sentinel-maintenance -u sentinel-scan | grep -i epss",
+                facts={}))
+    else:
+        age = _age_h(epss_row)
+        facts = {"age_h": None if age is None else round(age, 1),
+                 "error": epss_row.get("last_error")}
+        if age is None or age > EPSS_DEGRADED_H:
+            from sentinel.intel.epss import MAX_AGE_DAYS as _EPSS_MAX
+            results.append(CheckResult(
+                "risk:epss", "EPSS nu se mai reîmprospătează",
+                "down" if age is not None and age > _EPSS_MAX * 24 else "degraded",
+                detail=("niciodată reușit" if age is None
+                        else f"ultimul succes acum {_ago(age * 60)}")
+                       + f". Ultima eroare: {str(epss_row.get('last_error') or '—')[:200]}. "
+                       f"După {_EPSS_MAX} zile valorile nu mai sunt folosite: "
+                       f"constatările rămân colorate, dar fără număr de ordonare, nu "
+                       f"pe ultima valoare.",
+                action="journalctl -u sentinel-maintenance -u sentinel-scan | grep -i epss",
+                facts=facts))
+        else:
+            results.append(CheckResult(
+                "risk:epss", "EPSS (FIRST)", "ok",
+                detail=f"fișierul zilnic, reîmprospătat acum {_ago(age * 60)}", facts=facts))
+
+    # --- CISA Vulnrichment: fără el, niciun CVE nu are Exploitation ------------------------
+    vr_row = by_source.get("vulnrichment")
+    if vr_row is None:
+        if risk_row is not None:
+            results.append(CheckResult(
+                "risk:vulnrichment", "CISA Vulnrichment nu a răspuns niciodată", "unknown",
+                detail="fără rând pentru CVE, punctul Exploitation nu se poate decide și "
+                       "constatarea e GRI („nu l-am întrebat încă”). Dacă `intel.enabled` "
+                       "sau `intel.vulnrichment` e `false` în configurație, așa trebuie să "
+                       "arate.",
+                action="journalctl -u sentinel-maintenance -u sentinel-scan | grep -i vulnrichment",
+                facts={}))
+    else:
+        age = _age_h(vr_row)
+        detail_json = _intel_detail(vr_row.get("detail"))
+        aborted = bool(detail_json.get("aborted"))
+        blind = bool(detail_json.get("blind"))
+        facts = {"age_h": None if age is None else round(age, 1),
+                 "error": vr_row.get("last_error"), "last": detail_json}
+        if blind:
+            # Cel mai rău caz, și cel tăcut: parserul nu mai găsește punctele CISA,
+            # deci fiecare CVE arată „CISA n-a evaluat nimic” și Exploitation cade
+            # pe `none`. Nu e o sursă căzută — e o sursă care minte prin tăcere.
+            results.append(CheckResult(
+                "risk:vulnrichment", "CISA Vulnrichment — niciun punct SSVC în răspunsuri",
+                "degraded",
+                detail="ultima trecere a primit CVE-uri și zero puncte SSVC CISA, iar "
+                       "controlul pozitiv (un CVE care are puncte, cerut în aceeași trecere) "
+                       "n-a confirmat parserul — a venit și el fără puncte sau n-a putut fi "
+                       "citit, vezi eroarea: formatul "
+                       "răspunsului sau identificatorul containerului CISA s-a schimbat. "
+                       "Până se repară parserul, Exploitation pentru CVE-urile noi cade pe "
+                       f"ipoteza „nu e în KEV”. Eroare: {str(vr_row.get('last_error') or '—')[:200]}",
+                action="journalctl -u sentinel-maintenance -u sentinel-scan | grep -i 'parser orb'",
+                facts=facts))
+        elif age is None or age > VENDOR_DEGRADED_H or aborted:
+            results.append(CheckResult(
+                "risk:vulnrichment", "CISA Vulnrichment — căutările eșuează", "degraded",
+                detail=("niciun răspuns primit vreodată" if age is None
+                        else f"ultimul răspuns acum {_ago(age * 60)}")
+                       + (", ultima trecere s-a oprit după eșecuri consecutive" if aborted else "")
+                       + f". Ultima eroare: {str(vr_row.get('last_error') or '—')[:200]}. "
+                       "CVE-urile noi rămân GRI („nu l-am întrebat”) până se vindecă.",
+                action="journalctl -u sentinel-maintenance -u sentinel-scan | grep -i 'căutări eșuate'",
+                facts=facts))
+        else:
+            results.append(CheckResult(
+                "risk:vulnrichment", "CISA Vulnrichment", "ok",
+                detail=f"ultimul răspuns acum {_ago(age * 60)}"
+                       + (f"; avertisment: {str(vr_row.get('last_error'))[:120]}"
+                          if vr_row.get("last_error") else ""),
+                facts=facts))
+
+    # --- Red Hat și OSV: doar dacă au fost vreodată cerute --------------------------------
+    for source, label in (("redhat", "Red Hat Security Data"), ("osv", "OSV.dev")):
+        row = by_source.get(source)
+        if row is None:
+            continue
+        age = _age_h(row)
+        detail_json = _intel_detail(row.get("detail"))
+        aborted = bool(detail_json.get("aborted"))
+        facts = {"age_h": None if age is None else round(age, 1),
+                 "error": row.get("last_error"), "last": detail_json}
+        key = f"risk:{source}"
+        if age is None or age > VENDOR_DEGRADED_H or aborted:
+            results.append(CheckResult(
+                key, f"{label} — căutările eșuează", "degraded",
+                detail=("niciun răspuns primit vreodată" if age is None
+                        else f"ultimul răspuns acum {_ago(age * 60)}")
+                       + (", ultima trecere s-a oprit după eșecuri consecutive" if aborted else "")
+                       + f". Ultima eroare: {str(row.get('last_error') or '—')[:200]}. "
+                       "CVE-urile noi rămân fără scor (GRI) până se vindecă.",
+                action="journalctl -u sentinel-maintenance -u sentinel-scan | grep -i 'căutări eșuate'",
+                facts=facts))
+        else:
+            results.append(CheckResult(
+                key, label, "ok",
+                detail=f"ultimul răspuns acum {_ago(age * 60)}"
+                       + (f"; avertisment: {str(row.get('last_error'))[:120]}"
+                          if row.get("last_error") else ""),
+                facts=facts))
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Auditd: nucleul își aruncă înregistrările?
 # ---------------------------------------------------------------------------
 #: Pragul de înregistrări pierdute e ZERO, dinadins. `lost` e cumulativ de la
@@ -5391,6 +5614,7 @@ CHECKS: tuple[tuple[str, Callable], ...] = (
     ("restore_drill", check_restore_drill),
     ("patch_window", check_patch_window),
     ("reputation", check_reputation_feeds),
+    ("risk", check_risk_intel),
     ("inventory", check_inventory),
     ("audit", check_audit_records),
     ("history", check_command_history_filter),

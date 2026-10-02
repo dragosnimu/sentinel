@@ -764,7 +764,9 @@ const DETECTIONS: Stream = {
  * termen KEV mutat cu o zi e o data gresita pe care n-o semnaleaza nimic, si
  * spune pana cand trebuie reparat ceva ce se exploateaza ACTIV.
  *
- * `cvss` si `epss` sunt `numeric` la sursa, deci sosesc ca SIR, ca `ai_confidence`.
+ * `cvss`, `epss`, `epss_percentile` si `risk_score` sunt `numeric` la sursa, deci
+ * sosesc ca SIR, ca `ai_confidence`. Culoarea (`risk_color`) si decizia
+ * (`risk_decision`) vin gata decise: replica nu recalculeaza nimic.
  */
 const FINDINGS: Stream = {
   name: "findings",
@@ -786,6 +788,7 @@ const FINDINGS: Stream = {
     { source: "cvss", target: "cvss", kind: "decimal", nullable: true },
     { source: "cvss_vector", target: "cvss_vector", kind: "text", nullable: true, maxBytes: TEXT },
     { source: "epss", target: "epss", kind: "decimal", nullable: true },
+    { source: "epss_percentile", target: "epss_percentile", kind: "decimal", nullable: true },
     { source: "kev", target: "kev", kind: "bool", nullable: false },
     { source: "kev_due_date", target: "kev_due_date", kind: "date", nullable: true },
     { source: "package", target: "package", kind: "text", nullable: true, maxBytes: TEXT },
@@ -794,6 +797,13 @@ const FINDINGS: Stream = {
     { source: "location", target: "location", kind: "text", nullable: true, maxBytes: TEXT },
     { source: "ecosystem", target: "ecosystem", kind: "text", nullable: true, maxBytes: TEXT },
     { source: "priority", target: "priority", kind: "int", nullable: false },
+    // Semaforul SSVC (0047 pe server, 0017 aici). `risk_score` si `epss_percentile`
+    // sosesc ca SIR (`numeric` la sursa, nu `real`), `risk` ca text JSON fara
+    // proza. Culoarea nu se calculeaza aici: se afiseaza ce a decis serverul.
+    { source: "risk_color", target: "risk_color", kind: "text", nullable: false, maxBytes: 8 },
+    { source: "risk_decision", target: "risk_decision", kind: "text", nullable: true, maxBytes: 16 },
+    { source: "risk_score", target: "risk_score", kind: "decimal", nullable: true },
+    { source: "risk", target: "risk", kind: "json", nullable: false, maxBytes: TEXT },
     { source: "status", target: "status", kind: "text", nullable: false, maxBytes: TEXT },
     { source: "first_seen", target: "first_seen", kind: "timestamp", nullable: false },
     { source: "last_seen", target: "last_seen", kind: "timestamp", nullable: false },

@@ -197,7 +197,8 @@ def _conn(status: str, *, origine: str = "ai_manual",
     conn.execute(f"CREATE TABLE patch_plans ({', '.join(coloane)}, "
                  "generated_by TEXT, finding_id INTEGER)")
     conn.execute("CREATE TABLE findings (id INTEGER, status TEXT, kev INTEGER, "
-                 "fixed_version TEXT, priority INTEGER, ecosystem TEXT, raw TEXT)")
+                 "fixed_version TEXT, priority INTEGER, ecosystem TEXT, raw TEXT, "
+                 "risk_score REAL)")
     conn.execute("INSERT INTO findings (id, status, kev, fixed_version, priority, "
                  "ecosystem) VALUES (7, 'open', 1, '1.2.3', 5, ?)",
                  (ECOSISTEM,))

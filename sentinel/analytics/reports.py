@@ -1189,6 +1189,9 @@ async def overview(
                count(*) FILTER (WHERE status = 'open' AND kev) AS kev,
                count(*) FILTER (WHERE status = 'open'
                                   AND severity IN ('high','critical')) AS grave,
+               count(*) FILTER (WHERE status = 'open' AND risk_color = 'red') AS rosii,
+               count(*) FILTER (WHERE status = 'open' AND risk_color = 'amber') AS galbene,
+               count(*) FILTER (WHERE status = 'open' AND risk_color = 'grey') AS gri,
                count(*) FILTER (WHERE first_seen >= $1) AS noi,
                count(*) FILTER (WHERE resolved_at >= $1) AS rezolvate
         FROM findings
@@ -1249,6 +1252,11 @@ async def overview(
             "open": int(fnd["deschise"] or 0) if fnd else 0,
             "kev": int(fnd["kev"] or 0) if fnd else 0,
             "grave": int(fnd["grave"] or 0) if fnd else 0,
+            # Semaforul SSVC, „acum" ca și `open`. Gri se numără mereu: un raport
+            # care ar tăcea despre „fără date" ar arăta curat când nu se știe.
+            "red": int(fnd["rosii"] or 0) if fnd else 0,
+            "amber": int(fnd["galbene"] or 0) if fnd else 0,
+            "grey": int(fnd["gri"] or 0) if fnd else 0,
             "new": int(fnd["noi"] or 0) if fnd else 0,
             "resolved": int(fnd["rezolvate"] or 0) if fnd else 0,
             "coverage": live_cov,

@@ -179,3 +179,57 @@ def test_a_failure_here_cannot_stop_detection(monkeypatch):
     assert "except exception" in crossing_block
     # And after the cursor moves, so a failure cannot re-read the same events.
     assert src.index("set_detect_cursor") < src.index("exposure.detect")
+
+
+# --- which 500 findings it looks at ---------------------------------------
+def test_ties_inside_a_priority_band_are_cut_by_risk_score_not_by_chance():
+    """RUNS the real query on SQLite. Priority is the traffic-light band; most
+    open findings sit in the same one (766 of 812 at priority 0 in the 2 Oct
+    2026 rehearsal), so `LIMIT 500` must decide among ties. Without `risk_score`
+    in the ORDER BY it keeps whichever rows the engine meets first, and the
+    findings most likely to be exploited can be the ones dropped, so a
+    probe against exactly them is never crossed with an unpatched hole.
+
+    Declared limit: SQLite sorts NULL last on DESC, Postgres sorts it FIRST;
+    `NULLS LAST` is falsified against a real Postgres in
+    tests/integration/test_risk_intel_pg.py."""
+    import sqlite3
+
+    captured: list[str] = []
+
+    class _Capture:
+        async def fetch(self, sql, *a):
+            captured.append(sql)
+            return []
+
+    run(exposure.detect(_Capture()))
+    assert captured, "detect never queried findings"
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE findings (id INTEGER, cve TEXT, package TEXT, "
+                 "severity TEXT, kev INTEGER, priority INTEGER, asset_id INTEGER, "
+                 "status TEXT, risk_score REAL)")
+    conn.execute("CREATE TABLE assets (id INTEGER, name TEXT, stack TEXT)")
+    # 600 findings in one band (priority 0). Ids 201..600 have a risk_score that
+    # rises with the id; ids 1..200 all tie at 0.0 and are inserted in DESCENDING
+    # id order, so the cut at 500 falls INSIDE the tied group and only the `id`
+    # key decides which of them survive.
+    conn.executemany(
+        "INSERT INTO findings VALUES (?, 'CVE-2026-1', 'pkg', 'high', 0, 0, NULL, "
+        "'open', 0.0)", [(i,) for i in range(200, 0, -1)])
+    conn.executemany(
+        "INSERT INTO findings VALUES (?, 'CVE-2026-1', 'pkg', 'high', 0, 0, NULL, "
+        "'open', ?)", [(i, i / 1000.0) for i in range(201, 601)])
+    # And one higher band, which stays ahead of every tie.
+    conn.execute("INSERT INTO findings VALUES (9000, 'CVE-2026-2', 'pkg', 'high', 0, "
+                 "40, NULL, 'open', 0.0001)")
+
+    kept = [r[0] for r in conn.execute(captured[0])]
+    assert len(kept) == 500
+    assert kept[0] == 9000, "the higher priority band must stay first"
+    assert kept[1] == 600, "within the band the highest risk_score must lead"
+    assert set(range(201, 601)) <= set(kept), (
+        "every finding with a real risk_score must outrank the unscored ties")
+    assert set(kept) - set(range(201, 601)) - {9000} == set(range(1, 100)), (
+        "inside the tied group the lowest ids must survive, not whichever rows "
+        "the engine met first")

@@ -42,6 +42,8 @@
 import { scopePlaceholders, seesNothing } from "../auth/scope";
 import type { AuthDb } from "../auth/db";
 import type { InstanceScope } from "../auth/scope";
+import { countColors } from "../finding-risk";
+import type { RiskColor } from "../finding-risk";
 
 /** O pereche „acum / înainte", din care iese tendința. */
 export type Trend = { now: number; before: number };
@@ -56,6 +58,11 @@ export type Overview = {
   incidentsOpen: number;
   incidentsSevere: number;
   findingsOpen: number;
+  /**
+   * Cele neaplicate, pe culoarea semaforului SSVC al gazdei lor. Suma e
+   * `findingsOpen`: o culoare necunoscută se numără ca gri, nu dispare.
+   */
+  findingsByColor: Record<RiskColor, number>;
   blocksActive: number;
   /** Incidentele deschise, pe severitate, cu cele grave întâi. */
   bySeverity: { severity: string; count: number }[];
@@ -114,7 +121,7 @@ const EMPTY: Summary = {
   overview: {
     attackers: { now: 0, before: 0 }, detections: { now: 0, before: 0 },
     events: { now: 0, before: 0 }, incidentsOpen: 0, incidentsSevere: 0,
-    findingsOpen: 0, blocksActive: 0, bySeverity: [],
+    findingsOpen: 0, findingsByColor: countColors([]), blocksActive: 0, bySeverity: [],
   },
   series: [], rankings: { attackers: [], rules: [], sources: [] },
   activity: [], truncated: [],
@@ -224,7 +231,7 @@ export async function summary(
   if (incidents.length >= MAX_ROWS_READ) truncated.push("incidente");
 
   const findings = await db.all(
-    "SELECT status FROM finding_entries " +
+    "SELECT status, risk_color FROM finding_entries " +
     ` WHERE instance_id IN (${scope}) AND instance_id = ? LIMIT ?`,
     [...ids, MAX_ROWS_READ]);
   if (findings.length >= MAX_ROWS_READ) truncated.push("constatări");
@@ -335,6 +342,8 @@ export async function summary(
         .filter((s) => s.severity === "critical" || s.severity === "high")
         .reduce((a, s) => a + s.count, 0),
       findingsOpen: findings.filter((r) => FINDING_OPEN.has(String(r.status))).length,
+      findingsByColor: countColors(
+        findings.filter((r) => FINDING_OPEN.has(String(r.status)))),
       blocksActive: blocks.filter((r) => Number(r.active) === 1).length,
       bySeverity,
     },

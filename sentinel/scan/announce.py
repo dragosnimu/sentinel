@@ -23,6 +23,23 @@ numărul total. Mărginit aici, coada e numărul, iar lista e vârful.
 Ordinea: KEV întâi, apoi prioritatea. `kev` înseamnă „se exploatează chiar
 acum", iar dacă din tot mesajul se citește un singur rând, ăla trebuie să fie.
 
+## Culoarea, pe fiecare rând
+
+Constatările aduc `risk_color` (evaluarea de la sfârșitul trecerii, vezi
+`sentinel/scan/enrich.py`): punctul din fața rândului e semaforul — 🔴 Act, 🟡
+Attend, ⚪ fără date, 🟢 Track —, iar 🔥 rămâne lângă cele din KEV. Un rând fără
+culoare (o constatare care n-a trecut prin evaluare) păstrează forma veche: 🔴 doar
+pentru KEV. Un KEV poate ieși VERDE: arborele CISA îl dă Track când exploatarea e
+activă dar impactul e parțial și atacul nu e automatizabil, pe o misiune medie.
+Nu se ascunde: 🟢 și 🔥 pe același rând spun exact asta.
+
+## Trecerile în roșu — un singur mesaj, o singură dată
+
+`announce_red` anunță constatările care au DEVENIT roșii după ce fuseseră evaluate
+(vezi `enrich._announce_red` pentru regulile: nu prima evaluare, nu o constatare nouă
+a scanării, nu a doua oară). Evaluarea se mișcă singură, când se mișcă datele (KEV,
+punctele publicate de CISA); canalul se deschide doar pe urcări în roșu.
+
 ## De ce nu aruncă niciodată
 
 Un anunț care oprește scanarea ar transforma un canal de informare într-un mod
@@ -36,6 +53,10 @@ import logging
 from typing import Any, Callable, Iterable, Sequence
 
 log = logging.getLogger("sentinel.scan.announce")
+
+#: Semaforul, pe culori. Același dicționar ca în `risk.py`, importat și nu
+#: retipărit: două liste de emoji se despart la prima culoare mutată.
+COLOR_EMOJI = {"red": "🔴", "amber": "🟡", "green": "🟢", "grey": "⚪"}
 
 #: Câte constatări se enumeră în mesaj înainte de „și încă N".
 MAX_LISTED = 10
@@ -87,7 +108,11 @@ def build_message(findings: Sequence[dict[str, Any]], *, host: str) -> str:
 
     lines = [head, ""]
     for finding in ordered[:MAX_LISTED]:
-        mark = "🔴" if finding.get("kev") else "•"
+        color = finding.get("risk_color")
+        if color:
+            mark = COLOR_EMOJI.get(str(color), "⚪") + (" 🔥" if finding.get("kev") else "")
+        else:
+            mark = "🔴" if finding.get("kev") else "•"
         # Un aviz fără CVE structurat (`dnf list --security`, vezi
         # `os_packages._uncovered_advisories`) are `cve` nul, dar are ID-ul avizului:
         # mesajul e singurul loc unde operatorul află de el, iar „fără CVE" singur
@@ -135,6 +160,58 @@ async def announce(cfg: Any, findings: Iterable[dict[str, Any]]) -> int:
         return 0
     return await _deliver(cfg, lambda host: build_message(items, host=host),
                           label="de vulnerabilități noi", count=len(items))
+
+
+def build_red_message(findings: Sequence[dict[str, Any]], *, host: str) -> str:
+    """Mesajul „au devenit roșii". Funcție PURĂ.
+
+    Scurt dinadins, ca reamintirea zilnică din `build_pending_reboot_reminder`: e un
+    mesaj care se repetă când scorurile se mișcă, deci singurul pe care operatorul
+    l-ar opri. Fiecare rând spune DE CE e roșu într-un singur motiv („KEV", „CISA:
+    exploatat") și cât de grav e (CVSS, cu sursa lui); cele patru puncte de decizie și
+    justificarea furnizorului sunt în `/vuln <id>`.
+
+    Ordinea: după prioritate, descrescător; KEV-ul nu trece înaintea unui roșu fără
+    KEV, fiindcă TOATE rândurile de aici sunt Act.
+    """
+    from sentinel.scan import risk_view
+
+    total = len(findings)
+    ordered = sorted(findings, key=lambda f: int(f.get("priority") or 0), reverse=True)
+    noun = "vulnerabilitate a devenit roșie" if total == 1 else "vulnerabilități au devenit roșii"
+    lines = [f"🔴 <b>{_esc(host)} — {total} {noun}</b>",
+             "<i>Act: decizia CISA SSVC cea mai urgentă — exploatare activă, atac "
+             "automatizabil, impact total.</i>", ""]
+    for finding in ordered[:MAX_LISTED]:
+        cve = _esc(finding.get("cve") or finding.get("advisory_id") or "fără CVE")
+        pkg = _esc(finding.get("package") or "?")
+        risk = finding.get("risk") if isinstance(finding.get("risk"), dict) else {}
+        why = _esc(risk_view.one_liner("red", risk))
+        cvss = _esc(risk_view.fmt_cvss(risk.get("cvss")))
+        ident = f" · /vuln {finding['id']}" if finding.get("id") else ""
+        lines.append(f"🔴 <code>{cve}</code> — {pkg} · {why} · {cvss}{ident}")
+    if total > MAX_LISTED:
+        lines.append(f"\n…și încă {total - MAX_LISTED}. Lista întreagă e în panou.")
+    lines.append("\n<i>Mesajul vine o singură dată pentru fiecare constatare; scorurile "
+                 "se mișcă odată cu datele (KEV, CISA).</i>")
+    return "\n".join(lines)
+
+
+async def announce_red(cfg: Any, findings: Iterable[dict[str, Any]]) -> int:
+    """Trimite mesajul „au devenit roșii". Întoarce câte chat-uri l-au primit.
+
+    Aceleași reguli ca `announce`: comutatorul `scan.announce_new`, zero e un
+    răspuns valid, livrarea numărată per chat, nimic nu ridică spre evaluare.
+    Zero înseamnă și „nu a ajuns nicăieri", iar `enrich` retrage atunci
+    revendicarea, ca trecerea următoare să reîncerce.
+    """
+    items = list(findings)
+    if not items:
+        return 0
+    if not getattr(cfg.scan, "announce_new", True):
+        return 0
+    return await _deliver(cfg, lambda host: build_red_message(items, host=host),
+                          label="de vulnerabilități devenite roșii", count=len(items))
 
 
 async def _deliver(cfg: Any, build: Callable[[str], str], *, label: str,

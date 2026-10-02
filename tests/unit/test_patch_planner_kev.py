@@ -111,7 +111,8 @@ def test_expired_plans_do_not_block_a_fresh_kev_plan():
 
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE findings (id INTEGER, status TEXT, kev INTEGER, "
-                 "fixed_version TEXT, priority INTEGER, ecosystem TEXT, raw TEXT)")
+                 "fixed_version TEXT, priority INTEGER, ecosystem TEXT, raw TEXT, "
+                 "risk_score REAL)")
     conn.execute("CREATE TABLE patch_plans (finding_id INTEGER, status TEXT)")
     conn.execute("INSERT INTO findings (id, status, kev, fixed_version, priority, "
                  "ecosystem) VALUES (1, 'open', 1, '1.2.3', 5, ?)",
@@ -135,7 +136,8 @@ def test_a_genuinely_live_plan_still_blocks_a_duplicate():
 
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE findings (id INTEGER, status TEXT, kev INTEGER, "
-                 "fixed_version TEXT, priority INTEGER, ecosystem TEXT, raw TEXT)")
+                 "fixed_version TEXT, priority INTEGER, ecosystem TEXT, raw TEXT, "
+                 "risk_score REAL)")
     conn.execute("CREATE TABLE patch_plans (finding_id INTEGER, status TEXT)")
     conn.execute("INSERT INTO findings (id, status, kev, fixed_version, priority, "
                  "ecosystem) VALUES (1, 'open', 1, '1.2.3', 5, ?)",
@@ -218,3 +220,42 @@ def test_findingul_potrivit_familiei_ajunge_la_model(monkeypatch):
 
     assert chemari == [11]
     assert rezultate == [(42, "validated")]
+
+
+# ---------------------------------------------------------------------------
+# Departajarea în interiorul unei benzi
+# ---------------------------------------------------------------------------
+def test_kev_urile_cu_aceeasi_banda_se_aleg_dupa_risk_score_apoi_dupa_id():
+    """EXECUTAT peste SQLite, pe interogarea reală. `priority` e banda
+    semaforului, iar un KEV poate fi verde (SSVC: activ + neautomatizabil +
+    impact parțial = Track): verdele stă aproape tot la `priority` 0. Fără
+    `risk_score` în `ORDER BY`, `LIMIT 3` alege dintre ele după ordinea
+    fizică a rândurilor, iar planul cerut modelului (două apeluri Opus) merge
+    la un KEV oarecare în loc de cel mai probabil să fie atacat.
+
+    Limită declarată: SQLite pune NULL ultimul la DESC, Postgres îl pune
+    PRIMUL; `NULLS LAST` nu poate fi falsificat aici, ci în
+    `tests/integration/test_risk_intel_pg.py`, pe un Postgres real."""
+    db = _FetchDB(fetch_rows=[])
+    run(planner.generate_for_kev(db, cfg=_cfg(), api_key="sk-test", limit=3))
+    sql = _translate(db.fetch_sql)
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE findings (id INTEGER, status TEXT, kev INTEGER, "
+                 "fixed_version TEXT, priority INTEGER, ecosystem TEXT, raw TEXT, "
+                 "risk_score REAL)")
+    conn.execute("CREATE TABLE patch_plans (finding_id INTEGER, status TEXT)")
+    # (id, priority, risk_score), inserate într-o ordine fizică care nu e cea
+    # corectă pe nicio cheie, ca să nu iasă bună din întâmplare (5 înaintea lui 2
+    # la risk_score egal: doar `id` le pune în ordine).
+    rows = [(6, 40, 0.01), (5, 0, 0.90), (3, 0, None), (4, 0, 0.50), (2, 0, 0.90),
+            (1, 0, 0.10)]
+    conn.executemany("INSERT INTO findings (id, status, kev, fixed_version, priority, "
+                     "ecosystem, risk_score) VALUES (?, 'open', 1, '1.2.3', ?, ?, ?)",
+                     [(i, p, ECOSISTEM, s) for i, p, s in rows])
+
+    chosen = [r[0] for r in conn.execute(sql, (ECOSISTEM, 5))]
+    assert chosen == [6, 2, 5, 4, 1], (
+        "ordinea trebuie să fie banda (priority), apoi risk_score, apoi id; "
+        f"s-a ales {chosen}")
+    assert [r[0] for r in conn.execute(sql, (ECOSISTEM, 3))] == [6, 2, 5]

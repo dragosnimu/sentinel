@@ -445,6 +445,57 @@ def test_quiet_campaigns_step_is_registered_in_the_run():
     assert "quiet_campaigns" in src
 
 
+# --- expire_plans: planurile cerute de om trebuie să și îmbătrânească -----
+def test_expire_plans_reports_what_the_database_expired():
+    """Raportul pasului e singurul loc în care operatorul poate vedea că un
+    plan pe care îl aștepta a fost expirat. Un pas care spune mereu «nimic» ar
+    ascunde chiar întreținerea pe care o face."""
+    db = _DB(rows={"UPDATE patch_plans": [{"id": 4}, {"id": 9}]})
+    detail, evidence = run(ms.expire_plans(db))
+    assert evidence["expired"] == 2, evidence
+    assert "2 planuri" in detail
+    assert evidence["ttl_hours"] == 72
+
+
+def test_expire_plans_says_so_when_there_is_nothing_to_expire():
+    """«N-am avut ce expira» și «n-am rulat» sunt stări diferite; pasul trebuie
+    să apară în raport și în cazul gol."""
+    detail, evidence = run(ms.expire_plans(_DB()))
+    assert evidence["expired"] == 0
+    assert "niciun plan" in detail
+
+
+def test_expire_plans_actually_runs_in_the_hourly_pass(monkeypatch):
+    """Eșecul prevenit: un plan cerut cu `/planifica` și lăsat neatins rămâne
+    `validated` PENTRU TOTDEAUNA, deci vulnerabilitatea lui nu mai poate primi
+    niciodată alt plan — nici la cerere (`live_plan_for_finding`), nici automat
+    dacă e KEV — iar `/patch <id>` îi mai oferă butoane de aprobare luni mai
+    târziu, pentru versiuni de pachet care între timp s-au schimbat. Exact asta
+    era starea până pe 15 septembrie 2026: `expire_stale_plans` exista și nu o
+    chema nimeni.
+
+    Verificat pe RULAREA reală (`ms.run`), nu pe prezența unui nume în sursă:
+    un pas scris, numit corect și scos din listă ar trece un test de text.
+    """
+    from sentinel.db.repo import patches as patch_repo
+
+    chemari: list = []
+
+    async def _expire(db):
+        chemari.append(db)
+        return 1
+
+    monkeypatch.setattr(patch_repo, "expire_stale_plans", _expire)
+
+    rep = run(ms.run(_DB(), _cfg()))
+
+    assert chemari, ("nimeni n-a chemat expirarea planurilor în trecerea orară "
+                     "— un plan cerut manual rămâne viu la infinit")
+    pasi = [s for s in rep.steps if s.name == "expire_plans"]
+    assert len(pasi) == 1, [s.name for s in rep.steps]
+    assert pasi[0].ok and pasi[0].facts["expired"] == 1, pasi[0]
+
+
 # --- refresh_intel: KEV + feed-uri de reputație, în același pas izolat ----
 def test_refresh_intel_calls_both_kev_and_reputation(monkeypatch):
     """Funcționalitatea 03 a adăugat feed-urile de reputație lângă KEV, în

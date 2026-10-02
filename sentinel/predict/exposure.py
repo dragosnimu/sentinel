@@ -76,6 +76,12 @@ class Crossing:
 
 async def detect(db: Database, *, hours: int = 6, limit: int = 50) -> list[Crossing]:
     """Find crossings in the recent past. Cheap enough to run every cycle."""
+    # `priority` is a band of the traffic light (20 steps wide), and most open
+    # findings are green with priority 0: in the 2 Oct 2026 rehearsal 766 of 812
+    # tied there, so `LIMIT 500` kept an arbitrary 454 of them and a different
+    # set each cycle. `risk_score` (probability x impact) orders inside a band; NULLS
+    # LAST because Postgres puts NULL first on DESC, which would put the rows
+    # nobody has scored ahead of the ones that were. `id` makes the cut stable.
     findings = await db.fetch(
         """
         SELECT f.id, f.cve, f.package, f.severity, f.kev, f.priority,
@@ -83,7 +89,7 @@ async def detect(db: Database, *, hours: int = 6, limit: int = 50) -> list[Cross
         FROM findings f
         LEFT JOIN assets a ON a.id = f.asset_id
         WHERE f.status = 'open'
-        ORDER BY f.priority DESC
+        ORDER BY f.priority DESC, f.risk_score DESC NULLS LAST, f.id
         LIMIT 500
         """)
     if not findings:

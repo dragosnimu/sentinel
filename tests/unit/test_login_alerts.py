@@ -61,6 +61,35 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def _coloane_cerute(sql: str) -> list[str]:
+    """Numele sub care instrucțiunea chiar cere coloanele.
+
+    `host(src_ip) AS src_ip` -> `src_ip`.
+    """
+    corp = sql.split("SELECT", 1)[1].split("FROM", 1)[0]
+    nume = []
+    for bucata in corp.split(","):
+        bucata = bucata.strip()
+        if not bucata:
+            continue
+        nume.append(bucata.rsplit(" AS ", 1)[-1].strip())
+    return nume
+
+
+def _proiectie(sql: str, randuri: list[dict]) -> list[dict]:
+    """Rândul cu FIX coloanele cerute, nu cu tot ce ține dublul în el.
+
+    Dublul întorcea dicționarul întreg, deci un test putea trece pe o coloană
+    pe care `SELECT`-ul n-o cere deloc — iar în producție `session.get(...)` ar
+    fi întors `None` și mesajul ar fi ieșit altfel. Chiar tiparul „un dublu care
+    răspunde indiferent de întrebare” din CLAUDE.md, și cum s-ar fi pierdut
+    tăcut `closed_inferred` din rezumat.
+    """
+    coloane = _coloane_cerute(sql)
+    assert coloane, f"nu găsesc lista de coloane în: {sql}"
+    return [{c: r.get(c) for c in coloane} for r in randuri]
+
+
 class _DB:
     """Dublu cât să poarte anunțarea și rezumatul."""
 
@@ -80,14 +109,16 @@ class _DB:
                 # tot ar face testul despre sesiunile neinteractive să treacă
                 # degeaba — și exact aia e proprietatea care ține canalul viu.
                 assert "interactive = true" in sql, sql
-                return [s for s in self.sessions
-                        if s.get("alerted_at") is None and s.get("interactive")]
+                return _proiectie(sql, [
+                    s for s in self.sessions
+                    if s.get("alerted_at") is None and s.get("interactive")])
             assert "closed_at IS NOT NULL" in sql, sql
             assert "alerted_at IS NOT NULL" in sql, sql
-            return [s for s in self.sessions
-                    if s.get("closed_at") is not None
-                    and s.get("alerted_at") is not None
-                    and s.get("summarised_at") is None]
+            return _proiectie(sql, [
+                s for s in self.sessions
+                if s.get("closed_at") is not None
+                and s.get("alerted_at") is not None
+                and s.get("summarised_at") is None])
         if "FROM session_commands" in sql:
             priv = set(a[1])
             return [c for c in self.commands
@@ -391,6 +422,37 @@ def test_a_closed_session_gets_a_summary() -> None:
     assert "systemctl restart nginx" in corp, (
         "«412 comenzi» nu spune nimic; comenzile privilegiate sunt jumătatea "
         "utilă a rezumatului")
+
+
+def test_an_inferred_close_does_not_pretend_the_duration_was_measured() -> None:
+    """«Durată: 1h 35m» despre o sesiune a cărei ieșire n-a văzut-o nimeni.
+
+    Pe gazda Ubuntu, la 15 septembrie 2026, TOATE cele 17 sesiuni închise aveau
+    `closed_inferred = true`: momentul închiderii e ultima activitate, iar omul
+    a putut sta la prompt încă o oră după ea. Prezentată ca măsurată, cifra
+    asta nu mai poate fi verificată de nimeni a doua zi — și una dintre ele
+    chiar spunea «0m» despre o sesiune cu 71 de comenzi.
+    """
+    db = _DB([_sesiune(closed_at=NOW + timedelta(minutes=95), alerted_at=NOW,
+                       closed_inferred=True, command_count=412, sudo_count=0)])
+    assert run(detect_logins.summarise_closed_sessions(db)) == 1
+    corp = db.queued[0]["body"]
+    assert "cel puțin 1h 35m" in corp, (
+        "durata unei închideri presupuse e dată drept măsurată")
+    assert "ultima activitate" in corp, (
+        "mesajul nu spune de ce durata e doar o margine de jos")
+
+
+def test_a_real_logout_still_reports_the_duration_as_a_fact() -> None:
+    """Cealaltă direcție: când ieșirea CHIAR s-a văzut, durata e exactă și nu
+    are voie să fie tocită cu un «cel puțin» — altfel avertismentul devine
+    zgomot pe fiecare mesaj și nu mai deosebește nimic."""
+    db = _DB([_sesiune(closed_at=NOW + timedelta(minutes=95), alerted_at=NOW,
+                       closed_inferred=False, command_count=412, sudo_count=0)])
+    assert run(detect_logins.summarise_closed_sessions(db)) == 1
+    corp = db.queued[0]["body"]
+    assert "Durată: 1h 35m" in corp
+    assert "cel puțin" not in corp
 
 
 def test_a_purged_session_does_not_report_zero_commands() -> None:

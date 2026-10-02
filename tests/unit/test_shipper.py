@@ -1269,6 +1269,27 @@ RECEIVER_ONLY = {
                            "browser, nu despre lot",
     "CSP_META": "politica gata compusă; idem",
     "CSP_META_TAG": "elementul pus primul în `<head>`; idem",
+    # lib/finding-risk.ts — vocabularele de AFIȘARE ale semaforului SSVC. Niciuna
+    # nu mărginește ce poate trimite expeditorul: sunt cuvintele cu care pagina
+    # descrie o culoare deja decisă pe server. O valoare pe care nu o cunosc cade
+    # pe gri (`toColor`), nu e refuzată. Păstrate la paritate cu
+    # `sentinel/scan/risk_view.py` de `tests/unit/test_risk_view_parity.py`.
+    "COLORS": "cele patru culori ale semaforului, ca vocabular închis de afișare",
+    "COLOR_ORDER": "ordinea culorilor în listă (roșu, galben, gri, verde)",
+    "COLOR_LABEL_RO": "numele culorilor, pentru pastile",
+    "COLOR_EMOJI": "punctul colorat din fața etichetei",
+    "DECISION_LABEL_RO": "numele deciziilor SSVC (Act, Attend, Track*, Track)",
+    "NO_DECISION_RO": "eticheta unui rând fără decizie („fără date”)",
+    "SOURCE_RO": "numele surselor CVSS (Red Hat, OSV, trivy)",
+    "MISSING_RO": "textul pentru fiecare cod „ce lipsește” al unui gri",
+    "ONE_LINER_MISSING": "motivul scurt al unui gri, pe un rând de listă",
+    "OVERLAY_TAG_RO": "eticheta „regula Sentinel, nu SSVC” de lângă un galben urcat de regula "
+                      "Sentinel (aceeași ca în `risk_view.py`, comparată de paritate)",
+    "OVERLAY_REASON_RO": "motivul scurt al aceluiași galben, pe un rând de listă",
+    # lib/panel-page.ts
+    "OPEN_STATUSES": "stările în care panoul desenează culoarea unui rând (derivate din "
+                     "`GROUPS.neaplicate`); o stare nouă a serverului cade pe „închis”, "
+                     "adică fără culoare, nu e refuzată",
     # lib/prune.ts — `MAX_PRUNE_KEYS` NU e aici: el mărginește chiar ce trimite
     # expeditorul, deci e acordat în testul de limite de mai sus.
     "MAX_PRUNE_KEY_BYTES": "lungimea unei chei, egală cu lățimea coloanei de la "

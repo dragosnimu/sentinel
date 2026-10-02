@@ -490,6 +490,9 @@ async def _vuln_insight(db: Database) -> list[Insight]:
         """
         SELECT count(*) FILTER (WHERE status = 'open') AS deschise,
                count(*) FILTER (WHERE status = 'open' AND kev) AS kev,
+               count(*) FILTER (WHERE status = 'open' AND risk_color = 'red') AS rosii,
+               count(*) FILTER (WHERE status = 'open' AND risk_color = 'amber') AS galbene,
+               count(*) FILTER (WHERE status = 'open' AND risk_color = 'grey') AS gri,
                count(*) FILTER (WHERE status = 'resolved') AS rezolvate
         FROM findings
         """
@@ -497,22 +500,58 @@ async def _vuln_insight(db: Database) -> list[Insight]:
     if row is None:
         return []
     deschise, kev, rezolvate = int(row["deschise"] or 0), int(row["kev"] or 0), int(row["rezolvate"] or 0)
+    rosii, galbene, gri = (int(row["rosii"] or 0), int(row["galbene"] or 0),
+                           int(row["gri"] or 0))
+    # Culorile intră în dovadă, nu doar în text: cine citește cardul vede de ce.
+    evidence = {"total_deschise": deschise, "rosii": rosii, "galbene": galbene,
+                "fara_date": gri}
     if kev:
+        # KEV rămâne critic, ca până acum: catalogul CISA spune „se exploatează",
+        # iar canalele KEV (plan, reamintire, anunț) tratează la fel orice KEV.
+        # Semaforul poate pune însă un KEV pe verde (impact parțial, atac
+        # neautomatizabil), deci textul spune și culorile, nu ascunde diferența.
         return [Insight(
             level="critical",
             title=f"{kev} vulnerabilități exploatate ACTIV în acest moment",
             detail=("CISA le listează ca exploatate în sălbăticie chiar acum (KEV). "
-                    "Nu e o probabilitate teoretică — există exploit-uri în circulație."),
+                    "Nu e o probabilitate teoretică — există exploit-uri în circulație. "
+                    f"Semafor SSVC pe toate cele deschise: {rosii} roșii, {galbene} "
+                    f"galbene, {gri} fără date."),
             action="dnf update --security -y, apoi reboot dacă e kernel",
-            evidence={"kev": kev, "total_deschise": deschise},
+            evidence={"kev": kev, **evidence},
+        )]
+    if rosii:
+        return [Insight(
+            level="critical",
+            title=f"{rosii} vulnerabilități roșii (Act) — exploatare probabilă acum",
+            detail=("Decizia CISA SSVC cea mai urgentă: exploatare activă (în KEV sau "
+                    "publicată ca atare de CISA), atac automatizabil, impact total."),
+            action="/vulnerabilitati rosii",
+            evidence=evidence,
+        )]
+    if galbene:
+        return [Insight(
+            level="warning",
+            title=f"{galbene} vulnerabilități galbene (Attend) — de reparat mai repede decât ciclul obișnuit",
+            detail=(f"Niciuna roșie, niciuna în KEV. {gri} constatări n-au date "
+                    "suficiente pentru o decizie (gri) — nu sunt în regulă, doar "
+                    "neevaluate. Un galben marcat „regula Sentinel” nu e decizia SSVC: "
+                    "l-a urcat o regulă a Sentinel (EPSS ≥ 50% lângă o evaluare CISA "
+                    "de peste 180 de zile)."),
+            action="/vulnerabilitati galbene",
+            evidence=evidence,
         )]
     if deschise:
         return [Insight(
-            level="warning",
-            title=f"{deschise} vulnerabilități deschise, niciuna exploatată activ",
-            detail="Nimic pe lista KEV, deci nu e urgent — dar rămân de reparat.",
+            level="info",
+            title=f"{deschise} vulnerabilități deschise, nicio urgență (Track)",
+            detail=("Nimic în KEV, nimic roșu sau galben: toate pot aștepta ciclul "
+                    "obișnuit de actualizare"
+                    + (f". Atenție: {gri} dintre ele sunt GRI — nu s-a putut decide "
+                       "(lipsesc date), nu sunt confirmate ca fiind în regulă."
+                       if gri else ".")),
             action="Programează un dnf update --security",
-            evidence={"deschise": deschise},
+            evidence=evidence,
         )]
     if rezolvate:
         return [Insight(

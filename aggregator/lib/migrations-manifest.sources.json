@@ -548,6 +548,41 @@
           "sourceEnd": 1749
         }
       ]
+    },
+    {
+      "file": "0017_finding_risk.sql",
+      "statements": [
+        {
+          "index": 1,
+          "sql": "ALTER TABLE finding_entries ADD COLUMN epss_percentile DECIMAL(5,4) NULL COMMENT 'findings.epss_percentile; percentila EPSS, afisata langa probabilitate'",
+          "sourceStart": 0,
+          "sourceEnd": 2159
+        },
+        {
+          "index": 2,
+          "sql": "ALTER TABLE finding_entries ADD COLUMN risk_color VARCHAR(8) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'grey' COMMENT 'red|amber|green|grey, decis pe server; implicit gri = neevaluat'",
+          "sourceStart": 2159,
+          "sourceEnd": 2410
+        },
+        {
+          "index": 3,
+          "sql": "ALTER TABLE finding_entries ADD COLUMN risk_decision VARCHAR(16) CHARACTER SET ascii COLLATE ascii_bin NULL COMMENT 'act|attend|track_star|track (CISA SSVC), dupa ajustarea pentru repornire; NULL = gri'",
+          "sourceStart": 2410,
+          "sourceEnd": 2670
+        },
+        {
+          "index": 4,
+          "sql": "ALTER TABLE finding_entries ADD COLUMN risk_score DECIMAL(6,5) NULL COMMENT 'probabilitate x impact, 0..1; ordoneaza in interiorul unei culori'",
+          "sourceStart": 2670,
+          "sourceEnd": 2868
+        },
+        {
+          "index": 5,
+          "sql": "ALTER TABLE finding_entries ADD COLUMN risk JSON NULL COMMENT 'cele patru puncte de decizie si sursa lor, CVSS ales, EPSS; fara proza'",
+          "sourceStart": 2868,
+          "sourceEnd": 3051
+        }
+      ]
     }
   ]
 }

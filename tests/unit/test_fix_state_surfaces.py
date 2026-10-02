@@ -241,7 +241,12 @@ class _List:
         async def by_scanner(db):
             return {"dnf": len(self.rows)}
 
+        async def risk_counts(db, **kw):
+            return {"red": 0, "amber": 0, "grey": len(self.rows), "green": 0,
+                    "total": len(self.rows)}
+
         monkeypatch.setattr(findings_repo, "list_open", list_open)
+        monkeypatch.setattr(findings_repo, "risk_counts", risk_counts)
         monkeypatch.setattr(findings_repo, "open_counts", open_counts)
         monkeypatch.setattr(findings_repo, "open_counts_by_scanner", by_scanner)
 

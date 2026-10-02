@@ -167,15 +167,35 @@ finding has a *history*, not a new row each night.
 | `epss` | `numeric` — probability of exploitation in the next 30 days |
 | `kev` | `bool` — in the CISA Known Exploited Vulnerabilities catalog |
 | `package`, `installed_version`, `fixed_version`, `location` | |
-| `priority` | `0`–`100`, computed. **Rank by this, not by CVSS** |
+| `priority` | `0`–`100`, derived from the traffic light (band) and `risk_score`. **Rank by this, not by CVSS** |
+| `risk_color` | `red`\|`amber`\|`green`\|`grey` — the CISA SSVC decision (Act / Attend / Track). **`grey` = not enough data to decide, never "fine"** |
+| `risk_decision` | `act`\|`attend`\|`track_star`\|`track`; `NULL` ⇔ grey |
+| `risk_score` | `numeric(6,5)`, probability × impact; orders rows inside one colour |
+| `risk` | `jsonb`: the four SSVC points and their basis, the CVSS chosen and its source, EPSS, what is missing |
+| `epss_percentile` | `numeric(5,4)`; show EPSS as probability **with** percentile |
 | `status` | `open`\|`patch_planned`\|`patching`\|`resolved`\|`accepted_risk`\|`deferred`\|`false_positive` |
 | `first_seen`, `last_seen`, `resolved_at` | |
 | `deferred_until`, `accepted_by`, `accepted_reason` | |
 
-Priority formula (deterministic, in `scan/prioritize.py`):
-`CVSS` × `EPSS` × `KEV multiplier` × `internet-exposed multiplier` ×
-`asset criticality` × `fix availability`. A CVSS 7.5 in a KEV-listed,
-internet-facing app outranks a CVSS 9.8 in an unexposed local library.
+The traffic light (deterministic, `scan/ssvc.py` + `scan/risk.py`; the pass is
+`scan/enrich.py`): the colour is the CISA SSVC coordinator tree over four
+points — Exploitation (KEV, else CISA's published value from `vulnrichment`; EPSS
+is NOT an input — it is a forecast, not an observation; with neither, `none` with
+`basis: kev_absent`, Sentinel's own assumption), Automatable and Technical Impact
+(CISA's published value, else read from the CVSS vector) and Mission (the asset's
+criticality; `3` = medium for every finding today). Every point records its
+`basis` in `findings.risk`. `risk_score` is
+probability × impact (EPSS or 1.0 for KEV, times CVSS/10) and is used only to
+order inside a colour. The old points formula (`scan/prioritize.py`) is gone.
+
+One rule is Sentinel's own and is NOT SSVC's or FIRST's: if CISA's Exploitation
+value (`none`/`poc`) is older than 180 days and the fresh EPSS is >= 0.5, the colour
+is floored at amber (`attend`), and `findings.risk.overlay` records
+`basis: epss_overlay`, the SSVC decision it overrode and the numbers applied. The
+`points` are never rewritten, and grey stays grey. Every surface labels such a row
+"regula Sentinel, nu SSVC". Technical Impact from a CVSS vector is `total` only
+when `C:H` AND `I:H` (CVSS `C:H` is total loss of the *component*, SSVC's `total` is
+of the *system*; CISA agrees with the "and" reading on 95% of the host's CVEs).
 
 ---
 

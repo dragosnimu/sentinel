@@ -18,6 +18,12 @@ from typing import Any
 from sentinel.db.engine import Database
 
 
+#: Prioritatea unui rând nou-venit, înainte de prima evaluare: banda „gri" din
+#: `sentinel/scan/risk.py` (`UNASSESSED_PRIORITY`; un test cere să fie aceeași).
+#: Scrisă aici ca stratul de depozit să nu importe din `sentinel.scan`.
+UNASSESSED_PRIORITY = 40
+
+
 def finding_key(scanner: str, asset_id: int | None, package: str | None,
                 cve: str | None, location: str | None) -> str:
     material = "|".join(str(x or "") for x in (scanner, asset_id, package, cve, location))
@@ -63,7 +69,16 @@ async def finish_scan(db: Database, scan_id: int, *, status: str, findings_count
 
 async def upsert_finding(db: Database, f: dict[str, Any]) -> bool:
     """Insert or refresh one finding. Returns True if it is newly seen (or was
-    resolved and has reappeared), False if it was already open."""
+    resolved and has reappeared), False if it was already open.
+
+    Ce NU se rescrie la reîntâlnire: `priority`, `epss`, `epss_percentile`, toate
+    coloanele `risk_*` — și `cvss`/`cvss_vector` când scanerul nu aduce nimic.
+    Sunt ale trecerii de evaluare (`sentinel/scan/enrich.py`), pe care scanerul n-o
+    cunoaște: un `dnf` nu spune niciodată un scor, iar o rescriere cu NULL ar
+    șterge în fiecare noapte scorul adus de la Red Hat și ar lăsa pagina pe „fără
+    date" până la trecerea următoare. `priority` e derivată din (culoare, scor), nu
+    un câmp al scanerului: scrisă de aici, ar contrazice culoarea de lângă ea.
+    """
     row = await db.fetchrow(
         """
         INSERT INTO findings
@@ -77,8 +92,11 @@ async def upsert_finding(db: Database, f: dict[str, Any]) -> bool:
             -- A finding that was resolved but is seen again reopens.
             status = CASE WHEN findings.status = 'resolved' THEN 'open' ELSE findings.status END,
             resolved_at = NULL,
-            severity = EXCLUDED.severity, cvss = EXCLUDED.cvss, epss = EXCLUDED.epss,
-            kev = EXCLUDED.kev, priority = EXCLUDED.priority,
+            severity = EXCLUDED.severity,
+            cvss = COALESCE(EXCLUDED.cvss, findings.cvss),
+            cvss_vector = COALESCE(EXCLUDED.cvss_vector, findings.cvss_vector),
+            epss = COALESCE(EXCLUDED.epss, findings.epss),
+            kev = EXCLUDED.kev,
             fixed_version = EXCLUDED.fixed_version, scan_id = EXCLUDED.scan_id,
             raw = EXCLUDED.raw
         RETURNING (xmax = 0) AS is_new, status
@@ -88,7 +106,7 @@ async def upsert_finding(db: Database, f: dict[str, Any]) -> bool:
         f.get("severity", "medium"), f.get("cvss"), f.get("cvss_vector"),
         f.get("epss"), f.get("kev", False), f.get("kev_due_date"), f.get("package"),
         f.get("installed_version"), f.get("fixed_version"), f.get("location"),
-        f.get("ecosystem"), f.get("priority", 0), f.get("scan_id"),
+        f.get("ecosystem"), f.get("priority", UNASSESSED_PRIORITY), f.get("scan_id"),
         json.dumps(f.get("raw", {})),
     )
     return bool(row["is_new"])
@@ -333,9 +351,24 @@ def _severity_clause(severities: list[str] | None, column: str,
     return f" AND {column} = ANY(${len(args)}::text[])"
 
 
+def _color_clause(colors: list[str] | None, column: str, args: list[Any]) -> str:
+    """`AND <column> = ANY($n)` când se cere un filtru pe culoare, nimic altfel.
+
+    Aceeași convenție ca `_severity_clause`: `None` e „fără filtru", `[]` e
+    „nicio culoare cerută, deci niciun rând". Fără `coalesce`: `risk_color` e
+    `NOT NULL` cu `CHECK` pe cele patru valori (0047), deci niciun rând nu poate
+    scăpa filtrului printr-un NULL.
+    """
+    if colors is None:
+        return ""
+    args.append(list(colors))
+    return f" AND {column} = ANY(${len(args)}::text[])"
+
+
 def _subset_clause(args: list[Any], *, prefix: str = "",
                    scanners: list[str] | None = None,
                    severities: list[str] | None = None,
+                   colors: list[str] | None = None,
                    kev_only: bool = False) -> str:
     """Filtrele opționale ale unei mulțimi de constatări deschise, într-o ordine.
 
@@ -355,6 +388,7 @@ def _subset_clause(args: list[Any], *, prefix: str = "",
     """
     clause = _scanner_clause(scanners, f"{prefix}scanner", args)
     clause += _severity_clause(severities, f"{prefix}severity", args)
+    clause += _color_clause(colors, f"{prefix}risk_color", args)
     if kev_only:
         clause += f" AND {prefix}kev"
     return clause
@@ -363,6 +397,7 @@ def _subset_clause(args: list[Any], *, prefix: str = "",
 async def open_counts(db: Database, *,
                       scanners: list[str] | None = None,
                       severities: list[str] | None = None,
+                      colors: list[str] | None = None,
                       kev_only: bool = False) -> dict[str, int]:
     """Constatările deschise pe severitate, plus `total` și `kev`.
 
@@ -378,7 +413,7 @@ async def open_counts(db: Database, *,
     """
     args: list[Any] = []
     clause = _subset_clause(args, scanners=scanners, severities=severities,
-                            kev_only=kev_only)
+                            colors=colors, kev_only=kev_only)
     rows = await db.fetch(
         "SELECT severity, count(*) AS n FROM findings WHERE status = 'open'"
         f"{clause} GROUP BY severity", *args)
@@ -388,10 +423,39 @@ async def open_counts(db: Database, *,
     # doua copie ar fi doar o clauză redundantă care schimbă textul SQL pe care
     # se sprijină ciotul din teste.
     kev_args: list[Any] = []
-    kev_clause = _subset_clause(kev_args, scanners=scanners, severities=severities)
+    kev_clause = _subset_clause(kev_args, scanners=scanners, severities=severities,
+                                colors=colors)
     counts["kev"] = int(await db.fetchval(
         f"SELECT count(*) FROM findings WHERE status = 'open' AND kev{kev_clause}",
         *kev_args) or 0)
+    return counts
+
+
+async def risk_counts(db: Database, *,
+                      scanners: list[str] | None = None,
+                      severities: list[str] | None = None,
+                      kev_only: bool = False) -> dict[str, int]:
+    """Constatările deschise pe culoare, plus `total`.
+
+    NU primește `colors`: pastilele de culoare trebuie să descrie mulțimea
+    filtrată pe CELELALTE criterii (categorie, severitate, KEV) ca să arate câte
+    sunt în fiecare culoare, inclusiv în cele pe care nu s-a apăsat. Numărate
+    după culoarea aleasă, celelalte trei pastile ar spune zero.
+
+    Toate cele patru culori apar mereu în rezultat, cu zero unde nu e nimic: un
+    „gri: 0" lipsă din dicționar ar fi un `KeyError` la afișare sau, mai rău, o
+    tăcere despre gri.
+    """
+    args: list[Any] = []
+    clause = _subset_clause(args, scanners=scanners, severities=severities,
+                            kev_only=kev_only)
+    rows = await db.fetch(
+        "SELECT risk_color, count(*) AS n FROM findings WHERE status = 'open'"
+        f"{clause} GROUP BY risk_color", *args)
+    counts = {"red": 0, "amber": 0, "grey": 0, "green": 0}
+    for r in rows:
+        counts[str(r["risk_color"])] = int(r["n"])
+    counts["total"] = sum(counts.values())
     return counts
 
 
@@ -434,8 +498,10 @@ async def get_finding(db: Database, finding_id: int) -> dict[str, Any] | None:
     """
     row = await db.fetchrow(
         f"""
-        SELECT f.id, f.cve, f.title, f.severity, f.cvss, f.epss, f.kev,
-               f.priority, f.package, f.installed_version, f.fixed_version,
+        SELECT f.id, f.cve, f.advisory_id, f.title, f.severity, f.cvss, f.epss,
+               f.epss_percentile, f.kev, f.priority, f.risk_color,
+               f.risk_decision, f.risk_score, f.risk, f.package,
+               f.installed_version, f.fixed_version,
                f.location, f.ecosystem, f.scanner, f.status,
                {pending_reboot_sql("f.")} AS fix_pending_reboot,
                f.raw #>> '{{fix_state,installed}}' AS fix_installed,
@@ -449,9 +515,32 @@ async def get_finding(db: Database, finding_id: int) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+async def vendor_justification(db: Database, row: dict[str, Any]) -> tuple[str, str] | None:
+    """Justificarea scrisă a furnizorului pentru o constatare: `(text, sursă)`.
+
+    Numai Red Hat o dă („very unlikely to have a production system running
+    NetworkManager with DEBUG logs enabled"), și numai pentru pachete rpm. Stă în
+    `vuln_intel`, NU în `findings.risk`: e proză din rețea, iar `risk` pleacă la
+    martorul extern, a cărui margine puncteaza conținutul care seamănă cu linii de
+    comandă. Se citește la cerere, pentru detaliul unei singure constatări.
+
+    `None` când nu există: nu e rpm, n-are CVE, Red Hat n-a scris nimic sau
+    răspunsul n-a fost încă adus.
+    """
+    cve = row.get("cve")
+    if not cve or row.get("ecosystem") != "rpm":
+        return None
+    text = await db.fetchval(
+        "SELECT justification FROM vuln_intel "
+        "WHERE vuln_id = $1 AND source = 'redhat' AND status = 'found' "
+        "AND justification IS NOT NULL", cve)
+    return (str(text), "Red Hat") if text else None
+
+
 async def list_open(db: Database, *, limit: int = 100, offset: int = 0,
                     scanners: list[str] | None = None,
                     severities: list[str] | None = None,
+                    colors: list[str] | None = None,
                     kev_only: bool = False) -> list[dict[str, Any]]:
     """O felie din constatările deschise, în ordinea priorității.
 
@@ -466,6 +555,12 @@ async def list_open(db: Database, *, limit: int = 100, offset: int = 0,
     Python. Botul tăia 200 de rânduri și abia apoi păstra criticele din ele;
     întrebarea la care răspundea nu era „care sunt criticele deschise".
 
+    Ordinea: banda de prioritate (roșu, galben, gri, verde — vezi
+    `sentinel/scan/risk.py`), apoi scorul `probabilitate × impact` în interiorul
+    ei. `priority` singură are 20 de trepte pe bandă; fără `risk_score`, sute de
+    constatări verzi ar împărți aceleași trepte și s-ar ordona după severitate,
+    adică după CVSS, exact ce evaluarea a fost scrisă să nu facă.
+
     `f.id DESC` la coada ordonării nu e decor: `priority`, `severity` și
     `last_seen` se repetă pe sute de rânduri, iar o ordine parțială înseamnă că
     două pagini consecutive pot arăta același rând de două ori și-l pot sări pe
@@ -474,7 +569,7 @@ async def list_open(db: Database, *, limit: int = 100, offset: int = 0,
     """
     args: list[Any] = []
     clause = _subset_clause(args, prefix="f.", scanners=scanners,
-                            severities=severities, kev_only=kev_only)
+                            severities=severities, colors=colors, kev_only=kev_only)
     args.append(limit)
     limit_param = len(args)
     args.append(offset)
@@ -482,12 +577,14 @@ async def list_open(db: Database, *, limit: int = 100, offset: int = 0,
     rows = await db.fetch(
         f"""
         SELECT f.id, f.cve, f.advisory_id, f.title, f.severity, f.cvss, f.epss,
-               f.kev, f.priority, f.package, f.installed_version, f.fixed_version,
+               f.epss_percentile, f.kev, f.priority, f.risk_color, f.risk_decision,
+               f.risk_score, f.risk, f.package, f.installed_version, f.fixed_version,
                f.scanner, f.location, f.status, f.last_seen, a.name AS asset_name,
                {pending_reboot_sql("f.")} AS fix_pending_reboot
         FROM findings f LEFT JOIN assets a ON a.id = f.asset_id
         WHERE f.status = 'open'{clause}
-        ORDER BY f.priority DESC, f.severity DESC, f.last_seen DESC, f.id DESC
+        ORDER BY f.priority DESC, f.risk_score DESC NULLS LAST, f.severity DESC,
+                 f.last_seen DESC, f.id DESC
         LIMIT ${limit_param} OFFSET ${offset_param}
         """,
         *args)

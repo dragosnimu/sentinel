@@ -197,7 +197,10 @@ async def kpis(db: Database) -> dict[str, Any]:
     fnd = await db.fetchrow(
         """
         SELECT count(*) FILTER (WHERE status = 'open') AS deschise,
-               count(*) FILTER (WHERE status = 'open' AND kev) AS kev
+               count(*) FILTER (WHERE status = 'open' AND kev) AS kev,
+               count(*) FILTER (WHERE status = 'open' AND risk_color = 'red') AS rosii,
+               count(*) FILTER (WHERE status = 'open' AND risk_color = 'amber') AS galbene,
+               count(*) FILTER (WHERE status = 'open' AND risk_color = 'grey') AS gri
         FROM findings
         """
     )
@@ -210,6 +213,11 @@ async def kpis(db: Database) -> dict[str, Any]:
         "incidente_grave": int(inc["grave"] or 0),
         "vuln_deschise": int(fnd["deschise"] or 0),
         "vuln_kev": int(fnd["kev"] or 0),
+        # Semaforul SSVC (vezi `sentinel/scan/risk.py`). Verdele nu se numără aici:
+        # e restul. Gri se numără MEREU: „fără date" nu e „în regulă".
+        "vuln_rosii": int(fnd["rosii"] or 0),
+        "vuln_galbene": int(fnd["galbene"] or 0),
+        "vuln_gri": int(fnd["gri"] or 0),
         "blocate": blocked,
     }
 
