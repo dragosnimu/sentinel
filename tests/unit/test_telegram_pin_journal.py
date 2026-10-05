@@ -172,18 +172,11 @@ def test_a_correct_pin_is_never_journaled_and_is_not_recorded_as_a_command(
     _never_record_command(monkeypatch)
     monkeypatch.setattr("sentinel.config.get_secrets", lambda: _FakePinSecrets("246810"))
 
-    async def _approve(db, plan_id, *, by, expected_hash):
-        return True
-
-    async def _revoke(*a, **kw):
+    async def _ask(*a, **kw):
         pass
 
-    async def _run_plan(db, cfg, plan_id, *, mode, triggered_by):
-        return SimpleNamespace(status="succeeded", execution_id=1, error=None, steps=[])
-
-    monkeypatch.setattr(patch_flow.patches, "approve_plan", _approve)
-    monkeypatch.setattr(patch_flow.approvals, "revoke_for_plan", _revoke)
-    monkeypatch.setattr("sentinel.patch.runner.run_plan", _run_plan)
+    # The right PIN now leads on to the request for the operator's signature.
+    monkeypatch.setattr(patch_flow, "_ask_for_approval", _ask)
 
     chat_id = 900001
     patch_flow._pending_pins[chat_id] = patch_flow._PendingPin(
@@ -315,6 +308,40 @@ def test_a_human_reply_with_no_pin_pending_at_all_produces_no_log_record(caplog)
         run(handler(update, context))
 
     assert not any(r.getMessage() == "pin attempt" for r in caplog.records)
+
+
+# --- the operator's approval token travels through the same registered handler ---
+def test_an_approval_token_reply_reaches_its_handler_through_the_registered_pin_handler_unjournaled(
+        monkeypatch, caplog):
+    """The operator's signed token comes back as a REPLY to the approval prompt, and the
+    only text-reply handler `build_application` registers is the PIN one. If
+    `on_pin_reply` did not hand the reply on, the token would be dropped and the
+    operator would sign requests that nothing ever receives - while the PIN wrapper,
+    that exists to keep secrets out of journald, would have nothing to do with it. And
+    the text must stay out of the journal: this wrapper never writes it."""
+    _never_record_command(monkeypatch)
+    token = "ab" * 32
+    received = []
+
+    async def _approval(update, context):
+        received.append(update.message.text)
+        return True
+
+    monkeypatch.setattr(patch_flow, "on_approval_reply", _approval)
+
+    chat_id = 900007
+    cfg = _cfg([chat_id])
+    handler = _pin_handler(cfg)
+    update = _FakeUpdate(chat_id=chat_id, text=token, reply_to_message_id=PROMPT_MESSAGE_ID)
+    context = SimpleNamespace(bot_data={"db": object(), "cfg": cfg})
+
+    with caplog.at_level(logging.DEBUG):
+        run(handler(update, context))
+
+    assert received == [token], "the registered handler did not hand the token to the approval flow"
+    assert not _mentions(caplog, token)
+    assert not any(r.getMessage() == "pin attempt" for r in caplog.records), (
+        "a token reply is not a PIN attempt")
 
 
 # --- unauthorised chat: refused silently, logged without text ---------------

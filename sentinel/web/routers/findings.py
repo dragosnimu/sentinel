@@ -142,7 +142,7 @@ COLOR_FILTERS = ("red", "amber", "grey", "green")
 
 def _risk_view(row: dict[str, Any]) -> dict[str, Any]:
     """Ce arată șablonul despre semaforul unui rând. Calculat AICI, nu în Jinja:
-    o ramură de șablon nu se poate falsifica singură, iar „gri înseamnă că lipsesc
+    o ramură de șablon nu se poate falsifica singură, iar „Nedecis înseamnă că lipsesc
     date" e fix felul de regulă care nu are voie să se piardă în marcaj."""
     import json
 
@@ -158,17 +158,22 @@ def _risk_view(row: dict[str, Any]) -> dict[str, Any]:
         color = "grey"
     decision = row.get("risk_decision")
     why = risk_view.why_lines(data)
-    grey = risk_view.grey_reason(data) if color == "grey" else None
     cvss = (risk_view.fmt_cvss(data.get("cvss")) if data.get("cvss")
             else (f"CVSS {row['cvss']}" if row.get("cvss") else "fără CVSS"))
     return {
         "color": color,
         "dot": risk_view.DOT_CLASS[color],
         "label": risk_view.headline(color, decision, data),
-        "reason": grey if grey is not None else risk_view.one_liner(color, data),
+        # `None` când o linie n-ar spune nimic (un verde cu EPSS mic): șablonul nu
+        # desenează atunci nici `<br>`, ca celula să nu aibă un rând gol sub etichetă.
+        "reason": risk_view.reason_line(color, data),
         "why": why,
         "cvss": cvss,
         "epss": risk_view.fmt_epss(row.get("epss"), row.get("epss_percentile")),
+        # „nu se știe" când lista KEV n-a putut fi citită sau rândul n-are CVE: un „nu"
+        # acolo ar fi o liniștire fără verificare.
+        "kev": risk_view.fmt_kev(row.get("kev"), row.get("kev_due_date"), data),
+        "kev_on": bool(row.get("kev")),
         "reboot": bool(data.get("reboot_pending")),
     }
 
@@ -241,7 +246,10 @@ async def findings_page(
     kind = selected.kind if selected else None
     color_chips = [
         {"color": c, "emoji": risk_view.COLOR_EMOJI[c],
-         "label": risk_view.COLOR_LABEL_RO[c], "count": int(color_counts.get(c, 0)),
+         # Numele STĂRII, nu al culorii: același cuvânt ca în coloana „Risc" a rândurilor pe
+         # care pastila le aduce. Cuvântul culorii și numele CISA stau în `title`.
+         "label": risk_view.COLOR_STATE_RO[c], "title": risk_view.pill_title(c),
+         "count": int(color_counts.get(c, 0)),
          "url": page_url(kind, 1, c), "active": color == c}
         for c in COLOR_FILTERS]
 
@@ -267,6 +275,10 @@ async def findings_page(
             "next_url": page_url(kind, page + 1, color) if page < pages else None,
             "categorii": chips,
             "culori": color_chips,
+            # Textele legendei, din aceleași surse ca etichetele rândurilor: una scrisă de
+            # mână în șablon s-a abătut deja o dată (Telegram).
+            "legenda_stari": risk_view.legend_states(),
+            "legenda_kev": risk_view.KEV_UNKNOWN_NOTE_RO,
             "culoare": color,
             "url_toate_culorile": page_url(kind, 1),
             # Ce s-a presupus pentru TOATE rândurile: misiunea activului. E cea

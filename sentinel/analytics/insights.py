@@ -502,6 +502,12 @@ async def _vuln_insight(db: Database) -> list[Insight]:
     deschise, kev, rezolvate = int(row["deschise"] or 0), int(row["kev"] or 0), int(row["rezolvate"] or 0)
     rosii, galbene, gri = (int(row["rosii"] or 0), int(row["galbene"] or 0),
                            int(row["gri"] or 0))
+    # Numele STĂRILOR, nu ale culorilor (`risk_view.COLOR_STATE_RO`): cardul, pastila și rândul
+    # paginii „Vulnerabilități" spun același cuvânt pentru aceeași stare.
+    from sentinel.scan import risk_view
+    acum, curand = risk_view.state_with_ssvc("red"), risk_view.state_with_ssvc("amber")
+    ciclul = risk_view.state_with_ssvc("green")
+    nume_acum, nume_curand, nedecis = (risk_view.COLOR_STATE_RO[c] for c in ("red", "amber", "grey"))
     # Culorile intră în dovadă, nu doar în text: cine citește cardul vede de ce.
     evidence = {"total_deschise": deschise, "rosii": rosii, "galbene": galbene,
                 "fara_date": gri}
@@ -515,15 +521,15 @@ async def _vuln_insight(db: Database) -> list[Insight]:
             title=f"{kev} vulnerabilități exploatate ACTIV în acest moment",
             detail=("CISA le listează ca exploatate în sălbăticie chiar acum (KEV). "
                     "Nu e o probabilitate teoretică — există exploit-uri în circulație. "
-                    f"Semafor SSVC pe toate cele deschise: {rosii} roșii, {galbene} "
-                    f"galbene, {gri} fără date."),
+                    "Semafor SSVC pe toate cele deschise: "
+                    f"{risk_view.counts_ro(rosii, galbene, gri)}."),
             action="dnf update --security -y, apoi reboot dacă e kernel",
             evidence={"kev": kev, **evidence},
         )]
     if rosii:
         return [Insight(
             level="critical",
-            title=f"{rosii} vulnerabilități roșii (Act) — exploatare probabilă acum",
+            title=f"{acum}: {rosii} vulnerabilități — exploatare probabilă",
             detail=("Decizia CISA SSVC cea mai urgentă: exploatare activă (în KEV sau "
                     "publicată ca atare de CISA), atac automatizabil, impact total."),
             action="/vulnerabilitati rosii",
@@ -532,10 +538,11 @@ async def _vuln_insight(db: Database) -> list[Insight]:
     if galbene:
         return [Insight(
             level="warning",
-            title=f"{galbene} vulnerabilități galbene (Attend) — de reparat mai repede decât ciclul obișnuit",
-            detail=(f"Niciuna roșie, niciuna în KEV. {gri} constatări n-au date "
-                    "suficiente pentru o decizie (gri) — nu sunt în regulă, doar "
-                    "neevaluate. Un galben marcat „regula Sentinel” nu e decizia SSVC: "
+            title=f"{curand}: {galbene} vulnerabilități — de reparat mai repede decât ciclul obișnuit",
+            detail=(f"Niciuna „{nume_acum}”, niciuna în KEV. {gri} "
+                    f"constatări sunt „{nedecis}”: n-au date suficiente pentru o decizie — "
+                    "nu sunt în regulă, doar neevaluate. "
+                    f"Un „{nume_curand}” marcat „regula Sentinel” nu e decizia SSVC: "
                     "l-a urcat o regulă a Sentinel (EPSS ≥ 50% lângă o evaluare CISA "
                     "de peste 180 de zile)."),
             action="/vulnerabilitati galbene",
@@ -544,10 +551,10 @@ async def _vuln_insight(db: Database) -> list[Insight]:
     if deschise:
         return [Insight(
             level="info",
-            title=f"{deschise} vulnerabilități deschise, nicio urgență (Track)",
-            detail=("Nimic în KEV, nimic roșu sau galben: toate pot aștepta ciclul "
-                    "obișnuit de actualizare"
-                    + (f". Atenție: {gri} dintre ele sunt GRI — nu s-a putut decide "
+            title=f"{ciclul}: {deschise} vulnerabilități deschise, nicio urgență",
+            detail=(f"Nimic în KEV, nimic „{nume_acum}” sau „{nume_curand}”: toate pot aștepta "
+                    "ciclul obișnuit de actualizare"
+                    + (f". Atenție: {gri} dintre ele sunt „{nedecis}” — nu s-a putut decide "
                        "(lipsesc date), nu sunt confirmate ca fiind în regulă."
                        if gri else ".")),
             action="Programează un dnf update --security",

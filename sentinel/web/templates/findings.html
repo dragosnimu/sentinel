@@ -26,23 +26,30 @@
   {% if selectat %}<a href="{{ url_toate }}" class="pill pill-off">toate ×</a>{% endif %}
 </div>
 
-{# Semaforul: câte sunt în fiecare culoare, în mulțimea filtrată pe categorie.
-   Gri apare MEREU, chiar cu zero — „nimic fără date" e un fapt, iar o pastilă
-   lipsă ar fi tăcere despre exact ce nu se știe. Fiecare pastilă e și filtrul. #}
+{# Semaforul: câte sunt în fiecare stare, în mulțimea filtrată pe categorie. Pastila
+   poartă NUMELE stării (cel din coloana „Risc"), nu al culorii; cuvântul culorii și numele
+   din arborele CISA sunt în `title`. Nedecis apare MEREU, chiar cu zero — „nimic nedecis"
+   e un fapt, iar o pastilă lipsă ar fi tăcere despre exact ce nu se știe. Fiecare pastilă
+   e și filtrul. #}
 <div class="statline">
   {% for c in culori %}
   <a href="{{ c.url }}" class="pill {{ 'pill-bad' if c.color == 'red' else ('pill-warn' if c.color == 'amber' else ('pill-ok' if c.color == 'green' else 'pill-off')) }}"
-     {% if c.active %}aria-current="page"{% endif %}>{{ c.emoji }} {{ c.count }} {{ c.label }}</a>
+     title="{{ c.title }}"
+     {% if c.active %}aria-current="page"{% endif %}>{{ c.emoji }} {{ c.label }} {{ c.count }}</a>
   {% endfor %}
   {% if culoare %}<a href="{{ url_toate_culorile }}" class="pill pill-off">toate culorile ×</a>{% endif %}
 </div>
 
-<p class="muted small">Culoarea e decizia <strong>CISA SSVC</strong> a fiecărei constatări (🔴 Act ·
-  🟡 Attend · 🟢 Track), din exploatare (KEV, valorile publicate de CISA), vectorul CVSS și
-  criticitatea activului — nu un prag. <strong>Singura excepție, a Sentinel și nu a SSVC:</strong>
+<p class="muted small">Culoarea e decizia <strong>CISA SSVC</strong> a fiecărei constatări
+  ({{ legenda_stari }}; „De urmărit*” e ciclul obișnuit, dar cu o privire mai deasă), din
+  exploatare (KEV, valorile publicate de CISA), vectorul CVSS și criticitatea activului —
+  nu un prag.
+  <strong>Singura excepție, a Sentinel și nu a SSVC:</strong>
   un rând galben marcat „regula Sentinel” a fost urcat acolo fiindcă EPSS ≥ 50% stă lângă o
   evaluare CISA de peste 180 de zile; SSVC singur l-ar fi lăsat mai jos.
-  <strong>⚪ Gri înseamnă că lipsesc date, nu că e în regulă.</strong> Ordinea: culoarea, apoi
+  <strong>⚪ Nedecis înseamnă că lipsesc date, nu că e în regulă.</strong>
+  <strong>KEV „nu se știe”</strong> înseamnă că {{ legenda_kev }} — nu e
+  același lucru cu „nu”. Ordinea: starea (culoarea), apoi
   probabilitate × impact; în galben, un rând decis de arborele CISA stă înaintea unuia urcat de
   regula Sentinel (decizia CISA, înaintea estimării EPSS). <strong>Presupunere:</strong>
   misiunea activului e
@@ -78,30 +85,56 @@
 {% endif %}
 
 <div class="table-scroll">
-  <table>
+  <table class="findings">
     <thead>
-      {# „Asociat cu", nu „Scaner": numele scanerului spune CUM a fost găsită
-         constatarea, nu PE CE stă. Scanerul rămâne în `title`. #}
-      <tr><th>Risc</th><th>Sev.</th><th>CVE</th><th>Titlu</th><th>Pachet</th><th>Fix</th><th>Importanță</th><th>EPSS</th><th>Asociat cu</th></tr>
+      {# Aceeași ordine și aceleași nume ca pe agregator (`panel-page.ts`): semnalele — risc,
+         severitate, CVE, CVSS, EPSS, KEV — la stânga și lângă una alta, ca să se citească
+         împreună; ce identifică rândul (pachet, fix, titlu) după ele. Titlul, singura
+         coloană care se rupe pe mai multe rânduri, stă la capăt: pe un ecran îngust ce iese
+         din pagină e el, nu KEV-ul.
+         „Asociat cu" NU mai e coloană: cu zece coloane tabelul nu mai încăpea la 1700 px
+         (măsurat în Edge: 484 px peste, deci coloana cea mai din dreapta ieșea din pagină),
+         iar o coloană pe care trebuie s-o derulezi ca s-o găsești e una pe care nu o citești.
+         Eticheta (sistem de operare, container, aplicație) a trecut pe a doua linie a
+         celulei „Titlu", singura care știe să se rupe; scanerul rămâne în `title`. Se spune
+         „Asociat cu", nu „Scaner": numele scanerului spune CUM a fost găsită constatarea, nu
+         PE CE stă. #}
+      <tr><th>Risc</th><th>Severitate</th><th>CVE</th><th>CVSS</th><th>EPSS</th><th>KEV</th><th>Pachet</th><th>Fix</th><th>Titlu</th></tr>
     </thead>
     <tbody>
     {% for r in rows %}
       <tr class="{{ 'row-bad' if r.severity in ('high','critical') or r.kev }}">
-        {# Celula „Risc": culoarea, decizia și UN motiv. Cele patru puncte de decizie,
-           cu baza fiecăruia, sunt în `title` și în /vuln <id> din bot. #}
-        <td title="{{ r.risk_view.why | join(' · ') }}"><span class="dot dot-{{ r.risk_view.dot }}"></span><strong>{{ r.risk_view.label }}</strong>{% if r.risk_view.reboot %} <span class="tag" title="Reparația e instalată, lipsește o repornire">🔁</span>{% endif %}<br><span class="muted small">{{ r.risk_view.reason }}</span></td>
-        <td><span class="dot dot-{{ r.sev_dot }}"></span> {{ r.severity }}{% if r.kev %} <span class="tag" title="Exploatat activ (CISA KEV)">🔥</span>{% endif %}</td>
-        <td class="mono nowrap">
+        {# Celula „Risc": culoarea, decizia și — numai dacă spune ceva — UN motiv scurt.
+           Explicația lungă (cele patru puncte de decizie cu baza fiecăruia, ce lipsește la
+           un gri, propoziția regulii Sentinel) e în `title` și în /vuln <id> din bot.
+           Clasa `risc` dă coloanei lățimea sub care eticheta se rupea pe șase rânduri. Culoarea
+           o poartă emoji-ul din etichetă (🔴🟡🟢⚪), același ca în Telegram și pe agregator: un punct CSS
+           alături îl dubla („● 🟡 Curând") și costa 16 px din lățimea coloanei. #}
+        <td class="risc" title="{{ r.risk_view.why | join(' · ') }}"><strong class="risc-eticheta">{{ r.risk_view.label }}</strong>{% if r.risk_view.reboot %} <span class="tag" title="Reparația e instalată, lipsește o repornire">🔁</span>{% endif %}{% if r.risk_view.reason %}<br><span class="muted small">{{ r.risk_view.reason }}</span>{% endif %}</td>
+        {# Fără 🔥 aici: KEV are acum coloana lui, lângă EPSS. #}
+        <td><span class="dot dot-{{ r.sev_dot }}"></span> {{ r.severity }}</td>
+        <td class="mono cve">
           {{ vuln.cve_cell(r.cve, rpm=(r.scanner == 'dnf'), kev=r.kev) }}
         </td>
         {# No cve_refs here: the CVE column already carries the links, and a
            second copy on the same row is noise, not redundancy. #}
-        <td>{{ r.title }}</td>
-        <td class="mono">{{ r.package or '—' }}</td>
-        <td class="mono nowrap">{{ r.fixed_version or '—' }}</td>
-        <td class="small nowrap">{{ r.risk_view.cvss }}</td>
-        <td class="small nowrap">{{ r.risk_view.epss }}</td>
-        <td class="small" title="{{ r.subject.detail }}">{{ r.subject.label }}</td>
+        <td class="small cvss">{{ r.risk_view.cvss }}</td>
+        <td class="small epss">{{ r.risk_view.epss }}</td>
+        <td class="small nowrap">{% if r.risk_view.kev_on %}<strong>{{ r.risk_view.kev }}</strong>{% else %}{{ r.risk_view.kev }}{% endif %}</td>
+        {# Pachet: același tipar ca la Fix. Un nume ca „symfony/http-foundation" se rupea la cratimă
+           („http-" / „foundation") când coloana era strânsă, iar `nowrap` pe toată celula ar fi
+           lăsat cel mai lung nume să hotărască lățimea. Fiecare segment de după „/" stă într-un
+           <span> nerupte; între ele e un <wbr>, singurul loc unde se rupe. #}
+        <td class="mono pachet">{% if r.package %}{% for parte in r.package.split('/') %}<span class="nowrap">{{ parte }}{% if not loop.last %}/{% endif %}</span>{% if not loop.last %}<wbr>{% endif %}{% endfor %}{% else %}—{% endif %}</td>
+        {# Fix: coloana se rupe ÎNTRE versiuni, niciodată în interiorul uneia. O versiune ruptă la
+           cratimă („15.6.0-" / „canary.60") se citește greșit, deci fiecare stă într-un <span>
+           nerupte; virgula rămâne lipită de a ei, iar spațiul de după ea e singurul loc unde
+           rândul se poate rupe. Pe producție 10 rânduri din 648 au peste 60 de caractere (cel
+           mai lung: 135, nouăsprezece versiuni): cu `nowrap` pe toată celula, ele hotărau lățimea
+           pentru toate. Valoarea goală sau doar virgule se arată „—", ca până acum. #}
+        {%- set versiuni = (r.fixed_version or '').split(',') | map('trim') | select | list %}
+        <td class="mono fix">{% if versiuni %}{% for v in versiuni %}<span class="nowrap">{{ v }}</span>{% if not loop.last %}, {% endif %}{% endfor %}{% else %}—{% endif %}</td>
+        <td class="titlu">{{ r.title }}<br><span class="muted small asociat" title="{{ r.subject.detail }}">{{ r.subject.label }}</span></td>
       </tr>
     {% endfor %}
     </tbody>

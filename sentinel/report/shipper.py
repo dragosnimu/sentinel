@@ -1188,6 +1188,14 @@ LOGIN_SESSION_STREAM = Stream(
 # `argv` sosește DEJA REDACTAT de la colector (`sentinel/redact.py`). Nu se
 # redactează aici: la momentul ăsta secretul ar fi deja în baza locală, în
 # backup-urile ei, și doar copia externă ar fi curată.
+#
+# `session_id` e singura coloană de aici care se schimbă DUPĂ expediere: e NULL
+# cât timp comanda a sosit înaintea sesiunii ei și se completează la logare sau
+# la ieșire (`_attach_orphans`). Rândul însă pleacă o singură dată, deci receptorul
+# primește NULL pentru totdeauna — măsurat pe 5 octombrie 2026, 53 % din replică.
+# Nu se repară aici (ar însemna o coloană `updated_at` și o migrație pe gazdă):
+# agregatorul refă legătura din `session_key` și intervalul sesiunii, vezi
+# `aggregator/lib/session-links.ts`.
 SESSION_COMMAND_STREAM = Stream(
     name="session_commands",
     table="session_commands",

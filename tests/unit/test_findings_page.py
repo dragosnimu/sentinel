@@ -78,7 +78,9 @@ def _finding(**over) -> dict:
            # Coloanele semaforului, în forma în care le selectează `list_open`
            # (0047): un rând fără ele n-ar mai fi forma reală.
            "epss_percentile": None, "risk_color": "grey", "risk_decision": None,
-           "risk_score": None, "risk": {}}
+           "risk_score": None, "risk": {},
+           # `list_open` selecționează și ziua-limită KEV (pagina o scrie în celula KEV).
+           "kev_due_date": None}
     row.update(over)
     return row
 
@@ -279,13 +281,16 @@ def test_pagina_spune_pe_ce_sta_fiecare_constatare():
     html = _page(StubDB(findings=[
         _finding(id=1, scanner="dnf", location=None, package="openssl"),
         _finding(id=2, scanner="trivy_image", location="mariadb:11.4.7", package="libxml2"),
+        # Rândul se găsește după CVE, nu după numele pachetului: „twig/twig" e scris în celulă
+        # pe segmente (`<span>twig/</span><wbr><span>twig</span>`), deci nu mai apare întreg
+        # în HTML brut — textul de pe ecran e același.
         _finding(id=3, scanner="trivy_fs", location="html/phpMyAdmin/composer.lock",
-                 package="twig/twig"),
+                 package="twig/twig", cve="CVE-2026-0003"),
     ]))
 
     assert "Sistem de operare" in _cell(html, "openssl")
     assert "Container · mariadb:11.4.7" in _cell(html, "libxml2")
-    assert "Aplicație · phpMyAdmin (composer.lock)" in _cell(html, "twig/twig")
+    assert "Aplicație · phpMyAdmin (composer.lock)" in _cell(html, "CVE-2026-0003")
 
 
 def test_scanerul_nu_se_pierde_odata_cu_coloana():

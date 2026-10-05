@@ -196,7 +196,9 @@ def test_step_row_is_written_before_the_command_runs():
 
 
 def test_failure_during_apply_triggers_rollback():
-    assert "_rollback(db, execution_id, plan, seq, reason)" in RUNNER
+    # `binding=binding`: the rollback steps are approved steps too, and a rollback
+    # the executor refuses for want of the plan binding is the worst way to find out.
+    assert re.search(r"_rollback\(db, execution_id, plan, seq, reason,\s+binding=binding\)", RUNNER)
     assert "rollback_failed" in RUNNER
 
 

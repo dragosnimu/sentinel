@@ -62,7 +62,7 @@ def test_no_evaluation_at_all_is_unknown_not_ok():
     grey. "Nothing recorded" must not read as "nothing wrong"."""
     out = _by_key(run(checks.check_risk_intel(_DB([]))))
     assert out["risk:pass"].status == "unknown"
-    assert "GRI" in out["risk:pass"].detail
+    assert "„Nedecis”" in out["risk:pass"].detail
 
 
 def test_a_healthy_pass_is_ok_and_names_the_grey_count_without_alarming():
@@ -72,7 +72,7 @@ def test_a_healthy_pass_is_ok_and_names_the_grey_count_without_alarming():
     out = _by_key(run(checks.check_risk_intel(_DB(rows))))
     assert {r.status for r in out.values()} == {"ok"}
     assert "risk:vulnrichment" in out      # the loop over sources must not skip it
-    assert "25 constatări sunt GRI" in out["risk:pass"].detail
+    assert "25 constatări sunt „Nedecis”" in out["risk:pass"].detail
     assert out["risk:pass"].facts["colors"]["grey"] == 25
 
 
@@ -100,7 +100,7 @@ def test_epss_without_a_row_is_unknown_once_the_pass_exists():
     out = _by_key(run(checks.check_risk_intel(_DB([_row("risk", 0.1)]))))
     assert out["risk:epss"].status == "unknown"
     assert "risk_score" in out["risk:epss"].detail
-    assert "GRI" not in out["risk:epss"].detail, (
+    assert "Nedecis" not in out["risk:epss"].detail, (
         "EPSS is no longer a decision point: its absence must not be reported as "
         "greying the findings, which would send the operator after the wrong cause")
 
@@ -110,7 +110,7 @@ def test_vulnrichment_without_a_row_is_unknown_once_the_pass_exists():
     one source whose silence changes the colours."""
     out = _by_key(run(checks.check_risk_intel(_DB([_row("risk", 0.1)]))))
     assert out["risk:vulnrichment"].status == "unknown"
-    assert "GRI" in out["risk:vulnrichment"].detail
+    assert "„Nedecis”" in out["risk:vulnrichment"].detail
 
 
 def test_a_blind_vulnrichment_parser_degrades_even_though_the_source_answers():

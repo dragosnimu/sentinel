@@ -577,8 +577,9 @@ async def list_open(db: Database, *, limit: int = 100, offset: int = 0,
     rows = await db.fetch(
         f"""
         SELECT f.id, f.cve, f.advisory_id, f.title, f.severity, f.cvss, f.epss,
-               f.epss_percentile, f.kev, f.priority, f.risk_color, f.risk_decision,
-               f.risk_score, f.risk, f.package, f.installed_version, f.fixed_version,
+               f.epss_percentile, f.kev, f.kev_due_date, f.priority, f.risk_color,
+               f.risk_decision, f.risk_score, f.risk, f.package, f.installed_version,
+               f.fixed_version,
                f.scanner, f.location, f.status, f.last_seen, a.name AS asset_name,
                {pending_reboot_sql("f.")} AS fix_pending_reboot
         FROM findings f LEFT JOIN assets a ON a.id = f.asset_id

@@ -139,7 +139,9 @@ def test_applying_revokes_every_other_button():
 
 
 def test_rollback_failure_is_shouted_not_summarised():
-    helper = _func(FLOW, "_approve_and_run")
+    # The text lives in `format_apply_result`; `_approve_and_run` must send exactly that.
+    assert "format_apply_result(result)" in _func(FLOW, "_approve_and_run")
+    helper = _func(FLOW, "format_apply_result")
     assert "ROLLBACK-UL A EȘUAT" in helper
     assert "restore.sh" in helper                 # and tells them the way back
 

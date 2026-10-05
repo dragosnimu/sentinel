@@ -110,16 +110,45 @@ def _clean_pending():
 
 @pytest.fixture
 def _no_approve_or_run(monkeypatch):
-    """Fails the test loudly if approve_plan or run_plan is ever reached —
-    used by every test asserting the gate BLOCKS."""
+    """Fails the test loudly if approve_plan, run_plan or even the request for the
+    operator's signature is reached — used by every test asserting the gate BLOCKS.
+    The signature request is behind the PIN too: asking the executor for a
+    challenge on behalf of someone who has not typed the PIN would hand a stolen
+    phone the next step of the approval."""
     async def _boom_approve(*a, **kw):
         raise AssertionError("approve_plan must not run before the PIN succeeds")
 
     async def _boom_run(*a, **kw):
         raise AssertionError("run_plan must not run before the PIN succeeds")
 
+    async def _boom_ask(*a, **kw):
+        raise AssertionError("the signature request must not be sent before the PIN succeeds")
+
     monkeypatch.setattr(patch_flow.patches, "approve_plan", _boom_approve)
     monkeypatch.setattr("sentinel.patch.runner.run_plan", _boom_run)
+    monkeypatch.setattr(patch_flow, "_ask_for_approval", _boom_ask)
+
+
+@pytest.fixture
+def _asked(monkeypatch):
+    """Records the request for the operator's signature, and fails if the plan is
+    approved or run without it: after the taps (and the PIN) the next thing that may
+    happen is the request to sign, never the approval itself."""
+    asked: list[tuple[int, str]] = []
+
+    async def _ask(db, cfg, edit, *, chat_id, plan_id, plan_hash, by):
+        asked.append((plan_id, plan_hash))
+
+    async def _boom_approve(*a, **kw):
+        raise AssertionError("approve_plan must not run before the operator's signature")
+
+    async def _boom_run(*a, **kw):
+        raise AssertionError("run_plan must not run before the operator's signature")
+
+    monkeypatch.setattr(patch_flow, "_ask_for_approval", _ask)
+    monkeypatch.setattr(patch_flow.patches, "approve_plan", _boom_approve)
+    monkeypatch.setattr("sentinel.patch.runner.run_plan", _boom_run)
+    return asked
 
 
 class _Stage2Second:
@@ -144,30 +173,15 @@ def _stage2_scaffolding(monkeypatch):
 
 
 # --- the gate itself ------------------------------------------------------
-def test_pin_disabled_applies_exactly_as_before(monkeypatch, _stage2_scaffolding):
-    """The control: with the option off, nothing about this fix changes the
-    existing (already-tested) apply path."""
-    called = {}
-
-    async def _approve(db, plan_id, *, by, expected_hash):
-        called["approve"] = (plan_id, expected_hash)
-        return True
-
-    async def _revoke(*a, **kw):
-        called["revoked"] = True
-
-    async def _run_plan(db, cfg, plan_id, *, mode, triggered_by):
-        return SimpleNamespace(status="succeeded", execution_id=1, error=None, steps=[])
-
-    monkeypatch.setattr(patch_flow.patches, "approve_plan", _approve)
-    monkeypatch.setattr(patch_flow.approvals, "revoke_for_plan", _revoke)
-    monkeypatch.setattr("sentinel.patch.runner.run_plan", _run_plan)
-
+def test_pin_disabled_goes_straight_to_the_request_for_a_signature(
+        monkeypatch, _stage2_scaffolding, _asked):
+    """The control: with the option off, the second tap goes on to the request for
+    the operator's signature - and stops there. It does not approve and it does not
+    run; those need the signed token (`on_approval_reply`)."""
     update = _FakeUpdate(chat_id=1, with_callback_query=True)
     run(patch_flow.on_stage2(update, _second_tap_context(_cfg(False)), "tok"))
 
-    assert called.get("approve") == (42, "abc123")
-    assert called.get("revoked") is True
+    assert _asked == [(42, "abc123")]
     assert 1 not in patch_flow._pending_pins
 
 
@@ -202,23 +216,7 @@ def test_pin_required_stages_a_wait_and_does_not_apply_yet(
     assert any("PIN" in m for m in update.callback_query.edits)
 
 
-def test_correct_pin_reply_applies_the_plan(monkeypatch):
-    called = {}
-
-    async def _approve(db, plan_id, *, by, expected_hash):
-        called["approve"] = (plan_id, expected_hash, by)
-        return True
-
-    async def _revoke(*a, **kw):
-        called["revoked"] = True
-
-    async def _run_plan(db, cfg, plan_id, *, mode, triggered_by):
-        called["ran"] = (plan_id, mode)
-        return SimpleNamespace(status="succeeded", execution_id=9, error=None, steps=[])
-
-    monkeypatch.setattr(patch_flow.patches, "approve_plan", _approve)
-    monkeypatch.setattr(patch_flow.approvals, "revoke_for_plan", _revoke)
-    monkeypatch.setattr("sentinel.patch.runner.run_plan", _run_plan)
+def test_correct_pin_reply_goes_on_to_the_request_for_a_signature(monkeypatch, _asked):
     monkeypatch.setattr("sentinel.config.get_secrets", lambda: _FakeSecrets("13579"))
 
     import time
@@ -231,8 +229,7 @@ def test_correct_pin_reply_applies_the_plan(monkeypatch):
     handled = run(patch_flow.on_pin_reply(update, context))
 
     assert handled is True
-    assert called["approve"] == (99, "deadbeef", "telegram:4")
-    assert called["ran"] == (99, "apply")
+    assert _asked == [(99, "deadbeef")]
     assert 4 not in patch_flow._pending_pins
 
 
@@ -381,25 +378,10 @@ def test_pin_reply_refuses_if_the_configured_pin_disappeared_since_the_prompt(
     assert patch_flow._pending_pins[13].attempts == 1
 
 
-def test_a_non_ascii_configured_pin_can_still_be_matched(monkeypatch):
+def test_a_non_ascii_configured_pin_can_still_be_matched(monkeypatch, _asked):
     """The other direction: `TELEGRAM_APPLY_PIN` itself containing a
     diacritic ("parolă") must be a real, matchable secret, not a value that
     can never compare equal to anything once encoding is involved."""
-    called = {}
-
-    async def _approve(db, plan_id, *, by, expected_hash):
-        called["approve"] = True
-        return True
-
-    async def _revoke(*a, **kw):
-        pass
-
-    async def _run_plan(db, cfg, plan_id, *, mode, triggered_by):
-        return SimpleNamespace(status="succeeded", execution_id=1, error=None, steps=[])
-
-    monkeypatch.setattr(patch_flow.patches, "approve_plan", _approve)
-    monkeypatch.setattr(patch_flow.approvals, "revoke_for_plan", _revoke)
-    monkeypatch.setattr("sentinel.patch.runner.run_plan", _run_plan)
     monkeypatch.setattr("sentinel.config.get_secrets", lambda: _FakeSecrets("parolă"))
 
     import time
@@ -412,7 +394,7 @@ def test_a_non_ascii_configured_pin_can_still_be_matched(monkeypatch):
     handled = run(patch_flow.on_pin_reply(update, context))
 
     assert handled is True
-    assert called.get("approve") is True
+    assert _asked == [(1, "x")], "the right PIN must lead on to the request for a signature"
     assert 12 not in patch_flow._pending_pins
 
 

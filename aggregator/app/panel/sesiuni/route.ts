@@ -4,9 +4,9 @@
  * Pagină fără corespondent în panoul serverului: acolo istoricul se citește
  * direct din bază, aici e replica lui. Doar citire, ca tot panoul.
  *
- * `?sesiune=<source_id>` deschide comenzile unei sesiuni; `?toate=1` arată și
- * sesiunile de automatizare, care sunt de douăzeci de ori mai multe decât cele
- * de om.
+ * `?sesiune=<source_id>` deschide comenzile unei sesiuni, `&pagina=<n>` alege
+ * pagina (500 de comenzi pe pagină); `?toate=1` arată și sesiunile de
+ * automatizare, care sunt de douăzeci de ori mai multe decât cele de om.
  */
 
 import { authContext, guarded } from "@/lib/auth/context";
@@ -38,9 +38,13 @@ export async function GET(req: Request): Promise<Response> {
     // `Number.parseInt` și nu `Number`: un `?sesiune=abc` trebuie să dea `NaN`,
     // nu `0`, iar `0` ar fi un identificator care s-ar putea căuta.
     const cerut = Number.parseInt(url.searchParams.get("sesiune") ?? "", 10);
+    // Pagina inventată sau lipsă nu dă eroare: `sessionDetail` o aduce la una
+    // care există. O legătură pusă la favorite pe pagina 45 a unei sesiuni
+    // care între timp a fost tăiată trebuie să ducă undeva, nu la un ecran gol.
+    const pagina = Number.parseInt(url.searchParams.get("pagina") ?? "", 10);
 
     const detail = (only !== null && Number.isSafeInteger(cerut) && cerut > 0)
-      ? await sessionDetail(db, scope, only, cerut)
+      ? await sessionDetail(db, scope, only, cerut, pagina)
       : null;
 
     return htmlResponse(sessionsPage({

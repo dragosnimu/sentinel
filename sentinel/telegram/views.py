@@ -140,8 +140,12 @@ async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"Atacatori unici: {kpi['atacatori_24h']:,}{_delta(deltas, 'atacatori')}",
         f"Incidente deschise: <b>{kpi['incidente_deschise']}</b> "
         f"(grave: {kpi['incidente_grave']})",
-        f"Vulnerabilități: {kpi['vuln_deschise']} deschise · 🔴 {kpi['vuln_rosii']} · "
-        f"🟡 {kpi['vuln_galbene']} · ⚪ {kpi['vuln_gri']} fără date · "
+        # Numele STĂRILOR (`risk_view.COLOR_STATE_RO`), nu „fără date": același cuvânt ca pe
+        # rândul din listă și în panou. Nedecis apare mereu, chiar cu zero.
+        f"Vulnerabilități: {kpi['vuln_deschise']} deschise · "
+        f"🔴 {risk_view.COLOR_STATE_RO['red']} {kpi['vuln_rosii']} · "
+        f"🟡 {risk_view.COLOR_STATE_RO['amber']} {kpi['vuln_galbene']} · "
+        f"⚪ {risk_view.COLOR_STATE_RO['grey']} {kpi['vuln_gri']} · "
         f"🔥 {kpi['vuln_kev']} KEV",
         f"IP-uri blocate: {kpi['blocate']}",
         f"Servicii: 🟢 {health.get('up', 0)} · 🔴 {health.get('down', 0)} · "
@@ -217,10 +221,16 @@ MAX_SUBJECT_DETAIL = 120
 #: dedesubt rămâne goală cu antetul spunând cinstit „0 afișate".
 MAX_FIELD_LIST = 56
 
-#: Cât din motivul culorii („KEV", „EPSS 92,0% 🔁", „fără EPSS") intră pe un rând.
-#: Vine dintr-un vocabular închis (`risk_view.one_liner`), deci e scurt prin
+#: Cât din motivul culorii („exploatat activ (KEV)", „EPSS 92,0% 🔁", „fără EPSS") intră
+#: pe un rând. Vine dintr-un vocabular închis (`risk_view.one_liner`), deci e scurt prin
 #: construcție; plafonul e pentru ziua în care cineva îi adaugă o ramură nouă.
-MAX_REASON_LIST = 24
+#:
+#: 32, nu 24: un rând de listă n-are eticheta de deasupra, deci motivul unui galben al
+#: regulii Sentinel își poartă singur marcajul — „regula Sentinel · EPSS 100,0% 🔁" are 31
+#: de caractere în cel mai lung caz (EPSS rotunjit la 100,0%), iar marcajul tăiat la
+#: mijloc („regula Sent") e mai rău decât niciunul. Testul din `test_risk_view.py` măsoară
+#: cazul acela, nu o presupunere.
+MAX_REASON_LIST = 32
 
 #: Cât din identificatorul CVE intră pe un rând. Al patrulea câmp netrusted de
 #: pe rândul ăla, și singurul rămas nemărginit: `cve_html` cade pe
@@ -282,15 +292,19 @@ FILTER_WORDS: tuple[str, ...] = ("kev", "rosii", "galbene", "gri", "verzi", "cri
 
 #: Cuvintele de culoare, în felul în care le tastează operatorul (cu și fără
 #: diacritice: un argument e text liber, nu un nume de comandă — doar numele
-#: comenzilor din `CommandHandler` trebuie să rămână ASCII).
-_COLOR_ARGS: dict[str, tuple[str, str]] = {
-    "rosii": ("red", "roșii"), "roșii": ("red", "roșii"), "rosu": ("red", "roșii"),
-    "roșu": ("red", "roșii"), "red": ("red", "roșii"),
-    "galbene": ("amber", "galbene"), "galben": ("amber", "galbene"),
-    "amber": ("amber", "galbene"),
-    "gri": ("grey", "fără date (gri)"), "grey": ("grey", "fără date (gri)"),
-    "gray": ("grey", "fără date (gri)"),
-    "verzi": ("green", "verzi"), "verde": ("green", "verzi"), "green": ("green", "verzi"),
+#: comenzilor din `CommandHandler` trebuie să rămână ASCII), plus numele stărilor, ca
+#: ce vezi pe ecran să se poată și tasta. Cuvântul de culoare e ARGUMENTUL filtrului; ce se
+#: scrie în antetul listei e numele stării (`risk_view.COLOR_STATE_RO`), niciodată
+#: cuvântul tastat. Verdele n-are nume de stare tastabil: grupa lui are două („Ciclul
+#: obișnuit" și „De urmărit*").
+_COLOR_ARGS: dict[str, str] = {
+    "rosii": "red", "roșii": "red", "rosu": "red", "roșu": "red", "red": "red",
+    "acum": "red",
+    "galbene": "amber", "galben": "amber", "amber": "amber",
+    "curand": "amber", "curând": "amber",
+    "gri": "grey", "grey": "grey", "gray": "grey",
+    "nedecis": "grey", "nedecise": "grey",
+    "verzi": "green", "verde": "green", "green": "green",
 }
 
 _KIND_ARGS: dict[str, str] = {
@@ -316,8 +330,9 @@ def parse_vuln_filter(arg: str) -> VulnFilter:
         return VulnFilter("Vulnerabilități exploatate activ (KEV)",
                           "deschise exploatate activ", kev_only=True)
     if a in _COLOR_ARGS:
-        color, label = _COLOR_ARGS[a]
-        return VulnFilter(f"Vulnerabilități {label}", f"deschise {label}",
+        color = _COLOR_ARGS[a]
+        state = risk_view.COLOR_STATE_RO[color]
+        return VulnFilter(f"Vulnerabilități · {state}", f"deschise în „{state}”",
                           colors=(color,))
     if a in ("critice", "critical"):
         return VulnFilter("Vulnerabilități critice", "critice deschise",
@@ -530,7 +545,10 @@ async def cmd_vulns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ])
 
     tail = ("\n/vuln &lt;id&gt; · /planifica &lt;id&gt; pentru un plan"
-            "\n🔴 Act · 🟡 Attend · ⚪ fără date · 🟢 Track (CISA SSVC)"
+            # Din aceleași etichete pe care le scrie `headline` (`risk_view.legend_states`):
+            # rândul de listă poartă doar punctul colorat, iar legenda e singurul loc unde
+            # operatorul îi află numele — scrisă de mână, s-a abătut o dată de la ele.
+            f"\n{risk_view.legend_states()} — decizia CISA SSVC"
             + ("\n🟡 „regula Sentinel” = urcat de o regulă a Sentinel (EPSS mare lângă o "
                "evaluare CISA veche), nu de SSVC și nu de FIRST"
                if any(risk_view.overlay_of(_risk_dict(r.get("risk")), "amber") is not None
@@ -763,7 +781,17 @@ def _looks_like_ip(value: str) -> bool:
 # ---------------------------------------------------------------------------
 # /help
 # ---------------------------------------------------------------------------
-HELP = """🛡️ <b>Sentinel — comenzi</b>
+#: „rosii = Acum, galbene = Curând, …" din /ajutor: cuvântul de culoare pe care îl tastezi și starea
+#: pe care o aduce, luate din ACELEAȘI tabele pe care le citește `parse_vuln_filter`
+#: (`_COLOR_ARGS`, `risk_view.COLOR_STATE_RO`). Scrisă de mână, s-a abătut o dată de la
+#: etichetele rândurilor, iar /ajutor e locul unde operatorul învață ce înseamnă cuvântul.
+_VULN_HELP_STATES = ", ".join(
+    f"{word} = {risk_view.COLOR_STATE_RO[_COLOR_ARGS[word]]}"
+    for word in FILTER_WORDS if word in _COLOR_ARGS)
+
+# `HELP` e un f-string (numai pentru `_VULN_HELP_STATES`): o acoladă literală nouă aici ar
+# trebui dublată, altfel modulul nu se mai importă și botul nu mai pornește.
+HELP = f"""🛡️ <b>Sentinel — comenzi</b>
 
 <b>Privire de ansamblu</b>
 /dashboard — verdict, cifre, observații, top atacatori
@@ -777,7 +805,7 @@ HELP = """🛡️ <b>Sentinel — comenzi</b>
 /rezolva &lt;id&gt; · /fp &lt;id&gt; — închide, sau marchează fals-pozitiv
 
 <b>Vulnerabilități</b>
-/vulnerabilitati [kev|rosii|galbene|gri|verzi|critice|mari|sistem|container|aplicatie|necunoscut] — findings deschise, după semaforul CISA SSVC
+/vulnerabilitati [kev|rosii|galbene|gri|verzi|critice|mari|sistem|container|aplicatie|necunoscut] — findings deschise, după semaforul CISA SSVC ({_VULN_HELP_STATES})
 /vuln &lt;id&gt; — detaliu, cu legături către NVD și Red Hat
 
 <b>Patch-uri</b>

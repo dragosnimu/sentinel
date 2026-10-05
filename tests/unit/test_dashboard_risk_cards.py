@@ -27,16 +27,18 @@ def _kpi(**over):
     return base
 
 
-def test_the_dashboard_card_says_red_amber_and_grey_and_always_the_grey():
+def test_the_dashboard_card_names_the_states_and_always_the_undecided_one():
     html = _env().get_template("dashboard.html").render(**_context(
         kpi=_kpi(vuln_rosii=1, vuln_galbene=3, vuln_gri=27, vuln_kev=2)))
     note = " ".join(_card(html).split())
-    assert note == "1 roșii · 3 galbene · 27 fără date · 2 KEV", note
+    # The state NAMES (Acum, Curând, Nedecis) — the words the row and the pill of the
+    # vulnerabilities page use — not the colours' names and not "fără date".
+    assert note == "Acum 1 · Curând 3 · Nedecis 27 · 2 KEV", note
 
 
 def test_grey_is_stated_even_when_it_is_zero():
     html = _env().get_template("dashboard.html").render(**_context(kpi=_kpi()))
-    assert "0 fără date" in _card(html)
+    assert "Nedecis 0" in _card(html)
 
 
 def test_the_dashboard_card_turns_bad_on_a_red_even_without_kev():
@@ -55,9 +57,9 @@ def test_the_report_card_and_its_list_carry_the_colours(stub):  # noqa: F811
     with _client(stub) as c:
         body = c.get("/reports").text
     card = _kpi_cards(body)["Vulnerabilități deschise"]
-    assert "1 roșii · 2 galbene" in " ".join(card.split())
-    assert "1 fără date" in " ".join(card.split())
+    assert "Acum 1 · Curând 2 · Nedecis 1" in " ".join(card.split())
     # the stub row says kev=1 -> the card keeps saying KEV, next to the colours
     assert "1 KEV" in " ".join(card.split())
-    assert "🔴 Roșii (Act)" in body and "🟡 Galbene (Attend)" in body
-    assert "⚪ Fără date (gri)" in body
+    assert "🔴 Acum (Act)" in body and "🟡 Curând (Attend)" in body
+    assert "⚪ Nedecis" in body
+    assert "Roșii" not in body and "Fără date (gri)" not in body

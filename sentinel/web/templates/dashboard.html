@@ -78,10 +78,11 @@
   <div class="kpi {{ 'kpi-bad' if (kpi.vuln_rosii or kpi.vuln_kev) else ('kpi-warn' if kpi.vuln_galbene else ('kpi-ok' if not kpi.vuln_deschise)) }}">
     <div class="kpi-head"><span class="kpi-label">Vulnerabilități</span></div>
     <div class="kpi-main"><span class="kpi-value">{{ kpi.vuln_deschise }}</span></div>
-    {# Semaforul SSVC: roșii (Act), galbene (Attend), FĂRĂ DATE. Verdele e restul.
-       „Fără date" apare mereu, chiar cu zero: nu înseamnă „în regulă". #}
+    {# Semaforul SSVC, cu numele STĂRILOR (Acum, Curând, Nedecis), aceleași ca pe pastilele și
+       rândurile paginii „Vulnerabilități". Verdele e restul. „Nedecis" apare mereu, chiar cu
+       zero: nu înseamnă „în regulă". #}
     <span class="kpi-note">
-      {{ kpi.vuln_rosii }} roșii · {{ kpi.vuln_galbene }} galbene · {{ kpi.vuln_gri }} fără date
+      {{ state_counts(kpi.vuln_rosii, kpi.vuln_galbene, kpi.vuln_gri) }}
       {%- if kpi.vuln_kev %} · {{ kpi.vuln_kev }} KEV{% endif -%}
     </span>
   </div>

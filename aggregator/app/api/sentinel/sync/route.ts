@@ -117,6 +117,7 @@ import {
 } from "@/lib/ingest";
 import { verifyAfterIngest } from "@/lib/chain";
 import { applyPrune, checkPruneList } from "@/lib/prune";
+import { relinkAfterIngest } from "@/lib/session-links";
 import { SchemaGuardError } from "@/lib/schema-guard";
 import { SIGNATURE_HEADER, signatureValid } from "@/lib/signature";
 import { knownStreamNames, streamFor } from "@/lib/streams";
@@ -236,6 +237,17 @@ async function readBody(req: Request): Promise<Buffer | "too-large"> {
     chunks.push(Buffer.from(value));
   }
   return Buffer.concat(chunks);
+}
+
+/** `id`-urile dintr-o listă de rânduri deja acceptate de ingestie. */
+function sourceIds(list: unknown): number[] {
+  if (!Array.isArray(list)) return [];
+  const out: number[] = [];
+  for (const row of list) {
+    const id = (row as { id?: unknown } | null)?.id;
+    if (typeof id === "number" && Number.isSafeInteger(id) && id > 0) out.push(id);
+  }
+  return out;
 }
 
 export async function POST(req: Request) {
@@ -481,6 +493,37 @@ export async function POST(req: Request) {
       continue;
     }
     problems.push({ stream: name, kind: result.kind, detail: result.detail });
+  }
+
+  // Legătura comenzilor de sesiunile lor, DUPĂ ce rândurile sunt stocate.
+  //
+  // Gazda scrie `session_id` NULL pe o comandă care sosește înaintea sesiunii ei
+  // și îl completează mai târziu, dar fluxul `session_commands` e append-only:
+  // rândul pleacă o dată, cu NULL. Fără pasul ăsta, 53 % din comenzile replicii
+  // n-aveau sesiune (măsurat pe 5 octombrie 2026), iar detaliul unei sesiuni nu
+  // le putea arăta. Vezi `lib/session-links.ts`.
+  //
+  // Într-un `try` propriu, ca pasul de lanț de mai jos: rândurile sunt deja în
+  // arhivă, iar legătura se poate reface (`bin/relink-session-commands.ts`), deci
+  // o eroare aici nu are voie să anuleze ecoul unui lot valid — dar nici să
+  // treacă tăcută.
+  if (accepted.login_sessions !== undefined || accepted.session_commands !== undefined) {
+    try {
+      const report = await relinkAfterIngest(db, instanceId, {
+        sessionIds: accepted.login_sessions !== undefined
+          ? sourceIds(rows.login_sessions) : [],
+        commandIds: accepted.session_commands !== undefined
+          ? sourceIds(rows.session_commands) : [],
+      });
+      if (report.ambiguous.length > 0) {
+        console.warn(`[aggregator] ${instanceId}: ${report.ambiguous.length} sesiuni ` +
+                     "cu aceeași cheie și intervale suprapuse; comenzile lor " +
+                     `rămân nelegate (${report.ambiguous.slice(0, 10).join(", ")})`);
+      }
+    } catch (err) {
+      console.error(`[aggregator] lot preluat, dar comenzile n-au putut fi legate de ` +
+                    `sesiuni pentru ${instanceId}: ${(err as Error).message}`);
+    }
   }
 
   // Verificarea lanțului, DUPĂ ce rândurile sunt dovedit stocate și ÎNAINTE de

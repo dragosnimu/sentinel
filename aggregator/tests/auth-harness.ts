@@ -952,19 +952,27 @@ export class FakeAuthDb implements AuthDb, Pool {
     // `LIMIT ?` se leagă ULTIMUL, după parametrii lui `WHERE` — ordinea în care
     // driverul consumă lista. Se taie de la coadă înainte de orice altceva.
     let limit: number | null = null;
+    let offset = 0;
     let whereParams = params;
-    const limitAt = /\s+LIMIT (\?|\d+)$/.exec(tail);
+    // `LIMIT ? OFFSET ?` — paginarea comenzilor unei sesiuni. Parametrii se
+    // leagă în ordinea textului, deci OFFSET e ultimul din listă, iar LIMIT cel
+    // dinaintea lui: se scot de la coadă în ordinea inversă a citirii.
+    const limitAt = /\s+LIMIT (\?|\d+)(?: OFFSET (\?|\d+))?$/.exec(tail);
     if (limitAt) {
       tail = tail.slice(0, limitAt.index);
-      if (limitAt[1] === "?") {
-        assert.ok(params.length >= 1, "dublul: `LIMIT ?` fără niciun parametru");
-        limit = Number(params[params.length - 1]);
-        whereParams = params.slice(0, -1);
-      } else {
-        limit = Number(limitAt[1]);
-      }
+      const take = (part: string): number => {
+        if (part !== "?") return Number(part);
+        assert.ok(whereParams.length >= 1, "dublul: `LIMIT ?`/`OFFSET ?` fără parametru");
+        const value = Number(whereParams[whereParams.length - 1]);
+        whereParams = whereParams.slice(0, -1);
+        return value;
+      };
+      if (limitAt[2] !== undefined) offset = take(limitAt[2]);
+      limit = take(limitAt[1]);
       assert.ok(Number.isSafeInteger(limit) && limit >= 0,
                 `dublul: LIMIT cu o valoare care nu e un întreg (${String(limit)})`);
+      assert.ok(Number.isSafeInteger(offset) && offset >= 0,
+                `dublul: OFFSET cu o valoare care nu e un întreg (${String(offset)})`);
     }
 
     let order: string | null = null;
@@ -1010,7 +1018,7 @@ export class FakeAuthDb implements AuthDb, Pool {
         (row) => evalWhere(where, row, { params: whereParams, at: 0 }, this.nowMs));
 
     if (order !== null) rows = sortRows(rows, order, orderParams);
-    if (limit !== null) rows = rows.slice(0, limit);
+    if (limit !== null) rows = rows.slice(offset, offset + limit);
 
     // `SELECT <coloana>, COUNT(*) AS n ... GROUP BY <coloana>` — agregarea pe
     // care o face `countByGroup`. Modelata AICI, nu ocolita: codul livrat chiar

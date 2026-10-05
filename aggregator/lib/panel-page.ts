@@ -52,7 +52,9 @@ import type { Arrival } from "./data/arrivals";
 import type { BlockSummary } from "./data/blocklist";
 import type { DetectionSummary } from "./data/detections";
 import type { FindingSummary } from "./data/findings";
-import { COLORS, COLOR_LABEL_RO } from "./finding-risk";
+import {
+  COLORS, COLOR_STATE_RO, KEV_UNKNOWN_NOTE_RO, countsRo, legendStates, pillTitle,
+} from "./finding-risk";
 import { GROUPS } from "./finding-groups";
 import type { RiskColor } from "./finding-risk";
 import type { PlanSummary } from "./data/patch-plans";
@@ -331,15 +333,16 @@ function card(eticheta: string, valoare: string, sub: string, cls = ""): string 
 }
 
 /**
- * Sub-linia cardului de vulnerabilități: câte sunt roșii, galbene și FĂRĂ DATE.
+ * Sub-linia cardului de vulnerabilități: câte sunt Acum, Curând și Nedecis — numele
+ * stărilor, aceleași ca pe pastile și pe rânduri (`countsRo`), nu numele culorilor.
  *
- * Gri apare mereu, ca și pe pagina serverului: „0 fără date" e un fapt, iar un
- * card care ar tăcea despre gri ar arăta curat tocmai când nu se știe. Verdele nu
+ * Nedecis apare mereu, ca și pe pagina serverului: „Nedecis 0" e un fapt, iar un
+ * card care ar tăcea despre el ar arăta curat tocmai când nu se știe. Verdele nu
  * se enumeră: e restul, adică „ciclul obișnuit de actualizare".
  */
 function findingsCardSub(o: Summary["overview"]): string {
   const c = o.findingsByColor;
-  return `${c.red} roșii · ${c.amber} galbene · ${c.grey} fără date`;
+  return countsRo(c.red, c.amber, c.grey);
 }
 
 function cards(s: Summary): string {
@@ -825,9 +828,11 @@ function groupFilters(view: FindingsView): string {
 }
 
 /**
- * Filtrele de culoare, ca LEGĂTURI, cu numărul fiecăreia — roșu, galben, gri,
- * verde, în ordinea listei. Gri apare MEREU, chiar cu zero: „nimic fără date" e
- * un fapt, iar o pastilă lipsă ar fi tăcere despre exact ce nu se știe.
+ * Filtrele de culoare, ca LEGĂTURI, cu numărul fiecăreia, în ordinea listei: roșu,
+ * galben, gri, verde — dar pastila poartă NUMELE STĂRII (Acum, Curând, Nedecis, Ciclul
+ * obișnuit / De urmărit*), același cu cel al rândurilor pe care le aduce; cuvântul culorii
+ * și numele din arborele CISA stau în `title`. Nedecis apare MEREU, chiar cu zero: „nimic
+ * nedecis" e un fapt, iar o pastilă lipsă ar fi tăcere despre exact ce nu se știe.
  *
  * Numără doar constatările NEAPLICATE (culoarea nu se calculează pentru cele
  * rezolvate), iar o pastilă restrânge lista la grupa „neaplicate": nu poartă
@@ -850,8 +855,8 @@ function colorFilters(view: FindingsView): string {
   for (const color of COLORS) {
     const href = `${base}${keepGroup}${joiner}culoare=${color}`;
     const here = view.color === color ? ' class="aici" aria-current="page"' : "";
-    parts.push(`<a href="${href}"${here}>${glyphs[color]} ` +
-               `${escapeHtml(COLOR_LABEL_RO[color])} ` +
+    parts.push(`<a href="${href}" title="${escapeHtml(pillTitle(color))}"${here}>` +
+               `${glyphs[color]} ${escapeHtml(COLOR_STATE_RO[color])} ` +
                `<span class="nr">${view.colors[color]}</span></a>\n`);
   }
   parts.push("</nav>\n");
@@ -862,24 +867,44 @@ function colorFilters(view: FindingsView): string {
 const OPEN_STATUSES: ReadonlySet<string> = new Set(GROUPS.neaplicate);
 
 /**
- * Celula „Risc": culoarea, decizia, și UN motiv.
+ * Celula „Risc": culoarea, decizia, și — numai dacă spune ceva — UN motiv scurt.
  *
  * Agregatorul vede mai multe servere, așa că aici stă doar ce trebuie ca să
- * decizi unde te uiți mai departe: de ce e culoarea asta într-o linie („KEV",
- * „CISA: exploatat", „fără date CISA"). Cele patru puncte de decizie, cu sursa fiecăruia
- * și justificarea furnizorului, rămân pe serverul însuși și în bot.
+ * decizi unde te uiți mai departe: de ce e culoarea asta într-o linie („exploatat
+ * activ (KEV)", „EPSS 99,2%, CISA veche", „fără CVE"). Ce nu încape într-o celulă — ce
+ * lipsește la un gri, a cui e decizia — e în `title`; cele patru puncte de decizie, cu
+ * sursa fiecăruia și justificarea furnizorului, rămân pe serverul însuși și în bot.
+ *
+ * Semnul 🔁 (reparația e instalată, lipsește o repornire) vine din `rebootPending`, ca pe
+ * serverul însuși: motivul nu-l mai poartă, iar un verde cu EPSS mic n-are motiv deloc.
  */
 function riskCell(f: FindingSummary): string {
   // O constatare închisă nu mai e evaluată pe server: culoarea ei e cea implicită
-  // (gri) sau una veche, iar a o desena ar spune „fără date" despre ceva rezolvat.
+  // (gri) sau una veche, iar a o desena ar spune „Nedecis" despre ceva rezolvat.
   if (!OPEN_STATUSES.has(f.status)) {
     return `<td><span class="id">— (${escapeHtml(f.status)})</span></td>`;
   }
   const r = f.risk;
   const strong = r.color === "red" || r.color === "amber";
-  const head = strong ? `<strong>${escapeHtml(r.headline)}</strong>` : escapeHtml(r.headline);
-  const why = r.greyReason ?? r.oneLiner;
-  return `<td>${head}<br><span class="id">${escapeHtml(why)}</span></td>`;
+  const label = `<span class="risc-eticheta">${escapeHtml(r.headline)}</span>`;
+  const head = strong ? `<strong>${label}</strong>` : label;
+  const reboot = r.rebootPending
+    ? ' <span title="Reparația e instalată, lipsește o repornire">🔁</span>' : "";
+  const why = r.greyReason ?? r.reason;
+  const title = r.detail === null ? "" : ` title="${escapeHtml(r.detail)}"`;
+  return `<td class="risc"${title}>${head}${reboot}` +
+         (why === null ? "" : `<br><span class="id">${escapeHtml(why)}</span>`) + "</td>";
+}
+
+/**
+ * Celula KEV. Un rând rezolvat sau închis nu mai e evaluat de server: `risk` îi e cel
+ * vechi sau gol, deci „nu se știe" ar fi scris pe fiecare dintre cele ~6.700 de rânduri
+ * rezolvate o neîncredere care nu mai întreabă pe nimeni. Un rând aflat în catalog rămâne
+ * „da" oricare ar fi starea lui.
+ */
+function kevCell(f: FindingSummary): string {
+  if (f.kev) return `<strong>${escapeHtml(f.risk.kev)}</strong>`;
+  return OPEN_STATUSES.has(f.status) ? escapeHtml(f.risk.kev) : "—";
 }
 
 export function findingsPage(view: FindingsView): string {
@@ -888,32 +913,36 @@ export function findingsPage(view: FindingsView): string {
     // Ordinea e a serverului, și se spune: cine se uită la o listă sortată
     // altfel decât crede trage concluzii greșite despre ce e urgent.
     '<p class="nota">Culoarea e decizia CISA SSVC calculată pe serverul fiecărui ' +
-    "rând (roșu = Act, galben = Attend, verde = Track), din exploatare " +
+    `rând (${legendStates()}; „De urmărit*” e ciclul obișnuit, dar cu o privire mai deasă), ` +
+    "din exploatare " +
     "(KEV, valorile publicate de CISA), vector CVSS și criticitatea activului — nu un prag. " +
     "<strong>Singura excepție, a Sentinel și nu a SSVC:</strong> un rând galben marcat " +
     "„regula Sentinel” a fost urcat acolo fiindcă EPSS ≥ 50% stă lângă o evaluare CISA de " +
     "peste 180 de zile; SSVC singur l-ar fi lăsat mai jos. " +
-    "<strong>Gri înseamnă că lipsesc date, nu că e în regulă.</strong> Neaplicatele primele, apoi " +
-    "ordonate după culoare, apoi după probabilitate × impact; în galben, un rând decis de " +
+    "<strong>⚪ Nedecis înseamnă că lipsesc date, nu că e în regulă.</strong> " +
+    `<strong>KEV „nu se știe”</strong> înseamnă că ${KEV_UNKNOWN_NOTE_RO} — ` +
+    "nu e același lucru cu „nu”. Neaplicatele primele, apoi " +
+    "ordonate după stare (culoare), apoi după probabilitate × impact; în galben, un rând decis de " +
     "arborele CISA stă înaintea unuia urcat de regula Sentinel (decizia CISA, înaintea " +
     "estimării EPSS). Replica nu recalculează " +
     "nimic și nu amestecă serverele: culoarea unui rând e verdictul gazdei lui.</p>\n" +
     absent("findings", view.arrivals) +
     table(
-      "<th>Risc</th><th>Severitate</th><th>CVE</th><th>Pachet</th><th>Fix</th>" +
-      "<th>Importanță</th><th>EPSS</th><th>KEV</th><th>Stare</th>",
+      // Aceeași ordine și aceleași nume ca în panoul serverului (`findings.html`): semnalele
+      // — risc, severitate, CVE, CVSS, EPSS, KEV — la stânga, una lângă alta, ca să se
+      // citească împreună; ce identifică rândul (pachet, fix) după ele.
+      "<th>Risc</th><th>Severitate</th><th>CVE</th><th>CVSS</th><th>EPSS</th><th>KEV</th>" +
+      "<th>Pachet</th><th>Fix</th><th>Stare</th>",
       view.findings.map((f) =>
         "<tr>" + riskCell(f) + severityCell(f.severity) +
         `<td>${escapeHtml(f.cve ?? "—")}<br>` +
         `<span class="id">${escapeHtml(f.scanner)}</span></td>` +
+        `<td class="nr">${escapeHtml(f.risk.cvss)}</td>` +
+        `<td class="nr">${escapeHtml(f.risk.epss)}</td>` +
+        `<td>${kevCell(f)}</td>` +
         `<td>${escapeHtml(f.packageName ?? "—")}<br>` +
         `<span class="id">${escapeHtml(f.installedVersion ?? "—")}</span></td>` +
         `<td>${escapeHtml(f.fixedVersion ?? "—")}</td>` +
-        `<td class="nr">${escapeHtml(f.risk.cvss)}</td>` +
-        `<td class="nr">${escapeHtml(f.risk.epss)}</td>` +
-        `<td>${f.kev
-          ? `<strong>da</strong>${f.kevDueDate ? ` — ${escapeHtml(f.kevDueDate)}` : ""}`
-          : "nu"}</td>` +
         `<td>${escapeHtml(f.status)}</td></tr>\n`),
       "nicio constatare"));
 }
@@ -1044,7 +1073,11 @@ export function sessionsPage(view: SessionsView): string {
         `<td><code>${escapeHtml(s.srcIp ?? "local")}</code></td>` +
         `<td><code>${escapeHtml(s.terminal ?? "—")}</code></td>` +
         `<td>${escapeHtml(durata(s))}</td>` +
-        `<td class="nr">${s.commandCount}</td>` +
+        // Contorul e CHIAR legătura spre comenzi: până pe 5 octombrie 2026 era
+        // text, iar singura cale spre detaliu era data deschiderii — pe care
+        // nimic nu o arăta ca pe un buton.
+        `<td class="nr"><a href="${escapeHtml(href)}" ` +
+        `title="Arată comenzile sesiunii">${s.commandCount}</a></td>` +
         `<td class="nr">${s.sudoCount}</td></tr>\n`;
     }),
     view.showingAll ? "nicio sesiune" : "nicio sesiune cu terminal"));
@@ -1054,12 +1087,37 @@ export function sessionsPage(view: SessionsView): string {
                + "vechi, netăiate din bază.</p>\n");
   }
 
-  if (view.detail !== null) parts.push(sessionCommands(view.detail));
+  if (view.detail !== null) parts.push(sessionCommands(view, view.detail));
   return page(view, "Sesiuni", parts.join(""));
 }
 
+/** Legătura spre o pagină anume a comenzilor unei sesiuni. */
+function sessionPageHref(view: SessionsView, sourceId: number, pagina: number): string {
+  return withInstance("/panel/sesiuni", view.selected)
+    + (view.selected === null ? "?" : "&") + `sesiune=${sourceId}`
+    + (pagina > 1 ? `&pagina=${pagina}` : "")
+    + (view.showingAll ? "&toate=1" : "");
+}
+
+/** «Pagina 3 din 45», cu cele patru legături. Nimic când e o singură pagină. */
+function pager(view: SessionsView, detail: SessionDetail, sourceId: number): string {
+  if (detail.pages <= 1) return "";
+  const link = (pagina: number, eticheta: string, activ: boolean): string =>
+    activ
+      ? `<a href="${escapeHtml(sessionPageHref(view, sourceId, pagina))}">${eticheta}</a>`
+      : `<span class="id">${eticheta}</span>`;
+  return '<p class="nota">' +
+    `Pagina <strong>${detail.page}</strong> din ${detail.pages} · comenzile ` +
+    `${detail.from}–${detail.to} din ${detail.stored} · ` +
+    link(1, "« prima", detail.page > 1) + " · " +
+    link(detail.page - 1, "‹ înapoi", detail.page > 1) + " · " +
+    link(detail.page + 1, "înainte ›", detail.page < detail.pages) + " · " +
+    link(detail.pages, "ultima »", detail.page < detail.pages) +
+    "</p>\n";
+}
+
 /** Comenzile unei sesiuni. */
-function sessionCommands(detail: SessionDetail): string {
+function sessionCommands(view: SessionsView, detail: SessionDetail): string {
   if (detail.session === null) {
     return '<p class="gol">Sesiunea cerută nu există pe serverul ales.</p>\n';
   }
@@ -1083,15 +1141,32 @@ function sessionCommands(detail: SessionDetail): string {
                + "tabelul de mai jos arată ce a mai rămas aici.</p>\n");
   }
 
-  if (detail.truncated) {
-    // Un plafon TĂCUT arată exact ca «atât s-a rulat». Diferența dintre „n-a mai
-    // făcut nimic" și „restul nu ți l-am arătat" e chiar întrebarea.
-    parts.push('<p class="lipsa"><strong>Listă tăiată la '
-               + `${COMMANDS_SHOWN} de comenzi.</strong><br>Sesiunea a rulat `
-               + `${s.commandCount} în total. Un shell de login pornește singur `
-               + "câteva sute de procese; restul se citește din baza de pe "
-               + "gazdă.</p>\n");
+  // Ce lipsește FĂRĂ să fie curățare: gazda a numărat mai multe comenzi decât
+  // are replica. Spus cu cifre și cu cauza atât cât se știe — «nu știu» e un
+  // răspuns, iar un tabel mai scurt decât numărul de deasupra, fără nicio
+  // explicație, arată ca «atât s-a rulat».
+  if (detail.missing > 0) {
+    const cauza = detail.missingWhy === "retention"
+      ? `Sesiunea e mai veche decât fereastra de retenție a replicii pentru ` +
+        `sesiunile ${s.interactive ? "cu" : "fără"} terminal ` +
+        `(${detail.retentionDays} de zile): comenzile ei au fost tăiate de ea. ` +
+        "Pe gazdă rămân toate."
+      : "Cauza nu se poate stabili de aici: pot fi tăiate de curățarea " +
+        "automatizărilor, pot să nu fi ajuns încă pe replică (fluxul vine în " +
+        "loturi) sau n-au putut fi legate de sesiune. Pe gazdă sunt toate.";
+    parts.push('<p class="lipsa"><strong>'
+               + `${detail.missing} din ${s.commandCount} comenzi nu sunt în arhiva `
+               + "asta.</strong><br>" + escapeHtml(cauza) + "</p>\n");
   }
+
+  parts.push('<p class="nota">' + (detail.stored === 0
+    ? "Arhiva asta nu are nicio comandă a sesiunii."
+    : `În arhivă: <strong>${detail.stored}</strong> comenzi` +
+      (detail.pages > 1
+        ? `, pe pagini de ${COMMANDS_SHOWN}; aici sunt ${detail.from}–${detail.to}.`
+        : ", toate pe pagina asta.")) + "</p>\n");
+
+  parts.push(pager(view, detail, s.sourceId));
 
   parts.push(table(
     "<th>Când (UTC)</th><th>Binar</th><th>Linia de comandă</th><th>Rezultat</th>",
@@ -1106,6 +1181,8 @@ function sessionCommands(detail: SessionDetail): string {
         `<td>${stare}</td></tr>\n`;
     }),
     "nicio comandă înregistrată pentru sesiunea asta"));
+
+  parts.push(pager(view, detail, s.sourceId));
 
   parts.push('<p class="nota">Liniile de comandă sosesc <strong>redactate</strong>: '
              + "valorile care arată a secret sunt tăiate pe gazdă, la colectare. "

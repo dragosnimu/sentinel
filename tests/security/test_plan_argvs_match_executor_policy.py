@@ -223,6 +223,13 @@ class _SpyPolicy:
             self._verdict(argv)
         return list(argv)
 
+    def sandbox_refusal(self, argv):
+        # The executor's SECOND question ("is there anywhere to run it?"). A spy that
+        # permits every grammar also permits every step; one that lacked the method
+        # would be a policy too old to answer, which the validator refuses
+        # (test_a_policy_that_cannot_say_where_a_step_runs_refuses_the_plan).
+        return None
+
 
 def test_all_four_argv_shapes_reach_the_executors_own_check(monkeypatch):
     """Not "the validator calls check_argv somewhere" — that a command in

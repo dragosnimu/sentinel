@@ -1806,11 +1806,57 @@ async def _quiet_chats(cfg: Config, db: Database) -> set[int]:
         default_tz=getattr(cfg.telegram, "timezone", None)))
 
 
-async def _broadcast(app: Application, cfg: Config, text: str,
-                     kb: InlineKeyboardMarkup | None = None, *,
-                     quiet_chats: set[int] | None = None,
-                     severity: str | None = None, kind: str | None = None) -> int:
-    """Send to every allowed chat. Returns how many actually went out.
+@dataclass(frozen=True)
+class Delivery:
+    """Ce a spus Telegram despre fiecare chat — nu ce am vrut noi să se întâmple.
+
+    Există fiindcă `_broadcast` întoarce un număr, iar un număr nu poate spune
+    „mesajul 4711 e în chatul X". Un rând din `notifications` marcat `sent` pe
+    baza lui era o afirmație fără nimic în spate: `message_id` rămânea NULL pe
+    TOATE rândurile, deci nimic nu deosebea un mesaj livrat de unul presupus.
+
+    * `delivered` — chat -> `message_id` întors de Telegram. Singurul fapt
+      care dovedește că API-ul a primit mesajul: un `send_message` care nu a
+      aruncat nu e dovadă, un `Message` cu id întreg e.
+    * `unconfirmed` — chaturi unde apelul a revenit FĂRĂ excepție și fără un
+      `message_id` întreg. Cu `ExtBot` real nu se poate; apare doar dacă
+      transportul e înlocuit sau schimbat. Nu se numără drept livrat.
+    * `failed` — chat -> motivul, ca să ajungă în rând și în jurnal.
+    * `held` — sărite de fereastra de liniște. Nu sunt eșecuri și nu sunt
+      livrări: nu s-a încercat nimic.
+    """
+
+    delivered: dict[int, int]
+    unconfirmed: list[int]
+    failed: dict[int, str]
+    held: list[int]
+
+    @property
+    def accepted(self) -> int:
+        """Câte apeluri au revenit fără excepție — sensul vechi al lui `_broadcast`."""
+        return len(self.delivered) + len(self.unconfirmed)
+
+
+def _message_id(sent: Any) -> int | None:
+    """`message_id` din răspunsul lui `send_message`, sau `None` dacă nu e unul.
+
+    `bool` e exclus explicit: e subclasă de `int`, iar `True` ar trece drept
+    mesajul cu numărul 1.
+    """
+    mid = getattr(sent, "message_id", None)
+    if isinstance(mid, int) and not isinstance(mid, bool) and mid > 0:
+        return mid
+    return None
+
+
+async def _deliver(app: Application, cfg: Config, text: str,
+                   kb: InlineKeyboardMarkup | None = None, *,
+                   quiet_chats: set[int] | None = None,
+                   severity: str | None = None, kind: str | None = None) -> Delivery:
+    """Trimite către fiecare chat permis și întoarce ce a confirmat Telegram.
+
+    Aceeași logică ca `_broadcast` — care o cheamă —, dar păstrează răspunsul
+    fiecărui chat în loc să-l strângă într-un număr.
 
     A chat inside its quiet window is skipped — unless the message is one that
     is never muted, in which case the window is ignored entirely. See
@@ -1843,29 +1889,61 @@ async def _broadcast(app: Application, cfg: Config, text: str,
     # apuce să ruleze. Motivul pentru care plafonul de 30s există: fără el,
     # numărul de mai sus n-ar avea limită superioară.
     urgent = passes_anyway(severity, kind)
-    sent = 0
+    delivered: dict[int, int] = {}
+    unconfirmed: list[int] = []
+    failed: dict[int, str] = {}
+    held: list[int] = []
+
+    def _record(chat_id: int, sent: Any) -> None:
+        mid = _message_id(sent)
+        if mid is None:
+            # Telegram n-a ridicat nicio eroare, dar nici n-a dat un număr de
+            # mesaj. Nu e „livrat": nu avem ce să arătăm ca dovadă.
+            unconfirmed.append(chat_id)
+            log.error("telegram accepted a message without a message_id",
+                      extra={"chat_id": chat_id, "got": type(sent).__name__})
+        else:
+            delivered[chat_id] = mid
+
     for chat_id in cfg.telegram.allowed_chat_ids:
         if quiet_chats and chat_id in quiet_chats and not urgent:
+            held.append(chat_id)
             continue
         try:
-            await app.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML,
-                                       reply_markup=kb)
-            sent += 1
+            _record(chat_id, await app.bot.send_message(
+                chat_id, text, parse_mode=ParseMode.HTML, reply_markup=kb))
         except RetryAfter as exc:
             wait_s = min(float(exc.retry_after), 30.0)
             log.warning("push send rate-limited; waiting once before retrying",
                        extra={"chat_id": chat_id, "wait_s": wait_s})
             await asyncio.sleep(wait_s)
             try:
-                await app.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML,
-                                           reply_markup=kb)
-                sent += 1
+                _record(chat_id, await app.bot.send_message(
+                    chat_id, text, parse_mode=ParseMode.HTML, reply_markup=kb))
             except Exception as exc2:  # noqa: BLE001
+                failed[chat_id] = str(exc2)
                 log.warning("push send failed after rate-limit wait",
                            extra={"chat_id": chat_id, "detail": str(exc2)})
         except Exception as exc:  # noqa: BLE001
+            failed[chat_id] = str(exc)
             log.warning("push send failed", extra={"chat_id": chat_id, "detail": str(exc)})
-    return sent
+    return Delivery(delivered=delivered, unconfirmed=unconfirmed,
+                    failed=failed, held=held)
+
+
+async def _broadcast(app: Application, cfg: Config, text: str,
+                     kb: InlineKeyboardMarkup | None = None, *,
+                     quiet_chats: set[int] | None = None,
+                     severity: str | None = None, kind: str | None = None) -> int:
+    """Send to every allowed chat. Returns how many actually went out.
+
+    Număr, nu dovadă: pentru ce trebuie PROBAT că a ajuns (un rând din
+    `notifications`) se folosește `_deliver`, care păstrează `message_id`-ul
+    fiecărui chat. Aici rămâne pentru apelanții care au nevoie doar de „a plecat
+    ceva undeva" — incidentele, planurile, rezumatele.
+    """
+    return (await _deliver(app, cfg, text, kb, quiet_chats=quiet_chats,
+                           severity=severity, kind=kind)).accepted
 
 
 # More than this many incidents waiting when the window lifts, and they arrive
@@ -2075,6 +2153,23 @@ def _notification_due(enqueued_at: datetime, attempts: int) -> bool:
     return (now - enqueued_at).total_seconds() >= threshold_s
 
 
+def _partial_note(result: Delivery) -> str | None:
+    """Ce n-a ajuns, când mesajul a ajuns doar PARȚIAL — altfel `None`.
+
+    Un rând `sent` cu `error` gol spune „a ajuns peste tot unde trebuia". Dacă
+    un chat din două a refuzat, rândul rămâne `sent` (cel puțin un chat l-a
+    primit, iar a-l reîncerca ar dubla mesajul în celălalt), dar nu mai are
+    voie să tacă despre asta.
+    """
+    if not (result.failed or result.unconfirmed):
+        return None
+    total = len(result.delivered) + len(result.failed) + len(result.unconfirmed)
+    parts = [f"livrat la {len(result.delivered)} din {total} chaturi"]
+    parts += [f"chat {c}: {why}"[:120] for c, why in result.failed.items()]
+    parts += [f"chat {c}: fără message_id" for c in result.unconfirmed]
+    return "; ".join(parts)[:500]
+
+
 async def _push_notifications(app: Application, cfg: Config, db: Database,
                               quiet_chats: set[int]) -> None:
     """Drain the generic notification queue.
@@ -2116,23 +2211,54 @@ async def _push_notifications(app: Application, cfg: Config, db: Database,
         # Ce se ține și ce nu se decide din SEVERITATE și din FEL: vezi nota
         # lungă din `telegram/quiet.py` despre jumătatea care a fost scoasă din
         # scutire, și cea despre `login`, care nu se tace niciodată.
-        sent = await _broadcast(app, cfg, row["body"], _kb_from_row(row),
+        result = await _deliver(app, cfg, row["body"], _kb_from_row(row),
                                 quiet_chats=quiet_chats,
                                 severity=row["severity"], kind=kind)
-        if sent:
-            await db.execute(
-                "UPDATE notifications SET state = 'sent', sent_at = now(), "
-                "attempts = attempts + 1 WHERE id = $1", row["id"])
+        if result.delivered:
+            # `sent` înseamnă că TELEGRAM a răspuns cu un `message_id`, nu că
+            # `send_message` n-a aruncat. Numărul se scrie în rând: e singurul
+            # lucru care deosebește „livrat" de „presupus livrat", și singurul
+            # pe care cineva îl poate căuta în chat. Până la 5 octombrie 2026
+            # coloana rămânea NULL pe toate rândurile, deci un mesaj ajuns și
+            # unul care n-a ajuns arătau identic în bază.
+            #
+            # Jurnalul se scrie ÎNAINTE de `UPDATE`: livrarea s-a întâmplat deja
+            # și e ireversibilă; dacă baza cade chiar acum, rândul rămâne
+            # `queued` și mesajul se retrimite — iar urma că prima copie a
+            # existat (cu `message_id`) trebuie să fie în jurnal, ca dublura să
+            # se poată explica.
+            message_id = next(iter(result.delivered.values()))
             log.warning("notification pushed",
-                        extra={"id": row["id"], "severity": row["severity"], "chats": sent})
+                        extra={"id": row["id"], "severity": row["severity"],
+                               "chats": len(result.delivered),
+                               "message_id": message_id})
+            partial = _partial_note(result)
+            status = await db.execute(
+                "UPDATE notifications SET state = 'sent', sent_at = now(), "
+                "attempts = attempts + 1, message_id = $2, error = $3 "
+                "WHERE id = $1 AND state = 'queued'",
+                row["id"], message_id, partial)
+            if status == "UPDATE 0":
+                # Rândul nu mai era `queued` când am scris: altcineva l-a
+                # schimbat între citire și acum. Mesajul a plecat oricum; ce
+                # nu se poate e să rămână un rând care spune altceva fără urmă.
+                log.error("notification delivered but its row was no longer queued",
+                          extra={"id": row["id"], "message_id": message_id})
             continue
 
         new_attempts = row["attempts"] + 1
+        # Ce s-a întâmplat, pe față. Un apel întors fără `message_id` NU e un
+        # eșec de rețea și nu trebuie să arate ca unul: reîncercarea poate
+        # produce un duplicat, iar cine citește rândul trebuie să știe de ce.
+        reason = ("trimitere eșuată — se reîncearcă" if not result.unconfirmed
+                  else "Telegram a răspuns fără message_id — livrarea nu se poate "
+                       "dovedi, se reîncearcă")
         if new_attempts >= MAX_NOTIFICATION_ATTEMPTS:
+            verb = "confirmat-o" if result.unconfirmed else "primit-o"
             await db.execute(
                 "UPDATE notifications SET state = 'failed', attempts = $2, "
                 "error = $3 WHERE id = $1", row["id"], new_attempts,
-                f"toate cele {new_attempts} încercări au eșuat — niciun chat n-a primit-o")
+                f"toate cele {new_attempts} încercări au eșuat — niciun chat n-a {verb}")
             log.error("notification gave up after repeated failures",
                       extra={"id": row["id"], "attempts": new_attempts})
         else:
@@ -2140,7 +2266,7 @@ async def _push_notifications(app: Application, cfg: Config, db: Database,
             # încercare, nu ciclul curent al buclei.
             await db.execute(
                 "UPDATE notifications SET attempts = $2, error = $3 WHERE id = $1",
-                row["id"], new_attempts, "trimitere eșuată — se reîncearcă")
+                row["id"], new_attempts, reason)
             log.warning("notification send failed; will retry",
                         extra={"id": row["id"], "attempts": new_attempts})
 

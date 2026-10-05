@@ -226,6 +226,11 @@ th { color: var(--fg-muted); font-weight: 600; font-size: .85rem; }
 
 td.nr { text-align: right; }
 
+/* Celula „Risc" a listei de vulnerabilități: aceeași regulă ca în panoul serverului
+ * (`td.risc` din sentinel.css) — eticheta pe un rând, motivul rupt doar între cuvinte. */
+td.risc { min-width: 15rem; }
+.risc-eticheta { white-space: nowrap; }
+
 code.id { color: var(--fg-muted); font-size: .8rem; font-family: var(--mono); }
 
 .sev {

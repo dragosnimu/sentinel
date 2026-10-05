@@ -885,9 +885,12 @@ async def assess_risk(db: Database, cfg: Config) -> tuple[str, dict[str, Any]]:
     if out.get("status") != "completed":
         raise RuntimeError(f"evaluarea de risc a eșuat: {out.get('error', '?')}")
     colors = out.get("colors") or {}
+    from sentinel.scan import risk_view
+
+    # Numele stărilor (`risk_view.COLOR_STATE_RO`), ca pe pagină și în bot, nu cele ale culorilor.
     detail = (f"{out['findings']} constatări evaluate "
-              f"({colors.get('red', 0)} roșii, {colors.get('amber', 0)} galbene, "
-              f"{colors.get('grey', 0)} fără date, {colors.get('green', 0)} verzi); "
+              f"({risk_view.counts_ro(colors.get('red', 0), colors.get('amber', 0), colors.get('grey', 0))}"
+              f" · {risk_view.COLOR_STATE_RO['green']} {colors.get('green', 0)}); "
               f"{out['changed']} schimbate")
     sources = {k: v.get("status") or ("aborted" if v.get("aborted") else "ok")
                for k, v in (out.get("sources") or {}).items()}

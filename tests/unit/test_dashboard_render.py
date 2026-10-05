@@ -227,10 +227,11 @@ def test_findings_page_renders():
         prev_url=None, next_url=None, url_toate="/findings",
         selectat=None, avertismente=[],
         culori=[{"color": c, "emoji": risk_view.COLOR_EMOJI[c],
-                 "label": risk_view.COLOR_LABEL_RO[c], "count": 0,
-                 "url": f"/findings?culoare={c}", "active": False}
+                 "label": risk_view.COLOR_STATE_RO[c], "title": risk_view.pill_title(c),
+                 "count": 0, "url": f"/findings?culoare={c}", "active": False}
                 for c in ("red", "amber", "grey", "green")],
         culoare=None, url_toate_culorile="/findings", misiune="medium",
+        legenda_stari=risk_view.legend_states(), legenda_kev=risk_view.KEV_UNKNOWN_NOTE_RO,
         categorii=[{"kind": c.kind, "label": c.label, "count": c.count,
                     "url": f"/findings?asociat={c.kind}", "active": False}
                    for c in categories({"dnf": 2})],

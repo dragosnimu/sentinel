@@ -1243,6 +1243,14 @@ RECEIVER_ONLY = {
     "DELETE_PARAM_BUDGET": "câți parametri se leagă într-un DELETE de curățare a "
                            "sub-rândurilor; taie instrucțiunea în bucăți, nu "
                            "refuză nimic din ce sosește",
+    # lib/session-links.ts — legătura comenzilor de sesiuni, refăcută la primire.
+    # Nicio constantă de aici nu atinge ce poate trimite expeditorul: ambele
+    # privesc ce face receptorul cu rândurile DEJA primite.
+    "MARGIN_MS": "marginea de un minut din jurul unei sesiuni, aceeași ca în "
+                 "`_find_session`/`_attach_orphans` de pe gazdă; decide ce comandă "
+                 "se leagă de ce sesiune, nu ce se acceptă",
+    "DATETIME": "tiparul cu care se citește un DATETIME primit din bază; despre "
+                "rândurile stocate, nu despre corpul cererii",
     # lib/db.ts — `sql_mode` strict pe sesiune. Niciuna dintre cele trei nu
     # mărginește ce poate trimite expeditorul: ele decid ce REFUZĂ baza după ce
     # lotul a sosit. Expeditorul n-are ce să acorde aici, fiindcă geamăna de pe
@@ -1276,16 +1284,28 @@ RECEIVER_ONLY = {
     # `sentinel/scan/risk_view.py` de `tests/unit/test_risk_view_parity.py`.
     "COLORS": "cele patru culori ale semaforului, ca vocabular închis de afișare",
     "COLOR_ORDER": "ordinea culorilor în listă (roșu, galben, gri, verde)",
-    "COLOR_LABEL_RO": "numele culorilor, pentru pastile",
+    "COLOR_LABEL_RO": "numele culorilor, doar în titlul unei pastile (nu mai e numele unei "
+                      "stări: acela e `COLOR_STATE_RO`)",
+    "COLOR_STATE_RO": "numele STĂRII fiecărei culori (Acum, Curând, Nedecis, Ciclul obișnuit / "
+                      "De urmărit*), unul pe orice ecran; comparat cu `risk_view` de paritate",
+    "DECISION_COLOR": "culoarea fiecărei decizii SSVC (`ssvc.COLOR_OF`), pentru numele SSVC "
+                      "dintr-un titlu de pastilă și pentru legendă",
+    "KEV_UNKNOWN_NOTE_RO": "cauzele pentru care celula KEV spune „nu se știe”, în propoziția "
+                           "legendei; comparată cu `risk_view` de paritate",
     "COLOR_EMOJI": "punctul colorat din fața etichetei",
-    "DECISION_LABEL_RO": "numele deciziilor SSVC (Act, Attend, Track*, Track)",
-    "NO_DECISION_RO": "eticheta unui rând fără decizie („fără date”)",
+    "DECISION_LABEL_RO": "etichetele deciziilor SSVC, ce are de făcut cel care citește "
+                         "(Acum, Curând, De urmărit*, Ciclul obișnuit)",
+    "DECISION_SSVC_NAME": "numele din arborele CISA (Act, Attend, Track*, Track), pentru "
+                          "tooltip: eticheta se poate urmări până la el",
+    "NO_DECISION_RO": "eticheta unui rând fără decizie („Nedecis”)",
     "SOURCE_RO": "numele surselor CVSS (Red Hat, OSV, trivy)",
     "MISSING_RO": "textul pentru fiecare cod „ce lipsește” al unui gri",
-    "ONE_LINER_MISSING": "motivul scurt al unui gri, pe un rând de listă",
-    "OVERLAY_TAG_RO": "eticheta „regula Sentinel, nu SSVC” de lângă un galben urcat de regula "
-                      "Sentinel (aceeași ca în `risk_view.py`, comparată de paritate)",
-    "OVERLAY_REASON_RO": "motivul scurt al aceluiași galben, pe un rând de listă",
+    "MISSING_SHORT_RO": "ce lipsește la un gri, în două-trei cuvinte, pentru celula tabelului",
+    "OVERLAY_TAG_RO": "marcajul „regula Sentinel” de lângă un galben urcat de regula "
+                      "Sentinel (același ca în `risk_view.py`, comparat de paritate)",
+    "NOTEWORTHY_EPSS": "sub ce EPSS un verde nu mai are linie de motiv; egal cu pragul "
+                       "regulii Sentinel din `risk.py`, cu cazuri de-o parte și de alta "
+                       "în testul de paritate",
     # lib/panel-page.ts
     "OPEN_STATUSES": "stările în care panoul desenează culoarea unui rând (derivate din "
                      "`GROUPS.neaplicate`); o stare nouă a serverului cade pe „închis”, "

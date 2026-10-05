@@ -212,12 +212,27 @@ _SEVERITY_IMPACT = {"critical": 0.95, "high": 0.80, "medium": 0.55,
 
 #: Etichetele pentru operator. O singură listă, ca panoul, Telegram-ul și
 #: agregatorul să nu le scrie în trei feluri.
+#:
+#: Eticheta spune ce are de făcut cel care citește, nu numele din arborele CISA:
+#: „Attend — accelerat" urmat de „KEV" nu se citea ca o propoziție, iar „Track* —
+#: de urmărit" nu spunea nimic de făcut. Numele SSVC rămân în `DECISION_SSVC_NAME`,
+#: pentru detaliu și legendă, ca eticheta să poată fi urmărită până la arbore.
+#:
+#: `Track` simplu rămâne „Ciclul obișnuit", nu „De urmărit": SSVC le deosebește
+#: (Track* cere o privire mai deasă), iar cu același cuvânt pe amândouă ar mai rămâne
+#: doar un asterisc din deosebirea aceea.
 DECISION_LABEL_RO = {
-    ssvc.ACT: "Act — acum",
-    ssvc.ATTEND: "Attend — accelerat",
-    ssvc.TRACK_STAR: "Track* — de urmărit",
-    ssvc.TRACK: "Track — ciclul obișnuit",
-    None: "fără date",
+    ssvc.ACT: "Acum",
+    ssvc.ATTEND: "Curând",
+    ssvc.TRACK_STAR: "De urmărit*",
+    ssvc.TRACK: "Ciclul obișnuit",
+    None: "Nedecis",
+}
+#: Numele deciziei în vocabularul CISA SSVC. Apare numai în text de detaliu și în
+#: legende, NICIODATĂ lângă eticheta unui rând galben urcat de regula Sentinel: acolo
+#: „Attend" ar spune că arborele a decis ce n-a decis.
+DECISION_SSVC_NAME = {
+    ssvc.ACT: "Act", ssvc.ATTEND: "Attend", ssvc.TRACK_STAR: "Track*", ssvc.TRACK: "Track",
 }
 COLOR_LABEL_RO = {"red": "roșu", "amber": "galben", "green": "verde", "grey": "gri"}
 COLOR_EMOJI = {"red": "🔴", "amber": "🟡", "green": "🟢", "grey": "⚪"}

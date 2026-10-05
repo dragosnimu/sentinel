@@ -137,7 +137,8 @@ def test_a_successful_maintenance_pass_reports_colours_and_sources(monkeypatch):
                 "assessed": {"k": object()}}
     monkeypatch.setattr(enrich, "run", done)
     detail, facts = run(ms.assess_risk(object(), object()))
-    assert "812 constatări evaluate (1 roșii, 3 galbene, 25 fără date, 783 verzi); 3 schimbate" in detail
+    assert ("812 constatări evaluate (Acum 1 · Curând 3 · Nedecis 25 · "
+            "Ciclul obișnuit / De urmărit* 783); 3 schimbate") in detail
     assert "surse cu probleme: osv" in detail
     assert "assessed" not in facts and facts["sources"]["epss"] == "fresh"
 

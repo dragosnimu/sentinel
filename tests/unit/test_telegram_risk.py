@@ -45,7 +45,35 @@ def test_every_row_wears_its_own_colour_and_a_one_line_reason(monkeypatch):
     line = {int(m.group(2)): m.group(1)
             for m in re.finditer(r"(🔴|🟡|⚪|🟢) <b>#(\d+)</b>", text)}
     assert line == {1: "🔴", 2: "🟡", 3: "⚪", 4: "🟢"}
-    assert "KEV" in text and "EPSS 92,0%" in text and "fără EPSS" in text
+    assert "exploatat activ (KEV)" in text and "EPSS 92,0%" in text and "fără EPSS" in text
+
+
+def test_the_list_legend_maps_each_label_to_its_ssvc_name_and_says_what_grey_means(monkeypatch):
+    """The legend is the only place a Telegram list row can learn that "Curând" is CISA's
+    "Attend": the rows themselves carry just the colour dot. It once said "🟢 De urmărit
+    (Track)" while `headline` and `/vuln` said "Ciclul obișnuit" for Track, so the operator
+    was handed the wrong mapping on the one channel with nothing else to go on — and the
+    test pinned that same wrong string, green by construction.
+
+    Pinned against the label SOURCES, not a copied literal: every `headline(...)` the rows
+    and the headline of `/vuln` can print, with the SSVC name `/vuln` prints beside it."""
+    from sentinel.scan import risk_view as rv, ssvc
+
+    text, _ = _sent(monkeypatch, [_row(1, "amber", "attend")])
+    for decision in ssvc.DECISIONS:
+        color = ssvc.COLOR_OF[decision]
+        entry = f"{rv.headline(color, decision)} ({rv.ssvc_name(decision)})"
+        assert entry in text, (decision, entry)
+        # The same pairing the detail view of that decision prints.
+        detail = f"Decizie CISA SSVC: {rv.ssvc_name(decision)} ({rv.DECISION_LABEL_RO[decision]})"
+        assert rv.why_lines({"decision": decision})[0] == detail
+    grey = rv.headline("grey", None)
+    assert grey in text
+    # Grey must still read as missing data there, not as an unfinished decision.
+    assert f"{grey} (lipsesc date)" in text
+    # The wrong mapping that shipped, by name: "De urmărit" is Track*, never Track.
+    assert "De urmărit (Track)" not in text
+    assert "De urmărit* (Track*)" in text and "Ciclul obișnuit (Track)" in text
 
 
 def test_a_row_without_a_colour_is_drawn_grey_not_green(monkeypatch):
@@ -110,7 +138,8 @@ def test_the_detail_gives_the_four_points_the_sources_and_the_decision(monkeypat
             "cvss": {"source": "redhat", "score": 7.5},
             "epss": {"p": 0.0045, "percentile": 0.3682, "date": "2026-10-01"}}
     text = _detail(monkeypatch, _row(42, "amber", "attend", risk=risk, kev=True))
-    assert "🟡 Attend — accelerat" in text
+    assert "🟡 Curând" in text and "Attend — accelerat" not in text
+    assert "Decizie CISA SSVC: Attend (Curând)" in text
     assert "exploatat activ · neautomatizabil · impact total · misiune medie" in text
     assert "CVSS 7,5 (Red Hat) · EPSS 0,45% (percentila 37)" in text
     assert "urgența a coborât o treaptă" in text
@@ -121,8 +150,9 @@ def test_a_grey_detail_says_what_is_missing_and_how_bad_it_could_be(monkeypatch)
             "points": {"exploitation": {"value": None}, "automatable": {"value": "yes"},
                        "technical_impact": {"value": "partial"}, "mission": {"value": "medium"}}}
     text = _detail(monkeypatch, _row(42, "grey", None, risk=risk))
-    assert "⚪ fără date" in text and "lipsește EPSS" in text
-    assert "ar putea fi între Track și Attend" in text
+    assert "<b>⚪ Nedecis</b> — fără EPSS" in text, "the headline lost the missing datum"
+    assert "lipsește EPSS (nu există încă pentru acest CVE)" in text
+    assert "ar putea fi între Track și Attend" in text, "the long reasoning has no home"
     assert "? exploatare" in text
 
 
@@ -176,7 +206,8 @@ def test_the_dashboard_line_carries_the_colours_and_always_the_grey(monkeypatch)
     upd, msg = _update()
     run(views.cmd_dashboard(upd, _ctx(tv._DashDB())))
     line = [ln for ln in msg.sent[0].splitlines() if ln.startswith("Vulnerabilități:")][0]
-    assert line == ("Vulnerabilități: 812 deschise · 🔴 1 · 🟡 3 · ⚪ 0 fără date · 🔥 2 KEV"), line
+    assert line == ("Vulnerabilități: 812 deschise · 🔴 Acum 1 · 🟡 Curând 3 · ⚪ Nedecis 0 "
+                    "· 🔥 2 KEV"), line
 
 
 # ---------------------------------------------------------------------------
@@ -205,8 +236,8 @@ def test_the_list_marks_an_overlay_row_whole_and_explains_the_mark_once(monkeypa
                  "points": {"exploitation": {"value": "active", "basis": "kev"}}})]
     text, _ = _sent(monkeypatch, rows)
     block1 = text.split("#2</b>")[0]
-    assert "regula Sentinel (EPSS)" in block1, text
-    assert "regula Sentinel (EPSS)" not in text.split("#2</b>", 1)[1].split("\n/vuln")[0]
+    assert "regula Sentinel · EPSS 99,2%" in block1, text
+    assert "regula Sentinel ·" not in text.split("#2</b>", 1)[1].split("\n/vuln")[0]
     assert "„regula Sentinel” = urcat de o regulă a Sentinel" in text
     assert "nu de SSVC și nu de FIRST" in text
 
@@ -218,6 +249,6 @@ def test_the_legend_about_the_overlay_is_absent_when_no_row_has_one(monkeypatch)
 
 def test_the_detail_of_an_overlay_row_says_it_is_sentinels_rule_and_what_ssvc_said(monkeypatch):
     text = _detail(monkeypatch, _row(7, "amber", "attend", risk=_OVERLAY_RISK))
-    assert "🟡 Attend — accelerat (regula Sentinel, nu SSVC)" in text
+    assert "🟡 Curând · regula Sentinel" in text
     assert "REGULI A SENTINEL" in text
-    assert "SSVC singur ar fi dat Track — ciclul obișnuit" in text
+    assert "SSVC singur ar fi dat Track." in text

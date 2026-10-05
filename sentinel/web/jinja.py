@@ -139,6 +139,7 @@ def zone_label(tz_name: str | None):
 def template_globals() -> dict[str, Any]:
     from sentinel import __version__
     from sentinel.intel import links
+    from sentinel.scan import risk_view
 
     return {
         "version": __version__,
@@ -150,6 +151,11 @@ def template_globals() -> dict[str, Any]:
         # Cache-busting. A bare `/static/...` href in a template is a bug —
         # see asset_url.
         "asset_url": asset_url,
+        # Semaforul SSVC, în cuvintele lui: numele unei stări e unul singur pe orice
+        # ecran (`risk_view.COLOR_STATE_RO`). Un șablon care scrie „roșii" sau „fără date"
+        # de mână e felul în care aceeași stare ajunge să aibă trei nume.
+        "state_counts": risk_view.counts_ro,
+        "state_name": risk_view.state_with_ssvc,
     }
 
 

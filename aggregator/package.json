@@ -14,7 +14,8 @@
     "instance": "node --import tsx bin/instance.ts",
     "user": "node --import tsx bin/user.ts",
     "verify-chain": "node --import tsx bin/verify-chain.ts",
-    "purge-automation": "node --import tsx bin/purge-automation-commands.ts"
+    "purge-automation": "node --import tsx bin/purge-automation-commands.ts",
+    "relink-session-commands": "node --import tsx bin/relink-session-commands.ts"
   },
   "dependencies": {
     "hash-wasm": "^4.12.0",

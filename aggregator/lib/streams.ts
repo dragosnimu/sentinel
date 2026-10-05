@@ -1116,6 +1116,12 @@ const SESSION_COMMANDS: Stream = {
     // `login_sessions.id` de pe INSTANȚĂ, nu id-ul local. Nicio cheie străină:
     // cursoarele avansează independent, deci o comandă poate ajunge legitim
     // înaintea sesiunii ei, iar o referință suspendată e o stare normală.
+    //
+    // NULL aici NU înseamnă «comanda n-are sesiune». Gazda scrie NULL când
+    // comanda sosește înaintea sesiunii și îl completează mai târziu, dar fluxul
+    // e append-only: rândul pleacă o singură dată, cu NULL. Măsurat pe 5 octombrie
+    // 2026, 53 % din rândurile replicii erau așa. Legătura se refă la primire
+    // din `session_key` + fereastra de timp a sesiunii — `lib/session-links.ts`.
     { source: "session_id", target: "session_source_id", kind: "int", nullable: true },
     { source: "session_key", target: "session_key", kind: "text", nullable: false, maxBytes: TEXT },
     { source: "ts", target: "ts", kind: "timestamp", nullable: false },

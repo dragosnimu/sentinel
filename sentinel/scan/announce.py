@@ -26,8 +26,8 @@ acum", iar dacă din tot mesajul se citește un singur rând, ăla trebuie să f
 ## Culoarea, pe fiecare rând
 
 Constatările aduc `risk_color` (evaluarea de la sfârșitul trecerii, vezi
-`sentinel/scan/enrich.py`): punctul din fața rândului e semaforul — 🔴 Act, 🟡
-Attend, ⚪ fără date, 🟢 Track —, iar 🔥 rămâne lângă cele din KEV. Un rând fără
+`sentinel/scan/enrich.py`): punctul din fața rândului e semaforul — 🔴 Acum, 🟡
+Curând, ⚪ Nedecis, 🟢 Ciclul obișnuit / De urmărit* —, iar 🔥 rămâne lângă cele din KEV. Un rând fără
 culoare (o constatare care n-a trecut prin evaluare) păstrează forma veche: 🔴 doar
 pentru KEV. Un KEV poate ieși VERDE: arborele CISA îl dă Track când exploatarea e
 activă dar impactul e parțial și atacul nu e automatizabil, pe o misiune medie.
@@ -178,10 +178,14 @@ def build_red_message(findings: Sequence[dict[str, Any]], *, host: str) -> str:
 
     total = len(findings)
     ordered = sorted(findings, key=lambda f: int(f.get("priority") or 0), reverse=True)
-    noun = "vulnerabilitate a devenit roșie" if total == 1 else "vulnerabilități au devenit roșii"
+    # Numele STĂRII (`risk_view.COLOR_STATE_RO`), nu al culorii: același cuvânt ca pe rândul din
+    # listă și din panou. „Acum (Act)": cuvântul de acțiune întâi, numele CISA în paranteză.
+    state = risk_view.COLOR_STATE_RO["red"]
+    noun = (f"vulnerabilitate a ajuns la „{state}”" if total == 1
+            else f"vulnerabilități au ajuns la „{state}”")
     lines = [f"🔴 <b>{_esc(host)} — {total} {noun}</b>",
-             "<i>Act: decizia CISA SSVC cea mai urgentă — exploatare activă, atac "
-             "automatizabil, impact total.</i>", ""]
+             f"<i>{risk_view.state_with_ssvc('red')}: decizia CISA SSVC cea mai urgentă — exploatare "
+             "activă, atac automatizabil, impact total.</i>", ""]
     for finding in ordered[:MAX_LISTED]:
         cve = _esc(finding.get("cve") or finding.get("advisory_id") or "fără CVE")
         pkg = _esc(finding.get("package") or "?")

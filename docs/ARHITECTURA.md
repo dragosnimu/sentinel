@@ -688,9 +688,12 @@ Attend din arbore nu înseamnă mereu „observat" (la misiune mare, `none,yes,p
 Attend); regula e „decis de CISA înaintea celui ridicat de regula Sentinel", iar la misiune
 medie — singura de azi — un Attend din arbore are mereu o exploatare observată în spate.
 
-*Unde se spune pe ecran, ca regula Sentinel și nu a SSVC:* eticheta rândului („🟡 Attend —
-accelerat (regula Sentinel, nu SSVC)"), motivul scurt („regula Sentinel (EPSS)"), legenda
-listei din Telegram (numai când un astfel de rând e pe ecran), propoziția din `/vuln <id>`
+*Unde se spune pe ecran, ca regula Sentinel și nu a SSVC:* marcajul din eticheta rândului
+(„🟡 Curând · regula Sentinel"; etichetele conduc cu ce are de făcut cel care citește — Acum,
+Curând, De urmărit\*, Ciclul obișnuit, Nedecis — iar numele SSVC, Act / Attend / Track\*, stau
+în detaliu și în legendă, niciodată lângă marcaj), motivul scurt („EPSS 99,2%, CISA veche" în
+tabele; „regula Sentinel · EPSS 99,2%" pe un rând de listă din Telegram, care n-are eticheta
+deasupra), legenda listei din Telegram (numai când un astfel de rând e pe ecran), propoziția din `/vuln <id>`
 și din detaliul panoului (cu data, vârsta, EPSS-ul, pragurile și ce ar fi dat SSVC), nota
 paginii de vulnerabilități (serverul și agregatorul) și nota cardului „galbene" din
 analize.

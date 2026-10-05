@@ -58,6 +58,9 @@ RISK_CASES = [
     {"decision": None, "missing": ["cve", "kev_mirror"], "possible": ["track", "act"]},
     {"decision": None, "missing": ["epss_stale"]},
     {"decision": None, "missing": ["assessment_error"]},
+    # The shape `risk._unassessable` really writes: the KEV cell must read "nu se știe" on
+    # both ends (a crashed assessment keeps yesterday's `kev`, so "nu" would be a guess).
+    {"v": 1, "missing": ["assessment_error"], "error": "KeyError: x"},
     {"decision": None, "missing": ["vulnrichment"], "possible": ["track", "attend"]},
     {"decision": None, "missing": ["exploitation_unpublished"], "possible": ["track", "track"]},
     {"decision": None},
@@ -88,13 +91,34 @@ RISK_CASES = [
      "overlay": {"basis": "epss_overlay", "ssvc_decision": "track"}},
     {"decision": "attend", "overlay": {"basis": "something_else"}},
     {"decision": "attend", "overlay": "not a mapping"},
+    # An overlay that cannot prove its observation is old: "nedatată", not "veche".
+    {"decision": "attend", "epss": {"p": 0.9},
+     "overlay": {"basis": "epss_overlay", "ssvc_decision": "track", "epss": 0.9,
+                 "observation_as_of": None, "observation_age_days": None}},
+    # The EPSS-only reason on a green is dropped below Sentinel's own threshold (0.5) and
+    # kept from it upwards; on amber/red it is always kept. Cases on both sides of the edge.
+    {"decision": "track", "epss": {"p": 0.4999}},
+    {"decision": "track", "epss": {"p": 0.5}},
+    {"decision": "track", "epss": {"p": 0.0024}},
+    {"decision": "attend", "epss": {"p": 0.0024},
+     "points": {"exploitation": {"value": "active", "basis": "epss"}}},
+    # Grey codes: duplicates collapse, unknown codes stay visible, and a code that is also
+    # a property of every JavaScript object must not turn into that property.
+    {"decision": None, "missing": ["cve", "kev_mirror", "cve"], "possible": ["track", "act"]},
+    {"decision": None, "missing": ["something_new"], "possible": ["track", "bogus"]},
+    {"decision": None, "missing": ["constructor", "toString"],
+     "possible": ["constructor", "track"]},
+    {"decision": None, "missing": []},
 ]
+KEV_CASES = [(True, "2026-10-12"), (True, None), (True, ""), (False, None)]
+COUNT_CASES = [(1, 3, 27), (0, 0, 0), (12, 0, 5)]
 COLORS = ["red", "amber", "green", "grey"]
 DECISIONS = ["act", "attend", "track_star", "track", None]
 
 BRIDGE = """
 import {
-  fmtEpss, fmtCvss, headline, greyReason, oneLiner,
+  fmtEpss, fmtCvss, fmtKev, headline, greyReason, greyDetail, reasonLine, ssvcName,
+  COLOR_STATE_RO, stateWithSsvc, pillTitle, legendStates, countsRo, KEV_UNKNOWN_NOTE_RO,
 } from "../lib/finding-risk.ts";
 const orNull = (r) => (Object.keys(r).length === 0 ? null : r);
 const cases = JSON.parse(process.argv[2]);
@@ -103,9 +127,19 @@ const out = {
   cvss: cases.cvss.map((c) => fmtCvss(c)),
   headline: cases.headline.map(([c, d]) => headline(c, d)),
   headline_risk: cases.risk.flatMap((r) => cases.headline.map(([c, d]) => headline(c, d, orNull(r)))),
-  grey: cases.risk.map((r) => greyReason(Object.keys(r).length === 0 ? null : r)),
-  one: cases.risk.flatMap((r) => cases.colors.map(
-    (c) => oneLiner(c, Object.keys(r).length === 0 ? null : r))),
+  grey: cases.risk.map((r) => greyReason(orNull(r))),
+  grey_detail: cases.risk.map((r) => greyDetail(orNull(r))),
+  reason: cases.risk.flatMap((r) => cases.colors.map((c) => reasonLine(c, orNull(r)))),
+  kev: cases.risk.flatMap((r) => cases.kev.map(([k, due]) => fmtKev(k, due, orNull(r)))),
+  ssvc: cases.decisions.map((d) => ssvcName(d)),
+  vocab: {
+    state: cases.colors.map((c) => COLOR_STATE_RO[c]),
+    with_ssvc: cases.colors.map((c) => stateWithSsvc(c)),
+    pill: cases.colors.map((c) => pillTitle(c)),
+    legend: legendStates(),
+    counts: cases.counts.map(([r, a, g]) => countsRo(r, a, g)),
+    kev_note: KEV_UNKNOWN_NOTE_RO,
+  },
 };
 process.stdout.write(JSON.stringify(out));
 """
@@ -127,6 +161,8 @@ def test_both_ends_write_the_same_words_for_the_same_inputs():
     cases = {
         "epss": EPSS_CASES, "cvss": CVSS_CASES, "risk": RISK_CASES, "colors": COLORS,
         "headline": [[c, d] for c in COLORS for d in DECISIONS],
+        "kev": KEV_CASES, "decisions": DECISIONS + ["bogus", "constructor"],
+        "counts": COUNT_CASES,
     }
     ts = _typescript(cases)
 
@@ -139,11 +175,35 @@ def test_both_ends_write_the_same_words_for_the_same_inputs():
     assert ts["headline_risk"] == [rv.headline(c, d, r or None)
                                    for r in RISK_CASES for c in COLORS for d in DECISIONS]
     assert ts["grey"] == [rv.grey_reason(r or None) for r in RISK_CASES]
-    assert ts["one"] == [rv.one_liner(c, r or None) for r in RISK_CASES for c in COLORS]
+    assert ts["grey_detail"] == [rv.grey_detail(r or None) for r in RISK_CASES]
+    py_reason = [rv.reason_line(c, r or None) for r in RISK_CASES for c in COLORS]
+    assert ts["reason"] == py_reason, [
+        (r, c, a, b) for (r, c), a, b in zip(
+            [(r, c) for r in RISK_CASES for c in COLORS], ts["reason"], py_reason) if a != b]
+    assert ts["kev"] == [rv.fmt_kev(k, due, r or None) for r in RISK_CASES
+                         for k, due in KEV_CASES]
+    assert ts["ssvc"] == [rv.ssvc_name(d) for d in DECISIONS + ["bogus", "constructor"]]
+    # The state NAMES (one word per state on every screen), the legend built from them, the
+    # pill tooltips, the count line and the KEV "does not know" sentence: the same text.
+    vocab = ts["vocab"]
+    assert vocab["state"] == [rv.COLOR_STATE_RO[c] for c in COLORS]
+    assert vocab["with_ssvc"] == [rv.state_with_ssvc(c) for c in COLORS]
+    assert vocab["pill"] == [rv.pill_title(c) for c in COLORS]
+    assert vocab["legend"] == rv.legend_states()
+    assert vocab["counts"] == [rv.counts_ro(*c) for c in COUNT_CASES]
+    assert vocab["kev_note"] == rv.KEV_UNKNOWN_NOTE_RO
+    assert vocab["counts"][0] == "Acum 1 · Curând 3 · Nedecis 27", vocab["counts"]
     # An empty comparison would pass for ever; these are the sizes we expect.
     assert len(ts["epss"]) == len(EPSS_CASES) >= 15
-    assert len(ts["one"]) == len(RISK_CASES) * len(COLORS)
-    # ... and the overlay really reached the comparison: at least one label and one
-    # reason carry Sentinel's name on both sides.
+    assert len(ts["reason"]) == len(RISK_CASES) * len(COLORS)
+    assert len(ts["kev"]) == len(RISK_CASES) * len(KEV_CASES)
+    # ... and the interesting branches really reached the comparison, on BOTH sides: the
+    # overlay (marker in the label, fact in the reason, "nedatată" when undated), a green
+    # whose EPSS line was dropped and one that kept it, a grey code that collides with an
+    # Object property, and the three KEV outcomes.
     assert any(rv.OVERLAY_TAG_RO in h for h in ts["headline_risk"])
-    assert any(o == rv.OVERLAY_REASON_RO for o in ts["one"])
+    assert any(o == "EPSS 99,2%, CISA veche" for o in ts["reason"])
+    assert any(o == "EPSS 90,0%, CISA nedatată" for o in ts["reason"])
+    assert any(o is None for o in ts["reason"]) and any(o == "EPSS 50,0%" for o in ts["reason"])
+    assert "constructor, toString" in ts["grey"]
+    assert {"da — 2026-10-12", "da", "nu", "nu se știe"} <= set(ts["kev"])

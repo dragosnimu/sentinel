@@ -102,7 +102,10 @@ def test_an_unknown_colour_word_is_drawn_grey_not_blank():
 # ---------------------------------------------------------------------------
 def test_the_red_message_says_what_became_red_and_why():
     msg = announce.build_red_message([_red()], host="gazda")
-    assert "1 vulnerabilitate a devenit roșie" in msg
+    assert "1 vulnerabilitate a ajuns la „Acum”" in msg
+    # The note names the state first and CISA's name in brackets, as everywhere else.
+    assert "Acum (Act): decizia CISA SSVC cea mai urgentă" in msg
+    assert "roșie" not in msg and "roșii" not in msg
     assert "<code>CVE-2025-29927</code>" in msg and "next" in msg
     assert "EPSS 99,2%" in msg and "CVSS 9,1 (trivy)" in msg
     assert "/vuln 7" in msg
@@ -113,7 +116,7 @@ def test_the_red_message_pluralises_and_orders_by_priority():
     msg = announce.build_red_message(
         [_red(cve="CVE-LOW", priority=81, id=1), _red(cve="CVE-HIGH", priority=99, id=2)],
         host="gazda")
-    assert "2 vulnerabilități au devenit roșii" in msg
+    assert "2 vulnerabilități au ajuns la „Acum”" in msg
     assert msg.index("CVE-HIGH") < msg.index("CVE-LOW")
 
 
@@ -122,7 +125,7 @@ def test_the_red_message_is_bounded_and_counts_the_rest():
     msg = announce.build_red_message(items, host="gazda")
     assert sum(1 for ln in msg.splitlines() if ln.startswith("🔴 <code>")) == announce.MAX_LISTED
     assert f"încă {30 - announce.MAX_LISTED}" in msg
-    assert "30 vulnerabilități au devenit roșii" in msg
+    assert "30 vulnerabilități au ajuns la „Acum”" in msg
 
 
 def test_the_red_message_survives_a_hostile_package_name():

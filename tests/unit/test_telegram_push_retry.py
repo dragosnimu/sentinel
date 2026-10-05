@@ -65,6 +65,10 @@ class _FakeBot:
         if self.fail:
             raise RuntimeError("simulated send failure")
         self.sent.append(chat_id)
+        # Ca Telegram: un `Message` cu număr. De la 5 octombrie 2026 un rând
+        # nu devine `sent` fără el, deci un dublu care întoarce `None` ar
+        # proba un transport pe care Telegram nu-l are.
+        return SimpleNamespace(message_id=9000 + len(self.sent))
 
 
 def _app(fail: bool = False):
@@ -191,7 +195,9 @@ def test_a_successful_send_marks_sent_not_failed():
     run(bot._push_notifications(app, _cfg(), db, quiet_chats=set()))
 
     sent = [u for u in db.updates if "state = 'sent'" in u[0]]
-    assert sent and sent[0][1] == (1,)
+    # (id, message_id, error): numărul mesajului vine de la Telegram, iar
+    # `error` rămâne gol fiindcă ambele chaturi l-au primit.
+    assert sent and sent[0][1] == (1, 9001, None)
 
 
 def test_a_row_not_yet_due_for_retry_is_left_alone():
@@ -239,7 +245,7 @@ def test_retry_after_is_honoured_with_one_extra_attempt(monkeypatch):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise RetryAfter(1)  # o so
-            return None
+            return SimpleNamespace(message_id=1234)
 
     sleeps = []
 

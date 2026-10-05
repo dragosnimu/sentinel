@@ -90,8 +90,8 @@
     },
     {
       "id": "ap2",
-      "desc_ro": "Verifică sintaxa configurației după actualizare",
-      "argv": ["nginx", "-t"],
+      "desc_ro": "Confirmă că unitatea nginx rulează înainte de reîncărcare",
+      "argv": ["systemctl", "is-active", "nginx.service"],
       "run_as": "root",
       "timeout_s": 30,
       "idempotent": true,

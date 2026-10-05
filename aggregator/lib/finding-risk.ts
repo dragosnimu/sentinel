@@ -44,20 +44,41 @@ const COLOR_EMOJI: Record<RiskColor, string> = {
   red: "🔴", amber: "🟡", green: "🟢", grey: "⚪",
 };
 
+/**
+ * Eticheta spune ce are de făcut cel care citește, nu numele din arborele CISA
+ * (`risk.DECISION_LABEL_RO`): „Attend — accelerat" urmat de „KEV" nu se citea ca o
+ * propoziție. Numele SSVC rămân în `DECISION_SSVC_NAME`, pentru tooltip.
+ */
 export const DECISION_LABEL_RO: Record<string, string> = {
-  act: "Act — acum",
-  attend: "Attend — accelerat",
-  track_star: "Track* — de urmărit",
-  track: "Track — ciclul obișnuit",
+  act: "Acum",
+  attend: "Curând",
+  track_star: "De urmărit*",
+  track: "Ciclul obișnuit",
 };
-const NO_DECISION_RO = "fără date";
+const NO_DECISION_RO = "Nedecis";
+
+/** Numele deciziei în vocabularul CISA SSVC (`risk.DECISION_SSVC_NAME`). */
+const DECISION_SSVC_NAME: Record<string, string> = {
+  act: "Act", attend: "Attend", track_star: "Track*", track: "Track",
+};
+
+/** Culoarea fiecărei decizii (`ssvc.COLOR_OF`). */
+const DECISION_COLOR: Record<string, RiskColor> = {
+  act: "red", attend: "amber", track_star: "green", track: "green",
+};
 
 /**
- * Eticheta pusă lângă o culoare urcată de regula Sentinel (`risk.py`, suprapunerea
- * EPSS): aceeași ca `risk_view.OVERLAY_TAG_RO`, pe orice ecran.
+ * Marcajul pus lângă o culoare urcată de regula Sentinel (`risk.py`, suprapunerea
+ * EPSS): același ca `risk_view.OVERLAY_TAG_RO`, pe orice ecran.
  */
-const OVERLAY_TAG_RO = "regula Sentinel, nu SSVC";
-const OVERLAY_REASON_RO = "regula Sentinel (EPSS)";
+const OVERLAY_TAG_RO = "regula Sentinel";
+
+/**
+ * Sub ce EPSS un verde nu mai are nimic de spus despre EPSS pe rândul lui. Egal cu
+ * `risk.OVERLAY_MIN_EPSS` (0,5), ca în `risk_view.NOTEWORTHY_EPSS`: paritatea îl
+ * ține la același loc cu cazuri de-o parte și de alta a pragului.
+ */
+const NOTEWORTHY_EPSS = 0.5;
 
 const SOURCE_RO: Record<string, string> = {
   redhat: "Red Hat", osv: "OSV", trivy: "trivy",
@@ -75,7 +96,8 @@ const MISSING_RO: Record<string, string> = {
   assessment_error: "evaluarea a eșuat",
 };
 
-const ONE_LINER_MISSING: Record<string, string> = {
+/** Ce lipsește, în două-trei cuvinte: textul unui gri într-o celulă de tabel. */
+const MISSING_SHORT_RO: Record<string, string> = {
   cvss: "fără CVSS", cvss_vector: "fără vector", epss: "fără EPSS",
   epss_stale: "EPSS vechi", cve: "fără CVE", kev_mirror: "KEV nelegibil",
   vulnrichment: "fără date CISA", exploitation_unpublished: "CISA n-a evaluat",
@@ -90,16 +112,24 @@ export function toColor(value: unknown): RiskColor {
 export type RiskView = {
   color: RiskColor;
   decision: string | null;
-  /** „Act — acum", „fără date". */
+  /** „🔴 Acum", „⚪ Nedecis", „🟡 Curând · regula Sentinel". */
   headline: string;
-  /** Un singur motiv scurt: „KEV", „EPSS 92,0%", „fără EPSS". */
-  oneLiner: string;
-  /** Doar pentru gri: „lipsește …; ar putea fi între Track și Act". */
+  /**
+   * A doua linie a celulei „Risc": „exploatat activ (KEV)", „EPSS 92,0%", sau `null`
+   * când n-ar spune nimic (un verde cu EPSS mic: cifra e în coloana EPSS). Pentru un
+   * gri e `greyReason`, mereu. Fără 🔁 — semnul vine din `rebootPending`.
+   */
+  reason: string | null;
+  /** Doar pentru gri, pe scurt: „fără CVE". */
   greyReason: string | null;
+  /** Tooltip-ul celulei: ce nu încape în ea (ce lipsește la un gri, a cui e decizia). */
+  detail: string | null;
   /** „CVSS 7,5 (Red Hat)" sau „fără CVSS". */
   cvss: string;
   /** „0,45% (percentila 37)" sau „fără EPSS". */
   epss: string;
+  /** „da — 2026-10-12", „nu", sau „nu se știe" (vezi `fmtKev`). */
+  kev: string;
   rebootPending: boolean;
 };
 
@@ -190,45 +220,193 @@ export function headline(
   const label = decision !== null && decision in DECISION_LABEL_RO
     ? DECISION_LABEL_RO[decision] : NO_DECISION_RO;
   const tag = decision === "attend" && overlayOf(risk, color) !== null
-    ? ` (${OVERLAY_TAG_RO})` : "";
+    ? ` · ${OVERLAY_TAG_RO}` : "";
   return `${COLOR_EMOJI[color]} ${label}${tag}`;
 }
 
-export function greyReason(risk: Record<string, unknown> | null): string | null {
+/** Numele SSVC al unei decizii („Attend"), sau `null` fără decizie ori una necunoscută. */
+export function ssvcName(decision: unknown): string | null {
+  return typeof decision === "string" ? own(DECISION_SSVC_NAME, decision) ?? null : null;
+}
+
+/**
+ * Numele unei STĂRI, unul singur pe orice ecran (`risk_view.COLOR_STATE_RO`): eticheta
+ * deciziei, nu numele culorii și nu o descriere a cauzei. „Roșu", „fără date" și „Nedecis"
+ * erau trei nume ale aceleiași stări, la trei clicuri una de alta. Cuvintele de culoare
+ * rămân doar ca argument de filtru (`?culoare=gri`) și în titlul unei pastile. Verdele are
+ * două decizii, deci grupa lui poartă ambele etichete.
+ */
+export const COLOR_STATE_RO: Record<RiskColor, string> = {
+  red: DECISION_LABEL_RO.act,
+  amber: DECISION_LABEL_RO.attend,
+  green: `${DECISION_LABEL_RO.track} / ${DECISION_LABEL_RO.track_star}`,
+  grey: NO_DECISION_RO,
+};
+
+/** Numele SSVC ale deciziilor unei culori („Track / Track*"), sau `null` la gri. */
+function ssvcNamesOf(color: RiskColor): string | null {
+  const names = (["track", "track_star", "attend", "act"] as const)
+    .filter((d) => DECISION_COLOR[d] === color).map((d) => DECISION_SSVC_NAME[d]);
+  return names.length > 0 ? names.join(" / ") : null;
+}
+
+/** Ca `risk_view.state_with_ssvc`: „Acum (Act)", „Nedecis". */
+export function stateWithSsvc(color: RiskColor): string {
+  const ssvcNames = ssvcNamesOf(color);
+  return ssvcNames === null ? COLOR_STATE_RO[color] : `${COLOR_STATE_RO[color]} (${ssvcNames})`;
+}
+
+/** Ca `risk_view.pill_title`: tooltip-ul unei pastile de culoare. */
+export function pillTitle(color: RiskColor): string {
+  const ssvcNames = ssvcNamesOf(color);
+  const what = ssvcNames === null ? "nu se poate decide: lipsesc date"
+    : `decizia CISA SSVC: ${ssvcNames}`;
+  return `${COLOR_LABEL_RO[color]} · ${what}`;
+}
+
+/**
+ * Legenda stărilor, din aceleași etichete pe care le scrie `headline` (ca
+ * `risk_view.legend_states`): o legendă scrisă de mână se poate abate de la ele fără ca
+ * nimic să se strice la vedere.
+ */
+export function legendStates(): string {
+  const parts = (["act", "attend", "track", "track_star"] as const).map((d) =>
+    `${COLOR_EMOJI[DECISION_COLOR[d]]} ${DECISION_LABEL_RO[d]} (${DECISION_SSVC_NAME[d]})`);
+  parts.push(`${COLOR_EMOJI.grey} ${NO_DECISION_RO} (lipsesc date)`);
+  return parts.join(" · ");
+}
+
+/** Ca `risk_view.counts_ro`: „Acum 1 · Curând 3 · Nedecis 27"; Nedecis apare mereu. */
+export function countsRo(red: number, amber: number, grey: number): string {
+  return `${COLOR_STATE_RO.red} ${red} · ${COLOR_STATE_RO.amber} ${amber} · `
+    + `${COLOR_STATE_RO.grey} ${grey}`;
+}
+
+/**
+ * De ce celula KEV poate spune „nu se știe" (`risk_view.KEV_UNKNOWN_NOTE_RO`). Fără „a eșuat":
+ * `scan-age.test.ts` caută cuvântul în toată pagina ca să prindă o scanare în curs anunțată
+ * ca eșec, iar legenda l-ar fi aprins.
+ */
+export const KEV_UNKNOWN_NOTE_RO = "nu s-a căutat: lista KEV n-a putut fi citită, rândul n-are CVE, "
+  + "evaluarea lui s-a oprit cu o eroare sau încă n-a fost făcută";
+
+/**
+ * Valoarea unei chei PROPRII a vocabularului. `MAP["constructor"]` e funcția lui `Object`,
+ * nu `undefined`: un cod „ce lipsește" cu un astfel de nume ar fi ajuns în pagină ca
+ * textul funcției. Python n-are problema (`dict.get`), deci paritatea o dovedește.
+ */
+function own(map: Record<string, string>, key: string): string | undefined {
+  return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : undefined;
+}
+
+/**
+ * Se poate spune „nu e în KEV"? Nu, dacă lista n-a putut fi citită, dacă rândul n-are
+ * CVE, dacă n-a fost evaluat niciodată sau dacă evaluarea a căzut (`assessment_error`:
+ * `kev` e atunci valoarea veche, nu o căutare de azi). Ca `risk_view._kev_unknown`.
+ */
+function kevUnknown(risk: Record<string, unknown> | null): boolean {
+  if (risk === null || Object.keys(risk).length === 0) return true;
+  return Array.isArray(risk.missing)
+    && risk.missing.some((m) => ["cve", "kev_mirror", "assessment_error"].includes(String(m)));
+}
+
+/**
+ * Celula KEV: „da — 2026-10-12", „nu", sau „nu se știe". „nu" se scrie numai când s-a
+ * căutat: un rând fără CVE, cu oglinda KEV lipsă ori veche sau a cărui evaluare a căzut nu
+ * poate fi „în afara" listei, iar un „nu" acolo ar liniști despre exact ce nu s-a verificat. Același text ca
+ * `risk_view.fmt_kev`.
+ */
+export function fmtKev(
+  kev: boolean, due: unknown, risk: Record<string, unknown> | null,
+): string {
+  if (kev) {
+    return "da" + (due !== null && due !== undefined && String(due) !== "" ? ` — ${String(due)}` : "");
+  }
+  return kevUnknown(risk) ? "nu se știe" : "nu";
+}
+
+/** Tot ce se știe despre un gri, într-o propoziție — textul lung, pentru tooltip. Ca
+ * `risk_view.grey_detail`. */
+export function greyDetail(risk: Record<string, unknown> | null): string | null {
   if (risk === null || Object.keys(risk).length === 0) return "încă neevaluată";
   if (risk.decision !== null && risk.decision !== undefined) return null;
   const missing = Array.isArray(risk.missing) ? risk.missing : [];
-  const parts = missing.map((m) => MISSING_RO[String(m)] ?? String(m));
+  const parts = missing.map((m) => own(MISSING_RO, String(m)) ?? String(m));
   let text = parts.length > 0 ? "lipsește " + parts.join(", ") : "decizia nu se poate lua";
   const possible = risk.possible;
   if (Array.isArray(possible) && possible.length === 2) {
-    const [low, high] = possible.map(
-      (p) => (DECISION_LABEL_RO[String(p)] ?? String(p)).split(" ")[0]);
+    const [low, high] = possible.map((p) => ssvcName(p) ?? String(p));
     text += low === high ? `; oricum ar fi ${low}` : `; ar putea fi între ${low} și ${high}`;
   }
   return text;
 }
 
-export function oneLiner(color: RiskColor, risk: Record<string, unknown> | null): string {
-  if (risk === null || Object.keys(risk).length === 0) return "neevaluat";
-  if (color === "grey") {
-    const missing = Array.isArray(risk.missing) ? risk.missing : [];
-    return ONE_LINER_MISSING[String(missing[0])] ?? "fără date";
+/** Ce lipsește, pe scurt — „fără CVE". Ca `risk_view.grey_reason`. */
+export function greyReason(risk: Record<string, unknown> | null): string | null {
+  if (risk === null || Object.keys(risk).length === 0) return "încă neevaluată";
+  if (risk.decision !== null && risk.decision !== undefined) return null;
+  const missing = Array.isArray(risk.missing) ? risk.missing : [];
+  const parts: string[] = [];
+  for (const m of missing) {
+    const text = own(MISSING_SHORT_RO, String(m)) || (own(MISSING_RO, String(m)) ?? String(m));
+    if (!parts.includes(text)) parts.push(text);
   }
+  return parts.length > 0 ? parts.join(", ") : "decizia nu se poate lua";
+}
+
+/** „EPSS 99,2%, CISA veche" — faptul din spatele unui galben al regulii Sentinel. Ca
+ * `risk_view.overlay_reason`. */
+function overlayReason(overlay: Record<string, unknown>): string {
+  const epss = numOrNull(overlay.epss) !== null ? "EPSS " + fmtEpss(overlay.epss) : "EPSS mare";
+  const asOf = overlay.observation_as_of;
+  const dated = typeof asOf === "string" && asOf !== ""
+    && numOrNull(overlay.observation_age_days) !== null;
+  return `${epss}, CISA ${dated ? "veche" : "nedatată"}`;
+}
+
+/**
+ * A doua linie a celulei „Risc", sau `null` când n-ar spune nimic: un verde al cărui
+ * singur motiv ar fi un EPSS mic nu primește linie (cifra e în coloana EPSS). Ca
+ * `risk_view.reason_line`. Un gri primește mereu linie: griul fără motiv ar citi „în
+ * regulă".
+ */
+export function reasonLine(color: RiskColor, risk: Record<string, unknown> | null): string | null {
+  if (color === "grey") return greyReason(risk) ?? "decizia nu se poate lua";
+  if (risk === null || Object.keys(risk).length === 0) return "neevaluat";
+  const overlay = overlayOf(risk, color);
+  if (overlay !== null) return overlayReason(overlay);
   const pts = obj(risk.points);
   const expl = pts === null ? null : obj(pts.exploitation);
   const basis = expl === null ? null : expl.basis;
-  const reboot = risk.reboot_pending === true ? " 🔁" : "";
-  if (color === "amber" && overlayOf(risk, color) !== null) return OVERLAY_REASON_RO + reboot;
-  if (basis === "kev") return "KEV" + reboot;
+  if (basis === "kev") return "exploatat activ (KEV)";
   if (basis === "vulnrichment" && expl !== null && expl.value === "active") {
-    return "CISA: exploatat" + reboot;
+    return "exploatat activ (CISA)";
   }
   const epss = obj(risk.epss);
-  if (epss !== null && epss.p !== null && epss.p !== undefined) {
-    return "EPSS " + fmtEpss(epss.p) + reboot;
+  const p = epss === null ? null : numOrNull(epss.p);
+  if (p !== null && (color !== "green" || p >= NOTEWORTHY_EPSS)) {
+    return "EPSS " + fmtEpss(epss === null ? null : epss.p);
   }
-  return "—" + reboot;
+  return null;
+}
+
+/**
+ * Tooltip-ul celulei „Risc": ce nu încape în ea. Agregatorul n-are un ecran de detaliu
+ * (cele patru puncte de decizie rămân pe server și în bot), deci aici stau doar a cui e
+ * decizia și, la un gri, tot ce lipsește. La un galben al regulii Sentinel NU se scrie
+ * „Attend": arborele a dat altceva, și asta se spune.
+ */
+function detailOf(
+  color: RiskColor, decision: string | null, risk: Record<string, unknown> | null,
+): string | null {
+  if (color === "grey") return greyDetail(risk);
+  const overlay = decision === "attend" ? overlayOf(risk, color) : null;
+  if (overlay !== null) {
+    return "Urcat de regula Sentinel, nu decis de CISA SSVC; SSVC singur ar fi dat "
+      + (ssvcName(overlay.ssvc_decision) ?? "altceva");
+  }
+  const name = ssvcName(decision);
+  return name === null ? null : `Decizie CISA SSVC: ${name}`;
 }
 
 /**
@@ -238,7 +416,7 @@ export function oneLiner(color: RiskColor, risk: Record<string, unknown> | null)
  */
 export function riskView(row: {
   risk_color?: unknown; risk_decision?: unknown; risk?: unknown;
-  epss?: unknown; epss_percentile?: unknown;
+  epss?: unknown; epss_percentile?: unknown; kev?: unknown; kev_due_date?: unknown;
 }): RiskView {
   const color = toColor(row.risk_color);
   const risk = parseRisk(row.risk);
@@ -255,10 +433,13 @@ export function riskView(row: {
     color: safeColor,
     decision: safeDecision,
     headline: headline(safeColor, safeDecision, risk),
-    oneLiner: oneLiner(safeColor, risk),
+    reason: reasonLine(safeColor, risk),
     greyReason: safeColor === "grey" ? greyReason(risk) ?? "decizia nu se poate lua" : null,
+    detail: detailOf(safeColor, safeDecision, risk),
     cvss: fmtCvss(risk === null ? null : risk.cvss),
     epss: fmtEpss(row.epss, row.epss_percentile),
+    // `=== 1`, nu adevăr: coloana e `TINYINT(1)` și `Boolean("0")` e ADEVĂRAT.
+    kev: fmtKev(Number(row.kev) === 1, row.kev_due_date, risk),
     rebootPending: risk !== null && risk.reboot_pending === true,
   };
 }

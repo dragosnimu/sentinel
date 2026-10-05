@@ -604,6 +604,61 @@ tbody td { padding: .72rem .95rem; border-bottom: 1px solid var(--border); }
 tbody tr:last-child td { border-bottom: none; }
 tbody tr:hover { background: var(--bg-hover); }
 tr.row-bad td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
+/* Celula „Risc" a listei de vulnerabilități: eticheta cea mai lungă („🟡 Curând · regula
+ * Sentinel") încape pe un rând, iar motivul de sub ea se rupe doar între cuvinte. Fără o
+ * lățime a ei, coloana cedează în fața celorlalte opt și eticheta devine o panglică.
+ * 13rem, nu 17: eticheta oricum nu se rupe (`.risc-eticheta`), iar la 17rem tabelul nu mai
+ * încăpea la 1700 px. */
+td.risc { min-width: 13rem; }
+/* Tabelul vulnerabilităților (`findings.html`): nouă coloane, cele mai multe cu text care nu
+ * se rupe (risc, severitate, CVE, fix). Măsurat în Edge, 1700 px,
+ * cinci rânduri cu valori ca cele de pe producție: zece coloane cu umplutura obișnuită ieșeau cu 484 px
+ * din pagină; cu nouă și cele de mai jos încap.
+ *   - umplutura laterală mai mică și un corp de literă mai mic decât al celorlalte tabele;
+ *   - celula CVE lasă linkurile de referință (NVD, CISA KEV) să treacă pe rândul de sub
+ *     identificator, dar identificatorul însuși nu se rupe la cratimă;
+ *   - eticheta „asociat cu" (`container · ghcr.io/…:1.101.1`) n-are spații, deci se rupe
+ *     oriunde, ca să nu lărgească ea coloana titlului.
+ *
+ * TITLUL ARE O PODEA. Cu opt coloane care nu se rup, titlul era restul: 173 px la 1700 px (Edge,
+ * 40 de rânduri cu titluri ca pe producție — 59% trec de 60 de caractere, 28% de 80 — și
+ * cifre EPSS ca fracții), deci un titlu de 62 de caractere avea patru rânduri, unul de 142 șapte
+ * (rând de 260 px), iar tabelul ieșea cu 9 px din încăpere. Acum titlul are `min-width` (15rem), iar
+ * ce cedează sunt: CVSS și EPSS, care au voie să se rupe între cuvinte („0,45%" / „(percentila 37)")
+ * dar nu sub o lățime a lor — fără `min-width`, algoritmul tabelului le lasă pe fiecare la cel
+ * mai lung cuvânt și „(percentila 37)" ajunge pe trei rânduri —, apoi umplutura (.6 → .5rem) și corpul
+ * de literă (.92 → .9rem). Același fixture: titlul 260 px, cel de 62 de caractere pe două rânduri,
+ * cel de 142 pe patru (rând de 164 px), fără depășire la 1700 px. KEV rămâne nerupt: „da — 2026-10-12"
+ * se rupea la cratimele datei. Identificatorii (CVE, pachet, fix) rămân întregi: o versiune ruptă la
+ * cratimă se citește greșit. Cine adaugă o coloană re-măsoară la 1700 și la 1366 px. La 1366 px nouă
+ * coloane nu încap oricum (`.table-scroll` derulează ~310 px; pagina însăși nu depășește): titlul, ultima
+ * coloană, e cea care iese, iar când ajunge în ecran are măcar podeaua, nu 173 px. */
+table.findings { font-size: .9rem; }
+table.findings th, table.findings td { padding-left: .5rem; padding-right: .5rem; }
+table.findings .asociat { overflow-wrap: anywhere; }
+table.findings td.cve > a:first-child { white-space: nowrap; }
+table.findings td.titlu { min-width: 15rem; }
+table.findings td.cvss { min-width: 6.5rem; }
+table.findings td.epss { min-width: 7.5rem; }
+/* FIX: coloana se rupe între versiuni, nu în ele. Fiecare versiune stă într-un `<span class="nowrap">`
+ * (`findings.html`), deci rândul se rupe doar la „, ". Înainte, `nowrap` pe toată celula o făcea
+ * cât cea mai lungă valoare: pe producție `fixed_version` are cel mult 135 de caractere (19 versiuni,
+ * symfony/mime), iar 10 rânduri din 648 treceau de 60 — și hotărau lățimea pentru toate. Măsurat
+ * în Edge cu rândurile reale (pagina 1: 200 de rânduri; cele 23 cu fix peste 40 de caractere),
+ * `--window-size=1700` (fereastra de 1700 px are 1670 px de viewport): coloana Fix 775 px → 172 px,
+ * `.table-scroll` derula 658 px → 30 px, titlul — 657 px în afara ecranului, deci invizibil — are
+ * acum 218 din 247 px în ecran; la un viewport de 1700 px (`--window-size=1730`) derulează 0. La 1366 px
+ * tot nu încape (derulează 364 px, titlul rămâne în afară): șase coloane de semnal + pachet + fix
+ * cer ~1130 px din cei 1013-1043 ai tabelului, iar titlul are nevoie de încă 247.
+ *   - `min-width` e podeaua, ca la titlu: sub ea o coloană cu versiuni scurte („2.4.1, 3.0.0")
+ *     ar ajunge la o versiune pe rând;
+ *   - `max-width` e plafonul: pe un ecran lat, algoritmul tabelului împarte surplusul după cât
+ *     ar încăpea pe un singur rând, iar Fix (775 px în cea mai lungă formă) lua 545-667 px din
+ *     2530 și lăsa titlul la 509-592; cu plafon, Fix 335-360 px și titlul 713-754.
+ * Un `max-width` pe o celulă de tabel nu e garantat de specificație; Edge îl respectă. Unde nu e
+ * respectat, rămâne comportamentul fără plafon (coloana mai lată pe ecran lat), nu o ruptură de versiune. */
+table.findings td.fix { min-width: 10rem; max-width: 22rem; }
+.risc-eticheta { white-space: nowrap; }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .card table tbody td { padding: .55rem 0; }
 .card table tbody tr:hover { background: transparent; }

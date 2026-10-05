@@ -4859,7 +4859,7 @@ async def check_risk_intel(db: Database) -> list[CheckResult]:
         results.append(CheckResult(
             "risk:pass", "Evaluarea riscului (semaforul SSVC)", "unknown",
             detail="nicio trecere de evaluare nu s-a încheiat încă: toate constatările "
-                   "sunt GRI („fără date”) până la prima. Pornește din mentenanța orară "
+                   "sunt „Nedecis” (lipsesc date) până la prima. Pornește din mentenanța orară "
                    "și din scanarea nocturnă.",
             action="journalctl -u sentinel-maintenance -n 80",
             facts={}))
@@ -4891,7 +4891,7 @@ async def check_risk_intel(db: Database) -> list[CheckResult]:
             results.append(CheckResult(
                 "risk:pass", "Evaluarea riscului (semaforul SSVC)", "ok",
                 detail=f"ultima trecere acum {_ago(age * 60)}"
-                       + (f"; {grey} constatări sunt GRI (fără date suficiente) — "
+                       + (f"; {grey} constatări sunt „Nedecis” (lipsesc date suficiente) — "
                           f"cifra e informativă, nu o defecțiune" if grey else ""),
                 facts=facts))
 
@@ -4936,7 +4936,7 @@ async def check_risk_intel(db: Database) -> list[CheckResult]:
             results.append(CheckResult(
                 "risk:vulnrichment", "CISA Vulnrichment nu a răspuns niciodată", "unknown",
                 detail="fără rând pentru CVE, punctul Exploitation nu se poate decide și "
-                       "constatarea e GRI („nu l-am întrebat încă”). Dacă `intel.enabled` "
+                       "constatarea e „Nedecis” („nu l-am întrebat încă”). Dacă `intel.enabled` "
                        "sau `intel.vulnrichment` e `false` în configurație, așa trebuie să "
                        "arate.",
                 action="journalctl -u sentinel-maintenance -u sentinel-scan | grep -i vulnrichment",
@@ -4980,7 +4980,7 @@ async def check_risk_intel(db: Database) -> list[CheckResult]:
                        + _idle_gone_note(detail_json, attempt_age)
                        + (", ultima trecere s-a oprit după eșecuri consecutive" if aborted else "")
                        + f". Ultima eroare: {str(vr_row.get('last_error') or '—')[:200]}. "
-                       "CVE-urile noi rămân GRI („nu l-am întrebat”) până se vindecă.",
+                       "CVE-urile noi rămân „Nedecis” („nu l-am întrebat”) până se vindecă.",
                 action="journalctl -u sentinel-maintenance -u sentinel-scan | grep -i 'căutări eșuate'",
                 facts=facts))
         elif canary == "exhausted":
@@ -5042,7 +5042,7 @@ async def check_risk_intel(db: Database) -> list[CheckResult]:
                        + _idle_gone_note(detail_json, attempt_age)
                        + (", ultima trecere s-a oprit după eșecuri consecutive" if aborted else "")
                        + f". Ultima eroare: {str(row.get('last_error') or '—')[:200]}. "
-                       "CVE-urile noi rămân fără scor (GRI) până se vindecă.",
+                       "CVE-urile noi rămân fără scor („Nedecis”) până se vindecă.",
                 action="journalctl -u sentinel-maintenance -u sentinel-scan | grep -i 'căutări eșuate'",
                 facts=facts))
         else:
