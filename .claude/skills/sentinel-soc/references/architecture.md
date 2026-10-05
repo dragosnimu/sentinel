@@ -92,9 +92,12 @@ Allowed operations — this is the complete list, and it is deliberately short:
 | `allow_ip` / `disallow_ip` | Manage the allowlist set |
 | `flush_blocklist` | Empty the blocklist (panic path) |
 | `list_sets` | Read current nftables set contents |
-| `backup_create` / `backup_restore` | Create or replay a restore point |
+| `backup_create` | Create one artifact of a restore point (`backup_finalize` seals it: checksums, `manifest.json`, `restore.sh`) |
+| `backup_restore` | REFUSED, always (kept registered so a call is audited as a refusal). It ran a caller-chosen archive and `tar` as root with no approval, and could replace the approval key or hand it to `sentinel`; a restore is `sudo bash <restore point>/restore.sh`, run by the operator |
 | `restore_drill_verify` | Extract a restore point's archives into an isolated, disposable directory and verify them — never `/`. Used by the monthly restore drill |
-| `patch_step_exec` | Execute one validated argv from an approved patch plan |
+| `patch_step_exec` | Execute one validated argv from an approved patch plan; a real call must name the registered step (`plan_hash` + `step_index`) it replays, and spends it (each approved step runs once). A package transaction (`dnf`/`apt-get`/`apt`) runs in a transient systemd unit; any other step that writes the filesystem is refused up front, because the executor's sandbox is read-only |
+| `transaction_outcome` | Read-only: what the executor recorded about the package transaction of one approved step (`recorded` / `running` / `unknown`) - asked by the runner when a step came back "not over" because the executor was restarted under it |
+| `plan_challenge` / `register_plan` | The two halves of an approval: the first says what would be approved and issues a nonce (inert); the second registers the plan's exact steps and needs the OPERATOR's token, an HMAC over the plan hash, the steps and the nonce, made with a key `sentinel` cannot read |
 | `service_action` | `start` / `stop` / `restart` / `reload` on a unit in the inventory |
 | `read_privileged_file` | Read a specific allowlisted path (e.g. `/var/log/audit/audit.log`) |
 

@@ -1,6 +1,6 @@
 """The complete set of privileged operations.
 
-Eighteen operations, and the list is deliberately short. Every one validates its
+Twenty operations, and the list is deliberately short. Every one validates its
 arguments through `policy` before touching anything, and every one returns a
 plain dict that the executor serialises.
 
@@ -233,12 +233,10 @@ def op_unblock_ip(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def op_allow_ip(args: dict[str, Any]) -> dict[str, Any]:
-    import ipaddress
-
-    try:
-        network = ipaddress.ip_network(str(args.get("ip", "")), strict=False)
-    except ValueError as exc:
-        raise PolicyRefusal(f"not a valid address: {exc}") from None
+    # Capped the same way a block is (policy.check_allowable): an allowlist
+    # entry with no width limit accepted 0.0.0.0/0, which would have turned
+    # off blocking entirely rather than protecting one address or range.
+    network = policy.check_allowable(str(args.get("ip", "")))
 
     set_name = "allowlist_v4" if network.version == 4 else "allowlist_v6"
     result = _run([NFT, "add", "element", "inet", "sentinel", set_name, f"{{ {network} }}"],
@@ -381,12 +379,33 @@ def op_patch_step_exec(args: dict[str, Any]) -> dict[str, Any]:
     it. This re-validates anyway: that validator runs on the untrusted side of
     the boundary, and a step arriving here is a request, not a fact.
 
+    A real (non-dry-run) call must also name the exact registered plan step it
+    is replaying — `plan_hash` + `step_index`, checked against what the
+    operator's signed token registered (`policy.register_plan_steps`) — and refuses if the argv does not match
+    byte-for-byte. See policy.py's "Plan binding" section and README.md
+    "Binding to an approved plan" for why argv-shape validation alone is not
+    enough: it says a command is well-formed, not that the operator approved
+    THIS one. A dry run is exempt — it never reaches `_run` below, so there is
+    nothing for the binding to protect, and `runner.py`'s own rule is that a
+    dry run needs no approval.
+
     A package transaction (`transient_unit.is_transaction`) is not run here at
     all: this process's sandbox is read-only exactly where a transaction writes,
     so it is handed, still as the argv this function validated, to
     `transient_unit.run`. That path enforces the plan binding and the audit
     trail itself and refuses unless a set of facts about the host holds; read
     its module docstring before touching this branch.
+
+    Anything else that WRITES (`policy.sandbox_refusal`) has nowhere to run: this
+    sandbox is read-only everywhere a plan may name. Such a step is refused here -
+    in a dry run as `refused_because`, in a real call as a refusal - instead of
+    being run to fail with "Read-only file system" and send the runner into a
+    rollback of a machine nothing had touched.
+
+    Every real step is SPENT by running: the same step of the same registration is
+    refused the second time. The runner never sends one twice (a dry run, which
+    sends no binding, is the only repetition), so a second call is a replay - and
+    an approval that is good for the next hour is not "approved once".
     """
     argv = policy.check_argv(args.get("argv"))
     timeout = int(args.get("timeout_s", 60))
@@ -405,20 +424,72 @@ def op_patch_step_exec(args: dict[str, Any]) -> dict[str, Any]:
         raise PolicyRefusal("a package transaction takes no working directory; it "
                             "always runs from /")
 
+    # A step that is not a package transaction runs in THIS sandbox; whether it can is
+    # a fact about the argv, decided before anything is spent or run.
+    cannot_run = None if transaction else policy.sandbox_refusal(argv)
+
     if args.get("dry_run"):
         report = {"dry_run": True, "would_run": argv, "cwd": cwd, "timeout_s": timeout}
         if transaction:
             # A dry run spawns nothing, so without this it would say "fine" for
             # a step the real run is going to refuse.
             report["transaction"] = transient_unit.dry_run_report()
+        if cannot_run:
+            report["refused_because"] = [cannot_run]
         return report
+
+    if cannot_run:
+        raise PolicyRefusal(f"{argv!r} cannot run on this host: {cannot_run}")
 
     if transaction:
         return transient_unit.run(argv, timeout_s=timeout, plan_hash=args.get("plan_hash"),
                                   step_index=args.get("step_index"), redact=_redact)
 
+    policy.consume_registered_step(args.get("plan_hash"), args.get("step_index"), argv)
+
     result = _run(argv, timeout=timeout, cwd=cwd)
     return {"argv": argv, "cwd": cwd, **result}
+
+
+def op_transaction_outcome(args: dict[str, Any]) -> dict[str, Any]:
+    """What became of the package transaction started for one approved step, as this
+    executor knows it (`transient_unit.transaction_outcome`). Read-only: the runner
+    asks it when a step came back `still_running_or_unknown`, so that what the
+    operator is told about a restart in the middle of an install is the executor's
+    own record and not a guess."""
+    return transient_unit.transaction_outcome(args.get("plan_hash"), args.get("step_index"))
+
+
+def op_plan_challenge(args: dict[str, Any]) -> dict[str, Any]:
+    """First half of an approval: say what exactly would be approved, and issue the
+    nonce the operator's token must cover.
+
+    Inert, and open to the same caller as every other operation: it makes nothing
+    runnable. See policy.py's "Plan binding, and who is allowed to approve a plan"
+    for what the second half (`register_plan`) then demands.
+    """
+    return {"challenge": True, **policy.challenge_plan_steps(args.get("plan_hash"), args.get("steps"))}
+
+
+def op_register_plan(args: dict[str, Any]) -> dict[str, Any]:
+    """Second half of an approval: approve one plan's exact commands for
+    `patch_step_exec` to run.
+
+    `approval_token` is the OPERATOR's HMAC over the plan hash, the digest of
+    these exact steps and the nonce `plan_challenge` issued - computed with a key
+    that is not readable by the account that calls this. A token for one set of
+    steps registers no other; a token is spent by the registration it authorises.
+    The audit row records the digest of what was approved (never the token), so the
+    chain says WHICH commands the operator's signature covered.
+    """
+    ttl = args.get("ttl_s", 3600)
+    steps = args.get("steps")
+    count = policy.register_plan_steps(args.get("plan_hash"), steps, ttl, args.get("approval_token"))
+    digest = policy.steps_digest(steps)
+    return {"registered": True, "plan_hash": args.get("plan_hash"), "step_count": count,
+            "ttl_s": ttl, "digest": digest,
+            "audit_detail": json.dumps({"steps_digest": digest, "step_count": count, "ttl_s": ttl},
+                                       sort_keys=True, separators=(",", ":"))}
 
 
 def op_backup_create(args: dict[str, Any]) -> dict[str, Any]:
@@ -636,32 +707,50 @@ def op_backup_prune(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def op_backup_restore(args: dict[str, Any]) -> dict[str, Any]:
-    """Replay one restore command, after verifying the artifact's checksum."""
-    import hashlib
+    """REFUSED, always. Kept in OPERATIONS so a call is answered and audited as
+    a refusal instead of vanishing as an unknown operation.
 
-    artifact = policy.check_path(args.get("artifact"), purpose="restore from")
-    expected = str(args.get("sha256", ""))
-    argv = policy.check_argv(args.get("restore_argv"))
+    What it was: replay one caller-chosen `restore_argv` as root, against a
+    caller-chosen `artifact`, with no approval and with `sha256` optional. What
+    that was worth, measured in a container on 5 October 2026 as the `sentinel`
+    account:
 
-    if not Path(artifact).exists():
-        return {"ok": False, "error": f"{artifact} does not exist"}
+      * WRITE. `tar -xzf {artifact} -C /var/lib/sentinel-executor` replaced
+        `approval.key` (Gate 1) with the caller's. Naming that directory in
+        `PROTECTED_PATHS` stops THAT argv - and nothing else: the same archive
+        run with `-C /` and a member `var/lib/sentinel-executor/approval.key`
+        writes the same file, because `check_argv` reads the argument list and
+        cannot see inside the archive. The same call wrote `/etc/sentinel`,
+        `/run/sentinel`, `/var/backups/sentinel` and `/dev/shm` as root.
+      * READ. `backup_create` of `<dir sentinel owns>/link/approval.key`, with
+        `link` a symlink to the executor's state, archives the real key
+        (`check_path` is lexical); `backup_restore` then extracted it into a
+        directory `sentinel` made, and `chmod` made it readable. The key left
+        the building.
 
-    if expected:
-        digest = hashlib.sha256()
-        with open(artifact, "rb") as handle:
-            for chunk in iter(lambda: handle.read(1 << 20), b""):
-                digest.update(chunk)
-        if digest.hexdigest() != expected:
-            # Restoring from a corrupt artifact is worse than not restoring:
-            # it replaces a known-broken state with an unknown one.
-            raise PolicyRefusal(
-                f"checksum mismatch for {artifact}: expected {expected}, "
-                f"got {digest.hexdigest()}. Refusing to restore."
-            )
+    Why refusing, not narrowing. Restricting `artifact` to BACKUP_ROOT does not
+    help: the READ above already used an artifact that `backup_create` made
+    there, and the WRITE needs only a destination. And there is no
+    caller to break: nothing in `sentinel/` sends this operation - the runner
+    does not execute `restore_argv`, the restore is `restore.sh`, run by the
+    operator as root outside this process. Inside this process the filesystem
+    is read-only except Sentinel's own state (`ProtectSystem=strict` plus
+    `ReadWritePaths`), so a replayed restore of a REAL path (`/etc/nginx`)
+    fails with EROFS; the only things it could ever restore were the files an
+    attacker most wants to replace.
 
-    argv = [artifact if part == "{artifact}" else part for part in argv]
-    result = _run(argv, timeout=1800)
-    return {"ok": result["exit_code"] == 0, "artifact": artifact, **result}
+    Bringing it back is a design decision, not a flag: it would have to be a
+    step of an approved plan (`plan_hash` + `step_index`, spent once, like
+    `patch_step_exec`), with the artifact resolved to a restore point this
+    process sealed, and a destination whose contents it checks - not an argv it
+    reads.
+    """
+    raise PolicyRefusal(
+        "backup_restore is disabled. It ran a caller-chosen archive as root inside "
+        "the executor's own sandbox, where the only paths it could change were "
+        "Sentinel's own state (the approval key, the audit chain, the configuration). "
+        "A restore is `sudo bash <restore point>/restore.sh`, run by the operator."
+    )
 
 
 def _reset_drill_root() -> None:
@@ -913,6 +1002,9 @@ OPERATIONS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "service_action": op_service_action,
     "read_privileged_file": op_read_privileged_file,
     "patch_step_exec": op_patch_step_exec,
+    "plan_challenge": op_plan_challenge,
+    "register_plan": op_register_plan,
+    "transaction_outcome": op_transaction_outcome,
     "backup_create": op_backup_create,
     "backup_finalize": op_backup_finalize,
     "backup_prune": op_backup_prune,

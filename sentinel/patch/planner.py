@@ -94,11 +94,13 @@ in words; nothing here turns it into a guarantee.
    configuration (a constant list would drift), and changing what the planner
    may offer is a product decision, not a repair. Until then a `kernel*` plan
    that says `false` validates and `window.py` refuses it — the right outcome.
-2. The executor sandbox cannot run dnf at all. `patch_executions` id 9 (plan 5)
-   failed on apply AND rollback with `Config error: [Errno 30] Read-only file
-   system: '/var/log/dnf.log'`: the deployed executor unit's `ReadWritePaths`
-   has no writable dnf log path. A plan that passes validation would still die
-   there; that is an install-time fix in `deploy/systemd/`, outside this file.
+2. (Resolved, kept as history.) The executor sandbox cannot run dnf at all:
+   `patch_executions` id 9 (plan 5) failed on apply AND rollback with `Config
+   error: [Errno 30] Read-only file system: '/var/log/dnf.log'`. A package
+   transaction now runs in a transient systemd unit with a writable root
+   (`executor/transient_unit.py`, `dnf` and `apt-get`/`apt`), and any other step
+   that writes the filesystem is refused up front - by the validator, so the plan
+   is never offered (`executor/policy.py:sandbox_refusal`).
 """
 
 from __future__ import annotations
@@ -351,6 +353,27 @@ def _update_recipe_doc(family: str) -> str:
     ]
     return "\n".join(lines)
 
+# What a plan step may WRITE with, per family, and what it may not. The second is the
+# list `executor/policy.py:sandbox_refusal` refuses (a test holds the two together:
+# every program it refuses is named here), so the model is told what the validator
+# will say before it spends an attempt finding out.
+_TRANSACTION_FORMS: dict[str, str] = {
+    "rhel": "`dnf` cu install/update/upgrade/downgrade/reinstall/remove",
+    "debian": "`apt-get` sau `apt` cu install/upgrade/dist-upgrade/remove/autoremove",
+}
+SANDBOX_REFUSED_DOC = (
+    "`tar` cu -c sau -x, `cp`, `mv`, `mkdir`, `install`, `chmod`, `chown`, `nginx -t`, "
+    "`dnf clean`/`check-update`/`makecache`, `apt-get update`/`apt update`"
+)
+
+
+def _run_budget_s() -> int:
+    """The number the validator enforces, read from the module that owns it - lazily,
+    so that importing the planner does not import the executor client."""
+    from sentinel.patch import approval
+    return approval.RUN_BUDGET_S
+
+
 # The template, not yet rendered: still carries `%%...%%` placeholders for
 # everything that depends on the host (family) or on another module's table
 # (the check-kind fields, the binary allowlist). `PLANNER_SYSTEM` below is this
@@ -373,8 +396,9 @@ REGULI ABSOLUTE — un plan care le încalcă este respins de validator, nu disc
    `systemctl` cere NUMELE COMPLET al unității — `nginx.service`, nu `nginx` —
    și doar acțiunile start/stop/restart/reload/status.
 3. Nu atinge niciodată: /opt/sentinel, /etc/sentinel, /var/lib/sentinel,
-   /var/backups/sentinel, /root/.ssh, /etc/ssh, /etc/passwd, /etc/shadow,
-   /etc/sudoers, /boot.
+   /var/lib/sentinel-executor, /var/backups/sentinel, /root/.ssh, /etc/ssh,
+   /etc/passwd, /etc/shadow, /etc/gshadow, /etc/sudoers, /etc/sudoers.d, /boot,
+   /etc/systemd/system/sentinel-executor.service.
 4. `preflight`, `health_check` și `post_verification` sunt verificări STRUCTURATE
    (obiecte cu `kind`), nu comenzi. Fiecare tip are câmpuri OBLIGATORII — dacă
    lipsește vreunul, planul e respins:
@@ -388,6 +412,18 @@ REGULI ABSOLUTE — un plan care le încalcă este respins de validator, nu disc
    pentru un operator care citește la 3 dimineața.
 10. Fiecare `id` (de pas sau de verificare) trebuie să respecte `^[a-z0-9_]{2,16}$`
     — MAXIM 16 caractere. `verifica_disc` da; `protected_asset_gate` nu.
+11. Pașii din `apply` și `rollback`, ca și verificările `command`, rulează în
+    sandbox-ul executorului, unde sistemul de fișiere e DOAR pentru citire. Singurele
+    comenzi care pot scrie sunt tranzacțiile managerului de pachete (%%TXN_FORMS%%).
+    NU pune în pași și nici în verificări: %%SANDBOX_REFUSED%% — pică cu «Read-only
+    file system» sau nu fac nimic real, iar validatorul le respinge. Fișierele se
+    salvează în secțiunea `backup`, nu într-un pas; un serviciu se repornește cu
+    `systemctl restart <unitate>.service` și se verifică cu o verificare `systemd`.
+12. Suma `timeout_s` a tuturor pașilor din `apply` și `rollback`, plus 30 s pentru
+    fiecare verificare care rulează o comandă (pentru `command`, `timeout_s`-ul ei),
+    trebuie să fie cel mult %%RUN_BUDGET%% s: aprobarea expiră după o oră, iar punctul
+    de restaurare consumă din ea. Un plan mai lung e respins; o tranzacție de pachete
+    nu are nevoie de obicei de mai mult de 600 s.
 
 STRUCTURA EXACTĂ a câmpurilor obligatorii:
 - `schema_version`: 1
@@ -446,6 +482,9 @@ def _render_system(family: str) -> str:
     text = text.replace("%%CHECK_FIELDS%%", _check_fields_doc())
     text = text.replace("%%BACKUP_KIND_DOC%%", _backup_kind_doc(family))
     text = text.replace("%%UPDATE_RECIPE%%", _update_recipe_doc(family))
+    text = text.replace("%%TXN_FORMS%%", _TRANSACTION_FORMS[family])
+    text = text.replace("%%SANDBOX_REFUSED%%", SANDBOX_REFUSED_DOC)
+    text = text.replace("%%RUN_BUDGET%%", str(_run_budget_s()))
     return text
 
 

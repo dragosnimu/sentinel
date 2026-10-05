@@ -31,7 +31,7 @@ plan stocat + hash
    ↓
 mesaj Telegram cu butoane
    ↓  ✅ Aplică  →  a doua confirmare (restatează ținta, downtime, backup)
-executor (root), pas cu pas
+semnătura operatorului (pe stația lui) → executor (root), pas cu pas
    ↓
 preflight → backup → apply → health check → post-verificare
    ↓ ✗ oricând
@@ -115,6 +115,11 @@ restatează ținta exactă:
 
 Tokenul de confirmare este single-use, cu TTL de 10 minute, și legat de
 `(chat_id, plan_id, plan_hash)`.
+
+**Două atingeri nu sunt o aprobare pe care executorul s-o accepte.** După ele, botul îți
+cere o semnătură făcută pe stația TA (`scripts/approve-plan.py`), care arată comenzile
+exacte înainte să semneze; vezi „Aprobarea unui plan: cheia operatorului, nu a gazdei” mai
+jos. Fără ea nu rulează nimic, oricât de compromis ar fi botul.
 
 **Dacă planul se regenerează, hash-ul se schimbă și toate butoanele din mesajele
 anterioare mor.** Nu poți aproba planul A și să se execute planul B.
@@ -231,10 +236,35 @@ completă chiar dacă procesul a murit la mijloc. Ultimul rând cu
 
 `status='rollback_failed'`. Cazul cel mai prost, și alertează întotdeauna.
 
+Mesajul din Telegram spune, în ordine: motivul, vorbele pasului care a eșuat (coada
+stderr-ului lui), ce a înregistrat EXECUTORUL pentru fiecare pas de aplicare care a rulat
+(un rând `transaction_end` cu `finished`, cod 0, verificat de systemd înseamnă că pachetul
+A FOST schimbat), și punctul de restaurare — id și cale. Nu spune „restaurează”: spune unde
+e `restore.sh` și că se rulează doar dacă starea reală o cere. Verifică întâi starea reală
+(`rpm -q <pachet>` / `dpkg -l <pachet>`), apoi decide:
+
 ```bash
 ls /var/backups/sentinel/
 sudo /var/backups/sentinel/<restore_point_id>/restore.sh
 ```
+
+### Nu s-a făcut rollback, și asta e corect
+
+Două stări care ARATAU ca „rollback_failed” și nu sunt:
+
+- **Primul pas de aplicare a fost REFUZAT de executor** (de pildă: aprobarea lui fusese deja
+  consumată). Un pas refuzat n-a rulat, deci n-a schimbat nimic: execuția iese `aborted`,
+  planul `failed`, mesajul spune „nimic nu a fost schimbat, deci nu s-a făcut rollback”.
+  Înainte, runner-ul făcea rollback pe o mașină neatinsă, rollback-ul era refuzat la rândul
+  lui și operatorul citea „restaurează manual” pentru un server care era în regulă.
+- **Executorul a fost repornit în mijlocul unei tranzacții de pachete** (`systemctl restart
+  sentinel-executor`, un `needrestart`, o actualizare a lui). Tranzacția rămâne a lui PID 1
+  și se poate termina cu succes; aprobările stau în memoria executorului și nu supraviețuiesc
+  repornirii, deci un rollback ar fi refuzat fără o aprobare nouă. Execuția iese `failed` cu un
+  „rezultat NECUNOSCUT”, fără rollback; runner-ul întreabă executorul (operația
+  `transaction_outcome`, doar citire) cum s-a încheiat tranzacția și afișează răspunsul lui —
+  rândul pe care l-a scris el în lanțul de audit. Pașii următori ai planului (verificările)
+  nu mai rulează: reaprobă planul ca să ruleze, sau verifică de mână.
 
 ### Patch-ul a reușit dar finding-ul persistă
 
@@ -311,18 +341,18 @@ poziționale), nu o listă de interdicții:
 
 | Binar | Formă permisă |
 |---|---|
-| `dnf` | `{upgrade,update,install,downgrade,reinstall,remove,clean,check-update,makecache}` + `-y`, `--setopt=install_weak_deps=False`, `--enablerepo=`/`--disablerepo=<nume simplu>`. Fără `.rpm`/`.deb` local, fără `-c`, fără `--installroot`, fără `dnf shell` |
-| `apt-get` / `apt` | `{install,upgrade,dist-upgrade,update,remove,autoremove}` + `-y`, `-o Dpkg::Options::=--force-confold`, `--allow-downgrades` (doar cu `install` și doar dacă FIECARE pachet are `=versiune`). Pachetul poate fi `nume[:arh][=versiune]`, versiunea strict `[A-Za-z0-9.+~:-]`. Fără `.deb` local (verificat pe specificația întreagă, deci și `foo=1.0.deb`), fără `--only-upgrade` |
+| `dnf` | `{upgrade,update,install,downgrade,reinstall,remove,clean,check-update,makecache}` (primele șase rulează în unitatea tranzitorie; `clean`/`check-update`/`makecache` sunt REFUZATE într-un pas de plan — vezi „Unde poate rula un pas”) + `-y`, `--setopt=install_weak_deps=False`, `--enablerepo=`/`--disablerepo=<nume simplu>`. Fără `.rpm`/`.deb` local, fără `-c`, fără `--installroot`, fără `dnf shell` |
+| `apt-get` / `apt` | `{install,upgrade,dist-upgrade,update,remove,autoremove}` (`update` e REFUZAT într-un pas de plan; restul rulează în unitatea tranzitorie, ca `dnf`) + `-y`, `-o Dpkg::Options::=--force-confold`, `--allow-downgrades` (doar cu `install` și doar dacă FIECARE pachet are `=versiune`). Pachetul poate fi `nume[:arh][=versiune]`, versiunea strict `[A-Za-z0-9.+~:-]`. Fără `.deb` local (verificat pe specificația întreagă, deci și `foo=1.0.deb`), fără `--only-upgrade` |
 | `rpm` | doar interogare/verificare: `-q`, `-qa`, `-V`, `--qf`/`--queryformat <format fără %( sau lua:>`. Fără `-i/-U/-e/--import/--dbpath/--root/--eval/--pipe` |
 | `dpkg-query` | `-W`, `-l`, `-s`, `-f`/`--showformat <format>` — nou în această rundă |
 | `dpkg` | doar `--compare-versions VERSION OP VERSION` — nou în această rundă |
 | `systemctl` | exact `systemctl ACȚIUNE UNITATE`, ACȚIUNE ∈ {start,stop,restart,reload,status,is-active}; `link`/`enable`/`mask`/`daemon-reload` refuzate, unități de tipul `sshd.service` refuzate — neschimbat din runda 1 |
-| `tar` | `-c`/`-x`/`-t` (exact unul) cu `-f`, `-z`/`-j`/`-J`/`--zstd`, `-C`/`--directory`, `--one-top-level`, `-p`, `--no-same-owner`/`--same-owner` — listă pozitivă, nu interdicții |
-| `cp`, `mv`, `mkdir` | un set restrâns de flag-uri obișnuite (recursiv, forțat, verbose, etc.) |
+| `tar` | `-c`/`-x`/`-t` (exact unul; într-un pas de plan doar `-t` — `-c`/`-x` scriu și sunt REFUZATE, vezi „Unde poate rula un pas”) cu `-f`, `-z`/`-j`/`-J`/`--zstd`, `-C`/`--directory`, `--one-top-level`, `-p`, `--no-same-owner`/`--same-owner` — listă pozitivă, nu interdicții |
+| `cp`, `mv`, `mkdir` | un set restrâns de flag-uri obișnuite (recursiv, forțat, verbose, etc.). Scriu: REFUZATE într-un pas de plan |
 | `install` | flag-uri obișnuite; **fără `--strip-program=`** — rulează comanda dată ca root, echivalentul lui `--to-command` la tar |
 | `chmod` | modul (poziția întâi) trebuie octal sau simbolic recunoscut; fără `--reference=` |
 | `chown` | proprietarul (poziția întâi) trebuie `user[:grup]`, fără `/` |
-| `nginx` | exact `nginx -t` — reload/restart trec prin `systemctl` |
+| `nginx` | exact `nginx -t` — reload/restart trec prin `systemctl`. Într-un pas de plan e REFUZAT: își deschide jurnalele și își face directoare temporare, iar în sandbox pică cu «Read-only file system» pe o configurație bună |
 | `test` | exact `test -e CALE` — singura formă pe care `sentinel/patch/checks.py` o construiește |
 | `sha256sum` | exact `sha256sum CALE` — la fel |
 
@@ -340,6 +370,82 @@ Adăugarea unui binar înapoi pe listă e o decizie separată, cu gramatică
 proprie scrisă și testată — nu un efect secundar al altui bilet (vezi §3 mai
 sus, care spunea deja asta despre `dpkg`/`dpkg-query` înainte să fie
 adăugate).
+
+### Unde poate rula un pas de plan, și ce primești pe fiecare gazdă
+
+Un pas rulează în unul din două locuri, hotărât din argv-ul lui:
+
+- o **tranzacție de pachete** (`dnf` cu `upgrade/update/install/downgrade/reinstall/remove`;
+  `apt-get`/`apt` cu `install/upgrade/dist-upgrade/remove/autoremove`) merge într-o unitate
+  systemd tranzitorie, cu rădăcina scriibilă (`executor/transient_unit.py`);
+- **orice altceva** rulează în sandbox-ul executorului (`ProtectSystem=strict`): `/`, `/usr`,
+  `/etc`, `/var` și `/run` sunt doar-citire acolo.
+
+Măsurat pe 5 octombrie 2026, ca `sentinel`, cu executorul real sub propria unitate (container
+AlmaLinux 9.8 și container Ubuntu 24.04), cu un plan aprobat:
+
+| Pas | Rezultat în sandbox |
+|---|---|
+| `mkdir /var/lib/x`, `chmod`/`chown`/`mv`/`cp` sub `/etc` | cod 1, `Read-only file system` |
+| `tar -czf /var/backups/x.tar.gz -C / etc/y` | cod 2, `Cannot open: Read-only file system` |
+| `nginx -t` | cod 1, `open() "/var/log/nginx/error.log" failed (30: Read-only file system)` |
+| `dnf check-update` / `clean all` / `makecache` | cod 1, `Read-only file system: '/var/log/dnf.log'` |
+| `mkdir -p /tmp/x` | cod 0 — și `/tmp/x` nu există nicăieri în afara executorului (`/tmp` e privat) |
+| `apt-get update` (Ubuntu, într-o unitate cu aceeași sandbox) | cod 0 (!) cu `W: Problem unlinking ... Read-only file system`, fără nimic reîmprospătat; `apt-get install` pică cu cod 100 la `/var/cache/apt/archives/partial` |
+| `rpm -q`, `sha256sum`, `test -e`, `systemctl is-active/restart` | merg (citesc, sau cer ceva lui PID 1) |
+
+Primele cinci erau defectul: dry-run-ul spunea „ar rula”, pasul real pica, iar runner-ul făcea
+rollback pe o mașină neatinsă (și apoi raporta rollback-ul ca eșuat). Planul real nr. 1 de pe n8n
+avea ca pas de aplicare `tar -czf /var/backups/polkit-1.tar.gz -C / etc/polkit-1`.
+
+**Un pas care scrie și nu e tranzacție de pachete e refuzat devreme, în patru locuri, de aceeași
+funcție** (`executor/policy.py:sandbox_refusal`, ca să nu poată ajunge la păreri diferite):
+
+1. **validatorul** — eroarea `step_cannot_run`, cu calea pasului (`$.argv[id=ap2]`), la generare, la
+   primul tap („Aplică…”) și la rularea runner-ului; planificatorul vede eroarea la a doua încercare;
+2. **provocarea** (`plan_challenge`) și **înregistrarea** — operatorului nu i se cere să semneze:
+   `steps[3] [...] cannot run on this host: ...`;
+3. **dry-run-ul** — `refused_because` în rezultat, deci un dry-run roșu cu motivul executorului;
+4. **apelul real** — refuz, nu cod de ieșire 1; aprobarea NU se consumă.
+
+Textul, ca să-l recunoști: *„`mkdir` writes the filesystem, and a plan step that is not a package
+transaction runs inside the executor's sandbox, where every path a plan may name is read-only: it
+fails with 'Read-only file system' (or, under /tmp, appears to succeed in a private directory nobody
+else can see). Files are saved by the plan's `backup` section and changed by the package manager;
+only a package transaction has a unit that can write”*, iar în Telegram, la primul tap: „Planul #N nu
+mai trece validarea și nu poate fi aprobat; niciun token de confirmare nu a fost emis”, cu primele
+trei erori. `restore_argv` din secțiunea `backup` NU e judecat de regula asta: nu-l trimite runner-ul,
+e calea manuală scrisă în `restore.sh`, iar `tar -x` e exact ce trebuie acolo.
+
+**Pe fiecare gazdă, după asta:**
+
+- **producție (AlmaLinux, `dnf`)**: tranzacțiile de pachete rulează în unitate, cu verdictul lui
+  PID 1 (dovedit cap-coadă în container: planul ajunge `applied`, iar `rpm -q`, întrebat de test,
+  confirmă). Un plan cu pași de fișier (`tar`, `cp`, `mkdir`...) sau cu `nginx -t` ca verificare nu
+  mai e oferit; un plan stocat înainte de regulă iese `rejected_invalid` la rulare și e refuzat la
+  primul tap.
+- **n8n (Ubuntu, `apt-get`)**: `apt-get`/`apt` `install/upgrade/dist-upgrade/remove/autoremove` rulează
+  acum în aceeași unitate (înainte `is_transaction(['apt-get', ...])` era `False`: pasul mergea în
+  sandbox și pica cu cod 100 la `/var/cache/apt/archives/partial` — «Read-only file system» —, deci pe gazda asta NU
+  se putea aplica nimic).
+  Dovedit pe Ubuntu 24.04 (gazda are 26.04 — neverificat acolo): `apt-get -y install pachet=versiune`,
+  rollback `apt-get -y remove`, `-o Dpkg::Options::=--force-confold`, versiuni cu `~`.
+  `needrestart` (pus implicit pe Ubuntu) repornește el însuși serviciile după o actualizare de
+  bibliotecă: rulat ca hook-ul apt (`needrestart -m u`) DIN AFARA unității, după înlocuirea unei
+  biblioteci, a repornit `sentinel-executor` (măsurat). ÎN unitate nu face nimic azi — spune „No services
+  need to be restarted”, cu sau fără `NEEDRESTART_MODE=l` — fiindcă unitatea renunță la `CAP_SYS_PTRACE` și
+  nu poate citi hărțile de memorie ale altor procese. Linia `NEEDRESTART_MODE=l` e a doua garanție și e
+  dovedită doar pentru cazul în care prima cade: cu `CAP_SYS_PTRACE` redat și fără linie, executorul E
+  repornit în mijlocul tranzacției (proba capăt-la-capăt pică); cu linia, trece. Consecința pe n8n: o
+  actualizare de bibliotecă nu repornește servicii care o folosesc și nici nu le semnalează — singura
+  repornire e cea din planul însuși (și ce repornesc scriptletele pachetului), ca după `dnf`.
+  `DEBIAN_FRONTEND=noninteractive` e setat ca să nu depindă rezultatul de lanțul de rezervă al lui debconf
+  (măsurat cu `postfix`: și fără el instalarea se încheie, după ce încearcă Dialog, Readline, Teletype); nu s-a
+  dovedit necesar.
+
+**Decizii care rămân ale operatorului** (nu sunt luate aici): rutarea în unitate a altor binare
+(`cp`, `mv`, `chmod`, `tar -x`...) ar lărgi ce poate fi cerut rădăcinii neconfinate; la fel
+`dnf makecache`/`apt-get update`. Până atunci sunt refuzate devreme, nu rulate ca să pice.
 
 ### Actualizarea unui pachet Debian e fixată pe versiune, în ambele direcții
 
@@ -416,46 +522,111 @@ amândouă root:root 0644, deci partea neprivilegiată citește regulile fără 
 poată schimba. Pasul verifică apoi importul chiar ca utilizatorul `sentinel`,
 nu doar prezența fișierului.
 
-### Legarea `patch_step_exec` de un plan aprobat
+### Aprobarea unui plan: cheia operatorului, nu a gazdei
 
 O gramatică spune că o comandă e bine formată. Nu spune că operatorul a
 aprobat-o PE ACEEA. `dnf -y install un-pachet-plauzibil` trece de gramatică
 fără să fi trecut vreodată prin cele două confirmări din Telegram.
 
-Executorul are acum un registru în memorie: `register_plan(plan_hash, steps,
-ttl_s, approval_token)`, unde `approval_token` e HMAC-SHA256 peste
-`plan_hash` cu cheia `SENTINEL_EXECUTOR_APPROVAL_KEY` din
-`/etc/sentinel/secrets.env`. Un apel REAL (nu dry-run) către `patch_step_exec`
-trebuie acum să trimită `plan_hash` + `step_index`, iar executorul refuză
-dacă argv nu e identic, byte cu byte, cu pasul înregistrat la acel index.
-Dry-run rămâne fără nevoie de aprobare — nu execută nimic, deci n-are ce
-proteja legarea.
+Executorul ține un registru în memorie al comenzilor aprobate. Un apel REAL (nu
+dry-run) către `patch_step_exec` trebuie să trimită `plan_hash` + `step_index`, iar
+executorul refuză dacă argv nu e identic, byte cu byte, cu pasul înregistrat la acel
+index. Dry-run rămâne fără nevoie de aprobare — nu execută nimic.
 
-**Linia necesară în `secrets.env`** (instalatorul trebuie s-o genereze —
-neschimbat aici, `deploy/install.sh` nu e proprietatea acestei runde):
+**Cine poate înregistra comenzi** a fost defectul. Vechea schemă semna `plan_hash` cu o
+cheie din `/etc/sentinel/secrets.env` (`0640 root:sentinel`): contul `sentinel` —
+botul, interfața web, conducta de detecție — o citea, deci oricine compromitea oricare
+dintre ele își putea semna singur aprobarea. Jetonul mai acoperea doar hash-ul, nu
+comenzile: o semnătură pentru un plan înregistra comenzile oricărui altul
+(`dnf -y remove openssh-server` a fost înregistrat sub hash-ul altui plan).
+
+**Schema de acum.** Cheia de aprobare stă în două locuri: la tine, pe stația ta, și într-un
+fișier doar-root pe gazdă (`/var/lib/sentinel-executor/approval.key`, în același director
+`0700 root:root` ca lanțul de audit, pe care `sentinel` nici nu-l poate traversa).
+Aprobarea unui plan are patru pași:
+
+1. După cele două atingeri (și PIN-ul, dacă e activ), botul cere executorului să descrie
+   ce s-ar aproba (`plan_challenge`) și îți trimite o **cerere**: un rând care începe cu
+   `SENTINEL-APPROVAL-V1:`.
+2. Pe stația ta rulezi `python scripts/approve-plan.py sign`, lipești cererea, și scriptul
+   **recalculează** rezumatul comenzilor, **le tipărește în ordine** și îți cere primele
+   opt cifre ale rezumatului. Citește comenzile acolo — nu cele din Telegram: un bot
+   compromis poate minți în mesaj, dar nu poate pune în cerere altă comandă decât cea pe
+   care o vezi tu.
+3. Scriptul tipărește un **jeton** (HMAC-SHA256 peste hash-ul planului, rezumatul
+   comenzilor și un nonce emis de executor). Îl trimiți botului ca răspuns la cerere.
+4. Executorul verifică jetonul cu cheia lui și înregistrează comenzile. Jetonul acoperă
+   exact comenzile pentru care a fost calculat, și se consumă: o copie (istoricul
+   chatului, un jurnal) nu mai autorizează nimic a doua oară.
+
+**Pregătirea, o singură dată.**
 
 ```
-SENTINEL_EXECUTOR_APPROVAL_KEY=<hex aleator de minim 32 octeți, ex. openssl rand -hex 32>
+python scripts/approve-plan.py init        # pe stația ta: face ~/.sentinel/approval.key
+python scripts/approve-plan.py show-key    # tipărește cheia, ca s-o pui pe gazdă
 ```
 
-**Fără cheie, `patch_step_exec` e dezactivat pe gazda aia** — orice apel real
-refuză, cu un motiv explicit, nu o eroare ambiguă. Închis implicit, nu deschis
-implicit.
+Apoi, pe gazdă, ca root (lipești cheia când ți se cere; nu ajunge în argv și nici în
+istoricul shell-ului):
 
-**Cablarea rămasă, pentru runda care deține `runner.py`/`checks.py`:**
-`sentinel/patch/runner.py` trebuie să apeleze
-`ExecutorClient.register_plan(plan_hash, steps, ttl_s=…, approval_token=…)`
-o dată, imediat după ce planul e confirmat aprobat (lângă verificarea
-`row.status != "approved"` din `run_plan`), cu `steps` fiind lista aplatizată
-a TUTUROR comenzilor pe care planul le va trimite spre `patch_step_exec` — nu
-doar `apply`/`rollback`, ci și verificările `command`/`systemd`/`file_exists`/
-`file_absent`/`file_sha256` pe care `sentinel/patch/checks.py` le construiește
-pentru `preflight`/`health_check`/`post_verification`. Fiecare apel către
-`patch_step_exec`, din ambele fișiere, trebuie apoi să trimită `plan_hash` +
-indicele corespunzător din acea listă aplatizată. **Până nu se face asta în
-ambele fișiere, o rulare `mode="apply"` refuză la primul preflight real** —
-un `mode="dry_run"` rămâne neafectat, pentru că verificările sunt simulate
-local în `runner.py` fără să atingă executorul. Textul exact al liniei și
-limitarea recunoscută (uid-ul `sentinel` poate citi aceeași cheie din
-`secrets.env`) sunt în `executor/README.md`, secțiunea „Binding to an
-approved plan".
+```
+sudo sh -c 'umask 077; read -r K && printf "%s\n" "$K" > /var/lib/sentinel-executor/approval.key'
+```
+
+Verifică efectul, nu intenția: `sudo -u sentinel test -r /var/lib/sentinel-executor/approval.key`
+trebuie să răspundă „nu” (cod 1), iar un **Dry-run** din Telegram pe un plan cu un pas
+`dnf` trebuie să iasă verde — dacă poarta e închisă, dry-run-ul spune de ce, cu vorbele
+executorului. Fără cheie, executorul refuză orice cerere și spune că nu e înrolată nicio
+cheie: **o gazdă fără cheie nu poate aplica nimic**, nu aplică fără să fi aprobat cineva.
+
+**Schimbarea cheii.** `init` nu suprascrie o cheie existentă (una nouă ar invalida-o pe cea
+de pe gazdă fără să-ți spună). Ca s-o schimbi: șterge `~/.sentinel/approval.key`, rulează
+`init` din nou și repetă comanda de pe gazdă — fișierul de acolo e suprascris. Aprobările
+deja înregistrate rămân valabile până expiră (cel mult o oră).
+
+**Ce nu se mai citește.** `SENTINEL_EXECUTOR_APPROVAL_KEY` din `secrets.env` nu mai e
+citită de nimic. Dacă o ai acolo de la vechea schemă, șterge linia: o cheie citibilă de
+`sentinel` nu dovedește nimic.
+
+**Fereastra.** Aprobarea trăiește în executor cel mult 3600 s, iar punctul de restaurare
+rulează înăuntrul ei. Un plan ale cărui timeouturi declarate însumează peste 2400 s
+(`approval.RUN_BUDGET_S`: aplicarea ȘI revenirea ȘI verificările cu comandă, cazul cel mai
+rău) e o **eroare de validare** (`run_budget_exceeded`, cu cifrele), nu un refuz la prompt-ul de
+semnare: planul nu se oferă, iar planificatorul primește cifra în prompt (regula 12) și în
+erorile reinjectate la a doua încercare. Înainte, planul nr. 1 de pe n8n (2700 s) era refuzat
+abia după două atingeri și PIN, fără nicio cale de a-l scurta; celelalte nouă planuri măsurate
+pe 5 octombrie (990–2190 s) încap. O aprobare expirată la jumătate ar lăsa un sistem pe
+jumătate modificat, cu revenirea refuzată. Registrul e în memorie: o repornire a executorului
+cere o aprobare nouă (deliberat — o repornire e un motiv să te uiți din nou).
+
+**Fiecare pas aprobat rulează o singură dată.** Orice pas real — nu doar tranzacțiile de
+pachete — consumă înregistrarea lui: același pas din aceeași înregistrare e refuzat a doua oară
+(`has already been executed`). Măsurat înainte: `systemctl restart systemd-logind.service`,
+înregistrat o dată cu TTL de o oră, a rulat la încercările 0, 1 și 2. Dry-run-ul nu trimite
+legătura și nu consumă nimic. TTL-ul îl alege clientul (cel mult 3600 s) și nu e acoperit de
+jeton: cel mai rău lucru pe care îl poate alege e maximul; fiecare pas rulează oricum o dată.
+
+**Ce poate face încă un atacator care deține contul `sentinel`:**
+
+- poate cere „provocări” (inerte), poate înlocui provocarea în așteptare a unui plan și
+  poate umple tabela de provocări (16) — deci poate bloca aprobările, ceea ce putea face
+  oricum oprind botul;
+- te poate ruga să semnezi ceva — de aceea comenzile le citești pe stația ta;
+- **poate folosi socketul docker.** `sentinel` e în grupul `docker`, care pe gazda asta
+  înseamnă root: un `docker run -v /:/host` citește cheia sau rulează direct comanda.
+  Asta NU e închis de schema de mai sus și nu e înrăutățit de ea; e subiectul raportului
+  despre grupul `docker`. Până se schimbă apartenența, schema ține împotriva unui atacator
+  care rămâne în contul `sentinel`, nu împotriva unuia care folosește socketul;
+- poate face tot ce nu e `patch_step_exec` (blocarea unei adrese, o acțiune de serviciu) —
+  alte operații, cu propria lor politică. Una dintre ele nu avea: `backup_restore` rula ca
+  root o arhivă și un `tar` alese de apelant, fără aprobare, și a putut înlocui cheia sau
+  i-a dat-o lui `sentinel` (reprodus în container pe 5 octombrie 2026). Acum REFUZĂ mereu;
+  restaurarea e `restore.sh`, rulat de operator. Asta închide acea cale, nu poarta în
+  ansamblu: socketul docker de mai sus rămâne.
+
+`sentinel/patch/runner.py` și `sentinel/patch/checks.py` trimit `plan_hash` + indexul pe
+fiecare apel real, inclusiv pe verificările de preflight, health și post-verificare și pe
+pașii de rollback; indexul vine din lista aplatizată a planului
+(`sentinel/patch/approval.py:flatten`), aceeași pe care a semnat-o operatorul. Un dry-run
+nu trimite nimic, iar un dry-run al unui pas `dnf` spune acum, în rezultat, de ce ar fi
+refuzat pasul real — nu mai iese verde pentru un apply care va fi refuzat.

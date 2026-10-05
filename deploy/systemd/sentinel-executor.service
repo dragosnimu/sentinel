@@ -91,7 +91,22 @@ PrivateDevices=false
 
 # Every path it may write. Adding one here is a security decision, not a
 # convenience: this is the list of things root-level Sentinel can modify.
-ReadWritePaths=/var/backups/sentinel /var/lib/sentinel /run/sentinel /etc/sentinel
+#
+# -/var/lib/sentinel-executor: the "-" does NOT make a missing directory
+# tolerable, and an earlier version of this comment said it did. Measured in a
+# container on 5 October 2026: with the directory removed, the unit starts,
+# `_prepare_audit_dir` tries to create it, and under ProtectSystem=strict the
+# executor CANNOT (/var is read-only here) - it logs "cannot prepare the audit
+# directory", exits 1 (status=1/FAILURE) and systemd restarts it in a loop. Without
+# the "-" systemd would fail earlier, at namespace setup (226/NAMESPACE); what the
+# "-" buys is the executor's own readable log line instead of a namespace error,
+# nothing more. The directory is created by systemd-tmpfiles
+# (deploy/tmpfiles/sentinel.conf), and production is safe only because
+# deploy/install.sh applies tmpfiles BEFORE it starts this unit; anything that
+# starts the unit on a host where that has not happened gets the loop.
+# /var/lib/sentinel stays in this list for the audit chain's one-time migration
+# read from its old, pre-fix location.
+ReadWritePaths=/var/backups/sentinel /var/lib/sentinel -/var/lib/sentinel-executor /run/sentinel /etc/sentinel
 
 RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
 
@@ -104,6 +119,21 @@ IPAddressDeny=any
 MemoryMax=192M
 TasksMax=64
 OOMPolicy=stop
+
+# A patch step's own timeout can run up to 3600s (executor/commands.py,
+# op_patch_step_exec). Without this, `systemctl stop`/a reboot/an upgrade
+# sends SIGTERM, the default 90s TimeoutStopSec elapses while that step is
+# still legitimately running as root, and systemd SIGKILLs the process —
+# which is a mid-step kill with no audit row for the operation in flight
+# (sentinel_executor.py drains in-flight requests on SIGTERM specifically so
+# that row gets written, but it cannot do that if it is killed first).
+# KillMode=mixed sends SIGTERM to the main process only; if the drain has not
+# finished by TimeoutStopSec, SIGKILL goes to every process in the unit's
+# cgroup, not just the main one — the default KillMode=control-group would
+# already do that, but naming it states the intent rather than relying on the
+# default.
+KillMode=mixed
+TimeoutStopSec=3700
 
 StandardOutput=journal
 StandardError=journal

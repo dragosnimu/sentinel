@@ -39,13 +39,17 @@ def _async(fn):
 
 
 def _plan_row(id_=1, *, reversible_declared=True, backup_path=True):
-    plan = {
-        "target": {"asset_name": "web-1", "stack": "rpm"},
-        "risk": {"reversible": reversible_declared, "blast_radius": "single host"},
-        "backup": ([{"kind": "path", "path": "/etc/nginx"}] if backup_path else
-                  [{"kind": "rpm_state", "package": "nginx"}]),
-        "apply": [], "rollback": [],
-    }
+    # A plan that PASSES the validator: the first tap re-validates every plan (a plan that
+    # cannot be approved is never offered), so a stub with `apply: []` would be refused
+    # there and these tests would stop reaching the return-path gate they exist for.
+    from tests.unit.test_patch_runner import _plan
+
+    plan = _plan()
+    plan["risk"]["reversible"] = reversible_declared
+    if not backup_path:
+        plan["backup"] = [{"id": "bk1", "desc_ro": "starea pachetului", "kind": "rpm_state",
+                           "source": "nginx", "restore_argv": ["rpm", "-q", "nginx"],
+                           "estimated_size_mb": 1}]
     return SimpleNamespace(id=id_, plan_hash="h", plan=plan, status="validated",
                            reversible=reversible_declared, estimated_downtime_s=5,
                            requires_reboot=False, risk_level="high")

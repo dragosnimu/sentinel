@@ -69,7 +69,10 @@ def _plan(*, with_rollback: bool = True) -> dict[str, Any]:
         "rollback": ([_step("rb1", ["dnf", "-y", "downgrade", "nginx-1.20.1-14.el9"],
                             on_failure="abort")] if with_rollback else []),
         "post_verification": [
-            _check("pv_conf", {"kind": "command", "argv": ["nginx", "-t"],
+            # NOT `nginx -t`: it opens nginx's log files, which are read-only in the
+            # executor's sandbox, so on a real host it fails on a good configuration
+            # (policy.sandbox_refusal, and the validator refuses it).
+            _check("pv_conf", {"kind": "command", "argv": ["systemctl", "is-active", "nginx.service"],
                                "expect_exit": [0]}),
         ],
         "restore_instructions_ro":

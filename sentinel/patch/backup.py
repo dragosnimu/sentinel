@@ -46,6 +46,15 @@ class BackupRefused(Exception):
     """Preconditions for a safe backup are not met. Nothing usable was written."""
 
 
+#: Where the executor keeps restore points (`executor/commands.py:BACKUP_ROOT`).
+BACKUP_ROOT = "/var/backups/sentinel"
+
+
+def restore_point_path(rp_id: str) -> str:
+    """The directory of a restore point, and so where its `restore.sh` is."""
+    return f"{BACKUP_ROOT}/{rp_id}"
+
+
 def restore_point_id(plan_db_id: int | None = None) -> str:
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     return f"{stamp}-plan{plan_db_id}" if plan_db_id else stamp
@@ -115,7 +124,7 @@ async def create(db: Database, *, plan_db_id: int | None, asset_id: int | None,
         "sources": [i.get("source") for i in items],
     }
     total = int(sealed.get("total_bytes", 0))
-    path = f"/var/backups/sentinel/{rp_id}"
+    path = restore_point_path(rp_id)
 
     rp_db_id = await repo.record_restore_point(
         db, path=path, manifest=manifest, size_bytes=total,

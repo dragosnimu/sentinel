@@ -16,7 +16,6 @@ from __future__ import annotations
 import ast
 import errno
 import hashlib
-import hmac
 import inspect
 import json
 import os
@@ -33,6 +32,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "executor"))
 
+from _approval_support import approve, enrol_key  # noqa: E402
 import commands  # noqa: E402
 import policy  # noqa: E402
 import sentinel_executor as se  # noqa: E402
@@ -42,21 +42,22 @@ from policy import PolicyRefusal  # noqa: E402
 pytestmark = pytest.mark.security
 
 REPO = Path(__file__).resolve().parents[2]
-KEY = "unit-test-approval-key-not-a-secret"
 PLAN_HASH = hashlib.sha256(b"a plan").hexdigest()
 AUDIT = "/var/lib/sentinel-executor/audit.jsonl"
 UPDATE = ["dnf", "-y", "update", "nginx"]
 ROLLBACK = ["dnf", "-y", "downgrade", "nginx-1.24.0-1.el9"]
-KEY_PATH = str(policy.approval_key_path())
+
+
+def _key_path() -> str:
+    """The key path in force NOW. The fixtures enrol a key in a temporary directory,
+    so a constant read at import time would name a file nothing probes."""
+    return str(policy.approval_key_path())
+
 
 # The argvs used as "an approved step" must be legal for the grammar. If they
 # were not, every refusal below could be the grammar's and prove nothing.
 for _argv in (UPDATE, ROLLBACK):
     assert policy.check_argv(_argv) == _argv
-
-
-def _token(plan_hash: str = PLAN_HASH) -> str:
-    return hmac.new(KEY.encode(), plan_hash.encode(), hashlib.sha256).hexdigest()
 
 
 # 32 hex digits, built by repetition: a 32-character hex LITERAL in a tracked file is
@@ -165,11 +166,17 @@ class Rig:
 
 
 @pytest.fixture
-def rig(monkeypatch):
-    """A wired, open gate, an approved two-step plan, and nothing real underneath."""
+def rig(monkeypatch, tmp_path):
+    """A wired, open gate, an approved two-step plan, and nothing real underneath.
+
+    The approval is real: a key is enrolled, the executor issues a challenge, the
+    operator's own tool signs it and `register_plan_steps` verifies the token. A
+    fixture that wrote into the registry directly would leave the whole transaction
+    path tested against an approval nothing could have produced."""
     rig = Rig()
-    monkeypatch.setattr(policy, "_load_approval_key", lambda: KEY)
+    enrol_key(tmp_path, monkeypatch)
     policy._plan_registry.clear()
+    policy._challenges.clear()
     monkeypatch.setattr(tu, "_probe", rig.probe)
     monkeypatch.setattr(tu, "_mount_read_only", rig.mount_read_only)
     monkeypatch.setattr(tu, "_stat_says_requester_can_write", rig.stat_says)
@@ -183,9 +190,11 @@ def rig(monkeypatch):
     monkeypatch.setattr(tu, "_audit_path", PurePosixPath(AUDIT))
     monkeypatch.setattr(tu, "_stop", None)
     monkeypatch.setattr(tu, "_closed_invocations", set())
-    policy.register_plan_steps(PLAN_HASH, [UPDATE, ROLLBACK], 600, _token())
+    monkeypatch.setattr(tu, "_recorded", {})
+    approve(PLAN_HASH, [UPDATE, ROLLBACK])
     yield rig
     policy._plan_registry.clear()
+    policy._challenges.clear()
 
 
 def _run(argv=None, index=0, timeout=60, **kw):
@@ -208,29 +217,112 @@ def test_every_mutating_dnf_subcommand_is_routed(subcommand):
 @pytest.mark.parametrize("subcommand", ["clean", "check-update", "makecache"])
 def test_the_other_dnf_subcommands_are_not_routed(subcommand):
     """Giving a cache refresh an unconfined unit widens what a request can reach
-    for no package change; those stay where they were, until someone decides."""
+    for no package change; those stay where they were, until someone decides - and
+    in the sandbox they fail, so `op_patch_step_exec` refuses them up front
+    (test_executor_sandbox_refusal.py) instead of running them to fail."""
     assert tu.is_transaction(["dnf", subcommand]) is False
 
 
+@pytest.mark.parametrize("subcommand", ["install", "upgrade", "dist-upgrade", "remove", "autoremove"])
+@pytest.mark.parametrize("manager", ["apt-get", "apt"])
+def test_every_mutating_apt_subcommand_is_routed(manager, subcommand):
+    """A Debian host (the n8n one) has no `dnf`: an apt transaction that is not routed runs
+    in the read-only sandbox and fails (exit 100, "Read-only file system" at /var/cache/apt/archives/partial), so on that
+    host NOTHING could be applied. Both names, because the grammar accepts both."""
+    assert tu.is_transaction([manager, "-y", subcommand, "nginx"]) is True
+
+
+@pytest.mark.parametrize("argv", [
+    ["apt-get", "-o", "Dpkg::Options::=--force-confold", "-y", "install", "nginx=1.24.0-1"],
+    ["apt-get", "-y", "-o", "Dpkg::Options::=--force-confold", "install", "nginx=1.24.0-1"],
+    ["apt-get", "-y", "install", "-o", "Dpkg::Options::=--force-confold", "nginx=1.24.0-1"],
+    ["apt", "-y", "install", "--allow-downgrades", "nginx=1.22.1-9~deb12u1"],
+])
+def test_an_apt_option_value_is_not_mistaken_for_the_subcommand(argv):
+    """`-o Dpkg::Options::=--force-confold` is the one option the grammar allows, and its
+    VALUE has no dash. A router that took the first token without a dash read it as the
+    subcommand, decided "not a transaction", and sent a real install to the read-only
+    sandbox - on exactly the host that has nothing else."""
+    assert policy.check_argv(argv) == argv
+    assert tu.is_transaction(argv) is True
+
+
+@pytest.mark.parametrize("manager", ["apt-get", "apt"])
+def test_apt_update_is_not_routed(manager):
+    """`apt-get update` refreshes the package index (/var/lib/apt/lists) and changes no
+    package - the same class as `dnf makecache`, and kept out of the unit for the same
+    reason: giving it an unconfined unit is a separate decision."""
+    assert tu.is_transaction([manager, "update"]) is False
+
+
 def test_every_grammar_subcommand_is_classified_by_a_human():
-    """A subcommand added to the dnf grammar tomorrow must not become, by
-    default, either an unconfined-root command or one that silently fails."""
-    routed = tu.MUTATING_SUBCOMMANDS["dnf"]
-    kept = tu.NOT_ROUTED_SUBCOMMANDS["dnf"]
-    assert not routed & kept
-    assert routed | kept == set(policy._DNF_SUBCOMMANDS)
+    """A subcommand added to either grammar tomorrow must not become, by default,
+    either an unconfined-root command or one that silently fails."""
+    for manager, grammar in (("dnf", policy._DNF_SUBCOMMANDS), ("apt-get", policy._APT_SUBCOMMANDS),
+                             ("apt", policy._APT_SUBCOMMANDS)):
+        routed = tu.MUTATING_SUBCOMMANDS[manager]
+        kept = tu.NOT_ROUTED_SUBCOMMANDS[manager]
+        assert not routed & kept, manager
+        assert routed | kept == set(grammar), manager
+
+
+def test_every_manager_the_router_knows_has_a_program_to_run():
+    """A transaction with no entry in PROGRAMS would raise a KeyError at spawn time, after
+    the approval was spent and the start row written: the router and the table must
+    list the same managers."""
+    assert set(tu.PROGRAMS) == set(tu.MUTATING_SUBCOMMANDS) == set(tu.NOT_ROUTED_SUBCOMMANDS)
+    assert tu.PROGRAMS["apt-get"] == "/usr/bin/apt-get" and tu.PROGRAMS["apt"] == "/usr/bin/apt"
 
 
 @pytest.mark.parametrize("argv", [
     ["rpm", "-q", "nginx"], ["systemctl", "is-active", "nginx.service"],
-    ["apt-get", "-y", "install", "nginx"], ["cp", "-v", "/etc/a", "/etc/b"],
+    ["cp", "-v", "/etc/a", "/etc/b"],
     ["/opt/sentinel/bin/dnf", "-y", "update", "x"], ["/usr/bin/dnf", "-y", "update", "x"],
+    ["/usr/bin/apt-get", "-y", "install", "x"],
     [], "dnf -y update x", None, [1, 2], ["dnf"], ["dnf", "-y"], ["dnf", 5],
+    ["apt-get"], ["apt-get", "-o"], ["apt-get", "-y"], ["apt-get", "-o", "Dpkg::Options::=--force-confold"],
 ])
-def test_only_the_bare_dnf_name_is_ever_routed(argv):
+def test_only_the_bare_manager_names_are_ever_routed(argv):
     """Routing decides who gets an unconfined unit. Anything it cannot recognise
     exactly must stay in the sandbox, which is the safe side of every mistake."""
     assert tu.is_transaction(argv) is False
+
+
+@pytest.mark.parametrize("argv", [
+    ["apt-get", "-y", "install", "libssl3=3.0.11-1~deb12u2"],
+    ["apt-get", "-y", "install", "--allow-downgrades", "tzdata=2024a-0+deb12u1", "libc6=2.36-9+deb12u4"],
+    ["apt-get", "-y", "install", "vim=2:9.0.1378-2"],
+    ["apt-get", "-y", "install", "openssl=3.0.2-0ubuntu1.18~esm1"],
+])
+def test_a_debian_version_with_a_tilde_reaches_the_unit(argv):
+    """Every Debian security update has a `~` in its version (`1:2.3-1~deb12u1`), and a
+    Debian plan pins every package it installs and every package it rolls back. The
+    closed alphabet this unit allows a token used to lack `~`, so the rollback pin of
+    a real Debian plan was refused at the unit - after the apply had run."""
+    assert policy.check_argv(argv) == argv
+    tu.check_shape(argv)
+    assert tu.build_command(argv)[-len(argv) + 1:] == argv[1:]
+
+
+def test_an_apt_transaction_is_run_by_its_own_binary_and_a_terminal_free_environment():
+    """`apt-get` runs `/usr/bin/apt-get` and `apt` runs `/usr/bin/apt` - never one as
+    the other - and the unit says nobody is there to answer a debconf question."""
+    command = tu.build_command(["apt-get", "-y", "install", "nginx=1.24.0-1"])
+    assert command[command.index("--") + 1] == "/usr/bin/apt-get"
+    assert tu.build_command(["apt", "-y", "install", "nginx=1.24.0-1"])[
+        tu.build_command(["apt", "-y", "install", "nginx=1.24.0-1"]).index("--") + 1] == "/usr/bin/apt"
+    assert "--setenv=DEBIAN_FRONTEND=noninteractive" in command
+
+
+def test_the_unit_tells_needrestart_to_restart_nothing():
+    """The second guard against the executor being restarted under its own apt transaction.
+    Measured: Ubuntu's apt hook (`needrestart -m u`), run OUTSIDE the unit, restarts
+    sentinel-executor by itself after a library update; inside the unit it does nothing today
+    because CAP_SYS_PTRACE is dropped, and this line is what still holds if that is ever
+    given back (the end-to-end apt test fails without it in that case). It asserts the line,
+    not the effect - the effect is the end-to-end test's."""
+    assert "NEEDRESTART_MODE=l" in tu.UNIT_ENVIRONMENT
+    assert "--setenv=NEEDRESTART_MODE=l" in tu.build_command(["apt-get", "-y", "install", "nginx=1.24.0-1"])
 
 
 def test_flags_in_front_of_the_subcommand_do_not_hide_it():
@@ -252,7 +344,7 @@ def test_a_subcommand_word_used_as_a_package_name_does_not_route():
 # The bytes that reach systemd
 # ---------------------------------------------------------------------------
 HOSTILE_TOKENS = ["foo:${HOME}", "foo:$HOME", "foo:%n", "foo:%%", "foo:a\\b", "foo:a'b",
-                  'foo:a"b', "foo:é", "foo:a,b", "foo:a@b", "foo:a*", "foo:a~b"]
+                  'foo:a"b', "foo:é", "foo:a,b", "foo:a@b", "foo:a*"]
 
 
 @pytest.mark.parametrize("token", HOSTILE_TOKENS)
@@ -304,7 +396,7 @@ def test_the_largest_start_row_still_fits_in_the_audit_detail_field(rig):
         if len(json.dumps(argv, separators=(",", ":"))) >= tu.MAX_AUDITED_ARGV_CHARS:
             break
     assert tu.MAX_AUDITED_ARGV_CHARS - 5 <= len(json.dumps(argv, separators=(",", ":"))) <= tu.MAX_AUDITED_ARGV_CHARS
-    policy.register_plan_steps(PLAN_HASH, [argv], 600, _token())
+    approve(PLAN_HASH, [argv])
     _run(argv, index=0)
     detail = rig.rows[0][2]
     assert len(json.dumps(detail, sort_keys=True, separators=(",", ":"))) <= 1000
@@ -547,22 +639,64 @@ def test_refused_when_the_requester_can_read_the_approval_key(rig):
     """The failure this whole path is gated on: the key an approval is signed with
     is readable by the account the approval is supposed to constrain, so that
     account can approve itself. This is the state of every host today."""
-    rig.probes[("-r", KEY_PATH)] = True
+    rig.probes[("-r", _key_path())] = True
     _refused_and_nothing_happened(rig, "approval key .* readable by the requester")
 
 
 def test_refused_when_it_cannot_be_determined_whether_the_key_is_readable(rig):
-    rig.probes[("-r", KEY_PATH)] = None
+    rig.probes[("-r", _key_path())] = None
     _refused_and_nothing_happened(rig, "could not determine whether the requester can read")
+
+
+def test_refused_when_no_key_is_enrolled_although_the_requester_cannot_read_it(rig, monkeypatch, tmp_path):
+    """"The requester cannot read it" is also what a key that does not exist looks like
+    from the requester's side: `test -r` answers False for both. A gate that took that
+    False as the good answer would open on a host where no approval can ever be
+    verified - a transaction nobody could have approved. The executor reads the key
+    itself, and a missing one is a reason."""
+    monkeypatch.setattr(policy, "_APPROVAL_KEY_PATH", tmp_path / "never-enrolled.key")
+    rig.probes[("-r", _key_path())] = False  # what the requester's probe says about a file that is not there
+    reasons = tu.refusal_reasons()
+    assert any("no approval can be verified" in r and "no approval key is enrolled" in r for r in reasons)
+    _refused_and_nothing_happened(rig, "no approval can be verified")
+
+
+@pytest.mark.parametrize("content", ["", "not a key", "AB" * 32])
+def test_refused_when_the_key_is_there_but_is_not_a_key(rig, content):
+    """An empty file, a truncated paste or a key in capitals is not an approval key;
+    the gate says so instead of opening on a file whose only merit is that it exists."""
+    policy.approval_key_path().write_text(content, encoding="ascii")
+    _refused_and_nothing_happened(rig, "no approval can be verified")
+
+
+def test_the_key_and_every_directory_above_it_are_part_of_what_the_requester_must_not_write(rig):
+    """A directory above the key that the requester can write lets it replace the key
+    with one of its own, which is the same as reading it. The chain is the audit
+    chain's, extended to the key."""
+    key = Path(_key_path()).as_posix()
+    paths = tu._protected_paths(PurePosixPath(AUDIT), key)
+    assert paths[: len(AUDIT_CHAIN)] == AUDIT_CHAIN
+    assert key in paths
+    assert str(PurePosixPath(key).parent) in paths
+    assert len(paths) == len(set(paths)), "a path listed twice would be reported twice"
+
+
+@pytest.mark.parametrize("which", ["key", "key_directory"])
+def test_refused_when_the_requester_can_write_the_key_or_its_directory(rig, which):
+    key = Path(_key_path()).as_posix()
+    target = key if which == "key" else str(PurePosixPath(key).parent)
+    rig.probes[("-w", target)] = True
+    _refused_and_nothing_happened(rig, "requester can write")
 
 
 def test_the_key_that_is_probed_is_the_one_policy_verifies_against(rig, monkeypatch):
     """Probing a hard-coded path while policy verifies tokens against another
     would be a gate that checks the wrong file and reports it clean."""
-    monkeypatch.setattr(policy, "_APPROVAL_KEY_PATH", Path("/etc/somewhere/else.env"))
+    before = _key_path()
+    monkeypatch.setattr(policy, "_APPROVAL_KEY_PATH", Path("/var/lib/somewhere/else.key"))
     tu.refusal_reasons()
-    assert ("-r", str(Path("/etc/somewhere/else.env"))) in rig.probe_calls
-    assert ("-r", KEY_PATH) not in rig.probe_calls
+    assert ("-r", str(Path("/var/lib/somewhere/else.key"))) in rig.probe_calls
+    assert ("-r", before) not in rig.probe_calls
 
 
 AUDIT_CHAIN = [AUDIT, "/var/lib/sentinel-executor", "/var/lib", "/var", "/"]
@@ -793,10 +927,10 @@ def test_an_approved_step_runs_once(rig):
 def test_a_refusal_that_is_not_about_the_approval_does_not_spend_it(rig):
     """A gate that failed for a reason outside the operator's tap must not make
     them tap again."""
-    rig.probes[("-r", KEY_PATH)] = True
+    rig.probes[("-r", _key_path())] = True
     with pytest.raises(PolicyRefusal):
         _run()
-    rig.probes[("-r", KEY_PATH)] = False
+    rig.probes[("-r", _key_path())] = False
     assert _run()["exit_code"] == 0
 
 
@@ -866,7 +1000,7 @@ def test_a_registered_step_with_a_token_systemd_would_rewrite_is_still_not_run(r
     the step really was approved."""
     argv = ["dnf", "-y", "install", token]
     assert policy.check_argv(argv) == argv
-    policy.register_plan_steps(PLAN_HASH, [argv], 600, _token())
+    approve(PLAN_HASH, [argv])
     with pytest.raises(PolicyRefusal, match="letters, digits"):
         _run(argv, index=0)
     assert rig.spawned == [] and rig.rows == []
@@ -874,7 +1008,7 @@ def test_a_registered_step_with_a_token_systemd_would_rewrite_is_still_not_run(r
 
 def test_a_registered_step_too_long_for_one_audit_row_is_still_not_run(rig):
     argv = ["dnf", "-y", "install", *(f"package-number-{n:03d}" for n in range(40))]
-    policy.register_plan_steps(PLAN_HASH, [argv], 600, _token())
+    approve(PLAN_HASH, [argv])
     with pytest.raises(PolicyRefusal, match="audit row"):
         _run(argv, index=0)
     assert rig.spawned == [] and rig.rows == []
@@ -1422,7 +1556,11 @@ def routed(monkeypatch):
 
     monkeypatch.setattr(tu, "run", fake_tx)
     monkeypatch.setattr(commands, "_run", fake_run)
-    monkeypatch.setattr(policy, "lookup_registered_step", lambda *a, **k: None, raising=False)
+    # Every real step is SPENT by running (consume, not lookup): what the sandbox path
+    # calls is recorded, so a test can say which approval a step used up.
+    seen["consumed"] = []
+    monkeypatch.setattr(policy, "consume_registered_step",
+                        lambda plan_hash, step_index, argv: seen["consumed"].append((plan_hash, step_index, list(argv))))
     return seen
 
 
@@ -1469,7 +1607,7 @@ def test_a_transaction_takes_no_working_directory(routed):
 def test_a_dry_run_of_a_transaction_says_what_the_real_run_would_be_refused_for(rig):
     """A dry run spawns nothing, so it used to answer "fine" for a step the real
     run would refuse - the operator saw green and the apply failed."""
-    rig.probes[("-r", KEY_PATH)] = True
+    rig.probes[("-r", _key_path())] = True
     out = commands.op_patch_step_exec({"argv": UPDATE, "timeout_s": 60, "dry_run": True})
     assert out["dry_run"] is True and out["would_run"] == UPDATE
     assert out["transaction"]["transient_unit"] is True
@@ -1504,12 +1642,14 @@ def test_the_real_gate_with_nothing_wired_refuses_everything(monkeypatch):
 # policy: the approval is spent when it is used
 # ---------------------------------------------------------------------------
 @pytest.fixture
-def registered(monkeypatch):
-    monkeypatch.setattr(policy, "_load_approval_key", lambda: KEY)
+def registered(monkeypatch, tmp_path):
+    enrol_key(tmp_path, monkeypatch)
     policy._plan_registry.clear()
-    policy.register_plan_steps(PLAN_HASH, [UPDATE, ROLLBACK], 600, _token())
+    policy._challenges.clear()
+    approve(PLAN_HASH, [UPDATE, ROLLBACK])
     yield
     policy._plan_registry.clear()
+    policy._challenges.clear()
 
 
 def test_consuming_a_step_twice_is_refused(registered):
@@ -2232,6 +2372,92 @@ def test_the_real_probe_is_blind_on_a_read_only_mount_and_the_mode_bits_are_not(
         capture_output=True, text=True, timeout=60, check=False)
     assert ns.returncode == 0, ns.stderr
     assert ns.stdout.split() == ["True", "False", "True"], ns.stdout
+
+
+# ---------------------------------------------------------------------------
+# `transaction_outcome`: what the executor itself recorded about one step
+# ---------------------------------------------------------------------------
+def test_a_transaction_the_executor_closed_is_answered_from_its_own_end_row(rig):
+    """The runner cannot read the audit chain (root-only), and after an executor restart in
+    the middle of an install it has to tell the operator whether the install finished. The
+    answer is the end row the executor wrote - the same dict, once the row is on disk."""
+    _run()
+    answer = tu.transaction_outcome(PLAN_HASH, 0)
+    assert answer["state"] == "recorded"
+    assert answer["end"] == {"outcome": "finished", "exit_code": 0, "verified": True, "result": "success",
+                             "recovered": False, "duration_ms": 5}
+    assert rig.rows[1][2]["exit_code"] == answer["end"]["exit_code"], "the answer is the row's, not a second opinion"
+
+
+def test_a_transaction_a_restarted_executor_settled_is_answered_as_recovered(rig):
+    """The reproduced case: the executor was restarted under a running `dnf install`; the
+    unit finished fine under PID 1 and the NEW executor wrote the end row. Asked about that
+    step, it says: finished, exit 0, verified, recovered - which is what lets the operator
+    be told the package was installed instead of being sent to restore.sh."""
+    rig.unit = _unit()
+    rig.marker = {"plan_hash": PLAN_HASH, "step_index": 0}
+    assert tu._reconcile()[0] == "closed"
+    answer = tu.transaction_outcome(PLAN_HASH, 0)
+    assert answer["state"] == "recorded"
+    assert (answer["end"]["outcome"], answer["end"]["exit_code"], answer["end"]["verified"],
+            answer["end"]["recovered"]) == ("finished", 0, True, True)
+
+
+def test_a_failed_transaction_is_answered_as_failed_not_as_finished_ok(rig):
+    """The control: the answer must be able to say the other thing. A step whose unit
+    exited 3 is `finished` and `verified` (PID 1 vouches for the 3), with exit_code 3."""
+    rig.unit = _unit(active="failed", sub="failed", result="exit-code", status="3", invocation="c" * 32)
+    rig.marker = {"plan_hash": PLAN_HASH, "step_index": 1}
+    tu._reconcile()
+    answer = tu.transaction_outcome(PLAN_HASH, 1)
+    assert answer["end"]["exit_code"] == 3 and answer["end"]["verified"] is True
+
+
+def test_nothing_recorded_and_nothing_running_is_unknown_not_finished(rig):
+    """"Unknown" and "fine" are different states. A step this process never closed (an
+    earlier process did, and its row is only in the chain) must not be reported as done."""
+    rig.unit = dict(ABSENT)
+    assert tu.transaction_outcome(PLAN_HASH, 0) == {"state": "unknown"}
+
+
+def test_a_running_transaction_is_reported_running_and_whether_it_is_this_step(rig):
+    rig.unit = RUNNING
+    rig.marker = {"plan_hash": PLAN_HASH, "step_index": 0}
+    assert tu.transaction_outcome(PLAN_HASH, 0) == {"state": "running", "unit": tu.UNIT_FULL, "this_step": True}
+    assert tu.transaction_outcome(PLAN_HASH, 1)["this_step"] is False
+    assert tu.transaction_outcome(hashlib.sha256(b"other").hexdigest(), 0)["this_step"] is False
+
+
+def test_an_end_row_that_did_not_reach_the_disk_is_not_remembered_as_one(rig):
+    """The mirror is of rows that are ON DISK. A row the audit sink refused is not a record;
+    answering "recorded" from it would hand the operator a verdict nobody can check."""
+    rig.audit_end_ok = False
+    _run()
+    assert tu.transaction_outcome(PLAN_HASH, 0) == {"state": "unknown"}
+
+
+@pytest.mark.parametrize("plan_hash, step_index", [
+    ("x" * 64, 0), ("a" * 63, 0), (None, 0), ("a" * 64, -1), ("a" * 64, "0"), ("a" * 64, True), ("a" * 64, None),
+])
+def test_the_question_is_validated_before_anything_is_looked_up(plan_hash, step_index):
+    with pytest.raises(PolicyRefusal):
+        tu.transaction_outcome(plan_hash, step_index)
+
+
+def test_the_remembered_end_rows_are_bounded(rig):
+    """A long-lived executor must not grow this without limit: the oldest entry goes."""
+    for i in range(tu._RECORDED_MAX + 5):
+        tu._remember({"plan_hash": hashlib.sha256(str(i).encode()).hexdigest(), "step_index": 0,
+                      "outcome": "finished", "exit_code": 0, "verified": True})
+    assert len(tu._recorded) == tu._RECORDED_MAX
+    assert (hashlib.sha256(b"0").hexdigest(), 0) not in tu._recorded
+
+
+def test_the_operation_is_read_only_and_reachable_by_name(rig):
+    """It is in the operation table, and asking it starts nothing and writes no row of
+    its own in the transaction record."""
+    assert commands.OPERATIONS["transaction_outcome"]({"plan_hash": PLAN_HASH, "step_index": 0}) == {"state": "unknown"}
+    assert rig.spawned == [] and rig.rows == []
 
 
 # ---------------------------------------------------------------------------

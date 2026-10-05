@@ -652,12 +652,18 @@ def _false_with(good_plan: dict, rollback_argv: list[str]) -> dict:
     return plan
 
 
+# C and G were `dnf clean all` and `dnf makecache`. Those cannot run in the executor's
+# sandbox (policy.sandbox_refusal: they exit 1 with "Read-only file system"), so a plan that
+# carries one is refused as `step_cannot_run` before the question below is ever asked
+# (tests/unit/test_patch_plan_can_run.py). They are replaced by rollbacks that DO run and
+# still restore nothing - a query and a status - so the property stays tested: no code path
+# turns the model's `false` into `true`.
 @pytest.mark.parametrize("label,rollback_argv", [
     ("A_restart_only", ["systemctl", "restart", "nginx.service"]),
     ("B_reinstall", ["dnf", "-y", "reinstall", "nginx"]),
-    ("C_clean_all", ["dnf", "-y", "clean", "all"]),
+    ("C_rpm_query", ["rpm", "-q", "nginx"]),
     ("D_re_apply", ["dnf", "-y", "update", "nginx"]),
-    ("G_makecache", ["dnf", "-y", "makecache"]),
+    ("G_status_only", ["systemctl", "status", "nginx.service"]),
 ])
 def test_the_counterexamples_that_sank_the_first_fix_stay_false(
         monkeypatch, good_plan, label, rollback_argv):

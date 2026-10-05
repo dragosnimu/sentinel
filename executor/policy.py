@@ -30,9 +30,13 @@ from __future__ import annotations
 import hashlib
 import hmac
 import ipaddress
+import json
+import os
 import posixpath
 import re
+import secrets
 import socket
+import stat as stat_module
 import threading
 import time
 from pathlib import Path
@@ -114,10 +118,29 @@ PROTECTED_PATHS: tuple[str, ...] = (
     # but a plan step's `cwd` or a `tar`/`cp` path argument can still name
     # this directory directly, and now does the same refusal everything else
     # protected here gets. Kept out of the list on purpose:
-    # /var/backups/sentinel (BACKUP_ROOT) — op_backup_restore legitimately
-    # passes a caller-given artifact path under it through check_path, and
-    # protecting it here would refuse every restore.
+    # /var/backups/sentinel (BACKUP_ROOT) — op_backup_restore used to pass a
+    # caller-given artifact path under it through check_path, and protecting it
+    # here would have refused every restore. That operation now refuses
+    # outright, so nothing needs the exemption any more; it is left as it was
+    # because changing it is a separate decision (constants.PROTECTED_PATHS
+    # already lists it).
     "/var/lib/sentinel",
+    # The executor's OWN state: `approval.key` (the operator's HMAC key, which
+    # is Gate 1) and `audit.jsonl` (the hash chain). 0700 root:root, so
+    # `sentinel` cannot touch it directly - but it is in the executor's
+    # ReadWritePaths, which makes it a place a root-run `tar`/`cp`/`install`
+    # lands without a single permission error. Missing from this list, a
+    # `backup_restore` with `tar -xzf {artifact} -C /var/lib/sentinel-executor`
+    # replaced the key with the caller's (reproduced 5 October 2026, in a
+    # container). The entry above does not cover it: `check_path` matches
+    # `protected + "/"` as a prefix, and "/var/lib/sentinel-executor" does not
+    # start with "/var/lib/sentinel/".
+    #
+    # This closes the argument that NAMES the directory. It does not close an
+    # archive that CARRIES it as a member (`-C /` plus `var/lib/sentinel-executor/
+    # approval.key` inside the tar), which no argv check can see - that is why
+    # `op_backup_restore` refuses outright instead of relying on this list.
+    "/var/lib/sentinel-executor",
     "/root/.ssh",
     "/etc/ssh",
     "/etc/passwd",
@@ -480,7 +503,7 @@ _SERVICE_ACCOUNT = "sentinel"
 def _service_account_uid_gid() -> tuple[str | None, str | None]:
     """Resolve `sentinel`'s numeric uid/gid right now, or (None, None).
 
-    Read fresh on every call, the same reasoning as `_load_approval_key`
+    Read fresh on every call, the same reasoning as `_read_approval_key`
     below: a value cached at import time would still say "unknown" on a host
     where the installer created the account after the executor started.
     `pwd`/`grp` do not exist on the platform this file's own test suite runs
@@ -900,14 +923,35 @@ def _check_tar_argv(argv: list[str]) -> None:
             if i + 1 >= len(argv):
                 raise PolicyRefusal(f"tar {part} requires a directory argument")
             base_dir = argv[i + 1]
+            # Absolute and path-checked, like the `--directory=` form below. A
+            # RELATIVE value skips `check_argv`'s "starts with /" test and is
+            # resolved against the executor's working directory (/ under
+            # systemd): `-C var/lib/sentinel-executor` was accepted, and wrote
+            # there.
+            check_path(base_dir, purpose="extract into")
             i += 2
             continue
         if part.startswith("--directory="):
             base_dir = part.split("=", 1)[1]
+            # `check_argv` path-checks only tokens that START with "/"; this one
+            # starts with "--", so without this line the directory was never
+            # compared with PROTECTED_PATHS at all. Measured 5 October 2026 against
+            # the policy: `tar -xf x.tar --directory=/var/lib/sentinel-executor`
+            # was accepted, while `-C /var/lib/sentinel-executor` was not.
+            check_path(base_dir, purpose="extract into")
             i += 1
             continue
         if part.startswith("--one-top-level"):
-            # bare, or `--one-top-level=NAME`
+            # bare, or `--one-top-level=NAME`. NAME is a directory NAME, and a
+            # name has no "/": measured in a container on 5 October 2026, GNU tar
+            # 1.34 extracts into `--one-top-level=/root/t/abs` as an ABSOLUTE
+            # directory, ignoring `-C` - the same write as `-C /root/t/abs`, in a
+            # form no path check sees.
+            if "=" in part and "/" in part.split("=", 1)[1]:
+                raise PolicyRefusal(
+                    f"tar {part!r}: --one-top-level takes a directory name, not a path; "
+                    "an absolute value extracts there regardless of -C"
+                )
             i += 1
             continue
         if part in _TAR_ALLOWED_LONG:
@@ -917,6 +961,15 @@ def _check_tar_argv(argv: list[str]) -> None:
             raise PolicyRefusal(f"tar flag {part!r} is not in the allowed set {sorted(_TAR_ALLOWED_LONG)}")
         if part.startswith("-") and len(part) > 1:
             chars = part[1:]
+            if "C" in chars and len(chars) > 1:
+                # `-xCf DIR FILE`: C inside a cluster takes the next argument as
+                # the directory, but this loop only parses a standalone `-C`, so
+                # DIR was never path-checked (measured 5 October 2026: `tar -xCf
+                # var/lib/sentinel-executor x.tar` was accepted). One spelling.
+                raise PolicyRefusal(
+                    f"tar flag {part!r} bundles -C with other flags; write -C DIR "
+                    "as its own argument so the directory can be checked"
+                )
             for ch in chars:
                 if ch not in _TAR_ALLOWED_SHORT_CHARS:
                     raise PolicyRefusal(
@@ -1233,38 +1286,297 @@ def is_never_block(address: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Plan binding — round 1 narrowed WHAT any single `patch_step_exec` call can
-# do (the grammar above). It did not narrow WHICH calls get to happen at all:
-# a `sentinel`-uid attacker who can reach the socket can still construct an
-# argv that is grammar-legal — `dnf -y install some-plausible-package` passes
-# every check above — without that argv ever having been the operator's
-# Telegram approval. The grammar cannot tell "legal shape" from "approved
-# command"; only a record of what was actually approved can.
+# Where a plan step can run - and the steps that can run nowhere
+# ---------------------------------------------------------------------------
+# A step of an approved plan runs in one of two places, and which one is decided
+# from its argv alone:
 #
-# `register_plan` is that record: the trusted caller (sentinel-telegram, after
-# BOTH taps of the two-stage approval — see docs/PATCHING.md) presents a
-# plan_hash, the exact argv list the plan will run, and an HMAC of the hash
-# under a key only root and that caller can read. `patch_step_exec` then
-# refuses to run anything that is not byte-for-byte one of those registered
-# steps. A compromised `sentinel` uid that can read the same key (it can —
-# secrets.env is 0640 root:sentinel, stated honestly rather than pretended
-# away) can forge a token for a plan_hash of its own choosing, but it cannot
-# forge one for a HASH IT DID NOT ALSO CHOOSE THE CONTENT OF — the token binds
-# to the hash, and the hash is `sentinel.patch.validator.plan_hash(plan)`, a
-# function of the plan's own content computed independently on the untrusted
-# side. What this closes is not "a compromised sentinel-uid can never run a
-# command" (nothing here can promise that with one shared uid); it is "a
-# grammar-legal `patch_step_exec` call with no corresponding registration is
-# refused, not silently run" — see README.md "Binding to an approved plan".
+#   * a package TRANSACTION (`dnf`, `apt-get` or `apt` with a subcommand that
+#     changes the package database) is handed to a transient systemd unit whose
+#     root is writable (`transient_unit.py`);
+#   * everything else runs inside the executor's own sandbox, which is
+#     `ProtectSystem=strict`: `/`, `/usr`, `/etc`, `/var` and `/run` are read-only
+#     there, and the few paths that are writable (the backup root, Sentinel's own
+#     directories, a PRIVATE /tmp) are either protected from a plan or invisible
+#     to everybody else.
+#
+# So a step that writes the filesystem and is not a package transaction has no
+# place to run. Measured on 5 October 2026 in a container (AlmaLinux 9.8, the real
+# executor under its own unit, as `sentinel`, an approved plan):
+#
+#     mkdir /var/lib/NEW                        exit 1  Read-only file system
+#     tar -czf /var/backups/X.tgz -C / etc/Y    exit 2  Cannot open: Read-only file system
+#     chmod / chown / mv / cp  (under /etc)     exit 1  Read-only file system
+#     nginx -t                                  exit 1  open() "/var/log/nginx/error.log"
+#                                                       failed (30: Read-only file system)
+#     dnf check-update | clean all | makecache  exit 1  Config error: [Errno 30]
+#                                                       Read-only file system: '/var/log/dnf.log'
+#     apt-get update   (Ubuntu 24.04, a systemd-run unit with the same ProtectSystem=strict and
+#                       read-write list, not the executor itself)
+#                                               exit 0 (!)  W: Problem unlinking
+#                                                       /var/lib/apt/lists/... (30: Read-only
+#                                                       file system) - and nothing was refreshed
+#     apt-get -y install X  (same unit)          exit 100  E: Failed to fetch ... Could not open file
+#                                                       /var/cache/apt/archives/partial/...:
+#                                                       Read-only file system
+#     mkdir -p /tmp/NEW                         exit 0  - and /tmp/NEW exists nowhere
+#                                                       but inside the executor
+#     rpm -q, sha256sum, test -e, systemctl is-active/restart   work (they read, or
+#                                                       they ask PID 1)
+#
+# The first five (and `apt-get install`) are the failure this section exists for: the dry run said "would
+# run", the real run failed, and the runner - which cannot tell "the command
+# failed" from "the machine was changed and then failed" - rolled back a machine
+# nothing had touched, and then reported the rollback itself as failed. The sixth
+# is the same defect pointed the other way: a step that reports success for a
+# change that happened in a directory nobody can see.
+#
+# There are two honest answers. One is to route more binaries to a unit with a
+# writable root - a widening of what unconfined root may be asked to do (`cp`,
+# `mv`, `chmod` on any path a plan names), which is the operator's decision and not
+# a side effect of a bug fix. The other, taken here, is to refuse such a step where
+# the refusal can still be read: validation, the challenge, the dry run and the
+# real call all ask the ONE function below, so they cannot disagree.
+#
+# `systemctl`, `rpm`, `dpkg`, `dpkg-query`, `test`, `sha256sum` and `tar -t` are
+# not refused: they read, or they ask PID 1. A package manager given by absolute
+# path never gets this far - `check_argv` refuses an absolute program.
+#: Subcommands that change the package database, per manager. `transient_unit`
+#: routes exactly these to its unit. Together with `CACHE_SUBCOMMANDS` they are
+#: exactly the subcommands each grammar above accepts (asserted below), so a
+#: subcommand added to a grammar later is classified by a person, not by default.
+TRANSACTION_SUBCOMMANDS: dict[str, frozenset[str]] = {
+    "dnf": frozenset({"upgrade", "update", "install", "downgrade", "reinstall", "remove"}),
+    "apt-get": frozenset({"install", "upgrade", "dist-upgrade", "remove", "autoremove"}),
+    "apt": frozenset({"install", "upgrade", "dist-upgrade", "remove", "autoremove"}),
+}
+#: Accepted by the grammar, change no package, and write the manager's cache or log -
+#: read-only in the executor, and not given a unit (a separate decision, recorded in
+#: `transient_unit`). Refused by `sandbox_refusal`.
+CACHE_SUBCOMMANDS: dict[str, frozenset[str]] = {
+    "dnf": frozenset({"clean", "check-update", "makecache"}),
+    "apt-get": frozenset({"update"}),
+    "apt": frozenset({"update"}),
+}
+#: Flags that take the NEXT token as their value, so that value is not mistaken
+#: for the subcommand. dnf has none (its values are joined: `--enablerepo=x`).
+_PACKAGE_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    "dnf": frozenset(),
+    "apt-get": frozenset({"-o"}),
+    "apt": frozenset({"-o"}),
+}
+assert set(TRANSACTION_SUBCOMMANDS) == set(CACHE_SUBCOMMANDS) == set(_PACKAGE_VALUE_FLAGS)
+for _manager, _grammar_subcommands in (("dnf", _DNF_SUBCOMMANDS), ("apt-get", _APT_SUBCOMMANDS),
+                                       ("apt", _APT_SUBCOMMANDS)):
+    assert (TRANSACTION_SUBCOMMANDS[_manager] | CACHE_SUBCOMMANDS[_manager] == _grammar_subcommands
+            and not TRANSACTION_SUBCOMMANDS[_manager] & CACHE_SUBCOMMANDS[_manager]), (
+        f"{_manager}: every subcommand its grammar accepts must be classified as a transaction "
+        "or as a cache operation, exactly once")
+
+
+def package_subcommand(argv: Any) -> str | None:
+    """The subcommand of a `dnf`/`apt-get`/`apt` argv: the first token that is not a
+    flag and not a flag's value - which is how `_check_dnf_argv` and `_check_apt_argv`
+    find it. None for anything else.
+
+    `-o VALUE` is the reason this is not "the first token without a dash": the value
+    of `-o Dpkg::Options::=--force-confold` has no dash, and read as the subcommand it
+    makes a real `apt-get -o ... install` look like something that is not a
+    transaction - which sends it to the read-only sandbox.
+    """
+    if not isinstance(argv, list) or not argv or not isinstance(argv[0], str):
+        return None
+    takes_value = _PACKAGE_VALUE_FLAGS.get(argv[0])
+    if takes_value is None:
+        return None
+    i = 1
+    while i < len(argv):
+        part = argv[i]
+        if not isinstance(part, str):
+            return None
+        if part in takes_value:
+            i += 2
+            continue
+        if part.startswith("-"):
+            i += 1
+            continue
+        return part
+    return None
+
+
+def is_package_transaction(argv: Any) -> bool:
+    """True if this (grammar-validated) argv changes the package database and so is
+    run in `transient_unit`'s unit. Keyed on `argv[0]` exactly, like the unit's own
+    program table: a program given any other way is not routed there."""
+    subcommand = package_subcommand(argv)
+    return subcommand is not None and subcommand in TRANSACTION_SUBCOMMANDS[argv[0]]
+
+
+_SANDBOX_WRITERS = frozenset({"cp", "mv", "mkdir", "install", "chmod", "chown"})
+
+
+def _tar_writes(argv: list[str]) -> bool:
+    """Whether a (grammar-validated) `tar` argv creates or extracts - `-t` only
+    lists. Scans the way `_check_tar_argv` does, so the value of `-C` is not read as
+    a cluster of mode letters."""
+    i = 1
+    while i < len(argv):
+        part = argv[i]
+        if part in ("-C", "--directory"):
+            i += 2
+            continue
+        if part.startswith("--"):
+            i += 1
+            continue
+        if part.startswith("-") and len(part) > 1 and ("c" in part[1:] or "x" in part[1:]):
+            return True
+        i += 1
+    return False
+
+
+def sandbox_refusal(argv: Any) -> str | None:
+    """Why this (grammar-validated) step cannot run anywhere a plan can put it, or
+    None if it can.
+
+    ONE function for four callers: the plan validator (a plan that cannot run is
+    never stored as valid), the challenge and the registration (the operator is never
+    asked to sign for it), the dry run (it is not reported as "would run") and the
+    real call (it is never run to fail with EROFS, or to "succeed" in a private
+    /tmp). The reason names the command and what happens to it; the caller adds
+    WHICH step.
+    """
+    if not isinstance(argv, list) or not argv or not isinstance(argv[0], str):
+        return None
+    program = argv[0].rsplit("/", 1)[-1]
+    if program in TRANSACTION_SUBCOMMANDS:
+        if is_package_transaction(argv):
+            return None
+        return (f"`{program} {package_subcommand(argv) or '?'}` writes the package manager's cache and log, "
+                "which are read-only in the executor's sandbox, and it changes no package, so it is "
+                "not run in the unit that package transactions get. Measured: `dnf` exits 1 with "
+                "'Read-only file system'; `apt-get update` exits 0 after warning 'Problem unlinking "
+                "... Read-only file system', having refreshed nothing. A plan needs only the "
+                "transaction itself")
+    if program in _SANDBOX_WRITERS or (program == "tar" and _tar_writes(argv)):
+        return (f"`{program}` writes the filesystem, and a plan step that is not a package "
+                "transaction runs inside the executor's sandbox, where every path a plan may name is "
+                "read-only: it fails with 'Read-only file system' (or, under /tmp, appears to succeed "
+                "in a private directory nobody else can see). Files are saved by the plan's `backup` "
+                "section and changed by the package manager; only a package transaction has a unit "
+                "that can write")
+    if program == "nginx":
+        return ("`nginx -t` opens nginx's log files and creates its temporary directories, which are "
+                "read-only in the executor's sandbox: it exits 1 with 'Read-only file system' on a "
+                "configuration that is fine. Check the service instead (`systemctl is-active`), and "
+                "reload through `systemctl`")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Plan binding, and who is allowed to approve a plan.
+#
+# Two separate questions, both answered here, because a registry that records
+# WHICH commands were approved is worth nothing if anyone can write to it.
+#
+# 1. WHICH commands run. The grammar above says a command is well-formed, not
+#    that the operator approved THIS one: `dnf -y install some-plausible-package`
+#    is grammar-legal. So `patch_step_exec` refuses any real call whose argv is
+#    not, byte for byte, step N of a plan that was registered here.
+#
+# 2. WHO may register one. This is the part that used to be wrong. The previous
+#    design signed `plan_hash` with a key in /etc/sentinel/secrets.env, a file
+#    `0640 root:sentinel` - readable by the `sentinel` account, which runs the
+#    Telegram bot, the web UI and the detection pipeline. Anything that
+#    compromised any of those could read the key and sign an approval of its own
+#    choosing: the gate protected nothing against the attacker it exists for.
+#    The token was also an HMAC of the hash ALONE, so a signature obtained for
+#    one plan was accepted for the steps of any other (reproduced twice: `dnf -y
+#    remove openssh-server` registered under another plan's hash, then accepted
+#    by `lookup_registered_step` and `consume_registered_step`).
+#
+# THE CHOICE, and what was not chosen.
+#
+#   Not a separate approver account that owns the key. The operator's tap
+#   arrives in the bot, which is `sentinel`. For the approver to sign anything
+#   the bot must ask it to; a compromised bot asks too, so the approver is a
+#   signing oracle with an extra uid in front of it. An approver that does NOT
+#   sign on request has to reach the human by a channel of its own - a second
+#   Telegram bot with a token `sentinel` cannot read: a new daemon, a new
+#   credential, a new unit. That is a mechanism for the operator to approve, not
+#   one to slip in underneath a bug fix.
+#
+#   Not plain TOTP either. A six-digit code proves the human was present at some
+#   moment and says nothing about WHAT they approved, and it would be typed into
+#   the chat of the very process the gate distrusts: a compromised bot reads the
+#   code and spends it, inside its validity window, on steps of its own. No
+#   signature would cover the steps, so the binding below could not exist.
+#
+#   Chosen: an operator-held key and a transaction-bound token. The key exists in
+#   two places - the operator's workstation and a root-only file here - and is
+#   readable by nothing that runs as `sentinel`. The token is
+#   HMAC-SHA256(key, plan_hash | digest of the exact steps | a nonce this process
+#   issued). The operator's tool (scripts/approve-plan.py) recomputes the digest
+#   from the steps and prints the commands before it signs, so the display that
+#   matters is not the bot's: a bot that lies about what it will register can
+#   register nothing but what the operator read on his own screen.
+#
+#   What that buys, one property per sentence. The token cannot be made without
+#   the key. It is valid for exactly the steps it was computed over - a token for
+#   one plan registers no other. It is valid once: the nonce is consumed by the
+#   registration, so a copy of the token (a chat history, a log, a database row)
+#   authorises nothing a second time.
+#
+#   What it costs: approving needs the operator's workstation, not only the
+#   phone. That is the price of a display the bot does not control, and it is the
+#   operator's to waive (a phone-side TOTP is the cheaper, weaker alternative).
+#
+# WHAT AN ATTACKER WHO OWNS THE `sentinel` UID CAN STILL DO, said plainly:
+#
+#   * Ask for a challenge and register nothing: challenges are inert. It can
+#     replace a pending challenge for a plan hash (latest wins), so it can make
+#     the operator's token stop matching, and it can fill the table of pending
+#     challenges (`_CHALLENGE_MAX`) so that a legitimate one is refused until
+#     they expire - a denial of approvals either way. That was already possible
+#     by stopping the bot.
+#   * Ask the operator to sign something. The operator reads the commands on his
+#     own screen; this is the one place a human still has to look.
+#   * USE THE DOCKER SOCKET. `sentinel` is in the `docker` group, which is root on
+#     this host through /run/docker.sock: `docker run -v /:/host` reads the key
+#     file, or simply runs the command. That is not closed here and is not made
+#     worse; it is the measured subject of the gate-3 report, and no refusal was
+#     added for it. Until that membership changes, everything this section does
+#     holds against an attacker who stays inside the `sentinel` account and not
+#     against one who uses the socket.
+#   * Everything that is not `patch_step_exec`: blocking an address, a restore
+#     drill, a service action. Those are other operations with their own policy.
+#
+# What was NOT done: persisting registrations. The registry is in memory, so a
+# restart of this process asks for a new approval. That is deliberate (a restart
+# is a reason to look again) and README.md says so.
 # ---------------------------------------------------------------------------
 _PLAN_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
-_APPROVAL_KEY_NAME = "SENTINEL_EXECUTOR_APPROVAL_KEY"
-#: Same file as SECRET_PATHS[0] — not imported from there so this section
-#: reads standalone; a test asserts the two stay equal.
-_APPROVAL_KEY_PATH = Path("/etc/sentinel/secrets.env")
+_TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
+#: Beside the audit chain, in a directory `sentinel` cannot even traverse
+#: (0700 root:root). NOT in /etc/sentinel/secrets.env, which is readable by the
+#: account this key exists to restrain.
+_APPROVAL_KEY_PATH = Path("/var/lib/sentinel-executor/approval.key")
+_APPROVAL_KEY_OWNER_UID = 0
+#: 32 random bytes, written as 64 lowercase hex digits and a newline.
+_APPROVAL_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
+
+#: Domain separators: a token or a digest made for one purpose cannot be
+#: presented as the other, and neither collides with a value made by the old
+#: scheme (which signed the bare plan hash).
+_APPROVAL_DOMAIN = b"sentinel-plan-approval-v1"
+_STEPS_DOMAIN = b"sentinel-plan-steps-v1"
+
+#: A challenge lives this long. The operator has to read the commands, run the
+#: tool and paste the answer; much longer is a window for nothing.
+_CHALLENGE_TTL_S = 900
+_CHALLENGE_MAX = 16
 
 #: Registered plans are capped in count so that a caller that can reach
-#: `register_plan` at all (grammar-legal steps still required — see below)
+#: `register_plan` at all (a valid token AND grammar-legal steps still required)
 #: cannot grow this dict without bound between restarts.
 _PLAN_REGISTRY_MAX = 200
 _MAX_STEPS_PER_PLAN = 256
@@ -1273,94 +1585,226 @@ _MAX_TTL_S = 3600
 _plan_registry_lock = threading.Lock()
 #: plan_hash -> {"steps": list[list[str]], "expires_at": float (monotonic)}
 _plan_registry: dict[str, dict[str, Any]] = {}
+#: plan_hash -> {"digest": str, "nonce": str, "expires_at": float (monotonic)}.
+#: Guarded by the same lock as the registry: a challenge is consumed by the
+#: registration it authorises, and the two must change together.
+_challenges: dict[str, dict[str, Any]] = {}
 
 
-def _load_approval_key() -> str | None:
-    """Read SENTINEL_EXECUTOR_APPROVAL_KEY from secrets.env, or None.
+def steps_digest(steps: Any) -> str:
+    """sha256 over the exact commands of a plan, in order. The one definition of
+    "these steps": the executor computes it from what it is handed, the
+    operator's tool computes it from what it shows, and a token only verifies if
+    both got the same answer.
 
-    Read fresh on every call rather than cached at startup: the installer can
-    add the key to a running host, and the alternative — a key that only
-    starts working after a restart nobody was told to do — is a worse failure
-    mode than the cost of re-reading one short file on the rare path that
-    calls this. Parsing matches sentinel/config.py's own `load_secrets`
-    (KEY=VALUE, optional matching quotes, '#' comments) — duplicated rather
-    than imported for the same reason every other constant in this file is:
-    this process must not import from the untrusted side.
+    ASCII-escaped JSON with no whitespace, so that two programs in two languages
+    encode the same list to the same bytes. A non-string element is not
+    "converted": the grammar refuses it long before this runs.
     """
-    try:
-        if not _APPROVAL_KEY_PATH.exists():
-            return None
-        for raw in _APPROVAL_KEY_PATH.read_text(encoding="utf-8").splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            if key.strip() != _APPROVAL_KEY_NAME:
-                continue
-            value = value.strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-                value = value[1:-1]
-            return value or None
-    except OSError:
-        return None
-    return None
+    canonical = json.dumps(steps, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(_STEPS_DOMAIN + b"\n" + canonical.encode("ascii")).hexdigest()
+
+
+def approval_token(key: bytes, plan_hash: str, digest: str, nonce: str) -> str:
+    """What the operator's tool computes and this process verifies.
+
+    Covers the plan hash AND the digest of the steps AND this process's nonce:
+    drop any one and an old attack comes back (the hash alone: any plan's token
+    registers any plan's steps; no nonce: a token can be registered again).
+    """
+    message = b"\n".join((_APPROVAL_DOMAIN, plan_hash.encode("ascii"),
+                          digest.encode("ascii"), nonce.encode("ascii")))
+    return hmac.new(key, message, hashlib.sha256).hexdigest()
 
 
 def approval_key_path() -> Path:
-    """Where `register_plan_steps` looks for the approval key.
+    """Where the approval key is read from.
 
     A function and not the constant, so a caller that asks "which file would an
-    approval be signed with" gets the answer for the path actually in force -
-    `transient_unit` probes this file, and a probe of a copy of the path would be
-    a check of the wrong file that reports it clean.
+    approval be verified with" gets the answer for the path actually in force -
+    `transient_unit` probes this file as the `sentinel` uid, and a probe of a
+    copy of the path would be a check of the wrong file that reports it clean.
     """
     return _APPROVAL_KEY_PATH
 
 
-def _check_approval_token(plan_hash: Any, token: Any) -> None:
-    if not isinstance(plan_hash, str) or not _PLAN_HASH_RE.match(plan_hash):
-        raise PolicyRefusal("plan_hash must be a 64-character lowercase sha256 hex digest")
-    if not isinstance(token, str) or not token:
-        raise PolicyRefusal("approval_token is required")
-    key = _load_approval_key()
-    if not key:
-        raise PolicyRefusal(
-            f"{_APPROVAL_KEY_NAME} is not set in {_APPROVAL_KEY_PATH}; patch_step_exec "
-            "is disabled on this host until the installer generates one (see "
-            "docs/PATCHING.md, 'Binding to an approved plan') — failing closed rather "
-            "than accepting a plan nothing actually approved"
-        )
-    expected = hmac.new(key.encode("utf-8"), plan_hash.encode("utf-8"), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected, token):
-        raise PolicyRefusal("approval_token does not match plan_hash under the configured key")
+def _key_stat_problem(*, is_regular: bool, uid: int, mode: int, parent_uid: int,
+                      parent_mode: int, owner_uid: int = 0) -> str | None:
+    """Why a key file with these properties cannot be trusted, or None.
 
-
-def register_plan_steps(plan_hash: Any, steps: Any, ttl_s: Any, token: Any) -> int:
-    """Approve one plan's exact commands for `patch_step_exec` to run.
-
-    Every step is re-validated through `check_argv` here too: registering a
-    plan is not a way to bypass the grammar above, only a way to say WHICH of
-    the grammar-legal commands were actually approved. Returns the number of
-    steps registered.
+    A pure function of numbers, so every branch is exercised on any platform: the
+    properties of the REAL file are read by `_read_approval_key`, and this is the
+    judgement about them. A key that group or other can read is the original
+    defect again; a parent directory they can write is a way to replace the file
+    with one of their own.
     """
-    _check_approval_token(plan_hash, token)
+    if not is_regular:
+        return "it is not a regular file"
+    if uid != owner_uid:
+        return f"it is owned by uid {uid}, not by uid {owner_uid}"
+    if mode & 0o077:
+        return (f"its mode is {mode & 0o777:04o}; group or other can reach it, and the point "
+                "of the key is that nothing but root can")
+    if parent_uid != owner_uid:
+        return f"its directory is owned by uid {parent_uid}, not by uid {owner_uid}, who could replace the file"
+    if parent_mode & 0o022:
+        return (f"its directory has mode {parent_mode & 0o777:04o}; group or other can write to it "
+                "and replace the file")
+    return None
 
-    if not isinstance(ttl_s, int) or isinstance(ttl_s, bool) or not 1 <= ttl_s <= _MAX_TTL_S:
-        raise PolicyRefusal(f"ttl_s must be an integer in 1..{_MAX_TTL_S}, got {ttl_s!r}")
+
+def _read_approval_key() -> bytes:
+    """The approval key, or a refusal that says why there is none.
+
+    Read fresh on every call, never cached: whoever enrols a key does not also
+    have to restart the executor, and a key that was replaced or loosened is
+    noticed on the next use rather than at the next boot. `O_NOFOLLOW`: a
+    symlink planted at the path is refused, not followed.
+    """
+    where = str(_APPROVAL_KEY_PATH)
+    try:
+        fd = os.open(where, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    except FileNotFoundError:
+        raise PolicyRefusal(
+            f"no approval key is enrolled at {where}; patch_step_exec is disabled on this host "
+            "until the operator enrols one (see docs/PATCHING.md, 'Aprobarea unui plan') - failing "
+            "closed rather than accepting a plan nothing actually approved") from None
+    except OSError as exc:
+        raise PolicyRefusal(f"the approval key at {where} cannot be opened ({exc.strerror or exc}); "
+                            "failing closed") from None
+    try:
+        info = os.fstat(fd)
+        try:
+            parent = os.stat(os.path.dirname(where))
+        except OSError as exc:
+            raise PolicyRefusal(f"the directory of the approval key cannot be examined "
+                                f"({exc.strerror or exc}); failing closed") from None
+        problem = _key_stat_problem(
+            is_regular=stat_module.S_ISREG(info.st_mode), uid=info.st_uid, mode=info.st_mode,
+            parent_uid=parent.st_uid, parent_mode=parent.st_mode, owner_uid=_APPROVAL_KEY_OWNER_UID)
+        if problem:
+            raise PolicyRefusal(f"the approval key at {where} is not trusted: {problem}")
+        data = os.read(fd, 4096)
+    except OSError as exc:
+        raise PolicyRefusal(f"the approval key at {where} cannot be read ({exc.strerror or exc}); "
+                            "failing closed") from None
+    finally:
+        os.close(fd)
+    try:
+        text = data.decode("ascii").strip()
+    except UnicodeDecodeError:
+        text = ""
+    if not _APPROVAL_KEY_RE.match(text):
+        raise PolicyRefusal(f"the approval key at {where} is not 64 lowercase hex digits; failing closed")
+    return bytes.fromhex(text)
+
+
+def approval_key_problem() -> str | None:
+    """Why no approval can be verified on this host right now, or None if one can.
+
+    For `transient_unit`'s gate, which must say "the key is not there" rather than
+    leave the operator to infer it from a refusal later. Reads the key the same
+    way verification does - the two cannot disagree about what a usable key is.
+    """
+    try:
+        _read_approval_key()
+    except PolicyRefusal as exc:
+        return str(exc)
+    return None
+
+
+def _plan_steps_or_refuse(steps: Any) -> list[list[str]]:
     if not isinstance(steps, list) or not steps:
         raise PolicyRefusal("steps must be a non-empty list of argv lists")
     if len(steps) > _MAX_STEPS_PER_PLAN:
         raise PolicyRefusal(f"{len(steps)} steps exceeds the limit of {_MAX_STEPS_PER_PLAN}")
-
     validated: list[list[str]] = []
     for i, step in enumerate(steps):
         try:
             validated.append(check_argv(step))
         except PolicyRefusal as exc:
             raise PolicyRefusal(f"steps[{i}] does not pass the binary/argv grammar: {exc}") from None
+        # After the grammar, before anybody is asked to sign: a step that can only fail
+        # here is refused at the challenge, where the operator has spent nothing yet.
+        why = sandbox_refusal(validated[-1])
+        if why:
+            raise PolicyRefusal(f"steps[{i}] {validated[-1]!r} cannot run on this host: {why}")
+    return validated
+
+
+def _plan_hash_or_refuse(plan_hash: Any) -> str:
+    if not isinstance(plan_hash, str) or not _PLAN_HASH_RE.match(plan_hash):
+        raise PolicyRefusal("plan_hash must be a 64-character lowercase sha256 hex digest")
+    return plan_hash
+
+
+def challenge_plan_steps(plan_hash: Any, steps: Any) -> dict[str, Any]:
+    """Start an approval: say what exactly would be approved, and issue the nonce
+    the operator's token must cover.
+
+    Inert. Nothing becomes runnable, and the caller needs no authority to ask: the
+    answer is a digest of what it sent and a random value. It does need an
+    enrolled key - asking for an approval that can never be completed would only
+    waste the operator's time reading commands.
+
+    A second challenge for the same `plan_hash` replaces the first, so the older
+    nonce stops working. The steps are grammar-checked here too, so the operator is
+    never asked to sign something the executor would refuse.
+    """
+    _plan_hash_or_refuse(plan_hash)
+    _read_approval_key()  # refuses, with the reason, when no usable key is enrolled
+    validated = _plan_steps_or_refuse(steps)
+    digest = steps_digest(validated)
+    nonce = secrets.token_hex(16)
+    now = time.monotonic()
+    with _plan_registry_lock:
+        for stale in [h for h, entry in _challenges.items() if entry["expires_at"] <= now]:
+            del _challenges[stale]
+        if plan_hash not in _challenges and len(_challenges) >= _CHALLENGE_MAX:
+            raise PolicyRefusal(f"{_CHALLENGE_MAX} approvals are already waiting for an answer; "
+                                "refusing to open another rather than growing without bound")
+        _challenges[plan_hash] = {"digest": digest, "nonce": nonce, "expires_at": now + _CHALLENGE_TTL_S}
+    return {"plan_hash": plan_hash, "digest": digest, "nonce": nonce,
+            "step_count": len(validated), "expires_in_s": _CHALLENGE_TTL_S}
+
+
+def register_plan_steps(plan_hash: Any, steps: Any, ttl_s: Any, token: Any) -> int:
+    """Approve one plan's exact commands for `patch_step_exec` to run.
+
+    Succeeds only if `token` is the operator's HMAC over THIS `plan_hash`, THESE
+    steps and the nonce of a challenge this process issued for exactly these
+    steps and has not yet spent. Every step is re-validated through `check_argv`
+    too: registering a plan is never a way around the grammar, only a way to say
+    which of the grammar-legal commands were approved. Returns the number of steps.
+
+    The challenge is consumed only by a SUCCESSFUL registration. A wrong token
+    must not be a way to destroy the operator's pending approval.
+    """
+    _plan_hash_or_refuse(plan_hash)
+    if not isinstance(token, str) or not _TOKEN_RE.match(token):
+        raise PolicyRefusal("approval_token is required: 64 lowercase hex digits")
+    if not isinstance(ttl_s, int) or isinstance(ttl_s, bool) or not 1 <= ttl_s <= _MAX_TTL_S:
+        raise PolicyRefusal(f"ttl_s must be an integer in 1..{_MAX_TTL_S}, got {ttl_s!r}")
+    key = _read_approval_key()
+    validated = _plan_steps_or_refuse(steps)
+    digest = steps_digest(validated)
 
     now = time.monotonic()
     with _plan_registry_lock:
+        challenge = _challenges.get(plan_hash)
+        if challenge is None or challenge["expires_at"] <= now:
+            _challenges.pop(plan_hash, None)
+            raise PolicyRefusal(
+                f"no approval is waiting for {plan_hash}: it was never asked for, was already used, "
+                "or expired; ask for a new challenge")
+        if challenge["digest"] != digest:
+            raise PolicyRefusal(
+                f"these steps are not the ones the approval of {plan_hash} was asked for; a token "
+                "authorises exactly the steps it was computed over and nothing else")
+        expected = approval_token(key, plan_hash, digest, challenge["nonce"])
+        if not hmac.compare_digest(expected, token):
+            raise PolicyRefusal("approval_token does not match this plan, these steps and this challenge "
+                                "under the enrolled key")
         # Purge expired entries before the size check, so a host that has been
         # up for a while does not refuse a fresh, legitimate registration
         # because of old plans nobody will ever run again.
@@ -1371,6 +1815,7 @@ def register_plan_steps(plan_hash: Any, steps: Any, ttl_s: Any, token: Any) -> i
                 f"{_PLAN_REGISTRY_MAX} plans are already registered and unexpired; "
                 "refusing to register another rather than growing without bound"
             )
+        del _challenges[plan_hash]
         _plan_registry[plan_hash] = {"steps": validated, "expires_at": now + ttl_s}
     return len(validated)
 
@@ -1388,7 +1833,7 @@ def lookup_registered_step(plan_hash: Any, step_index: Any, argv: list[str]) -> 
         raise PolicyRefusal(
             "plan_hash is required and must be a 64-character lowercase sha256 hex "
             "digest; patch_step_exec only runs a step that was registered via "
-            "register_plan after the Telegram two-tap approval"
+            "register_plan after the operator signed it"
         )
     if not isinstance(step_index, int) or isinstance(step_index, bool) or step_index < 0:
         raise PolicyRefusal("step_index must be a non-negative integer")
@@ -1396,32 +1841,34 @@ def lookup_registered_step(plan_hash: Any, step_index: Any, argv: list[str]) -> 
     now = time.monotonic()
     with _plan_registry_lock:
         entry = _plan_registry.get(plan_hash)
-        if entry is None:
-            if _load_approval_key() is None:
+        if entry is not None:
+            if entry["expires_at"] <= now:
+                del _plan_registry[plan_hash]
+                raise PolicyRefusal(f"the registration for {plan_hash} has expired; re-approve to run it")
+            steps = entry["steps"]
+            if step_index >= len(steps):
                 raise PolicyRefusal(
-                    f"patch_step_exec is disabled: {_APPROVAL_KEY_NAME} is not "
-                    "configured, so no plan can ever be registered on this host"
+                    f"step_index {step_index} is out of range for {plan_hash} ({len(steps)} "
+                    "registered steps)"
                 )
-            raise PolicyRefusal(
-                f"no plan is registered for {plan_hash}; patch_step_exec only runs a "
-                "step that was registered via register_plan after the Telegram "
-                "two-tap approval"
-            )
-        if entry["expires_at"] <= now:
-            del _plan_registry[plan_hash]
-            raise PolicyRefusal(f"the registration for {plan_hash} has expired; re-approve to run it")
-        steps = entry["steps"]
-        if step_index >= len(steps):
-            raise PolicyRefusal(
-                f"step_index {step_index} is out of range for {plan_hash} ({len(steps)} "
-                "registered steps)"
-            )
-        if steps[step_index] != list(argv):
-            raise PolicyRefusal(
-                f"argv for step {step_index} does not match what was approved for "
-                f"{plan_hash}; refusing rather than running something different from "
-                "what the operator saw"
-            )
+            if steps[step_index] != list(argv):
+                raise PolicyRefusal(
+                    f"argv for step {step_index} does not match what was approved for "
+                    f"{plan_hash}; refusing rather than running something different from "
+                    "what the operator saw"
+                )
+            return
+    # Nothing registered. Said outside the lock - reading the key is file I/O - and
+    # said differently when no key is enrolled: "nothing can ever be approved on
+    # this host" is not "this plan was not approved".
+    problem = approval_key_problem()
+    if problem is not None:
+        raise PolicyRefusal(f"patch_step_exec is disabled: no plan can be registered on this "
+                            f"host ({problem})")
+    raise PolicyRefusal(
+        f"no plan is registered for {plan_hash}; patch_step_exec only runs a "
+        "step that was registered via register_plan after the operator signed it"
+    )
 
 
 def consume_registered_step(plan_hash: Any, step_index: Any, argv: list[str]) -> None:

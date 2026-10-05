@@ -178,6 +178,7 @@ def validate_plan(
         platform_family, apply_steps, rollback_steps, backups,
         preflight, health, postver, result
     )
+    _validate_run_budget(plan, platform_family, result)
     _validate_coupling(plan, risk, apply_steps, rollback_steps, backups, preflight, result)
     _validate_reboot_flag(plan, risk, result)
     _validate_restore_instructions(plan, result)
@@ -802,8 +803,10 @@ def _validate_platform_binaries(
 # opinion about it
 # ---------------------------------------------------------------------------
 # `executor/policy.py` is the thing that actually decides, as root, whether a
-# command runs: `patch_step_exec` and `backup_restore` in `executor/commands.py`
-# both call its `check_argv` before executing anything. This module used to
+# command runs: `patch_step_exec` in `executor/commands.py` calls its `check_argv`
+# before executing anything (`backup_restore` did too, until it was refused
+# outright on 5 October 2026 - see its docstring; a backup's `restore_argv` is
+# still checked here because the operator will run it by hand). This module used to
 # carry its own, independent idea of what an argv may look like, and the two
 # drifted exactly as far as nobody was comparing them. Measured on 18 September
 # 2026: the validator blessed `apt-get -y install --only-upgrade polkitd`,
@@ -920,6 +923,20 @@ def _validate_executor_grammar(
                 builder=builder, family=fam):
             candidates.setdefault((path, tuple(str(a) for a in argv)), (path, argv))
 
+    # The second question, asked only of commands the executor would otherwise accept:
+    # is there anywhere to RUN them? See `policy.sandbox_refusal`. A copy of the
+    # policy too old to have it cannot answer, and "cannot answer" is refused, not
+    # passed.
+    sandbox_refusal = getattr(policy, "sandbox_refusal", None)
+    if sandbox_refusal is None and candidates:
+        r.error(
+            "$", "executor_policy_outdated",
+            "the executor's command policy on this host does not say which steps can run "
+            "in its sandbox (`sandbox_refusal` is missing), so it is impossible to tell whether "
+            "this plan's steps would run or fail with 'Read-only file system'. Refused rather "
+            "than assumed to run. Redeploy: install.sh step 24 installs policy.py.",
+        )
+
     for path, argv in candidates.values():
         try:
             policy.check_argv(list(argv))
@@ -929,6 +946,7 @@ def _validate_executor_grammar(
                 f"the root executor refuses this command, so it can never run: "
                 f"{refusal}",
             )
+            continue
         except Exception as exc:
             # Anything other than a refusal is a bug in the policy module.
             # Reported as a plan error all the same: a validator that crashes
@@ -938,6 +956,105 @@ def _validate_executor_grammar(
                 f"the executor's policy raised {type(exc).__name__}: {exc} while "
                 "checking this command. That is a bug, not an approval.",
             )
+            continue
+        if sandbox_refusal is None or not _executed_by_the_runner(path):
+            continue
+        try:
+            why = sandbox_refusal(list(argv))
+        except Exception as exc:
+            r.error(
+                f"$.{path}", "executor_check_failed",
+                f"the executor's policy raised {type(exc).__name__}: {exc} while deciding "
+                "whether this command can run. That is a bug, not an approval.",
+            )
+            continue
+        if why:
+            r.error(
+                f"$.{path}", "step_cannot_run",
+                f"the executor accepts this command and has nowhere to run it: {why}. A step "
+                "that can only fail is refused here, before the operator is asked to approve "
+                "anything - not discovered after the apply, when the only thing left to do is "
+                "roll back a machine that was never changed.",
+            )
+
+
+def _executed_by_the_runner(path: str) -> bool:
+    """Whether an argv labelled by `_iter_plan_argvs` is something the runner SENDS to
+    the executor. A backup's `restore_argv` is not: it is the operator's documented
+    manual path, written into `restore.sh` and recorded with the restore point, and
+    `tar -x` is exactly what it is for."""
+    return not path.startswith("backup[")
+
+
+# ---------------------------------------------------------------------------
+# The approval window
+# ---------------------------------------------------------------------------
+def _validate_run_budget(plan: dict[str, Any], platform_family: str | None, r: ValidationResult) -> None:
+    """A plan whose declared timeouts do not fit the approval window is refused HERE.
+
+    The executor keeps an approval for `approval.APPROVAL_TTL_S` (one hour), the
+    restore point is taken inside it before the first command, and a registration that
+    expires halfway leaves a half-applied machine whose rollback is refused. So the
+    commands may declare `approval.RUN_BUDGET_S` seconds between them - the worst case,
+    apply AND rollback AND the checks, because the rollback is the one that must still
+    be approved when the apply has used its time.
+
+    This used to be checked only when the operator was asked to sign
+    (`approval.challenge`): after two taps and the PIN, with no way to shorten the plan
+    from there. Measured on 5 October 2026 across both databases: nine plans fit (990 -
+    2190 s) and one, n8n plan 1, declared 2700 s and was refused at the signing prompt.
+    A plan that cannot be approved must never be offered, so the same sum is a
+    validation error - which also puts it in front of the planner's second attempt.
+
+    The sum is `approval.flatten`'s, the function the challenge uses: what is counted
+    here is what is registered there, by construction.
+    """
+    try:
+        from sentinel.patch import approval
+    except Exception as exc:
+        r.error(
+            "$", "run_budget_unreadable",
+            f"`sentinel.patch.approval` could not be loaded ({type(exc).__name__}: {exc}), so "
+            "whether this plan's timeouts fit the approval window cannot be known. Refused "
+            "rather than assumed to fit.",
+        )
+        return
+    worst: tuple[int, int, int] | None = None
+    for family in ((platform_family,) if platform_family else PLATFORM_FAMILIES):
+        try:
+            flat = approval.flatten(plan, family)
+        except Exception:
+            # A check missing a field, a timeout that is not a number: each is its own
+            # error above; guessing what the author meant is not this function's job.
+            return
+        apply_s = _declared_seconds(plan.get("apply"))
+        rollback_s = _declared_seconds(plan.get("rollback"))
+        if worst is None or flat.budget_s > worst[0]:
+            worst = (flat.budget_s, apply_s, rollback_s)
+    if worst is None or worst[0] <= approval.RUN_BUDGET_S:
+        return
+    total, apply_s, rollback_s = worst
+    r.error(
+        "$", "run_budget_exceeded",
+        f"the commands of this plan declare timeouts that add up to {total} s (apply {apply_s} s, "
+        f"rollback {rollback_s} s, the checks that run a command {total - apply_s - rollback_s} s), "
+        f"and the most a plan may declare is {approval.RUN_BUDGET_S} s: the approval lives "
+        f"{approval.APPROVAL_TTL_S} s, the restore point is taken inside it, and an approval that "
+        "expires halfway leaves a half-applied machine whose rollback is refused. Lower `timeout_s` "
+        "on the steps that do not need so long (a package transaction rarely needs more than 600 s).",
+    )
+
+
+def _declared_seconds(steps: Any) -> int:
+    """The sum of the `timeout_s` of the steps of one section that carry a command."""
+    total = 0
+    for step in steps if isinstance(steps, list) else []:
+        if isinstance(step, dict) and step.get("argv"):
+            try:
+                total += int(step.get("timeout_s", 60))
+            except (TypeError, ValueError):
+                pass
+    return total
 
 
 # ---------------------------------------------------------------------------

@@ -88,7 +88,10 @@ not closed; the unit says what became of it.
 What is NOT recovered, and is not pretended to be: the approval. The registry of
 approved plans is in memory (policy.register_plan_steps), so after a restart the
 rollback step of an interrupted plan must be approved again; persisting approvals
-would be a new mechanism and is left to the operator. A duplicate end row for one
+would be a new mechanism and is left to the operator. What the runner does about
+that: it does not roll back from a transaction that is "not over" (it could not be
+approved, and it would race the transaction); it asks `transaction_outcome` what
+this process recorded for the step and tells the operator. A duplicate end row for one
 invocation is possible only if the process died between writing it and releasing
 the unit; it carries `recovered: true` and the true verdict. The unit's OUTPUT is
 kept by the journal (volatile on production: gone at reboot) and returned to the
@@ -168,7 +171,8 @@ that, because it is PID 1's child and not the executor's. This unit gets outboun
 network with no address filter, because dnf reaches mirrors and CDNs whose
 addresses cannot be listed. That is a real widening - a scriptlet can exfiltrate -
 and it is accepted only for the duration of one approved step. (The nftables table
-has no output hook, so nothing on the host bounds it either.)
+has no output hook, so nothing on the host bounds it either.) `apt-get` and `apt`
+reach their mirrors the same way, and run in the same unit.
 
 THE GATE. This path is not switchable by a flag, an environment variable or a
 config file: `refusal_reasons()` computes, at every call, facts about the host,
@@ -184,12 +188,20 @@ kernel and could not be:
      "can the probe say yes to -w at all" even from inside a read-only namespace.
      Without it a broken `-w` (wrong uid, no exec) reads as "cannot write" for
      every path below, and the gate would open on a probe that never worked.
-  4. the requester uid cannot read the approval key. It is what an approval token
-     is signed with; whoever can read it can sign a plan of their own choosing.
-     ANSWERED BY THE KERNEL: `test -r` as that uid. Reading is not refused by a
-     read-only mount, so the namespace this process runs in does not distort it.
+  4. the requester uid cannot read the approval key, AND a usable key exists. The
+     key is what an approval token is checked against; whoever can read it can sign
+     a plan of their own choosing. It lives in the root-only directory beside the
+     audit chain (policy.approval_key_path()), not in secrets.env, which the
+     `sentinel` account reads. Two observations, kept apart because each is blind
+     where the other sees: "cannot read" is ANSWERED BY THE KERNEL (`test -r` as that
+     uid; reading is not refused by a read-only mount, so this process's namespace
+     does not distort it) but is also what a MISSING key looks like from the
+     requester's side; so the executor reads the key itself, as root, the way it will
+     to verify a token (`policy.approval_key_problem()`: exists, regular file, owned
+     by root, no group/other bits, directory not writable by others, 64 hex digits).
   5. the requester cannot write the audit file, its directory, or any ancestor
-     (an ancestor it owns lets it rename the directory away and recreate one).
+     (an ancestor it owns lets it rename the directory away and recreate one) - and
+     the same for the approval key and every directory above it.
      This is NOT one kind of answer, and it must not be described as one:
 
        * a path on a mount that is WRITABLE in this process's mount namespace is
@@ -218,11 +230,16 @@ kernel and could not be:
      PID 1 refuses a second unit with the same name, and `_reconcile()` reads
      what is there before every spawn.
 
-The first of the facts is false on every host today: the approval key is read from
-/etc/sentinel/secrets.env, which is 0640 root:sentinel because the sentinel
-services read that file for their own reasons (measured on production,
-30 September 2026). Making it true is a design decision - a separate approver
-uid, or an operator-held secret the executor verifies - and is not made here.
+History, because it is why this gate exists. The approval key used to be read from
+/etc/sentinel/secrets.env, which is 0640 root:sentinel because the sentinel services
+read that file for their own reasons (measured on production, 30 September 2026), so
+this fact was false on every host and the gate stayed closed. The key is now an
+operator-held secret that lives in a root-only file, and the fact holds once an
+operator has enrolled one (docs/PATCHING.md, "Aprobarea unui plan"). WHAT THE GATE
+DOES NOT OBSERVE: whether the requester can reach root some other way. `sentinel` is
+in the `docker` group, which is root through the socket, and no fact above looks at
+that - on purpose, and reported separately: a refusal added here would close the path
+for a reason nobody has decided on yet.
 
 Stdlib only, imports nothing from `sentinel/` - see README.md.
 """
@@ -260,21 +277,28 @@ TEST = "/usr/bin/test"
 #: -w` say yes" from inside any mount namespace.
 WRITE_CONTROL = "/dev/null"
 
-#: The bare name the grammar validated -> the binary that is actually run.
-PROGRAMS: dict[str, str] = {"dnf": "/usr/bin/dnf"}
+#: The bare name the grammar validated -> the binary that is actually run. Every
+#: package manager the grammar knows has an entry (a test holds the two tables
+#: together): a manager the grammar accepts and this table lacks would be a
+#: transaction with nowhere to go. `apt` and `apt-get` are two names for the same
+#: Debian family of binaries; each is run as itself, never one as the other.
+PROGRAMS: dict[str, str] = {
+    "dnf": "/usr/bin/dnf",
+    "apt-get": "/usr/bin/apt-get",
+    "apt": "/usr/bin/apt",
+}
 
-#: dnf subcommands that write to the rpm database. Together with
-#: `NOT_ROUTED_SUBCOMMANDS` this must be exactly `policy._DNF_SUBCOMMANDS`, so a
-#: subcommand added to the grammar later is classified by a human, not by default.
-MUTATING_SUBCOMMANDS: dict[str, frozenset[str]] = {
-    "dnf": frozenset({"upgrade", "update", "install", "downgrade", "reinstall", "remove"}),
-}
-#: Left to the executor's own sandbox. They write the dnf cache, which is
-#: read-only there too - see the README - but they change no package, and giving
-#: them an unconfined unit is a separate decision.
-NOT_ROUTED_SUBCOMMANDS: dict[str, frozenset[str]] = {
-    "dnf": frozenset({"clean", "check-update", "makecache"}),
-}
+#: Subcommands that write to the package database - `policy.TRANSACTION_SUBCOMMANDS`,
+#: the one definition, which the plan validator and the challenge read too (they run
+#: on the other side of the trust boundary and cannot import this module). Together
+#: with `NOT_ROUTED_SUBCOMMANDS` it is exactly each grammar's subcommand set, so a
+#: subcommand added to a grammar later is classified by a human, not by default.
+MUTATING_SUBCOMMANDS: dict[str, frozenset[str]] = policy.TRANSACTION_SUBCOMMANDS
+#: Not given a unit. They write the manager's cache and log, which are read-only in
+#: the executor's sandbox - see the README - but they change no package, and giving
+#: them an unconfined unit is a separate decision. A step like that is REFUSED up
+#: front (`policy.sandbox_refusal`), not run to fail.
+NOT_ROUTED_SUBCOMMANDS: dict[str, frozenset[str]] = policy.CACHE_SUBCOMMANDS
 
 #: One fixed name. systemd refuses a second unit with the same name, which makes
 #: "one transaction at a time" a fact PID 1 enforces across executor restarts and
@@ -352,6 +376,29 @@ UNIT_ENVIRONMENT: tuple[str, ...] = (
     "LC_ALL=C.UTF-8",
     "HOME=/root",
     "TERM=dumb",
+    # No terminal, no one to answer. Measured (Ubuntu 24.04, `postfix`, which asks a
+    # debconf question): WITHOUT this, debconf tries the Dialog frontend, then Readline,
+    # each failing with a warning, falls back to Teletype and takes the defaults - the
+    # install completes; with it, it goes straight there. So it is the conventional
+    # setting that keeps the outcome from depending on a fallback chain, and it is NOT
+    # shown to be necessary. Not read by dnf.
+    "DEBIAN_FRONTEND=noninteractive",
+    # Ubuntu's apt hook runs `needrestart -m u` after every dpkg run, and in that mode
+    # it RESTARTS affected services by itself. Measured on 5 October 2026 (Ubuntu 24.04
+    # container, needrestart 3.6, libc replaced the way an upgrade does): run as the
+    # hook runs it, OUTSIDE this unit, it executed `systemctl restart
+    # sentinel-executor.service systemd-journald.service` and the executor's start time
+    # changed - the "restarted under an install" case (`recover`, runner rule 9).
+    # INSIDE this unit it does nothing today, with or without this line: it prints "No
+    # services need to be restarted", because the unit drops CAP_SYS_PTRACE
+    # (DENIED_CAPABILITIES) and so cannot read other processes' memory maps. This line
+    # is the second guard, and it is proved only for the case where the first one goes:
+    # with CAP_SYS_PTRACE given back and this line absent the end-to-end test
+    # (test_patch_apply_end_to_end_apt.py) fails - the executor IS restarted inside the
+    # apt transaction - and with the line present it passes. `l` lists and restarts
+    # nothing; the plan's own `systemctl restart` is then the only restart, as after a
+    # `dnf` transaction on the rpm hosts. Not read by dnf.
+    "NEEDRESTART_MODE=l",
 )
 #: The environment of the CLIENTS this process starts (`systemd-run`, `systemctl`,
 #: `journalctl`, the probe), not of the unit.
@@ -360,8 +407,12 @@ _CLIENT_ENV = {"PATH": "/usr/sbin:/usr/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF
 #: The closed alphabet a transaction token may use. Wider than a package name
 #: needs nowhere; narrower than `policy._PKG_NAME_RE`, which lets everything but
 #: `/` and whitespace follow a `:` - including `$` and `%`, which systemd
-#: substitutes in an exec line.
-_SAFE_TOKEN = re.compile(r"[A-Za-z0-9._+:=-]+")
+#: substitutes in an exec line. `~` is in it because a Debian version is: every
+#: Debian security update carries one (`1:2.3-1~deb12u1`), and without it the
+#: rollback pin of a Debian plan could never be sent. Measured that systemd hands
+#: it to the program unchanged (`systemd-run -- /usr/bin/echo 'pkg=2:1.2~rc1-1~deb12u1'`
+#: prints the argument as given); it has no meaning in an exec line, unlike `$` and `%`.
+_SAFE_TOKEN = re.compile(r"[A-Za-z0-9._+:=~-]+")
 _MAX_TOKEN_CHARS = 200
 #: The whole argv, JSON-encoded, goes into ONE audit row whose detail field is
 #: cut at 1000 characters. Longer is refused, never truncated: a row that shows a
@@ -413,6 +464,15 @@ _transaction_lock = threading.Lock()
 #: could not be released is not re-recorded on every later call.
 _closed_invocations: set[str] = set()
 
+#: The end rows THIS process wrote, by (plan_hash, step_index): the answer to "what
+#: became of the transaction for this approved step?" that `transaction_outcome`
+#: gives the runner. A mirror of rows that are already on disk - never a second
+#: source of truth: it is filled only after `audit_write` said the row landed,
+#: bounded, and gone at a restart (the audit chain is what survives one).
+_RECORDED_MAX = 64
+_recorded: dict[tuple[str, int], dict[str, Any]] = {}
+_recorded_lock = threading.Lock()
+
 
 def configure(audit_path: Any, audit_write: AuditWrite, stop: threading.Event | None = None,
               log: Callable[..., None] | None = None) -> None:
@@ -438,24 +498,17 @@ def is_transaction(argv: Any) -> bool:
     """True if this (already grammar-validated) argv writes to the package
     database and therefore belongs in a transient unit.
 
-    The subcommand is the first token that is not a flag - exactly how
-    `policy._check_dnf_argv` finds it, and the grammar refuses every abbreviation
-    (`in`, `up`, `rm`) dnf itself would accept, so the two cannot disagree about
-    which word is the subcommand. A False answer is the SAFE one: the command then
-    runs where it always ran, in the executor's read-only sandbox, and fails there.
+    Decided by `policy.is_package_transaction`, which finds the subcommand the way the
+    grammar does - the first token that is neither a flag nor a flag's value (`apt-get
+    -o Dpkg::Options::=--force-confold install x` is an install) - and the grammar
+    refuses every abbreviation (`in`, `up`, `rm`) the managers themselves would accept,
+    so the two cannot disagree about which word is the subcommand.
+
+    A False answer does NOT mean "run it in the sandbox and see": `op_patch_step_exec`
+    then asks `policy.sandbox_refusal`, and a step that can only fail there is refused
+    before it is run.
     """
-    if not isinstance(argv, list) or not argv or not isinstance(argv[0], str):
-        return False
-    subcommands = MUTATING_SUBCOMMANDS.get(argv[0])
-    if subcommands is None:
-        return False
-    for part in argv[1:]:
-        if not isinstance(part, str):
-            return False
-        if part.startswith("-"):
-            continue
-        return part in subcommands
-    return False
+    return policy.is_package_transaction(argv)
 
 
 def check_shape(argv: list[str]) -> None:
@@ -470,7 +523,7 @@ def check_shape(argv: list[str]) -> None:
     for index, part in enumerate(argv):
         if len(part) > _MAX_TOKEN_CHARS or not _SAFE_TOKEN.fullmatch(part):
             raise PolicyRefusal(
-                f"argv[{index}] is not made only of letters, digits and . _ + : = -; "
+                f"argv[{index}] is not made only of letters, digits and . _ + : = ~ -; "
                 "a package transaction is handed to systemd, which substitutes $ and % "
                 "in an exec line, so anything outside that alphabet is refused rather "
                 "than escaped"
@@ -639,6 +692,17 @@ def _audit_chain_paths(audit_path: PurePosixPath) -> list[str]:
     return [str(audit_path), *(str(parent) for parent in audit_path.parents)]
 
 
+def _protected_paths(audit_path: PurePosixPath | None, key_path: str) -> list[str]:
+    """Everything the requester must not be able to write: the audit chain, and the
+    approval key with every directory above it. A writable directory above the key
+    lets its owner replace the file with a key of their own, which is the same as
+    reading it."""
+    paths = list(_audit_chain_paths(audit_path)) if audit_path is not None else []
+    key = PurePosixPath(PurePath(key_path).as_posix())
+    paths += [str(key), *(str(parent) for parent in key.parents)]
+    return list(dict.fromkeys(paths))
+
+
 def refusal_reasons() -> list[str]:
     """Every reason a package transaction may not run on this host right now.
     An empty list means every fact below holds; there is no other way in.
@@ -679,18 +743,26 @@ def refusal_reasons() -> list[str]:
             "it can sign an approval for a plan of its own choosing: the approval binds "
             "nothing against the account it is meant to constrain"
         )
+    # The other half of fact 4. "The requester cannot read it" is also what a key
+    # that does not exist looks like from the requester's side, and a gate that
+    # opened on a missing key would open on a host where no approval can ever be
+    # checked. The executor reads the key itself, as root, the way it will to
+    # verify a token, and says what is wrong with it.
+    problem = policy.approval_key_problem()
+    if problem is not None:
+        reasons.append(f"no approval can be verified on this host: {problem}")
 
-    if audit_path is not None:
-        for path in _audit_chain_paths(audit_path):
-            writable, how = _requester_can_write(path)
-            if writable is None:
-                reasons.append(f"could not determine whether the requester can write {path}, "
-                               f"which the audit chain depends on ({how})")
-            elif writable:
-                reasons.append(
-                    f"the requester can write {path}, which the audit chain depends on: it "
-                    f"could rewrite, or rename away and replace, the record of what runs as root ({how})"
-                )
+    for path in _protected_paths(audit_path, key_path):
+        writable, how = _requester_can_write(path)
+        if writable is None:
+            reasons.append(f"could not determine whether the requester can write {path}, "
+                           f"which the audit chain or the approval key depends on ({how})")
+        elif writable:
+            reasons.append(
+                f"the requester can write {path}, which the audit chain or the approval key "
+                f"depends on: it could rewrite, or rename away and replace, the record of what "
+                f"runs as root, or the key an approval is checked against ({how})"
+            )
     return reasons
 
 
@@ -1201,6 +1273,53 @@ def _end_detail(outcome: dict[str, Any], marker: dict[str, Any] | None, recovere
     return detail
 
 
+def _remember(detail: dict[str, Any]) -> None:
+    """Keep what an end row said, for `transaction_outcome`. Called only once the row
+    is on disk. A row with no plan hash or step index (a transaction nobody can tie
+    to a step) is not kept: there is nobody who could ask."""
+    plan_hash, step_index = detail.get("plan_hash"), detail.get("step_index")
+    if not isinstance(plan_hash, str) or not isinstance(step_index, int):
+        return
+    with _recorded_lock:
+        _recorded.pop((plan_hash, step_index), None)
+        _recorded[(plan_hash, step_index)] = detail
+        while len(_recorded) > _RECORDED_MAX:
+            del _recorded[next(iter(_recorded))]
+
+
+def transaction_outcome(plan_hash: Any, step_index: Any) -> dict[str, Any]:
+    """What became of the package transaction started for one approved step, as this
+    executor knows it. Read-only: it settles nothing (`recover` and `_reconcile` do).
+
+    For the runner, which cannot see the audit chain and needs to know - when a step
+    came back `still_running_or_unknown` because the executor was restarted under it -
+    whether to tell the operator "it finished" or "it is still going" before anyone
+    suggests restoring anything.
+
+      recorded   an end row for this step was written by this process; `end` carries
+                 what it says (outcome, exit_code, verified, result, recovered)
+      running    a transaction is running under systemd now (`this_step` says whether
+                 it is the one asked about)
+      unknown    nothing is recorded by this process and nothing runs: a transaction
+                 settled by an earlier executor process is in the audit chain only
+    """
+    if not isinstance(plan_hash, str) or not _PLAN_HASH.fullmatch(plan_hash):
+        raise PolicyRefusal("plan_hash must be a 64-character lowercase sha256 hex digest")
+    if not isinstance(step_index, int) or isinstance(step_index, bool) or step_index < 0:
+        raise PolicyRefusal("step_index must be a non-negative integer")
+    with _recorded_lock:
+        kept = _recorded.get((plan_hash, step_index))
+    if kept is not None:
+        return {"state": "recorded", "end": {
+            key: kept.get(key) for key in
+            ("outcome", "exit_code", "verified", "result", "recovered", "duration_ms")}}
+    if _classify(_unit_state()) == "running":
+        marker = _read_marker() or {}
+        return {"state": "running", "unit": UNIT_FULL,
+                "this_step": marker.get("plan_hash") == plan_hash and marker.get("step_index") == step_index}
+    return {"state": "unknown"}
+
+
 def _finalize(outcome: dict[str, Any], marker: dict[str, Any] | None, *, recovered: bool) -> dict[str, Any]:
     """Close a transaction's record, in the only order that never loses an outcome:
 
@@ -1217,10 +1336,12 @@ def _finalize(outcome: dict[str, Any], marker: dict[str, Any] | None, *, recover
     if not recorded:
         if audit_write is None:
             return {"end_recorded": False, "marker_cleared": None, "released": None}
-        recorded = bool(audit_write("end", "ok" if outcome["exit_code"] == 0 else "error",
-                                    _end_detail(outcome, marker, recovered)))
-        if recorded and invocation_id is not None:
-            _closed_invocations.add(invocation_id)
+        end_detail = _end_detail(outcome, marker, recovered)
+        recorded = bool(audit_write("end", "ok" if outcome["exit_code"] == 0 else "error", end_detail))
+        if recorded:
+            _remember(end_detail)
+            if invocation_id is not None:
+                _closed_invocations.add(invocation_id)
     if not recorded:
         return {"end_recorded": False, "marker_cleared": None, "released": None}
     if not _clear_marker():

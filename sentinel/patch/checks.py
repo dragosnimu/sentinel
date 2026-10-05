@@ -30,6 +30,7 @@ against a machine nobody actually verified.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -51,28 +52,48 @@ class CheckOutcome:
     kind: str = ""
 
 
+#: `(plan_hash, step_index)` of the check being evaluated, when it belongs to an
+#: approved plan being applied. A context variable and not a parameter threaded
+#: through `_dispatch` and every kind: the executor refuses a real call that does not
+#: name the registered step it replays, and the index is a property of the check's
+#: place in the plan, not of its kind. Set by `evaluate`, read by `_exec`.
+_binding: contextvars.ContextVar[tuple[str, int] | None] = contextvars.ContextVar(
+    "patch_check_binding", default=None)
+
+
 async def _exec(argv: list[str], timeout: int = 30) -> dict[str, Any]:
     # socket_timeout_s covers the check's own timeout (up to 3600s for a
     # "command" check) plus margin, so the client does not give up on a
     # still-running check before the executor itself would time it out.
+    binding = _binding.get()
+    bound = {"plan_hash": binding[0], "step_index": binding[1]} if binding is not None else {}
     return await asyncio.to_thread(
         _client.call, "patch_step_exec", argv=argv, timeout_s=timeout,
-        socket_timeout_s=timeout + TIMEOUT_MARGIN_S)
+        socket_timeout_s=timeout + TIMEOUT_MARGIN_S, **bound)
 
 
-async def evaluate(db: Database, check: dict[str, Any], *, family: str = "rhel") -> CheckOutcome:
+async def evaluate(db: Database, check: dict[str, Any], *, family: str = "rhel",
+                   binding: tuple[str, int] | None = None) -> CheckOutcome:
     """Run one check. Never raises: an error is a failed check.
 
     `family` is `platform.family` from the running config — which package
     manager and version syntax `pkg_version` must speak. It defaults to
     `rhel` for the same reason `PlatformConfig.family` does (see its
     docstring): every caller that predates this parameter runs on AlmaLinux.
+
+    `binding` is `(plan_hash, step_index)` when this check belongs to an approved
+    plan that is being APPLIED: the executor refuses a real call that does not say
+    which registered step it replays. `None` (a dry run, a caller outside a plan)
+    sends nothing extra.
     """
     kind = str(check.get("kind", ""))
+    token = _binding.set(binding)
     try:
         return await _dispatch(db, kind, check, family)
     except Exception as exc:  # noqa: BLE001 - unevaluable is failed, not passed
         return CheckOutcome(False, f"verificarea nu a putut fi evaluată: {exc}", kind)
+    finally:
+        _binding.reset(token)
 
 
 def argv_for(check: dict[str, Any], family: str = "rhel") -> list[str] | None:

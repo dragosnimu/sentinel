@@ -168,9 +168,11 @@ Available `check.kind` values:
 }
 ```
 
-`{artifact}` is substituted by the runner with the real artifact path. The
-runner builds the *creation* command from `kind` + `source`; you supply the
-*restore* command, because that is the part that needs judgement.
+`restore_argv` is recorded with the plan and shown to the operator; nothing runs
+it (the runner does not send it, and the executor's `backup_restore` refuses),
+so `{artifact}` is a placeholder for the person reading it. The runner builds
+the *creation* command from `kind` + `source`; you supply the *restore* command,
+because that is the part that needs judgement.
 
 See `backup-restore.md` for the correct `kind` and restore command per stack.
 
@@ -230,8 +232,8 @@ Then:
      "check": {"kind": "systemd", "unit": "nginx.service", "expect_state": "active"}, "blocking": true},
     {"id": "pf3", "desc_ro": "Spațiu liber suficient pentru backup",
      "check": {"kind": "disk_free", "path": "/var/backups/sentinel", "min_bytes": 209715200}, "blocking": true},
-    {"id": "pf4", "desc_ro": "Configurația nginx curentă este validă",
-     "check": {"kind": "command", "argv": ["nginx", "-t"], "expect_exit": [0]}, "blocking": true},
+    {"id": "pf4", "desc_ro": "Fișierul de configurație nginx există",
+     "check": {"kind": "file_exists", "path": "/etc/nginx/nginx.conf"}, "blocking": true},
     {"id": "pf5", "desc_ro": "Niciun incident deschis pe acest asset",
      "check": {"kind": "no_open_incident", "asset_id": 3}, "blocking": true}
   ],
@@ -249,11 +251,8 @@ Then:
     {"id": "ap1", "desc_ro": "Actualizează pachetul nginx",
      "argv": ["dnf", "-y", "update", "nginx"], "run_as": "root",
      "timeout_s": 300, "idempotent": true, "expect_exit": [0], "on_failure": "rollback"},
-    {"id": "ap2", "desc_ro": "Verifică sintaxa configurației după actualizare",
-     "argv": ["nginx", "-t"], "run_as": "root",
-     "timeout_s": 30, "idempotent": true, "expect_exit": [0], "on_failure": "rollback"},
     {"id": "ap3", "desc_ro": "Reîncarcă nginx fără downtime",
-     "argv": ["systemctl", "reload", "nginx"], "run_as": "root",
+     "argv": ["systemctl", "reload", "nginx.service"], "run_as": "root",
      "timeout_s": 30, "idempotent": true, "expect_exit": [0], "on_failure": "rollback"}
   ],
 
@@ -285,7 +284,7 @@ Then:
 ```
 
 Note what makes it a good plan: preflight confirms the version *before*
-changing anything, `nginx -t` runs both before and after, the rollback is a
+changing anything, the rollback is a
 real downgrade to a specific version rather than a vague "restore", and the
 post-verification re-checks the thing the scanner will check tonight.
 

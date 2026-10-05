@@ -22,6 +22,19 @@ and every rule below exists because the alternative is a broken server at 3 a.m.
   7. **Nothing is ever partially applied silently.** If the runner cannot finish
      and cannot roll back, the execution ends as `rollback_failed`, which is the
      loudest state in the schema.
+  8. **A rollback needs something to roll back.** An apply step the executor
+     REFUSED never ran, so when the first one is refused nothing has changed and
+     the execution ends `aborted` with no rollback: rolling back a machine nobody
+     touched is how a plan that "could not run" became a red "rollback failed -
+     restore by hand" for a server that was fine.
+  9. **"Not over yet" is not "failed".** A package transaction the executor could
+     not follow to its end (it was restarted under it) is still owned by systemd and
+     may finish fine; the executor says so in the reply. The runner then does not
+     roll back - a rollback would race the transaction it is meant to undo and, after
+     an executor restart, is refused for want of an approval (the registry is in the
+     executor's memory) - it asks the executor for its own record of how
+     that transaction ended and puts that in front of the operator
+     (`RunResult.unknown_outcome`), with the execution ending `failed`.
 """
 
 from __future__ import annotations
@@ -33,8 +46,9 @@ from typing import Any
 from sentinel.config import Config
 from sentinel.db.engine import Database
 from sentinel.db.repo import patches as repo
+from sentinel.errors import ExecutorRejected
 from sentinel.logging_setup import get_logger
-from sentinel.patch import backup, checks
+from sentinel.patch import approval, backup, checks
 from sentinel.patch.validator import plan_hash, validate_plan
 from sentinel.respond.executor_client import TIMEOUT_MARGIN_S, ExecutorClient
 
@@ -67,6 +81,17 @@ class StepOutcome:
     timed_out: bool = False
     # Failed, but the plan declared `on_failure: continue` for it.
     tolerated: bool = False
+    # The executor said NO before running anything (`ExecutorRejected`): the step
+    # never ran, so it changed nothing and there is nothing to undo.
+    refused: bool = False
+    # The executor said the step's transaction is not over, or that it cannot tell how
+    # it ended (`transaction.still_running_or_unknown`). Neither a failure nor a success.
+    open: bool = False
+    # `(plan_hash, step_index)` of the registered step this was, when it was one.
+    binding: tuple[str, int] | None = None
+    # The restore point a backup step made: its id (a directory name) and its script.
+    restore_point: str | None = None
+    restore_script: str | None = None
 
 
 @dataclass
@@ -77,11 +102,39 @@ class RunResult:
     error: str | None = None
     rollback_reason: str | None = None
     post_ok: bool | None = None
+    # What the executor itself recorded about the apply transaction whose outcome was
+    # unknown when the run stopped (see rule 9). `None` when no step was in that state.
+    unknown_outcome: dict[str, Any] | None = None
+    # For a `rollback_failed`: what the executor recorded for each apply step that ran
+    # (step id -> its `transaction_outcome`), so the operator is not sent to restore a
+    # change the executor's own end row says finished.
+    apply_verdicts: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    @property
+    def restore_point(self) -> str | None:
+        """The id of the restore point this run made, if it got that far."""
+        return next((s.restore_point for s in self.steps if s.restore_point), None)
+
+    @property
+    def restore_script(self) -> str | None:
+        return next((s.restore_script for s in self.steps if s.restore_script), None)
+
+    @property
+    def restore_path(self) -> str | None:
+        point = self.restore_point
+        return backup.restore_point_path(point) if point else None
 
 
 async def _exec_step(db: Database, execution_id: int, phase: str, seq: int,
-                     step: dict[str, Any], *, dry_run: bool) -> StepOutcome:
-    """Run one step. Writes the DB row before the command, updates it after."""
+                     step: dict[str, Any], *, dry_run: bool,
+                     binding: tuple[str, int] | None = None) -> StepOutcome:
+    """Run one step. Writes the DB row before the command, updates it after.
+
+    `binding` is `(plan_hash, step_index)`: which step of the plan the operator
+    signed for this call is. The executor runs a real step only if its argv is
+    exactly that registered step, so a real call without it is refused there.
+    A dry run needs none (it runs nothing) and the runner gives it none.
+    """
     step_id = str(step.get("id") or f"{phase}-{seq}")
     argv = [str(a) for a in step.get("argv", [])]
     cwd = step.get("cwd")
@@ -89,6 +142,8 @@ async def _exec_step(db: Database, execution_id: int, phase: str, seq: int,
 
     row_id = await repo.begin_step(db, execution_id, phase=phase, step_id=step_id,
                                    seq=seq, argv=argv, cwd=cwd)
+    bound = ({"plan_hash": binding[0], "step_index": binding[1]}
+             if binding is not None and not dry_run else {})
     try:
         # socket_timeout_s covers the step's OWN timeout_s (up to 3600s,
         # executor/commands.py op_patch_step_exec) plus margin — the client's
@@ -98,12 +153,28 @@ async def _exec_step(db: Database, execution_id: int, phase: str, seq: int,
         result = await asyncio.to_thread(
             _client.call, "patch_step_exec",
             argv=argv, cwd=cwd, timeout_s=timeout, dry_run=dry_run,
-            socket_timeout_s=timeout + TIMEOUT_MARGIN_S)
+            socket_timeout_s=timeout + TIMEOUT_MARGIN_S, **bound)
     except Exception as exc:  # noqa: BLE001 - executor refused or unreachable
         await repo.end_step(db, row_id, status="failed", stderr=str(exc)[:2000])
-        return StepOutcome(False, phase, step_id, stderr=str(exc)[:2000])
+        # `ExecutorRejected` is the executor saying no BEFORE it ran anything; an
+        # unreachable executor says nothing about whether the step ran.
+        return StepOutcome(False, phase, step_id, stderr=str(exc)[:2000],
+                           refused=isinstance(exc, ExecutorRejected))
 
     if dry_run:
+        # A dry run runs nothing, so on its own it would say "fine" for a step the
+        # real run is going to be refused - the same collapse of "cannot know" into
+        # "fine" as a health check that cannot see what it checks. For a package
+        # transaction the executor says what it would refuse for; that is a FAILED
+        # dry run, with the executor's own words, so the apply is stopped here
+        # (guard 4 of `run_plan`) before anything has been touched.
+        # Two shapes, one meaning: a package transaction reports under `transaction`, a
+        # step that has nowhere to run (policy.sandbox_refusal) at the top level.
+        refused = result.get("refused_because") or (result.get("transaction") or {}).get("refused_because")
+        if isinstance(refused, list) and refused:
+            reason = ("executorul ar refuza acest pas: " + "; ".join(str(r) for r in refused))[:2000]
+            await repo.end_step(db, row_id, status="failed", exit_code=1, stderr=reason)
+            return StepOutcome(False, phase, step_id, exit_code=1, stderr=reason)
         await repo.end_step(db, row_id, status="ok", exit_code=0,
                             stdout="(dry-run) " + " ".join(argv))
         return StepOutcome(True, phase, step_id, exit_code=0)
@@ -115,16 +186,20 @@ async def _exec_step(db: Database, execution_id: int, phase: str, seq: int,
     # `expect_exit` is the schema's name for this, and honouring it matters:
     # dnf returns 100 for "updates available", which is not a failure.
     expect = [int(c) for c in step.get("expect_exit", [0])]
-    ok = (exit_code in expect) and not timed_out
+    # A transaction the executor could not follow to its end says so; whatever exit
+    # code it carries (125: "could not be vouched for") is not an answer.
+    open_ = bool((result.get("transaction") or {}).get("still_running_or_unknown"))
+    ok = (exit_code in expect) and not timed_out and not open_
 
     await repo.end_step(db, row_id, status="ok" if ok else "failed",
                         exit_code=exit_code, stdout=stdout, stderr=stderr,
                         timed_out=timed_out)
-    return StepOutcome(ok, phase, step_id, exit_code, stdout, stderr, timed_out)
+    return StepOutcome(ok, phase, step_id, exit_code, stdout, stderr, timed_out, open=open_)
 
 
 async def _run_check(db: Database, execution_id: int, phase: str, seq: int,
-                     item: dict[str, Any], *, dry_run: bool, family: str) -> StepOutcome:
+                     item: dict[str, Any], *, dry_run: bool, family: str,
+                     binding: tuple[str, int] | None = None) -> StepOutcome:
     """Evaluate one structured check and record it like any other step.
 
     A NON-blocking check that fails is recorded and tolerated: the plan author
@@ -143,7 +218,10 @@ async def _run_check(db: Database, execution_id: int, phase: str, seq: int,
                             stdout=f"(dry-run) verificare {kind}")
         return StepOutcome(True, phase, step_id, exit_code=0)
 
-    outcome = await checks.evaluate(db, check, family=family)
+    # Only passed when there is one: a check that sends no argv, and every dry run,
+    # call `evaluate` exactly as before.
+    extra = {"binding": binding} if binding is not None else {}
+    outcome = await checks.evaluate(db, check, family=family, **extra)
     blocking = bool(item.get("blocking", True))
     await repo.end_step(db, row_id, status="ok" if outcome.ok else "failed",
                         exit_code=0 if outcome.ok else 1, stdout=outcome.detail)
@@ -153,7 +231,8 @@ async def _run_check(db: Database, execution_id: int, phase: str, seq: int,
 
 
 async def _run_phase(db: Database, execution_id: int, plan: dict[str, Any], phase: str,
-                     seq_start: int, *, dry_run: bool, family: str = "rhel"
+                     seq_start: int, *, dry_run: bool, family: str = "rhel",
+                     binding: approval.Binding | None = None
                      ) -> tuple[list[StepOutcome], int]:
     """Run one phase. Check phases evaluate typed checks; apply and rollback run
     argv steps. A failure is tolerated only when the plan says so — a
@@ -170,12 +249,17 @@ async def _run_phase(db: Database, execution_id: int, plan: dict[str, Any], phas
     seq = seq_start
     is_checks = phase in CHECK_PHASES
 
-    for item in plan.get(phase, []) or []:
+    for position, item in enumerate(plan.get(phase, []) or []):
+        # Which registered step this item is, by the same (phase, position) the
+        # registration was flattened from. None for an item that sends no argv.
+        ref = binding.for_item(phase, position) if binding is not None and not dry_run else None
         if is_checks:
             outcome = await _run_check(db, execution_id, phase, seq, item,
-                                       dry_run=dry_run, family=family)
+                                       dry_run=dry_run, family=family, binding=ref)
         else:
-            outcome = await _exec_step(db, execution_id, phase, seq, item, dry_run=dry_run)
+            outcome = await _exec_step(db, execution_id, phase, seq, item, dry_run=dry_run,
+                                       binding=ref)
+            outcome.binding = ref
             if not outcome.ok and item.get("on_failure") == "continue":
                 outcome.tolerated = True
         seq += 1
@@ -223,11 +307,13 @@ async def _run_backup(db: Database, execution_id: int, plan: dict[str, Any],
     detail = (f"punct de restaurare {rp_id}: {len(manifest['items'])} artefacte, "
               f"verificate; restore.sh scris")
     await repo.end_step(db, row_id, status="ok", exit_code=0, stdout=detail)
-    return StepOutcome(True, "backup", "restore_point", 0, stdout=detail), seq + 1
+    return StepOutcome(True, "backup", "restore_point", 0, stdout=detail, restore_point=rp_id,
+                       restore_script=manifest.get("restore_script")), seq + 1
 
 
 async def _rollback(db: Database, execution_id: int, plan: dict[str, Any],
-                    seq_start: int, reason: str) -> tuple[bool, list[StepOutcome]]:
+                    seq_start: int, reason: str,
+                    binding: approval.Binding | None = None) -> tuple[bool, list[StepOutcome]]:
     """Run the rollback steps. Always attempted with dry_run=False — a rollback
     that only pretends to work is worse than none, because it reports success.
 
@@ -236,7 +322,8 @@ async def _rollback(db: Database, execution_id: int, plan: dict[str, Any],
     own docstring.
     """
     log.error("patch rollback starting", extra={"execution_id": execution_id, "reason": reason})
-    outcomes, _ = await _run_phase(db, execution_id, plan, "rollback", seq_start, dry_run=False)
+    outcomes, _ = await _run_phase(db, execution_id, plan, "rollback", seq_start, dry_run=False,
+                                   binding=binding)
     ok = bool(outcomes) and all(o.ok for o in outcomes)
     if not outcomes:
         # No rollback steps in the plan. The validator only permits that when
@@ -244,6 +331,79 @@ async def _rollback(db: Database, execution_id: int, plan: dict[str, Any],
         # still a state the operator must be told about explicitly.
         log.error("no rollback steps in plan", extra={"execution_id": execution_id})
     return ok, outcomes
+
+
+#: How long the runner waits for the executor to say how an open transaction ended, and
+#: how it spaces its questions (the schedule below adds up to 60 s; whichever of the
+#: two ends first stops the asking). The executor that took over after a restart settles
+#: a finished unit within seconds (`transient_unit.recover`); a transaction that is still
+#: running is not waited for beyond that - the answer then is "running", and the
+#: operator is told.
+VERDICT_WAIT_S = 60
+VERDICT_POLL_S = (2, 4, 8, 16, 30)
+
+
+async def _ask_outcome(binding: tuple[str, int]) -> dict[str, Any]:
+    """The executor's own record of one approved step's transaction, or a note that it
+    could not be read. Never raises: not being able to ask is an answer, and an
+    honest one - it is reported as `unavailable`, never as `finished`."""
+    try:
+        return await asyncio.to_thread(_client.call, "transaction_outcome",
+                                       plan_hash=binding[0], step_index=binding[1])
+    except Exception as exc:  # noqa: BLE001 - the executor may be mid-restart
+        return {"state": "unavailable", "error": str(exc)[:300]}
+
+
+async def _transaction_verdict(step: StepOutcome) -> dict[str, Any]:
+    """Wait, briefly, for the executor to record how an open transaction ended.
+
+    `recorded` ends the wait; so does `running` after the budget is spent, because a
+    transaction that is still going is the answer. What comes back always says which
+    step it is about (`step_id`)."""
+    if step.binding is None:
+        return {"state": "unavailable", "step_id": step.step_id,
+                "error": "the step carried no plan binding to ask about"}
+    waited = 0.0
+    answer: dict[str, Any] = {"state": "unavailable"}
+    for pause in (*VERDICT_POLL_S, None):
+        answer = await _ask_outcome(step.binding)
+        if answer.get("state") == "recorded" or pause is None or waited >= VERDICT_WAIT_S:
+            break
+        await asyncio.sleep(pause)
+        waited += pause
+    return {**answer, "step_id": step.step_id}
+
+
+def describe_outcome(verdict: dict[str, Any]) -> str:
+    """The executor's verdict about one transaction, in words for the operator. Says
+    only what the executor said: 'finished OK' needs the end row's `outcome:
+    finished`, exit 0 and `verified`, all three."""
+    state = verdict.get("state")
+    if state == "recorded":
+        end = verdict.get("end") or {}
+        if end.get("outcome") == "finished" and end.get("verified") is True and end.get("exit_code") == 0:
+            return ("executorul a înregistrat încheierea tranzacției: s-a încheiat CU SUCCES "
+                    "(cod 0, verificat de systemd) - pachetul a fost schimbat")
+        if end.get("outcome") == "finished" and end.get("verified") is True:
+            return (f"executorul a înregistrat încheierea tranzacției: s-a încheiat CU EȘEC "
+                    f"(cod {end.get('exit_code')})")
+        return (f"executorul a înregistrat tranzacția ca {end.get('outcome')!r} (cod "
+                f"{end.get('exit_code')}, verificat: {end.get('verified')}): rezultatul ei nu poate "
+                "fi garantat")
+    if state == "running":
+        return "tranzacția încă rulează sub systemd (sentinel-txn.service)"
+    return ("executorul nu poate spune acum cum s-a încheiat tranzacția; rândul `transaction_end` "
+            "din lanțul lui de audit (/var/lib/sentinel-executor/audit.jsonl, doar root) o spune")
+
+
+async def _apply_verdicts(steps: list[StepOutcome]) -> dict[str, dict[str, Any]]:
+    """For a failed rollback: what the executor recorded for each apply step that ran.
+    One question per step, no waiting - the run is over and this is context."""
+    out: dict[str, dict[str, Any]] = {}
+    for step in steps:
+        if step.phase == "apply" and step.binding is not None and not step.refused:
+            out[step.step_id] = await _ask_outcome(step.binding)
+    return out
 
 
 async def run_plan(db: Database, cfg: Config, plan_db_id: int, *,
@@ -291,6 +451,19 @@ async def run_plan(db: Database, cfg: Config, plan_db_id: int, *,
     # Guard 3: applying requires an approval that named this exact hash.
     if mode == "apply" and row.status != "approved":
         raise PatchRefused(f"planul nu este aprobat (stare: {row.status})")
+
+    # Guard 3b: an apply names, for every real command it sends, which step of the
+    # plan the operator signed for it is (`plan_hash` + index). The index is derived
+    # from the plan here, the same way the request the operator signed was; a plan
+    # whose commands cannot be listed is refused before anything runs. Without a
+    # matching registration in the executor each of those calls is refused THERE -
+    # the approval is the operator's token, and nothing in this process can supply it.
+    binding: approval.Binding | None = None
+    if mode == "apply":
+        try:
+            binding = approval.bind(plan, row.plan_hash, family)
+        except approval.ApprovalError as exc:
+            raise PatchRefused(f"planul nu poate fi legat de o aprobare: {exc}") from None
 
     # Guard 4 — S3: "dry run first, always" was a claim in this docstring that
     # the code never carried out; `apply` went straight to the real commands.
@@ -352,7 +525,7 @@ async def run_plan(db: Database, cfg: Config, plan_db_id: int, *,
             if phase == "apply":
                 apply_started = True
             outcomes, seq = await _run_phase(db, execution_id, plan, phase, seq,
-                                             dry_run=dry, family=family)
+                                             dry_run=dry, family=family, binding=binding)
             all_steps.extend(outcomes)
             failed = next((o for o in outcomes if not o.ok and not o.tolerated), None)
             if failed is None:
@@ -360,6 +533,10 @@ async def run_plan(db: Database, cfg: Config, plan_db_id: int, *,
 
             reason = (f"pasul {failed.step_id} din faza {phase} a eșuat "
                       f"(cod {failed.exit_code}{', timeout' if failed.timed_out else ''})")
+            if dry and failed.stderr:
+                # A dry run's failure IS the executor's reason ("would refuse: ..."), and
+                # the caller - the apply's pre-pass above - shows only this line.
+                reason += f": {failed.stderr[:600]}"
 
             # A failure before anything was applied needs no rollback: nothing
             # changed. Saying so plainly avoids a pointless rollback that could
@@ -372,7 +549,40 @@ async def run_plan(db: Database, cfg: Config, plan_db_id: int, *,
                 log.error("patch aborted before any change", extra={"reason": reason})
                 return RunResult("aborted", execution_id, all_steps, error=reason)
 
-            rolled_ok, rb_steps = await _rollback(db, execution_id, plan, seq, reason)
+            # Rule 9: a transaction that is not over is not a failure to undo. Nothing is
+            # rolled back - the rollback would race it, and after an executor restart is
+            # refused for want of an approval - and the executor is asked how it ended.
+            open_step = next((o for o in outcomes if o.open), None)
+            if open_step is not None:
+                verdict = await _transaction_verdict(open_step)
+                reason = (f"pasul {open_step.step_id} din faza apply are un rezultat NECUNOSCUT: "
+                          f"executorul nu a putut urmări tranzacția până la capăt (cod "
+                          f"{open_step.exit_code}); {describe_outcome(verdict)}. Nu s-a făcut rollback "
+                          "și pașii următori ai planului nu au rulat.")
+                await repo.finish_execution(db, execution_id, status="failed", error=reason,
+                                            result={"phase": phase, "unknown_outcome": verdict})
+                await repo.set_plan_status(db, plan_db_id, "failed")
+                log.error("patch stopped: the outcome of an apply transaction is unknown",
+                          extra={"reason": reason, "verdict": verdict.get("state")})
+                return RunResult("failed", execution_id, all_steps, error=reason,
+                                 unknown_outcome=verdict)
+
+            # Rule 8: nothing ran, so nothing changed. Only the FIRST apply step can be in
+            # this state - an earlier one that ran (and succeeded) is something to undo.
+            if phase == "apply" and failed.refused and not any(
+                    o is not failed and not o.refused for o in outcomes):
+                reason = (f"pasul {failed.step_id} din faza apply a fost REFUZAT de executor înainte "
+                          f"să ruleze ({failed.stderr[:600]}); nimic nu a fost schimbat, deci nu s-a "
+                          "făcut rollback")
+                await repo.finish_execution(db, execution_id, status="aborted", error=reason,
+                                            result={"phase": phase, "refused": failed.step_id})
+                await repo.set_plan_status(db, plan_db_id, "failed")
+                log.error("patch aborted: the executor refused the first apply step",
+                          extra={"reason": reason})
+                return RunResult("aborted", execution_id, all_steps, error=reason)
+
+            rolled_ok, rb_steps = await _rollback(db, execution_id, plan, seq, reason,
+                                                  binding=binding)
             all_steps.extend(rb_steps)
             status = "rolled_back" if rolled_ok else "rollback_failed"
             await repo.finish_execution(db, execution_id, status=status, error=reason,
@@ -380,7 +590,8 @@ async def run_plan(db: Database, cfg: Config, plan_db_id: int, *,
             await repo.set_plan_status(db, plan_db_id,
                                        "rolled_back" if rolled_ok else "failed")
             return RunResult(status, execution_id, all_steps, error=reason,
-                             rollback_reason=reason)
+                             rollback_reason=reason,
+                             apply_verdicts={} if rolled_ok else await _apply_verdicts(all_steps))
 
         post_ok = any(o.phase == "post_verification" and o.ok for o in all_steps) or None
         await repo.finish_execution(db, execution_id, status="succeeded",
@@ -399,7 +610,8 @@ async def run_plan(db: Database, cfg: Config, plan_db_id: int, *,
         # the same way a normal failure there does, not run rollback steps
         # against an untouched system.
         if not dry and apply_started:
-            rolled_ok, rb_steps = await _rollback(db, execution_id, plan, seq + 100, detail)
+            rolled_ok, rb_steps = await _rollback(db, execution_id, plan, seq + 100, detail,
+                                                  binding=binding)
             all_steps.extend(rb_steps)
             status = "rolled_back" if rolled_ok else "rollback_failed"
         else:

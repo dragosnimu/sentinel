@@ -140,6 +140,10 @@ PROTECTED_PATHS: Final[tuple[str, ...]] = (
     "/opt/sentinel",
     "/etc/sentinel",
     "/var/lib/sentinel",
+    # The executor's own state: the approval key and the audit chain. Mirrors
+    # executor/policy.py; `test_policy_agrees_with_sentinel_constants` requires
+    # every entry of the executor's list to be present here.
+    "/var/lib/sentinel-executor",
     "/var/backups/sentinel",
     "/root/.ssh",
     "/etc/ssh",

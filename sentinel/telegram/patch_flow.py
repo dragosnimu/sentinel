@@ -18,6 +18,15 @@ is built to be hard to do by accident and impossible to do by replay:
     is defence in depth for a lost or stolen phone: `approve_plan` is not
     called until the correct PIN is typed back, compared constant-time, with a
     per-chat attempt cap. See `on_pin_reply`.
+  * **The operator signs; the bot cannot.** Two taps are not an approval the
+    executor accepts. After them the bot asks the executor what would be approved
+    and shows the operator a request to sign ON THEIR OWN WORKSTATION
+    (`scripts/approve-plan.py`), which recomputes and prints the exact commands
+    before it produces a token. The token covers the plan hash, the commands and a
+    nonce the executor issued, and is checked against a key that nothing running as
+    `sentinel` can read (executor/policy.py, "Plan binding, and who is allowed to
+    approve a plan"). A compromised bot can ask; it cannot sign, and it cannot make
+    the token cover other commands. See `_ask_for_approval` / `on_approval_reply`.
   * **The return-path verdict is re-checked at `on_stage1`, for every plan.**
     `send_plan_for_approval` does not evaluate anything on its own, so any
     caller that hands out a full keyboard for a `validated` plan — `/patch
@@ -35,6 +44,7 @@ is built to be hard to do by accident and impossible to do by replay:
 from __future__ import annotations
 
 import hmac
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -196,6 +206,25 @@ async def on_stage1(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await query.edit_message_text(f"⛔ Planul nu mai e valabil (stare: {row.status}).")
         return
 
+    # Un plan care nu poate fi aprobat nu se oferă. Validarea rulează AICI, la prima
+    # atingere, și nu doar la generare: un plan stocat înainte ca o regulă să existe
+    # (un pas care nu poate rula în sandbox-ul executorului, timeouturi care nu încap în
+    # fereastra de aprobare) ar ajunge altfel la a doua atingere, la PIN și la cererea
+    # de semnătură - trei acțiuni ale operatorului - ca să fie refuzat abia acolo, fără
+    # nicio cale de a-l scurta. Același validator ca la generare și ca în runner.
+    from sentinel.patch.validator import validate_plan
+    cfg = context.bot_data.get("cfg")
+    family = cfg.platform.family if cfg is not None else None
+    verdict = validate_plan(row.plan, platform_family=family)
+    if not verdict.valid:
+        await query.edit_message_text(
+            f"⛔ <b>Planul #{row.id} nu mai trece validarea</b> și nu poate fi aprobat; niciun token "
+            f"de confirmare nu a fost emis ({len(verdict.errors)} erori):\n"
+            + "\n".join(f"• <code>{_esc(e.path)}</code>: {_esc(e.message[:300])}"
+                        for e in verdict.errors[:3]),
+            parse_mode=ParseMode.HTML)
+        return
+
     # V1 (runda 3, 16 sep 2026): verdictul de întoarcere se citește AICI, nu la
     # propunere. `send_plan_for_approval` nu evaluează nimic — vezi docstring-ul
     # ei — și `cmd_patches`/`/patch <id>` îl cheamă fără `gate_note`/`allow_apply`
@@ -327,9 +356,140 @@ async def on_stage2(update: Update, context: ContextTypes.DEFAULT_TYPE,
             prompt_message_id=getattr(prompt, "message_id", None))
         return
 
-    await _approve_and_run(db, cfg, query.edit_message_text,
-                           plan_id=second.plan_id or 0,
-                           plan_hash=second.plan_hash or "", by=by)
+    await _ask_for_approval(db, cfg, query.edit_message_text, chat_id=chat_id,
+                            plan_id=second.plan_id or 0,
+                            plan_hash=second.plan_hash or "", by=by)
+
+
+# ---------------------------------------------------------------------------
+# The operator's signature
+# ---------------------------------------------------------------------------
+# Same shape as the PIN wait below, deliberately: in-process only, keyed by chat,
+# answered by a REPLY to the prompt message, capped in attempts. A restart drops it
+# (the operator taps "Aplică…" again) - the executor's own challenge expires on its
+# own, and a challenge nobody answers makes nothing runnable.
+APPROVAL_TTL_S = 900          # the executor's challenge lives this long (`policy._CHALLENGE_TTL_S`)
+APPROVAL_MAX_ATTEMPTS = 3
+_TOKEN_SHAPE = re.compile(r"^[0-9a-f]{64}$")
+
+
+@dataclass
+class _PendingApproval:
+    plan_id: int
+    plan_hash: str
+    by: str
+    expires_at: float
+    #: The prompt's own id: the token must be a reply TO IT, for the reason
+    #: `_PendingPin.prompt_message_id` documents. `None` never matches.
+    prompt_message_id: int | None = None
+    attempts: int = 0
+
+
+_pending_approvals: dict[int, _PendingApproval] = {}
+
+
+async def _ask_for_approval(db: Database, cfg: Any, edit: Any, *, chat_id: int,
+                            plan_id: int, plan_hash: str, by: str) -> None:
+    """Ask the executor what would be approved and hand the operator the request to
+    sign. Nothing is approved here and nothing runs: the plan stays `validated`
+    until a token the executor accepts comes back (`on_approval_reply`).
+
+    The plan is re-read and its hash compared first, for the reason every step of
+    this flow does: the bytes the operator is about to sign for must be the bytes
+    the taps named."""
+    row = await patches.get_plan(db, plan_id)
+    if row is None or row.plan_hash != plan_hash or row.status != "validated":
+        await edit("⛔ Planul s-a schimbat sau nu mai e în starea 'validated'. "
+                   "Aprobarea a fost anulată — cere planul din nou.")
+        return
+
+    from sentinel.patch import approval
+    try:
+        request = await approval.challenge(row.plan, plan_hash, cfg.platform.family)
+    except approval.ApprovalError as exc:
+        await edit(f"⛔ Aprobarea nu poate fi cerută: {_esc(exc)}", parse_mode=ParseMode.HTML)
+        return
+
+    prompt = await edit(
+        f"🔐 <b>Semnează aprobarea planului #{plan_id}</b>\n\n"
+        "Jetonul se face pe <b>stația ta</b>, nu aici. Rulează acolo "
+        "<code>python scripts/approve-plan.py sign</code>, lipește la prompt cererea de mai jos și "
+        "<b>verifică comenzile pe care le arată scriptul</b> — nu pe cele din acest mesaj. "
+        "Apoi răspunde LA ACEST MESAJ cu jetonul.\n\n"
+        f"<code>{_esc(request)}</code>\n\n"
+        f"<i>Cererea expiră în {APPROVAL_TTL_S // 60} minute, jetonul se poate folosi o singură dată.</i>",
+        parse_mode=ParseMode.HTML)
+    _pending_approvals[chat_id] = _PendingApproval(
+        plan_id=plan_id, plan_hash=plan_hash, by=by,
+        expires_at=time.monotonic() + APPROVAL_TTL_S,
+        prompt_message_id=getattr(prompt, "message_id", None))
+
+
+async def on_approval_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Take a text reply as the operator's token, if an approval is pending for this
+    chat. `True` when the message was handled as an attempt (right, wrong or
+    expired); `False` when there is nothing pending or the reply is not to the
+    prompt, so the caller can try another reading of it.
+
+    The token is NOT a secret in the way the PIN is (it is bound to one set of
+    commands and spent by one registration), but this still never logs it.
+
+    A wrong token does not burn the executor's challenge, so a typo is retried here
+    up to `APPROVAL_MAX_ATTEMPTS` times; the executor, not this function, decides
+    whether the token is right.
+    """
+    chat_id = update.effective_chat.id
+    pending = _pending_approvals.get(chat_id)
+    if pending is None:
+        return False
+    reply_to = update.message.reply_to_message if update.message else None
+    if reply_to is None or reply_to.message_id != pending.prompt_message_id:
+        return False
+    if f"telegram:{chat_id}" != pending.by:
+        return False
+
+    if time.monotonic() > pending.expires_at:
+        del _pending_approvals[chat_id]
+        await update.message.reply_text("⛔ Cererea de aprobare a expirat. Cere planul din nou.")
+        return True
+
+    db: Database = context.bot_data["db"]
+    cfg = context.bot_data["cfg"]
+    typed = (update.message.text or "").strip().lower()
+
+    async def refuse(reason: str) -> bool:
+        pending.attempts += 1
+        if pending.attempts >= APPROVAL_MAX_ATTEMPTS:
+            del _pending_approvals[chat_id]
+            await update.message.reply_text(
+                f"⛔ {reason}\nPrea multe încercări. Cere planul din nou.")
+        else:
+            await update.message.reply_text(
+                f"⛔ {reason} ({pending.attempts}/{APPROVAL_MAX_ATTEMPTS}). "
+                "Răspunde din nou la cerere cu jetonul corect.")
+        return True
+
+    if not _TOKEN_SHAPE.match(typed):
+        return await refuse("Jetonul trebuie să aibă 64 de cifre hex.")
+
+    row = await patches.get_plan(db, pending.plan_id)
+    if row is None or row.plan_hash != pending.plan_hash or row.status != "validated":
+        del _pending_approvals[chat_id]
+        await update.message.reply_text(
+            "⛔ Planul s-a schimbat de când a fost cerută semnătura. Cere planul din nou.")
+        return True
+
+    from sentinel.patch import approval
+    try:
+        await approval.register(row.plan, pending.plan_hash, cfg.platform.family, typed)
+    except approval.ApprovalError as exc:
+        return await refuse(f"Executorul a refuzat aprobarea: {_esc(exc)}")
+
+    del _pending_approvals[chat_id]
+    progress = await update.message.reply_text("⏳ Aprobare primită. Aplic planul… primești rezultatul aici.")
+    await _approve_and_run(db, cfg, progress.edit_text, plan_id=pending.plan_id,
+                           plan_hash=pending.plan_hash, by=pending.by)
+    return True
 
 
 async def _approve_and_run(db: Database, cfg: Any, edit: Any, *,
@@ -357,18 +517,71 @@ async def _approve_and_run(db: Database, cfg: Any, edit: Any, *,
         await edit(f"⛔ Refuzat înainte de execuție: {_esc(exc)}")
         return
 
+    await edit(format_apply_result(result), parse_mode=ParseMode.HTML)
+
+
+def format_apply_result(result: Any) -> str:
+    """What the operator reads when an apply ends - the one message about a change to a
+    production machine, so it carries the EVIDENCE and not only a verdict.
+
+    Three things it used to leave out, each of which sent an operator to act on a
+    guess: why the failing step failed (its own stderr, as `on_dry_run` shows it for a
+    dry run), where the restore point is (id and path, not "the restore point"), and
+    what the executor recorded about the apply transaction. That last one matters most
+    after an executor restart in the middle of an install: the install FINISHED, the
+    rollback was refused because approvals do not survive a restart, and the old text
+    told the operator to restore by hand a machine whose package had just been
+    installed correctly. A restore is never advised here; it is offered, with the
+    facts, for the operator to decide.
+    """
+    from sentinel.patch.runner import describe_outcome
+
+    unknown = getattr(result, "unknown_outcome", None)
     icon = {"succeeded": "✅", "rolled_back": "↩️", "rollback_failed": "🔴",
             "aborted": "🟡", "failed": "🔴"}.get(result.status, "❓")
-    body = [f"{icon} <b>Patch {result.status}</b> (execuție #{result.execution_id})"]
+    if unknown is not None:
+        icon = "🟠"
+    body = [f"{icon} <b>Patch {_esc(result.status)}</b> (execuție #{result.execution_id})"]
     if result.error:
         body.append(f"Motiv: {_esc(result.error)}")
-    if result.status == "rollback_failed":
-        body.append("\n🔴 <b>ROLLBACK-UL A EȘUAT.</b> Serverul poate fi într-o stare "
-                    "intermediară. Restaurează manual: punctul de restaurare are "
-                    "<code>restore.sh</code>.")
+
+    # Why: the failing steps' own words, tail first (the failure is at the end of what a
+    # package manager prints). Tolerated failures are not shown: the plan said they are fine.
+    shown = 0
+    for step in result.steps:
+        if step.ok or getattr(step, "tolerated", False) or not step.stderr.strip():
+            continue
+        if shown == 3:
+            body.append("<i>(alți pași eșuați nu sunt afișați; sunt în execuție)</i>")
+            break
+        shown += 1
+        body.append(f"✗ <code>{_esc(step.phase)}/{_esc(step.step_id)}</code> (cod {step.exit_code}): "
+                    f"<i>{_esc(step.stderr.strip()[-400:])}</i>")
+
+    point = getattr(result, "restore_point", None)
+    script = getattr(result, "restore_script", None) or (
+        f"{result.restore_path}/restore.sh" if getattr(result, "restore_path", None) else None)
+    where = (f"\nPunct de restaurare: <code>{_esc(point)}</code> - "
+             f"<code>{_esc(script)}</code> (rulat ca root) îl restaurează; rulează-l doar dacă starea "
+             "reală o cere." if point and script else "")
+
+    if unknown is not None:
+        body.append("\n🟠 <b>Rezultatul tranzacției de pachete NU e cunoscut.</b> Nu s-a făcut "
+                    f"rollback. Executorul spune: {_esc(describe_outcome(unknown))}. Verifică starea "
+                    "reală a pachetelor (<code>rpm -q</code> / <code>dpkg -l</code>) înainte de orice "
+                    "restaurare." + where)
+    elif result.status == "rollback_failed":
+        body.append("\n🔴 <b>ROLLBACK-UL A EȘUAT.</b> Serverul poate fi într-o stare intermediară - "
+                    "verifică starea reală a pachetelor înainte de orice restaurare.")
+        for step_id, verdict in (getattr(result, "apply_verdicts", None) or {}).items():
+            body.append(f"ℹ️ Pasul de aplicare <code>{_esc(step_id)}</code>: {_esc(describe_outcome(verdict))}.")
+        body.append(where.lstrip("\n") or "Punctul de restaurare are <code>restore.sh</code>.")
+    elif result.status in ("failed", "rolled_back") and where:
+        body.append(where)
+
     ok = sum(1 for s in result.steps if s.ok)
     body.append(f"\nPași: {ok}/{len(result.steps)} reușiți")
-    await edit("\n".join(body), parse_mode=ParseMode.HTML)
+    return "\n".join(body)
 
 
 # ---------------------------------------------------------------------------
@@ -462,6 +675,13 @@ async def on_pin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
       silently trusting a dict key that no longer means what it used to.
     """
     chat_id = update.effective_chat.id
+    # The operator's token is a reply to a different prompt, handled the same way
+    # and by the same registered handler (see `on_approval_reply`). Tried first: a
+    # pending PIN and a pending approval cannot both exist for one chat - the PIN is
+    # what leads to the approval request - and the approval handler returns False
+    # for any reply that is not to its own prompt.
+    if await on_approval_reply(update, context):
+        return True
     pending = _pending_pins.get(chat_id)
     if pending is None:
         return False
@@ -504,9 +724,9 @@ async def on_pin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
     del _pending_pins[chat_id]
     db: Database = context.bot_data["db"]
     cfg = context.bot_data["cfg"]
-    progress = await update.message.reply_text("⏳ Aplic planul… primești rezultatul aici.")
-    await _approve_and_run(db, cfg, progress.edit_text, plan_id=pending.plan_id,
-                           plan_hash=pending.plan_hash, by=pending.by)
+    progress = await update.message.reply_text("⏳ PIN corect. Cer executorului aprobarea…")
+    await _ask_for_approval(db, cfg, progress.edit_text, chat_id=chat_id,
+                            plan_id=pending.plan_id, plan_hash=pending.plan_hash, by=pending.by)
     return True
 
 
@@ -538,6 +758,10 @@ async def on_dry_run(update: Update, context: ContextTypes.DEFAULT_TYPE,
     lines = [f"🧪 <b>Dry-run {result.status}</b> (execuție #{result.execution_id})", ""]
     for s in result.steps[:12]:
         lines.append(f"{'✓' if s.ok else '✗'} <code>{_esc(s.phase)}/{_esc(s.step_id)}</code>")
+        if not s.ok and s.stderr:
+            # Why, in the executor's own words: a dry run that only says ✗ leaves the
+            # operator to guess what to fix.
+            lines.append(f"   <i>{_esc(s.stderr[:300])}</i>")
     lines.append("\n<i>Nimic nu a fost modificat.</i>")
     lines.append("Butoanele de aprobare sunt pe mesajul planului, mai sus.")
     await progress.edit_text("\n".join(lines), parse_mode=ParseMode.HTML)

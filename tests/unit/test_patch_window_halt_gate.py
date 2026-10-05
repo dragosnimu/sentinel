@@ -68,6 +68,12 @@ def _wire_common(monkeypatch, *, plan_row, halt, approved=True, run_plan_calls):
         return approved
     monkeypatch.setattr(patch_repo, "approve_plan", _approve)
 
+    # Past the halt gate the second tap goes on to ask the operator for a signature;
+    # approving and running happen only once a signed token comes back.
+    async def _ask(*a, **k):
+        run_plan_calls["ask"] = True
+    monkeypatch.setattr(patch_flow, "_ask_for_approval", _ask)
+
     from sentinel.patch import runner
 
     async def _run_plan(*a, **k):
@@ -107,13 +113,14 @@ def test_a_non_window_plan_is_unaffected_by_a_window_failure(monkeypatch):
 
     run(patch_flow.on_stage2(update, _ctx(), "tok"))
 
-    assert calls.get("approve") is True
-    assert calls.get("run") is True
+    assert calls.get("ask") is True
+    assert "approve" not in calls and "run" not in calls, "fără semnătură nu se aprobă și nu se rulează"
 
 
 def test_a_window_plan_applies_normally_with_no_prior_failure(monkeypatch):
     """Reversul, ca poarta să nu blocheze orbește tot ce vine din fereastră:
-    fără niciun eșec anterior, planul trebuie aprobat și rulat ca înainte."""
+    fără niciun eșec anterior, planul merge mai departe — spre cererea de
+    semnătură, de unde îl duce jetonul operatorului."""
     update, edits = _update_and_edits()
     calls: dict[str, bool] = {}
     _wire_common(monkeypatch,
@@ -123,5 +130,5 @@ def test_a_window_plan_applies_normally_with_no_prior_failure(monkeypatch):
 
     run(patch_flow.on_stage2(update, _ctx(), "tok"))
 
-    assert calls.get("approve") is True
-    assert calls.get("run") is True
+    assert calls.get("ask") is True
+    assert "approve" not in calls and "run" not in calls
