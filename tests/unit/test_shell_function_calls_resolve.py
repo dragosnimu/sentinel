@@ -43,6 +43,32 @@ functions; `git` did not. Line numbers in a failure message are therefore
 lines of the COMMITTED file, which is not necessarily the line you see in your
 editor.
 
+## Which scripts are the corpus: the ones that ship, not every `.sh`
+
+The defect above is a script that RUNS ON A HOST calling a function that never
+reached it. So the corpus is the shell scripts the packager sends
+(`scripts/lib/build-package.sh`), not every file ending in `.sh`: the harness
+under `tests/` (`tests/integration/patch_e2e/*.sh`) builds a disposable
+container on the operator's workstation and calls what exists THERE —
+`cygpath` on Git Bash, `python3.12` and `/opt/e2e/venv/bin/pip` in the image.
+None of that is a shell function, and none of it ever executes on a Sentinel
+host. Teaching `EXTERNAL_COMMANDS` those names would have made a guard about
+host deploys vouch for a container's contents, and every name added there
+widens what "resolves" means for the scripts that DO ship — the one repair
+this file refuses (`test_no_function_names_hidden_as_binaries`).
+
+`NOT_SHIPPED_DIRS` is that boundary, written down once, and
+`test_the_directories_discovery_skips_are_the_ones_the_packager_leaves_out`
+ties it to the packager's own pathspec: if `:!tests` ever leaves
+`_SENTINEL_PACKAGE_PATHSPECS`, tests/ ships and this file starts failing
+instead of staying blind to it. Everything else — including `watcher/` and
+`aggregator/`, which the packager also omits but which run on a host of their
+own — stays in the corpus; this file narrows only where narrowing is the
+whole point.
+
+What this costs: nothing under `tests/` is resolved by anything. A function
+the e2e harness calls and never defines would be found when somebody runs it.
+
 ## Where the line is drawn on "a call"
 
 Reported as a call: a plain word in command position — first word of a simple
@@ -1279,9 +1305,24 @@ def _git_out(*args: str) -> bytes:
                           capture_output=True, check=True).stdout
 
 
+#: Top-level directories of the repository that the packager does NOT send to a
+#: host (see "Which scripts are the corpus" in the module docstring). Roots,
+#: not substrings: `deploy/tests/x.sh` ships and is analysed.
+NOT_SHIPPED_DIRS = ("tests",)
+
+
+def _is_shipped(path: str) -> bool:
+    """Whether a repo-relative path is outside every NOT_SHIPPED_DIRS root.
+
+    Mirrors how git reads the pathspec `:!tests`: the directory at the root and
+    everything beneath it — not `testsuite/x.sh`, not `deploy/tests/x.sh`.
+    """
+    return not any(path == d or path.startswith(d + "/") for d in NOT_SHIPPED_DIRS)
+
+
 @cache
 def _shell_scripts_at(rev: str) -> tuple[str, ...]:
-    """Paths of the `.sh` files in a commit — the tree, not the index.
+    """Paths of the SHIPPED `.sh` files in a commit — the tree, not the index.
 
     `git ls-files` would answer from the index, where a `git add`ed but
     uncommitted library is already visible; that is the exact state this test
@@ -1292,7 +1333,7 @@ def _shell_scripts_at(rev: str) -> tuple[str, ...]:
     # every test in this file pass over nothing at all.
     out = _git_out("ls-tree", "-r", "-z", "--name-only", rev)
     return tuple(sorted(p for p in out.decode("utf-8").split("\0")
-                        if p.endswith(".sh")))
+                        if p.endswith(".sh") and _is_shipped(p)))
 
 
 @cache
@@ -1364,6 +1405,52 @@ def test_every_call_in_a_committed_shell_script_has_a_committed_definition():
         "it is a binary the host provides, add it to EXTERNAL_COMMANDS in this "
         "file, where the claim gets reviewed.\n"
         + "\n".join(f"  {m}" for m in missing))
+
+
+def test_discovery_skips_the_unshipped_root_and_nothing_wider():
+    """A shipped script must not leave the corpus by sharing a name with tests/.
+
+    The narrowing that lets the e2e harness stay out of this guard would, done
+    with a substring match, also drop `deploy/tests/helper.sh` or
+    `scripts/tests-setup.sh` — a deployed script nobody resolves, with every
+    test here still green. Pure, so it runs without git.
+    """
+    assert not _is_shipped("tests/integration/patch_e2e/run.sh")
+    assert not _is_shipped("tests/x.sh")
+    for shipped in ("deploy/install.sh", "deploy/tests/helper.sh",
+                    "scripts/tests-setup.sh", "testsuite/x.sh", "scripts/tests.sh"):
+        assert _is_shipped(shipped), f"{shipped} would ship and must stay in the corpus"
+
+
+@needs_git
+def test_the_directories_discovery_skips_are_the_ones_the_packager_leaves_out():
+    """The corpus boundary and the packager's boundary are one fact, not two.
+
+    `NOT_SHIPPED_DIRS` says "these never reach a host, so their scripts need
+    not resolve". That is true only while `build_sentinel_package` excludes
+    them. If `:!tests` is dropped from `_SENTINEL_PACKAGE_PATHSPECS`, a script
+    under tests/ ships to the production host and this file would go on
+    skipping it: a guard blind to exactly the files it exists for, green.
+    """
+    text = _git_out("show", "HEAD:scripts/lib/build-package.sh").decode("utf-8")
+    block = re.search(r"^_SENTINEL_PACKAGE_PATHSPECS=\(\n(.*?)^\)", text,
+                      re.S | re.M)
+    assert block, ("_SENTINEL_PACKAGE_PATHSPECS is no longer an array literal "
+                   "in scripts/lib/build-package.sh — this tie cannot read it, "
+                   "and a tie that reads nothing proves nothing")
+    excluded = set(re.findall(r"^\s*':!([^']+)'\s*$", block.group(1), re.M))
+    # Positive control: the parser must see the exclusions that are known to be
+    # there, or an empty set would make the assertion below fail for the wrong
+    # reason (or, inverted, pass for it).
+    assert {"secrets", "docs", "watcher", "aggregator"} <= excluded, (
+        f"parsed pathspec exclusions {sorted(excluded)} lack ones that are "
+        "certainly in build-package.sh — the parser is broken")
+    unlisted = [d for d in NOT_SHIPPED_DIRS if d not in excluded]
+    assert not unlisted, (
+        f"discovery skips {unlisted}, but build-package.sh no longer excludes "
+        "it: those scripts now ship to a host and are not being resolved. "
+        "Remove it from NOT_SHIPPED_DIRS (and let the corpus grow) or put the "
+        "exclusion back in the packager.")
 
 
 @needs_git
@@ -1456,6 +1543,9 @@ def test_no_shell_script_escapes_discovery_by_having_no_sh_suffix():
                   for line in grep.stdout.decode("utf-8").splitlines() if ":" in line]
     assert candidates, ("no committed file has a shell shebang at all — this "
                         "check is looking at the wrong tree")
+    # What the packager leaves out is not "shipped without being analysed".
+    # The positive control above ran on the unfiltered list on purpose.
+    candidates = [c for c in candidates if _is_shipped(c)]
     analysed = set(_shell_scripts_at("HEAD"))
     stragglers = []
     for path in candidates:
