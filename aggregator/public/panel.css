@@ -226,10 +226,70 @@ th { color: var(--fg-muted); font-weight: 600; font-size: .85rem; }
 
 td.nr { text-align: right; }
 
-/* Celula „Risc" a listei de vulnerabilități: aceeași regulă ca în panoul serverului
- * (`td.risc` din sentinel.css) — eticheta pe un rând, motivul rupt doar între cuvinte. */
-td.risc { min-width: 15rem; }
+/* Tabelul vulnerabilităților (`findingsPage`).
+ *
+ * IDENTIFICATORII NU SE RUP. CVE-ul, data din KEV, fiecare versiune de la Fix, versiunea
+ * instalată și fiecare segment al numelui de pachet stau într-un `<span class="nowrap">`; rândul
+ * se rupe doar la „, " (Fix), la „/" (pachet, cu `<wbr>`), între „da —" și dată (KEV) și după
+ * „_" (stare). Înainte, pe cele 200 de rânduri reale ale paginii 1 (Edge, containerul de 1112 px):
+ * CVE rupt la cratimă pe 177 din 177 (`CVE-2026-` / `53362`), data KEV pe 2 din 2, iar versiunile
+ * de la Fix pe 0–122 din 296 (cu cât restul lăsa mai puțin loc) — `15.6.0-` / `canary.59` se
+ * citește ca altă versiune. Acum: 0 din 177, 0 din 2, 0 din 296, 0 din 205 (pachet) și 0 din 200
+ * (versiunea instalată), în toate scenariile de mai jos.
+ *
+ * DE CE NU E DOAR „pune nowrap", ȘI DE CE `main.wide`. Un identificator nerupt are lățimea lui
+ * și nu cedează: tabelul nu mai poate fi încăput prin rupere. Pe instanța n8n coloanele ținute
+ * de identificatori însumează cel puțin 1240 px (Fix: `1.85.0-dev.0.20260825072537-93e31b48545e`,
+ * 41 de caractere, 288 px într-un singur `nowrap`; Pachet: `linux-modules-6.8.0-142-generic`,
+ * 207 px), iar `main` are 72rem = 1112 px de conținut la orice ecran: 94 px peste, în fontul
+ * operatorului, chiar cu toate cedările de mai jos. 72rem e o lățime de CITIT PROZĂ; tabelul de
+ * nouă coloane de pe server folosește toată lățimea. De aceea pagina asta, și numai ea, cere
+ * `<main class="wide">` (`page(..., "wide")` în `lib/panel-page.ts`) și primește 100rem; celelalte
+ * pagini rămân la 72rem, cu același marcaj ca înainte.
+ *
+ * DE CE 100rem. Tabelul trebuie să încapă cu loc de rezervă în FONTUL CARE ÎNCAPE MAI RĂU. Foaia
+ * nu servește niciun font (`--sans` începe cu Inter, dar nu există `@font-face`, iar politica nu
+ * are `font-src`): fontul e al celui care citește. Operatorul are Segoe UI (CDP: `Segoe UI:14`);
+ * cine are Inter instalat local îl primește pe el, cu cam 100–140 px mai lat. Lățimile minime ale
+ * tabelului (cel mai îngust pe care îl poate lua, Edge, fiecare scenariu randat cu codul paginii):
+ *                                         Segoe UI   Inter
+ *   n8n, „Toate", datele de azi            1240      1392
+ *   n8n, cu un rând KEV și CVSS „estimat"  1337      1501   (stări pe care orice instanță le poate avea)
+ *   server-principal, „Toate"              1052      1164
+ *   server-principal, „rezolvate"          1114      1241
+ * Conținutul lui `main.wide` e 1560 px (100rem − 2 × 1,25rem): rezerva e 320 / 168 px pe n8n cu
+ * datele de azi (Segoe / Inter) și 223 / 59 px în cazul cel mai rău (KEV + CVSS „estimat" + Inter).
+ * 96rem ar fi lăsat −4 px acolo; 100rem e cea mai mică valoare rotundă cu cel puțin 50 px. Pe un
+ * ecran mai îngust containerul urmează ecranul. În Segoe UI, rezerva datele de azi / cazul cel mai
+ * rău: 160 / 63 px la 1440 px lățime, 86 / −11 px la 1366. Pe cel de 1366, doar în cazul cel mai
+ * rău, tabelul iese cu 11 px din pagină și o derulează; niciun identificator nu se rupe.
+ * Cifrele sunt MĂSURĂTORI pe seturi de rânduri reconstruite din valorile extreme ale producției
+ * (nu o copie a bazei): setul n8n „datele de azi" dă 1206 px la 72rem și corpul de 14,4 px, față de
+ * 1204 măsurat pe rândurile reale; cel server-principal, 1025 față de 1021. Cine adaugă o coloană
+ * re-măsoară la ambele fonturi.
+ *
+ * CE S-A CEDAT ȘI CE S-A DAT ÎNAPOI. Fiecare cedare scoate din lățimea minimă ce urmează:
+ *   - corpul de literă: NU se mai cedează. Tabelul are corpul paginii (15 px), ca restul panoului;
+ *     la 14,4 px cititul costa legibilitate (versiunea instalată, dedesubtul pachetului, merge cu
+ *     corpul tabelului, deci scădea odată cu el). Costul: +34 px pe n8n cu datele de azi, +51 px
+ *     în cazul cel mai rău cu Inter;
+ *   - KEV: `nowrap` doar pe dată (celula întreagă, „da — 2026-08-30", are 132,9 px; coloana cu
+ *     data singură, 94): „da —" trece pe rândul de sub ea; −41 px;
+ *   - Risc: `min-width` 13rem, nu 15 (eticheta oricum nu se rupe): −22 până la −30 px;
+ *   - umplutura laterală .5rem, nu .6rem, ca pe server: −29 px;
+ *   - Fix, CVSS, EPSS, motivul din Risc și starea (`patch_<wbr>planned`) se rup între cuvinte.
+ * Cele trei cedări de după corp nu se dau înapoi: niciuna nu costă lizibilitate (nu schimbă mărimea literei), iar
+ * fiecare, dată înapoi, ar mânca din cei 59 px din cazul cel mai rău cu Inter: Risc 15rem lasă 37,
+ * umplutura .6rem 31, KEV întreg 18 (măsurat pe rând, nu însumat).
+ *
+ * NU S-A FĂCUT: `min-width` pe CVSS și EPSS ca pe server (6,5rem + 7,5rem = 224 px față de 135 de
+ * minim acum), nici podea/plafon pe Fix. */
+td.risc { min-width: 13rem; }
 .risc-eticheta { white-space: nowrap; }
+
+.nowrap { white-space: nowrap; }
+main.wide { max-width: 100rem; }
+table.findings th, table.findings td { padding-left: .5rem; padding-right: .5rem; }
 
 code.id { color: var(--fg-muted); font-size: .8rem; font-family: var(--mono); }
 

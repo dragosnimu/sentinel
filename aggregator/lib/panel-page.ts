@@ -207,14 +207,20 @@ export function absent(stream: string | null, arrivals: Map<string, Arrival>): s
   return "";
 }
 
-function table(head: string, rows: string[], gol: string): string {
+function table(head: string, rows: string[], gol: string, cls = ""): string {
   if (rows.length === 0) return `<p class="gol">${escapeHtml(gol)}</p>\n`;
-  return `<table>\n<thead><tr>${head}</tr></thead>\n<tbody>\n` +
+  return `<table${cls === "" ? "" : ` class="${cls}"`}>\n<thead><tr>${head}</tr></thead>\n<tbody>\n` +
          rows.join("") + "</tbody>\n</table>\n";
 }
 
-function page(view: Chrome, title: string, body: string): string {
-  return shell(`${title} — Sentinel`, chrome(view) + "<main>\n" + body + "</main>\n");
+/**
+ * `mainClass`: o pagină al cărei conținut nu încape în lățimea de proză a lui `main`
+ * (`72rem`) își cere o clasă, iar foaia o scoate din ea (`main.wide`). Fără clasă marcajul e
+ * exact cel de dinainte: lățimea nu se schimbă pe pagini care n-au cerut-o.
+ */
+function page(view: Chrome, title: string, body: string, mainClass = ""): string {
+  const open = mainClass === "" ? "<main>" : `<main class="${mainClass}">`;
+  return shell(`${title} — Sentinel`, chrome(view) + open + "\n" + body + "</main>\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -903,8 +909,59 @@ function riskCell(f: FindingSummary): string {
  * „da" oricare ar fi starea lui.
  */
 function kevCell(f: FindingSummary): string {
-  if (f.kev) return `<strong>${escapeHtml(f.risk.kev)}</strong>`;
+  if (f.kev) return `<strong>${kevText(f.risk.kev)}</strong>`;
   return OPEN_STATUSES.has(f.status) ? escapeHtml(f.risk.kev) : "—";
+}
+
+/**
+ * „da — 2026-08-30”: data stă într-un `nowrap`, „da —” rămâne liber. Pe server întreaga
+ * celulă e `nowrap` (132 px), dar aici tabelul are 1112 px indiferent de ecran și nu-și
+ * permite 132 px pentru două rânduri: celula se poate rupe LA spațiul dintre „da —” și dată,
+ * nu în dată — fără asta data se rupea la cratime („2026-” / „08-30”). Textul vine din
+ * `risk.kev` (aceeași sursă ca pe celelalte ecrane); un text fără „ — ” rămâne cum e.
+ */
+function kevText(kev: string): string {
+  const sep = " — ";
+  const at = kev.indexOf(sep);
+  if (at < 0) return escapeHtml(kev);
+  return escapeHtml(kev.slice(0, at + sep.length)) + nowrap(kev.slice(at + sep.length));
+}
+
+/**
+ * Starea, cu un loc de rupere după fiecare „_”: `patch_planned` e un singur cuvânt fără spații
+ * și, cum Pachet, Fix, CVE și KEV nu se mai rup, ar ține coloana la 109 px în loc de 72 (măsurat
+ * în Edge, tabelul cu stări `patching`/`deferred`/`patch_planned`). E vocabular închis
+ * (`finding-groups.ts`), nu un identificator pe care operatorul îl copiază.
+ */
+function statusText(status: string): string {
+  return escapeHtml(status).replace(/_/g, "_<wbr>");
+}
+
+/** Un text pe care o linie nu-l poate rupe: identificatorul rămâne întreg sau trece întreg pe rândul următor. */
+function nowrap(text: string): string {
+  return `<span class="nowrap">${escapeHtml(text)}</span>`;
+}
+
+/**
+ * Numele pachetului: fiecare segment dintre „/” e un `nowrap`, iar între ele stă un `<wbr>`,
+ * singurul loc unde se rupe. Fără asta `symfony/http-foundation` se rupe la cratimă
+ * („http-” / „foundation”), iar numele citit așa e alt nume.
+ */
+function packageParts(name: string | null): string {
+  if (name === null || name === "") return "—";
+  const parts = name.split("/");
+  return parts.map((p, i) => nowrap(i < parts.length - 1 ? `${p}/` : p)).join("<wbr>");
+}
+
+/**
+ * `fixed_version`, o versiune pe `nowrap`, despărțite prin „, ”: celula se rupe doar între
+ * versiuni. Scanerul scrie versiunile separate prin virgulă (până la 19 pe producție,
+ * 135 de caractere), iar o versiune ruptă la cratimă („15.6.0-” / „canary.59”) se citește
+ * ca altă versiune.
+ */
+function fixVersions(fixed: string | null): string {
+  const versions = (fixed ?? "").split(",").map((v) => v.trim()).filter((v) => v !== "");
+  return versions.length === 0 ? "—" : versions.map(nowrap).join(", ");
 }
 
 export function findingsPage(view: FindingsView): string {
@@ -935,16 +992,18 @@ export function findingsPage(view: FindingsView): string {
       "<th>Pachet</th><th>Fix</th><th>Stare</th>",
       view.findings.map((f) =>
         "<tr>" + riskCell(f) + severityCell(f.severity) +
-        `<td>${escapeHtml(f.cve ?? "—")}<br>` +
+        `<td>${nowrap(f.cve ?? "—")}<br>` +
         `<span class="id">${escapeHtml(f.scanner)}</span></td>` +
         `<td class="nr">${escapeHtml(f.risk.cvss)}</td>` +
         `<td class="nr">${escapeHtml(f.risk.epss)}</td>` +
         `<td>${kevCell(f)}</td>` +
-        `<td>${escapeHtml(f.packageName ?? "—")}<br>` +
-        `<span class="id">${escapeHtml(f.installedVersion ?? "—")}</span></td>` +
-        `<td>${escapeHtml(f.fixedVersion ?? "—")}</td>` +
-        `<td>${escapeHtml(f.status)}</td></tr>\n`),
-      "nicio constatare"));
+        `<td>${packageParts(f.packageName)}<br>` +
+        `<span class="id nowrap">${escapeHtml(f.installedVersion ?? "—")}</span></td>` +
+        `<td>${fixVersions(f.fixedVersion)}</td>` +
+        `<td>${statusText(f.status)}</td></tr>\n`),
+      "nicio constatare", "findings"),
+    // Nouă coloane cu identificatori nerupți nu încap în 72rem — vezi `main.wide` în `panel.css`.
+    "wide");
 }
 
 // ---------------------------------------------------------------------------
