@@ -11,7 +11,8 @@
  * fiecare versiune, `<wbr>` între segmentele pachetului). AICI e altă problemă: un
  * identificator nerupt nu cedează, deci tabelul are nevoie de 1240–1500 px, iar
  * `main { max-width: 72rem }` dă 1112. Pagina cere `<main class="wide">` (100rem), iar
- * celelalte pagini nu — vezi comentariul din `panel.css`.
+ * celelalte pagini nu — în afară de Rapoarte, care o cere din alt motiv și e acoperită de
+ * `ai-panel.test.ts` — vezi comentariul din `panel.css`.
  *
  * Ce NU poate proba un test: pixelii. Un test care ar pretinde că măsoară lățimea unui
  * tabel fără browser ar măsura propria intenție. Aici stă forma marcajului (inclusiv ce pagini

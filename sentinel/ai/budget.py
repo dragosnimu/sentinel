@@ -66,10 +66,40 @@ async def spent_today(db: Database) -> float:
         "SELECT COALESCE(sum(cost_usd), 0) FROM ai_usage WHERE at::date = CURRENT_DATE") or 0)
 
 
+# Începutul lunii, scris O SINGURĂ DATĂ: plafonul lunar (`spent_month`) și contorul din
+# bara laterală (`usage_totals`) răspund la „cât s-a cheltuit luna asta", iar două copii ale
+# predicatului ar ajunge să însemne două luni — contorul ar arăta 12 $ în timp ce plafonul,
+# care decide dacă mai pleacă un apel, ar socoti 40.
+MONTH_START_SQL = "date_trunc('month', CURRENT_DATE)"
+
+
 async def spent_month(db: Database) -> float:
     return float(await db.fetchval(
         "SELECT COALESCE(sum(cost_usd), 0) FROM ai_usage "
-        "WHERE at >= date_trunc('month', CURRENT_DATE)") or 0)
+        f"WHERE at >= {MONTH_START_SQL}") or 0)
+
+
+async def usage_totals(db: Database) -> dict[str, float | int]:
+    """Ce a costat modelul și de câte ori a fost chemat: luna asta și de la început.
+
+    Citit din `ai_usage`, adică din ce a ÎNREGISTRAT `record()` — un apel care nu și-a scris
+    rândul nu e numărat aici, iar contorul nu pretinde altceva. O linie = un apel la model,
+    chiar dacă răspunsul n-a putut fi folosit: s-a plătit oricum.
+
+    Luna e cea a plafonului (`MONTH_START_SQL`); „de la început" e suma pe tot tabelul. O
+    singură interogare, ca cele două perechi să vină din același instantaneu.
+    """
+    row = await db.fetchrow(
+        f"""
+        SELECT count(*)                                           AS runs,
+               COALESCE(sum(cost_usd), 0)                         AS cost,
+               count(*) FILTER (WHERE at >= {MONTH_START_SQL})    AS month_runs,
+               COALESCE(sum(cost_usd) FILTER (WHERE at >= {MONTH_START_SQL}), 0)
+                                                                  AS month_cost
+        FROM ai_usage
+        """)
+    return {"runs": int(row["runs"]), "cost": float(row["cost"]),
+            "month_runs": int(row["month_runs"]), "month_cost": float(row["month_cost"])}
 
 
 async def allowed(db: Database, cfg: Config) -> tuple[bool, str]:

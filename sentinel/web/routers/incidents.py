@@ -60,6 +60,7 @@ async def incidents_page(
     counts = await inc_repo.open_counts(db)
     for r in rows:
         r.sev_dot = _SEV_DOT.get(r.severity, "off")  # type: ignore[attr-defined]
+        r.ai_sev_dot = _SEV_DOT.get(r.ai_severity or "", "off")  # type: ignore[attr-defined]
 
     templates = request.app.state.templates
     return templates.TemplateResponse(
@@ -88,6 +89,7 @@ async def incident_detail(
     detections = await inc_repo.incident_detections(db, incident_id, limit=30)
     verdict = await inc_repo.get_ai_verdict(db, incident_id)
     inc.sev_dot = _SEV_DOT.get(inc.severity, "off")  # type: ignore[attr-defined]
+    inc.ai_sev_dot = _SEV_DOT.get(inc.ai_severity or "", "off")  # type: ignore[attr-defined]
     return templates.TemplateResponse(
         request=request,
         name="incident.html",

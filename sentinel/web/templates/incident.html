@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% import "_vuln.html" as vuln %}
+{% import "_ai.html" as ai %}
 {% set active = 'incidents' %}
 {% block title %}Incident #{{ inc.id }} · Sentinel{% endblock %}
 
@@ -49,7 +50,7 @@
   <section class="card">
     <h2>Rezumat</h2>
     <dl class="kv">
-      <dt>Severitate</dt><dd>{{ inc.severity }}{% if inc.ai_severity %} <span class="muted">(AI: {{ inc.ai_severity }})</span>{% endif %}</dd>
+      <dt>Severitate</dt><dd>{{ inc.severity }}{% if inc.ai_severity %} <span class="ai-inline">{{ ai.badge() }} {{ inc.ai_severity }}</span>{% endif %}</dd>
       <dt>Stare</dt><dd>{{ status_ro.get(inc.status, inc.status) }}</dd>
       <dt>Sursă</dt><dd class="mono">{{ inc.actor_key or '—' }}</dd>
       <dt>Detecții</dt><dd>{{ inc.detection_count }}</dd>
@@ -62,11 +63,15 @@
 
   {% if verdict %}
   <section class="card">
-    <h2>Analiză AI</h2>
+    <h2>Analiză AI {{ ai.badge() }}</h2>
     <dl class="kv">
-      <dt>Severitate AI</dt><dd>{{ verdict.severity or '—' }}</dd>
+      <dt>Evaluat la</dt><dd class="mono">{{ inc.ai_analyzed_at | ora('%Y-%m-%d %H:%M:%S') }}</dd>
+      <dt>Severitate AI</dt><dd><span class="dot dot-{{ inc.ai_sev_dot }}"></span>{{ verdict.severity or '—' }}</dd>
       <dt>Fals-pozitiv?</dt><dd>{{ 'DA' if verdict.is_false_positive else 'nu' }}</dd>
-      <dt>Acțiune sugerată</dt><dd>{{ verdict.recommended_action or '—' }}</dd>
+      {#- Doar una din cele cinci acțiuni canonice; altfel rândul lipsește (nici „—", nici „unknown"):
+          eticheta „AI content" de la titlu nu are voie să certifice un text stricat. -#}
+      {% set action = verdict.recommended_action | ai_action %}
+      {% if action %}<dt>Acțiune sugerată</dt><dd>{{ action }}</dd>{% endif %}
       <dt>Încredere</dt><dd>{{ '%.0f%%' % (verdict.confidence * 100) if verdict.confidence is not none else '—' }}</dd>
       {% if verdict.prompt_injection_detected %}<dt>⚠️</dt><dd class="mono">tentativă de prompt-injection detectată în dovezi</dd>{% endif %}
     </dl>

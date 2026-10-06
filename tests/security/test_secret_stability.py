@@ -105,7 +105,17 @@ def test_an_undecryptable_secret_is_not_reported_as_an_expired_session():
     auth = (REPO / "sentinel" / "web" / "routers" / "auth.py").read_text(encoding="utf-8")
     assert "totp_undecryptable" in auth
     assert '"totp_key"' in auth
-    assert "enroll-totp" in auth, "the message does not say how to fix it"
+    # Where the fix is spelled out CHANGED on 6 Oct 2026. The command used to be in this message,
+    # which `/login?e=totp_key` serves to anyone who types the address (the parameter proves
+    # nothing). It now lives on `/totp`, reachable only with an accepted password, and the message
+    # points there. What is pinned is the EFFECT on both pages, not a substring of auth.py:
+    from sentinel.web.routers import auth as auth_module
+
+    message = auth_module._ERROR_MESSAGES["totp_key"]
+    assert "enroll-totp" not in message, "the forgeable login message names the command again"
+    assert "parola" in message and "pagina codului" in message, "the message no longer says where to go"
+    totp = (REPO / "sentinel" / "web" / "templates" / "totp.html").read_text(encoding="utf-8")
+    assert "--enroll-totp --username" in totp, "the page the message points to does not say how to fix it"
 
 
 # --- and the limiter that turned a bad code into a locked door -------------

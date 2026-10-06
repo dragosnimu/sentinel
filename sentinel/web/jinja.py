@@ -111,6 +111,55 @@ def ora_filter(tz_name: str | None):
     return ora
 
 
+def usd_filter(value: Any) -> str:
+    """Filtrul `usd`: o sumă în dolari, scrisă ca să nu mintă prin rotunjire.
+
+    `ai_usage.cost_usd` e `numeric(10,6)`, iar un apel de triaj costă ~0,003 $. Rotunjit la
+    două zecimale, primul apel al lunii ar apărea ca „0,00 $" — adică exact ca „nu s-a
+    folosit modelul". De sub un cent se scrie „<0,01 $", iar zero rămâne zero.
+
+    `None` (o valoare pe care n-am putut-o citi) NU devine zero: e „—".
+    """
+    if value is None:
+        return "—"
+    amount = float(value)
+    if amount == 0:
+        return "$0.00"
+    if amount < 0.005:
+        return "<$0.01"
+    return f"${amount:.2f}"
+
+
+def fraction_pct_filter(value: Any) -> str:
+    """Filtrul `pct01`: o încredere între 0 și 1 ca procent întreg; lipsa e „—", nu „0%"."""
+    if value is None:
+        return "—"
+    return f"{float(value) * 100:.0f}%"
+
+
+# Cele cinci acțiuni pe care `triage._clean` le poate stoca în `recommended_action`
+# (`sentinel.ai.triage._ACTION_ENUM`; `tests/unit/test_ai_content_badge.py` compară cele două
+# liste și pe cea a agregatorului). Copiate aici, nu importate: `triage` trage după el clientul
+# de model, iar un panou care randează o pagină nu are de ce să-l încarce.
+AI_ACTIONS = ("monitorizează", "blochează", "investighează", "ignoră", "patch")
+
+
+def ai_action_filter(value: Any) -> str | None:
+    """Filtrul `ai_action`: acțiunea sugerată de model, DOAR dacă e una din cele cinci.
+
+    Orice altceva — `unknown` (normalizatorul n-a știut să așeze răspunsul și l-a aruncat), o
+    formă cu o secvență de ASCII scrisă literal în locul diacriticii, un obiect sau un număr
+    scăpat în blob — devine `None`, iar șablonul OMITE rândul. Nu „—", nu textul: un rând
+    „Acțiune sugerată: unknown" sub eticheta „AI content" ar da gunoiul drept părerea modelului
+    (pe 6 oct 2026, 94% din verdictele judecate purtau una din aceste forme).
+
+    Comparația e exactă și nu repară nimic: repararea datelor e treaba producătorului, nu a
+    afișării. `value in tuple` (nu în `set`) ca un blob cu o listă în loc de șir să nu ridice
+    `TypeError` și să dea 500 pe pagina incidentului.
+    """
+    return value if isinstance(value, str) and value in AI_ACTIONS else None
+
+
 def zone_label(tz_name: str | None):
     """Globalul `fus_orar`: marcajul fusului în care sunt scrise orele paginii.
 
@@ -175,6 +224,9 @@ def configure_env(env: Any, tz_name: str | None = None) -> Any:
     """
     env.globals.update(template_globals())
     env.filters["ora"] = ora_filter(tz_name)
+    env.filters["usd"] = usd_filter
+    env.filters["pct01"] = fraction_pct_filter
+    env.filters["ai_action"] = ai_action_filter
     env.globals["fus_orar"] = zone_label(tz_name)
     return env
 

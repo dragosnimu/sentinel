@@ -59,6 +59,31 @@
     </nav>
 
     <div class="sidebar-foot">
+      {#
+        Contorul de cost AI. `request.state.ai_usage` îl pune `deps.current_user`, deci vine pe
+        orice pagină cu chenar fără ca un router să-și amintească. Trei stări, nu două:
+        lipsește (șablon randat fără cerere, ex. în teste) → nimic; `ok` → cifrele; `not ok` →
+        „indisponibil", NU „$0.00": o citire care a eșuat nu e o lună fără cheltuieli.
+        Cifrele sunt ESTIMATE din prețurile publice pe token (`ai/budget.py`), nu factura.
+      #}
+      {% set req_state = request.state if request is defined else none %}
+      {% set ai_meter = req_state.ai_usage if req_state else none %}
+      {% if ai_meter %}
+      <div class="ai-meter" role="group" aria-label="Cost AI"
+           title="Estimat din prețurile publice pe token, pe apelurile înregistrate în ai_usage. Nu e factura.">
+        <span class="ai-meter-head">Cost AI · estimat</span>
+        {% if ai_meter.ok %}
+        <span class="ai-meter-main">
+          <span class="ai-meter-cost">{{ ai_meter.month_cost | usd }}</span>
+          <span class="ai-meter-runs">{{ ai_meter.month_runs }} {{ 'rulare' if ai_meter.month_runs == 1 else 'rulări' }}</span>
+        </span>
+        <span class="ai-meter-per">luna aceasta</span>
+        <span class="ai-meter-total">de la început: {{ ai_meter.cost | usd }} · {{ ai_meter.runs }} {{ 'rulare' if ai_meter.runs == 1 else 'rulări' }}</span>
+        {% else %}
+        <span class="ai-meter-unknown">indisponibil acum</span>
+        {% endif %}
+      </div>
+      {% endif %}
       <a href="/account" class="userbox {% if active == 'account' %}active{% endif %}">
         <span class="avatar" aria-hidden="true">{{ user.username[:2] | upper }}</span>
         <span class="userbox-text">

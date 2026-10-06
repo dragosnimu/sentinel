@@ -239,16 +239,34 @@ class IncidentRow:
     ai_severity: str | None
     notified_at: datetime | None
     auto_action: str | None
+    # Cele două de mai jos au valoare implicită, ca fiecare `IncidentRow(...)` scris deja în
+    # teste (și rândurile-dicționar făcute de mână) să rămână valid. „Judecat de model" se
+    # citește din `ai_analyzed_at`: e scris de `set_ai_verdict` odată cu verdictul, deci e
+    # faptul observabil — nu `ai_severity`, care poate rămâne gol când modelul a întors o
+    # severitate pe care `triage._clean` o respinge, deși incidentul A fost judecat.
+    ai_confidence: float | None = None
+    ai_analyzed_at: datetime | None = None
+
+
+# Câmpurile care pot lipsi dintr-un rând (vezi mai sus): citite cu `.get`, nu cu `[]`.
+_OPTIONAL_AI = ("ai_confidence", "ai_analyzed_at")
 
 
 def _incident(row: Any) -> IncidentRow:
     d = dict(row)
-    return IncidentRow(**{k: d[k] for k in IncidentRow.__dataclass_fields__})
+    kw = {k: (d.get(k) if k in _OPTIONAL_AI else d[k])
+          for k in IncidentRow.__dataclass_fields__}
+    # `numeric(3,2)` vine din asyncpg ca `Decimal`; șablonul îl înmulțește cu 100 și îl
+    # formatează, iar `Decimal * float` ar arunca TypeError, adică un 500 pe lista de incidente.
+    if kw["ai_confidence"] is not None:
+        kw["ai_confidence"] = float(kw["ai_confidence"])
+    return IncidentRow(**kw)
 
 
 _INCIDENT_COLS = """
     id, fingerprint, status, severity, title, summary, actor_key, detection_count,
-    first_detection_at, last_detection_at, ai_severity, notified_at, auto_action
+    first_detection_at, last_detection_at, ai_severity, notified_at, auto_action,
+    ai_confidence, ai_analyzed_at
 """
 
 

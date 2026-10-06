@@ -16,10 +16,14 @@ from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, status
 
+from sentinel.ai import budget
 from sentinel.config import Config, Secrets
 from sentinel.db.engine import Database
 from sentinel.db.repo import sessions, users
+from sentinel.logging_setup import get_logger
 from sentinel.web.security import COOKIE_NAME, Authenticator
+
+log = get_logger(__name__)
 
 
 def now_utc() -> datetime:
@@ -97,6 +101,25 @@ async def current_session(
     return session
 
 
+async def ai_usage_for_sidebar(db: Database) -> dict[str, object]:
+    """Ce arată contorul de cost AI din bara laterală, pe fiecare pagină cu chenar.
+
+    Pus aici, în dependența pe care o cere orice pagină autentificată, ca un șablon nou să nu
+    poată uita contorul: bara laterală e în `base.html`, iar un router care ar trebui să-l
+    pună în contextul lui ar fi al doilea loc în care se poate uita.
+
+    Dacă citirea eșuează, răspunsul e `{"ok": False}`, NU zero: „n-am putut citi" și „n-a
+    costat nimic" sunt stări diferite, iar un contor care arată 0 $ peste o bază care nu
+    răspunde minte exact când operatorul se uită să vadă dacă a cheltuit ceva. Excepția nu
+    se propagă — un contor de cost nu are voie să dea 500 pe pagina de incidente.
+    """
+    try:
+        return {"ok": True, **await budget.usage_totals(db)}
+    except Exception as exc:  # noqa: BLE001 - un contor nu strică pagina
+        log.warning("ai usage counter unavailable", extra={"detail": str(exc)})
+        return {"ok": False}
+
+
 async def current_user(
     request: Request,
     db: Annotated[Database, Depends(get_db)],
@@ -113,6 +136,7 @@ async def current_user(
 
     await sessions.touch(db, session.id)
     request.state.user = user
+    request.state.ai_usage = await ai_usage_for_sidebar(db)
     return user
 
 

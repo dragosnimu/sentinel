@@ -37,6 +37,12 @@ class Insight:
     detail: str
     action: str | None = None
     evidence: dict[str, Any] = field(default_factory=dict)
+    # Adevărat când afirmația există DOAR fiindcă modelul a produs ceva (o severitate, un scor):
+    # panoul îi pune eticheta „AI content" la titlu. Numărătoarea e a noastră, dar ce se numără e
+    # judecata modelului, iar un card din „Ce spun datele" fără etichetă se citește ca o
+    # măsurătoare. `tests/unit/test_ai_content_badge.py` cere flagul pe orice regulă care citește
+    # `ai_severity`/`ai_verdict`/`ai_confidence`.
+    ai_derived: bool = False
 
 
 # Applications commonly probed by mass scanners. Seeing sustained traffic for one
@@ -669,6 +675,7 @@ async def _ai_disagreement_insight(db: Database) -> list[Insight]:
                 "are dreptate constant, pragurile regulilor merită relaxate."),
         action="Compară câteva verdicte pe pagina de incident",
         evidence={"coborate": downgrades, "total_analizate": total},
+        ai_derived=True,
     )]
 
 

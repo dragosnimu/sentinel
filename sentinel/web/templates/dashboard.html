@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_ai.html" as ai %}
 {% set active = 'dashboard' %}
 {% block title %}Panou · Sentinel{% endblock %}
 {% block head_extra %}<meta http-equiv="refresh" content="60">{% endblock %}
@@ -180,7 +181,7 @@
 <div class="insight insight-{{ ins.level }}">
   <div class="insight-icon" aria-hidden="true">{{ icons.get(ins.level, '⚪') }}</div>
   <div class="insight-body">
-    <p class="insight-title">{{ ins.title }}</p>
+    <p class="insight-title">{{ ins.title }}{% if ins.ai_derived %} {{ ai.badge() }}{% endif %}</p>
     <p class="insight-detail">{{ ins.detail }}</p>
     {% if ins.evidence.detalii %}
     <ul class="insight-evidence">

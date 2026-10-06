@@ -1,11 +1,12 @@
 {% extends "base.html" %}
 {% import "_vuln.html" as vuln %}
+{% import "_ai.html" as ai %}
 {% set active = 'patches' %}
 {% block title %}Plan #{{ p.id }} · Sentinel{% endblock %}
 
 {% block content %}
 <p class="muted small"><a href="/patches">← Planuri</a></p>
-<h1>Plan de patch #{{ p.id }}</h1>
+<h1>Plan de patch #{{ p.id }}{% if p.model %} {{ ai.badge() }}{% endif %}</h1>
 <p class="page-sub">
   <span class="pill pill-{{ p.pill }}">{{ p.status_ro }}</span>
   · țintă <strong>{{ p.plan.get('target', {}).get('asset_name', '?') }}</strong>
@@ -37,7 +38,7 @@
 
 <div class="grid-2">
   <div class="card">
-    <h2>Risc și impact</h2>
+    <h2>Risc și impact{% if p.model %} {{ ai.badge() }}{% endif %}</h2>
     <dl class="kv">
       <dt>Nivel de risc</dt><dd>{{ p.risk_level or '—' }}</dd>
       <dt>Impact</dt><dd>{{ p.plan.get('risk', {}).get('blast_radius', '—') }}</dd>
@@ -47,6 +48,7 @@
       <dt>Necesită reboot</dt>
       <dd>{% if p.requires_reboot %}<strong>DA</strong>{% else %}nu{% endif %}</dd>
       <dt>Generat de</dt><dd>{{ p.plan.get('generated_by', 'ai') }}</dd>
+      {% if p.model %}<dt>Model</dt><dd class="mono">{{ p.model }}</dd>{% endif %}
       {% if p.approved_by %}<dt>Aprobat de</dt><dd>{{ p.approved_by }}</dd>{% endif %}
     </dl>
   </div>
@@ -104,7 +106,7 @@
 </div>
 {% endmacro %}
 
-<h2>Ce face planul</h2>
+<h2>Ce face planul{% if p.model %} {{ ai.badge() }}{% endif %}</h2>
 {{ steps_table('Preflight — verificări înainte', p.plan.get('preflight', []), true) }}
 {{ steps_table('Backup — punctul de restaurare', p.plan.get('backup', []), false) }}
 {{ steps_table('Aplicare', p.plan.get('apply', []), false) }}
@@ -113,7 +115,7 @@
 {{ steps_table('Verificare finală', p.plan.get('post_verification', []), true) }}
 
 <div class="card" style="margin-top:1.1rem">
-  <h2>Cum revii manual</h2>
+  <h2>Cum revii manual{% if p.model %} {{ ai.badge() }}{% endif %}</h2>
   <p>{{ p.plan.get('restore_instructions_ro', '—') }}</p>
 </div>
 

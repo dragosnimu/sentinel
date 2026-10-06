@@ -224,6 +224,9 @@ body {
   position: sticky;
   top: 0;
   height: 100vh;
+  /* Cu contorul de cost AI, coloana are ~60px în plus; pe un ecran scund derulează în loc să
+     scoată utilizatorul și „Ieșire" din ecran. */
+  overflow-y: auto;
 }
 
 .content {
@@ -569,16 +572,45 @@ input:focus-visible, select:focus-visible, a:focus-visible, button:focus-visible
 }
 
 /* ================================================================ auth */
+/*
+ * Pagina de login și cea de cod, măsurate în Edge la 1700 px (vezi `tests/unit/test_login_page.py`
+ * pentru ce e fixat în teste și ce nu). Înainte: câmpul de parolă și butonul se ATINGEAU (0 px între
+ * ele — `label` avea marginea de sus și niciun element nu avea una de jos), eticheta stătea la 6 px
+ * de câmp, iar cardul avea 410 px. Acum:
+ *   - cardul 28rem, cu 2,5rem umplutură: câmpuri de 368 px în loc de 344;
+ *   - eticheta la .5rem de câmpul ei, iar perechile etichetă+câmp despărțite prin 1,35rem — spațiu
+ *     între GRUPURI mai mare decât spațiul din interiorul unui grup, ca ochiul să le citească ca
+ *     perechi (proximitate), nu ca o coloană uniformă de rânduri;
+ *   - butonul la 2rem sub ultimul câmp: e acțiunea, nu încă un câmp;
+ *   - antetul (marcă, nume, domeniu) cu mai mult aer sub el, fiindcă desparte „cine ești" de „ce
+ *     completezi".
+ * Câmpurile rămân la 50 px înălțime: sunt deja o țintă confortabilă de apăsat, iar mai înalte ar fi
+ * arătat umflate pe un ecran lat.
+ */
 .auth-card {
-  width: 100%; max-width: 410px;
+  width: 100%; max-width: 28rem;
   background: var(--bg-raised); border: 1px solid var(--border);
-  border-radius: var(--radius-lg); padding: 2rem; box-shadow: var(--shadow-lg);
+  border-radius: var(--radius-lg); padding: 2.5rem 2.5rem 2.2rem; box-shadow: var(--shadow-lg);
 }
-.auth-head { text-align: center; margin-bottom: 1.6rem; }
-.auth-head h1 { margin: .7rem 0 .25rem; font-size: 1.5rem; }
+.auth-head { text-align: center; margin-bottom: 2.2rem; }
+.auth-head h1 { margin: .8rem 0 .3rem; font-size: 1.55rem; }
 .auth-head p { margin: 0; font-size: .95rem; color: var(--fg-muted); }
-.auth-note { margin: 1.4rem 0 0; font-size: .88rem; color: var(--fg-dim); line-height: 1.55; }
-.auth-alt { margin-top: .7rem; }
+.auth-card .alert { margin: 0 0 1.5rem; }
+.auth-form .field + .field { margin-top: 1.35rem; }
+.auth-form label { margin: 0 0 .5rem; }
+.auth-form .field-hint { margin: .6rem 0 0; }
+.auth-form .btn-primary { margin-top: 2rem; }
+.auth-alt { margin-top: .8rem; }
+
+/* Ajutorul de recuperare de pe pagina de cod: un `<details>` fără JavaScript (CSP-ul n-are
+   `unsafe-inline`), închis implicit — cine are aplicația n-are de ce să vadă o comandă de shell
+   sub câmpul codului. */
+.auth-help { margin-top: 1.6rem; padding-top: 1.2rem; border-top: 1px solid var(--border);
+             font-size: .9rem; color: var(--fg-muted); line-height: 1.55; }
+.auth-help summary { cursor: pointer; color: var(--fg-muted); font-weight: 550; }
+.auth-help summary:hover { color: var(--fg); }
+.auth-help p { margin: .7rem 0 0; }
+.auth-help code { display: block; overflow-x: auto; white-space: nowrap; padding: .55rem .7rem; }
 
 /* ================================================================ data */
 .kv { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: .55rem 1.2rem; }
@@ -710,6 +742,52 @@ table.services td { vertical-align: top; }
   border: 1px solid color-mix(in srgb, var(--off) 50%, transparent);
 }
 .tag-exposed { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+
+/* ================================================================ AI content
+ *
+ * „AI content": eticheta pusă PESTE TOT unde ce se vede a fost scris sau judecat de model — verdictul
+ * unui incident, un plan de patch. Aceeași formă pe fiecare pagină (și pe agregator, `panel.css`):
+ * o etichetă care arată diferit de la un loc la altul nu mai spune „aici e modelul".
+ * Accentul, nu o culoare de stare: `--ok/--warn/--bad` înseamnă sănătos/atenție/rău, iar eticheta
+ * nu spune nimic despre asta, doar CINE a scris. Culoarea nu e singurul semn — textul e „AI
+ * content", iar `::before` e doar un ornament (fără text alternativ).
+ * Fundalul e `--accent-soft`, OPAC, nu o tentă peste ce e dedesubt: o tentă de 12% din accent peste
+ * rândul de tabel survolat (`--bg-hover`) dădea 3,93:1 pe întuneric și 4,49:1 pe lumină, adică sub
+ * AA tocmai când se citește eticheta; cu `--accent-soft` perechea e cea din `.badge` și nu mai
+ * depinde de ce e dedesubt (vezi `test_ai_content_badge.py`). */
+.ai-badge {
+  display: inline-flex; align-items: center; gap: .3rem;
+  padding: .05rem .55rem .05rem .45rem;
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font: 650 .72rem/1.5 var(--sans);
+  letter-spacing: .01em; text-transform: none; white-space: nowrap;
+  vertical-align: middle;
+}
+.ai-badge::before { content: "\2726"; content: "\2726" / ""; font-size: .85em; line-height: 1; }
+.ai-cell { white-space: nowrap; }
+.ai-meta { margin-left: .5rem; font-size: .88rem; color: var(--fg-muted); font-variant-numeric: tabular-nums; vertical-align: middle; }
+.ai-when { display: block; margin-top: .2rem; font-size: .78rem; color: var(--fg-dim); }
+.ai-inline { display: inline-flex; align-items: center; gap: .4rem; }
+
+/* Contorul de cost AI din bara laterală. Cifre, nu grafic: „cât a costat și de câte ori" se citește
+   dintr-o privire, iar o linie de tendință ar cere o serie pe care contorul nu o are. */
+.ai-meter {
+  display: flex; flex-direction: column; gap: .1rem;
+  padding: .75rem .85rem;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--bg);
+}
+.ai-meter-head { font-size: .68rem; text-transform: uppercase; letter-spacing: .07em; font-weight: 700; color: var(--fg-dim); }
+.ai-meter-main { display: flex; align-items: baseline; justify-content: space-between; gap: .6rem; margin-top: .3rem; }
+.ai-meter-cost { font: 700 1.4rem/1.1 var(--display); letter-spacing: -.02em; font-variant-numeric: tabular-nums; color: var(--fg); }
+.ai-meter-runs { font-size: .85rem; color: var(--fg-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ai-meter-per { font-size: .78rem; color: var(--fg-dim); }
+.ai-meter-total { margin-top: .5rem; padding-top: .5rem; border-top: 1px solid var(--border);
+                  font-size: .78rem; color: var(--fg-muted); font-variant-numeric: tabular-nums; }
+.ai-meter-unknown { margin-top: .3rem; font-size: .92rem; color: var(--fg-muted); }
 
 /* Secondary vulnerability references (Red Hat, CISA KEV) sitting next to a CVE.
    Quiet by default: the identifier itself is the link you want most of the
@@ -852,6 +930,9 @@ table.events td { vertical-align: top; }
   .sidebar-foot { margin-top: 0; flex-direction: row; align-items: center; gap: .5rem; }
   .sidebar-foot .btn { width: auto; }
   .userbox { border: none; padding: .3rem; }
+  .ai-meter { padding: .3rem .6rem; }
+  .ai-meter-head, .ai-meter-per, .ai-meter-total { display: none; }
+  .ai-meter-main { margin-top: 0; }
   .userbox-text { display: none; }
   .content { padding: 1.3rem 1rem 1.5rem; }
   h1 { font-size: 1.55rem; }

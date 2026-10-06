@@ -30,6 +30,12 @@ export type PlanSummary = {
   reversible: boolean;
   estimatedDowntimeS: number | null;
   confidence: string | null;
+  /**
+   * Modelul care a redactat planul, sau `null` pentru unul scris de mână. Pe el se sprijină
+   * eticheta „AI content" — NU pe `generated_by`, care spune cine l-a CERUT, nu cine a scris
+   * textul (`sentinel/patch/planner.py:generate`).
+   */
+  model: string | null;
   createdAt: string;
   approvedBy: string | null;
   approvedAt: string | null;
@@ -39,7 +45,7 @@ export type PlanSummary = {
 
 const COLUMNS =
   "id, source_id, plan_uuid, status, risk_level, blast_radius, requires_reboot, " +
-  "reversible, estimated_downtime_s, confidence, created_at, approved_by, " +
+  "reversible, estimated_downtime_s, confidence, model, created_at, approved_by, " +
   "approved_at, rejected_by, rejected_reason";
 
 const MAX_PAGE = 200;
@@ -79,6 +85,7 @@ export async function listPlans(
       || row.estimated_downtime_s === undefined
       ? null : Number(row.estimated_downtime_s),
     confidence: text(row.confidence),
+    model: text(row.model),
     createdAt: String(row.created_at),
     approvedBy: text(row.approved_by),
     approvedAt: text(row.approved_at),

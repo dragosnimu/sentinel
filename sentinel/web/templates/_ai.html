@@ -1,0 +1,13 @@
+{#
+  Eticheta „AI content": același element, cu aceeași formă, peste tot unde ce se vede pe ecran a
+  fost scris sau judecat de model. Un singur macro, ca două pagini să nu ajungă să o scrie
+  diferit — o etichetă care arată altfel de la o pagină la alta nu mai spune „aici e modelul".
+
+  Textul „AI content" e al operatorului, în engleză, și identic pe agregator
+  (`aggregator/lib/panel-page.ts:aiBadge`); `tests/unit/test_ai_content_badge.py` compară cele
+  două. Se pune DOAR lângă conținut pe care modelul chiar l-a produs: un câmp măsurat nu
+  primește etichetă, iar „modelul n-a judecat încă" nu se scrie cu ea.
+#}
+{% macro badge() -%}
+<span class="ai-badge" title="Text sau scor produs de modelul AI — nu e o măsurătoare.">AI content</span>
+{%- endmacro %}

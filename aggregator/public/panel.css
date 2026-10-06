@@ -74,6 +74,7 @@
 
   --accent:      var(--brand-primary-700);
   --accent-hover:#0d47a1;
+  --accent-soft: #e3f0fb;
 
   /* Severitatea nu e marcă, e semantică: valorile rămân cele alese pentru
      lizibilitate, nu cele ale site-ului. Sunt tokenuri fiindcă fiecare era
@@ -132,6 +133,7 @@
 
     --accent:      var(--brand-primary);
     --accent-hover:#42a0f0;
+    --accent-soft: #08172a;
 
     --sev-critical: #ff7b82;
     --sev-high:     #ffa657;
@@ -243,9 +245,10 @@ td.nr { text-align: right; }
  * 41 de caractere, 288 px într-un singur `nowrap`; Pachet: `linux-modules-6.8.0-142-generic`,
  * 207 px), iar `main` are 72rem = 1112 px de conținut la orice ecran: 94 px peste, în fontul
  * operatorului, chiar cu toate cedările de mai jos. 72rem e o lățime de CITIT PROZĂ; tabelul de
- * nouă coloane de pe server folosește toată lățimea. De aceea pagina asta, și numai ea, cere
- * `<main class="wide">` (`page(..., "wide")` în `lib/panel-page.ts`) și primește 100rem; celelalte
- * pagini rămân la 72rem, cu același marcaj ca înainte.
+ * nouă coloane de pe server folosește toată lățimea. De aceea pagina asta cere
+ * `<main class="wide">` (`page(..., "wide")` în `lib/panel-page.ts`) și primește 100rem; Rapoarte o
+ * cere dintr-un alt motiv (vezi `.din-ce` mai jos); celelalte pagini rămân la 72rem, cu același
+ * marcaj ca înainte.
  *
  * DE CE 100rem. Tabelul trebuie să încapă cu loc de rezervă în FONTUL CARE ÎNCAPE MAI RĂU. Foaia
  * nu servește niciun font (`--sans` începe cu Inter, dar nu există `@font-face`, iar politica nu
@@ -289,6 +292,25 @@ td.risc { min-width: 13rem; }
 
 .nowrap { white-space: nowrap; }
 main.wide { max-width: 100rem; }
+/* Rapoarte (`reportsPage`): sursele unei ore stau pe un rând și se rup între ele, nu în ele.
+ *
+ * DE CE `wide` AICI, ȘI DE CE NU E DESTUL SINGUR. Măsurat în Edge (Segoe UI, viewport 1700) pe cele
+ * 48 de ore încheiate ale producției (rânduri din `event_rollup_1h`, 6 oct 2026, 20 de perechi
+ * sursă/acțiune, cea mai lungă din fereastră 18 caractere):
+ *                                   lățime necesară   lățimea tabelului   rând    pagină
+ *   înainte, surse una sub alta     582 px (min 459)  1112 px (72rem)     107 px  5173 px
+ *   înainte + `wide` (doar clasa)   582 px            1560 px (100rem)    107 px  5173 px
+ *   acum, surse una lângă alta      1039 px (min 488) 1560 px (100rem)     40 px  1933 px
+ * Adică: lățimea nu era ce lipsea paginii, înălțimea era. Doar clasa `wide` ar fi întins un tabel
+ * care are nevoie de 582 px peste 1560, cu 120–150 px în plus pe coloană și nimic mai citibil. Cu
+ * sursele pe un rând, tabelul chiar are ce face cu lățimea: 1039 px necesari, iar la 72rem (1112)
+ * încape doar cu 73 px rezervă — o etichetă mai lungă (`auditd/audit_config_change`, 26 de
+ * caractere, apare în date) sau Inter în loc de Segoe UI (~100–140 px mai lat) ar rupe rândul în
+ * două. 100rem dă 521 px rezervă și, mai important, e ACEEAȘI lățime ca pagina de vulnerabilități:
+ * trecerea dintre cele două file nu mută marginea stângă a conținutului. La 1366 px tabelul are
+ * 1281 px (fără derulare). Fontul Inter nu s-a măsurat: nu e instalat pe mașina de lucru. */
+.din-ce { display: flex; flex-wrap: wrap; gap: .15rem 1.4rem; }
+.din-ce .sursa { white-space: nowrap; }
 table.findings th, table.findings td { padding-left: .5rem; padding-right: .5rem; }
 
 code.id { color: var(--fg-muted); font-size: .8rem; font-family: var(--mono); }
@@ -817,3 +839,37 @@ h2 {
  * două — una în fiecare loc. */
 .cron-blocare td:first-child { border-left: 3px solid var(--trend-down); padding-left: .5rem; }
 .cron-detectie td:first-child { border-left: 3px solid var(--border); padding-left: .5rem; }
+
+/* ---------------------------------------------------------------------------
+ * „AI content": eticheta pusă peste tot unde ce se vede a fost scris sau judecat de model —
+ * verdictul unui incident, un plan de patch. ACEEAȘI formă ca pe panoul serverului
+ * (`sentinel.css`, `.ai-badge`) și același text, pe care le compară
+ * `tests/unit/test_ai_content_badge.py`: o etichetă care arată diferit de la un loc la altul nu
+ * mai spune „aici e modelul".
+ *
+ * Accentul, nu o culoare de stare: `--sev-*` înseamnă gravitate, iar eticheta nu spune nimic
+ * despre asta, doar CINE a scris. Culoarea nu e singurul semn — textul e „AI content", iar
+ * `::before` e doar un ornament. Fundalul e `--accent-soft`, opac (aceleași valori ca în
+ * `sentinel.css`): o tentă peste ce e dedesubt scădea sub AA pe rândul survolat. Fără pictogramă-imagine: `img-src 'self'` din `lib/csp.ts` nu
+ * cuprinde `data:`, deci o mască SVG inline n-ar apărea deloc, tăcut — un caracter da.
+ * ------------------------------------------------------------------------- */
+.ai-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: .3rem;
+  padding: .05rem .55rem .05rem .45rem;
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font: 650 .72rem/1.5 var(--sans);
+  letter-spacing: .01em;
+  text-transform: none;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+.ai-badge::before { content: "\2726"; content: "\2726" / ""; font-size: .85em; line-height: 1; }
+.ai-cell { white-space: nowrap; }
+.ai-cell .id { color: var(--fg-muted); font-size: .8rem; }
+.gol-ai { color: var(--fg-muted); }
+h2 .ai-badge { margin-left: .4rem; }

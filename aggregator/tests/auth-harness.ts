@@ -230,6 +230,10 @@ export type IncidentRow = {
   status: string;
   severity: string;
   ai_severity: string | null;
+  ai_confidence: string | null;
+  ai_analyzed_at: number | null;
+  /** Blobul JSON de pe server, ca ȘIR (cum îl dă driverul), sau `null`. */
+  ai_verdict: string | null;
   title: string;
   summary: string | null;
   actor_key: string | null;
@@ -681,7 +685,7 @@ export class FakeAuthDb implements AuthDb, Pool {
       id: nextId(this.patchPlanEntries), instance_id: instanceId, source_id: 1,
       plan_uuid: "00000000-0000-0000-0000-000000000001", status: "draft",
       risk_level: "low", blast_radius: "un serviciu", requires_reboot: 0,
-      reversible: 1, estimated_downtime_s: 30, confidence: "0.90",
+      reversible: 1, estimated_downtime_s: 30, confidence: "0.90", model: null,
       created_at: this.nowMs, approved_by: null, approved_at: null,
       rejected_by: null, rejected_reason: null,
       ...over,
@@ -801,6 +805,9 @@ export class FakeAuthDb implements AuthDb, Pool {
       status: "open",
       severity: "high",
       ai_severity: null,
+      ai_confidence: null,
+      ai_analyzed_at: null,
+      ai_verdict: null,
       title: "titlu",
       summary: null,
       actor_key: null,

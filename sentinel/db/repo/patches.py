@@ -57,12 +57,17 @@ class PlanRow:
     # de Funcționalitatea 08) să rămână valid fără să numească un câmp de care
     # nu-i pasă.
     proposed_by_window: bool = False
+    # Modelul care a redactat planul, sau `None` pentru unul scris de mână. E faptul pe care
+    # se sprijină eticheta „AI content" din interfață: `generated_by` spune cine l-a CERUT
+    # (vezi `planner.generate`), nu cine a scris textul, deci nu poate fi folosit pentru asta.
+    # Implicit `None`, ca fiecare `PlanRow(...)` din teste să rămână valid.
+    model: str | None = None
 
 
 _PLAN_COLS = """
     id, plan_id, plan_hash, plan, status, risk_level, requires_reboot, reversible,
     estimated_downtime_s, asset_id, created_at, approved_by, approved_at, validation_errors,
-    proposed_by_window
+    proposed_by_window, model
 """
 
 
@@ -75,7 +80,8 @@ def _plan(row: Any) -> PlanRow:
     # `_PLAN_COLS` always carries it, but plenty of tests build a bare dict by
     # hand to stand in for a row, predating Funcționalitatea 08 — those must
     # keep meaning "not released by the window" rather than fail to construct.
-    return PlanRow(**{k: d.get(k, False) if k == "proposed_by_window" else d[k]
+    return PlanRow(**{k: d.get(k, False) if k == "proposed_by_window"
+                      else d.get(k) if k == "model" else d[k]
                       for k in PlanRow.__dataclass_fields__})
 
 

@@ -19,6 +19,7 @@ user" from "wrong password" hands over the username list one guess at a time.
 
 from __future__ import annotations
 
+import shlex
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Form, Request, Response, status
@@ -56,10 +57,17 @@ _ERROR_MESSAGES = {
     # The one failure a retry can never fix. Saying "expired" here sent the
     # operator round the login loop until nginx rate-limited them with a 429,
     # and nothing on screen ever mentioned the real cause.
+    #
+    # Mesajul NU mai numește comanda. `/login?e=totp_key` e o adresă pe care o poate scrie
+    # oricine — parametrul `e` nu dovedește nimic —, deci comanda de recuperare scrisă aici era
+    # aceeași scurgere ca textul scos de sub formular: drumul exact, spus unuia neautentificat.
+    # Comanda, cu numele contului, e pe `/totp` (`totp.html`), unde se ajunge doar cu parola
+    # corectă; mesajul trimite acolo.
     "totp_key": (
-        "Secretul TOTP stocat nu mai poate fi decriptat — cheia de sesiune a "
-        "serverului s-a schimbat. Reînrolează pe server: "
-        "sudo sentinel web --enroll-totp --username <utilizator>"
+        "Secretul celui de-al doilea factor nu mai poate fi decriptat — cheia de "
+        "sesiune a serverului s-a schimbat, iar niciun cod nu va funcționa până când "
+        "contul e reînrolat pe server. Introdu din nou parola: comanda de reînrolare "
+        "apare pe pagina codului."
     ),
     # "locked" is NOT here: its message needs the minute count carried in the
     # `m` query param, which a fixed string in this dict cannot hold. See
@@ -110,6 +118,17 @@ def _login_error(request: Request) -> str | None:
         phrase = f"{minutes} minute" if minutes is not None else "câteva minute"
         return f"Cont blocat temporar. Reîncearcă în {phrase}."
     return _ERROR_MESSAGES.get(code)
+
+
+def _recovery_username(username: str | None) -> str:
+    """The account name as it must appear in the `--enroll-totp` command on `/totp`.
+
+    `shlex.quote`d, because the command is meant to be pasted into a shell and a name with a
+    space or an apostrophe would otherwise split into another command's arguments. Empty for a
+    missing name: `shlex.quote("")` is `''`, which the template would print as a real (and
+    wrong) `--username ''` instead of its placeholder.
+    """
+    return shlex.quote(username) if username else ""
 
 
 def _render(request: Request, name: str, status_code: int = 200, **context: object) -> Response:
@@ -242,7 +261,8 @@ async def totp_form(
     if user is None:
         return RedirectResponse("/login", status_code=status.HTTP_303_SEE_OTHER)
     return _render(
-        request, "totp.html", csrf_token=session.csrf_token, username=user.username
+        request, "totp.html", csrf_token=session.csrf_token, username=user.username,
+        recovery_username=_recovery_username(user.username),
     )
 
 
@@ -311,6 +331,7 @@ async def totp_submit(
             status_code=status.HTTP_401_UNAUTHORIZED,
             csrf_token=still_valid.csrf_token,
             username=user.username if user else "",
+            recovery_username=_recovery_username(user.username if user else None),
             error=result.detail_ro or "Cod incorect.",
         )
 

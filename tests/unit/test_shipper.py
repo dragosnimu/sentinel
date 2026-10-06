@@ -1251,6 +1251,11 @@ RECEIVER_ONLY = {
                  "se leagă de ce sesiune, nu ce se acceptă",
     "DATETIME": "tiparul cu care se citește un DATETIME primit din bază; despre "
                 "rândurile stocate, nu despre corpul cererii",
+    # lib/ai-verdict.ts — ce acțiuni sugerate scrie panoul.
+    "AI_ACTIONS": "cele cinci cuvinte pe care panoul le AFIȘEAZĂ ca acțiune sugerată; ce nu "
+                  "e unul dintre ele se omite la citire. Nu refuză nimic din ce sosește — "
+                  "blobul se stochează cum a venit. Egalitatea cu `triage._ACTION_ENUM` o "
+                  "ține `test_ai_content_badge.py`",
     # lib/db.ts — `sql_mode` strict pe sesiune. Niciuna dintre cele trei nu
     # mărginește ce poate trimite expeditorul: ele decid ce REFUZĂ baza după ce
     # lotul a sosit. Expeditorul n-are ce să acorde aici, fiindcă geamăna de pe

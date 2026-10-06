@@ -54,6 +54,8 @@
 import { scopePlaceholders, seesNothing } from "../auth/scope";
 import type { AuthDb } from "../auth/db";
 import type { InstanceScope } from "../auth/scope";
+import { readAiVerdict } from "../ai-verdict";
+import type { AiVerdict } from "../ai-verdict";
 
 /**
  * Cât se întoarce dintr-o listă, cel mult.
@@ -93,6 +95,18 @@ export type IncidentSummary = {
   status: string;
   severity: string;
   aiSeverity: string | null;
+  /**
+   * Încrederea modelului, ca ȘIR zecimal (`"0.85"`): `DECIMAL(3,2)` vine din driver ca text, iar
+   * `null` înseamnă „n-a judecat" sau „n-a spus", nu 0%.
+   */
+  aiConfidence: string | null;
+  /**
+   * Momentul în care modelul a judecat incidentul. Ăsta e faptul pe care se sprijină eticheta
+   * „AI content": `ai_analyzed_at` se scrie pe server odată cu verdictul (`set_ai_verdict`),
+   * pe când `ai_severity` poate rămâne gol când modelul a întors o severitate respinsă — deși
+   * incidentul A fost judecat. `null` = modelul nu l-a judecat (sau judecata n-a ajuns încă aici).
+   */
+  aiAnalyzedAt: string | null;
   title: string;
   detectionCount: number;
   firstDetectionAt: string;
@@ -106,15 +120,22 @@ export type IncidentDetail = IncidentSummary & {
   acknowledgedAt: string | null;
   resolvedAt: string | null;
   resolutionNote: string | null;
+  /**
+   * `null`: niciun verdict stocat. `"unreadable"`: există text, dar nu e JSON de forma așteptată
+   * — o stare DISTINCTĂ, fiindcă „modelul n-a spus nimic" și „n-am putut citi ce a spus" nu se
+   * repară la fel, iar a le scrie la fel ar ascunde a doua.
+   */
+  aiVerdict: AiVerdict | "unreadable" | null;
 };
 
 const SUMMARY_COLUMNS =
-  "id, instance_id, source_id, fingerprint, status, severity, ai_severity, title, " +
+  "id, instance_id, source_id, fingerprint, status, severity, ai_severity, " +
+  "ai_confidence, ai_analyzed_at, title, " +
   "detection_count, first_detection_at, last_detection_at";
 
 const DETAIL_COLUMNS =
   `${SUMMARY_COLUMNS}, summary, actor_key, acknowledged_by, acknowledged_at, ` +
-  "resolved_at, resolution_note";
+  "resolved_at, resolution_note, ai_verdict";
 
 /**
  * Cele mai recente incidente de pe instanțele permise.
@@ -184,6 +205,7 @@ export async function incidentById(
     acknowledgedAt: text(row.acknowledged_at),
     resolvedAt: text(row.resolved_at),
     resolutionNote: text(row.resolution_note),
+    aiVerdict: readAiVerdict(row.ai_verdict),
   };
 }
 
@@ -271,6 +293,8 @@ function toSummary(row: Record<string, unknown>): IncidentSummary {
     status: String(row.status),
     severity: String(row.severity),
     aiSeverity: text(row.ai_severity),
+    aiConfidence: text(row.ai_confidence),
+    aiAnalyzedAt: text(row.ai_analyzed_at),
     title: String(row.title),
     detectionCount: count(row.detection_count, "incident_entries.detection_count"),
     firstDetectionAt: String(row.first_detection_at),

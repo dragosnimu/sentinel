@@ -457,17 +457,23 @@ def test_no_rule_forbids_the_fix_column_from_wrapping():
 PANEL_PAGE = Path(__file__).resolve().parents[2] / "aggregator" / "lib" / "panel-page.ts"
 
 
-def test_only_the_vulnerability_page_asks_for_the_wide_container():
-    """EVERY PANEL PAGE QUIETLY GETS 100rem. ``main.wide`` exists for one table that cannot fit
-    72rem. A second page that asks for it (or a ``page()`` that adds it to all) widens prose and
-    forms nobody measured. The call sites are read from the source, so this holds in a clone
-    without node; ``findings-fit.test.ts`` checks the rendered ``<main>`` of the pages it can
-    build, this one checks all of them by name."""
+def test_only_the_measured_pages_ask_for_the_wide_container():
+    """EVERY PANEL PAGE QUIETLY GETS 100rem. ``main.wide`` exists for pages whose tables cannot (or
+    should not) sit in 72rem prose width, and each one that asks has been MEASURED: the
+    vulnerability page (1240+ px of unbreakable identifiers) and, since 6 Oct 2026, the reports page
+    (sources side by side, 1039 px needed; numbers in the comment above ``.din-ce`` in
+    ``panel.css``). A third page that asks for it (or a ``page()`` that adds it to all) widens prose
+    and forms nobody measured. The call sites are read from the source, so this holds in a clone
+    without node; ``findings-fit.test.ts`` and ``ai-panel.test.ts`` check the rendered ``<main>`` of
+    the pages they can build, this one checks all of them by name."""
     src = PANEL_PAGE.read_text(encoding="utf-8")
-    start = src.index("export function findingsPage")
-    end = src.index("\nexport function", start + 1)
-    assert src.count('"wide"') == 1, "`\"wide\"` must be written once, by the vulnerability page"
-    assert '"wide"' in src[start:end], "the vulnerability page no longer asks for `wide`"
+    assert src.count('"wide"') == 2, (
+        "`\"wide\"` must be written exactly twice: by the vulnerability page and the reports page")
+    for name in ("findingsPage", "reportsPage"):
+        start = src.index(f"export function {name}")
+        nxt = src.find("\nexport function", start + 1)
+        end = len(src) if nxt < 0 else nxt
+        assert '"wide"' in src[start:end], f"{name} no longer asks for `wide`"
     # `page()` itself must not hard-code the class: the default stays a bare <main>.
     page_fn = src[src.index("function page("):src.index("\n}\n", src.index("function page(")) + 3]
     assert "wide" not in page_fn, page_fn

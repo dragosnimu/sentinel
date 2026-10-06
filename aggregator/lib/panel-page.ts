@@ -178,6 +178,42 @@ function severityCell(severity: string): string {
 }
 
 /**
+ * Eticheta „AI content": același element, aceeași formă, peste tot unde ce se vede a fost scris
+ * sau judecat de model — verdictul unui incident, un plan de patch. Un singur loc care o scrie,
+ * ca două pagini să nu ajungă s-o scrie diferit: o etichetă care arată altfel de la un loc la
+ * altul nu mai spune „aici e modelul".
+ *
+ * Textul e al operatorului, în engleză, și IDENTIC cu cel de pe panoul serverului
+ * (`sentinel/web/templates/_ai.html`); `tests/unit/test_ai_content_badge.py` compară cele două
+ * la octet. Se pune DOAR lângă conținut produs de model: un câmp măsurat nu o primește, iar
+ * „modelul n-a judecat" nu se scrie cu ea.
+ */
+export function aiBadge(): string {
+  return '<span class="ai-badge" title="Text sau scor produs de modelul AI — nu e o măsurătoare.">' +
+         "AI content</span>";
+}
+
+/** Încrederea din bază (`"0.85"`) ca procent întreg; ce nu se poate citi e „—", nu 0%. */
+function confidencePct(value: string | null): string {
+  if (value === null) return "—";
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 && n <= 1 ? `${Math.round(n * 100)}%` : "—";
+}
+
+/**
+ * Celula „Analiză AI" a unui incident: eticheta, ce a judecat modelul și când — sau „—".
+ *
+ * „Judecat" = `aiAnalyzedAt` setat (vezi `IncidentSummary`). Un incident pe care modelul nu l-a
+ * văzut rămâne cu „—": fără etichetă și fără niciun cuvânt care să sugereze că a fost evaluat.
+ */
+function aiCell(inc: IncidentSummary): string {
+  if (inc.aiAnalyzedAt === null) return '<td class="gol-ai">—</td>';
+  return `<td class="ai-cell">${aiBadge()}<br>` +
+         `${escapeHtml(inc.aiSeverity ?? "—")} &middot; ${escapeHtml(confidencePct(inc.aiConfidence))}` +
+         `<br><span class="id">${escapeHtml(moment(inc.aiAnalyzedAt))} UTC</span></td>`;
+}
+
+/**
  * Ce se scrie în locul unei pagini care n-are date — și de ce sunt DOUĂ mesaje.
  *
  * „Nimic de arătat" e o informație despre server: nu s-a întâmplat nimic.
@@ -618,13 +654,14 @@ export function summaryPage(view: SummaryView): string {
 function incidentRows(incidents: IncidentSummary[], selected: string | null): string {
   return table(
     "<th>Severitate</th><th>Incident</th><th>Stare</th><th>Detecții</th>" +
-    "<th>Ultima detecție (UTC)</th>",
+    "<th>Analiză AI</th><th>Ultima detecție (UTC)</th>",
     incidents.map((inc) =>
       "<tr>" + severityCell(inc.severity) +
       `<td><a href="${withInstance(`/panel/incidente/${inc.id}`, selected)}">` +
       `${escapeHtml(inc.title)}</a></td>` +
       `<td>${escapeHtml(inc.status)}</td>` +
       `<td class="nr">${inc.detectionCount}</td>` +
+      aiCell(inc) +
       `<td>${escapeHtml(moment(inc.lastDetectionAt))}</td></tr>\n`),
     "niciun incident");
 }
@@ -639,6 +676,59 @@ export function incidentsPage(view: IncidentsView): string {
 
 export type IncidentView = Chrome & { incident: IncidentDetail; timeline: Timeline };
 
+/**
+ * Ce a judecat modelul despre un incident, cu eticheta „AI content" la titlu — sau NIMIC.
+ *
+ * Fără `aiAnalyzedAt` nu se scrie nicio secțiune: nici etichetă, nici „neevaluat", fiindcă un
+ * rând care vorbește despre model într-un loc unde modelul n-a spus nimic se citește ca „a fost
+ * evaluat și n-a găsit nimic". Severitatea deterministă rămâne mai sus, în lista de fapte, fără
+ * etichetă: e măsurată, nu judecată.
+ *
+ * Un verdict stocat dar necitibil se spune: severitatea și ora sunt coloane și se arată, iar
+ * lipsa textului e o frază, nu o secțiune goală.
+ */
+function aiBlock(inc: IncidentDetail): string {
+  if (inc.aiAnalyzedAt === null) return "";
+  const verdict = inc.aiVerdict;
+  const facts: [string, string][] = [
+    ["Evaluat la (UTC)", moment(inc.aiAnalyzedAt)],
+    ["Severitate AI", inc.aiSeverity ?? "—"],
+    ["Încredere", confidencePct(inc.aiConfidence)],
+  ];
+  if (verdict !== null && verdict !== "unreadable") {
+    facts.push(["Fals-pozitiv?",
+                verdict.isFalsePositive === null ? "—" : (verdict.isFalsePositive ? "DA" : "nu")]);
+    // Doar una din cele cinci acțiuni canonice (`readAiVerdict`); altfel rândul LIPSEȘTE — nici „—",
+    // nici „unknown": o etichetă „AI content" lângă un text stricat l-ar da drept răspunsul modelului.
+    if (verdict.recommendedAction !== null) {
+      facts.push(["Acțiune sugerată", verdict.recommendedAction]);
+    }
+  }
+
+  const parts: string[] = [`<h2>Analiză AI ${aiBadge()}</h2>\n`, '<dl class="detaliu">\n'];
+  for (const [key, value] of facts) {
+    parts.push(`<dt>${escapeHtml(key)}</dt><dd>${escapeHtml(value)}</dd>\n`);
+  }
+  if (verdict !== null && verdict !== "unreadable" && verdict.promptInjectionDetected) {
+    parts.push("<dt>Atenție</dt><dd>tentativă de prompt-injection detectată în dovezile " +
+               "incidentului</dd>\n");
+  }
+  parts.push("</dl>\n");
+
+  if (verdict === "unreadable") {
+    parts.push('<p class="lipsa"><strong>Textul verdictului nu a putut fi citit.</strong><br>' +
+               "Severitatea, încrederea și ora de mai sus sunt coloane și s-au citit; " +
+               "blobul JSON din care vine textul nu are forma așteptată.</p>\n");
+  } else if (verdict === null) {
+    parts.push('<p class="gol">Gazda n-a trimis textul verdictului pentru acest incident.</p>\n');
+  } else if (verdict.summaryRo !== null) {
+    parts.push(`<p>${escapeHtml(verdict.summaryRo)}</p>\n`);
+  }
+  parts.push(`<p class="nota">Verdict deterministic: <strong>${escapeHtml(inc.severity)}</strong>. ` +
+             "AI-ul comentează, nu suprascrie.</p>\n");
+  return parts.join("");
+}
+
 export function incidentPage(view: IncidentView): string {
   const inc = view.incident;
   const parts: string[] = [];
@@ -649,7 +739,6 @@ export function incidentPage(view: IncidentView): string {
   parts.push('<dl class="detaliu">\n');
   const rows: [string, string][] = [
     ["Severitate", inc.severity],
-    ["Severitate AI", inc.aiSeverity ?? "—"],
     ["Stare", inc.status],
     ["Detecții", String(inc.detectionCount)],
     ["Prima detecție (UTC)", moment(inc.firstDetectionAt)],
@@ -666,6 +755,7 @@ export function incidentPage(view: IncidentView): string {
   parts.push("</dl>\n");
 
   if (inc.summary) parts.push(`<h2>Rezumat</h2>\n<p>${escapeHtml(inc.summary)}</p>\n`);
+  parts.push(aiBlock(inc));
   if (inc.resolutionNote) {
     parts.push(`<h2>Notă de rezolvare</h2>\n<p>${escapeHtml(inc.resolutionNote)}</p>\n`);
   }
@@ -1049,6 +1139,12 @@ export function patchPlansPage(view: PlansView): string {
     "sunt aici: <code>patch_steps.argv</code> e un tablou, iar protocolul nu " +
     "poartă încă sub-rânduri. Dry-run-ul și respingerea nu se portează — sunt " +
     "comenzi, iar agregatorul nu execută niciodată nimic dintr-un plan.</p>\n" +
+    // Ce poartă eticheta, și ce înseamnă: un plan are un model scris în rând (`patch_plans.model`)
+    // doar dacă l-a redactat modelul; unul introdus de mână n-o primește. Riscul, repornirea,
+    // reversibilitatea și indisponibilitatea sunt ale lui — estimări de model, nu măsurători.
+    '<p class="nota">Planurile cu eticheta „AI content” au fost redactate de model: ' +
+    "riscul, repornirea, reversibilitatea și indisponibilitatea sunt estimările lui, " +
+    "nu măsurători făcute pe gazdă.</p>\n" +
     absent("patch_plans", view.arrivals) +
     table(
       "<th>Stare</th><th>Risc</th><th>Plan</th><th>Repornire</th>" +
@@ -1058,7 +1154,8 @@ export function patchPlansPage(view: PlansView): string {
         `<td>${escapeHtml(p.status)}${p.rejectedReason
           ? `<br><span class="id">${escapeHtml(p.rejectedReason)}</span>` : ""}</td>` +
         `<td>${escapeHtml(p.riskLevel ?? "—")}</td>` +
-        `<td><code class="id">${escapeHtml(p.planUuid)}</code>${p.blastRadius
+        `<td><code class="id">${escapeHtml(p.planUuid)}</code>${p.model === null
+          ? "" : ` ${aiBadge()}`}${p.blastRadius
           ? `<br>${escapeHtml(p.blastRadius)}` : ""}</td>` +
         `<td>${p.requiresReboot ? "<strong>da</strong>" : "nu"}</td>` +
         `<td>${p.reversible ? "da" : "<strong>NU</strong>"}</td>` +
@@ -1326,9 +1423,17 @@ export function reportsPage(view: ReportsView): string {
         `<td class="nr">${h.uniqSources}</td>` +
         `<td class="nr">${escapeHtml(bytes(h.bytesIn))}</td>` +
         `<td class="nr">${escapeHtml(bytes(h.bytesOut))}</td>` +
-        `<td>${h.top.map((t) =>
+        // Sursele unei ore, UNA LÂNGĂ ALTA (`.din-ce`), nu una sub alta: măsurat pe cele 48 de ore
+        // reale ale producției, tabelul are nevoie de 582 px (min-content 459), iar la 72rem avea
+        // 1112 — lățimea nu e ce lipsește pe pagina asta, înălțimea e: patru surse stivuite dau
+        // rânduri de 107 px și o pagină de 5173 px pentru 48 de ore. Pe o singură linie, lățimea
+        // lui `main.wide` e folosită de ce o merită, iar rândul scade la un sfert.
+        `<td><div class="din-ce">${h.top.map((t) =>
+          '<span class="sursa">' +
           `<code class="id">${escapeHtml(t.source)}/${escapeHtml(t.action)}</code>` +
-          ` ${t.events}`).join("<br>") || "&mdash;"}</td>` +
+          ` ${t.events}</span>`).join("") || "&mdash;"}</div></td>` +
         "</tr>\n"),
-      "nicio ora incheiata inca"));
+      "nicio ora incheiata inca"),
+    // Vezi `main.wide` și măsurătorile din `panel.css`.
+    "wide");
 }

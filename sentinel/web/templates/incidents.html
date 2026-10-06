@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% import "_vuln.html" as vuln %}
+{% import "_ai.html" as ai %}
 {% set active = 'incidents' %}
 {% block title %}Incidente · Sentinel{% endblock %}
 
@@ -48,7 +49,7 @@
   <table>
     <thead>
       <tr><th>#</th><th>Sev.</th><th>Titlu</th><th>Sursă</th>
-          <th class="num">Detecții</th><th>Stare</th><th>Ultima</th>
+          <th class="num">Detecții</th><th>Stare</th><th>Analiză AI</th><th>Ultima</th>
           {% if can_act %}<th>Acțiuni</th>{% endif %}</tr>
     </thead>
     <tbody>
@@ -62,6 +63,16 @@
         <td class="nowrap small">
           {{ status_ro.get(r.status, r.status) }}
           {%- if r.notified_at %} <span class="tag" title="Trimis pe Telegram">📨</span>{% endif -%}
+        </td>
+        {#- „Judecat" = `ai_analyzed_at` setat. Un incident pe care modelul nu l-a văzut
+            (sub pragul de triaj, închis înainte, buget epuizat) rămâne cu „—": fără etichetă și
+            fără vreun cuvânt care să sugereze că a fost evaluat. -#}
+        <td class="ai-cell">
+          {%- if r.ai_analyzed_at %}
+          {{ ai.badge() }}
+          <span class="ai-meta"><span class="dot dot-{{ r.ai_sev_dot }}"></span>{{ r.ai_severity or '—' }} · {{ r.ai_confidence | pct01 }}</span>
+          <span class="ai-when mono">{{ r.ai_analyzed_at | ora }}</span>
+          {%- else %}<span class="muted small">—</span>{% endif -%}
         </td>
         <td class="mono nowrap small">{{ r.last_detection_at | ora }}</td>
         {% if can_act %}

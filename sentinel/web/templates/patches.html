@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_ai.html" as ai %}
 {% set active = 'patches' %}
 {% block title %}Patch-uri · Sentinel{% endblock %}
 
@@ -20,10 +21,17 @@
 </div>
 {% endif %}
 
+{% if rows %}
+<p class="muted small" style="margin:0 0 .8rem">
+  Planurile cu eticheta „AI content” au fost redactate de model: riscul, repornirea,
+  reversibilitatea și downtime-ul sunt estimările lui, nu măsurători făcute pe gazdă.
+</p>
+{% endif %}
+
 <div class="table-scroll">
   <table>
     <thead>
-      <tr><th>#</th><th>Țintă</th><th>Risc</th><th>Downtime</th>
+      <tr><th>#</th><th>Țintă</th><th>Redactat de</th><th>Risc</th><th>Downtime</th>
           <th>Reversibil</th><th>Stare</th><th>Creat</th></tr>
     </thead>
     <tbody>
@@ -31,6 +39,9 @@
       <tr class="{{ 'row-bad' if r.status in ('failed', 'rejected_invalid') }}">
         <td class="mono"><a href="/patches/{{ r.id }}">{{ r.id }}</a></td>
         <td class="strong">{{ r.asset }}</td>
+        {#- Eticheta doar când rândul are un model scris în el (`patch_plans.model`): un plan
+            introdus de mână nu poartă eticheta, iar „—" nu spune nimic despre autor. -#}
+        <td>{% if r.model %}{{ ai.badge() }}{% else %}<span class="muted small">—</span>{% endif %}</td>
         <td>{{ r.risk_level or '—' }}</td>
         <td class="num">{{ r.estimated_downtime_s or 0 }}s</td>
         <td>
