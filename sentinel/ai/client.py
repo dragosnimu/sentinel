@@ -66,6 +66,13 @@ async def call_structured(
             detail = resp.text[:200]
             log.warning("anthropic non-200", extra={"status": resp.status_code, "detail": detail})
             return Result(ok=False, error=f"http {resp.status_code}: {detail}")
+        # The one and only JSON decode between the API and our tables, and it is
+        # exact: a diacritic escaped once arrives as the diacritic. A literal
+        # backslash-u that reaches `triage` was already literal here — measured
+        # on 2026-10-06, see the comment on `triage._ACTION_WIRE`. Do not
+        # "repair" strings in this module: it would rewrite EVERY field,
+        # including a summary that legitimately quotes a backslash. The one
+        # field with a closed vocabulary repairs itself in `_normalise_action`.
         data = resp.json()
     except Exception as exc:  # noqa: BLE001 - degrade, never crash the worker
         log.warning("anthropic call failed", extra={"detail": str(exc)})
