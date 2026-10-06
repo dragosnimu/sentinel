@@ -60,6 +60,44 @@ instrucțiuni din `0001_core.sql`, inclusiv cele două triggere, iar aplicarea d
 după le-a creat pe amândouă. Verificarea e mai puternică decât o descria textul —
 dar pe altă versiune verdictul se poate întoarce, și de-aia ramura rămâne.
 
+### Uneltele de operator citesc `aggregator/.env.local`
+
+Cele șase scripturi — `migrate`, `user`, `instance`, `verify-chain`,
+`purge-automation`, `relink-session-commands` — încarcă `aggregator/.env.local`
+înainte de a porni (`bin/preload-env.ts`, prin `--import` în `package.json`).
+Deci comanda din documentație merge exact cum e scrisă:
+
+```bash
+npm run user -- enroll-totp <utilizator>
+```
+
+Până pe 6 octombrie 2026 niciun script nu citea fișierul, iar eroarea
+`SENTINEL_SESSION_SECRET lipsește` apărea cu variabila prezentă în el: nimeni nu o
+citise, dar mesajul spunea că n-a pus-o nimeni.
+
+Fișierul e `NUME=valoare`, câte unul pe rând, în **UTF-8** (cu sau fără BOM), și e
+ignorat de git. **Nu UTF-16**: `>` din PowerShell 5 scrie UTF-16, iar un astfel de
+fișier ar fi citit ca fără nicio variabilă — de-aia e refuzat, cu un mesaj.
+`build`, `start`, `test` și `typecheck` NU îl încarcă.
+
+* **Mediul shellului câștigă** în fața fișierului, ca la `node --env-file`. Dacă o
+  variabilă din fișier e acoperită de o valoare DIFERITĂ din shell, unealta o spune
+  pe nume, pe `stderr` (`unset NUME` / `Remove-Item Env:NUME` o scoate). Valorile nu
+  se tipăresc niciodată.
+* O cheie scrisă de două ori în fișier se raportează pe nume; se ia ULTIMA.
+* **Fără `.env.local`** (clonă proaspătă): unealta pornește, spune `[env] ... nu
+  există`, iar variabilele vin doar din shell. Ce lipsește îl numește eroarea
+  obișnuită a uneltei, în română, cu motivul ei.
+* Un fișier ilizibil, UTF-16 sau care nu e UTF-8 valid OPREȘTE unealta: „nu pot citi”
+  nu înseamnă „nu conține nimic”.
+* `SENTINEL_ENV_FILE=<cale>` indică alt fișier; acela TREBUIE să existe.
+
+Nu e `--env-file` simplu fiindcă, cu fișierul lipsă, acela iese cu `node:
+.env.local: not found` și cod 9, fără să spună nimic despre variabilele care
+lipsesc, iar `--env-file-if-exists` există abia din Node 22 (găzduirea rulează 20).
+Cârligul cere Node 20.12 sau mai nou (`util.parseEnv`); pe găzduire aceste scripturi
+nu rulează niciodată.
+
 ## Publicarea pe găzduire — ce intră în arhivă
 
 Procedura de publicare (arhivă de surse, fără `node_modules/` și fără `.next/`)
@@ -107,7 +145,9 @@ găzduire nu rulează niciodată `bin/migrate.ts`.
 ## Configurație
 
 Totul din mediu, nimic în cod — numele bazei și al utilizatorului conțin
-identificatorul de cont al găzduirii, iar depozitul e public.
+identificatorul de cont al găzduirii, iar depozitul e public. Pe găzduire mediul e
+cel din panoul aplicației; pe stația operatorului, uneltele `npm run ...` îl iau din
+`aggregator/.env.local` (vezi „Uneltele de operator citesc `aggregator/.env.local`”).
 
 | Variabilă | Obligatorie | Implicit |
 |---|---|---|
@@ -788,16 +828,48 @@ tastează, fără ecou, sau vine printr-o conductă:
 pass show panou/ana | npm run user -- create ana --role owner
 ```
 
-Cere `SENTINEL_SESSION_SECRET` în mediu (cifrează secretul TOTP în repaus) și
-datele de conectare, ca `npm run migrate`.
+Cere `SENTINEL_SESSION_SECRET` (cifrează secretul TOTP în repaus) și datele de
+conectare, din `.env.local` sau din mediu, ca `npm run migrate` (vezi „Uneltele de
+operator citesc `aggregator/.env.local`”).
 
 Înrolarea celui de-al doilea factor e în același pas și **se confirmă cu un cod
-adevărat**: URI-ul `otpauth://` și secretul base32 se afișează o singură dată,
-iar contul rămâne fără al doilea factor — deci nu se poate autentifica — până
-când cineva dovedește că poate produce un cod din el. Dacă pasul ăla eșuează,
-comanda iese cu cod nenul și spune ce să rulezi. Fără QR: ar fi însemnat o
-dependență nouă pentru o operație care se face de câteva ori în viața unei
-instalări.
+adevărat**: URI-ul `otpauth://`, secretul base32 și un **cod QR desenat în terminal**
+se afișează o singură dată, iar contul rămâne fără al doilea factor — deci nu se
+poate autentifica — până când cineva dovedește că poate produce un cod din el. Dacă
+pasul ăla eșuează, comanda iese cu cod nenul și spune ce să rulezi. Cele trei poartă
+ACEEAȘI valoare: nu face captură de ecran și curăță terminalul după scanare, fiindcă
+secretul rămâne în istoricul lui.
+
+**QR-ul.** Se desenează negru pe alb, cu culori explicite (nu „negru pe fundalul
+temei”, care iese inversat pe un terminal întunecat), cu glife de jumătate de bloc
+(`▀ ▄ █`). Înainte de desen, matricea se decodează înapoi cu decodorul bibliotecii și
+se compară cu URI-ul, octet cu octet; dacă nu e egal sau decodorul nu poate rula,
+QR-ul NU se desenează și un rând spune de ce — URI-ul și secretul rămân. Terminalul se
+verifică, nu se presupune:
+
+| terminalul | desenul |
+|---|---|
+| TTY cu culori, pe Windows | glife (consola primește UTF-16; pagina de coduri nu contează) |
+| TTY cu culori, local UTF-8 (`LC_ALL`, `LC_CTYPE`, `LANG`) | glife |
+| TTY cu culori, fără UTF-8 | ASCII: fiecare modul = două spații cu fundal colorat |
+| fără culori (ieșire redirecționată, `NO_COLOR`, `TERM=dumb`) | **nu se desenează** — polaritatea nu se poate ști |
+| mai îngust decât desenul | **nu se desenează** — rândurile s-ar rupe |
+
+`SENTINEL_QR=ascii` forțează stilul ASCII (dacă glifele apar rupte; în PowerShell:
+`$env:SENTINEL_QR = "ascii"`), `unicode` îl forțează pe cel cu glife, `off` îl oprește.
+Forțat pe o ieșire fără culori, QR-ul e desenat pentru fundal DESCHIS, iar unealta o
+spune. Dacă desenul apare rupt, `Ctrl+C` și `enroll-totp` din nou — alt secret; cel
+neconfirmat se abandonează.
+
+`qr` (zero dependențe tranzitive, ~0,5 MB despachetat, versiune FIXATĂ exact: vede secretul
+în clar, iar 0.6.0 avea un decodor care refuza simboluri valide) e în `devDependencies`:
+`package.json` se livrează pe găzduire, dar uneltele de aici nu rulează acolo. Încărcat prin
+`import()` într-un `try`, nu static: pe o instalare fără dependențe de dezvoltare
+(`npm ci --omit=dev`), `create` și `list` merg în continuare, iar `enroll-totp` arată
+URI-ul și secretul cu un rând care spune că lipsește pachetul. Pe o găzduire care
+instalează totuși dependențele de dezvoltare, `qr` se instalează, dar nu e importat de
+nimic din `app/` sau `lib/` (o gardă din `tests/enrolment-display.test.ts` o apără), deci
+nu intră în aplicația servită.
 
 Codul folosit la confirmare e CONSUMAT (contorul anti-reluare), deci prima
 autentificare cere codul următor. `npm run user -- list` arată `2FA NU` pentru

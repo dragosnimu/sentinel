@@ -9,13 +9,13 @@
     "start": "next start",
     "test": "node run-tests.mjs",
     "typecheck": "tsc --noEmit",
-    "migrate": "node --import tsx bin/migrate.ts",
+    "migrate": "node --import tsx --import ./bin/preload-env.ts bin/migrate.ts",
     "generate-migrations-manifest": "node --import tsx bin/generate-migrations-manifest.ts",
-    "instance": "node --import tsx bin/instance.ts",
-    "user": "node --import tsx bin/user.ts",
-    "verify-chain": "node --import tsx bin/verify-chain.ts",
-    "purge-automation": "node --import tsx bin/purge-automation-commands.ts",
-    "relink-session-commands": "node --import tsx bin/relink-session-commands.ts"
+    "instance": "node --import tsx --import ./bin/preload-env.ts bin/instance.ts",
+    "user": "node --import tsx --import ./bin/preload-env.ts bin/user.ts",
+    "verify-chain": "node --import tsx --import ./bin/preload-env.ts bin/verify-chain.ts",
+    "purge-automation": "node --import tsx --import ./bin/preload-env.ts bin/purge-automation-commands.ts",
+    "relink-session-commands": "node --import tsx --import ./bin/preload-env.ts bin/relink-session-commands.ts"
   },
   "dependencies": {
     "hash-wasm": "^4.12.0",
@@ -27,6 +27,7 @@
   "devDependencies": {
     "@types/node": "^22.10.0",
     "@types/react": "19.2.18",
+    "qr": "0.7.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.0"
   }

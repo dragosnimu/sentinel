@@ -8,6 +8,10 @@
  *     npm run user -- revoke <utilizator> <instanță>
  *     npm run user -- list
  *
+ * Mediul vine din `aggregator/.env.local`, încărcat de `bin/preload-env.ts` prin
+ * scriptul `user` din `package.json` — fără el, comanda de mai sus ar cere
+ * `SENTINEL_SESSION_SECRET` din shell, deși stă în fișier (vezi `bin/env-file.ts`).
+ *
  * Fără ea nu se poate autentifica nimeni: nu există nicio altă cale prin care un
  * rând să ajungă în `users`. Politica, verificările și scrierile sunt în
  * `lib/auth/accounts.ts` — aici sunt doar intrarea, ieșirea și codul de retur,
@@ -53,6 +57,7 @@ import {
 } from "../lib/auth/accounts";
 import type { AuthDb } from "../lib/auth/db";
 import type { Enrolment } from "../lib/auth/accounts";
+import { enrolmentLines } from "./enrolment-display";
 
 /**
  * Secretul, arătat o singură dată.
@@ -61,24 +66,20 @@ import type { Enrolment } from "../lib/auth/accounts";
  * unealta nu are o comandă care să-l scoată — asta ar fi chiar mecanismul prin
  * care cine capătă acces la găzduire capătă și al doilea factor al tuturor.
  * Pierdut, se reînrolează.
+ *
+ * Ce se tipărește (URI, secret, QR) e construit în `bin/enrolment-display.ts`,
+ * unde un test îl poate citi întreg. Aici doar se spune ce terminal e — nimic
+ * nu merge în fișier, în `argv` sau în jurnal, ca secretul să rămână tipărit
+ * O DATĂ.
  */
-function showEnrolment(enrolment: Enrolment): void {
-  console.log("");
-  console.log("=".repeat(64));
-  console.log(`  ÎNROLARE AL DOILEA FACTOR — ${enrolment.username}`);
-  console.log("=".repeat(64));
-  console.log("");
-  console.log("  Lipește URI-ul în aplicația de autentificare (Aegis, 1Password,");
-  console.log("  Google Authenticator) sau introdu secretul de mână:");
-  console.log("");
-  console.log(`      ${enrolment.uri}`);
-  console.log("");
-  console.log(`      secret: ${enrolment.secret}`);
-  console.log("");
-  console.log("  ATENȚIE: se afișează O SINGURĂ DATĂ. În bază e cifrat, deci nu");
-  console.log("  poate fi reafișat. Pierdut, rulează `enroll-totp`.");
-  console.log("=".repeat(64));
-  console.log("");
+async function showEnrolment(enrolment: Enrolment): Promise<void> {
+  const lines = await enrolmentLines(enrolment, {
+    isTTY: process.stdout.isTTY === true,
+    columns: process.stdout.columns,
+    platform: process.platform,
+    env: process.env,
+  });
+  for (const line of lines) console.log(line);
 }
 
 /**
@@ -171,7 +172,7 @@ async function main(): Promise<number> {
         // înrolarea, iar `null` spune exact asta — nu e o valoare lipsă.
         const name = created.value === null ? parsed.username : created.value.username;
         if (created.value !== null) {
-          showEnrolment(created.value);
+          await showEnrolment(created.value);
           const confirmed = await confirm(db, created.value);
           if (!confirmed.ok) {
             console.error(unconfirmedMessage(confirmed.reason, created.value.username));
@@ -196,7 +197,7 @@ async function main(): Promise<number> {
           console.error(`EȘUAT: ${enrolled.detail}`);
           return 1;
         }
-        showEnrolment(enrolled.value);
+        await showEnrolment(enrolled.value);
         const confirmed = await confirm(db, enrolled.value);
         if (!confirmed.ok) {
           console.error(unconfirmedMessage(confirmed.reason, enrolled.value.username));
