@@ -33,6 +33,28 @@ acelasi server si cere acelasi verdict.
 sa iasa avertisment („unknown Host returned 000000") in loc de „refuzat fara
 raspuns". Curatat in cele trei locuri.
 
+**Numele vhostului il da nginx, nu yaml-ul si nu aliasul ssh.** Prima varianta a
+sondei lua numele din `domain:` al lui `sentinel.yaml`, iar cand acela e gol, din
+`--host`. Pe n8n yaml-ul are `domain: ""` si nu se va repara singur
+(configuratia gazdei nu se regenereaza la livrare), iar operatorul ajunge la
+gazda prin aliasul ssh `n8n`, care nu e `server_name` nicaieri: cu aliasul sonda
+cadea iar pe blocul de refuz si dadea rosu pe o gazda sanatoasa, iar cu numele
+intreg dadea verde. Acum numele se citeste din `sudo nginx -T`: `server_name` al
+blocului care asculta pe portul dedicat (in mod shared, al blocului care face
+`proxy_pass http://sentinel_app`, fiindca pe 443 stau si site-urile tale).
+Ordinea: `--domain` dat explicit, numele din nginx, `domain:` din yaml, `--host`
+ca ultima rezerva — iar rezerva se spune, nu se foloseste pe tacute. Daca yaml-ul
+are domeniul gol dar nginx are un nume (exact cazul n8n), smoke-testul trece si
+pune un avertisment: configuratia si ce serveste gazda nu spun acelasi lucru. Daca
+nginx nu poate fi citit (fara sudo, fara nginx), asta nu devine „niciun vhost":
+cade pe rezerva si o spune. Verificat pe nginx 1.30.5 cu sablonul real de refuz,
+inclusiv cu aliasul ssh si cu un vhost strain pe acelasi port.
+
+Pasul de proba de fum din `deploy/install.sh` accepta doar 200/401/302/503, in
+timp ce poarta de la pasul 33 si smoke-testul accepta si 301/303/307/308; aliniat,
+iar un test cu un vhost care redirectioneaza prinde divergenta. Al patrulea
+`|| echo 000` (sonda „am devenit vhostul implicit?") curatat si el.
+
 **Agregatorul: ruta de optimizare de imagini e inchisa, iar Next e la o versiune
 fara cele doua critice.** `/_next/image` exista implicit in orice aplicatie
 Next, iar agregatorul nu foloseste `next/image`; prin ea ajunge `sharp` sa

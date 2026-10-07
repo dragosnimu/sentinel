@@ -3955,8 +3955,9 @@ INSPECT /etc/nginx NOW — do not restart nginx until nginx -t passes."
     # `default_server` ourselves, or editing the operator's vhost to claim it,
     # would change how their sites answer an unknown Host.
     local unknown_host
-    unknown_host="$(curl -sk --max-time 8 -o /dev/null -w '%{http_code}' \
-        -H 'Host: sentinel-default-probe.invalid' "https://127.0.0.1/" 2>/dev/null || echo 000)"
+    # `https_code`, not an inline curl with `|| echo 000`: a failed curl already
+    # prints 000, and the `|| echo` glued a second one on ("000000").
+    unknown_host="$(https_code "https://127.0.0.1/" -H 'Host: sentinel-default-probe.invalid')"
     local probe_body
     probe_body="$(curl -sk --max-time 8 -H 'Host: sentinel-default-probe.invalid' \
         "https://127.0.0.1/login" 2>/dev/null | head -c 2000 || true)"
@@ -5495,15 +5496,18 @@ beacon_seq() {
 # them is `tests/unit/test_smoke_test_loopback_probe.py`, which runs both
 # against the same server and goes red if either goes back to the bare address.
 #
-# Severity and accepted codes are unchanged on purpose: step 33
-# (`verify_dashboard_answers`) is the gate that stops the run; this only
-# re-checks that the answer still holds at the end.
+# Severity is unchanged on purpose: step 33 (`verify_dashboard_answers`) is the
+# gate that stops the run; this only re-checks that the answer still holds at the
+# end. The accepted codes are SENTINEL_ANSWERED — the set step 33 and
+# scripts/smoke-test.sh already accept. This probe used to carry its own, narrower
+# list (no 3xx), so a vhost that redirected was fine for the gate and the smoke
+# test and a warning here.
 smoke_loopback_check() {
     local code
     local -a name_args=()
     [[ -n "$DOMAIN" ]] && name_args=(-H "Host: ${DOMAIN}")
     code="$(https_code "https://127.0.0.1:${PUBLIC_PORT}/healthz" ${name_args[@]+"${name_args[@]}"})"
-    if [[ "$code" =~ ^(200|401|302|503)$ ]]; then
+    if [[ "$code" =~ $SENTINEL_ANSWERED ]]; then
         ok "nginx is serving the dashboard on :${PUBLIC_PORT}"
     else
         warn "https://127.0.0.1:${PUBLIC_PORT}/healthz answered HTTP ${code}${DOMAIN:+ for Host: ${DOMAIN}} (000 = no response at all)"

@@ -89,6 +89,11 @@ done
 
 [[ -n "$HOST" && -n "$USER" ]] || die "--host and --user are required"
 
+# Ce a AFIRMAT operatorul, înainte ca `DOMAIN` să fie completat din sentinel.yaml:
+# sonda de pe loopback pune un `--domain` explicit înaintea numelui citit din nginx,
+# dar numele din yaml după el (vezi `pick_probe_name`).
+DOMAIN_FLAG="$DOMAIN"
+
 # In shared mode the dashboard is on 443 and the URL carries no port. Building
 # the base URL once means every check below is automatically mode-correct.
 if [[ "$NGINX_MODE" == "shared" ]]; then
@@ -185,6 +190,118 @@ check_in_set() {
     esac
 }
 
+# Numele vhostului Sentinel, CITIT DE LA NGINX.
+#
+# Sursa de adevăr a numelui e nginx, nu sentinel.yaml și nu `--host`. Pe n8n
+# `sentinel.yaml` are `domain: ""` (configurația gazdei nu se regenerează la
+# livrare: beacon și ship sunt scrise de mână acolo, iar o regenerare ar opri
+# martorul extern), deci numele nu se poate lua de acolo. `--host` e adesea un
+# alias ssh (`n8n`), care nu e `server_name` pe nicăieri: măsurat, cu aliasul
+# sonda dădea „nginx ASCULTĂ dar a închis conexiunea" pe o gazdă sănătoasă, iar cu
+# numele întreg 200. Roșul fals supraviețuia exact scenariului pentru care fusese
+# scrisă reparația.
+#
+# `nginx -T` e configurația așa cum o asamblează nginx însuși, cu includerile
+# rezolvate. Din ea se ia `server_name` al blocului `server` care ascultă pe
+# portul sondat, fără `_` (nu e nume: e „nimic nu se potrivește") și fără
+# wildcard-uri sau expresii regulate (nu sunt un Host pe care să-l poți trimite).
+#
+#   dedicated — portul e al Sentinel, deci orice bloc cu nume de pe el e vhostul.
+#   shared    — pe 443 stau și site-urile operatorului, cu numele lor; vhostul
+#               Sentinel e doar blocul care face `proxy_pass http://sentinel_app`.
+#
+# Limita marcajului, măsurată și acceptată: dacă un vhost al operatorului face
+# și el `proxy_pass http://sentinel_app` — de pildă un `/sentinel/` sub domeniul
+# lui — și vine primul în ordinea fișierelor, e luat drept vhostul Sentinel și
+# sonda trimite `Host:` străin. Pe gazdele de azi nu e cazul (toate cele șase
+# apariții de pe fiecare gazdă stau în blocul Sentinel), dar e singura cale prin
+# care sonda poate întoarce un nume GREȘIT în loc să-l rateze — iar un nume
+# greșit trece verde pe altcineva, ce e mai rău decât roșul pe care îl repară.
+# Potrivirea prinde și prefixele, deci `sentinel_app_v2` ar potrivi la fel.
+#
+# Și o circularitate de știut: sonda dovedește acum „nginx rutează propriul
+# `server_name` spre Sentinel", nu că numele e cel corect. Un `server_name` scris
+# greșit trece sonda de loopback; controlul care l-ar prinde e verificarea
+# externă pe `$DOMAIN`, iar aceea NU rulează pe o gazdă cu `domain` gol — acolo
+# singurul semnal rămâne avertismentul de dezacord.
+#               Fără marcajul ăsta, primul nume de pe 443 ar fi al altcuiva.
+#
+# Patru stări, și niciuna nu e „totul bine" în tăcere:
+#
+#   found       un nume (de pe blocul marcat, sau singurul nume din dedicated)
+#   none        nginx s-a citit, dar niciun bloc cu nume nu ascultă pe port — starea
+#               NORMALĂ a unei instalări fără --domain, unde vhostul e
+#               `default_server` cu `server_name _`
+#   ambiguous   mai multe nume nemarcate; nu aleg unul la nimereală
+#   unreadable  fără sudo, fără nginx, ieșire goală sau ce nu e o listare
+#
+# `unreadable` se recunoaște după antetul `# configuration file …:` pe care
+# nginx -T îl pune în fața fiecărui fișier citit. Un sudo care cere parola, o
+# eroare, o sesiune ssh tăiată arată exact ca „niciun vhost" după filtrare; fără
+# antet nu e o listare, deci e „nu știu", nu `none`.
+#
+#   $1 ieșirea lui `sudo nginx -T 2>&1`   $2 portul   $3 modul (dedicated|shared)
+#
+# Scrie în NGINX_STATE, NGINX_NAME (doar la found) și NGINX_NAMES (cele văzute).
+parse_nginx_vhost_name() {
+    local raw="$1" port="$2" mode="$3" out kind name marked="" unmarked=""
+    NGINX_STATE="unreadable"; NGINX_NAME=""; NGINX_NAMES=""
+    grep -q '^# configuration file ' <<< "$raw" || return 0
+    NGINX_STATE="none"
+
+    out="$(awk -v port="$port" -v mode="$mode" '
+        {
+            line = $0
+            sub(/#.*/, "", line)
+            if (!in_server && line ~ /^[ \t]*server[ \t]*[{]/) {
+                in_server = 1; sdepth = depth; ports = " "; names = ""; marker = 0
+            }
+            if (in_server) {
+                if (line ~ /^[ \t]*listen[ \t]/) {
+                    t = line; sub(/^[ \t]*listen[ \t]+/, "", t); split(t, a, /[ \t;]+/)
+                    p = a[1]; sub(/.*:/, "", p); ports = ports p " "
+                }
+                if (line ~ /^[ \t]*server_name[ \t]/) {
+                    t = line; sub(/^[ \t]*server_name[ \t]+/, "", t); sub(/;.*/, "", t)
+                    names = names " " t
+                }
+                if (line ~ /proxy_pass[ \t]+http:[/][/]sentinel_app/) marker = 1
+            }
+            o = gsub(/[{]/, "{", line); c = gsub(/[}]/, "}", line)
+            depth += o - c
+            if (in_server && depth <= sdepth) {
+                in_server = 0
+                if (index(ports, " " port " ") > 0) {
+                    n = split(names, nt, /[ \t]+/); first = ""
+                    for (i = 1; i <= n; i++)
+                        if (nt[i] ~ /^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$/) { first = nt[i]; break }
+                    k = marker ? "M" : "U"
+                    if (first != "" && (marker || mode == "dedicated")) print k, first
+                }
+            }
+        }' <<< "$raw")"
+
+    while read -r kind name; do
+        [[ -n "$name" ]] || continue
+        if [[ "$kind" == "M" ]]; then
+            [[ " $marked " == *" $name "* ]] || marked="${marked} ${name}"
+        else
+            [[ " $unmarked " == *" $name "* ]] || unmarked="${unmarked} ${name}"
+        fi
+    done <<< "$out"
+
+    NGINX_NAMES="${marked}${unmarked}"
+    if [[ -n "$marked" ]]; then
+        NGINX_STATE="found"; NGINX_NAME="${marked# }"; NGINX_NAME="${NGINX_NAME%% *}"
+    elif [[ -n "$unmarked" ]]; then
+        if [[ "${unmarked# }" == *" "* ]]; then
+            NGINX_STATE="ambiguous"
+        else
+            NGINX_STATE="found"; NGINX_NAME="${unmarked# }"
+        fi
+    fi
+}
+
 # Numele cu care sonda de pe loopback ajunge la vhostul Sentinel.
 #
 # De ce un nume, nu o adresă: în mod `dedicated`, instalatorul pune pe portul
@@ -197,29 +314,73 @@ check_in_set() {
 # `dedicated` se termina cu „Verificări eșuate", chiar cu panoul sănătos — și,
 # fiindcă era mereu roșie, un panou căzut arăta identic.
 #
-# `DOMAIN` când se știe (flag sau sentinel.yaml), altfel `HOST`. Fără domeniu,
-# instalatorul nu pune blocul de refuz (vhostul Sentinel e el însuși
-# `default_server`), deci orice Host merge; `HOST` e doar încercarea cea mai bună
-# când sentinel.yaml n-a putut fi citit, iar mesajul de eșec spune de unde a
-# venit numele, ca operatorul să nu caute un vhost după un nume ghicit.
+# Ordinea, de la cel mai de încredere la cel mai puțin:
+#
+#   1. `--domain` dat explicit — operatorul a afirmat un nume; nu-l contrazic.
+#   2. numele citit din nginx (`parse_nginx_vhost_name`) — ce servește gazda.
+#   3. `domain:` din sentinel.yaml — doar dacă nginx n-a dat un nume.
+#   4. `--host` — ultima rezervă, și spusă ca atare: poate fi un alias ssh.
+#
+# DEZACORDUL e o stare, nu o eroare și nu o tăcere: yaml cu `domain` gol dar
+# nginx cu un nume (exact n8n), yaml și nginx cu nume diferite, sau un nume
+# declarat pe care nginx nu-l servește. Configurația și ce servește gazda nu
+# spun același lucru — felul de divergență care devine o pană peste șase luni —
+# deci PROBE_NOTE îl spune, iar apelantul îl tipărește ca avertisment. Tot în
+# PROBE_NOTE: rezerva pe care a trebuit s-o folosească, când nginx n-a putut fi
+# citit.
 #
 # Numele intră într-o comandă care rulează pe gazdă: doar caractere de nume de
 # gazdă, altfel nu se trimite niciun antet (și se spune asta).
+#
+# Intrări: DOMAIN_FLAG, DOMAIN (flag sau yaml), HOST, WEB_PORT, NGINX_STATE,
+# NGINX_NAME, NGINX_NAMES. Ieșiri: PROBE_NAME, PROBE_NAME_FROM, PROBE_NOTE.
 pick_probe_name() {
     local candidate re='^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$'
-    PROBE_NAME=""
-    if [[ -n "$DOMAIN" ]]; then
+    local declared="$DOMAIN" declared_from why="" low_declared low_nginx
+    PROBE_NAME=""; PROBE_NOTE=""
+    if [[ -n "$DOMAIN_FLAG" ]]; then declared_from="--domain"; else declared_from="sentinel.yaml"; fi
+
+    case "$NGINX_STATE" in
+        unreadable) why="nginx -T n-a putut fi citit" ;;
+        none)       why="nginx nu are niciun vhost cu nume pe :${WEB_PORT}" ;;
+        ambiguous)  why="nginx are mai multe nume pe :${WEB_PORT} (${NGINX_NAMES# }), niciunul marcat ca al Sentinel" ;;
+    esac
+
+    if [[ -n "$DOMAIN_FLAG" ]]; then
+        candidate="$DOMAIN_FLAG"
+        PROBE_NAME_FROM="--domain dat explicit"
+    elif [[ "$NGINX_STATE" == "found" ]]; then
+        candidate="$NGINX_NAME"
+        PROBE_NAME_FROM="nginx"
+    elif [[ -n "$DOMAIN" ]]; then
         candidate="$DOMAIN"
-        PROBE_NAME_FROM="domeniul instalat"
+        PROBE_NAME_FROM="sentinel.yaml, rezervă: ${why}"
     else
         candidate="$HOST"
-        PROBE_NAME_FROM="--host, fiindcă nu se știe niciun domeniu"
+        PROBE_NAME_FROM="--host, rezervă: ${why}; sentinel.yaml n-are domeniu"
     fi
+
     if [[ "$candidate" =~ $re ]]; then
         PROBE_NAME="$candidate"
     else
         PROBE_NAME_FROM="niciun nume utilizabil ('${candidate}' nu e un nume de gazdă simplu)"
     fi
+
+    # Hostname-urile nu țin cont de litere mari: `Panou.Exemplu.ro` nu e un dezacord.
+    low_declared="$(tr 'A-Z' 'a-z' <<< "$declared")"
+    low_nginx="$(tr 'A-Z' 'a-z' <<< "$NGINX_NAME")"
+    case "$NGINX_STATE" in
+        found)
+            if [[ -z "$declared" ]]; then
+                PROBE_NOTE="dezacord: sentinel.yaml are domain gol, dar nginx servește vhostul Sentinel de pe :${WEB_PORT} sub numele '${NGINX_NAME}'. Sonda a folosit numele din nginx. Configurația și gazda nu spun același lucru: pune domain: ${NGINX_NAME} în sentinel.yaml la prima modificare a configurației (smoke-testul nu scrie nimic)."
+            elif [[ "$low_declared" != "$low_nginx" ]]; then
+                PROBE_NOTE="dezacord: ${declared_from} spune '${declared}', dar nginx servește vhostul Sentinel de pe :${WEB_PORT} sub numele '${NGINX_NAME}'. Sonda a folosit '${PROBE_NAME}' (${PROBE_NAME_FROM})."
+            fi ;;
+        none)
+            [[ -z "$declared" ]] || PROBE_NOTE="dezacord: ${declared_from} spune '${declared}', dar nginx nu are niciun vhost cu nume pe :${WEB_PORT} (vhostul e default_server, fără domeniu). Sonda a folosit '${PROBE_NAME}'." ;;
+        unreadable|ambiguous)
+            [[ -n "$DOMAIN_FLAG" ]] || PROBE_NOTE="numele vhostului n-a putut fi luat din nginx (${why}). Sonda a folosit '${PROBE_NAME:-niciun nume}' (${PROBE_NAME_FROM}); un nume greșit dă o închidere falsă, nu o problemă reală." ;;
+    esac
 }
 
 # Sonda propriu-zisă: curl PE GAZDĂ, spre nginx, pe loopback. Tipărește
@@ -639,8 +800,13 @@ code="$(r "curl -sk -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.
 # nginx in front of it, still over loopback. Separating this from the external
 # check below means a failure names the layer that is wrong, rather than just
 # saying "unreachable".
-# Prin vhostul Sentinel, nu prin default_server — vezi `pick_probe_name`.
+# Prin vhostul Sentinel, nu prin default_server, iar numele vine de la nginx —
+# vezi `parse_nginx_vhost_name` și `pick_probe_name`. Fără `|| echo`: un `sudo`
+# căzut dă ieșire goală, iar parserul o citește ca „ilizibil", nu ca „niciun vhost".
+nginx_dump="$(r "sudo nginx -T 2>&1" || true)"
+parse_nginx_vhost_name "$nginx_dump" "$WEB_PORT" "$NGINX_MODE"
 pick_probe_name
+[[ -z "$PROBE_NOTE" ]] || warn "$PROBE_NOTE"
 report_loopback_probe "$(probe_loopback "$WEB_PORT" "$PROBE_NAME")" "$WEB_PORT" "$PROBE_NAME" "$PROBE_NAME_FROM"
 
 if r "sudo nginx -t"; then pass "nginx config valid"; else fail "nginx -t failed"; fi
