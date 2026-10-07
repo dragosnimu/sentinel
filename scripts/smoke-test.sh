@@ -185,6 +185,107 @@ check_in_set() {
     esac
 }
 
+# Numele cu care sonda de pe loopback ajunge la vhostul Sentinel.
+#
+# De ce un nume, nu o adresă: în mod `dedicated`, instalatorul pune pe portul
+# dashboard-ului un `default_server` cu `server_name _` și `return 444` (vezi
+# `deploy/nginx/sentinel-default-deny.conf.tmpl`) — intenționat, ca un scan al
+# adresei să nu afle nimic. O cerere către `https://127.0.0.1:PORT/` poartă
+# `Host: 127.0.0.1`, care nu se potrivește cu niciun `server_name`, deci cade pe
+# acel bloc și conexiunea se închide fără niciun răspuns. Sonda veche testa
+# exact întărirea instalatorului și o raporta ca pe o defecțiune: fiecare livrare
+# `dedicated` se termina cu „Verificări eșuate", chiar cu panoul sănătos — și,
+# fiindcă era mereu roșie, un panou căzut arăta identic.
+#
+# `DOMAIN` când se știe (flag sau sentinel.yaml), altfel `HOST`. Fără domeniu,
+# instalatorul nu pune blocul de refuz (vhostul Sentinel e el însuși
+# `default_server`), deci orice Host merge; `HOST` e doar încercarea cea mai bună
+# când sentinel.yaml n-a putut fi citit, iar mesajul de eșec spune de unde a
+# venit numele, ca operatorul să nu caute un vhost după un nume ghicit.
+#
+# Numele intră într-o comandă care rulează pe gazdă: doar caractere de nume de
+# gazdă, altfel nu se trimite niciun antet (și se spune asta).
+pick_probe_name() {
+    local candidate re='^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$'
+    PROBE_NAME=""
+    if [[ -n "$DOMAIN" ]]; then
+        candidate="$DOMAIN"
+        PROBE_NAME_FROM="domeniul instalat"
+    else
+        candidate="$HOST"
+        PROBE_NAME_FROM="--host, fiindcă nu se știe niciun domeniu"
+    fi
+    if [[ "$candidate" =~ $re ]]; then
+        PROBE_NAME="$candidate"
+    else
+        PROBE_NAME_FROM="niciun nume utilizabil ('${candidate}' nu e un nume de gazdă simplu)"
+    fi
+}
+
+# Sonda propriu-zisă: curl PE GAZDĂ, spre nginx, pe loopback. Tipărește
+# `<cod http> rc=<cod curl>`.
+#
+# De ce și codul de ieșire al lui curl, nu doar `%{http_code}`: `000` înseamnă
+# două lucruri cu reacții opuse — „nimic nu ascultă" (rc=7) și „nginx a primit
+# conexiunea și a închis-o fără răspuns" (altceva). `%{http_code}` le dă pe
+# amândouă la fel. Antetul `Host:` rămâne pe loopback fiindcă URL-ul e o adresă
+# IP: `--resolve` ar fi ignorat de curl pentru un URL cu IP literal, iar un
+# `--host` dat ca IP ar duce sonda pe adresa publică, adică pe firewall.
+#
+# Fără `|| echo 000` după curl: pe un `000` curl iese nenul, iar `|| echo` ar fi
+# lipit un al doilea `000` de primul („000000").
+probe_loopback() {
+    local port="$1" name="$2" host_arg=""
+    [[ -n "$name" ]] && host_arg=" -H 'Host: ${name}'"
+    r "curl -sk -o /dev/null -w '%{http_code}' --max-time 10${host_arg} https://127.0.0.1:${port}/healthz; echo \" rc=\$?\"" || true
+}
+
+# Traduce răspunsul sondei în pass/fail. Funcție separată ca să poată fi probată
+# fără o gazdă — vezi `tests/unit/test_smoke_test_loopback_probe.py`.
+#
+#   $1 ieșirea lui probe_loopback   $2 portul   $3 numele trimis ("" = niciun antet)
+#   $4 de unde vine numele
+#
+# Trei răspunsuri cu cauze diferite, deci cu mesaje diferite — reacția
+# operatorului diferă: nginx oprit se pornește, un vhost care nu se potrivește
+# se repară în configurație. Un răspuns ilizibil (ssh căzut, curl lipsă) NU e
+# nici „bine", nici „nimic nu ascultă": e „nu știu", și pică, fiindcă o
+# verificare care nu poate dovedi nu are voie să treacă.
+report_loopback_probe() {
+    local raw="$1" port="$2" name="$3" from="$4" line code rc via nginx_t
+    line="$(tail -n 1 <<< "$raw")"
+    if [[ ! "$line" =~ ^([0-9]{3})?\ ?rc=([0-9]+)$ ]]; then
+        fail "sonda nginx de pe loopback nu a întors un răspuns citibil (${line:-nimic}) — nu pot spune dacă nginx servește, ssh sau curl pe gazdă au căzut"
+        return 0
+    fi
+    code="${BASH_REMATCH[1]}"; rc="${BASH_REMATCH[2]}"
+    if [[ -n "$name" ]]; then
+        via="Host: ${name}, din ${from}"
+    else
+        via="fără antet Host; ${from}"
+    fi
+    nginx_t="sudo nginx -T | grep -B2 -A8 'server_name ${name:-<domeniu>}'"
+
+    if (( rc == 127 )); then
+        fail "curl nu există pe gazdă (rc=127) — nu pot proba nginx de pe loopback"
+    elif [[ -z "$code" ]]; then
+        fail "sonda nginx n-a primit niciun cod HTTP (curl rc=${rc}) — nu pot spune dacă nginx servește"
+    elif [[ "$code" == "000" ]]; then
+        case "$rc" in
+            7)  fail "NIMIC NU ASCULTĂ pe 127.0.0.1:${port} (conexiune refuzată, curl rc=7) — nginx e oprit sau ascultă pe alt port. Vezi: sudo ss -lntp | grep ':${port}' ; systemctl status nginx" ;;
+            28) fail "127.0.0.1:${port} a acceptat conexiunea, dar nu a răspuns în 10 s (curl rc=28, ${via}) — nginx blocat sau suprasolicitat" ;;
+            35) fail "ceva ascultă pe 127.0.0.1:${port}, dar handshake-ul TLS a eșuat (curl rc=35) — portul nu servește TLS cu un certificat utilizabil. Vezi: ${nginx_t}" ;;
+            *)  fail "nginx ASCULTĂ pe :${port}, dar a închis conexiunea fără niciun răspuns (curl rc=${rc}, ${via}). Asta face blocul catch-all (\`return 444\`) pentru un Host care nu se potrivește cu niciun vhost: nu s-a ales vhostul Sentinel. Dacă verificarea de pe 8787 a trecut, aplicația e sănătoasă și greșit e rutarea. Vezi: ${nginx_t} — vhostul se alege după nume, deci numele trimis trebuie să fie exact cel din server_name (--domain)" ;;
+        esac
+    elif (( rc != 0 )); then
+        fail "răspunsul nginx de pe :${port} a fost întrerupt (HTTP ${code}, curl rc=${rc}, ${via})"
+    elif [[ "$code" =~ ^(200|301|302|303|307|308|401|503)$ ]]; then
+        pass "nginx serving on :${port} (HTTP ${code}; ${via})"
+    else
+        fail "nginx răspunde pe :${port}, dar cu HTTP ${code} la /healthz (${via}) — nu e dashboard-ul Sentinel. Vezi: ${nginx_t}"
+    fi
+}
+
 printf '%sSentinel smoke test — %s%s\n' "$_B" "$HOST" "$_0"
 
 # ---------------------------------------------------------------------------
@@ -528,21 +629,25 @@ fi
 # ---------------------------------------------------------------------------
 sect "Dashboard"
 
-code="$(r "curl -sk -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:8787/healthz" || echo 000)"
+# Fără `|| echo 000`: curl tipărește el însuși `000` când eșuează, iar `|| echo`
+# l-ar lipi de al lui („000000"). Gol = ssh n-a răspuns; se citește tot ca 000.
+code="$(r "curl -sk -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:8787/healthz" || true)"
+[[ -n "$code" ]] || code=000
 [[ "$code" =~ ^(200|301|302|303|307|308|401|503)$ ]] && pass "app answers on 127.0.0.1:8787 (HTTP ${code})" \
                                      || fail "app did not answer on 8787 (got ${code})"
 
 # nginx in front of it, still over loopback. Separating this from the external
 # check below means a failure names the layer that is wrong, rather than just
 # saying "unreachable".
-code="$(r "curl -sk -o /dev/null -w '%{http_code}' --max-time 10 https://127.0.0.1:${WEB_PORT}/healthz" || echo 000)"
-[[ "$code" =~ ^(200|301|302|303|307|308|401|503)$ ]] && pass "nginx serving on :${WEB_PORT} (HTTP ${code})" \
-                                     || fail "nginx did not answer on :${WEB_PORT} (got ${code})"
+# Prin vhostul Sentinel, nu prin default_server — vezi `pick_probe_name`.
+pick_probe_name
+report_loopback_probe "$(probe_loopback "$WEB_PORT" "$PROBE_NAME")" "$WEB_PORT" "$PROBE_NAME" "$PROBE_NAME_FROM"
 
 if r "sudo nginx -t"; then pass "nginx config valid"; else fail "nginx -t failed"; fi
 
 if [[ -n "$DOMAIN" ]]; then
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://${DOMAIN}${URL_SUFFIX}/healthz" || echo 000)"
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://${DOMAIN}${URL_SUFFIX}/healthz" || true)"
+    [[ -n "$code" ]] || code=000
     if [[ "$code" =~ ^(200|401|302)$ ]]; then
         pass "reachable from outside at https://${DOMAIN}${URL_SUFFIX} (HTTP ${code})"
     elif [[ "$code" == "000" ]]; then
@@ -579,7 +684,8 @@ not pointing here yet — Sentinel itself is fine."
     body="$(curl -sk --max-time 10 -H 'Host: not-sentinel.invalid' \
         "https://${HOST}${URL_SUFFIX}/login" 2>/dev/null | head -c 4000 || true)"
     bare="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 \
-        -H 'Host: not-sentinel.invalid' "https://${HOST}${URL_SUFFIX}/" 2>/dev/null || echo 000)"
+        -H 'Host: not-sentinel.invalid' "https://${HOST}${URL_SUFFIX}/" 2>/dev/null || true)"
+    [[ -n "$bare" ]] || bare=000
 
     if grep -qi 'sentinel' <<< "$body"; then
         fail "a request with an UNKNOWN Host header returns Sentinel's dashboard \

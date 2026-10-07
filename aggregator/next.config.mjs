@@ -65,6 +65,25 @@ const nextConfig = {
   // cadou gratuit pentru cine face recunoaștere.
   poweredByHeader: false,
   reactStrictMode: true,
+  /**
+   * API-ul de optimizare de imagini (`/_next/image`) e închis.
+   *
+   * Next îl montează IMPLICIT, chiar dacă aplicația nu folosește `next/image` —
+   * și agregatorul nu-l folosește (`app/` și `lib/` n-au nicio potrivire pentru
+   * `next/image` sau `<Image`; singurele imagini sunt `/logo.svg` și fișierele
+   * din `public/`, servite direct). Era deci o suprafață fără beneficiar: cea
+   * prin care ajunge `sharp` (libvips, libheif, librsvg) la intrare controlată
+   * de un vizitator neautentificat, inclusiv RCE-ul din libheif pentru AVIF.
+   *
+   * `unoptimized: true` nu e un steag cosmetic pentru `next/image`: în
+   * `next-server`, ruta răspunde 404 ÎNAINTE de validarea parametrilor și de
+   * orice apel către `sharp`. Măsurat pe aplicația construită, nu presupus: cu
+   * un PNG în `public/`, `/_next/image?url=/x.png&w=640&q=75` dădea 200 și
+   * `image/png` recodat înainte, 404 după (vezi
+   * `tests/image-optimizer-closed.test.ts`, care repetă măsurătoarea pe un build
+   * real — nu citește acest fișier).
+   */
+  images: { unoptimized: true },
   async headers() {
     return [
       {

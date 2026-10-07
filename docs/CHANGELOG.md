@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.22.9 — Livrarea in mod dedicated nu mai pica pe un panou sanatos, si agregatorul inchide optimizatorul de imagini
+
+**Fiecare livrare in mod `dedicated` se termina cu „Nu considera deployment-ul
+reusit", chiar cu panoul perfect sanatos.** Sonda de pe loopback cerea
+`https://127.0.0.1:PORT/`, adica `Host: 127.0.0.1`. Pe portul dedicat
+instalatorul pune intentionat un `default_server` care raspunde `return 444`
+(inchide conexiunea fara niciun raspuns, ca un scan al adresei sa nu afle
+nimic), iar acel Host nu se potrivea cu niciun vhost, deci cadea pe el: `curl`
+raporta `000`. Sonda testa deci intarirea instalatorului si o raporta ca pe o
+defectiune. Masurat pe gazda n8n pe 7 octombrie: aceeasi cerere cu
+`Host: <numele gazdei>` dadea 200.
+
+Costul real nu era zgomotul, ci semnalul pierdut: o verificare rosie MEREU nu
+mai deosebeste un panou sanatos de unul cazut. Acum sonda cere vhostul dupa nume
+(domeniul instalat; fara domeniu nu exista bloc de refuz, deci nu se trimite
+niciun nume), si cele doua feluri de `000` nu se mai amesteca: **„nimic nu
+asculta"** (conexiune refuzata — nginx e oprit) si **„nginx asculta dar a
+inchis conexiunea"** (niciun vhost nu se potriveste cu numele) au mesaje si
+remedii diferite. Un raspuns pe care scriptul nu-l poate citi pica, nu trece.
+Pe nginx 1.30.5 cu sablonul real de refuz, conexiunea inchisa da `curl rc=92`
+(eroare de flux HTTP/2), nu `52` — de aceea cazul „inchis" nu e legat de un cod.
+
+Aceeasi sonda era in `deploy/install.sh` (pasul de proba de fum), ca simplu
+avertisment care suna pe fiecare gazda cu bloc de refuz. A primit aceeasi
+alegere de nume. Cele doua nu pot fi o singura functie (una ruleaza pe statia
+operatorului, peste ssh; cealalta pe gazda), asa ca un test le ruleaza pe
+acelasi server si cere acelasi verdict.
+
+`|| echo 000` dupa `curl` lipea al doilea `000` de primul: operatorul citea
+„got 000000". In dedicated, asta facea ca refuzul corect al unui Host necunoscut
+sa iasa avertisment („unknown Host returned 000000") in loc de „refuzat fara
+raspuns". Curatat in cele trei locuri.
+
+**Agregatorul: ruta de optimizare de imagini e inchisa, iar Next e la o versiune
+fara cele doua critice.** `/_next/image` exista implicit in orice aplicatie
+Next, iar agregatorul nu foloseste `next/image`; prin ea ajunge `sharp` sa
+proceseze intrare de la un vizitator neautentificat. `images.unoptimized` o
+inchide: pe aplicatia construita, un PNG din `public/` dadea 200 prin
+optimizator inainte si 404 dupa. Un test porneste un server si cere raspunsul,
+nu citeste configuratia.
+
+`next` urca de la 15.5.23 la 15.5.27, in linia 15: ambele critice (RCE in
+optimizatorul de imagini cu AVIF, RCE pe servere Windows) sunt reparate de la
+15.5.24, deci saltul la 16 nu era necesar. Intervalul din `package.json` e acum
+`^15.5.27`, iar lockfile-ul il pinneaza; un test cere ca ambele sa ramana peste
+pragul din advisory. `postcss` si `source-map-js` (dependente de constructie)
+sunt ridicate prin `overrides`. `npm audit`: 4 vulnerabilitati (3 high, 1
+critical) devin 1 (`sharp`, high, ajuns doar prin ruta acum inchisa).
+Agregatorul trece la 0.1.2.
+
 ## 0.22.8 — Semafor luat din CISA, patching care cere semnatura ta, si ce a scris modelul se vede ca atare
 
 Punctajul vechi dadea 80-90 aproape la tot, deci nu separa nimic. In locul lui,

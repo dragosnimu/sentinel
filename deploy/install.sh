@@ -5472,6 +5472,44 @@ beacon_seq() {
         | tr -d '[:space:]'
 }
 
+# The loopback half of the smoke test, asked THROUGH SENTINEL'S VHOST.
+#
+# With --domain, the installer leaves a `default_server` on the dashboard port
+# whose whole job is `return 444` (deploy/nginx/sentinel-default-deny.conf.tmpl).
+# A request to https://127.0.0.1:PORT/ carries `Host: 127.0.0.1`, matches no
+# `server_name`, falls onto that block and gets no response at all: curl says
+# 000. This probe used to send exactly that request, so on every host with the
+# deny block it warned "nothing answered" about a healthy dashboard — measured
+# on the n8n host, 7 Oct 2026, where the same curl with `Host: <name>` got 200.
+# A warning that fires on every healthy host is one nobody reads on the one
+# where it is true.
+#
+# Without --domain there is no deny block and the app vhost is itself the
+# default_server (see "Dedicated mode: who answers on :PUBLIC_PORT"), so no
+# name is needed and none is sent.
+#
+# `scripts/smoke-test.sh` asks the same question over ssh and makes the same
+# choice (`pick_probe_name`). They cannot share one function: that script runs
+# on the operator's workstation, reads curl's exit code off a remote shell, and
+# is not sourceable; this one runs on the host through `https_code`. What ties
+# them is `tests/unit/test_smoke_test_loopback_probe.py`, which runs both
+# against the same server and goes red if either goes back to the bare address.
+#
+# Severity and accepted codes are unchanged on purpose: step 33
+# (`verify_dashboard_answers`) is the gate that stops the run; this only
+# re-checks that the answer still holds at the end.
+smoke_loopback_check() {
+    local code
+    local -a name_args=()
+    [[ -n "$DOMAIN" ]] && name_args=(-H "Host: ${DOMAIN}")
+    code="$(https_code "https://127.0.0.1:${PUBLIC_PORT}/healthz" ${name_args[@]+"${name_args[@]}"})"
+    if [[ "$code" =~ ^(200|401|302|503)$ ]]; then
+        ok "nginx is serving the dashboard on :${PUBLIC_PORT}"
+    else
+        warn "https://127.0.0.1:${PUBLIC_PORT}/healthz answered HTTP ${code}${DOMAIN:+ for Host: ${DOMAIN}} (000 = no response at all)"
+    fi
+}
+
 step_smoke_test() {
     "${SENTINEL_PREFIX}/bin/sentinel" config-check -v || warn "config-check reported problems"
 
@@ -5480,12 +5518,7 @@ step_smoke_test() {
     # Loopback first: proves the app and nginx agree, independently of DNS, the
     # certificate and the provider firewall. Separating the two checks means a
     # failure says *which* of those is wrong.
-    if curl -sk --max-time 10 -o /dev/null -w '%{http_code}' \
-        "https://127.0.0.1:${PUBLIC_PORT}/healthz" | grep -qE '^(200|401|302|503)$'; then
-        ok "nginx is serving the dashboard on :${PUBLIC_PORT}"
-    else
-        warn "nothing answered on https://127.0.0.1:${PUBLIC_PORT}/healthz"
-    fi
+    smoke_loopback_check
 
     if [[ -n "$DOMAIN" ]]; then
         if curl -sk --max-time 10 -o /dev/null -w '%{http_code}' \
