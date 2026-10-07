@@ -1,5 +1,82 @@
 # Changelog
 
+## 0.22.8 — Semafor luat din CISA, patching care cere semnatura ta, si ce a scris modelul se vede ca atare
+
+Punctajul vechi dadea 80-90 aproape la tot, deci nu separa nimic. In locul lui,
+arborele SSVC al CISA decide Act/Attend/Track din exploatare, automatizare,
+impact si criticitate, iar culoarea urmeaza decizia. Datele vin prin API din
+surse gratuite si citabile: EPSS de la FIRST, CVSS de la Red Hat si OSV,
+exploatarea observata din CISA Vulnrichment. Ce nu are date e **gri**, nu verde.
+
+Doua lucruri sunt ale noastre, nu ale CISA, si scrie asa pe fiecare suprafata:
+absenta din KEV e citita ca „exploatare neobservata", prezumtie care decide 395
+din 812 randuri; iar o observatie CISA mai veche de 180 de zile, contrazisa de
+un EPSS proaspat peste 0,5, ridica podeaua culorii la galben.
+
+**Garda care vede CISA amutind nu se mai stinge singura.** Prima varianta
+raporta „ok" fara sa verifice nimic: alarma se stergea la urmatoarea trecere
+orara, iar un lot tipic de 5-6 CVE-uri statea sub pragul de 20, deci intr-o lume
+complet oarba verdictul nu se calcula aproape niciodata. Pe 72 de treceri
+simulate: 0 calculate. Acum controlul pozitiv ruleaza la fiecare trecere si
+scrie intr-un rand propriu: 72 din 72.
+
+**„N-am avut ce cere" nu mai arata ca „am cerut si a esuat".** `run_lookups` se
+intorcea fara sa scrie nimic cand nu era nimic de cerut, deci `last_ok_at`
+ingheta si verificarea suna `degraded` la 36 de ore fara ca nimic sa fi esuat.
+A sunat chiar asa pe 4 octombrie, pe ambele gazde.
+
+**Un pas de patch ruleaza doar daca operatorul a semnat exact acei pasi.** Cheia
+de aprobare a iesit de sub contul care ruleaza botul si web-ul; semnatura acopera
+acum `plan_hash` + amprenta pasilor + nonce, si se consuma o data. Inainte, o
+semnatura valida pentru un plan inofensiv autoriza o comanda arbitrara. `apt`
+ruleaza in unitatea tranzitorie ca si `dnf`, si niciun pas nu mai trece verde la
+proba uscata ca sa cada apoi cu „Read-only file system". `backup_restore` refuza
+intotdeauna: putea inlocui chiar cheia de aprobare.
+
+**Pagina de vulnerabilitati spune ce ai de facut.** O stare are un singur nume
+peste tot, iar legendele sunt generate din sursa etichetelor, nu copiate. CVSS,
+EPSS si KEV stau impreuna langa risc. Tabelul incape la 1700 px: o coloana
+`nowrap` e lata cat cea mai lata celula a ei, iar zece randuri din 648 impingeau
+titlul complet in afara ecranului.
+
+**Sesiunile isi arata comenzile.** Gazda scria `session_id` NULL cand o comanda
+sosea inaintea randului de sesiune si completa legatura mai tarziu — dar fluxul
+e doar-adaugare, deci completarea nu se expedia niciodata.
+
+**Se vede ce a scris modelul.** Eticheta `AI content` marcheaza ce a produs sau
+a judecat modelul, iar bara din stanga arata costul si numarul de rulari. Si
+actiunea recomandata nu mai ajunge `unknown` in 90% din cazuri: escape-ul venea
+din cererea noastra, nu din raspuns — enumerarea ajungea la model serializata cu
+`ensure_ascii`, iar modelul raspundea in ortografia pe care i-o aratasem.
+
+**Pagina de autentificare nu mai arata comanda de recuperare a celui de-al
+doilea factor.** Oricine ajungea pe `/login`, nelogat, o citea — si o putea
+provoca direct cu `/login?e=totp_key`, deci nu trebuia nici sa greseasca parola.
+Textul s-a mutat pe `/totp`, in spatele autentificarii.
+
+**Comanda din documentatie chiar merge.** Niciunul din cele sase scripturi de
+operator nu citea `.env.local`, deci fiecare invocatie documentata esua cu un
+mesaj corect si complet inselator. Inrolarea celui de-al doilea factor deseneaza
+acum si un QR, care isi decodeaza propria matrice inainte sa-l deseneze.
+
+**O reparatie instalata nu e o reparatie care ruleaza.** Cele 491 de constatari
+de kernel cereau o REPORNIRE, nu un patch, iar Sentinel nu deosebea cele doua
+stari — operatorul a petrecut patru zile cautand un patch care era deja pus. Si
+o scanare dnf care eseaza nu mai poate raporta gazda drept curata: zero
+constatari dintr-o comanda care n-a rulat se citea identic cu zero constatari
+reale.
+
+**Executorul poate rula o tranzactie de pachete, dar refuza s-o faca.** Calea
+tranzitorie exista si e exercitata de teste; se deschide doar dupa cheie,
+legarea planului si iesirea din grupul docker. Un plan de patch nu mai
+supravietuieste constatarii pe care o repara, iar instalatorul nu mai cade la
+pasul 42 pe o livrare de productie, fiindca pasul 27 ii golea tabloul din care
+citea secretul.
+
+**Versiunea se vede in coltul stanga jos, si urca la fiecare livrare.** Pana
+acum `VERSION` statuse la 0.18.0 din primul commit, 215 commit-uri la rand, in
+timp ce jurnalul asta numara corect pana la 0.22.7. Un test leaga acum cele doua.
+
 ## 0.22.7 — Jurnalul supraviețuiește repornirii, botul ascultă doar de tine, iar marcajele de stare nu se mai mută
 
 Trei schimbări ale instalatorului care pleacă împreună, fiindcă trăiesc în

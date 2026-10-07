@@ -83,7 +83,7 @@ def test_the_login_page_renders_no_recovery_path_in_any_state(state):
     if state == "empty":
         html = _login_html()
     elif state == "wrong-password":
-        html = _login_html(error="Autentificare eșuată.", username="dragos")
+        html = _login_html(error="Autentificare eșuată.", username="operator")
     elif state == "after-logout":
         req = SimpleNamespace(query_params={"e": "logout"})
         html = _login_html(error=auth._login_error(req))
@@ -163,9 +163,9 @@ def test_the_totp_page_carries_the_recovery_command_with_the_account_name():
     Eșecul pe care îl previne: ajutorul scos de pe `/login` nu apare nicăieri. Operatorul cu
     telefonul pierdut ar sta la ecranul de cod fără să știe că deblocarea se face pe server.
     """
-    html = _totp_html("dragos")
+    html = _totp_html("operator")
     assert "<details" in html and "Ai pierdut aplicația de autentificare?" in html
-    assert "sudo sentinel web --enroll-totp --username dragos" in html
+    assert "sudo sentinel web --enroll-totp --username operator" in html
     # Closed by default: someone who HAS the app does not need a shell command under the code field.
     assert re.search(r"<details[^>]* open", html) is None
 

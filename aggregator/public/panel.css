@@ -191,6 +191,13 @@ a { color: var(--accent); }
 .cine { margin-left: auto; color: var(--fg-muted); }
 .bara form { margin: 0; }
 
+/* Nota de versiune, lângă utilizator: mai mică decât numele, fără chenar — o notă de subsol în
+ * antet, nu o insignă. Fără `margin-left: auto`: stă lipită de `.cine`, care împinge grupul spre
+ * dreapta. `--fg-muted`, nu `--fg-dim`: foaia asta nu definește `--fg-dim`, iar o variabilă
+ * nedefinită ar lăsa culoarea moștenită, fără nicio eroare. */
+.versiune { color: var(--fg-muted); font-size: .78rem; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.versiune-beta { text-transform: uppercase; letter-spacing: .06em; font-weight: 700; }
+
 .bara button {
   font: inherit;
   padding: .3rem .8rem;
@@ -353,6 +360,7 @@ code.id { color: var(--fg-muted); font-size: .8rem; font-family: var(--mono); }
 @media (max-width: 40rem) {
   main { padding: 1rem .75rem; }
   table { display: block; overflow-x: auto; }
+  .versiune { display: none; }   /* antetul nu se împarte pe rânduri; nota nu merită să-l lărgească */
 }
 
 /* --- meniu, selector de server, pagini fără date -------------------------- */

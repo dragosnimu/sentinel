@@ -5,7 +5,7 @@
  * ## Ce s-a stricat fără ea
  *
  * Niciun script `npm run ...` nu citea fișierul. Operatorul a rulat exact ce
- * spunea README-ul — `npm run user -- enroll-totp dragos` — și a primit
+ * spunea README-ul — `npm run user -- enroll-totp <utilizator>` — și a primit
  * `SENTINEL_SESSION_SECRET lipsește (sau e goală)`, urmat de o explicație lungă,
  * corectă și, în cazul ăsta, înșelătoare: variabila stătea în `.env.local` de la
  * început, iar nimic nu o citise. Mesajul numea efectul (lipsește din MEDIU) ca

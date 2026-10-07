@@ -358,6 +358,20 @@ body {
 .role-owner    { color: var(--accent); border-color: var(--accent-dim); }
 .role-operator { color: var(--warn); border-color: var(--warn); }
 
+/* Nota de versiune, sub „Ieșire": un subsol al barei, nu o insignă. Aceeași culoare ca `.footer`
+   (`--fg-dim`, măsurată pe fundalul barei), mai mică, fără chenar și fără fundal — nu concurează
+   cu navigarea. Coloana are deja `overflow-y: auto`, deci o linie în plus coboară cel mult
+   butonul „Ieșire" cu o linie, nu îl scoate din ecran. */
+.version-foot {
+  margin: 0;
+  text-align: center;
+  font-size: .76rem;
+  line-height: 1.3;
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+}
+.version-beta { text-transform: uppercase; letter-spacing: .06em; font-weight: 700; }
+
 form.inline { display: inline; margin: 0; }
 
 .auth-shell { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 2rem 1.25rem; }
@@ -934,6 +948,7 @@ table.events td { vertical-align: top; }
   .ai-meter-head, .ai-meter-per, .ai-meter-total { display: none; }
   .ai-meter-main { margin-top: 0; }
   .userbox-text { display: none; }
+  .version-foot { display: none; }   /* banda orizontală n-are loc de notă; subsolul paginii o are */
   .content { padding: 1.3rem 1rem 1.5rem; }
   h1 { font-size: 1.55rem; }
   .kpi-value { font-size: 2rem; }

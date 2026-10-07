@@ -48,6 +48,7 @@ import type { Ranked, Summary, Trend } from "./data/overview";
 import { MAX_ROWS_READ, SERIES_HOURS, WINDOW_HOURS } from "./data/overview";
 import type { ScanHealth } from "./data/scans";
 import { escapeHtml } from "./auth/render";
+import { VERSION, releaseStage } from "./version";
 import type { Arrival } from "./data/arrivals";
 import type { BlockSummary } from "./data/blocklist";
 import type { DetectionSummary } from "./data/detections";
@@ -120,6 +121,31 @@ export function withInstance(href: string, instance: string | null): string {
 }
 
 /**
+ * Nota de versiune din antet, lângă utilizator: „Agregator 0.1.0 · beta".
+ *
+ * Aici nu există bară laterală, iar agregatorul nu cunoaște versiunea vreunei instanțe (niciun
+ * câmp în fluxuri, nimic în beacon) — deci arată a LUI, și o numește „Agregator", ca să nu fie
+ * citită drept versiunea serverului din selector. Versiunea vine din `lib/version.ts`
+ * (`package.json`); „beta" apare doar sub 1.0, iar o versiune necitită se scrie „necunoscută".
+ * Parametrii există ca testul să poată cere o altă versiune; pagina reală îi lasă pe cei impliciți.
+ */
+export function versionNote(version: unknown = VERSION): string {
+  const stage = releaseStage(version);
+  if (stage === "unknown") {
+    return '<span class="versiune" title="Versiunea agregatorului nu are forma X.Y.Z, deci nu pot spune dacă e sub 1.0.">' +
+           "Agregator, versiune necunoscută</span>\n";
+  }
+  const title = stage === "beta"
+    ? ' title="Versiune beta (sub 1.0): funcțiile și interfața se mai pot schimba."' : "";
+  const beta = stage === "beta" ? ' &middot; <span class="versiune-beta">beta</span>' : "";
+  // Fără `escapeHtml`, dinadins: `releaseStage` a primit doar `[0-9A-Za-z.+-]`, deci șirul de aici
+  // n-are cum purta marcaj, iar un escape pe o cale care nu poate fi atinsă ar fi cod mort.
+  // Gardianul e expresia regulată; o apasă `tests/version.test.ts` („un șir cu marcaj nu ajunge
+  // în pagină ca marcaj”).
+  return `<span class="versiune"${title}>Agregator ${String(version)}${beta}</span>\n`;
+}
+
+/**
  * Antetul: cine ești, ce server privești, meniul, și ieșirea.
  *
  * Selectorul e un formular `GET`, nu JavaScript: politica interzice scripturile,
@@ -147,6 +173,7 @@ function chrome(view: Chrome): string {
   }
 
   parts.push(`<span class="cine">${escapeHtml(view.username)}</span>\n`);
+  parts.push(versionNote());
   parts.push('<form method="post" action="/logout">\n');
   parts.push(`<input type="hidden" name="csrf_token" value="${escapeHtml(view.csrfToken)}">\n`);
   parts.push('<button type="submit">Ieși</button>\n</form>\n</header>\n');

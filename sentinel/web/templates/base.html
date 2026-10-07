@@ -95,6 +95,16 @@
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
         <button type="submit" class="btn btn-quiet btn-sm btn-block">Ieșire</button>
       </form>
+      {#
+        Versiunea, ca notă de subsol sub „Ieșire" — nu insignă între linkuri. Vine din globalul
+        `release` (`web/jinja.py`), adică din `VERSION`; „beta" apare doar cât versiunea e sub
+        1.0, iar o versiune necitită se scrie „necunoscută", nu „beta" (`release_stage`).
+      #}
+      {% if release.stage == 'unknown' %}
+      <p class="version-foot" title="Versiunea nu s-a putut citi sau nu are forma X.Y.Z, deci nu pot spune dacă e sub 1.0.">Versiune necunoscută</p>
+      {% else %}
+      <p class="version-foot"{% if release.stage == 'beta' %} title="Versiune beta (sub 1.0): funcțiile și interfața se mai pot schimba."{% endif %}>Versiune {{ release.version }}{% if release.stage == 'beta' %} · <span class="version-beta">beta</span>{% endif %}</p>
+      {% endif %}
     </div>
   </aside>
 

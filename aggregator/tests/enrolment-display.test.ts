@@ -210,7 +210,7 @@ async function output(uri: string, term: TerminalInfo, secret = SECRET): Promise
 // ---------------------------------------------------------------------------
 // Dovada centrală: ce se tipărește se decodează înapoi la URI
 // ---------------------------------------------------------------------------
-const USERNAMES = ["a", "dragos", "ana-maria.popescu", "x".repeat(40),
+const USERNAMES = ["a", "operator", "ana-maria.popescu", "x".repeat(40),
                    "Ștefan Ionescu", "o@adresa.ro"];
 
 for (const style of STYLES) {
@@ -327,7 +327,7 @@ for (const style of STYLES) {
     // matricea encoderului, iar orientarea se dovedește SEPARAT, din biții de
     // format citiți în pozițiile standard (două copii, același cuvânt valid pentru
     // nivelul L) — oglindirea schimbă ordinea biților și cuvântul iese invalid.
-    const uri = uriFor("dragos");
+    const uri = uriFor("operator");
     const region = qrRegion(await output(uri, style.term));
     const grid = gridOf(emulate(region, style.themes[style.themes.length - 1]));
 
@@ -366,7 +366,7 @@ for (const style of STYLES.slice(0, 2)) {
     // întunecat QR-ul iese inversat (alb pe negru), iar multe aplicații nu
     // scanează un cod inversat. Decodorul bibliotecii poate citi și inversat,
     // deci polaritatea se verifică DIRECT, pe pixeli.
-    const region = qrRegion(await output(uriFor("dragos"), style.term));
+    const region = qrRegion(await output(uriFor("operator"), style.term));
     for (const theme of style.themes) {
       const picture = emulate(region, theme);
       assert.equal(picture.data[0], 255, "colțul zonei libere nu e alb");
@@ -381,7 +381,7 @@ for (const style of STYLES) {
     // Eșecul pe care îl previne: un cod lipit de marginea desenului, pe care
     // camera îl găsește greu sau deloc. Se măsoară pe pixeli, fără decodor: un
     // decodor pe o imagine sintetică ar citi un cod fără nicio margine.
-    const region = qrRegion(await output(uriFor("dragos"), style.term));
+    const region = qrRegion(await output(uriFor("operator"), style.term));
     const picture = emulate(region, style.themes[style.themes.length - 1]);
     const dark = (x: number, y: number): boolean =>
       picture.data[(y * picture.width + x) * 4] === 0;
@@ -493,7 +493,7 @@ test("pe un terminal prea îngust QR-ul nu se desenează, dar URI-ul și secretu
   // Eșecul pe care îl previne: rânduri care se rup la marginea ferestrei —
   // desenul devine un grilaj care nu se scanează, dar arată ca un QR. Limita e
   // exactă: cu o coloană în plus se desenează.
-  const uri = uriFor("dragos");
+  const uri = uriFor("operator");
   const full = await output(uri, WINDOWS_TTY);
   const width = visible(qrRegion(full)[0]).length + 6;
   const fits = await output(uri, { ...WINDOWS_TTY, columns: width });
@@ -516,7 +516,7 @@ test("un QR care NU se decodează la URI nu se desenează, iar URI-ul rămâne",
       real.encodeQR(text.replace(SECRET, "A".repeat(SECRET.length)), out, opts)) as QrLibs["encodeQR"],
     decodeQR: decoder.decodeQR,
   };
-  const uri = uriFor("dragos");
+  const uri = uriFor("operator");
   const built = await buildVerifiedMatrix(uri, async () => lying);
   assert.ok("failed" in built, "un QR care codifică alt șir a fost acceptat");
   assert.match((built as { failed: string }).failed, /NU dă URI-ul/);
@@ -538,7 +538,7 @@ test("un decodor care nu poate rula înseamnă QR omis, nu QR nedovedit", async 
     encodeQR: real.encodeQR,
     decodeQR: (() => { throw new Error("decodor stricat"); }) as QrLibs["decodeQR"],
   };
-  const built = await buildVerifiedMatrix(uriFor("dragos"), async () => broken);
+  const built = await buildVerifiedMatrix(uriFor("operator"), async () => broken);
   assert.ok("failed" in built);
   assert.match((built as { failed: string }).failed, /nu pot dovedi/);
 });

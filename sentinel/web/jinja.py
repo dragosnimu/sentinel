@@ -13,6 +13,7 @@ So there is one factory, and both the app and the tests use it.
 from __future__ import annotations
 
 import hashlib
+import re
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -185,6 +186,32 @@ def zone_label(tz_name: str | None):
     return fus_orar
 
 
+# `X.Y.Z`, urmat opțional de `-pre` și `+build`. Aceeași formă o cere `releaseStage` din
+# `aggregator/lib/version.ts`; `tests/unit/test_version_label.py` le dă ambelor aceleași cazuri.
+# `re.ASCII`: în Python `\d` potrivește orice cifră Unicode (`１`, `٣`), în JavaScript doar `0-9`;
+# fără steag, aceeași versiune ar fi „stabilă" aici și „necunoscută" în agregator.
+_SEMVER = re.compile(r"^(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$", re.ASCII)
+
+
+def release_stage(version: str) -> str:
+    """`beta` (sub 1.0), `stable` (de la 1.0 în sus) sau `unknown` (n-am putut citi versiunea).
+
+    Cuvântul „beta" din bara laterală iese DIN CIFRĂ, nu dintr-un steag scris de mână: operatorul
+    a legat cele două („sub 1.0 pentru că e beta"), iar un steag separat ar fi a doua sursă care
+    poate minți — în ziua în care `VERSION` devine `1.0.0`, panoul ar continua să spună „beta".
+
+    `unknown` NU e „beta": `sentinel._read_version` cade pe `0.0.0+unknown` când nu găsește
+    fișierul `VERSION`, iar 0.0.0 e tehnic sub 1.0. A scrie „beta" peste o versiune pe care n-am
+    citit-o ar fi o afirmație fără fapt în spate; panoul spune că nu știe.
+
+    Un sufix `-rc1` îl face tot `beta`: `1.0.0-rc1` e, prin definiția semver, ÎNAINTE de 1.0.0.
+    """
+    m = _SEMVER.fullmatch(version or "")
+    if not m or version.endswith("+unknown"):
+        return "unknown"
+    return "beta" if int(m.group(1)) < 1 or m.group(4) else "stable"
+
+
 def template_globals() -> dict[str, Any]:
     from sentinel import __version__
     from sentinel.intel import links
@@ -192,6 +219,10 @@ def template_globals() -> dict[str, Any]:
 
     return {
         "version": __version__,
+        # Versiunea din bara laterală, sub utilizator. Un global separat de `version` (cel din
+        # subsol): un `version=...` pus în contextul unei pagini îl acoperă pe acela, dar nu pe
+        # ăsta, deci bara nu poate arăta altceva decât `VERSION`.
+        "release": {"version": __version__, "stage": release_stage(__version__)},
         # Vulnerability references. Exposed as callables rather than
         # precomputed per view, because the same CVE is rendered from a
         # findings row, a plan's vulnerability list and an incident title.
