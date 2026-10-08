@@ -1,6 +1,6 @@
 {
   "name": "sentinel-aggregator",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Agregator extern pentru N instante Sentinel — arhiva, panoul si martorul",
   "private": true,
   "scripts": {

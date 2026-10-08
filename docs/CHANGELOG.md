@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.22.10 — `sharp` la versiunea reparata, si un fisier de stare strain nu mai apare ca eroare
+
+**`sharp` urca de la 0.34.5 la 0.35.5 — aparare in adancime, nu inchiderea unei
+cai deschise.** Trei avertizari `high` (librsvg CVE-2026-96889, CVSS 8,9; libheif,
+CVSS 8,9; libvips, CVSS 7) sunt reparate cel tarziu in 0.35.5. Conditiile difera:
+avizele libheif si libvips spun literal ca afecteaza „cine proceseaza intrare
+nesigura"; avizul librsvg nu spune asta — il leaga de „anumite conditii de
+executie", cere pentru RCE un binar `node` compilat fara PIE (cele „oficiale" nu
+sunt), si da ca ocolire blocarea decodarii SVG. Agregatorul nu proceseaza
+intrare: `/_next/image`, singura cale prin care ajungea `sharp` la un vizitator, e inchis
+din 0.22.9 prin `images.unoptimized`. Valoarea reparatiei e alta: linia aceea e
+una singura, si daca o sterge cineva, versiunea lui `sharp` conteaza din nou.
+Pana atunci, versiunea buna sta acolo, nu versiunea cu trei avertizari.
+
+Nu a trebuit niciun `overrides`: `sharp` vine ca dependenta optionala a lui
+`next@15.5.27`, al carui interval (`^0.34.3 || ^0.35.4`) admitea deja versiunea
+buna, deci a ajuns un `npm update sharp`. Tocmai de aceea o regenerare a
+lockfile-ului il poate lasa pe 0.34.x fara nicio eroare — `npm audit` doar
+redevine rosu. Un test cere acum ca lockfile-ul sa rezolve la prag trei pachete
+diferite, fiindca un lockfile mixt le poate desface unul de altul: `sharp` si
+bindingurile `@img/sharp-<platforma>` (doar legatura Node, ~415 kB) la 0.35.5 sau
+mai sus, si bibliotecile `@img/sharp-libvips-<platforma>` la 1.3.4 sau mai sus.
+Acestea din urma sunt cele care poarta codul vulnerabil: ~18,7 MB, libvips cu
+libheif si librsvg inauntru, iar saltul `sharp` 0.35.4 → 0.35.5 este chiar saltul
+libvips 1.3.3 → 1.3.4 (librsvg 2.63.2, libheif 1.23.5). 1.3.4 e ce fixeaza
+`sharp@0.35.5` in `optionalDependencies`, si un al doilea test verifica exact
+asta in lockfile. Fara ele, `sharp` si bindingul la 0.35.5 cu libvips la 1.2.4
+ar fi ramas vulnerabile sub un test verde. In plus, `package.json` nu are voie sa
+declare `sharp` sub prag. Pragul lui `sharp` e cel mai mare dintre cele trei
+„reparat in".
+
+Masurat pe un build real, sub Node 20.9.0 (minimul cerut de `sharp@0.35.5`) si
+sub 20.20.2, pe Linux, cu `npm install` — comanda pe care o ruleaza gazduirea —
+nu doar cu `npm ci`: arborele instalat e identic cu al lui `npm ci` (112 intrari
+in fiecare), `sharp` iese 0.35.5, `tsc --noEmit` trece, iar `next build` si
+`next start` merg. `/_next/image` raspunde 404 pe PNG, pe SVG si pe AVIF, cu si
+fara `Accept: image/avif`, iar `/logo.svg` ramane 200 (martorul pozitiv).
+Cu un inregistrator pe `require('sharp')`, serverul porneste, raspunde la toate
+cererile si `sharp` nu se incarca nicio data; acelasi build cu configuratia
+golita deschide ruta (200 pe PNG si AVIF) si inregistratorul vede 11 incarcari —
+deci masuratoarea chiar poate vedea ce spune ca nu vede. `npm audit` pe
+lockfile: 1 vulnerabilitate (`sharp`, high, trei avertizari) devine 0. Singurul
+`EBADENGINE` sub 20.9.0 e `qr@0.7.0` (cere >= 20.19.0), dependenta de dezvoltare
+veche, fara legatura cu schimbarea asta; sub 20.20.2 nu apare niciunul.
+Agregatorul trece la 0.1.3.
+
+**Un fisier de stare strain nu mai iese pe nivel ERROR.** Linia „fisiere de stare
+ignorate, nu sunt ale niciunei instante" se scria cu `console.error`, desi
+comentariile din jurul ramurii care o produce spun de doua ori ca nu e o
+defectiune: o identitate retrasa al carei fisier a ramas pe disc, sau o copie
+pusa langa stare, e o stare prevazuta. Pe productie linia aparea de 3 ori in 16
+ore, mereu cu numarul 1, adica exact cazul pentru care e facuta dedublarea. Pe
+`error` ajungea in jurnalul gazduirii acolo unde operatorul cauta defectiuni,
+fara nicio actiune de facut — iar un jurnal care cere actiuni inexistente nu mai
+e citit. Acum e `console.warn`.
+
+Celelalte doua linii din aceeasi functie de citire raman `console.error`, si
+asta are test in ambele sensuri: „stare ilizibila pentru o instanta" si „fisierul
+unei instante poarta alta identitate" sunt pe ramura unei instante CONFIGURATE,
+unde `/status` arata rosu. Un refactor care „uniformizeaza" toate trei la `warn`
+ar sterge exact semnalul rosu, si acum cade intr-un test. Aceeasi regula o are si
+a patra linie `console.error` din `lib/store.ts`, cea din `updateInstance`
+(„nu suprascriu o stare devenita necitibila"): nivelul ei e asertat, deci toata
+familia de patru linii e pazita.
+
 ## 0.22.9 — Livrarea in mod dedicated nu mai pica pe un panou sanatos, si agregatorul inchide optimizatorul de imagini
 
 **Fiecare livrare in mod `dedicated` se termina cu „Nu considera deployment-ul

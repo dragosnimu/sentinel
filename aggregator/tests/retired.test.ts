@@ -142,10 +142,11 @@ test("fișierul rămas al unei identități retrase nu o învie și nu ajunge �
   setEnv({ SENTINEL_RETIRED_INSTANCES: "vechi1;vechi2" });
 
   const log = captureLog();
+  const warn = captureWarn();
   let state: Awaited<ReturnType<typeof readAll>>;
   try {
     state = await readAll();
-  } finally { log.restore(); }
+  } finally { warn.restore(); log.restore(); }
 
   assert.deepEqual(Object.keys(state.instances), ["a1b2c3"],
     "un fișier rămas a înviat o identitate retrasă");
@@ -153,10 +154,12 @@ test("fișierul rămas al unei identități retrase nu o învie și nu ajunge �
     "o identitate retrasă a fost raportată ilizibilă, adică roșu");
 
   // Se raportează ca fișiere ignorate — numărul, niciodată numele.
-  const ignorate = log.lines.filter((l) => l.join(" ").includes("ignorate"));
+  const ignorate = warn.lines.filter((l) => l.join(" ").includes("ignorate"));
   assert.equal(ignorate.length, 1, "nu s-a spus nimic despre fișierele rămase");
   assert.match(ignorate[0].join(" "), /\b2\b/, "avertismentul nu spune CÂTE fișiere");
-  for (const line of log.lines) {
+  // O identitate retrasă nu e o defecțiune: nimic pe nivel ERROR.
+  assert.deepEqual(log.lines, [], "o identitate retrasă a produs o linie pe nivel ERROR");
+  for (const line of [...log.lines, ...warn.lines]) {
     assert.ok(!line.join(" ").includes("vechi1"),
       `jurnalul a scris un nume de fișier: ${line.join(" ")}`);
   }

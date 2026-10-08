@@ -542,7 +542,15 @@ async function reportForeignFiles(foreign: string[]): Promise<void> {
     // Numărul, nu numele: numele unui fișier străin e ales de cine l-a pus
     // acolo, iar jurnalul martorului nu e locul în care să ajungă text ales de
     // altcineva. Regula asta are test — altfel un refactor o pierde gratis.
-    console.error("[watcher] fișiere de stare ignorate, nu sunt ale niciunei instanțe",
+    //
+    // `warn`, nu `error`: un fișier străin e o stare PREVĂZUTĂ (identitate
+    // retrasă cu fișierul rămas pe disc, o copie pusă lângă stare), pe care
+    // `readAll` o numește explicit „nu e o defecțiune". Pe `error` ar apărea în
+    // jurnalul găzduirii exact unde operatorul caută defecțiuni și ar cere o
+    // acțiune care nu există; a doua oară nu l-ar mai citi. Celelalte două linii
+    // din `readAll` (`unreadable`) rămân `error`: aceleia sunt roșii. Diferența
+    // dintre cele trei are test, în ambele sensuri.
+    console.warn("[watcher] fișiere de stare ignorate, nu sunt ale niciunei instanțe",
       foreign.length);
   }
 }

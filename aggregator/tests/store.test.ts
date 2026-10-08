@@ -32,8 +32,8 @@ import { promises as fsp } from "fs";
 import path from "path";
 
 import {
-  STATE_FILE, configureInstances, leftoverTempFiles, pretendCwd, removeState, setEnv,
-  stateFileExists, writeRawInstance, writeRawState,
+  STATE_FILE, captureLog, captureWarn, configureInstances, leftoverTempFiles, pretendCwd,
+  removeState, setEnv, stateFileExists, writeRawInstance, writeRawState,
 } from "./witness-harness";
 import {
   instanceFile, readAll, readInstance, stateIsVolatile, updateInstance, writeInstance,
@@ -421,7 +421,21 @@ test("`updateInstance` NU scrie peste o stare devenită necitibilă", async () =
   configureInstances(["aaa111"]);
   await writeRawInstance("aaa111", "}}stricata{{");
 
-  const written = await updateInstance("aaa111", (p) => ({ ...p, alerted: { kind: "silent", at: "x" } }));
+  // Nivelul jurnalului face parte din regulă. Refuzul e pe ramura unei instanțe
+  // CONFIGURATE a cărei stare nu se mai poate citi — roșie în `/status` — deci
+  // linia trebuie să rămână pe ERROR, ca cele două din `readAll`. Un refactor care
+  // uniformizează familia de patru linii la `warn` ar șterge semnalul exact unde
+  // operatorul caută defecțiuni.
+  const err = captureLog();
+  const warn = captureWarn();
+  let written: boolean;
+  try {
+    written = await updateInstance("aaa111", (p) => ({ ...p, alerted: { kind: "silent", at: "x" } }));
+    const pe_error = err.lines.filter((l) => l.join(" ").includes("necitibilă"));
+    assert.equal(pe_error.length, 1, "refuzul de a suprascrie nu mai iese pe ERROR");
+    assert.deepEqual(warn.lines.filter((l) => l.join(" ").includes("necitibilă")), [],
+      "refuzul de a suprascrie a fost coborât la avertisment");
+  } finally { err.restore(); warn.restore(); }
   assert.equal(written, false, "a scris peste o stare pe care nu o putea citi");
   assert.deepEqual((await readAll()).unreadable, ["aaa111"],
     "starea ilizibilă a fost înlocuită cu una goală și verde");

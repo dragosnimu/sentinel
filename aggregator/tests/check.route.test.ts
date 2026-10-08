@@ -18,7 +18,7 @@ import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  baseEnv, beatPayload, beatRequest, bodyOf, captureLog, captureTelegram,
+  baseEnv, beatPayload, beatRequest, bodyOf, captureLog, captureTelegram, captureWarn,
   configureInstances, keyFor, removeState, setEnv, writeRawInstance,
   CHECK_KEY, STATE_FILE,
 } from "./witness-harness";
@@ -444,16 +444,66 @@ test("avertismentul despre fișiere străine apare, și nu conține numele lor",
   await seed({ aaa111: freshState() });
   await writeRawInstance("copie-suspecta-2026", JSON.stringify(freshState()));
 
-  const log = captureLog();
+  const warn = captureWarn();
+  const err = captureLog();
   const t = captureTelegram();
   try {
     await GET(req(CHECK_KEY));
-    const relevante = log.lines.filter((l) => l.join(" ").includes("ignorate"));
+    const relevante = warn.lines.filter((l) => l.join(" ").includes("ignorate"));
     assert.equal(relevante.length, 1, "nu s-a scris niciun avertisment despre fișierul străin");
     assert.match(relevante[0].join(" "), /\b1\b/, "avertismentul nu spune câte fișiere");
     assert.doesNotMatch(relevante[0].join(" "), /copie-suspecta-2026/,
       "avertismentul a scris în jurnal un nume de fișier ales de altcineva");
-  } finally { t.restore(); log.restore(); }
+    // Nivelul face parte din regulă: un fișier străin nu e o defecțiune. Pe
+    // `console.error` ar apărea în jurnalul găzduirii, filtrat pe ERROR, ca o linie
+    // care nu cere nicio acțiune — iar operatorul ar înceta s-o mai citească.
+    assert.deepEqual(err.lines, [],
+      "un fișier străin a ieșit pe nivel ERROR, deși nu e o defecțiune");
+  } finally { t.restore(); err.restore(); warn.restore(); }
+});
+
+test("un fișier ilizibil al unei instanțe CONFIGURATE rămâne pe nivel ERROR, nu avertisment", async () => {
+  // Contrapartea testului de mai sus. Aceeași funcție are trei linii de jurnal și
+  // doar una e „nu e o defecțiune". Un refactor care le uniformizează la `warn`
+  // șterge exact semnalul roșu: o instanță al cărei fișier nu se mai poate citi
+  // (`unreadable`, roșu în `/status`) ar înceta să apară acolo unde operatorul
+  // caută erori.
+  await seed({ aaa111: freshState() });
+  await writeRawInstance("aaa111", "}}stricat{{");
+
+  const warn = captureWarn();
+  const err = captureLog();
+  const t = captureTelegram();
+  try {
+    const state = await readAll();
+    assert.deepEqual(state.unreadable, ["aaa111"],
+      "controlul: instanța configurată cu fișier stricat trebuie să fie ilizibilă");
+    const pe_error = err.lines.filter((l) => l.join(" ").includes("ilizibilă"));
+    assert.equal(pe_error.length, 1, "starea ilizibilă a unei instanțe nu mai iese pe ERROR");
+    assert.deepEqual(warn.lines.filter((l) => l.join(" ").includes("ilizibilă")), [],
+      "starea ilizibilă a fost coborâtă la avertisment");
+  } finally { t.restore(); err.restore(); warn.restore(); }
+});
+
+test("fișierul unei instanțe CONFIGURATE care poartă altă identitate rămâne pe nivel ERROR", async () => {
+  // Aceeași pereche ca mai sus, pentru a treia linie. Cineva a pus la calea unei
+  // instanțe configurate fișierul alteia: e roșu (`unreadable`), nu o copie
+  // oarecare, deci trebuie să rămână pe ERROR.
+  await seed({ aaa111: freshState() });
+  await writeRawInstance("aaa111", JSON.stringify({ ...freshState(), instance_id: "bbb222" }));
+
+  const warn = captureWarn();
+  const err = captureLog();
+  const t = captureTelegram();
+  try {
+    const state = await readAll();
+    assert.deepEqual(state.unreadable, ["aaa111"],
+      "controlul: fișierul cu altă identitate trebuie să dea instanța ilizibilă");
+    const pe_error = err.lines.filter((l) => l.join(" ").includes("altă identitate"));
+    assert.equal(pe_error.length, 1, "linia despre identitatea străină nu mai iese pe ERROR");
+    assert.deepEqual(warn.lines.filter((l) => l.join(" ").includes("altă identitate")), [],
+      "linia despre identitatea străină a fost coborâtă la avertisment");
+  } finally { t.restore(); err.restore(); warn.restore(); }
 });
 
 test("avertismentul se repetă când se SCHIMBĂ mulțimea de fișiere străine", async () => {
@@ -464,7 +514,7 @@ test("avertismentul se repetă când se SCHIMBĂ mulțimea de fișiere străine"
   const t = captureTelegram();
   try {
     await writeRawInstance("copie-unu", JSON.stringify(freshState()));
-    let log = captureLog();
+    let log = captureWarn();
     await GET(req(CHECK_KEY));
     await GET(req(CHECK_KEY));
     let n = log.lines.filter((l) => l.join(" ").includes("ignorate")).length;
@@ -472,7 +522,7 @@ test("avertismentul se repetă când se SCHIMBĂ mulțimea de fișiere străine"
     assert.equal(n, 1, "avertismentul s-a repetat la fiecare cerere");
 
     await writeRawInstance("copie-doi", JSON.stringify(freshState()));
-    log = captureLog();
+    log = captureWarn();
     await GET(req(CHECK_KEY));
     n = log.lines.filter((l) => l.join(" ").includes("ignorate")).length;
     log.restore();
