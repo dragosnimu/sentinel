@@ -1,0 +1,31 @@
+# /etc/sentinel/vps-watchdog.conf - configuratia gazdei pentru vps-watchdog.
+#
+# Prezenta acestui fisier este si ACTIVAREA: install.sh instaleaza si porneste
+# watchdog-ul (deploy/vps-watchdog/) doar pe o gazda unde exista. Pe o gazda fara
+# el, instalarea nu atinge nimic. Copiaza fisierul acolo, root:root, modul 0600,
+# si pune valorile gazdei. Depozitul e public: domeniile reale NU se pun aici.
+#
+# Format: CHEIE=valoare, un rand per cheie, ghilimele optionale. Fisierul nu se
+# executa; cheile necunoscute sunt ignorate, iar o valoare invalida e raportata pe
+# Telegram (sys:config:<CHEIE>) si se foloseste cea implicita.
+
+# Domenii al caror /api/health se verifica de pe gazda, separate prin spatiu.
+# Un raspuns lipsa (conexiune cazuta, DNS, timeout) da alerta; orice cod HTTP
+# inseamna ca raspunde. Gol sau lipsa = nicio verificare de domeniu.
+HEALTH_DOMAINS="app.example.org status.example.org"
+
+# Containere pe care auto-remedierea nu are voie sa le reporneasca (se semnaleaza
+# doar). Nume docker, separate prin spatiu. Implicit: root-app-1 (ca in versiunea
+# de dinaintea mutarii in depozit); EXCLUDE_AUTOFIX="" nu exclude nimic.
+#EXCLUDE_AUTOFIX="manual-app-1"
+
+# Praguri. Valorile implicite sunt cele din antetul watchdog.sh, masurate pe o
+# gazda cu 7680 MB RAM - pe alta memorie, MEM_AVAIL_MIN_MB trebuie reconsiderat.
+#MEM_AVAIL_MIN_MB=1200
+#PAGING_PAGES_S_MAX=100
+#DISK_PCT_MAX=88
+#LOAD_PER_CORE_MAX=2.0
+#AUTO_FIX=1
+#MAX_FIX=3
+#UNHEALTHY_STREAK=2
+#CURL_TIMEOUT=10

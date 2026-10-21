@@ -1,0 +1,17 @@
+[Unit]
+# NU e in deploy/systemd/, dinadins: install.sh instaleaza acolo TOT ce se potriveste
+# cu *.service pe FIECARE gazda, iar asta ruleaza ca root si reporneste containere.
+# Se instaleaza doar pe gazdele care si-au creat /etc/sentinel/vps-watchdog.conf
+# (install_vps_watchdog din deploy/install.sh).
+Description=VPS availability & capacity watchdog (alert + bounded container auto-fix)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/vps-watchdog/watchdog.sh
+# Un oneshot nu are timeout implicit, iar timerul nu porneste a doua instanta cat
+# prima inca "ruleaza": o rulare agatata (docker blocat, curl fara raspuns) ar
+# amuti watchdog-ul pentru totdeauna, fara nicio alerta. Cu plafon, systemd o
+# omoara si urmatorul minut incearca din nou.
+TimeoutStartSec=300

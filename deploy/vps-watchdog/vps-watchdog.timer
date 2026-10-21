@@ -1,0 +1,13 @@
+[Unit]
+Description=Run vps-watchdog every minute
+
+[Timer]
+OnBootSec=2min
+# 60 s e legat de PAGING_MIN_SPAN_S din watchdog.sh: verdictul de paginare apare
+# la a treia rulare. Un interval mai lung fara sa urce si KEEP_S ar lasa
+# verificarea fara verdict pentru totdeauna (tests/security/test_vps_watchdog.py).
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

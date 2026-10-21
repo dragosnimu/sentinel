@@ -5296,8 +5296,110 @@ kernel, and auditd (pid ${audit_pid}) is collecting"
     fi
 }
 
+# --- vps-watchdog ---------------------------------------------------------
+# The host-level availability/capacity watchdog (deploy/vps-watchdog/). It used
+# to live ONLY on the production host, hand-copied, outside every review: it
+# restarts containers as root and sends under Sentinel's bot token.
+#
+# Opt-in, and the opt-in is a FILE: ${SENTINEL_CONFIG_DIR}/vps-watchdog.conf. The
+# watchdog restarts containers, so installing it on every host would change a
+# host nobody asked to change; and the conf carries what cannot live in a public
+# repository (the domains it health-checks). No conf, no install — and on a host
+# that already runs a hand-copied watchdog, no conf also means that copy is left
+# ALONE: replacing it would silently drop its domain checks, which is "unknown"
+# turning into "fine" with a green installer on top.
+#
+# Not under deploy/systemd/: step_systemd installs every unit there on every
+# host, scripts/smoke-test.sh and test_systemd_hardening.py assume each one is a
+# `sentinel` service.
+#
+# What is proved: that the installed bytes are the repository's, that systemd's
+# loaded copy of each unit is the one on disk (NeedDaemonReload=no — `daemon-reload`
+# exiting 0 is not that), and that the timer is enabled and active. What is NOT
+# proved: that a run has happened. The service is a oneshot the timer starts a
+# minute from now; /opt/vps-watchdog/state/vmstat.ring appearing is that proof.
+VPS_WATCHDOG_DIR="${VPS_WATCHDOG_DIR:-/opt/vps-watchdog}"
+VPS_WATCHDOG_UNIT_DIR="${VPS_WATCHDOG_UNIT_DIR:-/etc/systemd/system}"
+
+install_vps_watchdog() {
+    local src="${SCRIPT_DIR}/vps-watchdog"
+    local conf="${VPS_WATCHDOG_CONF:-${SENTINEL_CONFIG_DIR}/vps-watchdog.conf}"
+    local dir="$VPS_WATCHDOG_DIR" udir="$VPS_WATCHDOG_UNIT_DIR"
+
+    if [[ ! -e "$conf" ]]; then
+        if [[ -e "${dir}/watchdog.sh" || -e "${udir}/vps-watchdog.timer" ]]; then
+            warn "vps-watchdog: ${dir}/watchdog.sh exists but ${conf} does not, so the \
+reviewed version in the repository was NOT installed over it. The copy on this host \
+keeps running unreviewed. To adopt the repository's version, create ${conf} (template: \
+deploy/config/vps-watchdog.conf.example — carry over HEALTH_DOMAINS and EXCLUDE_AUTOFIX \
+from the old script) and re-run."
+        else
+            info "vps-watchdog: not installed (opt-in: create ${conf} from \
+deploy/config/vps-watchdog.conf.example)"
+        fi
+        return 0
+    fi
+    if [[ ! -r "$conf" ]]; then
+        warn "vps-watchdog: ${conf} exists but cannot be read — nothing installed or changed."
+        return 0
+    fi
+
+    local f
+    for f in watchdog.sh vps-watchdog.service vps-watchdog.timer; do
+        if [[ ! -f "${src}/${f}" ]]; then
+            warn "vps-watchdog: ${src}/${f} is not in this package — nothing installed or changed."
+            return 0
+        fi
+    done
+    # A syntax error here would replace a working watchdog with one that dies on
+    # its first line, and the only symptom is silence.
+    local syntax
+    if ! syntax="$(bash -n "${src}/watchdog.sh" 2>&1)"; then
+        warn "vps-watchdog: ${src}/watchdog.sh does not parse (${syntax//$'\n'/ }) — nothing \
+installed or changed; the previous copy, if any, keeps running."
+        return 0
+    fi
+
+    install -d -m 0755 -o root -g root "$dir"
+    install -m 0755 -o root -g root "${src}/watchdog.sh"          "${dir}/watchdog.sh"
+    install -m 0644 -o root -g root "${src}/vps-watchdog.service" "${udir}/vps-watchdog.service"
+    install -m 0644 -o root -g root "${src}/vps-watchdog.timer"   "${udir}/vps-watchdog.timer"
+    systemctl daemon-reload
+
+    local -a problems=()
+    local reload_state
+    cmp -s "${src}/watchdog.sh" "${dir}/watchdog.sh" \
+        || problems+=("${dir}/watchdog.sh is not the repository's file")
+    for f in vps-watchdog.service vps-watchdog.timer; do
+        cmp -s "${src}/${f}" "${udir}/${f}" || problems+=("${udir}/${f} is not the repository's file")
+        reload_state="$(systemctl show "$f" -p NeedDaemonReload --value 2>&1)" || true
+        [[ "$reload_state" == "no" ]] \
+            || problems+=("systemd's loaded ${f} is not the one on disk (NeedDaemonReload='${reload_state}')")
+    done
+
+    # restart, not `enable --now`: on a host where the timer already runs,
+    # `--now` is a no-op and a changed OnUnitActiveSec would not be picked up.
+    systemctl enable vps-watchdog.timer >/dev/null || problems+=("systemctl enable vps-watchdog.timer failed")
+    systemctl restart vps-watchdog.timer || problems+=("systemctl restart vps-watchdog.timer failed")
+    local enabled active
+    enabled="$(systemctl is-enabled vps-watchdog.timer 2>&1)" || true
+    active="$(systemctl is-active vps-watchdog.timer 2>&1)" || true
+    [[ "$enabled" == "enabled" ]] || problems+=("vps-watchdog.timer is '${enabled}', not enabled")
+    [[ "$active" == "active" ]]   || problems+=("vps-watchdog.timer is '${active}', not active")
+
+    if (( ${#problems[@]} )); then
+        warn "vps-watchdog: installed, but not proven working:
+    $(printf '%s\n    ' "${problems[@]}")"
+    else
+        ok "vps-watchdog: files match the repository, systemd has the units as on disk, timer \
+enabled and active. First run is due within a minute; ${dir}/state/vmstat.ring appearing is the \
+proof it ran."
+    fi
+}
+
 step_auxiliary() {
     install_audit_rules
+    install_vps_watchdog
     if [[ -f "${SCRIPT_DIR}/fail2ban/sentinel-web.conf" ]] && have fail2ban-client; then
         install -D -m 0644 "${SCRIPT_DIR}/fail2ban/sentinel-web.conf" \
             /etc/fail2ban/jail.d/sentinel-web.conf

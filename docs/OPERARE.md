@@ -1130,3 +1130,49 @@ compromis ulterior). Un PIN static, ca apărare „telefon pierdut sau furat",
 oferă protecție doar cât timp istoricul conversației e la fel de bine păzit
 ca telefonul însuși — nu e o parolă de unică folosință și nu se comportă ca
 una.
+
+---
+
+## 18. `vps-watchdog` — alertele de gazdă care nu vin de la Sentinel
+
+Pe gazda de producție rulează, o dată pe minut, un script bash separat de
+Sentinel (`deploy/vps-watchdog/`, timer `vps-watchdog.timer`). Trimite pe
+Telegram cu tokenul din `secrets.env`, deci mesajele apar **sub numele botului
+Sentinel** fără să fie produse de detecția lui. Nu are legătură cu
+`sentinel-watchdog` (deadman-ul anti-lockout din secțiunea 8).
+
+**Ce verifică:** daemonul docker; containerele cu politică de repornire
+(și le repornește, plafonat: 2 verificări `unhealthy` la rând, cel mult 3
+reporniri, apoi cere intervenție); disc ≥ 88%; RAM disponibil sub 1200 MB;
+paginare swap peste 100 de pagini/s (medie pe ~5 minute); load peste 2 × nuclee;
+și `/api/health` pe fiecare domeniu din configurație (alertă doar dacă nu
+răspunde deloc).
+
+**Cum se citesc mesajele:** „problema nouă" și „rezolvat" se calculează pe
+*cheia* problemei, nu pe text — o problemă care persistă cu altă valoare (disc
+89% → 91%) nu mai trimite nimic. O problemă `unk:*` înseamnă „n-am putut citi
+măsurătoarea", **nu** „e bine"; o alertă deja dată rămâne dată cât timp
+verificarea nu poate spune nimic.
+
+**De ce nu mai există alerta de swap plin:** un swap plin e consecința unei
+presiuni de RAM care a trecut, nu o defecțiune; sunase ore întregi pe o stare
+statică, iar pe evenimentul real (RAM disponibil 809 MB, swap la 36%) tăcuse.
+Acum sună paginarea activă (`pswpin`+`pswpout`), iar pragul de RAM e 1200 MB
+(fusese 400, atins de zero ori). Cifrele și măsurătorile din care vin sunt în
+antetul `deploy/vps-watchdog/watchdog.sh`.
+
+### Activare — opt-in, printr-un fișier
+
+Instalatorul (pasul 37) pune watchdog-ul **doar** pe o gazdă unde există
+`/etc/sentinel/vps-watchdog.conf` (șablon: `deploy/config/vps-watchdog.conf.example`).
+Fără el nu atinge nimic: auto-remedierea repornește containere, deci nu se
+instalează pe o gazdă care n-a cerut-o. Domeniile verificate stau doar în acel
+fișier — depozitul e public.
+
+**Gazda care îl rulează deja de mână** (`/opt/vps-watchdog/watchdog.sh`): fără
+conf, instalatorul lasă copia veche în pace și avertizează. Creează întâi
+fișierul (root:root, 0600) cu `HEALTH_DOMAINS` luat din scriptul vechi, apoi
+rulează deploy-ul. Starea (`/opt/vps-watchdog/state/`) se păstrează.
+`state/vmstat.ring` apare chiar de la prima rulare — asta e dovada că a rulat.
+Verdictul de paginare are nevoie de două probe, deci în primul minut nu poate
+alerta pe paginare; restul verificărilor merg de la prima rulare.
