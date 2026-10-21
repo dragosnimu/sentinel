@@ -23,7 +23,8 @@
 # Fisierul de stare pastreaza TOT randul (cheie|text), pentru ca mesajul
 # "rezolvat" trebuie sa citeze textul unei probleme care nu mai exista in rularea
 # curenta. Formatul e cel vechi, deci o stare scrisa de versiunea dinainte se
-# citeste fara migrare.
+# citeste fara migrare - si ramane cel vechi: contoarele de la sectiunea 5 stau
+# intr-un fisier separat (hysteresis.state), nu in coloane noi ale acestuia.
 #
 # ---------------------------------------------------------------------------
 # 2. Swap-ul plin NU e o defectiune; paginarea activa ESTE.
@@ -62,13 +63,14 @@
 # ---------------------------------------------------------------------------
 # 3. RAM disponibil: pragul 1200 MB (MEM_AVAIL_MIN_MB), nu 400.
 #
-# Gazda are 7680 MB. Pragul de 400 MB nu s-a atins NICIODATA: minimul din
-# 2026-10-20 a fost 809 MB, la care swap-ul era la 36%. Pe 12-19 octombrie
-# minimul a fost 1642 MB; 1200 e de 1,48 ori peste 809 si cu 27% sub 1642, deci
-# vede un eveniment ca cel real fara sa sune pe zilele normale. Intre pragurile
-# 900/1000/1200/1500 are cele mai putine episoade pe date (4, fata de 59/29/13):
-# adica cele mai putine perechi nou/rezolvat. Se schimba in conf pe o gazda cu
-# alta memorie.
+# Gazda are 7680 MB. Pragul de 400 MB (cel vechi) s-a atins o SINGURA data in 12,5
+# zile: 85 MB, 2026-10-21 10:42:23 UTC, cu 22 s inainte ca nucleul sa omoare un proces
+# (sectiunea 5). Pana atunci minimul fusese 809 MB (20 oct 17:22, swap-ul la 36%). Pe
+# 12-19 octombrie minimul zilnic a fost 1642 MB; 1200 e de 1,48 ori peste 809 si cu 27%
+# sub 1642, deci vede un eveniment ca cel din 20 oct fara sa sune pe zilele normale.
+# Intre pragurile 900/1000/1200/1500 are cele mai putine episoade pe date (8, fata de
+# 63/33/17): adica cele mai putine perechi nou/rezolvat. Se schimba in conf pe o gazda
+# cu alta memorie.
 #
 # ---------------------------------------------------------------------------
 # 4. "Nu pot citi" nu e "e bine".
@@ -77,6 +79,127 @@
 # problema `unk:*` si pastreaza starea anterioara a verificarii. Versiunea
 # veche inlocuia valoarea lipsa cu una sanatoasa (disc 0%, RAM 99999 MB).
 # Valorile invalide din conf se raporteaza (`sys:config:*`), nu se ignora tacut.
+#
+# ---------------------------------------------------------------------------
+# 5. Histerezis pe RAM: aceeasi conditie nu intra si iese de patru ori in 5 minute -
+#    dar o citire ADANCA nu asteapta nicio confirmare.
+#
+# Toate cifrele de aici vin din interogari pe capacity_samples rulate pe 2026-10-21
+# (33542 de esantioane, 2026-10-09 00:00 .. 2026-10-21 11:58 UTC = 12,5 zile, mediana
+# 32 s intre ele), prag 1200 MB, si din scriptul REAL rulat prin harness-ul din
+# tests/security/test_vps_watchdog.py cu esantionul tinut pana la urmatoarea proba
+# ("60 de faze" = secunda din minut in care cade proba, la cadenta timerului). O versiune
+# anterioara a acestei sectiuni numara patru episoade si un singur episod de load; azi
+# sunt opt si doua - cifrele nu se copiaza dintr-o zi in alta.
+#
+# Ce a vazut gazda: 8 episoade sub prag (16 traversari). UNUL lung: 20 oct 10:59 -> 21 oct
+# 00:38, 13,65 h, 1543 de esantioane la rand, minim 809. SAPTE scurte, de 1-2 esantioane,
+# toate pe 21 oct: 04:16 (1115), 05:41 (862), 05:43 (810), 09:51 (844), 09:53 (826) -
+# zgomot - si 10:40 (497), 10:41 (85), care sunt evenimentul real. La 10:42:45 UTC
+# (13:42:45 EEST) nucleul a chemat oom-killer si a omorat next-server (anon-rss 2476940
+# kB); `oom_kill` din /proc/vmstat e 1 de la pornirea din 18 oct. Seria: 10:39:41 1354 |
+# 10:40:19 1019 | 10:40:45 497 | 10:41:17 1505 | 10:41:44 939 | 10:42:23 85 | 10:42:54
+# 2219 (swap 2047 -> 805, load1 20,5). Rafala de la 05:41 a fost 899 -> 1724 -> 810 ->
+# 2164 MB in 2,5 minute; scriptul fara histerezis (cheia ca identitate, nimic altceva),
+# rulat pe ea in cele 60 de faze, a trimis 3 mesaje in 27 de faze si 5 in 33 (2 sau 4
+# dintre ele despre RAM, restul despre paginare).
+#
+# Patru mecanisme, fiecare cu ce cumpara MASURAT (mesaje de RAM, 60 de faze):
+#
+#   * REZOLVAT dupa MEM_CLEAR_RUNS=2 rulari consecutive peste prag: ASTA opreste perechile
+#     nou/rezolvat. Cu o singura proba peste prag, "rezolvat" urmat de "nou" in 10 minute
+#     apare de 83 de ori (suma pe cele 60 de faze, 12,5 zile); cu doua, de 0. Rafala de la
+#     05:41-05:50, mesaje de RAM: 2 sau 4 (27 / 33 de faze, scriptul real) cu o singura proba;
+#     2 in toate cele 60 de faze cu doua probe (model, confirmare 1); 0 sau 2 (57 / 3 faze,
+#     scriptul real) cu ambele.
+#   * Marja de 10% (MEM_CLEAR_MARGIN_PCT; rezolvat doar peste 1320 MB): pe cadenta de 60 s NU
+#     schimba nimic pe datele de azi (0 "rezolvat" urmat de "nou", cu marja 0 si cu 10%, pe
+#     60 de faze). Conteaza la cadenta nativa a esantioanelor (31 s): 2 -> 0, din cauza lui
+#     1304 MB de la 05:42:43, care fara marja numara ca a doua proba "buna". A ramas ca
+#     asigurare ieftina, nu ca mecanism dovedit pe cadenta reala. PLAFON: gazda traieste
+#     dupa episodul lung la p1 = 1504 MB (p5 = 1534), deci o marja peste ~25% ar tine
+#     alerta deschisa pentru totdeauna. Amplitudinea pe 5 minute in episodul lung: p99 =
+#     112 MB (9,3%), maxim 141 MB (11,8%).
+#   * CONFIRMARE: MEM_CONFIRM_RUNS=2 rulari CONSECUTIVE sub prag. Opreste doar caderile de
+#     UN esantion (04:16, 09:51, 09:53, jumatate din 05:41): pe cele 10 ore de zgomot de
+#     azi (00:38-10:38) da 0 mesaje in 57 de faze si o pereche in 3, fata de 4-8 mesaje
+#     (media 5,5) cu confirmare 1. SINGURA, ar fi costat evenimentul real: pe seria de mai
+#     sus, 27 de faze din 60 nu aveau niciun mesaj de RAM, iar in celelalte 33 anuntul
+#     venea tarziu si cita 939 MB, nu adancimea (85). Alerta de RAM nu are voie sa devina
+#     tacere in cel mai rau minut al lunii.
+#   * SCAPARE DE ADANCIME: o citire sub MEM_DEEP_MB = MEM_DEEP_PCT (50%) din prag = 600 MB
+#     se anunta IMEDIAT, fara confirmare. Limita se deriva din date: sub 810 MB exista
+#     exact trei esantioane (809, 497, 85), si NICIUNUL intre 498 si 808 (interogarea cu
+#     martor: <810 intoarce 3 randuri). Zgomotul scurt nu coboara sub 810; evenimentul a
+#     coborat la 497 si 85. Orice limita din (497, 809) separa datele la fel (rulat cu 500,
+#     600, 700, 800: rezultate identice); 600 e jumatatea pragului, deci urmareste pragul
+#     din conf, si sta la 5,4% de media geometrica a golului (634). Rezultat pe aceeasi
+#     serie, 60 de faze, scriptul real: 54 de faze anunta (32 citeaza 497, 21 citeaza 85,
+#     una 939; TOATE inainte de kill-ul de la 10:42:45), 6 nu. Fara scapare: 33 de faze
+#     anunta, toate citand 939, si 27 nu anunta deloc. Pe cele 10 ore de zgomot: neschimbat
+#     (0,1 mesaje in medie), pe episodul lung: neschimbat (doua mesaje).
+#
+# GOLUL RAMAS, MASURAT: cu proba la secunda 17-22 din minut (6 din 60 de faze) nicio proba
+# nu cade pe cele doua esantioane adanci (497 si 85 MB tin ~30 s fiecare), iar restul seriei
+# (1019, 1505, 939) arata ca rafala de la 05:41. Alerta de RAM tace in acele faze; orice
+# regula care le prinde plateste in zgomot (confirmare 1: 5,5 mesaje in 10 ore; "2 din
+# ultimele 3": 2,1 si tot o faza muta). Nu e un gol de CANAL: in toate cele 60 de faze
+# operatorul a primit un mesaj (load1 20,5 la 10:42:54, deci "Load1" la proba urmatoare;
+# plus paginare, derivata din swap) - verificat pe scriptul real; o simulare fara load
+# (cum a fost prima oara reprodusa) da "zero mesaje" doar fiindca nimeni nu a pus load-ul.
+# Serviciul real pornea in acel minut la secundele 37 si 46 (jurnal: 13:41:37 si 13:42:46
+# EEST); citirea de RAM vine la cateva secunde dupa pornire, deci tot in zona prinsa -
+# dar faza deriva cu ~1 s pe minut si trece prin toate secundele intr-o ora, deci golul
+# e ~10% din timp, nu zero. CE AR INCHIDE GOLUL si NU s-a construit: contorul
+# `oom_kill` din /proc/vmstat (exista pe gazda, valoare 1): o crestere intre doua rulari
+# e dovada unui OOM kill indiferent de faza. E un mecanism nou si o decizie a operatorului.
+#
+# Limita onesta: opt episoade si un singur OOM sunt un esantion mic; cifrele sunt cele mai
+# mici care opresc ce s-a vazut, nu o garantie pentru alte rafale. Ipoteza modelului:
+# intre doua esantioane de ~31 s valoarea se tine; ce a facut RAM-ul intre ele nu se stie.
+#
+# DOAR cap:mem, si fiecare alta verificare a fost decisa separat:
+#   cap:paging - e deja o medie pe ~5 minute (sectiunea 2): are propria confirmare.
+#   cap:disk   - masurat: 18,4-85,9%, rampa de 8-10 puncte/zi (12-15 oct) si o singura
+#                curatare (16 oct, 85,4 -> 18,4). Cu pragul implicit 88 niciun esantion
+#                nu l-a atins: zero traversari, deci nicio cifra pentru histerezis. `df`
+#                rotunjeste in sus la intreg: langa 85 a stat 16 h, iar un prag pus la 86
+#                ar fi avut 6 intrari/iesiri - de aceea nu se coboara pragul fara a relua
+#                masuratoarea. Un minut de intarziere nu cumpara nimic.
+#   cap:load   - load1 e deja o medie exponentiala a nucleului: 2 episoade peste 2,0 x 4
+#                nuclee (19 oct 21:53, 3 esantioane, varf 34,6; 21 oct 10:42:54, 4
+#                esantioane, varf 20,5), fara reintrari. Al doilea e chiar minutul OOM.
+#   sys:docker, ctr:*, net:* - nu au nicio masuratoare in capacity_samples, deci nicio
+#                cifra de sustinut; un daemon cazut sau un site al unui client picat
+#                e exact ce vrea operatorul repede. NEMASURAT, nu "sigur".
+#   Mesajele de auto-remediere (reparare, "urmaresc", "dezactivat") raporteaza o ACTIUNE
+#                sau o stare deja luata; nu trec prin diferenta de chei si nu se intarzie.
+#   unk:*, sys:config:* - se spun imediat: sunt chiar lipsa de date.
+#
+# Contoarele stau in hysteresis.state, `cheie|pend|n|ts` (anuntul asteptat) sau
+# `cheie|clear|n|ts` (rezolvarea asteptata); problems.state ramane `cheie|text`, deci
+# nu exista nicio migrare, iar copia veche de pe gazda il citeste in continuare. Un
+# contor e valid doar daca are 4 campuri numerice, `ts` nu e din viitor si e mai nou de
+# HYST_STALE_S = 420 s. Fereastra NU e "3 cadente": un contor care expira intre doua
+# rulari valide transforma confirmarea in tacere. Unitatea permite unei rulari sa dureze
+# pana la TimeoutStartSec=300, iar timerul porneste urmatoarea la 60 s dupa - doua rulari
+# terminate pot fi la 360 s; 420 = asta + 60 s, si un test leaga cele trei valori (cu 180,
+# RAM la 900 MB timp de 20 de minute cu rulari la 200 s unul de altul nu da NICIUN mesaj,
+# contorul ramane `pend|1`, iar `unk:hysteresis` nu apare: el acopera contoare ce nu se
+# pot SCRIE, nu contoare EXPIRATE). Pe gazda reala asta e teoretic: din 2732 de porniri
+# ale serviciului (jurnal, 19-21 oct) intervalul maxim a fost 68,9 s, niciunul peste 120 s;
+# dar rularile se lungesc tocmai sub presiune (20 s in minutul OOM-ului). Alternativa
+# luata in calcul - confirmare dupa TIMP scurs de la prima citire proasta, nu dupa numar
+# de rulari - nu scoate fereastra: un contor tot trebuie sa expire undeva, altfel o citire
+# de acum ore ar confirma una singura de azi; ar ajuta doar la rulari mai dese decat
+# cadenta (pornite de mana) si cere un camp nou in fisier. NU s-a ales. Ramane: o rulare
+# omorata de TimeoutStartSec nu produce nicio citire, iar doua la rand (peste 420 s) reseteaza
+# numaratoarea - atunci serviciul apare in `systemctl --failed`, nu ca tacere de RAM.
+# Un fisier de contoare lipsa, stricat sau expirat poate doar INTARZIA un mesaj - niciodata
+# sa emita unul. Invers, un fisier care nu se poate scrie ar tine confirmarea la 1 pentru
+# totdeauna si ar amuti alerta: atunci se renunta la confirmare (se anunta imediat) si
+# se raporteaza `unk:hysteresis`. O citire ilizibila (unknown/carry) nu e proba: reseteaza
+# numaratoarea, nu o avanseaza.
 #
 # Auto-remedierea containerelor (sectiunea docker) e neschimbata fata de
 # versiunea de dinainte: aceleasi reguli, aceleasi plafoane.
@@ -91,6 +214,7 @@ PROC="${WATCHDOG_PROC:-/proc}"
 
 STATE="$STATE_DIR/problems.state"; SEEDED="$STATE_DIR/.seeded"; FIXDIR="$STATE_DIR/fix"
 RING="$STATE_DIR/vmstat.ring"
+HYST="$STATE_DIR/hysteresis.state"
 mkdir -p "$STATE_DIR" "$FIXDIR"
 
 # Valori implicite. Se pot suprascrie din conf (doar cele din lista de mai jos).
@@ -100,6 +224,14 @@ HEALTH_DOMAINS=""; CURL_TIMEOUT=10
 # Constante de proiectare, nu de operare: fereastra tinta, istoricul minim fara
 # de care nu dam verdict, si cat de vechi poate fi un esantion ca sa mai conteze.
 PAGING_MIN_SPAN_S=120; PAGING_KEEP_S=330; PAGING_RING_MAX=8
+# Histerezis (sectiunea 5 din antet): doar cap:mem. Constante de proiectare, nu de
+# operare - o valoare gresita in conf (confirmare 99) ar amuti alerta de RAM.
+# MEM_DEEP_PCT: sub aceasta parte din prag citirea se anunta FARA confirmare.
+# HYST_STALE_S = TimeoutStartSec (300) + 2 cadente ale timerului: un contor mai vechi
+# nu mai e "consecutiv", dar nici o rulare permisa de unitate nu trebuie sa-l expire
+# (tests/security/test_vps_watchdog.py leaga cele trei valori).
+MEM_CONFIRM_RUNS=2; MEM_CLEAR_RUNS=2; MEM_CLEAR_MARGIN_PCT=10; MEM_DEEP_PCT=50; HYST_STALE_S=420
+HYST_POLICY="cap:mem=${MEM_CONFIRM_RUNS}/${MEM_CLEAR_RUNS}"
 # Chei care nu se mai emit. Se scot din starea anterioara, ca dispari lor sa nu
 # apara ca "rezolvat" (swap-ul nu s-a rezolvat: pur si simplu nu mai e verificat).
 RETIRED_KEYS="cap:swap"
@@ -168,11 +300,14 @@ prev=""
   BEGIN { n = split(r, a, " "); for (i = 1; i <= n; i++) dead[a[i]] = 1 }
   { i = index($0, "|"); k = (i ? substr($0, 1, i - 1) : $0); if (!(k in dead)) print }' "$STATE")
 
+# prev_line CHEIE - randul anuntat in rularea trecuta (gol daca nu era anuntata).
+prev_line(){ printf '%s\n' "$prev" | awk -F'|' -v k="$1" '$1 == k { print; exit }'; }
 # carry CHEIE - pastreaza problema din rularea trecuta, daca era una. Pentru o
-# verificare care NU poate spune nimic acum: "necunoscut" nu e "rezolvat".
+# verificare care NU poate spune nimic acum: "necunoscut" nu e "rezolvat". Pentru
+# motorul de histerezis e un rand "inca rau": nu avanseaza numaratoarea de rezolvare.
 carry(){
   local line
-  line=$(printf '%s\n' "$prev" | awk -F'|' -v k="$1" '$1 == k { print; exit }')
+  line=$(prev_line "$1")
   [ -n "$line" ] && problems+="$line"$'\n'
   return 0
 }
@@ -273,9 +408,19 @@ disk=$(df --output=pcent / 2>/dev/null | tail -1 | tr -dc '0-9')
 if [ -z "$disk" ]; then unknown cap:disk "ocuparea discului /"
 elif [ "$disk" -ge "$DISK_PCT_MAX" ]; then add "cap:disk|💽 Disk / la ${disk}% (prag ${DISK_PCT_MAX}%)"; fi
 
+# Banda moarta: sub MEM_CLEAR_AT_MB o alerta DEJA data nu se poate rezolva. `10#`:
+# o valoare din conf cu zero in fata (`0800`) ar fi octala in $(( )).
+MEM_CLEAR_AT_MB=$(( 10#$MEM_AVAIL_MIN_MB * (100 + MEM_CLEAR_MARGIN_PCT) / 100 ))
+MEM_DEEP_MB=$(( 10#$MEM_AVAIL_MIN_MB * MEM_DEEP_PCT / 100 ))
+IMMEDIATE_KEYS=""   # chei care, in rularea asta, se anunta fara confirmare
 mem=$(awk '/^MemAvailable:/ { printf "%d", $2 / 1024; exit }' "$PROC/meminfo" 2>/dev/null)
 if ! [[ "$mem" =~ ^[0-9]+$ ]]; then unknown cap:mem "MemAvailable din $PROC/meminfo"
-elif [ "$mem" -lt "$MEM_AVAIL_MIN_MB" ]; then add "cap:mem|🧠 RAM disponibil ${mem}MB (prag ${MEM_AVAIL_MIN_MB}MB)"; fi
+elif [ "$mem" -lt "$MEM_AVAIL_MIN_MB" ]; then
+  add "cap:mem|🧠 RAM disponibil ${mem}MB (prag ${MEM_AVAIL_MIN_MB}MB)"
+  # Scapare de adancime (sectiunea 5): sub MEM_DEEP_MB nu se asteapta confirmarea.
+  [ "$mem" -lt "$MEM_DEEP_MB" ] && IMMEDIATE_KEYS+=" cap:mem"
+elif [ "$mem" -lt "$MEM_CLEAR_AT_MB" ]; then carry cap:mem   # fara alerta deschisa, carry nu adauga nimic
+fi
 
 check_paging
 
@@ -293,25 +438,102 @@ for d in $HEALTH_DOMAINS; do
   [ "$code" = "000" ] && add "net:$d|🌐 $d nu raspunde"
 done
 
-# --- diferenta pe identitate ------------------------------------------------
+# --- diferenta pe identitate, cu histerezis ---------------------------------
 # Un singur rand per cheie (primul castiga), fara randuri goale.
-cur=$(printf '%s' "$problems" | awk 'NF { i = index($0, "|"); k = (i ? substr($0, 1, i - 1) : $0); if (!(k in s)) { s[k] = 1; print } }')
-printf '%s\n' "$cur" | sed '/^$/d' > "$STATE.tmp" && mv -f "$STATE.tmp" "$STATE"
+dedupe(){ printf '%s' "$problems" | awk 'NF { i = index($0, "|"); k = (i ? substr($0, 1, i - 1) : $0); if (!(k in s)) { s[k] = 1; print } }'; }
+
+# hyst_blind MOTIV - contoarele de confirmare nu se pot tine. Raspunsul NU e sa
+# astepte (ar ramane la "prima proba" pentru totdeauna = alerta de RAM amutita), ci
+# sa renunte la confirmare si sa spuna asta.
+HYST_OK=1
+hyst_blind(){
+  HYST_OK=0
+  add "unk:hysteresis|❔ Nu pot tine contoarele de confirmare (${1}) - alertele de RAM se trimit fara confirmare, nu sunt intarziate"
+}
+NOW=$(date +%s)
+if ! [[ "$NOW" =~ ^[0-9]+$ ]]; then hyst_blind "ceasul: date +%s a dat '${NOW}'"
+elif [ -e "$HYST" ] && [ ! -f "$HYST" ]; then hyst_blind "$HYST nu e un fisier obisnuit"
+fi
+
+# engine MOD - noua/rezolvata din chei, cu confirmare si rezolvare cu numaratoare.
+# MOD=1: contoarele conteaza; MOD=0: fiecare cheie se anunta/rezolva la prima proba.
+# Intrari: starea anuntata (cu cheile retrase scoase), randurile de acum, contoarele.
+# Iese: S|stare noua  N|noua  R|rezolvata  K|contor nou  si END|ok la sfarsit - fara
+# el motorul a esuat si NIMIC din ce a tiparit nu se foloseste.
+engine(){
+  awk -v now="$NOW" -v stale="$HYST_STALE_S" -v pol="$HYST_POLICY" -v mod="$1" \
+      -v pf="$2" -v cf="$3" -v hf="$HYST" -v imm="$IMMEDIATE_KEYS" '
+    function key(l,  i) { i = index(l, "|"); return i ? substr(l, 1, i - 1) : l }
+    BEGIN {
+      n = split(pol, pa, " ")
+      for (i = 1; i <= n; i++) { split(pa[i], kv, "="); split(kv[2], nk, "/"); cn[kv[1]] = nk[1] + 0; kn[kv[1]] = nk[2] + 0 }
+      n = split(imm, ia, " "); for (i = 1; i <= n; i++) now_k[ia[i]] = 1
+      while ((getline l < cf) > 0) if (l != "") { k = key(l); if (!(k in C)) { C[k] = l; ord[++no] = k } }
+      close(cf)
+      while ((getline l < pf) > 0) if (l != "") { k = key(l); if (!(k in P)) { P[k] = l; if (!(k in C)) ord[++no] = k } }
+      close(pf)
+      # Contor valid: 4 campuri, numere, nu din viitor, nu mai vechi de `stale`. Un contor
+      # pend pentru o cheie deja anuntata (sau clear pentru una neanuntata) nu se citeste
+      # niciodata: pend se foloseste doar la chei neanuntate, clear doar la anuntate.
+      if (mod) while ((getline l < hf) > 0) {
+        if (split(l, f, "|") != 4 || f[3] !~ /^[0-9]+$/ || f[4] !~ /^[0-9]+$/) continue
+        age = now - f[4]; if (age < 0 || age > stale) continue
+        if (f[2] == "pend") PN[f[1]] = f[3] + 0
+        else if (f[2] == "clear") CN[f[1]] = f[3] + 0
+      }
+      for (i = 1; i <= no; i++) {
+        k = ord[i]
+        nc = (mod && (k in cn) && !(k in now_k)) ? cn[k] : 1
+        nr = (mod && (k in kn)) ? kn[k] : 1
+        if (k in P) {
+          if (k in C) print "S|" C[k]
+          else {
+            c = CN[k] + 1
+            if (c >= nr) print "R|" P[k]
+            else { print "S|" P[k]; print "K|" k "|clear|" c "|" now }
+          }
+        } else {
+          p = PN[k] + 1
+          if (p >= nc) { print "S|" C[k]; print "N|" C[k] }
+          else print "K|" k "|pend|" p "|" now
+        }
+      }
+      print "END|ok"
+    }'
+}
+
+cur=$(dedupe)
+if [ "$SEED" = 1 ]; then
+  # Prima rulare: nu exista "anuntat" fata de care sa numaram; baza ESTE anuntul.
+  state_new="$cur"; newp=""; resp=""
+else
+  tag(){ printf '%s\n' "$out" | sed -n "s/^$1|//p"; }
+  # Fara `END|ok` motorul a esuat: starea si contoarele raman cum erau, nu se trimite
+  # nimic, iar iesirea nenula apare in `systemctl --failed`. Un `out` gol NU se
+  # citeste ca "nicio problema" - ar sterge starea si ar "rezolva" tot.
+  run_engine(){
+    out=$(engine "$1" <(printf '%s\n' "$prev") <(printf '%s\n' "$cur")) || out=""
+    printf '%s\n' "$out" | grep -qx 'END|ok' \
+      || { echo "watchdog: motorul de diferente a esuat - starea ramane neschimbata, nu trimit nimic" >&2; exit 1; }
+  }
+  run_engine "$HYST_OK"
+  if [ "$HYST_OK" = 1 ]; then
+    # Contoarele se scriu INAINTE sa se foloseasca decizia: daca nu se pot persista,
+    # decizia "inca astept" s-ar repeta la nesfarsit. Atunci se refac deciziile fara ele.
+    if ! { tag K | sed '/^$/d' > "$HYST.tmp" && mv -f "$HYST.tmp" "$HYST"; }; then
+      hyst_blind "nu pot scrie $HYST"; cur=$(dedupe); run_engine 0
+    fi
+  fi
+  state_new=$(tag S); newp=$(tag N); resp=$(tag R)
+fi
+printf '%s\n' "$state_new" | sed '/^$/d' > "$STATE.tmp" && mv -f "$STATE.tmp" "$STATE"
 if [ "$SEED" = 1 ]; then
   touch "$SEEDED"; n=$(printf '%s\n' "$cur" | sed '/^$/d' | grep -c . || true)
-  msg="🛡️ VPS watchdog FAZA 2 activ pe ${HOST} (verificare 1 min). Probleme (alerta): ${n}"
+  msg="🛡️ VPS watchdog pornit pe ${HOST} - verific o data pe minut. Probleme deschise acum: ${n}"
   [ "$n" -gt 0 ] && msg+=$'\n'"$(printf '%s\n' "$cur" | sed '/^$/d' | cut -d'|' -f2-)"
   [ -n "$baseline_extra" ] && msg+=$'\n'"Remediabile automat:"$'\n'"${baseline_extra}"
   send "$msg"; exit 0
 fi
-# lines_missing_from A B - randurile din A a caror CHEIE nu apare in B.
-lines_missing_from(){
-  awk 'function key(l,  i) { i = index(l, "|"); return i ? substr(l, 1, i - 1) : l }
-       NR == FNR { if ($0 != "") seen[key($0)] = 1; next }
-       $0 != "" && !(key($0) in seen)' "$2" "$1"
-}
-newp=$(lines_missing_from <(printf '%s\n' "$cur") <(printf '%s\n' "$prev"))
-resp=$(lines_missing_from <(printf '%s\n' "$prev") <(printf '%s\n' "$cur"))
 [ -n "$newp" ] && send "🚨 VPS ${HOST} - problema noua:"$'\n'"$(printf '%s\n' "$newp" | sed '/^$/d' | cut -d'|' -f2-)"
 [ -n "$resp" ] && send "✅ VPS ${HOST} - rezolvat:"$'\n'"$(printf '%s\n' "$resp" | sed '/^$/d' | cut -d'|' -f2-)"
 exit 0

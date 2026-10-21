@@ -225,7 +225,7 @@ EXTERNAL_COMMANDS = {
     # coreutils and friends — present on any host the installer supports
     "awk", "base64", "basename", "cat", "chmod", "chown", "cmp", "comm", "cp",
     "cut", "date", "df", "dirname", "du", "env", "find", "getent", "grep", "head",
-    "id", "install", "ln", "mkdir", "mktemp", "mv", "od", "readlink", "rm", "sed",
+    "id", "install", "ln", "mkdir", "mktemp", "mv", "nproc", "od", "readlink", "rm", "sed",
     "seq", "sha256sum", "sleep", "sort", "stat", "tail", "tar", "timeout",
     "touch", "tr", "uniq", "unzip", "wc",
     # accounts, privilege, ACLs
@@ -1364,6 +1364,7 @@ CORE_SCRIPTS = {
     "deploy/postgres/fix-pg-hba.sh",
     "deploy/preflight.sh",
     "deploy/rollback.sh",
+    "deploy/vps-watchdog/watchdog.sh",
     "scripts/deploy.sh",
     "scripts/inventory-push.sh",
     "scripts/lib/build-package.sh",

@@ -5318,9 +5318,9 @@ kernel, and auditd (pid ${audit_pid}) is collecting"
 # exiting 0 is not that), and that the timer is enabled and active. What is NOT
 # proved: that a run has happened. The service is a oneshot the timer starts a
 # minute from now; /opt/vps-watchdog/state/vmstat.ring appearing is that proof.
-VPS_WATCHDOG_DIR="${VPS_WATCHDOG_DIR:-/opt/vps-watchdog}"
-VPS_WATCHDOG_UNIT_DIR="${VPS_WATCHDOG_UNIT_DIR:-/etc/systemd/system}"
-
+#
+# The directories and the marker are defined in lib/common.sh, shared with
+# rollback.sh, which removes exactly what this function installs.
 install_vps_watchdog() {
     local src="${SCRIPT_DIR}/vps-watchdog"
     local conf="${VPS_WATCHDOG_CONF:-${SENTINEL_CONFIG_DIR}/vps-watchdog.conf}"
@@ -5360,6 +5360,35 @@ installed or changed; the previous copy, if any, keeps running."
         return 0
     fi
 
+    # ADOPTIE: fisiere de-ale watchdog-ului exista, dar semnatura instalatorului nu. Sunt
+    # ale unui om, nu ale noastre, iar scriptul vechi e singura evidenta a domeniilor
+    # clientilor pe care le verifica (depozitul e public, ele stau doar in conf). Inainte
+    # sa fie suprascrise se pastreaza o copie, o singura data (`cp -n`: o a doua rulare nu
+    # are voie sa o inlocuiasca cu fisierul nostru). Restaurarea o face operatorul, de
+    # mana - nici rollback.sh nu o face, ca sa nu readuca un script nerevizuit care
+    # reporneste containere ca root. Copia se VERIFICA (`cmp`), nu se presupune dupa
+    # codul de iesire, iar daca nu se poate face nu se instaleaza nimic: o adoptare fara
+    # copie ar sterge singura evidenta.
+    local suffix="$VPS_WATCHDOG_BACKUP_SUFFIX" adopted="" old_path old_copy
+    if [[ ! -e "$VPS_WATCHDOG_MARKER" ]]; then
+        # Copiile stau langa script: directorul trebuie sa existe si cand doar unitatile
+        # sunt la locul lor, altfel `cp` esueaza si o gazda adoptabila n-ar putea fi adoptata.
+        install -d -m 0755 -o root -g root "$dir"
+        for old_path in "${dir}/watchdog.sh" "${udir}/vps-watchdog.service" "${udir}/vps-watchdog.timer"; do
+            [[ -e "$old_path" ]] || continue
+            old_copy="${dir}/$(basename "$old_path")${suffix}"
+            if [[ ! -e "$old_copy" ]]; then
+                cp -pn "$old_path" "$old_copy" || true   # eroarea lui cp ramane vizibila; verdictul e cmp
+                if ! cmp -s "$old_path" "$old_copy"; then
+                    warn "vps-watchdog: could not keep a copy of ${old_path} at ${old_copy} \
+before replacing it — nothing installed or changed; the copy on this host keeps running."
+                    return 0
+                fi
+            fi
+            adopted+=" ${old_copy}"
+        done
+    fi
+
     install -d -m 0755 -o root -g root "$dir"
     install -m 0755 -o root -g root "${src}/watchdog.sh"          "${dir}/watchdog.sh"
     install -m 0644 -o root -g root "${src}/vps-watchdog.service" "${udir}/vps-watchdog.service"
@@ -5368,6 +5397,12 @@ installed or changed; the previous copy, if any, keeps running."
 
     local -a problems=()
     local reload_state
+    # The signature rollback.sh looks for before it removes anything: this
+    # installer put these files here. Written as soon as the files are, so a run
+    # that fails further down can still be rolled back.
+    printf 'installed by deploy/install.sh at %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        > "$VPS_WATCHDOG_MARKER" \
+        || problems+=("could not write ${VPS_WATCHDOG_MARKER}: rollback.sh will not remove this install")
     cmp -s "${src}/watchdog.sh" "${dir}/watchdog.sh" \
         || problems+=("${dir}/watchdog.sh is not the repository's file")
     for f in vps-watchdog.service vps-watchdog.timer; do
@@ -5387,6 +5422,9 @@ installed or changed; the previous copy, if any, keeps running."
     [[ "$enabled" == "enabled" ]] || problems+=("vps-watchdog.timer is '${enabled}', not enabled")
     [[ "$active" == "active" ]]   || problems+=("vps-watchdog.timer is '${active}', not active")
 
+    [[ -z "$adopted" ]] || info "vps-watchdog: replaced a copy this installer had not put there. \
+It is kept, not restored, at:${adopted} — it holds the domains the old script checked. \
+To go back to it: copy it over, by hand, after reading it."
     if (( ${#problems[@]} )); then
         warn "vps-watchdog: installed, but not proven working:
     $(printf '%s\n    ' "${problems[@]}")"
@@ -5646,8 +5684,19 @@ step_verify_nothing_broken() {
     if ! assert_nothing_broken "after install"; then
         warn "rolling back automatically"
         "${SCRIPT_DIR}/rollback.sh" "$SNAPSHOT_DIR" --yes || true
+        # Citit DUPA rollback, nu presupus: vps-watchdog e pierdut doar daca a fost adoptat
+        # (exista copia veche) SI scriptul nu mai e acolo. Daca rollback-ul nu l-a scos,
+        # nu se pretinde ca l-a scos.
+        local wd_note=""
+        if [[ -e "${VPS_WATCHDOG_DIR}/watchdog.sh${VPS_WATCHDOG_BACKUP_SUFFIX}" \
+              && ! -e "${VPS_WATCHDOG_DIR}/watchdog.sh" ]]; then
+            wd_note=" LOST: vps-watchdog was removed by that rollback, and this host now has \
+no availability/capacity alerts. The hand-copied version this installer replaced (with the \
+client domains it checked) is saved, not restored, as ${VPS_WATCHDOG_DIR}/*${VPS_WATCHDOG_BACKUP_SUFFIX} \
+— restore it by hand, after reading it."
+        fi
         die "the deployment stopped a service that was running before it started. \
-Rolled back. Compare ${STATE_MARKERS}/baseline-services.txt with the current state."
+Rolled back. Compare ${STATE_MARKERS}/baseline-services.txt with the current state.${wd_note}"
     fi
 }
 

@@ -8,6 +8,9 @@
 #
 # What it does:
 #   * stops and disables every sentinel-* unit
+#   * removes vps-watchdog (timer, service, script) if — and only if — this
+#     installer put it there (the signature file written by install.sh); a
+#     hand-copied one is reported and left alone
 #   * deletes `table inet sentinel` — every block disappears immediately
 #   * removes its nginx files; in dedicated mode also restores /etc/nginx from
 #     the snapshot, in shared mode deliberately does NOT (that would revert your
@@ -70,6 +73,86 @@ else
     systemctl daemon-reload
     systemctl reset-failed 2>/dev/null || true
 fi
+
+# ---------------------------------------------------------------------------
+section "1b. vps-watchdog"
+
+# vps-watchdog is not a `sentinel-*` unit, so the loop above never sees it, and
+# that is deliberate: it lives outside deploy/systemd/ precisely because
+# install.sh installs everything in that directory on every host (see the comment
+# above install_vps_watchdog). Moving or renaming it to be found here would put a
+# root-privileged container restarter on hosts that never asked for one. So it has
+# its own removal, keyed on the signature install_vps_watchdog writes.
+#
+# No signature = this installer did not put it there. install.sh runs this script
+# on its own when a health gate fails, so removing on name alone would delete a
+# hand-copied watchdog the deploy never touched.
+#
+# Every step below is checked by READING BACK what systemd says, not by the exit
+# code of the command that was supposed to cause it: `disable --now` returning 0
+# is the signal sent, and a oneshot that is mid-run (restarting a container) is
+# still active after it.
+# --- vps-watchdog: begin ---
+if [[ -e "$VPS_WATCHDOG_MARKER" ]]; then
+    # The wants/ symlink is what `disable` removes; if disable did not work it would
+    # be left dangling and re-created by nothing, so it is removed and checked too.
+    wd_unit_files=("${VPS_WATCHDOG_UNIT_DIR}/vps-watchdog.timer" "${VPS_WATCHDOG_UNIT_DIR}/vps-watchdog.service"
+                   "${VPS_WATCHDOG_UNIT_DIR}/timers.target.wants/vps-watchdog.timer")
+    wd_out="$(systemctl disable --now vps-watchdog.timer 2>&1)" || true
+    wd_out+=$'\n'"$(systemctl stop vps-watchdog.service 2>&1)" || true
+    # `|| true`: sub `set -e`, un `rm` care nu poate sterge (fisier imutabil, sistem de
+    # fisiere doar-citire) ar opri TOT rollback-ul aici, fara verdict si fara
+    # firewall/nginx scoase. Verdictul vine din citirea inapoi de mai jos.
+    rm -f "${wd_unit_files[@]}" "${VPS_WATCHDOG_DIR}/watchdog.sh" || true
+    wd_left=()
+    systemctl daemon-reload || wd_left+=("systemctl daemon-reload failed")
+    systemctl reset-failed vps-watchdog.service vps-watchdog.timer >/dev/null 2>&1 || true
+
+    for wd_unit in vps-watchdog.timer vps-watchdog.service; do
+        wd_state="$(systemctl is-active "$wd_unit" 2>&1)" || true
+        case "$wd_state" in
+            active|activating|reloading|deactivating) wd_left+=("${wd_unit} is still '${wd_state}'") ;;
+        esac
+        wd_state="$(systemctl is-enabled "$wd_unit" 2>&1)" || true
+        case "$wd_state" in
+            enabled|enabled-runtime|linked|linked-runtime|alias) wd_left+=("${wd_unit} is still '${wd_state}'") ;;
+        esac
+    done
+    for wd_path in "${wd_unit_files[@]}" "${VPS_WATCHDOG_DIR}/watchdog.sh"; do
+        if [[ -e "$wd_path" || -L "$wd_path" ]]; then wd_left+=("${wd_path} still exists"); fi
+    done
+
+    if (( ${#wd_left[@]} )); then
+        # The signature stays, so running the rollback again finishes the job.
+        fail "vps-watchdog is NOT fully removed — it restarts containers as root, so this
+matters: $(printf '%s; ' "${wd_left[@]}")
+systemctl said: ${wd_out//$'\n'/ }"
+    else
+        rm -f "$VPS_WATCHDOG_MARKER"
+        ok "vps-watchdog removed: units and script gone, timer and service neither active nor enabled"
+        # warn, nu info: gazda ramane FARA alerte de disponibilitate, iar daca instalatorul
+        # adoptase o copie facuta de mana, aceea (singura evidenta a domeniilor clientilor
+        # pe care le verifica) a fost suprascrisa. NU se restaureaza automat: ar readuce, ca
+        # efect lateral al unei porti de sanatate picate, un script nerevizuit care
+        # reporneste containere ca root. Se pastreaza o copie pentru operator.
+        wd_saved=()
+        for wd_name in watchdog.sh vps-watchdog.service vps-watchdog.timer; do
+            [[ -e "${VPS_WATCHDOG_DIR}/${wd_name}${VPS_WATCHDOG_BACKUP_SUFFIX}" ]]                 && wd_saved+=("${VPS_WATCHDOG_DIR}/${wd_name}${VPS_WATCHDOG_BACKUP_SUFFIX}")
+        done
+        wd_msg="this host now has NO vps-watchdog availability/capacity alerts until it is installed again; ${VPS_WATCHDOG_DIR}/state is kept."
+        if (( ${#wd_saved[@]} )); then
+            wd_msg+=" The copy that was here before this installer adopted it is saved, NOT restored (an unreviewed script that restarts containers as root): ${wd_saved[*]}. To bring it back by hand, read it first, then copy the script to ${VPS_WATCHDOG_DIR}/watchdog.sh and the unit files to ${VPS_WATCHDOG_UNIT_DIR}/ (drop the ${VPS_WATCHDOG_BACKUP_SUFFIX} suffix), then systemctl daemon-reload && systemctl enable --now vps-watchdog.timer."
+        fi
+        warn "$wd_msg"
+    fi
+elif [[ -e "${VPS_WATCHDOG_UNIT_DIR}/vps-watchdog.timer" || -e "${VPS_WATCHDOG_DIR}/watchdog.sh" ]]; then
+    warn "vps-watchdog is installed but this installer did not put it there (no \
+${VPS_WATCHDOG_MARKER}), so it was left running. It restarts containers as root; to remove it \
+by hand: systemctl disable --now vps-watchdog.timer && rm ${VPS_WATCHDOG_UNIT_DIR}/vps-watchdog.{service,timer}"
+else
+    info "no vps-watchdog installed by this installer"
+fi
+# --- vps-watchdog: end ---
 
 # ---------------------------------------------------------------------------
 section "2. Firewall"
@@ -282,11 +365,13 @@ cat <<EOF
         && printf '%s' "${SNAPSHOT}/packages.txt" \
         || printf '%s' 'NU s-a putut lua (vezi avertismentul de la pasul 18)' )
     - ${SENTINEL_STATE_DIR} și ${SENTINEL_BACKUP_DIR}
+    - ${VPS_WATCHDOG_DIR}/state (istoricul vps-watchdog, dacă a existat)
     - certificatul Let's Encrypt
 $( (( PURGE )) || echo "    - baza de date 'sentinel' (folosește --purge pentru a o șterge)" )
 
   Verifică:
     systemctl list-units 'sentinel-*'     # gol
+    systemctl list-unit-files 'vps-watchdog*'   # gol, dacă instalarea era a noastră
     systemctl --failed                    # nimic picat
     nft list tables                       # fără 'inet sentinel'
     ss -tlnp | grep -E ':(8787|443|80)'

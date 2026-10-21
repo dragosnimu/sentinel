@@ -1154,11 +1154,35 @@ răspunde deloc).
 măsurătoarea", **nu** „e bine"; o alertă deja dată rămâne dată cât timp
 verificarea nu poate spune nimic.
 
+**Alerta de RAM are histerezis (doar ea).** Se anunță după **două** rulări
+consecutive sub 1200 MB (deci cu până la un minut mai târziu) și se declară
+rezolvată după două rulări consecutive peste 1320 MB; între 1200 și 1320 MB o
+alertă deja dată rămâne dată. Motivul: pe 21 octombrie RAM-ul disponibil a făcut
+899 → 1724 → 810 → 2164 MB în 2,5 minute și a produs șase mesaje în șapte minute.
+O cădere de o jumătate de minut nu devine mesaj; o criză reală (cea din 20–21
+octombrie a ținut 13,6 ore) se anunță la a doua probă. **Excepție — adâncimea:** o
+citire sub **600 MB** (jumătate din prag) se anunță imediat, fără confirmare. Pe
+21 octombrie, 13:42 (ora gazdei), nucleul a omorât un proces după ce RAM-ul
+disponibil făcuse 1019 → 497 → 1505 → 939 → 85 MB în două minute; cu confirmare
+simplă alerta era mută la jumătate din fazele timerului. Zgomotul nu coboară sub
+810 MB, evenimentul a coborât la 497 și 85, iar între ele nu există niciun eșantion.
+**Gol rămas, măsurat:** cele două căderi adânci țin ~30 s fiecare, deci cu proba la
+secunda 17–22 din minut (6 din 60 de faze) nicio probă nu le nimerește și alerta de
+RAM tace; în minutul acela sună totuși load-ul (nu e întârziat), cam la 13:43 ora gazdei. Toate
+celelalte verificări
+(disc, load, docker, containere, domenii) se anunță la prima rulare — nu există
+date care să arate oscilație pentru ele, iar un docker căzut sau un site picat
+sunt exact ce vrei repede. Cifrele și simulările sunt în secțiunea 5 din antetul
+scriptului. Contoarele stau în `/opt/vps-watchdog/state/hysteresis.state`;
+`problems.state` rămâne `cheie|text`. Dacă contoarele nu se pot scrie, apare
+`unk:hysteresis` și alerta de RAM se trimite fără confirmare — nu tace.
+
 **De ce nu mai există alerta de swap plin:** un swap plin e consecința unei
 presiuni de RAM care a trecut, nu o defecțiune; sunase ore întregi pe o stare
 statică, iar pe evenimentul real (RAM disponibil 809 MB, swap la 36%) tăcuse.
 Acum sună paginarea activă (`pswpin`+`pswpout`), iar pragul de RAM e 1200 MB
-(fusese 400, atins de zero ori). Cifrele și măsurătorile din care vin sunt în
+(fusese 400, atins o singură dată în 12,5 zile: 85 MB, la OOM-ul din 21 octombrie).
+Cifrele și măsurătorile din care vin sunt în
 antetul `deploy/vps-watchdog/watchdog.sh`.
 
 ### Activare — opt-in, printr-un fișier
@@ -1172,7 +1196,32 @@ fișier — depozitul e public.
 **Gazda care îl rulează deja de mână** (`/opt/vps-watchdog/watchdog.sh`): fără
 conf, instalatorul lasă copia veche în pace și avertizează. Creează întâi
 fișierul (root:root, 0600) cu `HEALTH_DOMAINS` luat din scriptul vechi, apoi
-rulează deploy-ul. Starea (`/opt/vps-watchdog/state/`) se păstrează.
+rulează deploy-ul. Starea (`/opt/vps-watchdog/state/`) se păstrează. **Adoptarea
+păstrează copia veche:** înainte să suprascrie scriptul și cele două unități,
+instalatorul le copiază, o singură dată, în `/opt/vps-watchdog/watchdog.sh.pre-adoption`,
+`vps-watchdog.service.pre-adoption` și `vps-watchdog.timer.pre-adoption`, le
+compară cu originalele și, dacă nu poate, nu instalează nimic. Scriptul vechi e
+singura evidență a domeniilor clientului; **nu se restaurează automat** (ar readuce un
+script nerevizuit care repornește containere ca root) — restaurarea e a ta, de mână.
 `state/vmstat.ring` apare chiar de la prima rulare — asta e dovada că a rulat.
 Verdictul de paginare are nevoie de două probe, deci în primul minut nu poate
 alerta pe paginare; restul verificărilor merg de la prima rulare.
+
+### Rollback
+
+`deploy/rollback.sh` scoate watchdog-ul (timer, serviciu, script) **doar dacă îl
+pusese instalatorul** — semnătura e fișierul `/opt/vps-watchdog/.installed-by-sentinel`,
+scris de `install.sh`. O copie făcută de mână (fără semnătură) rămâne pornită, iar
+rollback-ul spune asta: un rollback automat, pornit de instalator când o poartă de
+sănătate cade, n-are voie să șteargă un serviciu pe care deploy-ul nu l-a atins.
+Rollback-ul citește starea înapoi de la systemd (`is-active`, `is-enabled`) și
+raportează eșec dacă timerul sau serviciul mai sunt active; nu se încrede în codul
+de ieșire al lui `disable --now`. `/opt/vps-watchdog/state/` se păstrează. Atenție:
+după un rollback pe o gazdă care avusese copia de mână, gazda **nu mai are** alerte
+de disponibilitate până la o nouă instalare. Rollback-ul spune asta cu un avertisment
+(nu cu o notă) și numește fișierele `*.pre-adoption` salvate la adoptare; mesajul
+final al lui `install.sh`, când o poartă de sănătate cade, adaugă `LOST` dacă
+watchdog-ul adoptat chiar nu mai e pe disc după rollback. Nimic nu se restaurează
+singur: citește copia veche, apoi pune-o la loc de mână (scriptul în
+`/opt/vps-watchdog/watchdog.sh`, unitățile în `/etc/systemd/system/`, fără sufixul
+`.pre-adoption`, apoi `systemctl daemon-reload && systemctl enable --now vps-watchdog.timer`).

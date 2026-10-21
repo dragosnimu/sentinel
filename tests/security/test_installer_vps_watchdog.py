@@ -47,9 +47,14 @@ def _func(name: str) -> str:
 
 
 def _defaults() -> str:
-    lines = re.findall(r"^VPS_WATCHDOG_(?:DIR|UNIT_DIR)=.*$", INSTALL, re.M)
-    assert len(lines) == 2, lines
-    return "\n".join(lines) + "\n"
+    """Caile si semnatura traiesc in lib/common.sh (impartite cu rollback.sh); harness-ul
+    face `source common.sh`, deci doar se verifica ca sunt acolo si NU in install.sh."""
+    common = (REPO / "deploy" / "lib" / "common.sh").read_text(encoding="utf-8")
+    names = re.findall(r"^VPS_WATCHDOG_(DIR|UNIT_DIR|MARKER)=", common, re.M)
+    assert sorted(names) == ["DIR", "MARKER", "UNIT_DIR"], names
+    assert not re.search(r"^VPS_WATCHDOG_(?:DIR|UNIT_DIR|MARKER)=", INSTALL, re.M), \
+        "install.sh isi defineste propriile cai: rollback.sh si el ar putea diverge"
+    return ""
 
 
 def _stub(directory: Path, name: str, body: str) -> None:
@@ -252,3 +257,124 @@ def test_the_units_are_not_in_the_directory_the_installer_globs_for_every_host()
     pusa acolo, ar ajunge si pe gazdele care n-au cerut-o."""
     assert not list((REPO / "deploy" / "systemd").glob("vps-watchdog*")), \
         "vps-watchdog.* a ajuns in deploy/systemd/ - se instaleaza pe orice gazda"
+
+
+def test_the_install_signs_what_it_put_on_the_host_and_only_then(tmp_path):
+    """`rollback.sh` scoate watchdog-ul DOAR daca exista semnatura instalatorului: pe
+    productie ruleaza de saptamani o copie facuta de mana, iar un rollback automat
+    (install.sh il porneste singur cand o poarta de sanatate pica) care ar scoate-o
+    dupa nume ar sterge un serviciu pe care deploy-ul nu l-a atins. Semnatura apare
+    cand instalatorul a copiat fisierele - nu pe o gazda care n-a cerut instalarea,
+    nu cand scriptul nu trece `bash -n`."""
+    signed = Env(tmp_path / "signed", with_conf=True).run()
+    marker = signed.dir / ".installed-by-sentinel"
+    assert marker.is_file(), signed.stdout + signed.stderr
+    assert marker.read_text(encoding="utf-8").startswith("installed by deploy/install.sh at ")
+
+    not_opted_in = Env(tmp_path / "optout", with_conf=False).run()
+    assert not (not_opted_in.dir / ".installed-by-sentinel").exists()
+
+    broken = tmp_path / "pkg"
+    shutil.copytree(SRC_DIR, broken)
+    (broken / "watchdog.sh").write_text("#!/usr/bin/env bash\nif true; then\n",
+                                        encoding="utf-8", newline="\n")
+    bad = Env(tmp_path / "broken", with_conf=True, package=broken).run()
+    assert "does not parse" in bad.stderr
+    assert not (bad.dir / ".installed-by-sentinel").exists()
+
+
+def test_a_signature_that_cannot_be_written_is_reported_not_swallowed(tmp_path):
+    """Fara semnatura, rollback-ul nu mai scoate nimic: instalatorul ar spune "gata"
+    si, la prima revenire, watchdog-ul (care reporneste containere) ar ramane. Se
+    raporteaza, nu se trece cu vederea."""
+    e = Env(tmp_path, with_conf=True)
+    (e.dir / ".installed-by-sentinel").mkdir(parents=True)   # nu se poate scrie un fisier peste un director
+    e.run()
+    assert "could not write" in e.stderr and "rollback.sh will not remove" in e.stderr, e.stderr
+    assert "[+] vps-watchdog:" not in e.stdout
+
+
+OLD_UNIT = b"[Service]\n# unitatea veche, scrisa de mana\nExecStart=/opt/vps-watchdog/watchdog.sh\n"
+BACKUPS = ("watchdog.sh", "vps-watchdog.service", "vps-watchdog.timer")
+
+
+def _hand_copied_host(root: Path, **kw) -> Env:
+    """O gazda cu un watchdog facut de mana: script si unitati la locul lor, FARA semnatura."""
+    e = Env(root, with_conf=True, **kw)
+    e.dir.mkdir()
+    (e.dir / "watchdog.sh").write_bytes(OLD_SCRIPT)
+    (e.udir / "vps-watchdog.service").write_bytes(OLD_UNIT)
+    (e.udir / "vps-watchdog.timer").write_bytes(OLD_UNIT + b"# timer\n")
+    return e
+
+
+def test_adopting_a_hand_copied_install_keeps_the_old_files_for_the_operator(tmp_path):
+    """Pe productie scriptul vechi e SINGURA evidenta a celor trei domenii de client pe care le
+    verifica (depozitul e public, domeniile stau doar in conf). Adoptarea il suprascrie cu
+    versiunea din depozit; daca apoi o poarta de sanatate pica si rollback-ul scoate
+    watchdog-ul, ce verifica gazda s-a pierdut fara urma. Inainte de suprascriere se pastreaza
+    o copie a scriptului si a celor doua unitati, octet cu octet, ca operatorul sa le
+    restaureze de mana; instalatorul spune unde sunt si ca NU le restaureaza."""
+    e = _hand_copied_host(tmp_path)
+    old = {n: (e.dir / n).read_bytes() if n == "watchdog.sh" else (e.udir / n).read_bytes() for n in BACKUPS}
+    e.run()
+    assert e.rc == 0, e.stdout + e.stderr
+    for name in BACKUPS:
+        assert (e.dir / f"{name}.pre-adoption").read_bytes() == old[name], name
+    assert _bytes(e.dir / "watchdog.sh") == _bytes(SRC_DIR / "watchdog.sh"), "adoptarea nu a instalat"
+    assert (e.dir / ".installed-by-sentinel").is_file()
+    assert "kept, not restored" in e.stdout and "watchdog.sh.pre-adoption" in e.stdout, e.stdout
+
+
+def test_a_host_the_installer_never_adopted_gets_no_backup_files(tmp_path):
+    """Copiile `.pre-adoption` inseamna "aici a fost o instalare straina". Pe o gazda curata,
+    sau la a doua rulare peste o instalare a noastra (semnatura exista), nu se creeaza: un
+    fisier de felul asta aparut din nimic ar trimite operatorul sa restaureze ceva ce nu a
+    existat - sau, mai rau, o copie a fisierului NOSTRU pusa drept "original"."""
+    fresh = Env(tmp_path / "fresh", with_conf=True).run()
+    assert fresh.rc == 0 and not list(fresh.dir.glob("*.pre-adoption")), list(fresh.dir.iterdir())
+    fresh.run()   # a doua rulare, acum cu semnatura
+    assert not list(fresh.dir.glob("*.pre-adoption")), list(fresh.dir.iterdir())
+    assert "kept, not restored" not in fresh.stdout
+
+
+def test_the_adoption_backup_is_never_replaced_by_a_later_run(tmp_path):
+    """`cp -n`, o singura data: daca semnatura dispare (rollback) si cineva copiaza iar de
+    mana un script, a doua adoptare nu are voie sa scrie peste prima copie - ar pierde
+    originalul cu domeniile clientilor in favoarea unui fisier mai nou."""
+    e = _hand_copied_host(tmp_path)
+    (e.dir / "watchdog.sh.pre-adoption").write_bytes(b"#!/usr/bin/env bash\n# PRIMA copie\n")
+    e.run()
+    assert e.rc == 0, e.stdout + e.stderr
+    assert (e.dir / "watchdog.sh.pre-adoption").read_bytes() == b"#!/usr/bin/env bash\n# PRIMA copie\n"
+    assert _bytes(e.dir / "watchdog.sh") == _bytes(SRC_DIR / "watchdog.sh")
+
+
+def test_an_adoption_that_cannot_keep_a_copy_installs_nothing(tmp_path):
+    """Daca copia veche nu se poate face (disc plin, director doar-citire), nu se
+    suprascrie nimic: o adoptare fara copie sterge singura evidenta a domeniilor. Verdictul
+    vine din compararea copiei cu originalul, nu din codul de iesire al lui `cp` (care aici
+    iese cu 0 fara sa fi scris nimic, cum face un `cp -n` peste o cale deja ocupata)."""
+    e = _hand_copied_host(tmp_path)
+    _stub(e.bin, "cp", 'echo "cp: silent no-op" >&2\nexit 0\n')
+    e.run()
+    assert "could not keep a copy" in e.stderr and "nothing installed or changed" in e.stderr, e.stderr
+    assert _bytes(e.dir / "watchdog.sh") == OLD_SCRIPT, "copia veche a fost inlocuita fara backup"
+    assert not (e.dir / ".installed-by-sentinel").exists()
+    assert not re.search(r"install -m ", e.log) and "restart" not in e.log, e.log   # niciun fisier copiat
+
+
+def test_a_host_with_the_units_but_no_script_directory_can_still_be_adopted(tmp_path):
+    """Unitatile pot sta in /etc/systemd/system fara ca /opt/vps-watchdog sa existe (script
+    mutat, director sters). Copiile se pun langa script: fara directorul creat INAINTE,
+    `cp` ar esua, adoptarea ar fi refuzata ("nu pot pastra o copie") si gazda n-ar putea fi
+    adusa niciodata sub revizie de instalator."""
+    e = Env(tmp_path, with_conf=True)
+    (e.udir / "vps-watchdog.service").write_bytes(OLD_UNIT)
+    (e.udir / "vps-watchdog.timer").write_bytes(OLD_UNIT + b"# timer\n")
+    assert not e.dir.exists()
+    e.run()
+    assert e.rc == 0 and "could not keep a copy" not in e.stderr, e.stdout + e.stderr
+    assert (e.dir / "vps-watchdog.service.pre-adoption").read_bytes() == OLD_UNIT
+    assert (e.dir / "vps-watchdog.timer.pre-adoption").read_bytes() == OLD_UNIT + b"# timer\n"
+    assert _bytes(e.dir / "watchdog.sh") == _bytes(SRC_DIR / "watchdog.sh")

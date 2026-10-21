@@ -10,6 +10,27 @@ SENTINEL_STATE_DIR="${SENTINEL_STATE_DIR:-/var/lib/sentinel}"
 SENTINEL_BACKUP_DIR="${SENTINEL_BACKUP_DIR:-/var/backups/sentinel}"
 SENTINEL_USER="${SENTINEL_USER:-sentinel}"
 
+# vps-watchdog (deploy/vps-watchdog/). Defined HERE, not in install.sh, because
+# install.sh puts it on a host and rollback.sh has to take it off again: two
+# files with their own copy of the same default would drift, and a rollback that
+# looks in the wrong directory reports "nothing to remove" about a service that is
+# still restarting containers as root.
+#
+# The marker is the installer's own signature, written by install_vps_watchdog
+# once it has copied the files. Without it the units are not the installer's: a
+# production host ran a hand-copied vps-watchdog for weeks before this tree
+# adopted it, and an automatic rollback (install.sh runs one when a health gate
+# fails) that removed it on name alone would delete a service the deploy never
+# touched.
+VPS_WATCHDOG_DIR="${VPS_WATCHDOG_DIR:-/opt/vps-watchdog}"
+VPS_WATCHDOG_UNIT_DIR="${VPS_WATCHDOG_UNIT_DIR:-/etc/systemd/system}"
+VPS_WATCHDOG_MARKER="${VPS_WATCHDOG_MARKER:-${VPS_WATCHDOG_DIR}/.installed-by-sentinel}"
+# Copia pe care instalatorul o pastreaza cand ADOPTA un watchdog facut de mana
+# (fisierele existau, semnatura nu): scriptul veche e singura evidenta a domeniilor
+# clientilor pe care le verifica. Se scrie o data (cp -n), langa script, si nu o atinge
+# nimeni automat - nici rollback-ul. Restaurarea o face operatorul, de mana.
+VPS_WATCHDOG_BACKUP_SUFFIX=".pre-adoption"
+
 # NOT under SENTINEL_STATE_DIR. That directory is 0750 sentinel:sentinel (see
 # step_user_and_dirs below) so the service account can write its own runtime
 # state — geoip/, cursors/ — and that same write bit on the PARENT let it
