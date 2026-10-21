@@ -145,6 +145,10 @@ docs/Sentinel-prezentare-20*.pdf
 docs/Sentinel-prezentare-20*.pptx
 docs/Sentinel-fisa-produs-*.pdf
 docs/Sentinel-fisa-produs-*.pptx
+# Materialele comerciale — plan de monetizare, liste de prețuri — nu conțin date
+# din producție, dar nici nu se publică: repository-ul e public.
+docs/Sentinel-monetizare-*
+docs/Sentinel-preturi-*
 
 # Worktree-uri temporare create de agenti; au propriul `.git` si nu sunt
 # continut de repository. Fara asta, `test_every_enumerated_file_can_be_read`
