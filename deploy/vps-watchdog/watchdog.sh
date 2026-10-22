@@ -150,9 +150,9 @@
 # Serviciul real pornea in acel minut la secundele 37 si 46 (jurnal: 13:41:37 si 13:42:46
 # EEST); citirea de RAM vine la cateva secunde dupa pornire, deci tot in zona prinsa -
 # dar faza deriva cu ~1 s pe minut si trece prin toate secundele intr-o ora, deci golul
-# e ~10% din timp, nu zero. CE AR INCHIDE GOLUL si NU s-a construit: contorul
-# `oom_kill` din /proc/vmstat (exista pe gazda, valoare 1): o crestere intre doua rulari
-# e dovada unui OOM kill indiferent de faza. E un mecanism nou si o decizie a operatorului.
+# e ~10% din timp, nu zero. CE INCHIDE GOLUL, dar DUPA kill, nu inainte: contorul `oom_kill`
+# din /proc/vmstat - o crestere intre doua rulari e dovada unui OOM kill indiferent de faza
+# (sectiunea 6). Alerta de RAM ramane singura care poate suna INAINTE.
 #
 # Limita onesta: opt episoade si un singur OOM sunt un esantion mic; cifrele sunt cele mai
 # mici care opresc ce s-a vazut, nu o garantie pentru alte rafale. Ipoteza modelului:
@@ -201,6 +201,46 @@
 # se raporteaza `unk:hysteresis`. O citire ilizibila (unknown/carry) nu e proba: reseteaza
 # numaratoarea, nu o avanseaza.
 #
+# ---------------------------------------------------------------------------
+# 6. Nucleul a omorat ceva: contorul `oom_kill`, un EVENIMENT.
+#
+# Pe 21 oct 2026 nucleul a omorat o aplicatie de productie (next-server, anon-rss
+# 2476940 kB) si operatorul n-a aflat de la nimeni. Sectiunea 5 e avertizare, adica un
+# model: la ~1 faza din 10 proba cade intre citirile adanci, iar pe faza serviciului real
+# alerta ar fi venit la 3-4 s DUPA kill. /proc/vmstat are un contor al nucleului,
+# `oom_kill` (1 pe gazda azi, din 18 oct; un singur camp `oom*` din 185), care creste cu
+# fiecare proces omorat de oom-killer, inclusiv in cgroup. O crestere intre doua rulari e
+# dovada nucleului ca ceva a fost omorat: fara fals pozitiv si fara dependenta de faza. NU
+# avertizeaza - raporteaza in cel mult un minut - deci completeaza sectiunea 5, n-o inlocuieste.
+#
+#   * EVENIMENT, nu stare. Nu are cheie, nu trece prin motorul de diferente, nu are
+#     "problema noua" / "rezolvat" (nu e nimic de rezolvat) si nu se deduplica pe text: un
+#     mesaj `💀 ... nucleul a omorat N proces(e)` pleaca direct. Ultima valoare vazuta sta in
+#     oom_kill.state (un numar), langa restul starii.
+#   * Prima rulare nu are valoare anterioara: o retine si NU anunta. Fara asta, instalarea
+#     ar anunta ca "nou" kill-ul de acum o zi, din istoria contorului.
+#   * O valoare MAI MICA decat cea retinuta e o repornire (contorul porneste de la 0): baza
+#     se refa, fara mesaj. Limita: dupa o repornire, kill-urile pana la valoarea veche nu
+#     se disting de baza (retinut 1, repornire, un kill => tot 1). Pe gazda repornirile sunt
+#     rare; un `boot_id` in fisierul de stare ar inchide golul si NU s-a construit.
+#   * Contor ilizibil sau lipsa (/proc/vmstat fara `oom_kill`) => `unk:oom` ("nu pot citi"),
+#     ca la paginare: nici kill inventat, nici "sanatos". Fisier de stare cu continut care nu
+#     e un numar => `unk:oom` o rulare si baza refacuta (un kill dintre timp poate lipsi).
+#   * O singura citire a /proc/vmstat pe rulare: aceeasi pentru paginare si OOM.
+#   * Mesajul nu uita un kill: baza se muta DOAR dupa ce `curl` a primit 2xx. Un kill in
+#     timpul unei pene de retea (exact cand o gazda sufocata de memorie pierde conexiuni)
+#     se reincearca la urmatoarea rulare, deci poate veni de doua ori daca raspunsul s-a
+#     pierdut dupa livrare - mai bine decat niciodata. Invers, temporarul cu valoarea noua se
+#     scrie INAINTE de trimitere: daca nu se poate scrie, nu se anunta (fiecare minut ar
+#     repeta aceeasi crestere) si apare `unk:oom`.
+#   * Victima: `journalctl -k` ruland ca root, linia `Killed process PID (nume) ... anon-rss`.
+#     Marginit: `timeout` OOM_JOURNAL_TIMEOUT_S si fereastra OOM_LOOKBACK_MIN (jurnalul
+#     gazdei e mare si volatil - fara /var/log/journal, pierdut la repornire). Se iau cel mult
+#     min(N, OOM_NAMES_MAX) randuri, cele mai noi. Daca nu gaseste nimic, mesajul spune asta
+#     si pleaca oricum: contorul e dovada, numele e doar comoditate. Numele vine de la un
+#     proces, deci se taie la caractere tiparibile si 40 de caractere. Formatul real are
+#     paranteze in nume (`next-server (v`).
+#
 # Auto-remedierea containerelor (sectiunea docker) e neschimbata fata de
 # versiunea de dinainte: aceleasi reguli, aceleasi plafoane.
 set -uo pipefail
@@ -215,6 +255,7 @@ PROC="${WATCHDOG_PROC:-/proc}"
 STATE="$STATE_DIR/problems.state"; SEEDED="$STATE_DIR/.seeded"; FIXDIR="$STATE_DIR/fix"
 RING="$STATE_DIR/vmstat.ring"
 HYST="$STATE_DIR/hysteresis.state"
+OOM_STATE="$STATE_DIR/oom_kill.state"
 mkdir -p "$STATE_DIR" "$FIXDIR"
 
 # Valori implicite. Se pot suprascrie din conf (doar cele din lista de mai jos).
@@ -232,6 +273,10 @@ PAGING_MIN_SPAN_S=120; PAGING_KEEP_S=330; PAGING_RING_MAX=8
 # (tests/security/test_vps_watchdog.py leaga cele trei valori).
 MEM_CONFIRM_RUNS=2; MEM_CLEAR_RUNS=2; MEM_CLEAR_MARGIN_PCT=10; MEM_DEEP_PCT=50; HYST_STALE_S=420
 HYST_POLICY="cap:mem=${MEM_CONFIRM_RUNS}/${MEM_CLEAR_RUNS}"
+# OOM kill (sectiunea 6 din antet). Constante de proiectare: fereastra jurnalului acopera
+# cateva reincercari ale unui mesaj nelivrat, nu istoria; plafonul de timp tine cautarea
+# victimei sub controlul unitatii (o rulare agatata amuteste watchdog-ul).
+OOM_LOOKBACK_MIN=30; OOM_NAMES_MAX=3; OOM_JOURNAL_TIMEOUT_S=5
 # Chei care nu se mai emit. Se scot din starea anterioara, ca dispari lor sa nu
 # apara ca "rezolvat" (swap-ul nu s-a rezolvat: pur si simplu nu mai e verificat).
 RETIRED_KEYS="cap:swap"
@@ -283,11 +328,15 @@ TG_TOKEN=$(conf_get "$SECRETS" TELEGRAM_BOT_TOKEN) || TG_TOKEN=""
 TG_CHAT=$(conf_get "$SECRETS" TELEGRAM_CHAT_ID) || TG_CHAT=""
 # Tokenul NU intra in argv (`ps` il arata oricui are cont pe gazda, iar aici se
 # vorbeste cu planul de control al botului): URL-ul merge pe stdin, spre `curl -K -`.
-send(){
-  [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ] || return 0
+# send_try TEXT - 0 doar daca curl a primit un raspuns 2xx (`-f`); 1 si cand nu e configurat
+# niciun canal, si cand trimiterea a esuat. Doar evenimentele (sectiunea 6) il folosesc:
+# ele nu au o stare care sa se reia singura, deci trebuie sa stie daca mesajul a plecat.
+send_try(){
+  [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ] || return 1
   printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$TG_TOKEN" \
-    | curl -fsS -m 15 -K - --data-urlencode "chat_id=${TG_CHAT}" --data-urlencode "text=$1" >/dev/null 2>&1 || true
+    | curl -fsS -m 15 -K - --data-urlencode "chat_id=${TG_CHAT}" --data-urlencode "text=$1" >/dev/null 2>&1
 }
+send(){ send_try "$1" || true; }
 HOST=$(hostname -s)
 in_list(){ case " $2 " in *" $1 "*) return 0;; *) return 1;; esac; }
 SEED=0; [ ! -f "$SEEDED" ] && SEED=1
@@ -358,13 +407,23 @@ else
   add "sys:docker|🔴 Docker daemon nu raspunde"
 fi
 
+# --- /proc/vmstat: o singura citire pentru paginare si OOM -------------------
+# VM_PIN / VM_POUT / VM_OOM = pswpin / pswpout / oom_kill, sau `-` daca lipsesc (fisier
+# ilizibil, camp absent sau fara valoare). `-` nu e un numar, deci cele doua verificari de
+# mai jos il citesc ca "nu pot citi", nu ca zero.
+VM_PIN=""; VM_POUT=""; VM_OOM=""
+read_vmstat(){
+  read -r VM_PIN VM_POUT VM_OOM <<< "$(awk '
+    $1 == "pswpin" || $1 == "pswpout" || $1 == "oom_kill" { v[$1] = $2 }
+    function f(k) { return (k in v && v[k] != "") ? v[k] : "-" }
+    END { print f("pswpin"), f("pswpout"), f("oom_kill") }' "$PROC/vmstat" 2>/dev/null)"
+}
+
 # --- paginare ---------------------------------------------------------------
 # Vezi antetul, sectiunea 2. Scrie istoricul in $RING (atomic) si adauga
 # cap:paging doar la un verdict HIGH.
 check_paging(){
-  local pin pout now res verdict rate span
-  pin=$(awk '$1 == "pswpin" { print $2; exit }' "$PROC/vmstat" 2>/dev/null)
-  pout=$(awk '$1 == "pswpout" { print $2; exit }' "$PROC/vmstat" 2>/dev/null)
+  local pin="$VM_PIN" pout="$VM_POUT" now res verdict rate span
   now=$(date +%s)
   if ! [[ "$pin" =~ ^[0-9]+$ && "$pout" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ ]]; then
     unknown cap:paging "pswpin/pswpout din $PROC/vmstat"; return 0
@@ -403,6 +462,72 @@ check_paging(){
   esac
 }
 
+# --- OOM kill ---------------------------------------------------------------
+# Vezi antetul, sectiunea 6. Un EVENIMENT, nu o stare: nu are cheie, nu trece prin motorul
+# de diferente si nu are "rezolvat". Mesajul pleaca direct; baza (ultima valoare a
+# contorului `oom_kill`) se muta doar dupa ce mesajul a plecat.
+
+# oom_victims N - cel mult N randuri `ora|pid|rss_kB|nume` din jurnalul nucleului, cele mai
+# noi. Marginit in timp (`timeout`) si in fereastra (`--since`): jurnalul gazdei e mare si
+# volatil, iar un kill mai vechi decat fereastra nu e gasit - mesajul atunci nu numeste
+# nimic, ceea ce e mai bine decat un mesaj tarziu. Nu esueaza niciodata catre apelant.
+# `[:print:]` scoate din nume orice caracter de control: numele vine de la un proces.
+# Greedy pe nume: `comm` poate contine paranteze (pe gazda: "next-server (v").
+oom_victims(){
+  command -v journalctl >/dev/null 2>&1 || return 0
+  timeout "$OOM_JOURNAL_TIMEOUT_S" journalctl -k --no-pager -q -o short-iso \
+      --since "-${OOM_LOOKBACK_MIN}min" 2>/dev/null \
+    | grep 'Killed process [0-9]' | tail -n "$1" | tr -cd '[:print:]\n' \
+    | sed -n 's/^\([^ ]*\) .*Killed process \([0-9][0-9]*\) (\(.*\)) total-vm:[^,]*, anon-rss:\([0-9][0-9]*\)kB.*$/\1|\2|\4|\3/p'
+  return 0
+}
+
+check_oom(){
+  local cur="$VM_OOM" last="" had=0 delta line ts pid rss name names="" nfound=0 msg tmp="$OOM_STATE.tmp"
+  if ! [[ "$cur" =~ ^[0-9]{1,15}$ ]]; then unknown cap:oom "oom_kill din $PROC/vmstat"; return 0; fi
+  cur=$((10#$cur))
+  if [ -e "$OOM_STATE" ] || [ -L "$OOM_STATE" ]; then
+    # Ceva care nu e fisier obisnuit (director, legatura moarta) nu se poate inlocui cu `mv`
+    # (ar muta temporarul IN director si rularea ar parea reusita): se spune si se renunta.
+    [ -f "$OOM_STATE" ] || { unknown cap:oom "starea contorului oom_kill ($OOM_STATE nu e un fisier obisnuit)"; return 0; }
+    # Un fisier care exista dar nu are un numar nu e "prima rulare": un kill dintre timp poate
+    # lipsi, si asta se spune. Baza se reface oricum, ca sa nu ramana stricat.
+    read -r last < "$OOM_STATE"
+    if [[ "$last" =~ ^[0-9]{1,15}$ ]]; then had=1; last=$((10#$last))
+    else unknown cap:oom "starea contorului oom_kill din $OOM_STATE (baza refacuta; un kill de dinainte poate lipsi)"; fi
+  fi
+  [ "$had" = 1 ] && [ "$cur" -eq "$last" ] && return 0
+  # Valoarea noua se scrie intr-un temporar INAINTE de orice mesaj: daca nu se poate scrie,
+  # fiecare rulare ar vedea aceeasi crestere si ar anunta-o din nou, in fiecare minut.
+  if ! printf '%s\n' "$cur" > "$tmp"; then
+    unknown cap:oom "contorul oom_kill (nu pot scrie $tmp; nu anunt ca sa nu repet in fiecare minut)"; return 0
+  fi
+  # Prima rulare (nu exista valoare anterioara) sau repornire (contorul a scazut): baza noua,
+  # fara mesaj. Istoria dinaintea instalarii nu e un eveniment de acum.
+  if [ "$had" = 0 ] || [ "$cur" -lt "$last" ]; then
+    mv -f "$tmp" "$OOM_STATE" || { rm -f "$tmp"; unknown cap:oom "contorul oom_kill (nu pot scrie $OOM_STATE)"; }
+    return 0
+  fi
+  # Crestere: nucleul a omorat ceva intre doua rulari. Fara canal configurat nu am cum sa
+  # spun nimic, deci baza ramane: mesajul vine cand canalul exista.
+  if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then rm -f "$tmp"; return 0; fi
+  delta=$((cur - last))
+  while IFS='|' read -r ts pid rss name; do
+    [ -n "$pid" ] || continue
+    nfound=$((nfound + 1))
+    names+=$'\n'"  • ${name:0:40} (pid ${pid}, $((10#$rss / 1024)) MB RSS) la ${ts:11:8}"
+  done < <(oom_victims "$(( delta < OOM_NAMES_MAX ? delta : OOM_NAMES_MAX ))")
+  msg="💀 VPS ${HOST}: nucleul a omorat ${delta} proces(e) din lipsa de memorie (oom_kill ${last} -> ${cur})."
+  if [ "$nfound" -gt 0 ]; then msg+=$'\n'"Din jurnalul nucleului (ultimele ${OOM_LOOKBACK_MIN} min):${names}"
+  else msg+=$'\n'"Numele victimei nu l-am gasit in jurnalul nucleului (ultimele ${OOM_LOOKBACK_MIN} min); contorul e dovada."; fi
+  if send_try "$msg"; then
+    mv -f "$tmp" "$OOM_STATE" || { rm -f "$tmp"; unknown cap:oom "contorul oom_kill (nu pot scrie $OOM_STATE; mesajul s-ar repeta)"; }
+  else
+    rm -f "$tmp"   # nelivrat: baza veche ramane, urmatoarea rulare reincearca
+  fi
+  return 0
+}
+
 # --- capacitate -------------------------------------------------------------
 disk=$(df --output=pcent / 2>/dev/null | tail -1 | tr -dc '0-9')
 if [ -z "$disk" ]; then unknown cap:disk "ocuparea discului /"
@@ -422,7 +547,9 @@ elif [ "$mem" -lt "$MEM_AVAIL_MIN_MB" ]; then
 elif [ "$mem" -lt "$MEM_CLEAR_AT_MB" ]; then carry cap:mem   # fara alerta deschisa, carry nu adauga nimic
 fi
 
+read_vmstat
 check_paging
+check_oom
 
 cores=$(nproc); load1=$(awk '{ print $1; exit }' "$PROC/loadavg" 2>/dev/null)
 if ! [[ "$load1" =~ ^[0-9]+(\.[0-9]+)?$ && "$cores" =~ ^[0-9]+$ ]]; then unknown cap:load "load-ul din $PROC/loadavg"

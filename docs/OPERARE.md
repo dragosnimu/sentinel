@@ -1168,7 +1168,8 @@ simplă alerta era mută la jumătate din fazele timerului. Zgomotul nu coboară
 810 MB, evenimentul a coborât la 497 și 85, iar între ele nu există niciun eșantion.
 **Gol rămas, măsurat:** cele două căderi adânci țin ~30 s fiecare, deci cu proba la
 secunda 17–22 din minut (6 din 60 de faze) nicio probă nu le nimerește și alerta de
-RAM tace; în minutul acela sună totuși load-ul (nu e întârziat), cam la 13:43 ora gazdei. Toate
+RAM tace; în minutul acela sună totuși load-ul (nu e întârziat), cam la 13:43 ora gazdei, iar
+contorul `oom_kill` (mai jos) anunță kill-ul în cel mult un minut, indiferent de fază. Toate
 celelalte verificări
 (disc, load, docker, containere, domenii) se anunță la prima rulare — nu există
 date care să arate oscilație pentru ele, iar un docker căzut sau un site picat
@@ -1176,6 +1177,26 @@ sunt exact ce vrei repede. Cifrele și simulările sunt în secțiunea 5 din ant
 scriptului. Contoarele stau în `/opt/vps-watchdog/state/hysteresis.state`;
 `problems.state` rămâne `cheie|text`. Dacă contoarele nu se pot scrie, apare
 `unk:hysteresis` și alerta de RAM se trimite fără confirmare — nu tace.
+
+**Nucleul a omorât ceva (`oom_kill`) — un eveniment, nu o stare.** Alerta de RAM e
+avertizare, deci un model; pe 21 octombrie nucleul a omorât o aplicație de producție și
+nimeni n-a aflat. `/proc/vmstat` are un contor al nucleului, `oom_kill`, care crește cu
+fiecare proces omorât de oom-killer (și în cgroup, adică și la limita de memorie a unui
+container). O creștere între două rulări e dovada nucleului că ceva a fost omorât: fără fals
+pozitiv, fără dependență de faza timerului — dar **nu avertizează**, raportează în cel mult
+un minut, deci completează alerta de RAM, nu o înlocuiește. Mesajul are forma
+`💀 VPS <gazdă>: nucleul a omorat N proces(e) din lipsa de memorie (oom_kill A -> B)` și, dacă
+`journalctl -k` mai are linia (fereastră de 30 de minute, plafon de 5 s), numele victimei,
+pid-ul, RSS-ul și ora. Nu trece prin „problemă nouă" / „rezolvat": n-are ce să se rezolve.
+Ultima valoare văzută stă în `/opt/vps-watchdog/state/oom_kill.state`; **prima rulare o
+reține și nu anunță** (altfel instalarea ar anunța kill-ul de acum o zi), iar o valoare
+**mai mică** înseamnă repornire și reface baza fără mesaj. Baza se mută doar după ce
+Telegram a răspuns 2xx — un kill în timpul unei pene de rețea se reîncearcă, deci poate veni
+de două ori dacă răspunsul s-a pierdut după livrare. Contor ilizibil sau fișier de stare
+care nu se poate scrie => `unk:oom` („nu pot citi"), nu „sănătos" și nu un kill inventat.
+**Limită:** după o repornire, kill-urile până la valoarea veche nu se disting de bază
+(reținut 1, repornire, un kill => tot 1); un `boot_id` în fișierul de stare ar închide golul și
+nu s-a construit. Detalii: secțiunea 6 din antetul scriptului.
 
 **De ce nu mai există alerta de swap plin:** un swap plin e consecința unei
 presiuni de RAM care a trecut, nu o defecțiune; sunase ore întregi pe o stare
@@ -1195,8 +1216,15 @@ fișier — depozitul e public.
 
 **Gazda care îl rulează deja de mână** (`/opt/vps-watchdog/watchdog.sh`): fără
 conf, instalatorul lasă copia veche în pace și avertizează. Creează întâi
-fișierul (root:root, 0600) cu `HEALTH_DOMAINS` luat din scriptul vechi, apoi
-rulează deploy-ul. Starea (`/opt/vps-watchdog/state/`) se păstrează. **Adoptarea
+fișierul (root:root, 0600) cu `HEALTH_DOMAINS` luat din scriptul vechi — **cu
+`scripts/vps-watchdog-conf-init.sh`, nu de mână**: citește domeniile de pe gazdă la rulare
+(nu intră în depozit), preia și `EXCLUDE_AUTOFIX` dacă scriptul vechi îl are, refuză să
+suprascrie un fișier existent, refuză o listă goală (care ar opri în tăcere verificarea
+site-urilor clienților) și citește fișierul înapoi într-o sesiune ssh separată (fișier
+obișnuit, proprietar, mod, un singur nume, aceleași domenii). Se rulează o dată cu
+`--dry-run` (nu scrie nimic), apoi fără; a doua rulare spune „există deja" și nu schimbă
+nimic. Se rulează **înainte** de deploy: după el, scriptul vechi (singura sursă a domeniilor)
+e înlocuit, iar copia lui rămâne doar ca `*.pre-adoption`. Apoi rulează deploy-ul. Starea (`/opt/vps-watchdog/state/`) se păstrează. **Adoptarea
 păstrează copia veche:** înainte să suprascrie scriptul și cele două unități,
 instalatorul le copiază, o singură dată, în `/opt/vps-watchdog/watchdog.sh.pre-adoption`,
 `vps-watchdog.service.pre-adoption` și `vps-watchdog.timer.pre-adoption`, le

@@ -92,6 +92,7 @@ class Run:
             [l for l in sp.read_text(encoding="utf-8").splitlines() if l] if sp.exists() else [])
         self.restarts: list[str] = [l for l in read("restarts.log").splitlines() if l]
         self.timeout_calls: list[str] = [l for l in read("timeout.log").splitlines() if l]
+        self.journal_calls: list[str] = [l for l in read("journalctl.log").splitlines() if l]
         argv_files = sorted(calls.glob("curl.*.argv"), key=lambda p: int(p.name.split(".")[1]))
         self._argvs = [f.read_text(encoding="utf-8").splitlines() for f in argv_files]
         self._stdins = [f.read_text(encoding="utf-8") for f in sorted(calls.glob("curl.*.stdin"))]
@@ -121,6 +122,8 @@ class Host:
         self.secrets = root / "secrets.env"
         self.containers = root / "containers.txt"
         self.down = root / "down-domains.txt"
+        self.journal = root / "journal-k.txt"
+        self.journal.write_text("", encoding="utf-8")
         self.containers.write_text("", encoding="utf-8")
         self.down.write_text("", encoding="utf-8")
         self.secrets.write_text(
@@ -164,17 +167,24 @@ class Host:
               '  if [ "$a" = "-K" ]; then\n'
               '    cat > "$CALLS/curl.$n.stdin"\n'
               '    for t in "$@"; do case "$t" in text=*) printf "%s" "${t#text=}" > "$CALLS/send.$n" ;; esac; done\n'
-              '    exit 0\n'
+              '    exit "${FAKE_SEND_RC:-0}"\n'
               '  fi\n'
               'done\n'
               'url="${@: -1}"; host="${url#https://}"; host="${host%%/*}"\n'
               'if grep -qxF "$host" "$DOWN"; then printf 000; exit 7; fi\n'
               'printf 200; exit 0\n')
+        # `journalctl -k`: arata continutul fisierului `journal-k.txt` si noteaza argumentele.
+        # NU implementeaza --since: ce face fereastra e treaba jurnalului real, iar testele de
+        # fereastra verifica DOAR ca argumentul e transmis si ca apelul trece prin `timeout`.
+        _stub(b, "journalctl",
+              'echo "$*" >> "$CALLS/journalctl.log"\n'
+              '[ -n "${FAKE_JOURNAL_FAIL:-}" ] && { echo "journalctl: boom" >&2; exit 1; }\n'
+              'cat "$JOURNAL"\n')
 
     # -- /proc --------------------------------------------------------------
     def set_proc(self, *, avail_mb: int | None = 4000, swap_total_mb: int = 2047,
                  swap_used_mb: int = 0, pswpin: int | None = 0, pswpout: int | None = 0,
-                 load: str | None = "0.10") -> None:
+                 load: str | None = "0.10", oom_kill: int | None = 0) -> None:
         mem = self.proc / "meminfo"
         if avail_mb is None:
             mem.unlink(missing_ok=True)
@@ -187,8 +197,11 @@ class Host:
         if pswpin is None:
             vm.unlink(missing_ok=True)
         else:
+            # `oom_kill` e un camp real al /proc/vmstat (pe gazda: linia 117 din 185). Fara el
+            # (`oom_kill=None`) fisierul seamana cu un nucleu care nu-l are.
+            oom = "" if oom_kill is None else f"oom_kill {oom_kill}\n"
             vm.write_text(f"nr_free_pages 12345\npswpin {pswpin}\npswpout {pswpout}\n"
-                          f"pgmajfault 99\n", encoding="utf-8")
+                          f"{oom}pgmajfault 99\n", encoding="utf-8")
         la = self.proc / "loadavg"
         if load is None:
             la.unlink(missing_ok=True)
@@ -214,7 +227,7 @@ class Host:
             script: Path = SCRIPT) -> Run:
         for f in self.calls.glob("send.*"):
             f.unlink()
-        for name in ("restarts.log", "timeout.log"):
+        for name in ("restarts.log", "timeout.log", "journalctl.log"):
             (self.calls / name).unlink(missing_ok=True)
         for f in self.calls.glob("curl.*"):
             f.unlink()
@@ -228,6 +241,7 @@ class Host:
             "CALLS": self.calls.as_posix(),
             "CONTAINERS": self.containers.as_posix(),
             "DOWN": self.down.as_posix(),
+            "JOURNAL": self.journal.as_posix(),
             "FAKE_NOW": str(now),
             "FAKE_DISK": str(disk),
         })
@@ -1303,6 +1317,362 @@ def test_the_baseline_message_says_what_it_is_not_a_phase_label(host):
     assert "FAZA" not in msg and "testhost" in msg and "pornit" in msg, msg
     assert "Probleme deschise acum: 1" in msg and "Disk / la 95%" in msg, msg
     assert "FAZA" not in SCRIPT.read_text(encoding="utf-8")
+
+
+# ===========================================================================
+# I. Nucleul a omorat ceva: contorul `oom_kill` (sectiunea 6 din antet)
+# ===========================================================================
+#
+# Pe 21 oct 2026 nucleul a omorat o aplicatie de productie si NIMENI nu a anuntat
+# operatorul. Aici contorul din /proc/vmstat e fabricat (`WATCHDOG_PROC`), iar jurnalul
+# nucleului e un fals care intoarce linii in formatul REAL de pe gazda (citit pe 22 oct cu
+# `journalctl -k`), cu un nume de gazda fictiv. Ce NU are simularea: un nucleu care chiar
+# omoara ceva, un `journalctl` care chiar respecta `--since`, un Telegram.
+
+def _kill_line(pid: int = 1495591, name: str = "next-server (v", rss_kb: int = 2476940,
+               hms: str = "13:42:47") -> str:
+    return (f"2026-10-21T{hms}+0300 testhost.example.org kernel: Out of memory: Killed process "
+            f"{pid} ({name}) total-vm:21703792kB, anon-rss:{rss_kb}kB, file-rss:128kB, "
+            f"shmem-rss:0kB, UID:100 pgtables:24676kB oom_score_adj:0")
+
+
+def _oom_msgs(run: Run) -> list[str]:
+    return [m for m in run.msgs if "nucleul a omorat" in m]
+
+
+def _put_oom_state(host: Host, text: str) -> None:
+    """Scris ca octeti: `write_text` pe Windows ar pune CR+LF, iar gazda reala nu are CR."""
+    (host.state / "oom_kill.state").write_bytes(text.encode("utf-8"))
+
+
+def _oom_state(host: Host) -> str | None:
+    p = host.state / "oom_kill.state"
+    return p.read_text(encoding="utf-8").strip() if p.exists() else None
+
+
+def _assert_kill_channel_works(tmp_path: Path) -> None:
+    """Martorul pozitiv pentru orice "nu s-a anuntat niciun kill": pe o gazda de control,
+    acelasi fals-uri, o CRESTERE a contorului ajunge la operator. Fara el, un canal sau un
+    jurnal stricat ar face ca "zero mesaje" sa treaca oricum."""
+    ctl = Host(tmp_path / "oom-control")
+    ctl.journal.write_text(_kill_line() + "\n", encoding="utf-8")
+    ctl.set_proc(oom_kill=1)
+    assert ctl.run(now=1_000_000).msgs == []
+    ctl.set_proc(oom_kill=2)
+    r = ctl.run(now=1_000_060)
+    assert len(_oom_msgs(r)) == 1, f"canalul de control nu anunta o crestere: {r.msgs!r} / {r.stderr}"
+
+
+def test_the_first_run_takes_the_kernels_count_as_a_baseline_and_announces_nothing(host, tmp_path):
+    """Gazda are `oom_kill 1` din 18 oct, adica kill-ul de acum o zi. Daca prima rulare dupa
+    instalare ar compara cu 0, operatorul ar primi, in primul minut al watchdog-ului nou,
+    "nucleul a omorat 1 proces" despre ceva vechi - o alarma falsa chiar la livrare, si
+    prima impresie a mecanismului. Prima rulare retine valoarea si tace; nici jurnalul nu se
+    citeste degeaba."""
+    host.set_proc(oom_kill=1)
+    host.journal.write_text(_kill_line() + "\n", encoding="utf-8")
+    first = host.run(now=1_000_000)
+    again = host.run(now=1_000_060)
+    assert first.returncode == 0 and again.returncode == 0, (first.stderr, again.stderr)
+    assert first.msgs == [] and again.msgs == [], (first.msgs, again.msgs)
+    assert _oom_state(host) == "1"
+    assert first.journal_calls == [] and again.journal_calls == []
+    # Prima rulare ABSOLUTA a watchdog-ului (fara `.seeded`) trimite doar mesajul de pornire:
+    # istoria contorului nu apare in el si nu apare ca mesaj separat.
+    fresh = Host(tmp_path / "fresh")
+    (fresh.state / ".seeded").unlink()
+    fresh.set_proc(oom_kill=1)
+    fresh.journal.write_text(_kill_line() + "\n", encoding="utf-8")
+    r = fresh.run(now=1_000_000)
+    assert len(r.msgs) == 1 and "pornit" in r.msgs[0] and "omorat" not in r.msgs[0], r.msgs
+    assert _oom_state(fresh) == "1"
+    _assert_kill_channel_works(tmp_path)
+
+
+def test_a_rise_announces_the_kill_once_by_name_and_outside_the_problem_engine(host, tmp_path):
+    """Un kill e un eveniment: nu are "rezolvat". Daca ar trece prin motorul de chei,
+    operatorul ar primi "problema noua" si apoi, la urmatoarea rulare, "rezolvat" pentru un
+    proces care nu mai exista - sau nimic, fiindca o cheie care persista nu emite. Aici:
+    exact UN mesaj, cu victima numita (pid, nume, RSS, ora) si contorul vechi/nou; fara
+    "problema noua"/"rezolvat"; niciun rand in problems.state; si nu se repeta la rularea
+    urmatoare, cu aceeasi valoare. Un disc plin in aceeasi rulare ramane un mesaj SEPARAT, prin
+    motorul de chei."""
+    host.set_proc(oom_kill=1)
+    host.run(now=1_000_000)
+    host.journal.write_text(_kill_line() + "\n", encoding="utf-8")
+    host.set_proc(oom_kill=2)
+    r = host.run(now=1_000_060, disk=95)
+    assert r.returncode == 0, r.stderr
+    kills = _oom_msgs(r)
+    assert len(kills) == 1, r.msgs
+    k = kills[0]
+    assert "testhost" in k and "oom_kill 1 -> 2" in k and "omorat 1 proces" in k, k
+    assert "next-server (v" in k and "pid 1495591" in k and "2418 MB" in k and "13:42:47" in k, k
+    assert "problema noua" not in k and "rezolvat" not in k, k
+    assert len(r.msgs) == 2, f"discul trebuia sa fie un mesaj separat: {r.msgs!r}"
+    disk = next(m for m in r.msgs if m is not k)
+    assert "problema noua" in disk and "Disk /" in disk and "omorat" not in disk, disk
+    assert not any("oom" in l or "omorat" in l for l in r.state_lines), r.state_lines
+    assert _oom_state(host) == "2"
+    after = host.run(now=1_000_120, disk=95)
+    assert _oom_msgs(after) == [] and after.msgs == [], after.msgs
+    assert after.journal_calls == [], "jurnalul se citeste si cand nu s-a intamplat nimic"
+    _assert_kill_channel_works(tmp_path)
+
+
+def test_a_counter_that_has_not_moved_says_nothing_and_does_not_touch_the_journal(host, tmp_path):
+    """Verificarea ruleaza in fiecare minut, 1440 de ori pe zi. Fara crestere nu are voie nici
+    sa vorbeasca, nici sa deschida jurnalul nucleului (mare si volatil) - altfel costul
+    "nu s-a intamplat nimic" s-ar plati zilnic si ar adauga un punct de agatare in fiecare
+    rulare. Contorul poate fi si mare: 14 kill-uri vechi nu sunt 14 evenimente noi."""
+    host.set_proc(oom_kill=14)
+    host.journal.write_text(_kill_line() + "\n", encoding="utf-8")
+    runs = [host.run(now=1_000_000 + 60 * i) for i in range(5)]
+    assert [r.msgs for r in runs] == [[]] * 5
+    assert all(r.journal_calls == [] for r in runs)
+    assert _oom_state(host) == "14"
+    _assert_kill_channel_works(tmp_path)
+
+
+def test_a_counter_that_goes_down_is_a_reboot_and_the_next_kill_is_still_seen(host, tmp_path):
+    """La repornire contorul revine la 0. Daca valoarea retinuta (aici 5) ar ramane, orice kill
+    de dupa repornire ar fi invizibil pana cand contorul depaseste 5 - operatorul ar crede ca
+    nucleul nu omoara nimic. Daca scaderea s-ar citi ca o crestere negativa, ar primi un
+    mesaj fals ("omorat -5"). Scaderea reface baza FARA mesaj, iar primul kill de dupa
+    repornire se anunta."""
+    _put_oom_state(host, "5\n")
+    host.set_proc(oom_kill=0)
+    rebooted = host.run(now=1_000_000)
+    assert rebooted.msgs == [], rebooted.msgs
+    assert _oom_state(host) == "0"
+    host.journal.write_text(_kill_line() + "\n", encoding="utf-8")
+    host.set_proc(oom_kill=1)
+    r = host.run(now=1_000_060)
+    assert len(_oom_msgs(r)) == 1 and "oom_kill 0 -> 1" in r.msgs[0], r.msgs
+    _assert_kill_channel_works(tmp_path)
+
+
+@pytest.mark.parametrize("how", ["field_absent", "value_not_a_number", "field_without_value"])
+def test_an_unreadable_counter_is_unknown_never_a_kill_and_never_fine(host, tmp_path, how):
+    """Un /proc/vmstat fara `oom_kill` (nucleu fara contor, montare lipsa) sau cu o valoare
+    care nu e un numar nu poate fi citit ca "0 kill-uri" (verificarea ar parea sanatoasa
+    pentru totdeauna) si nici ca o crestere (kill inventat). Se raporteaza `unk:oom`,
+    NECUNOSCUT, iar ultima valoare buna ramane retinuta, ca primul kill de dupa ce
+    contorul redevine citibil sa nu se piarda."""
+    _put_oom_state(host, "3\n")
+    if how == "field_absent":
+        host.set_proc(oom_kill=None)
+    else:
+        host.set_proc(oom_kill=None)
+        bad = "oom_kill abc\n" if how == "value_not_a_number" else "oom_kill\n"
+        with open(host.proc / "vmstat", "a", encoding="utf-8", newline="") as f:
+            f.write(bad)
+    r = host.run(now=1_000_000)
+    assert r.returncode == 0, r.stderr
+    assert _oom_msgs(r) == [], r.msgs
+    assert len(r.msgs) == 1 and "NECUNOSCUTA" in r.msgs[0] and "(oom)" in r.msgs[0], r.msgs
+    assert any(l.startswith("unk:oom|") for l in r.state_lines), r.state_lines
+    assert _oom_state(host) == "3"
+    ctl = Host(tmp_path / "ctl")  # martor: acelasi contor, citibil si neschimbat, e tacut
+    _put_oom_state(ctl, "3\n")
+    ctl.set_proc(oom_kill=3)
+    assert ctl.run().msgs == []
+
+
+@pytest.mark.parametrize("journal", ["empty", "journalctl_fails", "unrecognised_format"])
+def test_a_kill_whose_victim_cannot_be_named_is_still_announced(host, tmp_path, journal):
+    """Jurnalul gazdei e volatil (fara /var/log/journal) si se pierde la repornire; un kill
+    poate fi mai vechi decat fereastra, `journalctl` poate esua, formatul liniei se poate
+    schimba. Contorul e dovada, numele doar comoditate: mesajul pleaca oricum, spune ca nu
+    a gasit victima, si baza avanseaza. Un mesaj fara nume e mai bun decat niciunul."""
+    host.set_proc(oom_kill=1)
+    host.run(now=1_000_000)
+    env = {}
+    if journal == "journalctl_fails":
+        env["FAKE_JOURNAL_FAIL"] = "1"
+    elif journal == "unrecognised_format":
+        host.journal.write_text("2026-10-21T13:42:47+0300 h kernel: Killed process 12 in some other format\n",
+                                encoding="utf-8")
+    host.set_proc(oom_kill=2)
+    r = host.run(now=1_000_060, env_extra=env)
+    assert len(_oom_msgs(r)) == 1, r.msgs
+    assert "omorat 1 proces" in r.msgs[0] and "nu l-am gasit" in r.msgs[0], r.msgs[0]
+    assert "(pid " not in r.msgs[0], r.msgs[0]
+    assert _oom_state(host) == "2"
+    assert len(r.journal_calls) == 1, "jurnalul trebuia incercat o data"
+    _assert_kill_channel_works(tmp_path)
+
+
+def test_the_journal_search_is_bounded_in_time_and_in_window(host):
+    """O gazda sufocata de memorie e exact cand `journalctl` poate sa se agate. Cautarea
+    victimei ruleaza in aceeasi rulare ca restul verificarilor: fara plafon de timp, un jurnal
+    lent ar tine toata rularea pana la TimeoutStartSec (300 s) si ar amuti watchdog-ul pe
+    minutele urmatoare; fara fereastra, ar citi tot jurnalul volatil. Cautarea trece prin
+    `timeout` si are `--since`."""
+    host.set_proc(oom_kill=1)
+    host.run(now=1_000_000)
+    host.set_proc(oom_kill=2)
+    r = host.run(now=1_000_060)
+    assert len(r.journal_calls) == 1, r.journal_calls
+    call = r.journal_calls[0]
+    assert "-k" in call.split() and "--since" in call.split(), call
+    assert "-30min" in call, call
+    assert any(l.split()[:2] == ["5", "journalctl"] for l in r.timeout_calls), r.timeout_calls
+
+
+def test_only_the_newest_kills_are_named_as_many_as_the_counter_rose(host):
+    """Fereastra jurnalului acopera si kill-uri deja anuntate. Daca mesajul le-ar lista pe
+    toate, operatorul ar citi ca "a fost omorat" un proces despre care a aflat acum doua
+    ore. Contorul spune CAT de multe sunt noi (delta); se numesc cele mai noi `delta` linii.
+    Delta 1 -> doar ultima; delta 2 -> ultimele doua."""
+    old_a = _kill_line(pid=111, name="old-a", hms="11:00:00")
+    old_b = _kill_line(pid=222, name="old-b", hms="12:00:00")
+    new_c = _kill_line(pid=333, name="new-c", hms="13:00:00")
+    new_d = _kill_line(pid=444, name="new-d", hms="13:01:00")
+    host.set_proc(oom_kill=2)
+    host.run(now=1_000_000)
+    host.journal.write_text("\n".join([old_a, old_b, new_c]) + "\n", encoding="utf-8")
+    host.set_proc(oom_kill=3)
+    one = host.run(now=1_000_060)
+    assert len(_oom_msgs(one)) == 1 and "new-c" in one.msgs[0], one.msgs
+    assert "old-a" not in one.msgs[0] and "old-b" not in one.msgs[0], one.msgs[0]
+    host.journal.write_text("\n".join([old_a, old_b, new_c, new_d]) + "\n", encoding="utf-8")
+    host.set_proc(oom_kill=5)
+    two = host.run(now=1_000_120)
+    assert len(_oom_msgs(two)) == 1 and "omorat 2 proces" in two.msgs[0], two.msgs
+    assert "new-c" in two.msgs[0] and "new-d" in two.msgs[0] and "old-b" not in two.msgs[0], two.msgs[0]
+
+
+def test_a_kill_that_could_not_be_announced_is_retried_not_forgotten(host):
+    """Un kill vine exact cand gazda e sufocata - si poate pierde conexiuni. Daca baza ar
+    avansa la trimitere in loc de la livrare, un mesaj pierdut ar insemna un kill pe care
+    operatorul nu-l afla niciodata: pe 21 oct tocmai asta s-a intamplat, din alt motiv.
+    Trimitere esuata -> baza ramane -> rularea urmatoare reincearca si, cand canalul
+    merge, anunta O DATA."""
+    host.set_proc(oom_kill=1)
+    host.run(now=1_000_000)
+    host.journal.write_text(_kill_line() + "\n", encoding="utf-8")
+    host.set_proc(oom_kill=2)
+    down = host.run(now=1_000_060, env_extra={"FAKE_SEND_RC": "22"})
+    assert down.returncode == 0, down.stderr
+    assert _oom_state(host) == "1", "baza a avansat desi mesajul nu a plecat"
+    up = host.run(now=1_000_120)
+    assert len(_oom_msgs(up)) == 1 and "oom_kill 1 -> 2" in up.msgs[0], up.msgs
+    assert _oom_state(host) == "2"
+    assert host.run(now=1_000_180).msgs == []
+
+
+def test_without_a_channel_the_baseline_stays_until_there_is_one(host):
+    """Fara token/chat nu se poate spune nimic. A muta baza atunci ar insemna ca primul canal
+    configurat nu afla niciodata de kill-urile dintre timp; pastrata, baza face ca primul
+    mesaj sa vina cand canalul exista. Nici nu se cauta victima degeaba."""
+    host.set_proc(oom_kill=1)
+    host.run(now=1_000_000)
+    good_secrets = host.secrets.read_text(encoding="utf-8")
+    host.secrets.write_text("", encoding="utf-8")
+    host.set_proc(oom_kill=2)
+    silent = host.run(now=1_000_060)
+    assert silent.msgs == [] and silent.journal_calls == [], (silent.msgs, silent.journal_calls)
+    assert _oom_state(host) == "1"
+    host.secrets.write_text(good_secrets, encoding="utf-8")
+    back = host.run(now=1_000_120)
+    assert len(_oom_msgs(back)) == 1, back.msgs
+
+
+def test_a_state_that_cannot_be_written_is_reported_and_never_repeated(host):
+    """Daca valoarea noua nu se poate persista, fiecare rulare ar vedea aceeasi crestere si
+    ar anunta-o din nou, in fiecare minut - operatorul ar invata sa ignore canalul. Se alege
+    celalalt esec, dar spus cu voce tare: niciun mesaj "a omorat", ci `unk:oom` (contorul nu
+    se poate tine). Martor: aceeasi crestere pe o gazda cu starea scriibila e anuntata."""
+    host.set_proc(oom_kill=1)
+    host.run(now=1_000_000)
+    host.journal.write_text(_kill_line() + "\n", encoding="utf-8")
+    host.set_proc(oom_kill=2)
+    (host.state / "oom_kill.state.tmp").mkdir()
+    runs = [host.run(now=1_000_060 + 60 * i) for i in range(2)]
+    for r in runs:
+        assert _oom_msgs(r) == [], r.msgs
+    assert "NECUNOSCUTA" in runs[0].msgs[0] and "oom" in runs[0].msgs[0], runs[0].msgs
+    assert _oom_state(host) == "1"
+    ctl = Host(host.root.parent / "writable")
+    ctl.journal.write_text(_kill_line() + "\n", encoding="utf-8")
+    ctl.set_proc(oom_kill=1)
+    ctl.run(now=1_000_000)
+    ctl.set_proc(oom_kill=2)
+    assert len(_oom_msgs(ctl.run(now=1_000_060))) == 1
+
+
+@pytest.mark.parametrize("content", ["abc", "", "-3", "1e3", "7 8"])
+def test_a_garbled_state_file_neither_invents_a_kill_nor_hides_the_damage(host, tmp_path, content):
+    """Daca fisierul de stare s-ar citi ca 0 cand nu e un numar, contorul real (7) ar parea
+    7 kill-uri noi - o alarma falsa; daca s-ar ignora fara un cuvant, un kill dintre timp ar
+    lipsi fara ca cineva sa stie. Raspunsul: baza se reface la valoarea citita acum, fara
+    mesaj de kill, si apare `unk:oom` o rulare; apoi totul e normal si urmatorul kill se
+    anunta."""
+    _put_oom_state(host, content)
+    host.set_proc(oom_kill=7)
+    r = host.run(now=1_000_000)
+    assert _oom_msgs(r) == [], r.msgs
+    assert len(r.msgs) == 1 and "NECUNOSCUTA" in r.msgs[0], r.msgs
+    assert _oom_state(host) == "7"
+    nxt = host.run(now=1_000_060)   # ca orice `unk:*`: rezolvat cand masuratoarea redevine citibila
+    assert _oom_msgs(nxt) == [] and len(nxt.msgs) == 1 and "rezolvat" in nxt.msgs[0], nxt.msgs
+    assert host.run(now=1_000_090).msgs == []
+    host.journal.write_text(_kill_line() + "\n", encoding="utf-8")
+    host.set_proc(oom_kill=8)
+    assert len(_oom_msgs(host.run(now=1_000_120))) == 1
+    _assert_kill_channel_works(tmp_path)
+
+
+def test_a_state_path_that_is_not_a_regular_file_is_reported_not_papered_over(host):
+    """Daca `oom_kill.state` e un director, `mv temporar director` NU esueaza - muta
+    temporarul IN director si iese cu 0. Rularea ar parea reusita, baza n-ar avansa
+    niciodata, iar fiecare crestere ar fi anuntata la nesfarsit. Se spune `unk:oom` si nu se
+    anunta nimic."""
+    (host.state / "oom_kill.state").mkdir()
+    host.set_proc(oom_kill=2)
+    host.journal.write_text(_kill_line() + "\n", encoding="utf-8")
+    runs = [host.run(now=1_000_000 + 60 * i) for i in range(2)]
+    for r in runs:
+        assert _oom_msgs(r) == [], r.msgs
+    assert "NECUNOSCUTA" in runs[0].msgs[0], runs[0].msgs
+    assert list((host.state / "oom_kill.state").iterdir()) == [], "temporarul a fost mutat in director"
+
+
+def test_a_process_name_cannot_inject_control_characters_or_flood_the_message(host):
+    """Numele din linia `Killed process` vine de la un proces al carui nume nu-l controleaza
+    operatorul (un container, un utilizator). Caractere de control (ESC, CR) ar ajunge pe
+    telefonul operatorului, iar un nume lung ar acoperi mesajul. Numele se taie la
+    caractere tiparibile si la 40."""
+    host.set_proc(oom_kill=1)
+    host.run(now=1_000_000)
+    hostile = "evil\x1b[31m\rRED" + "A" * 100
+    host.journal.write_text(_kill_line(name=hostile) + "\n", encoding="utf-8", newline="")
+    host.set_proc(oom_kill=2)
+    r = host.run(now=1_000_060)
+    assert len(_oom_msgs(r)) == 1, r.msgs
+    m = r.msgs[0]
+    assert "\x1b" not in m and "\r" not in m, repr(m)
+    assert "evil[31mRED" + "A" * 29 in m and "A" * 30 not in m, repr(m)
+
+
+def test_the_kernel_counter_is_read_with_the_paging_counters_in_one_pass(host):
+    """/proc/vmstat se citeste o data pe rulare, nu o data pentru paginare si inca o data
+    pentru OOM: doua citiri din momente diferite pot vedea valori care nu mai apartin
+    aceluiasi moment, iar fiecare citire in plus e un proces in plus pe o gazda sufocata.
+    Un `awk` care ocoleste fisierul de fals-uri numara cate procese au primit vmstat."""
+    real_awk = subprocess.run([BASH, "-c", "command -v awk"], capture_output=True,
+                              text=True).stdout.strip()
+    assert real_awk, "nu gasesc awk"
+    _stub(host.bin, "awk",
+          'case "$*" in *vmstat*) echo x >> "$CALLS/vmstat.reads" ;; esac\n'
+          f'exec "{real_awk}" "$@"\n')
+    (host.calls / "vmstat.reads").unlink(missing_ok=True)
+    host.set_proc(oom_kill=1)
+    r = host.run(now=1_000_000)
+    assert r.returncode == 0, r.stderr
+    reads = (host.calls / "vmstat.reads").read_text(encoding="utf-8").split()
+    assert len(reads) == 1, f"/proc/vmstat citit de {len(reads)} ori intr-o rulare"
 
 
 # ===========================================================================

@@ -5,6 +5,11 @@
 # el, instalarea nu atinge nimic. Copiaza fisierul acolo, root:root, modul 0600,
 # si pune valorile gazdei. Depozitul e public: domeniile reale NU se pun aici.
 #
+# Pe o gazda care ruleaza deja copia veche, scrisa de mana, fisierul se creeaza cu
+# scripts/vps-watchdog-conf-init.sh: citeste HEALTH_DOMAINS (si EXCLUDE_AUTOFIX, daca
+# exista) din scriptul vechi, il scrie root:root 0600, nu suprascrie un fisier existent
+# si il citeste inapoi. Scrie doar cele doua chei de mai jos.
+#
 # Format: CHEIE=valoare, un rand per cheie, ghilimele optionale. Fisierul nu se
 # executa; cheile necunoscute sunt ignorate, iar o valoare invalida e raportata pe
 # Telegram (sys:config:<CHEIE>) si se foloseste cea implicita.

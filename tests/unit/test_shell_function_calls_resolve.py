@@ -1369,10 +1369,12 @@ CORE_SCRIPTS = {
     "scripts/inventory-push.sh",
     "scripts/lib/build-package.sh",
     "scripts/lib/check-line-endings.sh",
+    "scripts/lib/vps-watchdog-conf-init-remote.sh",
     "scripts/secrets-init.sh",
     "scripts/smoke-test.sh",
     "scripts/tail-logs.sh",
     "scripts/vendor-assets.sh",
+    "scripts/vps-watchdog-conf-init.sh",
     "scripts/wizard.sh",
 }
 
