@@ -587,6 +587,12 @@ VALUE_EXEMPT: dict[str, tuple[dict[str, int], str]] = {
     # `00000000-0000-0000-0000-000000000001` — zerouri și un unu, adică vizibil
     # sintetic, într-un dublu de bază de date.
     "tests/unit/test_patch_runner.py": ({SHAPE_HEX: 1}, "UUID sintetic de plan de test"),
+    # Cele doua `boot_id` fictive ale testelor watchdog-ului (`BOOT_A`, `BOOT_B`): UUID-uri în
+    # forma reală a lui `/proc/sys/kernel/random/boot_id`, cifre repetate, vizibil sintetice.
+    # Forma TREBUIE să fie cea reală — scriptul își validează intrarea cu un tipar de UUID.
+    # Înainte erau asamblate din bucăți ca să treacă pe lângă gardă; asta ar fi lăsat fișierul
+    # orb pentru totdeauna. Cu scutire numărată, un al treilea UUID e din nou văzut.
+    "tests/security/test_vps_watchdog.py": ({SHAPE_HEX: 2}, "boot_id sintetice de test"),
     "aggregator/tests/crypto.test.ts":
         ({SHAPE_HEX: 2, SHAPE_B64: 1},
          "chei de test sintetice, plus alfabetul base64url scris ca literal"),
@@ -2269,6 +2275,47 @@ _PROBE_HEX_64 = ("9876543210" * 7)[:64]
 # valoarea tot a ajuns acolo. O probă alfanumerică pură nu se sparge la
 # scăpare, deci o verificare simplă pe substring rămâne validă.
 _PROBE_IDENTITY_USER = "cont9917fabricatpentrusonda"
+
+
+def test_a_third_uuid_in_the_watchdog_test_is_still_caught() -> None:
+    """Scutirea fișierului de test al watchdog-ului acoperă DOUĂ UUID-uri, nu „oricâte".
+
+    Ce se strică pentru operator: `BOOT_A` și `BOOT_B` au fost asamblate din bucăți
+    (`"-".join([...])`) ca să nu fie văzute de gardă. Tehnica generalizează — orice valoare
+    se poate scrie așa — iar fișierul rămânea orb pentru totdeauna: o cheie lipită acolo, ca al
+    treilea „UUID de test", ar fi trecut. Cu scutire numită și numărată, garda vede din nou
+    oricare UUID în plus. Testul rulează garda REALĂ pe conținutul REAL al fișierului: martorul
+    pozitiv e că fișierul curent trece (cele două sunt văzute și acoperite), iar un al treilea,
+    adăugat în coadă, trebuie raportat cu plafonul numit. Dacă scutirea se lărgește, sau UUID-urile
+    se ascund din nou prin asamblare, testul se înroșește.
+    """
+    rel = "tests/security/test_vps_watchdog.py"
+    assert rel in VALUE_EXEMPT, f"{rel} nu mai are scutire numită — vezi de ce s-a scos"
+    real = (REPO / rel).read_text(encoding="utf-8")
+
+    def scan(text: str) -> list[str]:
+        return _scan_tree_for_secrets([rel], lambda _: [("disc", text)])
+
+    # Martor pozitiv: fișierul de azi trece, DAR garda chiar vede cele două UUID-uri (altfel
+    # „trece" ar putea însemna că a orbit, nu că e acoperit).
+    seen = [h for h in _secret_value_hits(real) if h[1] == SHAPE_HEX]
+    assert len(seen) == 2, f"garda vede {len(seen)} UUID-uri în fișier, scutirea cere 2"
+    assert scan(real) == [], scan(real)
+
+    # Al treilea UUID, sintetic, în coadă: trebuie raportat — toate cele trei, cu plafonul numit.
+    third = real + f'\nBOOT_C = "{_UUID_36}"\n'
+    caught = scan(third)
+    assert len(caught) == 3 and all("cere 2 de formă hexa" in o for o in caught), caught
+    assert not any(_UUID_36 in o for o in caught), "mesajul nu are voie să conțină valoarea"
+
+    # Și a doua cale de ascundere, cea veche: UUID-ul asamblat din bucăți nu mai are voie să
+    # scape. Dacă scade numărul VĂZUT sub 2 (cele două ascunse), scutirea cere 2 și nu găsește —
+    # raportat ca scutire moartă, nu tăcut.
+    hidden = real.replace('"aaaaaaaa-1111-4222-8333-444444444444"',
+                          '"-".join(["aaaaaaaa", "1111", "4222", "8333", "444444444444"])')
+    assert hidden != real, "înlocuirea de probă nu a potrivit nimic"
+    blind = scan(hidden)
+    assert len(blind) == 1 and "cere 2 de formă hexa" in blind[0], blind
 
 
 def test_the_assembled_guard_reports_a_fabricated_tree() -> None:

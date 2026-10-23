@@ -258,9 +258,15 @@
 #     pentru un jurnal care se pierde. 30 de minute acopera cateva reincercari ale unui mesaj
 #     nelivrat (una pe minut); plafonul de timp e cel care tine rularea sub controlul unitatii
 #     pe un jurnal mare. Un kill mai vechi nu e numit - mesajul spune asta si contorul ramane
-#     dovada. `--since` trece peste repornire: dupa una, o victima de dinainte de ea poate fi
-#     numita doar daca jurnalul n-are cele `delta` linii de dupa; `-b` nu s-a adaugat. Se iau
-#     cel mult min(N, OOM_NAMES_MAX) randuri, cele mai noi. Daca nu gaseste nimic, mesajul spune asta
+#     dovada. Cautarea e pe pornirea CURENTA (`-b`), ca si contorul: `oom_kill` numara de la
+#     pornire, deci orice kill din valoarea raportata s-a intamplat in aceasta pornire, iar o
+#     victima de dinaintea repornirii nu are voie sa fie numita langa un contor de dupa ea.
+#     Pe gazda de productie `-k` DEJA implica `-b` (`man journalctl`, systemd 252; masurat pe
+#     23 oct pe fereastra 18 oct 14:00-15:30, repornire la 15:26: 970 de linii cu `-k`, 1120 cu
+#     `-k -b -1`, 2090 cu `_TRANSPORT=kernel` pe toate pornirile), deci `-b` explicit nu
+#     schimba nimic acolo si nici nu grabeste cautarea (mediana 70 vs 74 ms, 30 de rulari
+#     fiecare): doar pastreaza garantia daca `-k` ar fi inlocuit de un filtru pe transport.
+#     Se iau cel mult min(N, OOM_NAMES_MAX) randuri, cele mai noi. Daca nu gaseste nimic, mesajul spune asta
 #     si pleaca oricum: contorul e dovada, numele e doar comoditate. Numele vine de la un
 #     proces, deci se taie la caractere tiparibile si 40 de caractere. Formatul real are
 #     paranteze in nume (`next-server (v`).
@@ -495,11 +501,15 @@ check_paging(){
 # noi. Marginit in timp (`timeout`) si in fereastra (`--since`): jurnalul gazdei e mare
 # (persistent, ~1,6 G), iar un kill mai vechi decat fereastra nu e gasit - mesajul atunci nu
 # numeste nimic, ceea ce e mai bine decat un mesaj tarziu. Nu esueaza niciodata catre apelant.
+# `-b` = pornirea curenta, aceeasi ca a contorului `oom_kill` (vezi antetul: azi `-k` o
+# implica deja). Nu inlocuieste nici fereastra, nici `timeout`: `-b` margineste dupa PORNIRE,
+# nu dupa timp (pe o gazda pornita de zile, pornirea curenta are mii de linii de nucleu, iar un
+# kill vechi de ore nu mai e unul de reincercat), si nu opreste un `journalctl` agatat.
 # `[:print:]` scoate din nume orice caracter de control: numele vine de la un proces.
 # Greedy pe nume: `comm` poate contine paranteze (pe gazda: "next-server (v").
 oom_victims(){
   command -v journalctl >/dev/null 2>&1 || return 0
-  timeout "$OOM_JOURNAL_TIMEOUT_S" journalctl -k --no-pager -q -o short-iso \
+  timeout "$OOM_JOURNAL_TIMEOUT_S" journalctl -k -b --no-pager -q -o short-iso \
       --since "-${OOM_LOOKBACK_MIN}min" 2>/dev/null \
     | grep 'Killed process [0-9]' | tail -n "$1" | tr -cd '[:print:]\n' \
     | sed -n 's/^\([^ ]*\) .*Killed process \([0-9][0-9]*\) (\(.*\)) total-vm:[^,]*, anon-rss:\([0-9][0-9]*\)kB.*$/\1|\2|\4|\3/p'

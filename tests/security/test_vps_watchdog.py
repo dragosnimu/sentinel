@@ -61,10 +61,14 @@ TOKEN = ":".join(["1234567890", "-".join(["SYNTHETIC", "token", "for", "tests", 
 CHAT = "-1001234567890"
 # Doua porniri distincte, in forma reala a lui /proc/sys/kernel/random/boot_id: UUID cu litere
 # mici, 36 de caractere + newline = 37 de octeti (masurat pe gazda pe 22 oct). Valori fictive.
-# Asamblate din bucati, ca TOKEN-ul de mai sus: un literal hex de 36 de caractere seamana cu
-# un secret pentru garda din test_repo_is_sanitised.py, care recunoaste forma, nu intentia.
-BOOT_A = "-".join(["aaaaaaaa", "1111", "4222", "8333", "444444444444"])
-BOOT_B = "-".join(["bbbbbbbb", "5555", "4666", "8777", "888888888888"])
+# Scrise ca literali, nu asamblate: un UUID e o potrivire de VALOARE a gardei din
+# test_repo_is_sanitised.py, iar garda isi prescrie singura calea - o scutire NUMITA si NUMARATA
+# in `VALUE_EXEMPT` (aici doua). Un `"-".join([...])` ar orbi garda pe fisierul asta pentru
+# totdeauna: un al treilea UUID strecurat n-ar mai fi vazut. `TOKEN` de mai sus e altceva - e
+# o potrivire de FORMAT (tiparul unui token Telegram), care nu are scutire, deci acolo asamblarea
+# a fost singura cale. `test_a_third_uuid_in_the_watchdog_test_is_still_caught` tine numarul.
+BOOT_A = "aaaaaaaa-1111-4222-8333-444444444444"
+BOOT_B = "bbbbbbbb-5555-4666-8777-888888888888"
 MB = 1024  # kB per MB, pentru /proc/meminfo
 
 
@@ -1655,6 +1659,27 @@ def test_the_journal_search_is_bounded_in_time_and_in_window(host):
     call = r.journal_calls[0]
     assert "-k" in call.split() and "--since" in call.split(), call
     assert "-30min" in call, call
+    assert any(l.split()[:2] == ["5", "journalctl"] for l in r.timeout_calls), r.timeout_calls
+
+
+def test_the_victim_search_is_pinned_to_the_current_boot(host):
+    """`oom_kill` numara de la pornire, deci cautarea victimei trebuie sa fie pe aceeasi
+    pornire. Fara asta, dupa o repornire mesajul ar putea numi un proces omorat INAINTE de ea,
+    alaturi de un contor de DUPA ea - operatorul ar cauta un vinovat care nu mai exista.
+    ATENTIE la ce dovedeste testul: doar ca `-b` e in apel. Pe gazda de productie (systemd 252)
+    `-k` il implica deja (masurat 23 oct: 970 + 1120 = 2090 linii de nucleu in jurul unei
+    repornirii), deci azi nu exista nicio atribuire gresita pe care testul s-o prinda; el pastreaza
+    garantia daca cineva inlocuieste `-k` cu un filtru pe transport. Fals-ul de `journalctl`
+    nu modeleaza porniri, iar efectul real nu se poate dovedi de aici."""
+    host.set_proc(oom_kill=1)
+    host.run(now=1_000_000)
+    host.set_proc(oom_kill=2)
+    r = host.run(now=1_000_060)
+    assert len(r.journal_calls) == 1, r.journal_calls
+    args = r.journal_calls[0].split()
+    assert "-b" in args and "-k" in args, r.journal_calls[0]
+    # Fereastra si plafonul de timp raman alaturi de -b: -b margineste dupa pornire, nu dupa timp.
+    assert "--since" in args and "-30min" in args, r.journal_calls[0]
     assert any(l.split()[:2] == ["5", "journalctl"] for l in r.timeout_calls), r.timeout_calls
 
 
