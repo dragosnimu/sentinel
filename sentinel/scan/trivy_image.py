@@ -93,11 +93,12 @@ and it is the only source that reports either.
 ## The severity floor is HIGH here and MEDIUM in `trivy_fs`, on purpose
 
 `SEVERITIES` below says the whole of why. The short version: on 29 August 2026
-the six running images carried 2838 findings at MEDIUM and above against a
-`MAX_FINDINGS` cap of 2500, so this scanner refused every night and reported
-nothing whatsoever about the containers; at HIGH they carry 450. `trivy_fs`
-keeps MEDIUM — its 92 findings are nowhere near its own cap, and nobody asked
-for it to change.
+the six running images carried 2838 findings at MEDIUM and above against the
+`MAX_FINDINGS` cap of that day — 2500, and a refusal of the whole run, not the
+6000 per-image budget it is since 23 October — so this scanner refused every
+night and reported nothing whatsoever about the containers; at HIGH they carry
+450. `trivy_fs` keeps MEDIUM — its 92 findings are nowhere near its own cap, and
+nobody asked for it to change.
 
 A scan that looks at less has to SAY it looks at less, or the number it reports
 gets read as "the containers are clean" when it means "we did not look" — the
@@ -142,12 +143,16 @@ open `waha` findings from being announced as fixed.
 nothing at all was ingested. That is correct as far as it goes — a list cut at
 the cap would be followed by `mark_resolved_absent` and the rest announced as
 fixed — but the failure mode was total blindness. On 23 Oct 2532 findings
-(`waha` 1602, `snipe-it` 530, nine others ~400) were 32 over the 2500 cap, so
-the operator lost the findings on their own applications along with the two
-third-party images that blew the budget. The night before the total had been
-2484, sixteen under; it swings by hundreds between nights (1801, 1725, 2484 on
-the 20th-22nd; the cause was not investigated), so a total that sits near the
-cap can flap across it with nobody having changed anything.
+(`waha` 1602, `snipe-it` 530, nine others ~400) were 32 over the cap of that
+day, 2500, so the operator lost the findings on their own applications along
+with the two third-party images that blew the budget. The night before the total
+had been 2484, sixteen under. The total does not drift, it moves in steps, and
+each step is an event — a third-party `:latest` image appearing or being
+refreshed (720 -> 1517 on 17 Oct when `waha` appeared, +698 on 22 Oct when it was
+refreshed) — so a total that sits near the cap crosses it the night an image
+changes, with nobody having touched this scanner. That is why the cap is 6000
+today and not 2500: the series, the reasoning and the measured costs are written
+next to `MAX_FINDINGS`.
 
 So the budget decides PER IMAGE, and an image that is not ingested is NAMED:
 
@@ -176,22 +181,22 @@ So the budget decides PER IMAGE, and an image that is not ingested is NAMED:
 One number, not two. A per-image cap only means something if it is LOWER than
 the per-run one (an image over the whole run budget is over any larger per-image
 cap too), and nothing in the data justifies a particular lower number: the
-largest image today is 64% of the budget and a lower per-image cap would skip it
-permanently. So the single `MAX_FINDINGS` is the run's budget and "an image
-alone over it" is its degenerate case, reported under a different reason because
-the remedy differs — an image alone over the budget stays skipped whatever the
-others do; one that merely did not fit comes back when the sum drops.
+largest image on 23 Oct (`waha`, 1602) was 64% of that day's 2500 budget and is
+27% of today's 6000, and a lower per-image cap would skip it permanently. So the
+single `MAX_FINDINGS` is the run's budget and "an image alone over it" is its
+degenerate case, reported under a different reason because the remedy differs —
+an image alone over the budget stays skipped whatever the others do; one that
+merely did not fit comes back when the sum drops.
 
-The per-run sum is kept, and not for memory: parsed findings cost ~1.6 KB each
-with full-length descriptions (measured locally with tracemalloc on a synthetic
-payload, not on the host), so 2500 is ~4 MB against `MemoryMax=1G`, and the
-ingest of the 2484-finding run of 22 Oct took 58 s end to end. The sum is a bound
-on how much one night can write and on how much of it is held at once
-(`MAX_IMAGES` x a per-image bound would be 100 000 rows), and a tripwire — if a
-trivy release stops honouring `--severity`, every image goes up by an order of
-magnitude together and the run says so instead of flooding `findings`. That the
-number could safely be several times larger is a fact, not a recommendation: it
-is a trade between noise and coverage, and not this file's to make.
+The per-run sum is kept, and not as protection for the panel or for memory: it
+bounds how much one night can write and how much of it is held at once
+(`MAX_IMAGES` x a per-image bound of `MAX_FINDINGS` would be 40 x 6000 = 240 000
+rows), and it is a tripwire — if a trivy release stops honouring `--severity`,
+every image goes up together and the run says so instead of flooding `findings`.
+What the number is, what it costs (with the figures, dated, and which of them
+were NOT measured on the host) and why it is not 2500 are written next to
+`MAX_FINDINGS`, as the severity floor's are next to `SEVERITIES`: one copy, so
+the figures cannot drift apart.
 
 What the operator sees: `scans.target` is rewritten when the row is closed, with
 `N din M imagini ingerate` next to the severity floor — a count is only honest
@@ -327,9 +332,12 @@ MAX_IMAGES = 40
 #: Ridicata la HIGH pe 29 august 2026, la cererea explicita a operatorului. Ce
 #: s-a masurat pe gazda in ziua aia, cu trivy 0.73.0, pe cele sase imagini care
 #: rulau: 2838 de constatari de la MEDIUM in sus si 450 de la HIGH in sus, cu
-#: `MAX_FINDINGS` la 2500. Adica scanarea refuza sa ingereze in fiecare noapte —
-#: pe drept, vezi mai jos — deci despre containere nu se raporta nimic. O singura
-#: imagine (`snipe-it`) aducea 75% din volumul de la MEDIUM.
+#: `MAX_FINDINGS` la 2500 (plafonul de ATUNCI, un refuz al intregii rulari; azi e
+#: 6000 pe imagine, vezi acolo). Adica scanarea refuza sa ingereze in fiecare
+#: noapte — pe drept, vezi mai jos — deci despre containere nu se raporta nimic.
+#: O singura imagine (`snipe-it`) aducea 75% din volumul de la MEDIUM. Cu plafonul
+#: de azi cele 2838 ar incapea; pragul ramane la HIGH fiindca el e maneta pentru
+#: zgomotul din panou, iar plafonul nu e (vezi `MAX_FINDINGS`).
 #:
 #: De ce o lista proprie si nu ridicarea celei din `trivy_fs`: constanta de acolo
 #: e folosita de amandoua scanerele, deci ridicata acolo ar fi mutat si scanarea
@@ -374,20 +382,106 @@ SEVERITIES = ("UNKNOWN", "HIGH", "CRITICAL")
 #: Pana pe 23 octombrie 2026 era un REFUZ al intregii rulari (acelasi rationament
 #: ca la `trivy_fs.MAX_FINDINGS`, care ramane refuz: 92 de constatari fata de 500,
 #: un singur set de cai). Aici a dus la orbire totala: 2532 de constatari fata de
-#: 2500 si operatorul pierdea si aplicatiile lui, nu doar cele doua imagini care
-#: depasisera bugetul.
+#: plafonul de atunci, 2500, si operatorul pierdea si aplicatiile lui, nu doar
+#: cele doua imagini care depasisera bugetul.
 #:
-#: Numarul NU a fost mutat. Nu era problema de atunci, si „ridica plafonul" e
-#: chiar mutarea care amana totul: bugetul margineste cat scrie si cat tine o
-#: noapte, si e un prag de alarma daca trivy inceteaza sa respecte `--severity`.
-#: Costul masurat, ca decizia sa se poata lua cu cifre: ~1,6 KB per constatare in
-#: memorie (descrieri la lungime maxima), deci 2500 inseamna ~4 MB fata de
-#: `MemoryMax=1G`; ingestia rularii din 22 octombrie (2484) a durat 58 s cu tot
-#: cu scanarea. Ca ar incapea de cateva ori mai mult e un fapt, nu o recomandare:
-#: cu cat e mai mare, cu atat mai mult zgomot intra in panou, si asta decide
-#: operatorul. Cat timp ramane aici, imaginea cea mai MARE e cea care se sare
-#: cand suma depaseste — spus in text, in fiecare noapte in care se intampla.
-MAX_FINDINGS = 2500
+#: 6000, pe 23 octombrie 2026, la decizia operatorului; era 2500. 5000 a fost
+#: propus intai si respins la verificare: nu acopera 5335 (vezi mai jos). Argumentul,
+#: ca sa nu se re-derive dintr-o data care a trecut:
+#:
+#:   * NU margineste zgomotul din panou. Randurile unei imagini sarite raman
+#:     deschise (`skip_locations`), deci cele 1522 de constatari deschise ale lui
+#:     `waha` sunt in panou si la 2500, si la 6000; sarita, ele nu dispar, doar se
+#:     invechesc (data ultimei rulari care le-a vazut) si nu se mai pot rezolva —
+#:     o reparatie nu s-ar mai inregistra. Maneta pentru zgomot e pragul de
+#:     severitate (`SEVERITIES`), nu numarul asta;
+#:   * margineste ce scrie o noapte si ce se tine in memorie deodata, iar
+#:     amandoua sunt ieftine, vezi mai jos;
+#:   * flota nu oscileaza, creste in TREPTE, si fiecare treapta e un EVENIMENT: o
+#:     imagine tertă `:latest` care apare sau se reimprospateaza. Seria completa a
+#:     rularilor `completed` din `scans` (55, citita pe 23 oct): 446-720 de la
+#:     30 aug pana pe 16 oct (sapte saptamani), apoi 720 -> 1517 pe 17 oct (+800:
+#:     apare `waha:latest`, 800 din cele 806 randuri noi ale noptii sunt ale ei),
+#:     1615, 1615, 1801 pe 20 oct (+186, `snipe-it`), 1725, 2484 pe 22 oct (+698
+#:     `waha`, reluata, si +77 `snipe-it`), 2532 pe 23 oct (randul `failed` 208, pe
+#:     plafon). Rapoartele de la o noapte la alta: 2,107 / 1,065 / 1,0 / 1,115 /
+#:     0,958 / 1,44 / 1,019. Cel mai mare salt e 2,107, pe 16 -> 17 oct; e acelasi
+#:     fel de eveniment ca cel din 22 oct, deci nu exista motiv sa fie lasat
+#:     deoparte. Un plafon lipit de flota cade la prima treapta: imaginea scoasa e
+#:     cea mai MARE (cea cu 34 CRITICAL), `scan:last:trivy_image` trece `degraded`,
+#:     iar runner-ul alerteaza. Cele trei citiri 2484 / 2532 / 2517 sunt din doua
+#:     zile la capatul scarii, nu o banda: 2517 e o remasurare directa cu trivy a
+#:     doua zi (nu e un rand din `scans`), la cateva zeci de 2532 — dar de cealalta
+#:     parte a lui 2500, deci un plafon acolo ar fi depins si de zgomotul asta.
+#:     6000 acopera o treapta de 2,107 peste noaptea de azi: 2532 x 2,107 = 5335.
+#:     Orice plafon fix va fi depasit data viitoare cand apare o imagine mare;
+#:     plasa pe imagine (`REASON_IMAGE`/`REASON_BUDGET`) exista pentru asta, si
+#:     pentru un trivy care nu mai respecta `--severity`.
+#:
+#: Ce costa 6000. Citit de pe gazda pe 23 octombrie 2026 (jurnalul serviciilor si
+#: `psql`, doar citire), cu rularea din 22 octombrie ca reper (2484 de constatari,
+#: 777 noi), in afara de ce spune ca e extrapolat sau nemasurat:
+#:
+#:   * ingestia (de la «trivy image scan parsed» la «scan complete») a durat
+#:     13,6 s, ~5,5 ms per constatare; cu totul, randul `scans` 205 a durat 58 s.
+#:     Extrapolat liniar, ~33 s la 6000 — extrapolare, nu masuratoare;
+#:   * toata trecerea de scanare a durat 5,5 minute (00:24:13 -> 00:29:46 UTC)
+#:     din cele 14400 s ale unitatii, din care 3 min 48 s in `enrich`. Plafoanele
+#:     documentate (300 + 1800 + `TIMEOUT_S`) sunt 5700 s si le pazeste un test;
+#:     `TIMEOUT_S` acopera doar rularile trivy, ingestia si evaluarea vin DUPA el;
+#:   * expedierea: un lot de `findings` e plafonat la 2000 de randuri
+#:     (`ship.max_rows_per_batch`, `MAX_ROWS_PER_BATCH` la agregator), deci
+#:     bugetul schimba NUMARUL loturilor, nu marimea lor. In noaptea de 22 oct au
+#:     plecat `findings`x2000 si, la 3 s distanta (`DRAIN_PAUSE_S` + cererea),
+#:     `findings`x502, fara niciun avertisment in jurnalul expeditorului; 6000 de
+#:     randuri sunt trei-patru loturi (si randurile atinse de rezolvare), ~9-12 s,
+#:     fata de `ship.timeout_s` 30 per cerere.
+#:     Plafonul de octeti e `MAX_BODY_BYTES` = 2000 x 4096 = 8 192 000: lotul de
+#:     22 oct a purtat 5 057 646 (62%), iar cele mai late 2000 de randuri
+#:     `trivy_image` din baza insumeaza ~6,2 MB (~75%, masurat ca text JSON al
+#:     randului, deci un reprezentant, nu octetii de pe sarma). Niciuna nu depinde
+#:     de buget. Pe gazda, `sentinel.yaml` nu seteaza decat `ship.enabled`, deci
+#:     `timeout_s` si `max_rows_per_batch` sunt implicitele din cod;
+#:   * limita de 64 KB per coloana a agregatorului: singurul text scris de aici si
+#:     tinut acolo e `scans.error`/`scans.target`, ambele marginite de
+#:     `MAX_ROW_TEXT` (2000 de caractere) oricare ar fi bugetul — el intra in text
+#:     doar ca un numar. Cel mai lung de pe gazda: 254 si 75 de caractere;
+#:   * jurnalul: `scan pass done` scrie TOATE constatarile noi (`new_items`) pe o
+#:     singura linie. Pe 22 oct, 777 de noi au fost 1,54 MB, taiati de jurnal in
+#:     bucati de 48 KiB, ~2 KB per constatare noua; o noapte cu 6000 de noi ar
+#:     fi ~12 MB. Cresterea bugetului nu schimba media, dar ridica cel mai rau
+#:     caz. Lasat neschimbat aici;
+#:   * memoria — NEMASURATA PE GAZDA. `MemoryPeak` e nesetat (`systemctl show`
+#:     tipareste 2^64-1): cgroup-ul unitatii dispare cand serviciul `oneshot`
+#:     iese, deci dupa rulare nu mai ramane nimic de citit. Singurele cifre sunt
+#:     locale, cu tracemalloc pe un raport SINTETIC (Python 3.10 si 3.13; gazda
+#:     ruleaza 3.12). Doua ordini de masurare dau doua cifre, si amandoua sunt
+#:     adevarate despre altceva: cu raportul deja in memorie si doar `parse()`
+#:     urmarit, ~1,2-1,6 KB (masurat de mine si de verificator) per constatare INDIFERENT de lungimea descrierii —
+#:     asta e lista fara sirurile pe care le imparte cu raportul (o felie
+#:     completa intoarce acelasi obiect in CPython). Dar constatarile TIN acele
+#:     siruri vii dupa ce raportul e eliberat, iar asta e ce ramane tinut pe
+#:     noapte: urmarind si `json.loads`, ~2,4-2,9 KB cu descrieri de lungimea
+#:     medie din baza (560 de caractere) si ~3,9-4,3 KB cu descrieri la maxim
+#:     (2000), adica ~15-26 MB la 6000 fata de `MemoryMax=1G`. Cifra scrisa aici
+#:     pana pe 23 octombrie (~1,6 KB, ~4 MB la 2500) era a primei ordini si e
+#:     retrasa ca figura de memorie tinuta. Ce domina de fapt varful nu e numarul
+#:     asta: raportul unei imagini se citeste intreg INAINTE sa decida bugetul,
+#:     iar `json.loads` ia de 1,8-2,7 ori marimea fisierului (masurat local),
+#:     deci un raport la plafonul `trivy_fs.MAX_OUTPUT_BYTES` (64 MiB) ar fi
+#:     ~120-180 MB indiferent de buget.
+#:
+#: Ce se schimba la plasa `--severity`. Un trivy care ar adauga brusc nivelul
+#: MEDIUM ar umfla totalul cu un FACTOR, nu cu un numar: pe 29 august cele sase
+#: imagini aveau 2838 de la MEDIUM in sus si 450 de la HIGH in sus, adica ~6,3x.
+#: Aplicat flotei de azi (2532) ar da ~15 900, iar `waha` singura (1602) ~10 000 —
+#: amandoua mult peste 6000, deci plasa ar suna oricum, ca `REASON_IMAGE`. Asta e o
+#: IPOTEZA: raportul e masurat pe alte imagini (`snipe-it` aducea 75% din volumul
+#: de la MEDIUM), iar trivy n-a fost rulat pe gazda cu MEDIUM de atunci.
+#:
+#: Cat timp bugetul se atinge, imaginea cea mai MARE e cea care se sare cand suma
+#: depaseste — spus in text, in fiecare noapte in care se intampla.
+MAX_FINDINGS = 6000
 
 #: De ce nu a fost ingerata o imagine. Trei motive, pentru ca remediul difera:
 #: `image` — singura depaseste tot bugetul (ramane sarita orice ar face celelalte,

@@ -35,6 +35,7 @@ trivy sau docker în teste.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import re
@@ -419,9 +420,11 @@ def test_the_image_floor_is_high_and_the_filesystem_one_stays_medium() -> None:
     sau e la o linie distanță:
 
     * lipite pe valoarea lui `trivy_fs` (MEDIUM), scanarea de imagini se întoarce
-      la 2838 de constatări peste plafonul de 2500, refuză să ingereze în fiecare
-      noapte și nu mai raportează NIMIC despre containere — starea din 29 august
-      2026, `scan:last:trivy_image` roșu în `/selfcheck`;
+      la 2838 de constatări (măsurate pe 29 august 2026, șase imagini). Atunci
+      plafonul era 2500 și un refuz al întregii rulări, deci scanarea nu mai
+      raporta NIMIC despre containere — `scan:last:trivy_image` roșu în
+      `/selfcheck`. Cu bugetul de azi, pe imagine, 2838 ar încăpea; pragul rămâne
+      la HIGH pentru că el e maneta pentru zgomotul din panou, nu plafonul;
     * lipite pe valoarea de aici (HIGH), scanarea de FIȘIERE tace despre
       constatările ei medii fără ca cineva să fi cerut asta: 92 de constatări azi,
       nicăieri lângă plafonul ei, deci ridicarea n-ar repara nimic și ar ascunde
@@ -431,8 +434,9 @@ def test_the_image_floor_is_high_and_the_filesystem_one_stays_medium() -> None:
     ceruta = imagini[imagini.index("--severity") + 1].split(",")
     assert "HIGH" in ceruta and "CRITICAL" in ceruta
     assert "MEDIUM" not in ceruta, (
-        f"scanarea de imagini cere din nou MEDIUM: {ceruta} — plafonul de "
-        f"{trivy_image.MAX_FINDINGS} o va face să refuze în fiecare noapte")
+        f"scanarea de imagini cere din nou MEDIUM: {ceruta} — pragul HIGH e "
+        f"maneta pentru zgomotul din panou (MEDIUM a însemnat 2838 de "
+        f"constatări pe șase imagini, pe 29 august 2026)")
 
     fisiere = trivy_fs.build_argv("/opt", "/tmp/y.json", TRIVY)
     ale_fisierelor = fisiere[fisiere.index("--severity") + 1].split(",")
@@ -2010,21 +2014,17 @@ def test_count_open_at_locations_asks_nothing_when_nothing_was_skipped() -> None
 
 
 # --- noaptea de 23 octombrie 2026, cu cifrele masurate ----------------------
-def test_last_nights_fleet_ingests_ten_images_and_names_waha(
-        gazda, monkeypatch) -> None:
-    """Noaptea care a orbit panoul, rejucată cu cifrele ei reale.
+def _the_night_of_23_october(gazda, monkeypatch):
+    """Flota din 23 octombrie 2026, cap la cap: scanerul adevărat, orchestratorul
+    adevărat, `check_last_scan` adevărat citind rândul pe care l-a scris
+    orchestratorul. Întoarce `(rezultatul orchestratorului, baza, verificarea,
+    referințele flotei)`.
 
-    Eșecul pe care îl previne: 2532 de constatări pe 11 imagini față de plafonul
-    de 2500 → «trivy image scan failed … nu se ingerează nimic». Cifrele: `waha`
-    1602 (34 CRITICAL, 918 HIGH, 650 UNKNOWN) și `snipe-it` 530 (50 / 479 / 1) sunt
-    MĂSURATE cu trivy pe gazdă pe 23 octombrie; restul de 400 e împărțit pe cele
-    nouă imagini după proporțiile din `findings` de pe 22 octombrie (+11 la
+    NU atinge `MAX_FINDINGS`: cine o apelează hotărăște ce buget vrea. Cifrele:
+    `waha` 1602 (34 CRITICAL, 918 HIGH, 650 UNKNOWN) și `snipe-it` 530 (50 / 479 /
+    1) sunt MĂSURATE cu trivy pe gazdă pe 23 octombrie; restul de 400 e împărțit
+    pe cele nouă imagini după proporțiile din `findings` de pe 22 octombrie (+11 la
     prima), deci împărțirea e aproximativă — totalul de 2532 nu e.
-
-    Cap la cap: scanerul adevărat, orchestratorul adevărat, verificarea adevărată
-    citind rândul pe care l-a scris orchestratorul. Cu plafonul NEATINS (2500),
-    suma depășește cu 32 → cade imaginea cea mai mare, `waha`, și toate celelalte
-    zece intră. Operatorul vede asta pe `scan:last:trivy_image`, cu nume.
     """
     from sentinel.selfcheck import checks
 
@@ -2049,17 +2049,6 @@ def test_last_nights_fleet_ingests_ten_images_and_names_waha(
     db = _DB(open_at_skipped=1522)
     out = run(orchestrator._run_trivy_image(db, "schedule"))
 
-    assert out["status"] == "completed", out
-    assert out["findings"] == 930 and len(db.upserted) == 930
-    assert "devlikeapro/waha:latest" not in {u["location"] for u in db.upserted}
-    assert {u["location"] for u in db.upserted} == set(flota) - {"devlikeapro/waha:latest"}
-    assert out["skipped"] == ["devlikeapro/waha:latest"]
-    # Garda ajunge la rezolvare: fără ea, cele 1522 de rânduri deschise ale lui
-    # `waha` ar fi închise în noaptea în care nu s-a uitat nimeni la ele.
-    (_sql, args_rezolvare) = db.resolve_calls[0]
-    assert ["devlikeapro/waha:latest"] in [
-        list(a) for a in args_rezolvare if isinstance(a, list)]
-
     (rand,) = db.finished
     (deschis,) = db.scans
     acum = datetime.now(timezone.utc)
@@ -2080,11 +2069,166 @@ def test_last_nights_fleet_ingests_ten_images_and_names_waha(
     cfg = SimpleNamespace(scan=SimpleNamespace(enabled=True))
     (r,) = run(checks.check_last_scan(_SelfcheckDB(), cfg))
     assert r.key == "scan:last:trivy_image"
+    return out, db, r, set(flota)
+
+
+def test_last_nights_fleet_ingests_ten_images_and_names_waha(
+        gazda, monkeypatch) -> None:
+    """Noaptea care a orbit panoul, rejucată cu cifrele ei reale ȘI cu plafonul ei.
+
+    Eșecul pe care îl previne: 2532 de constatări pe 11 imagini față de plafonul
+    de atunci, 2500 → «trivy image scan failed … nu se ingerează nimic». Testul
+    verifică ce face scanerul când suma DEPĂȘEȘTE bugetul — cade imaginea cea mai
+    mare, `waha`, restul intră, garda ține deschise cele 1522 de rânduri ale ei,
+    iar `scan:last:trivy_image` iese `degraded`, cu nume.
+
+    Plafonul e FIXAT aici la 2500, nu citit din `MAX_FINDINGS`: ce descrie testul
+    e forma nopții, nu valoarea de azi. Citit din constantă, testul a căzut în
+    clipa în care bugetul a devenit mai mare decât 2532 (23 octombrie 2026), fiindcă 2532 încape
+    — adică depindea de un număr pe care nu-l declara. Că 2532 încape sub bugetul
+    real o spune testul de mai jos.
+    """
+    monkeypatch.setattr(trivy_image, "MAX_FINDINGS", 2500)
+    out, db, r, flota = _the_night_of_23_october(gazda, monkeypatch)
+
+    assert out["status"] == "completed", out
+    assert out["findings"] == 930 and len(db.upserted) == 930
+    assert "devlikeapro/waha:latest" not in {u["location"] for u in db.upserted}
+    assert {u["location"] for u in db.upserted} == flota - {"devlikeapro/waha:latest"}
+    assert out["skipped"] == ["devlikeapro/waha:latest"]
+    # Garda ajunge la rezolvare: fără ea, cele 1522 de rânduri deschise ale lui
+    # `waha` ar fi închise în noaptea în care nu s-a uitat nimeni la ele.
+    (_sql, args_rezolvare) = db.resolve_calls[0]
+    assert ["devlikeapro/waha:latest"] in [
+        list(a) for a in args_rezolvare if isinstance(a, list)]
+
     assert r.status == "degraded", (
         "noaptea care înainte era roșie a devenit verde: " + r.status)
     assert "devlikeapro/waha:latest" in r.detail
     assert "34 CRITICAL" in r.detail and "918 HIGH" in r.detail
     assert "930 constatări" in r.detail and "10 din 11 imagini" in r.detail
+
+
+def test_the_same_night_fits_whole_under_the_real_budget(
+        gazda, monkeypatch) -> None:
+    """Aceeași noapte, cu bugetul REAL: nicio imagine sărită, `ok`, nu `degraded`.
+
+    Eșecul pe care îl previne: bugetul coborât (sau o constantă rescrisă) la nivelul
+    flotei de azi — 2484 (22 oct), 2532 (23 oct), 2517 la o remasurare directă.
+    Flota crește în trepte (vezi testul de mai jos), așa că un plafon lipit de ea
+    cade la prima treaptă: `scan:last:trivy_image` trece `degraded`, runner-ul
+    alertează, iar imaginea scoasă ar fi `waha`, cea cu 34 CRITICAL, ale cărei
+    1522 de rânduri ar rămâne în panou învechite și nerezolvabile.
+
+    Nu fixează bugetul: rulează cu cel din cod și spune ce se întâmplă cu flota
+    măsurată. Dacă operatorul îl coboară, testul cade și trebuie să spună de ce.
+    """
+    out, db, r, flota = _the_night_of_23_october(gazda, monkeypatch)
+
+    assert out["status"] == "completed", out
+    assert out["skipped"] == [], (
+        f"imagini sărite cu bugetul real {trivy_image.MAX_FINDINGS}: {out['skipped']}")
+    assert out["findings"] == 2532 and len(db.upserted) == 2532
+    assert {u["location"] for u in db.upserted} == flota
+    (rand,) = db.finished
+    assert rand["error"] is None, rand["error"]
+    assert r.status == "ok", f"{r.status}: {r.detail}"
+    assert "11 din 11 imagini" in r.detail, r.detail
+
+
+# Totalurile rularilor `trivy_image` din `scans` de pe gazda, in ordine, pentru
+# ultimele opt NOPTI CONSECUTIVE (citite pe 23 oct 2026; seria completa are 55 de
+# rulari `completed`, 446-720 din 30 aug pana pe 16 oct):
+#
+#   16 oct 720 | 17 oct 1517 | 18 oct 1615 | 19 oct 1615 | 20 oct 1801 |
+#   21 oct 1725 | 22 oct 2484 | 23 oct 2532 (randul `failed` 208, cifra din eroare)
+#
+# Fiecare salt mare e un EVENIMENT, nu zgomot: pe 17 oct a aparut `waha:latest`
+# (800 din cele 806 randuri noi ale noptii), pe 20 oct `snipe-it` +186, pe 22 oct
+# `waha` reimprospatata +698 si `snipe-it` +77. 2517 e o remasurare directa cu
+# trivy a doua zi (nu e un rand din `scans`), deci nu intra in sir.
+NIGHTLY_TOTALS = (720, 1517, 1615, 1615, 1801, 1725, 2484, 2532)
+REMEASURED = 2517
+# Calculat din sir, nu scris de mana: o cifra tastata se poate croi pe valoarea
+# pe care o pazeste (1,44 = doar saltul din 22 oct a fost asa).
+LARGEST_NIGHT_TO_NIGHT_GROWTH = max(
+    later / earlier for earlier, later in zip(NIGHTLY_TOTALS, NIGHTLY_TOTALS[1:]))
+
+
+def test_the_budget_covers_the_largest_observed_step() -> None:
+    """Bugetul acoperă o noapte ca cea de azi crescută cu cea mai mare treaptă văzută.
+
+    Eșecul pe care îl previne: un buget lipit de flota de azi (2600, 3000, 5000)
+    trece testul cu flota rejucată și pică la prima treaptă — a doua apariție a
+    unei imagini mari. Treapta cea mai mare din serie e 2,107 (16 → 17 oct, când a
+    apărut `waha`), nu 1,44 (22 oct); cu 2532 × 2,107 = 5335 un buget de 5000 nu
+    mai acoperă, `scan:last:trivy_image` trece `degraded`, runner-ul alertează, iar
+    imaginea scoasă e cea mai mare, cea cu 34 CRITICAL.
+
+    Cifrele sunt măsurători DATATE, nu o proprietate: dacă apare o treaptă mai
+    mare, se adaugă în `NIGHTLY_TOTALS`, nu se slăbește aserțiunea. Nici un
+    plafon fix nu e sigur la infinit — plasa pe imagine există pentru ce depășește.
+    """
+    cel_mai_mare = max(NIGHTLY_TOTALS + (REMEASURED,))
+    necesar = cel_mai_mare * LARGEST_NIGHT_TO_NIGHT_GROWTH
+    assert trivy_image.MAX_FINDINGS >= necesar, (
+        f"bugetul {trivy_image.MAX_FINDINGS} nu acoperă o noapte ca {cel_mai_mare} "
+        f"crescută cu încă o treaptă de {LARGEST_NIGHT_TO_NIGHT_GROWTH:.3f}x "
+        f"(= {necesar:.0f}); seria: {NIGHTLY_TOTALS}")
+
+
+def test_the_series_keeps_its_largest_step() -> None:
+    """Seria de mai sus păstrează saltul din 16 → 17 octombrie (2,107×).
+
+    Eșecul pe care îl previne: cineva scurtează `NIGHTLY_TOTALS` ca să înceapă
+    după 17 oct (sau o înlocuiește cu o cifră), iar factorul din testul de buget
+    coboară la 1,44 fără ca vreun test să cadă — și atunci acceptă orice buget
+    peste 3647. A fost exact defectul primei variante a testului, croită pe
+    cifra pe care o păzea.
+    """
+    assert NIGHTLY_TOTALS[:2] == (720, 1517), NIGHTLY_TOTALS
+    assert LARGEST_NIGHT_TO_NIGHT_GROWTH > 2.1, LARGEST_NIGHT_TO_NIGHT_GROWTH
+
+
+def test_no_budget_number_is_written_into_the_scanner_logic() -> None:
+    """Bugetul există într-un singur loc: constanta `MAX_FINDINGS`.
+
+    Eșecul pe care îl previne: un `if total > 2500` (sau `Admission(6000)`) scris
+    în logică. Operatorul schimbă `MAX_FINDINGS`, cifra din text și din
+    `scans.error` se schimbă, iar scanerul continuă să decidă după alta — „nu a
+    încăput" ar spune un buget, iar imaginile ar fi sărite după altul. Testele
+    de comportament care monkeypatchuiesc constanta (10, 2) prind asta pentru
+    `scan()`; ăsta o prinde oriunde altundeva în modul, inclusiv pe ramuri pe care
+    nicio fixtură nu le atinge.
+
+    Regula: orice literal întreg ≥ 1000 din modul e ÎNTREGUL membru drept al unei
+    atribuiri la nivel de modul către un nume cu majuscule (`TIMEOUT_S = 3600`,
+    `MAX_FINDINGS = 6000`). Plus: valoarea veche, 2500, nu mai apare ca întreg
+    nicăieri. Ce NU prinde: un buget scris ca expresie (`25 * 100`) sau ca șir.
+    """
+    sursa = (ROOT / "sentinel" / "scan" / "trivy_image.py").read_text(encoding="utf-8")
+    arbore = ast.parse(sursa)
+    numite = {
+        id(nod.value) for nod in arbore.body
+        if isinstance(nod, ast.Assign) and isinstance(nod.value, ast.Constant)
+        and all(isinstance(t, ast.Name) and t.id.isupper() for t in nod.targets)}
+    mari = [nod for nod in ast.walk(arbore)
+            if isinstance(nod, ast.Constant) and type(nod.value) is int
+            and nod.value >= 1000]
+
+    # Martorul pozitiv: regula chiar vede constantele pe care ar trebui să le
+    # vadă. Fără el, un fișier mutat sau un parcurs gol ar face testul să treacă
+    # pe nimic.
+    assert trivy_image.MAX_FINDINGS in {nod.value for nod in mari}, (
+        "regula nu vede literalul lui MAX_FINDINGS — testul ar trece pe nimic")
+    assert any(id(nod) in numite for nod in mari)
+
+    ratacite = [(nod.lineno, nod.value) for nod in mari if id(nod) not in numite]
+    assert not ratacite, (
+        f"literale întregi ≥ 1000 în afara unei constante de modul: {ratacite} — "
+        f"un buget scris în logică nu se schimbă odată cu `MAX_FINDINGS`")
+    vechi = [nod.lineno for nod in mari if nod.value == 2500]
+    assert not vechi, f"2500 (bugetul de până pe 23 octombrie 2026) apare la {vechi}"
 
 
 def test_the_budget_edges_are_inclusive() -> None:

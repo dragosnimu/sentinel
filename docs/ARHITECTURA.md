@@ -363,8 +363,10 @@ nimic vreodată; era adevărat o noapte și a rămas scris opt săptămâni.)
 a găsit 2532 de constatări pe 11 imagini — `waha` 1602, `snipe-it` 530, celelalte
 nouă ~400 — și n-a ingerat nimic: operatorul și-a pierdut și constatările
 propriilor aplicații, care sunt aproape nimic, odată cu cele două imagini străine
-care adunau 82%. Cu 2484 în ziua dinainte, totalul stătea la 16 sub plafon și
-oscilează cu sute de la o noapte la alta.
+care adunau 82%. Cu 2484 în ziua dinainte, totalul stătea la 16 sub plafon. Totalul
+nu oscilează, ci crește în trepte, fiecare un eveniment — o imagine terță `:latest`
+care apare sau se reîmprospătează (720 → 1517 pe 17 octombrie, când a apărut
+`waha`; +698 pe 22 octombrie, când a fost reluată).
 
 Împărțirea pe imagini de mai sus e tot o fotografie, nu o constantă: e citită
 pe 22 octombrie 2026. Remăsurată a doua zi, cu baza de vulnerabilități
@@ -388,13 +390,21 @@ Acum fiecare imagine e scanată și parsată, iar bugetul decide care se ingerea
   *unde* s-a uitat rularea, nu *cât de tare*. Rămân deschise, cu data ultimei rulări
   care le-a văzut;
 - un singur număr, nu două. Un plafon pe imagine are sens doar dacă e mai mic decât
-  cel pe rulare, iar nimic din date nu justifică o anumită valoare mai mică (cea mai
-  mare imagine are azi 64% din buget);
+  cel pe rulare, iar nimic din date nu justifică o anumită valoare mai mică (pe 23
+  octombrie cea mai mare imagine, `waha` cu 1602, avea 64% din bugetul de atunci,
+  2500, și are 27% din cel de azi);
 - suma pe rulare rămâne ca margine a cât scrie o noapte și ca alarmă dacă trivy
-  încetează să respecte `--severity`, **nu** ca protecție de memorie: ~1,6 KB per
-  constatare (măsurat local pe un raport sintetic cu descrieri la lungime maximă)
-  face din 2500 vreo 4 MB față de `MemoryMax=1G`. Valoarea e decizia operatorului și
-  nu a fost mutată.
+  încetează să respecte `--severity`, **nu** ca protecție a panoului (rândurile
+  unei imagini sărite rămân deschise, deci sunt în panou oricum) și nu ca
+  protecție de memorie. Valoarea e **6000** din 23 octombrie 2026 (era 2500), la
+  decizia operatorului. Un plafon lipit de flotă cade la prima treaptă: cea mai mare
+  din seria `scans` (55 de rulări) e de 2,107×, pe 16 → 17 octombrie, iar 2532 ×
+  2,107 = 5335 — un buget de 5000, propus întâi, nu o acoperea. Atunci
+  `scan:last:trivy_image` trece `degraded`, runner-ul alertează, iar imaginea scoasă
+  e cea mai mare. Seria completă, costurile măsurate, ce nu s-a măsurat (memoria pe
+  gazdă: `MemoryPeak` nu se poate citi după ce unitatea iese) și ce se schimbă la
+  plasa `--severity` sunt scrise lângă constantă, în `sentinel/scan/trivy_image.py`,
+  într-un singur loc.
 
 Ce vede operatorul: `scans.target` se rescrie la închidere cu „N din M imagini
 ingerate", ca numărul de constatări să nu circule fără imaginile pe care le acoperă;
