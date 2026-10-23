@@ -1185,9 +1185,26 @@ fiecare proces omorât de oom-killer (și în cgroup, adică și la limita de me
 container). O creștere între două rulări e dovada nucleului că ceva a fost omorât: fără fals
 pozitiv, fără dependență de faza timerului — dar **nu avertizează**, raportează în cel mult
 un minut, deci completează alerta de RAM, nu o înlocuiește. Mesajul are forma
-`💀 VPS <gazdă>: nucleul a omorat N proces(e) din lipsa de memorie (oom_kill A -> B)` și, dacă
-`journalctl -k` mai are linia (fereastră de 30 de minute, plafon de 5 s), numele victimei,
-pid-ul, RSS-ul și ora. Nu trece prin „problemă nouă" / „rezolvat": n-are ce să se rezolve.
+`💀 VPS <gazdă>: nucleul a omorat N proces(e) prin oom-killer (oom_kill A -> B)` și, dacă
+`journalctl -k` mai are linia (fereastră de 30 de minute, plafon de 5 s), o linie `Tip:` și, pe
+victimă, numele, pid-ul, RSS-ul, ora și **felul** kill-ului. Nu trece prin „problemă nouă" /
+„rezolvat": n-are ce să se rezolve.
+
+**Cele două feluri de kill înseamnă lucruri opuse.** *GAZDA fără memorie*
+(`constraint=CONSTRAINT_NONE`, prefixul `Out of memory:`): nucleul a căutat o victimă în toată
+mașina și a ales un container, dar putea alege oricare altul — containerul nu e neapărat cauza
+(21 oct, swap la 100%). *LIMITA proprie de memorie* (`CONSTRAINT_MEMCG`, prefixul `Memory cgroup
+out of memory:`): un container (sau un serviciu cu `MemoryMax=`) și-a atins limita și a fost oprit
+în interiorul ei, fără căutare în restul gazdei — limita și-a făcut treaba, docker îl repornește
+(23 oct, 04:12). Felul se ia din **ambele** locuri, legate prin pid: prefixul liniei
+`Killed process` și `constraint=` de pe linia `oom-kill:` care o precedă. Dacă se contrazic, sau
+`constraint=` e altceva decât NONE/MEMCG (CPUSET, MEMORY_POLICY), mesajul spune „neclar" și nu
+alege. Fără linia `oom-kill:` (fereastra a tăiat-o) rămâne prefixul, dar fără container. O rulare
+poate cuprinde ambele feluri: atunci apare **AMESTEC**, cu numărul fiecăruia, iar fiecare victimă
+își are propria etichetă; kill-urile care nu apar în jurnal se numără aparte, „fără tip", nu iau
+eticheta celorlalte. Containerul e numit prin `docker inspect` (plafon de 5 s, doar dacă docker
+a răspuns în aceeași rulare); dacă numele nu se poate afla (docker căzut, container recreat
+între timp) mesajul pune id-ul scurt de 12 caractere și spune că numele nu s-a aflat.
 Ultima valoare văzută stă în `/opt/vps-watchdog/state/oom_kill.state`, ca o pereche pe un
 rând, `<boot_id> <contor>`; **prima rulare o reține și nu anunță** (altfel instalarea ar
 anunța kill-ul de acum o zi). Contorul pornește de la 0 la fiecare pornire a gazdei, deci

@@ -270,6 +270,43 @@
 #     si pleaca oricum: contorul e dovada, numele e doar comoditate. Numele vine de la un
 #     proces, deci se taie la caractere tiparibile si 40 de caractere. Formatul real are
 #     paranteze in nume (`next-server (v`).
+#   * FELUL kill-ului. Doua lucruri opuse pentru operator, iar mesajul nu are voie sa le numeasca la
+#     fel. Pe 23 oct 04:12 EEST doua procese au fost omorate fiindca UN CONTAINER si-a atins limita
+#     proprie (`constraint=CONSTRAINT_MEMCG`, prefixul `Memory cgroup out of memory:`): limita si-a
+#     facut treaba, containerul a fost oprit in cutia lui, docker l-a repornit. Pe 21 oct 13:42 a fost
+#     opusul (`CONSTRAINT_NONE`, `Out of memory:`): gazda a ramas fara memorie, nucleul a cautat o
+#     victima in toata masina si a ales un container - putea alege oricare altul - iar swap-ul a ajuns
+#     la 100%. Felul sta in DOUA locuri, citite din jurnalul real al gazdei (nucleu 5.14):
+#       - prefixul liniei `Killed process`, adica linia pe care o citim deja. Nu lipseste cand exista
+#         victima, dar nu spune containerul. `task_memcg` NU spune felul: la un kill global, victima
+#         tot apartine unui container (21 oct: docker-e25a...). `oom_memcg=` exista doar la MEMCG.
+#       - `constraint=` de pe linia `oom-kill:constraint=...,task=NUME,pid=N,uid=U`, care o precede cu
+#         aceeasi secunda: spune felul si poarta cgroup-ul, dar e O ALTA linie, deci trebuie legata
+#         de victima. Legarea e dupa pid (ULTIMUL `,pid=N,uid=` din linie: numele procesului sta
+#         inaintea lui si il alege procesul), iar linia se consuma la prima victima - un pid
+#         reutilizat in fereastra nu o mosteneste.
+#     Se folosesc AMBELE. Prefixul da felul si cand linia `oom-kill:` lipseste (fereastra `--since`
+#     taie intre ele, rotirea jurnalului): atunci mesajul spune felul, dar NU numeste containerul.
+#     `constraint=` confirma si da containerul. Daca se contrazic - sau `constraint=` nu e nici NONE,
+#     nici MEMCG (CPUSET, MEMORY_POLICY: memorie restransa la noduri, nu gazda plina) - felul e
+#     "neclar" si mesajul nu alege in locul operatorului. Linia `oom-kill:` fara `Killed process` nu
+#     produce nimic (n-are RSS, nu e dovada ca procesul a murit): contorul o acopera, iar kill-ul
+#     intra la "fara tip". Prefixul global se potriveste si ca `Out of memory (oom_kill_allocating_
+#     task):`; orice alt prefix, fara `constraint=`, e "neclar".
+#   * Mesajul spune felul pe ce s-a GASIT, pe categorii, niciodata pe tot: "N din lipsa de memorie a
+#     GAZDEI", "M la LIMITA proprie a unui container", "K neclar", "R fara tip" (kill-urile din
+#     contor care nu apar in lista - fereastra, plafonul OOM_NAMES_MAX - nu primesc eticheta altora).
+#     Cu ambele feluri apare AMESTEC, iar fiecare victima isi are propria eticheta.
+#   * Containerul: cgroup-ul `docker-<id>` (64 de caractere hexa) devine nume prin `docker inspect -f
+#     '{{.Name}}'`, o chemare pe victima (cel mult OOM_NAMES_MAX), cu `timeout` OOM_DOCKER_TIMEOUT_S si
+#     NUMAI daca `docker info` a raspuns mai devreme in aceeasi rulare (DOCKER_UP): un demon cazut nu se
+#     mai apeleaza, ar costa 5 s pe victima. La MEMCG se numeste cgroup-ul care si-a atins limita
+#     (`oom_memcg`), nu frunza victimei; la un kill global, cgroup-ul victimei. Un cgroup care nu e
+#     container (un serviciu cu `MemoryMax=`) se numeste ca atare, fara docker. Fara nume - docker
+#     cazut, container recreat intre timp (pe 23 oct ambele id-uri din kill-urile reale nu mai
+#     existau pe gazda) - mesajul pune id-ul scurt de 12 caractere si spune ca numele nu s-a aflat.
+#     Raspunsul docker trece prin tiparul numelor de containere; un nume de cgroup din jurnal, prin
+#     `[A-Za-z0-9@:._-]` si 40 de caractere (altfel ar muta campurile separate cu `|`).
 #
 # Auto-remedierea containerelor (sectiunea docker) e neschimbata fata de
 # versiunea de dinainte: aceleasi reguli, aceleasi plafoane.
@@ -307,6 +344,9 @@ HYST_POLICY="cap:mem=${MEM_CONFIRM_RUNS}/${MEM_CLEAR_RUNS}"
 # cateva reincercari ale unui mesaj nelivrat, nu istoria; plafonul de timp tine cautarea
 # victimei sub controlul unitatii (o rulare agatata amuteste watchdog-ul).
 OOM_LOOKBACK_MIN=30; OOM_NAMES_MAX=3; OOM_JOURNAL_TIMEOUT_S=5
+# Numele containerului din id-ul cgroup-ului: o singura chemare `docker inspect` pe victima, cu plafon
+# propriu, si doar daca demonul a raspuns mai devreme in rularea asta (DOCKER_UP).
+OOM_DOCKER_TIMEOUT_S=5; DOCKER_UP=0
 # Chei care nu se mai emit. Se scot din starea anterioara, ca dispari lor sa nu
 # apara ca "rezolvat" (swap-ul nu s-a rezolvat: pur si simplu nu mai e verificat).
 RETIRED_KEYS="cap:swap"
@@ -397,6 +437,7 @@ unknown(){
 }
 
 if timeout 20 docker info >/dev/null 2>&1; then
+  DOCKER_UP=1
   while read -r name; do
     [ -z "$name" ] && continue
     pol=$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$name" 2>/dev/null || echo "")
@@ -497,23 +538,101 @@ check_paging(){
 # de diferente si nu are "rezolvat". Mesajul pleaca direct; baza (ultima valoare a
 # contorului `oom_kill`) se muta doar dupa ce mesajul a plecat.
 
-# oom_victims N - cel mult N randuri `ora|pid|rss_kB|nume` din jurnalul nucleului, cele mai
-# noi. Marginit in timp (`timeout`) si in fereastra (`--since`): jurnalul gazdei e mare
-# (persistent, ~1,6 G), iar un kill mai vechi decat fereastra nu e gasit - mesajul atunci nu
-# numeste nimic, ceea ce e mai bine decat un mesaj tarziu. Nu esueaza niciodata catre apelant.
+# oom_victims N - cel mult N randuri `ora|pid|rss_kB|tip|cgroup|nume` din jurnalul nucleului, cele
+# mai noi. `tip` e `host` (gazda a ramas fara memorie), `cont` (un cgroup si-a atins limita
+# proprie) sau `unk` (jurnalul nu spune sau se contrazice); `cgroup` e ultimul element al caii
+# cgroup-ului relevant (goala daca nu se stie). Marginit in timp (`timeout`) si in fereastra
+# (`--since`): jurnalul gazdei e mare (persistent, ~1,6 G), iar un kill mai vechi decat fereastra
+# nu e gasit - mesajul atunci nu numeste nimic, ceea ce e mai bine decat un mesaj tarziu. Nu
+# esueaza niciodata catre apelant.
 # `-b` = pornirea curenta, aceeasi ca a contorului `oom_kill` (vezi antetul: azi `-k` o
 # implica deja). Nu inlocuieste nici fereastra, nici `timeout`: `-b` margineste dupa PORNIRE,
 # nu dupa timp (pe o gazda pornita de zile, pornirea curenta are mii de linii de nucleu, iar un
 # kill vechi de ore nu mai e unul de reincercat), si nu opreste un `journalctl` agatat.
 # `[:print:]` scoate din nume orice caracter de control: numele vine de la un proces.
-# Greedy pe nume: `comm` poate contine paranteze (pe gazda: "next-server (v").
+# Numele se ia pana la ULTIMUL `) total-vm:` (`comm` poate contine paranteze; pe gazda:
+# "next-server (v"), iar pid-ul din linia `oom-kill:` e ULTIMUL `,pid=N,uid=` (numele procesului
+# sta inaintea lui si il alege procesul).
+# Tipul vine din DOUA locuri (antetul, sectiunea 6): prefixul liniei `Killed process` si
+# `constraint=` din linia `oom-kill:` care o precede, legate prin pid. Daca se contrazic sau
+# constraint-ul nu e nici NONE, nici MEMCG, tipul e `unk` - nu se alege unul dintre ei.
 oom_victims(){
   command -v journalctl >/dev/null 2>&1 || return 0
   timeout "$OOM_JOURNAL_TIMEOUT_S" journalctl -k -b --no-pager -q -o short-iso \
       --since "-${OOM_LOOKBACK_MIN}min" 2>/dev/null \
-    | grep 'Killed process [0-9]' | tail -n "$1" | tr -cd '[:print:]\n' \
-    | sed -n 's/^\([^ ]*\) .*Killed process \([0-9][0-9]*\) (\(.*\)) total-vm:[^,]*, anon-rss:\([0-9][0-9]*\)kB.*$/\1|\2|\4|\3/p'
+    | grep -E 'Killed process [0-9]|oom-kill:constraint=' | tr -cd '[:print:]\n' \
+    | awk '
+      function field(s, key,   i, r) {
+        i = index(s, key); if (!i) return ""
+        r = substr(s, i + length(key)); sub(/,.*/, "", r); return r
+      }
+      function lastpid(s,   m) {
+        m = ""
+        while (match(s, /,pid= *[0-9]+,uid=/)) { m = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + 1) }
+        if (m == "") return ""
+        gsub(/[^0-9]/, "", m); return m
+      }
+      function leaf(p,   n, a) {
+        n = split(p, a, "/"); p = (n ? a[n] : "")
+        return (p ~ /^[A-Za-z0-9@:._-]+$/) ? p : ""
+      }
+      index($0, "oom-kill:constraint=") {
+        p = lastpid($0)
+        if (p != "") {
+          con[p] = field($0, "oom-kill:constraint="); lim[p] = leaf(field($0, ",oom_memcg="))
+          vic[p] = leaf(field($0, ",task_memcg="))
+        }
+        next
+      }
+      {
+        if (!match($0, /Killed process [0-9]+ \(/)) next
+        pre = substr($0, 1, RSTART - 1); pid = substr($0, RSTART + 15, RLENGTH - 17)
+        rest = substr($0, RSTART + RLENGTH)
+        pos = 0; base = 0; s = rest
+        while ((i = index(s, ") total-vm:")) > 0) { pos = base + i; base = pos; s = substr(rest, base + 1) }
+        if (!pos) next
+        name = substr(rest, 1, pos - 1); s = substr(rest, pos + 11)
+        if (!match(s, /^[^,]*, anon-rss:[0-9]+kB/)) next
+        rss = substr(s, RSTART, RLENGTH); sub(/^.*anon-rss:/, "", rss); sub(/kB$/, "", rss)
+        pk = ""
+        if (pre ~ /kernel: Memory cgroup out of memory: $/) pk = "cont"
+        else if (pre ~ /kernel: Out of memory[^:]*: $/) pk = "host"
+        ck = ""
+        if (pid in con) ck = (con[pid] == "CONSTRAINT_MEMCG") ? "cont" : (con[pid] == "CONSTRAINT_NONE") ? "host" : "unk"
+        kind = "unk"
+        if (ck == "") kind = (pk == "") ? "unk" : pk
+        else if (pk == "" || pk == ck) kind = ck
+        cg = ""
+        if (pid in con) cg = (kind == "cont" && lim[pid] != "") ? lim[pid] : (kind == "unk" ? "" : vic[pid])
+        delete con[pid]; delete lim[pid]; delete vic[pid]
+        print $1 "|" pid "|" rss "|" kind "|" cg "|" name
+      }' \
+    | tail -n "$1"
   return 0
+}
+
+# oom_where CGROUP - de unde era victima, ca fraza: containerul cu numele lui (docker inspect,
+# marginit; numai daca demonul a raspuns mai devreme in rularea asta), sau cu id-ul scurt daca
+# numele nu se poate afla (docker cazut, containerul recreat intre timp), sau cgroup-ul daca nu e
+# un container. Gol daca nu se stie. Numele iese din docker, deci trece prin tiparul numelor de
+# containere. `</dev/null`: bucla apelanta citeste din jurnal, iar `docker` nu are voie sa-i manance
+# intrarea.
+OOM_SCOPE_RE='^docker-([0-9a-f]{64})\.scope$'
+oom_where(){
+  local cg="$1" id nm=""
+  [ -n "$cg" ] || return 0
+  if [[ "$cg" =~ $OOM_SCOPE_RE ]]; then
+    id="${BASH_REMATCH[1]}"
+    if [ "$DOCKER_UP" = 1 ]; then
+      nm=$(timeout "$OOM_DOCKER_TIMEOUT_S" docker inspect -f '{{.Name}}' "$id" 2>/dev/null </dev/null) || nm=""
+      nm="${nm#/}"
+      [[ "$nm" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ ]] || nm=""
+    fi
+    if [ -n "$nm" ]; then printf 'containerul %s' "$nm"
+    else printf 'containerul %s (numele nu l-am aflat)' "${id:0:12}"; fi
+  else
+    printf 'cgroup-ul %s' "${cg:0:40}"
+  fi
 }
 
 # boot_id al nucleului: un UUID (litere mici, 36 de caractere), nou la fiecare pornire. Orice
@@ -522,7 +641,7 @@ oom_victims(){
 OOM_BOOT_RE='^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
 
 check_oom(){
-  local cur="$VM_OOM" last="" sboot="" extra="" boot="" had=0 rebooted=0 delta line ts pid rss name names="" nfound=0 msg tmp="$OOM_STATE.tmp"
+  local cur="$VM_OOM" last="" sboot="" extra="" boot="" had=0 rebooted=0 delta line ts pid rss kind cg name where tag tip names="" nfound=0 ng=0 nc=0 nu=0 nr msg tmp="$OOM_STATE.tmp"
   if ! [[ "$cur" =~ ^[0-9]{1,15}$ ]]; then unknown cap:oom "oom_kill din $PROC/vmstat"; return 0; fi
   cur=$((10#$cur))
   # Pornirea curenta. Se verifica FORMA citita, nu codul de iesire al `read`: un fisier fara
@@ -578,15 +697,32 @@ check_oom(){
   # spun nimic, deci baza ramane: mesajul vine cand canalul exista.
   if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then rm -f "$tmp"; return 0; fi
   delta=$((cur - last))
-  while IFS='|' read -r ts pid rss name; do
+  while IFS='|' read -r ts pid rss kind cg name; do
     [ -n "$pid" ] || continue
     nfound=$((nfound + 1))
-    names+=$'\n'"  • ${name:0:40} (pid ${pid}, $((10#$rss / 1024)) MB RSS) la ${ts:11:8}"
+    where=$(oom_where "$cg")
+    case "$kind" in
+      host) ng=$((ng + 1)); tag="GAZDA fara memorie${where:+; victima rula in ${where}}" ;;
+      cont) nc=$((nc + 1)); tag="LIMITA proprie de memorie atinsa de ${where:-un cgroup necunoscut}" ;;
+      *)    nu=$((nu + 1)); tag="tip neclar" ;;
+    esac
+    names+=$'\n'"  • ${name:0:40} (pid ${pid}, $((10#$rss / 1024)) MB RSS) la ${ts:11:8} - ${tag}"
   done < <(oom_victims "$(( delta < OOM_NAMES_MAX ? delta : OOM_NAMES_MAX ))")
-  msg="💀 VPS ${HOST}: nucleul a omorat ${delta} proces(e) din lipsa de memorie (oom_kill ${last} -> ${cur})."
+  # Tipul se spune pe ce s-a GASIT, pe categorii, niciodata pe tot: o rulare poate cuprinde kill-uri de
+  # ambele feluri, iar cele negasite (fereastra, plafon) nu au tip - se numara aparte, nu se prind
+  # sub eticheta celorlalte.
+  nr=$((delta - nfound))
+  tip=""
+  [ "$ng" -gt 0 ] && tip+="; ${ng} din lipsa de memorie a GAZDEI (nucleul a cautat victima in toata masina; cea aleasa nu e neaparat cauza)"
+  [ "$nc" -gt 0 ] && tip+="; ${nc} la LIMITA proprie de memorie a unui container (oprirea s-a facut in interiorul limitei, fara cautare in restul gazdei)"
+  [ "$nu" -gt 0 ] && tip+="; ${nu} neclar (jurnalul nu spune sigur: gazda sau limita de container)"
+  [ "$nr" -gt 0 ] && [ "$nfound" -gt 0 ] && tip+="; ${nr} fara tip (nu apar in lista de mai jos)"
+  tip="${tip#; }"
+  [ "$ng" -gt 0 ] && [ "$nc" -gt 0 ] && tip="AMESTEC - ${tip}"
+  msg="💀 VPS ${HOST}: nucleul a omorat ${delta} proces(e) prin oom-killer (oom_kill ${last} -> ${cur})."
   [ "$rebooted" = 1 ] && msg+=$'\n'"Gazda s-a repornit de la ultima rulare: contorul numara de la pornire, nu de la rularea anterioara."
-  if [ "$nfound" -gt 0 ]; then msg+=$'\n'"Din jurnalul nucleului (ultimele ${OOM_LOOKBACK_MIN} min):${names}"
-  else msg+=$'\n'"Numele victimei nu l-am gasit in jurnalul nucleului (ultimele ${OOM_LOOKBACK_MIN} min); contorul e dovada."; fi
+  if [ "$nfound" -gt 0 ]; then msg+=$'\n'"Tip: ${tip}"$'\n'"Din jurnalul nucleului (ultimele ${OOM_LOOKBACK_MIN} min):${names}"
+  else msg+=$'\n'"Numele victimei nu l-am gasit in jurnalul nucleului (ultimele ${OOM_LOOKBACK_MIN} min); contorul e dovada, iar tipul (gazda sau limita unui container) nu se stie."; fi
   if send_try "$msg"; then
     mv -f "$tmp" "$OOM_STATE" || { rm -f "$tmp"; unknown cap:oom "contorul oom_kill (nu pot scrie $OOM_STATE; mesajul s-ar repeta)"; }
   else

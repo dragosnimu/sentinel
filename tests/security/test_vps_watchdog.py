@@ -63,7 +63,7 @@ CHAT = "-1001234567890"
 # mici, 36 de caractere + newline = 37 de octeti (masurat pe gazda pe 22 oct). Valori fictive.
 # Scrise ca literali, nu asamblate: un UUID e o potrivire de VALOARE a gardei din
 # test_repo_is_sanitised.py, iar garda isi prescrie singura calea - o scutire NUMITA si NUMARATA
-# in `VALUE_EXEMPT` (aici doua). Un `"-".join([...])` ar orbi garda pe fisierul asta pentru
+# in `VALUE_EXEMPT` (aici patru: doua boot_id, doua id-uri de container). Un `"-".join([...])` ar orbi garda pe fisierul asta pentru
 # totdeauna: un al treilea UUID strecurat n-ar mai fi vazut. `TOKEN` de mai sus e altceva - e
 # o potrivire de FORMAT (tiparul unui token Telegram), care nu are scutire, deci acolo asamblarea
 # a fost singura cale. `test_a_third_uuid_in_the_watchdog_test_is_still_caught` tine numarul.
@@ -103,6 +103,7 @@ class Run:
         self.restarts: list[str] = [l for l in read("restarts.log").splitlines() if l]
         self.timeout_calls: list[str] = [l for l in read("timeout.log").splitlines() if l]
         self.journal_calls: list[str] = [l for l in read("journalctl.log").splitlines() if l]
+        self.name_lookups: list[str] = [l for l in read("docker-inspect.log").splitlines() if "{{.Name}}" in l]
         argv_files = sorted(calls.glob("curl.*.argv"), key=lambda p: int(p.name.split(".")[1]))
         self._argvs = [f.read_text(encoding="utf-8").splitlines() for f in argv_files]
         self._stdins = [f.read_text(encoding="utf-8") for f in sorted(calls.glob("curl.*.stdin"))]
@@ -133,8 +134,10 @@ class Host:
         self.containers = root / "containers.txt"
         self.down = root / "down-domains.txt"
         self.journal = root / "journal-k.txt"
+        self.ids = root / "container-ids.txt"
         self.journal.write_text("", encoding="utf-8")
         self.containers.write_text("", encoding="utf-8")
+        self.ids.write_text("", encoding="utf-8")
         self.down.write_text("", encoding="utf-8")
         self.secrets.write_text(
             f"TELEGRAM_BOT_TOKEN={TOKEN}\nTELEGRAM_CHAT_ID={CHAT}\n", encoding="utf-8")
@@ -160,6 +163,9 @@ class Host:
               '  ps) cut -d"|" -f1 "$CONTAINERS" ;;\n'
               '  restart) echo "$2" >> "$CALLS/restarts.log"; exit 0 ;;\n'
               '  inspect)\n'
+              '    echo "$*" >> "$CALLS/docker-inspect.log"\n'
+              '    case "$3" in "{{.Name}}") cat >/dev/null; n=$(grep "^$4|" "$IDS" | cut -d"|" -f2-); [ -n "$n" ] || exit 1\n'
+              '                          echo "/$n"; exit 0 ;; esac\n'
               '    line=$(grep "^$4|" "$CONTAINERS") || exit 1\n'
               '    IFS="|" read -r _n pol status health <<< "$line"\n'
               '    case "$3" in\n'
@@ -240,6 +246,10 @@ class Host:
     def set_containers(self, rows: list[str]) -> None:
         self.containers.write_text("".join(r + "\n" for r in rows), encoding="utf-8")
 
+    def set_ids(self, names: dict[str, str]) -> None:
+        """Id-ul complet al unui container -> numele lui, pentru `docker inspect -f '{{.Name}}' ID`."""
+        self.ids.write_text("".join(f"{i}|{n}\n" for i, n in names.items()), encoding="utf-8")
+
     def set_down(self, domains: list[str]) -> None:
         self.down.write_text("".join(d + "\n" for d in domains), encoding="utf-8")
 
@@ -248,7 +258,7 @@ class Host:
             script: Path = SCRIPT) -> Run:
         for f in self.calls.glob("send.*"):
             f.unlink()
-        for name in ("restarts.log", "timeout.log", "journalctl.log"):
+        for name in ("restarts.log", "timeout.log", "journalctl.log", "docker-inspect.log"):
             (self.calls / name).unlink(missing_ok=True)
         for f in self.calls.glob("curl.*"):
             f.unlink()
@@ -261,6 +271,7 @@ class Host:
             "WATCHDOG_PROC": self.proc.as_posix(),
             "CALLS": self.calls.as_posix(),
             "CONTAINERS": self.containers.as_posix(),
+            "IDS": self.ids.as_posix(),
             "DOWN": self.down.as_posix(),
             "JOURNAL": self.journal.as_posix(),
             "FAKE_NOW": str(now),
@@ -1950,6 +1961,338 @@ def test_the_kernel_counter_is_read_with_the_paging_counters_in_one_pass(host):
     assert r.returncode == 0, r.stderr
     reads = (host.calls / "vmstat.reads").read_text(encoding="utf-8").split()
     assert len(reads) == 1, f"/proc/vmstat citit de {len(reads)} ori intr-o rulare"
+
+
+# ---------------------------------------------------------------------------
+# Ce fel de kill: gazda fara memorie sau limita proprie a unui container
+# ---------------------------------------------------------------------------
+#
+# Doua feluri de kill inseamna lucruri opuse pentru operator. Pe 23 oct la 04:12 EEST doua
+# procese au fost omorate pentru ca UN CONTAINER si-a atins limita lui: limita si-a facut treaba,
+# containerul a fost oprit in cutia lui, gazda nu a ramas fara memorie, iar docker l-a repornit.
+# Pe 21 oct la 13:42 a fost opusul: gazda a ramas fara memorie, nucleul a cautat o victima in toata
+# masina si a ales (nu neaparat din vina ei) un container; swap-ul a ajuns la 100%. Mesajul de
+# dinainte le numea la fel. Liniile de mai jos sunt cele trei kill-uri reale, citite de pe gazda
+# cu `journalctl -k` pe 23 oct, cu numele gazdei inlocuit (depozitul e public).
+#
+# Ce NU au testele astea: un nucleu care chiar scrie liniile (formatul e al nucleului 5.14 de pe
+# gazda; alte versiuni pot adauga campuri), un `journalctl` care respecta `--since`, un docker real.
+# Awk-ul de pe gazde (gawk 5.1 si 5.2) a fost rulat si sub mawk (n8n) pe aceleasi linii, manual.
+
+# Id-urile celor doua containere din kill-urile reale: identificatori PUBLICI de container (nu
+# secrete), dispareau de pe gazda dupa recrearea containerelor. Scrisi ca literali, pe fata: garda din
+# test_repo_is_sanitised.py le vede si le acopera cu o scutire NUMITA si NUMARATA (`VALUE_EXEMPT`).
+CID_21OCT = "e25a29e59c17840fd13d78164427fd2b2b9354554b638c7532ac3823f0d502a1"
+CID_23OCT = "7185f6896d6868965622542862d63445d136b0efb038df847c3c3e40ad867ab7"
+OOM_HOSTNAME = "testhost.example.org"
+T_21 = "2026-10-21T13:42:47+0300"
+T_23 = "2026-10-23T04:12:36+0300"
+
+
+def _k(ts: str, msg: str) -> str:
+    return f"{ts} {OOM_HOSTNAME} kernel: {msg}"
+
+
+def _real_global_kill() -> list[str]:
+    """21 oct 13:42 - GLOBAL: `constraint=CONSTRAINT_NONE`, `Out of memory:`, victima in docker-e25a..."""
+    cg = f"/system.slice/docker-{CID_21OCT}.scope"
+    return [
+        _k("2026-10-21T13:42:45+0300", "containerd invoked oom-killer: gfp_mask=0x140cca(GFP_HIGHUSER_MOVABLE|__GFP_COMP), order=0, oom_score_adj=-999"),
+        _k(T_21, "oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=containerd.service,mems_allowed=0,"
+                 f"global_oom,task_memcg={cg},task=next-server (v,pid=1495591,uid=100"),
+        _k(T_21, "Out of memory: Killed process 1495591 (next-server (v) total-vm:21703792kB, anon-rss:2476940kB, "
+                 "file-rss:128kB, shmem-rss:0kB, UID:100 pgtables:24676kB oom_score_adj:0"),
+    ]
+
+
+def _real_container_limit_kills() -> list[str]:
+    """23 oct 04:12 - doua kill-uri in LIMITA containerului 7185...: `CONSTRAINT_MEMCG`,
+    `Memory cgroup out of memory:`; al doilea are numele `runc:[2:INIT]`, care nu spune nimic."""
+    cg = f"/system.slice/docker-{CID_23OCT}.scope"
+    head = (f"oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=docker-{CID_23OCT}.scope,"
+            f"mems_allowed=0,oom_memcg={cg},task_memcg={cg}")
+    invoked = _k(T_23, "runc:[2:INIT] invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), order=0, oom_score_adj=0")
+    return [
+        invoked,
+        _k(T_23, f"{head},task=next-server (v,pid=2373195,uid=100"),
+        _k(T_23, "Memory cgroup out of memory: Killed process 2373195 (next-server (v) total-vm:21244212kB, "
+                 "anon-rss:3120264kB, file-rss:67456kB, shmem-rss:0kB, UID:100 pgtables:22136kB oom_score_adj:0"),
+        invoked,
+        _k(T_23, f"{head},task=runc:[2:INIT],pid=3310083,uid=0"),
+        _k(T_23, "Memory cgroup out of memory: Killed process 3310083 (runc:[2:INIT]) total-vm:1639140kB, "
+                 "anon-rss:1680kB, file-rss:3712kB, shmem-rss:0kB, UID:0 pgtables:156kB oom_score_adj:0"),
+    ]
+
+
+def _announce(host: Host, lines: list[str], delta: int, *, ids: dict[str, str] | None = None,
+              env: dict | None = None) -> tuple[str, Run]:
+    """Baza 0, jurnalul `lines`, contorul urca cu `delta`: intoarce mesajul de kill (unul) si rularea."""
+    host.set_proc(oom_kill=0)
+    host.run(now=1_000_000)
+    host.journal.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    host.set_ids(ids or {})
+    host.set_proc(oom_kill=delta)
+    r = host.run(now=1_000_060, env_extra=env)
+    assert r.returncode == 0, r.stderr
+    assert "awk" not in r.stderr, r.stderr
+    kills = _oom_msgs(r)
+    assert len(kills) == 1, (r.msgs, r.stderr)
+    assert f"oom_kill 0 -> {delta}" in kills[0], kills[0]
+    return kills[0], r
+
+
+def _victim_lines(msg: str) -> list[str]:
+    return [l for l in msg.splitlines() if l.startswith("  • ")]
+
+
+def test_the_21_oct_host_wide_oom_is_called_the_host_running_out_not_a_container_limit(host):
+    """Pe 21 oct gazda a ramas fara memorie (swap 100%). Daca mesajul ar suna ca o limita de
+    container care si-a facut treaba, operatorul ar citi "garda a tinut" exact cand masina a
+    fost la capat si ar lasa asa. Kill-ul real: `CONSTRAINT_NONE` + `Out of memory:`. Mesajul
+    spune GAZDA, nu LIMITA, numeste containerul doar ca locul victimei si nu pretinde ca el
+    e cauza."""
+    msg, r = _announce(host, _real_global_kill(), 1, ids={CID_21OCT: "web-prod"})
+    v = _victim_lines(msg)
+    assert len(v) == 1, msg
+    assert "GAZDA fara memorie" in v[0] and "victima rula in containerul web-prod" in v[0], v[0]
+    assert "next-server (v" in v[0] and "pid 1495591" in v[0] and "2418 MB" in v[0], v[0]
+    assert "din lipsa de memorie a GAZDEI" in msg and "nu e neaparat cauza" in msg, msg
+    assert "LIMITA" not in msg and "AMESTEC" not in msg, msg
+
+
+def test_the_23_oct_container_limit_kills_are_not_called_the_host_running_out(host):
+    """Pe 23 oct containerul si-a atins limita proprie de doua ori si a fost oprit in cutia lui;
+    gazda n-a ramas fara memorie. Daca mesajul ar suna ca pe 21 oct, operatorul ar crede ca
+    masina a fost la capat si ar cauta o scurgere pe gazda (sau ar muta containere) in loc sa
+    ridice limita acelui container. Kill-urile reale: `CONSTRAINT_MEMCG` + `Memory cgroup out of
+    memory:`. Al doilea proces se cheama `runc:[2:INIT]`: de aceea mesajul numeste CONTAINERUL."""
+    msg, r = _announce(host, _real_container_limit_kills(), 2, ids={CID_23OCT: "web-prod"})
+    v = _victim_lines(msg)
+    assert len(v) == 2, msg
+    assert all("LIMITA proprie de memorie atinsa de containerul web-prod" in l for l in v), v
+    assert "runc:[2:INIT]" in v[1] and "pid 3310083" in v[1], v[1]
+    assert "2 la LIMITA proprie de memorie a unui container" in msg, msg
+    assert "GAZDA" not in msg and "GAZDEI" not in msg and "AMESTEC" not in msg, msg
+    assert "lipsa de memorie" not in msg.splitlines()[0], msg.splitlines()[0]
+    assert len(r.name_lookups) >= 1 and all(CID_23OCT in l for l in r.name_lookups), r.name_lookups
+    assert any(l.split()[:3] == ["5", "docker", "inspect"] for l in r.timeout_calls), r.timeout_calls
+
+
+def test_a_run_with_both_kinds_labels_each_victim_and_never_one_label_for_all(host):
+    """Contorul poate urca cu mai multe intre doua rulari, din ambele feluri (21 oct + 23 oct,
+    3 kill-uri). Un mesaj care ar alege o singura eticheta pentru toate ar minti despre cel putin
+    unul: ori "gazda a ramas fara memorie" pentru doua kill-uri de limita, ori "limita si-a facut
+    treaba" pentru o gazda la capat. Aici: AMESTEC, cu numarul fiecarui fel, iar fiecare victima
+    are propria eticheta."""
+    msg, _ = _announce(host, _real_global_kill() + _real_container_limit_kills(), 3,
+                       ids={CID_21OCT: "web-old", CID_23OCT: "web-prod"})
+    v = {l.split("(pid ")[1].split(",")[0]: l for l in _victim_lines(msg)}
+    assert sorted(v) == ["1495591", "2373195", "3310083"], msg
+    assert "GAZDA fara memorie" in v["1495591"] and "LIMITA" not in v["1495591"], v["1495591"]
+    assert "containerul web-old" in v["1495591"], v["1495591"]
+    for pid in ("2373195", "3310083"):
+        assert "LIMITA proprie" in v[pid] and "GAZDA" not in v[pid], v[pid]
+        assert "containerul web-prod" in v[pid], v[pid]
+    assert "AMESTEC" in msg, msg
+    assert "1 din lipsa de memorie a GAZDEI" in msg and "2 la LIMITA proprie" in msg, msg
+
+
+def test_kills_that_are_not_in_the_journal_are_counted_apart_not_given_the_found_label(host):
+    """Contorul a urcat cu 3, dar jurnalul (fereastra de 30 de minute, plafonul de nume) arata
+    un singur kill, de limita. Daca mesajul ar scrie "3 la limita de container" ar pune pe
+    celelalte doua o eticheta pe care nimeni n-a citit-o in jurnal - poate erau de gazda.
+    Cele negasite se numara aparte, "fara tip"."""
+    msg, _ = _announce(host, _real_container_limit_kills()[:3], 3, ids={CID_23OCT: "web-prod"})
+    assert len(_victim_lines(msg)) == 1, msg
+    assert "1 la LIMITA proprie" in msg and "2 fara tip" in msg, msg
+    assert "3 la" not in msg and "GAZDA" not in msg and "AMESTEC" not in msg, msg
+
+
+_ONE_GLOBAL_KILL_LINE = _real_global_kill()[2]
+_ONE_LIMIT_KILL_LINE = _real_container_limit_kills()[2]
+_ONE_GLOBAL_CONSTRAINT_LINE = _real_global_kill()[1]
+
+
+@pytest.mark.parametrize("case", ["prefix_global_no_constraint", "prefix_global_allocating_task",
+                                  "prefix_limit_no_constraint", "constraint_without_victim"])
+def test_a_lone_kernel_line_says_only_what_it_says_and_never_borrows_the_missing_one(host, case):
+    """Jurnalul poate avea o linie fara cealalta (fereastra taie in doua, formatul altui nucleu,
+    rotirea jurnalului). `Killed process` singura inca spune felul prin prefixul ei - dar NU
+    spune containerul, deci mesajul nu inventeaza unul; linia `oom-kill:` singura nu e o victima
+    (n-are pid de omorat, RSS, nume) si nu produce nici nume, nici eticheta."""
+    lines = {"prefix_global_no_constraint": [_ONE_GLOBAL_KILL_LINE],
+             "prefix_global_allocating_task": [_ONE_GLOBAL_KILL_LINE.replace(
+                 "Out of memory:", "Out of memory (oom_kill_allocating_task):")],
+             "prefix_limit_no_constraint": [_ONE_LIMIT_KILL_LINE],
+             "constraint_without_victim": [_ONE_GLOBAL_CONSTRAINT_LINE]}[case]
+    msg, r = _announce(host, lines, 1, ids={CID_21OCT: "web-old", CID_23OCT: "web-prod"})
+    assert r.name_lookups == [], r.name_lookups
+    if case == "constraint_without_victim":
+        assert _victim_lines(msg) == [] and "nu l-am gasit" in msg and "nu se stie" in msg, msg
+        assert "Tip:" not in msg and "GAZDA" not in msg and "LIMITA" not in msg, msg
+        return
+    v = _victim_lines(msg)
+    assert len(v) == 1 and "containerul" not in v[0], msg
+    if case.startswith("prefix_global"):
+        assert "GAZDA fara memorie" in v[0] and "LIMITA" not in msg, msg
+    else:
+        assert "LIMITA proprie de memorie atinsa de un cgroup necunoscut" in v[0] and "GAZDA" not in msg, msg
+
+
+@pytest.mark.parametrize("case", ["global_prefix_with_memcg_constraint", "memcg_prefix_with_none_constraint",
+                                  "global_prefix_with_cpuset_constraint"])
+def test_a_prefix_and_a_constraint_that_disagree_are_unclear_not_picked(host, case):
+    """Prefixul liniei `Killed process` si `constraint=` vin din aceeasi conditie a nucleului, deci
+    nu ar trebui sa difere - dar o legare gresita dupa pid sau alt nucleu le poate rupe. Cand se
+    contrazic (sau constraint-ul nu e nici NONE, nici MEMCG: CPUSET inseamna "memorie restransa la
+    anumite noduri", nu "gazda plina"), mesajul spune "neclar": nu alege in locul operatorului
+    si nu pune numele unui container pe care nu-l poate sustine."""
+    if case == "memcg_prefix_with_none_constraint":
+        lines = [l.replace("CONSTRAINT_MEMCG", "CONSTRAINT_NONE") for l in _real_container_limit_kills()[:3]]
+    elif case == "global_prefix_with_memcg_constraint":
+        lines = [l.replace("CONSTRAINT_NONE", "CONSTRAINT_MEMCG") for l in _real_global_kill()]
+    else:
+        lines = [l.replace("CONSTRAINT_NONE", "CONSTRAINT_CPUSET") for l in _real_global_kill()]
+    msg, r = _announce(host, lines, 1, ids={CID_21OCT: "web-old", CID_23OCT: "web-prod"})
+    v = _victim_lines(msg)
+    assert len(v) == 1 and v[0].endswith(" - tip neclar"), v
+    assert "1 neclar" in msg, msg
+    assert "GAZDA" not in msg and "LIMITA" not in msg and "AMESTEC" not in msg, msg
+    assert "containerul" not in msg and r.name_lookups == [], msg
+
+
+def test_the_victim_is_paired_with_its_own_oom_kill_line_by_pid(host):
+    """Linia `oom-kill:` a unui kill (pid 777, limita unui container) nu are voie sa treaca pe
+    victima UNUI ALT kill (pid 888, prefix global, fara linia lui): operatorul ar vedea numele
+    unui container care n-are nicio legatura si "limita" pentru o gazda plina. Legarea e dupa
+    pid, nu dupa "ultima linie `oom-kill:` vazuta"."""
+    cg = f"/system.slice/docker-{CID_23OCT}.scope"
+    stray = _k(T_23, f"oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=x,mems_allowed=0,"
+                     f"oom_memcg={cg},task_memcg={cg},task=other,pid=777,uid=0")
+    victim = _k(T_23, "Out of memory: Killed process 888 (victim-b) total-vm:1kB, anon-rss:2048kB, "
+                      "file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:1kB oom_score_adj:0")
+    msg, r = _announce(host, [stray, victim], 1, ids={CID_23OCT: "web-prod"})
+    v = _victim_lines(msg)
+    assert len(v) == 1 and "victim-b" in v[0] and "GAZDA fara memorie" in v[0], v
+    assert "web-prod" not in msg and "LIMITA" not in msg and r.name_lookups == [], msg
+
+
+def test_an_oom_kill_line_is_used_once_so_a_reused_pid_does_not_inherit_it(host):
+    """Pid-urile se refolosesc. Un kill de limita (pid 777, containerul X) urmat, in aceeasi
+    fereastra de 30 de minute, de un kill GLOBAL al unui alt proces care a primit tot pid 777,
+    dar a carui linie `oom-kill:` lipseste din jurnal: al doilea nu are voie sa mosteneasca
+    containerul si "limita" primului. Linia `oom-kill:` se consuma la prima victima."""
+    cg = f"/system.slice/docker-{CID_23OCT}.scope"
+    oomline = _k(T_23, f"oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=x,mems_allowed=0,"
+                       f"oom_memcg={cg},task_memcg={cg},task=first,pid=777,uid=0")
+    first = _k(T_23, "Memory cgroup out of memory: Killed process 777 (first) total-vm:1kB, anon-rss:2048kB, "
+                     "file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:1kB oom_score_adj:0")
+    second = _k("2026-10-23T04:20:00+0300", "Out of memory: Killed process 777 (second) total-vm:1kB, "
+                "anon-rss:4096kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:1kB oom_score_adj:0")
+    msg, _ = _announce(host, [oomline, first, second], 2, ids={CID_23OCT: "web-prod"})
+    v = _victim_lines(msg)
+    assert len(v) == 2, msg
+    assert v[0].startswith("  • first (pid 777") and "LIMITA proprie de memorie atinsa de containerul web-prod" in v[0], v[0]
+    assert v[1].startswith("  • second (pid 777") and v[1].endswith("GAZDA fara memorie"), v[1]
+
+
+def test_a_padded_pid_in_the_oom_kill_line_is_still_paired(host):
+    """Nucleul scrie pid-ul si uid-ul din linia `oom-kill:` cu latime fixa pe unele versiuni
+    (`pid=  412,uid=  100`; gazda de azi le scrie fara spatii). Un pid mic, cu spatii in fata, nu
+    are voie sa piarda legatura cu victima: mesajul ar numi tipul dupa prefix, dar fara containerul
+    din linia `oom-kill:`, iar operatorul nu ar sti ce container a fost."""
+    lines = [l.replace("pid=1495591,uid=100", "pid=  412,uid=  100").replace("Killed process 1495591", "Killed process 412")
+             for l in _real_global_kill()]
+    assert any("pid=  412,uid=  100" in l for l in lines) and any("Killed process 412 " in l for l in lines)
+    msg, _ = _announce(host, lines, 1, ids={CID_21OCT: "web-prod"})
+    v = _victim_lines(msg)
+    assert len(v) == 1 and "(pid 412," in v[0], msg
+    assert "GAZDA fara memorie; victima rula in containerul web-prod" in v[0], v[0]
+
+
+def test_a_process_name_cannot_steer_which_oom_kill_line_it_is_paired_with(host):
+    """Numele procesului sta in linia `oom-kill:` inaintea pid-ului real si il alege procesul.
+    Un nume ca `,pid=42,uid=` (12 caractere, incape in cei 15 ai nucleului) ar face o citire
+    "primul pid din linie" sa lege kill-ul de pid 42 si sa piarda containerul victimei reale.
+    Pid-ul e ULTIMUL `,pid=N,uid=` din linie, cum il scrie nucleul."""
+    lines = [l.replace("task=next-server (v,pid=1495591,uid=100", "task=,pid=42,uid=,pid=1495591,uid=100")
+             for l in _real_global_kill()]
+    assert any(",pid=42,uid=,pid=1495591" in l for l in lines)
+    msg, _ = _announce(host, lines, 1, ids={CID_21OCT: "web-prod"})
+    v = _victim_lines(msg)
+    assert len(v) == 1 and "GAZDA fara memorie; victima rula in containerul web-prod" in v[0], msg
+
+
+@pytest.mark.parametrize("case", ["named", "docker_down", "container_gone", "hostile_name"])
+def test_the_container_is_named_by_docker_and_degrades_to_the_short_id_never_to_silence(host, case):
+    """`runc:[2:INIT]` nu spune nimic; numele containerului spune totul - dar il da doar docker, iar
+    docker poate fi cazut (exact cand gazda e sufocata), containerul recreat intre timp, sau
+    raspunsul poate fi altceva decat un nume. In toate cazurile kill-ul se anunta oricum, cu id-ul
+    scurt (12 caractere) in locul numelui si cu spusa ca numele nu s-a aflat; nu se apeleaza un
+    demon care deja n-a raspuns in rularea asta, iar un text neasteptat de la docker nu ajunge
+    in mesaj."""
+    short = CID_23OCT[:12]
+    ids = {"named": {CID_23OCT: "web-prod"}, "docker_down": {CID_23OCT: "web-prod"},
+           "container_gone": {}, "hostile_name": {CID_23OCT: "web prod\x1b[31m;evil"}}[case]
+    env = {"FAKE_DOCKER_INFO_RC": "1"} if case == "docker_down" else None
+    msg, r = _announce(host, _real_container_limit_kills()[3:], 1, ids=ids, env=env)
+    v = _victim_lines(msg)
+    assert len(v) == 1 and "runc:[2:INIT]" in v[0], msg
+    if case == "named":
+        assert "atinsa de containerul web-prod" in v[0] and short not in msg, v[0]
+        assert len(r.name_lookups) == 1 and CID_23OCT in r.name_lookups[0], r.name_lookups
+        return
+    assert f"atinsa de containerul {short} (numele nu l-am aflat)" in v[0], v[0]
+    assert "\x1b" not in msg and "evil" not in msg, repr(msg)
+    if case == "docker_down":
+        assert r.name_lookups == [], "s-a apelat un demon care nu raspunsese"
+        assert any("sys:docker" in m for m in r.msgs) or any("Docker daemon" in m for m in r.msgs), r.msgs
+    else:
+        assert len(r.name_lookups) == 1, r.name_lookups
+    assert _oom_state(host) == "1", "baza nu a avansat desi mesajul a plecat"
+
+
+def test_the_container_named_for_a_limit_is_the_one_that_hit_it_not_the_victims_leaf(host):
+    """La o limita de container, victima poate sta intr-un cgroup copil al containerului
+    (`task_memcg=.../docker-ID.scope/sub`), iar `oom_memcg=` e cel care si-a atins limita.
+    Daca mesajul ar numi frunza victimei, operatorul ar citi "sub" in loc de containerul a carui
+    limita trebuie ridicata."""
+    lines = [l.replace(f"task_memcg=/system.slice/docker-{CID_23OCT}.scope",
+                       f"task_memcg=/system.slice/docker-{CID_23OCT}.scope/sub")
+             for l in _real_container_limit_kills()[:3]]
+    assert any("scope/sub,task=" in l for l in lines)
+    msg, _ = _announce(host, lines, 1, ids={CID_23OCT: "web-prod"})
+    v = _victim_lines(msg)
+    assert len(v) == 1 and v[0].endswith("atinsa de containerul web-prod"), v
+
+
+@pytest.mark.parametrize("case", ["pipe_in_cgroup_name", "very_long_cgroup_name"])
+def test_a_cgroup_name_from_the_journal_cannot_break_the_message_fields_or_flood_it(host, case):
+    """Numele cgroup-ului ajunge in mesaj si trece printr-un camp separat de `|`. Un nume cu `|`
+    ar muta campurile: numele victimei ar deveni "inject.service|next-server (v" - operatorul ar
+    citi un proces care nu exista. Unul foarte lung ar acoperi mesajul. Un nume ciudat nu se
+    foloseste deloc (cgroup necunoscut); unul lung se taie la 40."""
+    leaf = "evil|inject.service" if case == "pipe_in_cgroup_name" else "x" * 60 + ".service"
+    lines = [l.replace(f"docker-{CID_23OCT}.scope", leaf) for l in _real_container_limit_kills()[:3]]
+    msg, r = _announce(host, lines, 1, ids={CID_23OCT: "web-prod"})
+    v = _victim_lines(msg)
+    assert len(v) == 1 and r.name_lookups == [], msg
+    if case == "pipe_in_cgroup_name":
+        assert v[0].startswith("  • next-server (v (pid 2373195,") and "inject" not in msg, v[0]
+        assert v[0].endswith("atinsa de un cgroup necunoscut"), v[0]
+    else:
+        assert "cgroup-ul " + "x" * 40 in v[0] and "x" * 41 not in v[0], v[0]
+
+
+def test_a_limit_hit_by_a_plain_service_names_the_cgroup_and_does_not_ask_docker(host):
+    """Nu orice cgroup cu limita e un container: un serviciu systemd cu `MemoryMax=` isi atinge
+    limita la fel. Mesajul numeste atunci cgroup-ul (`shop-api.service`), nu inventeaza un
+    "container" si nu intreaba docker despre ceva ce nu e al lui."""
+    lines = [l.replace(f"docker-{CID_23OCT}.scope", "shop-api.service") for l in _real_container_limit_kills()[:3]]
+    msg, r = _announce(host, lines, 1, ids={CID_23OCT: "web-prod"})
+    v = _victim_lines(msg)
+    assert len(v) == 1 and "LIMITA proprie de memorie atinsa de cgroup-ul shop-api.service" in v[0], msg
+    assert "containerul" not in msg.replace("a unui container", "") and r.name_lookups == [], msg
 
 
 # ===========================================================================
