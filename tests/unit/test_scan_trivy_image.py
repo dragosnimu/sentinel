@@ -919,22 +919,27 @@ def test_too_many_containers_are_refused(gazda, monkeypatch) -> None:
     assert [c[1] for c in gazda.calls if c[0] == DOCKER] == ["version", "ps"]
 
 
-def test_more_findings_than_the_cap_are_refused_and_not_truncated(
+def test_one_image_over_the_whole_budget_is_not_truncated_to_fit(
         gazda, monkeypatch) -> None:
-    """O listă tăiată e mai periculoasă decât niciuna.
+    """O imagine peste tot bugetul nu se taie la buget; si fara ea nu ramane nimic.
 
     Eșecul pe care îl previne: 3000 de constatări tăiate la plafon ar fi urmate de
     `mark_resolved_absent`, care ar marca restul drept REZOLVATE. Panoul ar arăta
-    mai puține vulnerabilități tocmai fiindcă sunt mai multe.
+    mai puține vulnerabilități tocmai fiindcă sunt mai multe. Aici imaginea e
+    SINGURA, deci rularea nu are ce preda: e un eșec cu numele imaginii, nu un
+    `completed` cu zero constatări (minciuna din migrația 0029).
     """
     monkeypatch.setattr(trivy_image, "MAX_FINDINGS", 2)
     gazda.containers([("a" * 64, IMG_NGINX, "nginx:1.27", "web")])
     gazda.reports["*"] = SAMPLE
     items, eroare, fapte = run(trivy_image.scan())
 
-    assert items == []
-    assert eroare and "plafonul de 2" in eroare
-    assert fapte["total"] == 3, "numărul real trebuie să ajungă pe rândul `failed`"
+    assert items == [], "constatările imaginii peste buget au fost ingerate (tăiate?)"
+    assert eroare and "niciuna nu a putut fi ingerată" in eroare
+    assert "nginx:1.27" in eroare and "3 constatări" in eroare, (
+        f"eroarea nu numește imaginea și cât are: {eroare!r}")
+    assert fapte["coverage"] is None, (
+        "acoperirea e scrisă pe un drum de eroare, unde nu s-a ingerat nimic")
 
 
 def test_the_budget_deadline_refuses_instead_of_ingesting_half(
@@ -1070,7 +1075,8 @@ class _DB:
     pragul de severitate — implicit zero, ca o bază fără istoric.
     """
 
-    def __init__(self, sub_prag: int = 0) -> None:
+    def __init__(self, sub_prag: int = 0, open_at_skipped: int = 0,
+                 fail_upsert_after: int | None = None) -> None:
         self.scans: list[dict] = []
         self.finished: list[dict] = []
         self.upserted: list[dict] = []
@@ -1080,6 +1086,13 @@ class _DB:
         self.resolve_calls: list[tuple] = []
         self.counted: list[tuple] = []
         self.sub_prag = sub_prag
+        # Numaratoarea „cate au ramas deschise pe imaginile sarite" e o alta
+        # interogare decat cea de sub prag; ordinea in care ruleaza fata de
+        # rezolvare se aserteaza din `events`.
+        self.open_at_skipped = open_at_skipped
+        self.counted_at: list[tuple] = []
+        self.events: list[str] = []
+        self.fail_upsert_after = fail_upsert_after
 
     async def fetchval(self, sql, *args):
         if "INSERT INTO scans" in sql:
@@ -1087,17 +1100,25 @@ class _DB:
                                "triggered_by": args[3]})
             return len(self.scans)
         if "SELECT count(*) FROM findings" in sql:
+            if "location = ANY" in sql:
+                self.events.append("count_at_skipped")
+                self.counted_at.append((sql, args))
+                return self.open_at_skipped
             self.counted.append((sql, args))
             return self.sub_prag
         return 0
 
     async def fetchrow(self, sql, *args):
+        if (self.fail_upsert_after is not None
+                and len(self.upserted) >= self.fail_upsert_after):
+            raise RuntimeError("conexiunea cu baza a cazut la ingestie")
         self.upserted.append({"finding_key": args[0], "scanner": args[2],
                               "cve": args[3], "location": args[16]})
         return {"is_new": True, "status": "open"}
 
     async def fetch(self, sql, *args):
         if "SET status = 'resolved'" in sql:
+            self.events.append("resolve")
             self.resolved.append((args[0], args[1], args[2]))
             self.resolve_calls.append((sql, args))
         return []
@@ -1106,7 +1127,8 @@ class _DB:
         if "UPDATE scans SET" in sql:
             self.finished.append({"id": args[0], "status": args[1],
                                   "findings_count": args[2], "error": args[6],
-                                  "db_version": args[7]})
+                                  "db_version": args[7], "target": args[8],
+                                  "sql": sql})
 
 
 def _no_kev(monkeypatch):
@@ -1560,3 +1582,640 @@ def test_the_docker_group_cost_is_written_down_where_it_is_read() -> None:
     assert "docker" in rand, (
         f"rândul din modelul de amenințare nu spune că `sentinel` e în grupul "
         f"docker: {rand}")
+
+
+# --------------------------------------------------------------------------
+# Bugetul pe imagine: o imagine care nu incape se numeste, nu orbeste flota
+# --------------------------------------------------------------------------
+#
+# Rularea din 23 octombrie 2026 ingera 2532 de constatari fata de un plafon de
+# 2500 si refuza TOT: aplicatiile operatorului (aproape nimic) se pierdeau
+# impreuna cu `waha` (1602) si `snipe-it` (530). Testele de mai jos fixeaza
+# comportamentul care il lasa sa vada ce incape si sa afle pe nume ce nu.
+def _synthetic_report(image_id: str, *, critical: int = 0, high: int = 0,
+                      unknown: int = 0, label: str = "x") -> dict:
+    """Un raport `trivy image` cu exact atatea constatari din fiecare fel."""
+    vulns = []
+    for severity, count in (("CRITICAL", critical), ("HIGH", high),
+                            ("UNKNOWN", unknown)):
+        for _ in range(count):
+            k = len(vulns)
+            vulns.append({"VulnerabilityID": f"CVE-2026-{label}{k:05d}",
+                          "PkgName": f"{label}-pkg{k}", "Severity": severity,
+                          "InstalledVersion": "1.0", "FixedVersion": "1.1",
+                          "Title": f"{label} {k}"})
+    return {"SchemaVersion": 2, "ArtifactName": image_id,
+            "Metadata": {"ImageID": f"sha256:{image_id}",
+                         "OS": {"Family": "debian", "Name": "12"}},
+            "Results": [{"Target": "t", "Class": "os-pkgs", "Type": "debian",
+                         "Vulnerabilities": vulns}] if vulns else None}
+
+
+def _image_id(n: int) -> str:
+    return f"{n:064x}"
+
+
+def _fleet(gazda, sizes: dict[str, int]) -> dict[str, str]:
+    """Containere pentru `sizes` ({referinta: constatari}); intoarce {ref: id}."""
+    ids = {ref: _image_id(i + 1) for i, ref in enumerate(sizes)}
+    gazda.containers([(f"{i + 1:064x}"[::-1], ids[ref], ref, f"c{i}")
+                      for i, ref in enumerate(sizes)])
+    for ref, n in sizes.items():
+        gazda.reports[ids[ref]] = _synthetic_report(ids[ref], high=n, label=f"i{ids[ref][-2:]}")
+    return ids
+
+
+def test_images_that_fit_are_ingested_when_another_one_blows_the_budget(
+        gazda, monkeypatch) -> None:
+    """O imagine uriasa nu are voie sa ia cu ea aplicatiile operatorului.
+
+    Eșecul pe care îl previne: starea din 23 octombrie 2026. Un singur total peste
+    plafon și rularea refuza totul — operatorul pierdea constatările propriilor
+    aplicații, care sunt aproape nimic, odată cu cele două imagini străine care
+    adunau 82%. Aici: două imagini mici încap, una uriașă nu, și ce încape trebuie
+    să ajungă în bază.
+    """
+    monkeypatch.setattr(trivy_image, "MAX_FINDINGS", 10)
+    _fleet(gazda, {"app-a": 3, "app-b": 4, "third-party": 50})
+    items, eroare, fapte = run(trivy_image.scan())
+
+    assert eroare is None, eroare
+    assert {i["location"] for i in items} == {"app-a", "app-b"}
+    assert len(items) == 7
+    cov = fapte["coverage"]
+    assert cov["ingested"] == ["app-a", "app-b"]
+    (sarita,) = cov["skipped"]
+    assert sarita["reference"] == "third-party"
+    assert sarita["reason"] == trivy_image.REASON_IMAGE
+    assert sarita["findings"] == 50, "imaginii sărite i se spune câte constatări are"
+
+
+def test_an_image_over_the_budget_alone_is_skipped_whole_and_never_cut(
+        gazda, monkeypatch) -> None:
+    """Imaginea peste buget nu se ingerează „cât încape" — ori toată, ori deloc.
+
+    Eșecul pe care îl previne: o imagine de 50 de constatări tăiată la 10 ar
+    lăsa 40 de rânduri ale ei absente din `seen_keys`. Chiar cu garda pe
+    `location` ele ar rămâne deschise, dar cele 10 ingerate ar fi reîmprospătate
+    și celelalte 40 nu — o imagine pe jumătate măsurată, prezentată întreagă.
+    """
+    monkeypatch.setattr(trivy_image, "MAX_FINDINGS", 10)
+    _fleet(gazda, {"app-a": 3, "third-party": 50})
+    items, _eroare, fapte = run(trivy_image.scan())
+
+    assert "third-party" not in {i["location"] for i in items}, (
+        "constatări ale imaginii peste buget au ajuns în lista de ingerat")
+    assert fapte["total"] == 3
+
+
+def test_the_largest_image_is_the_one_left_out_when_the_sum_binds(
+        gazda, monkeypatch) -> None:
+    """Când suma depășește, cade imaginea cea mai MARE, nu una aleasă la întâmplare.
+
+    Eșecul pe care îl previne: bugetul aplicat „în ordinea în care a venit
+    docker", deci o aplicație mică a operatorului ar putea fi cea sărită iar o
+    imagine străină de o mie de rânduri ar rămâne. Fiecare încape singură (3, 4,
+    5 față de 10), dar împreună fac 12.
+    """
+    monkeypatch.setattr(trivy_image, "MAX_FINDINGS", 10)
+    _fleet(gazda, {"zz-big": 5, "aa-small": 3, "mm-mid": 4})
+    items, _eroare, fapte = run(trivy_image.scan())
+
+    cov = fapte["coverage"]
+    assert cov["ingested"] == ["aa-small", "mm-mid"]
+    (sarita,) = cov["skipped"]
+    assert (sarita["reference"], sarita["reason"]) == (
+        "zz-big", trivy_image.REASON_BUDGET)
+    assert cov["admitted_findings"] == 7 and len(items) == 7
+
+
+def _fake_image(ref: str, n: int):
+    # Id deterministic (`hash(str)` difera de la o rulare la alta): departajarea
+    # testata e pe NUME, nu pe id.
+    image = trivy_image.RunningImage(image_id=_image_id(ord(ref[0])),
+                                     reference=ref, containers=())
+    return image, [{"severity": "high"} for _ in range(n)]
+
+
+def test_the_outcome_does_not_depend_on_the_order_images_arrive_in() -> None:
+    """Aceeași flotă dă aceeași listă de sărite oricum le-ar enumera docker.
+
+    Eșecul pe care îl previne: o repornire de container schimbă ordinea din
+    `docker ps`, iar imaginea sărită se mută de la o noapte la alta fără ca ceva
+    din flotă să se fi schimbat — constatările ei ar apărea și ar dispărea din
+    panou după un criteriu pe care nimeni nu-l poate explica. Include două
+    imagini cu ACELAȘI număr de constatări: departajarea trebuie să fie pe nume.
+    Se compară cu definiția, nu cu o a doua copie a algoritmului: cel mai lung
+    prefix, în ordinea (mărime, nume), a cărui sumă încape.
+    """
+    import itertools
+
+    sizes = {"b": 2, "a": 2, "c": 5, "d": 1, "e": 5}
+    # 10: d, a, b, c încap (sumă 10), iar e nu — dintre c și e, TOT ce le
+    # deosebește e numele. Cu un buget de 9 ar cădea amândouă și departajarea n-ar
+    # mai conta (un test care trece oricum nu apără nimic).
+    budget = 10
+    asteptat_ingerate = []
+    total = 0
+    for ref, n in sorted(sizes.items(), key=lambda kv: (kv[1], kv[0])):
+        if total + n > budget:
+            break
+        asteptat_ingerate.append(ref)
+        total += n
+    assert asteptat_ingerate == ["d", "a", "b", "c"], (
+        "fixtura nu mai testează departajarea")
+
+    vazute = set()
+    for perm in itertools.permutations(sizes):
+        adm = trivy_image.Admission(budget)
+        for ref in perm:
+            adm.offer(*_fake_image(ref, sizes[ref]))
+        cov = adm.coverage(len(sizes))
+        vazute.add((tuple(cov["ingested"]),
+                    tuple(sk["reference"] for sk in cov["skipped"])))
+    assert vazute == {(("a", "b", "c", "d"), ("e",))}, (
+        f"rezultatul depinde de ordinea sosirii: {sorted(vazute)}")
+
+
+def test_an_oversized_report_skips_that_image_and_not_the_run(
+        gazda, monkeypatch) -> None:
+    """Un raport prea mare pentru memorie nu mai orbește toate containerele.
+
+    Eșecul pe care îl previne: raportul unei singure imagini peste
+    `MAX_OUTPUT_BYTES` întorcea o eroare pentru întreaga rulare — aceeași formă
+    de orbire totală ca plafonul de constatări, de la o singură imagine. Mărimea
+    e un fapt MĂSURAT despre imaginea aceea (o repetare nu o schimbă), spre
+    deosebire de o cădere a lui trivy. Numărul ei de constatări nu se știe —
+    raportul nu s-a citit — și se spune așa, nu ca zero.
+    """
+    gazda.containers([("a" * 64, IMG_NGINX, "nginx:1.27", "web"),
+                      ("b" * 64, IMG_APP, "zz-app:2.3", "app")])
+    gazda.reports = {IMG_NGINX: SAMPLE, IMG_APP: CLEAN}
+    mic = len(json.dumps(CLEAN))
+    mare = len(json.dumps(SAMPLE))
+    assert mic < mare
+    monkeypatch.setattr(trivy_fs, "MAX_OUTPUT_BYTES", mic + 10)
+
+    items, eroare, fapte = run(trivy_image.scan())
+    assert eroare is None, eroare
+    cov = fapte["coverage"]
+    assert cov["ingested"] == ["zz-app:2.3"], (
+        "imaginea curată (zero constatări) trebuie să conteze ca ingerată")
+    (sarita,) = cov["skipped"]
+    assert sarita["reference"] == "nginx:1.27"
+    assert sarita["reason"] == trivy_image.REASON_REPORT
+    assert sarita["findings"] is None, "un număr necitit a fost scris ca număr"
+    assert items == []
+
+
+def test_a_skipped_image_records_what_severities_the_operator_is_not_shown() -> None:
+    """„O imagine sărită" cu 34 de CRITICAL nu e același lucru cu una cu 3 MEDIUM.
+
+    Eșecul pe care îl previne: alerta spune doar numele și numărul total, iar
+    operatorul nu poate judeca cât de urgent e să facă loc bugetului. Cifrele vin
+    din ce s-a parsat (severitatea de la ingestie, steagul `severity_known`).
+    """
+    items = trivy_image.parse(
+        _synthetic_report(_image_id(9), critical=2, high=3, unknown=4, label="q"),
+        reference="r", image_id=_image_id(9))
+    adm = trivy_image.Admission(5)
+    adm.offer(trivy_image.RunningImage(_image_id(9), "r", ()), items)
+    (sk,) = adm.skipped
+    assert (sk.findings, sk.critical, sk.high, sk.unrated) == (9, 2, 3, 4)
+
+
+# --- orchestratorul: garda pe imagine si ce scrie pe rand -------------------
+def _coverage(skipped=(), ingested=("nginx:1.27",), images=None, admitted=3):
+    return {"images": images if images is not None else len(skipped) + len(ingested),
+            "ingested": list(ingested), "admitted_findings": admitted,
+            "budget": trivy_image.MAX_FINDINGS,
+            "skipped": [{"reference": ref, "image_id": _image_id(7),
+                         "reason": trivy_image.REASON_BUDGET, "findings": n,
+                         "critical": c, "high": h, "unrated": u,
+                         "report_bytes": None}
+                        for ref, n, c, h, u in skipped]}
+
+
+WAHA = ("devlikeapro/waha:latest", 1602, 34, 918, 650)
+
+
+def test_a_skipped_image_is_fenced_off_from_resolution(monkeypatch) -> None:
+    """Imaginea sărită nu e imaginea reparată.
+
+    Eșecul pe care îl previne: constatările lui `waha` lipsesc din `seen_keys`
+    fiindcă rularea nu le-a luat, nu fiindcă s-au reparat. Fără `skip_locations`,
+    `mark_resolved_absent` le-ar închide pe toate cele 1522 deschise ca
+    `absent_from_latest_scan`, iar panoul ar anunța o imagine cu 34 de CRITICAL
+    ca rezolvată într-o noapte în care nimeni n-a atins-o.
+    """
+    _probe(monkeypatch, trivy_image.DOCKER_READY)
+    _no_kev(monkeypatch)
+    _merge_stub(monkeypatch, facts={"coverage": _coverage(skipped=[WAHA])})
+    db = _DB(open_at_skipped=1522)
+    run(orchestrator._run_trivy_image(db, "test"))
+
+    (sql, args) = db.resolve_calls[0]
+    assert "location = ANY" in sql, f"rezolvarea nu e îngrădită pe imagine: {sql}"
+    assert ["devlikeapro/waha:latest"] in [list(a) for a in args if isinstance(a, list)], (
+        f"imaginea sărită nu e între argumentele rezolvării: {args!r}")
+
+
+def test_the_location_fence_is_numbered_after_the_severity_ones(monkeypatch) -> None:
+    """Un `$N` greșit se vede noaptea, ca o scanare căzută — nu la citire.
+
+    Eșecul pe care îl previne: garda pe `location` se adaugă după cea de
+    severitate cu un număr calculat; cu garda de severitate absentă ocupă `$4`,
+    cu ea prezentă `$6`. O numerotare scrisă de mână pentru un singur caz e
+    respinsă de Postgres la execuție în celălalt: excepție în orchestrator, rând
+    `failed`, nicio constatare ingerată — în fiecare noapte. Se verifică numărul
+    ȘI tipul, ca la garda de severitate, plus că lista goală nu adaugă nimic.
+    """
+    class Rec:
+        def __init__(self):
+            self.calls = []
+
+        async def fetch(self, sql, *args):
+            self.calls.append((sql, args))
+            return []
+
+    async def lansat(**kw):
+        db = Rec()
+        await fx.mark_resolved_absent(db, "trivy_image", None, ["k"], **kw)
+        return db.calls[0]
+
+    for eticheta, kw, asteptat_param in (
+            ("cu garda de severitate", dict(visible_severities=["high"],
+                                            visible_unscored=True,
+                                            skip_locations=["img:1"]), 6),
+            ("fără garda de severitate", dict(skip_locations=["img:1"]), 4)):
+        sql, args = run(lansat(**kw))
+        numere = {int(n) for n in re.findall(r"\$(\d+)", sql)}
+        assert numere == set(range(1, len(args) + 1)), (
+            f"{eticheta}: textul folosește {sorted(numere)}, se trimit {len(args)}")
+        assert f"location = ANY(${asteptat_param}::text[])" in sql, (
+            f"{eticheta}: garda pe location nu e pe ${asteptat_param}: {sql}")
+        assert args[asteptat_param - 1] == ["img:1"]
+        # NULL-safe: un rând fără `location` nu aparține nicio imagini sărite.
+        assert "NOT COALESCE(location = ANY" in sql and ", false)" in sql
+
+    for gol in (None, []):
+        sql, args = run(lansat(skip_locations=gol))
+        assert "location" not in sql and len(args) == 3, (
+            f"lista goală de imagini sărite a adăugat o gardă: {sql}")
+
+
+def test_the_completed_row_names_what_was_skipped_and_what_it_covered(
+        monkeypatch) -> None:
+    """Rândul `completed` spune CE imagine lipsește, nu doar că ceva lipsește.
+
+    Eșecul pe care îl previne: «nouă din unsprezece» fără nume nu e acționabil.
+    Operatorul trebuie să afle de pe rând, fără jurnal: care imagine, câte
+    constatări și câte CRITICAL nu i se arată, de ce, câte rânduri vechi au rămas
+    deschise (citite din bază), și ce a acoperit rularea. `target` poartă
+    domeniul în care e adevărată cifra de constatări.
+    """
+    _probe(monkeypatch, trivy_image.DOCKER_READY)
+    _no_kev(monkeypatch)
+    _merge_stub(monkeypatch, facts={"images": 2, "coverage": _coverage(
+        skipped=[WAHA], ingested=("nginx:1.27",), admitted=930)})
+    db = _DB(open_at_skipped=1522)
+    out = run(orchestrator._run_trivy_image(db, "test"))
+
+    (rand,) = db.finished
+    assert rand["status"] == "completed", (
+        "o rulare care a ingerat restul nu e un eșec: cifra ei e adevărată")
+    err = rand["error"]
+    assert "devlikeapro/waha:latest" in err
+    assert "1602 constatări" in err and "34 CRITICAL" in err and "918 HIGH" in err
+    assert "1522" in err, "nu spune cât a rămas deschis pe imaginile sărite"
+    assert "nginx:1.27" in err, "nu spune ce s-a ingerat"
+    assert trivy_image.severity_scope() in rand["target"]
+    assert "1 din 2 imagini ingerate" in rand["target"]
+    assert out["skipped"] == ["devlikeapro/waha:latest"]
+    assert out["skipped_open"] == 1522
+
+
+def test_a_run_that_skipped_nothing_does_not_claim_a_caveat(monkeypatch) -> None:
+    """Fără imagini sărite, rândul rămâne curat: nicio alarmă în fiecare noapte.
+
+    Eșecul pe care îl previne: `error` completat pe fiecare rulare (de pildă cu
+    «0 imagini sărite»). `check_last_scan` citește orice `error` de pe un rând
+    `completed` ca „nu a acoperit tot" și ar da `degraded` permanent — alarma care
+    sună mereu îl învață pe operator s-o ignore, inclusiv pe cea adevărată.
+    """
+    _probe(monkeypatch, trivy_image.DOCKER_READY)
+    _no_kev(monkeypatch)
+    _merge_stub(monkeypatch, facts={"coverage": _coverage(ingested=("nginx:1.27",))})
+    db = _DB()
+    out = run(orchestrator._run_trivy_image(db, "test"))
+
+    (rand,) = db.finished
+    assert rand["status"] == "completed" and rand["error"] is None
+    assert "1 din 1 imagini ingerate" in rand["target"]
+    assert out["skipped"] == [] and db.counted_at == [], (
+        "s-a făcut o interogare pentru imagini sărite când nu era niciuna")
+
+
+def test_what_stays_open_is_counted_from_the_database_after_the_resolve(
+        monkeypatch) -> None:
+    """Numărul rămas deschis e citit DUPĂ rezolvare, din bază — nu presupus.
+
+    Eșecul pe care îl previne: «rămân deschise N» calculat din ce intenționăm,
+    adică confirmarea intenției în locul efectului. Dacă garda ar cădea, numărul
+    intenționat ar spune tot N, iar cel citit din bază după rezolvare ar spune 0.
+    """
+    _probe(monkeypatch, trivy_image.DOCKER_READY)
+    _no_kev(monkeypatch)
+    _merge_stub(monkeypatch, facts={"coverage": _coverage(skipped=[WAHA])})
+    db = _DB(open_at_skipped=0)
+    run(orchestrator._run_trivy_image(db, "test"))
+
+    assert db.events.index("resolve") < db.events.index("count_at_skipped"), (
+        f"numărătoarea rulează înaintea rezolvării: {db.events}")
+    (rand,) = db.finished
+    assert "(0)" in rand["error"], (
+        "numărul din bază (0) nu ajunge pe rând; s-a scris altceva")
+
+
+def test_an_ingest_that_dies_midway_names_the_skipped_but_not_the_ingested(
+        monkeypatch) -> None:
+    """Un rând `failed` după decizie păstrează imaginile sărite, dar nu minte.
+
+    Eșecul pe care îl previne: două direcții. (1) Ingestia cade la a treia
+    constatare și rândul `failed` poartă doar «conexiunea a căzut» — operatorul
+    nu mai află că `waha` fusese oricum sărită. (2) Rândul ar scrie «Ingerate
+    (1): nginx» deși ingestia n-a terminat: o afirmație despre un efect pe care
+    nu l-am verificat.
+    """
+    _probe(monkeypatch, trivy_image.DOCKER_READY)
+    _no_kev(monkeypatch)
+    _merge_stub(monkeypatch, facts={"coverage": _coverage(skipped=[WAHA])})
+    db = _DB(fail_upsert_after=2)
+    out = run(orchestrator._run_trivy_image(db, "test"))
+
+    assert out["status"] == "failed"
+    (rand,) = db.finished
+    assert rand["status"] == "failed"
+    assert "conexiunea cu baza a cazut" in rand["error"]
+    assert "devlikeapro/waha:latest" in rand["error"]
+    assert "Ingerate (" not in rand["error"], (
+        "rândul cazut afirmă ce s-a ingerat, deși ingestia n-a terminat")
+    assert db.resolved == [], "o ingestie căzută a rezolvat constatări"
+
+
+def test_finish_scan_without_a_target_keeps_the_one_written_at_open() -> None:
+    """Ceilalți scanere nu își pierd `target`-ul fiindcă `finish_scan` a învățat unul.
+
+    Eșecul pe care îl previne: `SET target = $9` cu `None` din apelurile vechi —
+    coloana e `NOT NULL`, deci fiecare rulare de `dnf` și `trivy_fs` ar cădea la
+    închiderea rândului, iar rândurile ar rămâne `running` până la pragul de
+    «blocat». `COALESCE` e ce face parametrul opțional.
+    """
+    class Rec:
+        def __init__(self):
+            self.calls = []
+
+        async def execute(self, sql, *args):
+            self.calls.append((sql, args))
+
+    db = Rec()
+    run(fx.finish_scan(db, 1, status="completed"))
+    (sql, args) = db.calls[0]
+    assert "COALESCE($9, target)" in sql, f"target fără COALESCE: {sql}"
+    assert args[8] is None
+
+    run(fx.finish_scan(db, 1, status="completed", target="nou"))
+    assert db.calls[1][1][8] == "nou"
+
+
+def test_count_open_at_locations_asks_nothing_when_nothing_was_skipped() -> None:
+    """Fără imagini sărite nu se interoghează baza pentru ele.
+
+    Eșecul pe care îl previne: o interogare în plus în fiecare noapte curată, a
+    cărei cădere ar muta o rulare bună în `failed`. Un număr care nu se cere nu
+    are cum să strice nimic.
+    """
+    class Rec:
+        def __init__(self):
+            self.calls = 0
+
+        async def fetchval(self, sql, *args):
+            self.calls += 1
+            return 5
+
+    db = Rec()
+    assert run(fx.count_open_at_locations(db, "trivy_image", None, [])) == 0
+    assert db.calls == 0
+    assert run(fx.count_open_at_locations(db, "trivy_image", None, ["x"])) == 5
+
+
+# --- noaptea de 23 octombrie 2026, cu cifrele masurate ----------------------
+def test_last_nights_fleet_ingests_ten_images_and_names_waha(
+        gazda, monkeypatch) -> None:
+    """Noaptea care a orbit panoul, rejucată cu cifrele ei reale.
+
+    Eșecul pe care îl previne: 2532 de constatări pe 11 imagini față de plafonul
+    de 2500 → «trivy image scan failed … nu se ingerează nimic». Cifrele: `waha`
+    1602 (34 CRITICAL, 918 HIGH, 650 UNKNOWN) și `snipe-it` 530 (50 / 479 / 1) sunt
+    MĂSURATE cu trivy pe gazdă pe 23 octombrie; restul de 400 e împărțit pe cele
+    nouă imagini după proporțiile din `findings` de pe 22 octombrie (+11 la
+    prima), deci împărțirea e aproximativă — totalul de 2532 nu e.
+
+    Cap la cap: scanerul adevărat, orchestratorul adevărat, verificarea adevărată
+    citind rândul pe care l-a scris orchestratorul. Cu plafonul NEATINS (2500),
+    suma depășește cu 32 → cade imaginea cea mai mare, `waha`, și toate celelalte
+    zece intră. Operatorul vede asta pe `scan:last:trivy_image`, cu nume.
+    """
+    from sentinel.selfcheck import checks
+
+    # Numele aplicatiilor operatorului sunt inlocuite (repository-ul e public);
+    # imaginile straine (mariadb, postgres, waha, snipe-it) sunt cele reale.
+    altele = {"app-alpha": 93, "mariadb:11.4.7": 70, "app-beta:latest": 46,
+              "app-gamma:latest": 46, "app-delta": 43, "app-delta-worker": 43,
+              "postgres:16-alpine": 27, "app-eps-api": 16, "app-eps-worker": 16}
+    assert sum(altele.values()) == 400
+    flota = {"devlikeapro/waha:latest": (34, 918, 650),
+             "snipe/snipe-it:latest": (50, 479, 1),
+             **{ref: (0, n, 0) for ref, n in altele.items()}}
+    ids = {ref: _image_id(i + 1) for i, ref in enumerate(flota)}
+    gazda.containers([(f"{i + 1:064x}"[::-1], ids[ref], ref, f"c{i}")
+                      for i, ref in enumerate(flota)])
+    for ref, (c, h, u) in flota.items():
+        gazda.reports[ids[ref]] = _synthetic_report(
+            ids[ref], critical=c, high=h, unknown=u, label=f"n{ids[ref][-2:]}")
+
+    _probe(monkeypatch, trivy_image.DOCKER_READY)
+    _no_kev(monkeypatch)
+    db = _DB(open_at_skipped=1522)
+    out = run(orchestrator._run_trivy_image(db, "schedule"))
+
+    assert out["status"] == "completed", out
+    assert out["findings"] == 930 and len(db.upserted) == 930
+    assert "devlikeapro/waha:latest" not in {u["location"] for u in db.upserted}
+    assert {u["location"] for u in db.upserted} == set(flota) - {"devlikeapro/waha:latest"}
+    assert out["skipped"] == ["devlikeapro/waha:latest"]
+    # Garda ajunge la rezolvare: fără ea, cele 1522 de rânduri deschise ale lui
+    # `waha` ar fi închise în noaptea în care nu s-a uitat nimeni la ele.
+    (_sql, args_rezolvare) = db.resolve_calls[0]
+    assert ["devlikeapro/waha:latest"] in [
+        list(a) for a in args_rezolvare if isinstance(a, list)]
+
+    (rand,) = db.finished
+    (deschis,) = db.scans
+    acum = datetime.now(timezone.utc)
+
+    class _SelfcheckDB:
+        async def fetch(self, _sql, *_a):
+            return [{"id": 1, "scanner": deschis["scanner"], "status": rand["status"],
+                     "started_at": acum, "finished_at": acum, "error": rand["error"],
+                     "findings_count": rand["findings_count"],
+                     "target": rand["target"],
+                     "ok_started_at": acum, "ok_finished_at": acum,
+                     "ok_findings_count": rand["findings_count"],
+                     "ok_target": rand["target"]}]
+
+        async def fetchval(self, _sql, *args):
+            return (acum - args[0]).total_seconds()
+
+    cfg = SimpleNamespace(scan=SimpleNamespace(enabled=True))
+    (r,) = run(checks.check_last_scan(_SelfcheckDB(), cfg))
+    assert r.key == "scan:last:trivy_image"
+    assert r.status == "degraded", (
+        "noaptea care înainte era roșie a devenit verde: " + r.status)
+    assert "devlikeapro/waha:latest" in r.detail
+    assert "34 CRITICAL" in r.detail and "918 HIGH" in r.detail
+    assert "930 constatări" in r.detail and "10 din 11 imagini" in r.detail
+
+
+def test_the_budget_edges_are_inclusive() -> None:
+    """Exact cât bugetul încape; un singur rând în plus nu.
+
+    Eșecul pe care îl previne: `>` devenit `>=` într-una din cele două
+    comparații. O imagine cu exact `MAX_FINDINGS` constatări ar fi sărită ca și
+    cum ar depăși, iar o flotă a cărei sumă e exact bugetul ar pierde imaginea
+    cea mai mare — adică un plafon de 2500 care se comportă ca unul de 2499, fără
+    ca vreo cifră din text să arate asta.
+    """
+    singura = trivy_image.Admission(10)
+    singura.offer(*_fake_image("x", 10))
+    assert [sk.reference for sk in singura.skipped] == []
+    assert singura.coverage(1)["ingested"] == ["x"]
+
+    peste = trivy_image.Admission(10)
+    peste.offer(*_fake_image("x", 11))
+    assert [(sk.reference, sk.reason) for sk in peste.skipped] == [
+        ("x", trivy_image.REASON_IMAGE)]
+
+    suma = trivy_image.Admission(10)
+    suma.offer(*_fake_image("a", 3))
+    suma.offer(*_fake_image("b", 7))
+    assert suma.skipped == [] and suma.total() == 10
+
+    mai_mult = trivy_image.Admission(10)
+    mai_mult.offer(*_fake_image("a", 3))
+    mai_mult.offer(*_fake_image("b", 8))
+    assert [(sk.reference, sk.reason) for sk in mai_mult.skipped] == [
+        ("b", trivy_image.REASON_BUDGET)]
+
+
+def test_a_long_list_of_skipped_images_is_named_up_to_a_count_bound() -> None:
+    """Textul de pe rând și din `/selfcheck` nu crește cu flota.
+
+    Eșecul pe care îl previne: patruzeci de imagini sărite scrise toate, într-o
+    coloană care pleacă spre agregator cu o limită de 64 KB per coloană —
+    depășită, valoarea e REFUZATĂ, nu tăiată — și într-un mesaj de Telegram. Cele
+    mai mari (cele care contează) sunt numite primele; restul se numără, nu
+    dispar.
+    """
+    cov = _coverage(images=40, ingested=("mica",), admitted=1, skipped=[
+        (f"i-{i:02d}", 100 + i, 0, 0, 0) for i in range(39)])
+    cov["skipped"].sort(key=lambda sk: -sk["findings"])
+    text = trivy_image.coverage_caveat(cov, held_open=1000)
+
+    assert text.count("constatări)") == trivy_image.MAX_NAMED_SKIPPED, (
+        "numărul de imagini numite nu e cel din margine")
+    assert "și încă 29 nenumite" in text, "cele peste margine nu sunt numărate"
+    assert "i-38 (138" in text, "nu s-a numit cea mai mare"
+    assert "i-00 (" not in text
+    assert "(1000)" in text and "Ingerate (1)" in text, (
+        "propozițiile de după nume au dispărut din text")
+
+
+def test_long_names_cannot_push_the_closing_sentences_out_of_the_text() -> None:
+    """Numele lungi sunt tăiate ele, nu propozițiile care vin după ele.
+
+    Eșecul pe care îl previne: zece referințe de registry de câte o sută de
+    caractere umplu singure textul, iar o tăiere la sfârșit scoate chiar
+    propoziția care spune câte rânduri au rămas deschise și lista imaginilor
+    ingerate. Prins de un test care punea toate cele 39 de nume lungi și nu mai
+    găsea nici «și încă 29».
+    """
+    cov = _coverage(images=40, ingested=("mica",), admitted=1, skipped=[
+        (f"registry.example/echipa/imagine-cu-nume-lung-{i:02d}:latest", 100 + i, 1, 2, 3)
+        for i in range(39)])
+    cov["skipped"].sort(key=lambda sk: -sk["findings"])
+    text = trivy_image.coverage_caveat(cov, held_open=1000)
+
+    assert len(text) <= trivy_image.MAX_ROW_TEXT
+    assert 0 < text.count("imagine-cu-nume-lung") < trivy_image.MAX_NAMED_SKIPPED, (
+        "marginea pe caractere nu a limitat numele")
+    assert "imagine-cu-nume-lung-38" in text
+    assert "nenumite aici" in text
+    assert "(1000)" in text and "Ingerate (1)" in text and not text.endswith("…")
+
+    uriasa = "r/" + "x" * 3000
+    text = trivy_image.coverage_caveat(
+        _coverage(skipped=[(uriasa, 5, 0, 5, 0)]), held_open=5)
+    assert len(text) <= trivy_image.MAX_ROW_TEXT
+    assert "x" * 200 not in text, "o referință uriașă a intrat întreagă în text"
+    assert uriasa[:50] in text and "(5)" in text
+
+
+def test_each_reason_for_skipping_is_said_in_its_own_words() -> None:
+    """„Peste tot bugetul" și „nu a încăput laolaltă" cer remedii diferite.
+
+    Eșecul pe care îl previne: ambele scrise ca „peste plafon". O imagine care
+    singură depășește tot bugetul rămâne sărită orice ar face celelalte (se
+    rezolvă prin imagine sau prin prag); una care doar n-a încăput revine când
+    suma scade (se rezolvă prin buget). Operatorul care le citește la fel ia
+    decizia greșită pentru una dintre ele.
+    """
+    cov = _coverage(skipped=[("uriasa", 9000, 1, 2, 3), WAHA, ("raport", 0, 0, 0, 0)])
+    cov["skipped"][0]["reason"] = trivy_image.REASON_IMAGE
+    cov["skipped"][2].update(reason=trivy_image.REASON_REPORT, findings=None)
+    text = trivy_image.coverage_caveat(cov, held_open=3)
+
+    assert "depășește singură tot plafonul" in text
+    assert text.index("depășește singură") < text.index("uriasa")
+    assert "încape singură, dar nu și laolaltă" in text
+    assert text.index("încape singură") < text.index("devlikeapro/waha:latest")
+    assert "raportul trivy e prea mare" in text
+    assert "raport (numărul de constatări nu se știe" in text, (
+        "un raport necitit e scris cu un număr inventat")
+
+    # Singular și plural nu se amestecă într-o propoziție pentru operator.
+    una = trivy_image.coverage_caveat(_coverage(skipped=[WAHA]), held_open=1)
+    assert una.startswith("1 imagine din 2 NU a fost ingerată")
+    assert "încape singură" in una and "încap singure" not in una
+    # Nicio imagine ingerată se spune, nu se lasă o listă goală după două puncte.
+    nimic = trivy_image.coverage_caveat(
+        _coverage(skipped=[WAHA], ingested=()), held_open=1)
+    assert "Ingerate (0): niciuna." in nimic
+
+
+def test_the_hard_cap_on_the_row_text_holds_even_if_the_other_bounds_fail(
+        monkeypatch) -> None:
+    """Ultima plasă are propriul test, fiindcă nimic altceva nu o atinge.
+
+    Eșecul pe care îl previne: marginile pe nume (număr, caractere, lungimea
+    referinței) ajung la ~1600 de caractere; plafonul dur de 2000 nu se atinge
+    niciodată cu ele întregi. O apărare pe care nicio intrare reală n-o declanșează
+    poate fi ștearsă fără ca vreun test să pice — așa că aici marginile sunt
+    ridicate și plafonul coborât, ca să se vadă că tăie și că o spune (`…`).
+    """
+    monkeypatch.setattr(trivy_image, "MAX_NAMED_SKIPPED_CHARS", 10**6)
+    monkeypatch.setattr(trivy_image, "MAX_REFERENCE_CHARS", 10**6)
+    monkeypatch.setattr(trivy_image, "MAX_ROW_TEXT", 300)
+    text = trivy_image.coverage_caveat(
+        _coverage(skipped=[("r/" + "x" * 3000, 5, 0, 5, 0)]), held_open=5)
+    assert len(text) == 300 and text.endswith("…")

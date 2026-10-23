@@ -3999,6 +3999,13 @@ async def check_last_scan(db: Database, cfg: Config) -> list[CheckResult]:
     conține cifra conține și `_scan_scope` — domeniul luat din RÂNDUL a cărui
     cifră se spune, nu din constantele de azi.
 
+    Al patrulea, de pe 23 octombrie 2026: o rulare încheiată poate să nu fi
+    acoperit tot. `trivy_image` nu mai refuză totul când două imagini depășesc
+    bugetul, ci le sare și le numește — și le numește în `scans.error` al unui
+    rând `completed`. Fără ramura de aici, același rând ar fi ieșit `ok` (singurul
+    `status` pe care îl citeam era `completed`), iar noaptea care înainte era roșie
+    ar fi devenit verde tocmai când o parte din containere sunt măsurate de ieri.
+
     `degraded`, nu `down`: nimic de pe gazdă nu s-a oprit — colectarea și blocarea
     merg mai departe. Ce e stricat e prospețimea unei liste. Fiecare scanner își
     primește cheia lui: un `dnf` care cade contează altfel decât un `trivy`, iar
@@ -4156,6 +4163,27 @@ async def check_last_scan(db: Database, cfg: Config) -> list[CheckResult]:
             continue
 
         findings = int(r.get("findings_count") or 0)
+
+        # O rulare `completed` cu `error` completat nu e o eroare — e rularea care
+        # spune ce n-a acoperit (azi: `trivy_image` si imaginile pe care nu le-a
+        # ingerat, vezi „Ingest per image" in modulul ei). Cifra de mai jos e
+        # adevarata PENTRU ce a acoperit, nu pentru gazda, iar `ok` peste ea ar fi
+        # absenta unui semnal citita ca dovada de bine: singura diferenta fata de
+        # noaptea dinainte, cand aceeasi situatie era `failed` si rosie, ar fi ca
+        # operatorul a fost lasat sa creada ca totul e masurat. Textul vine de la
+        # scaner, cu numele imaginilor; aici nu se reinterpreteaza.
+        caveat = str(r.get("error") or "").strip()
+        if caveat:
+            results.append(CheckResult(
+                key, f"Scanarea „{scanner}” nu a acoperit tot", "degraded",
+                detail=f"ultima rulare încheiată acum {_ago(age_s / 60)}, "
+                       f"{findings} constatări {_scan_scope(r.get('target'))}, dar "
+                       f"a încheiat spunând că nu a acoperit tot: {caveat}",
+                action="journalctl -u sentinel-scan -n 50",
+                facts={"scanner": scanner, "status": status, "findings": findings,
+                       "target": r.get("target"), "caveat": caveat}))
+            continue
+
         results.append(CheckResult(
             key, f"Scanarea „{scanner}”", "ok",
             detail=f"ultima rulare încheiată acum {_ago(age_s / 60)}, "

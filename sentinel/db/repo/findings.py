@@ -54,17 +54,28 @@ async def start_scan(db: Database, scanner: str, target: str, *,
 async def finish_scan(db: Database, scan_id: int, *, status: str, findings_count: int = 0,
                       new_findings: int = 0, resolved_findings: int = 0,
                       exit_code: int | None = None, error: str | None = None,
-                      db_version: str | None = None) -> None:
+                      db_version: str | None = None,
+                      target: str | None = None) -> None:
+    """Close a scan row.
+
+    `target` is written at OPEN time (what the run was asked to look at) and stays
+    that unless the caller passes a new one here: a scanner that only learns what
+    it actually covered once it has run (`trivy_image`: which images fit the
+    budget) says so on the row it is closing. `None` keeps what was written at
+    open — `COALESCE`, so every caller that does not know about the parameter
+    keeps behaving exactly as before.
+    """
     await db.execute(
         """
         UPDATE scans SET status = $2, findings_count = $3, new_findings = $4,
             resolved_findings = $5, exit_code = $6, error = $7, db_version = $8,
+            target = COALESCE($9, target),
             finished_at = now(),
             duration_ms = (extract(epoch from (now() - started_at)) * 1000)::int
         WHERE id = $1
         """,
         scan_id, status, findings_count, new_findings, resolved_findings,
-        exit_code, error, db_version)
+        exit_code, error, db_version, target)
 
 
 async def upsert_finding(db: Database, f: dict[str, Any]) -> bool:
@@ -145,7 +156,8 @@ def _visible_sql(sev_param: int, unscored_param: int) -> str:
 async def mark_resolved_absent(db: Database, scanner: str, asset_id: int | None,
                                seen_keys: list[str], *,
                                visible_severities: list[str] | None = None,
-                               visible_unscored: bool = False) -> int:
+                               visible_unscored: bool = False,
+                               skip_locations: list[str] | None = None) -> int:
     """Findings this scanner used to report for the asset but did not this run
     are resolved. Passing an empty seen list resolves them all — correct when a
     scan comes back clean.
@@ -163,6 +175,19 @@ async def mark_resolved_absent(db: Database, scanner: str, asset_id: int | None,
     not a severity argument to the scan itself, so there is no floor to fence.
     `trivy_fs` and `trivy_image` both filter at the source and both pass their
     own `visible_severities()` here.
+
+    `skip_locations` is the same fence on the other axis: WHERE the run looked,
+    not how hard. `trivy_image` can decline to ingest one image (its report alone
+    is bigger than the run's budget) while ingesting the rest; its findings are
+    then absent from `seen_keys` for a third reason, "the run did not take them
+    in", which is neither fixed nor no-longer-looked-for-by-severity. Rows whose
+    `location` is in the list are left exactly as they were. `None` and `[]` both
+    mean "no location was skipped".
+
+    The test is `NOT COALESCE(location = ANY(...), false)`, not `location <>
+    ALL(...)`: a row with a NULL `location` makes the second NULL, and NULL in a
+    WHERE is "not selected" — a row that belongs to no skipped image would then be
+    unclosable forever. Same trap, same cure as `_visible_sql`.
     """
     where = ["scanner = $1 AND asset_id IS NOT DISTINCT FROM $2",
              _RESOLVABLE_STATUSES,
@@ -171,6 +196,9 @@ async def mark_resolved_absent(db: Database, scanner: str, asset_id: int | None,
     if visible_severities is not None:
         where.append(_visible_sql(4, 5))
         args += [list(visible_severities), bool(visible_unscored)]
+    if skip_locations:
+        args.append(list(skip_locations))
+        where.append(f"NOT COALESCE(location = ANY(${len(args)}::text[]), false)")
 
     rows = await db.fetch(
         f"""
@@ -299,6 +327,31 @@ async def count_open_outside_severities(db: Database, scanner: str,
           AND NOT {_visible_sql(3, 4)}
         """,
         scanner, asset_id, list(visible_severities), bool(visible_unscored)) or 0)
+
+
+async def count_open_at_locations(db: Database, scanner: str, asset_id: int | None,
+                                  locations: list[str]) -> int:
+    """How many still-open findings sit at the given locations.
+
+    The counterpart of `mark_resolved_absent(skip_locations=...)`: those rows are
+    protected from being closed, which is right, and left at the date of the last
+    run that did look. Protected and unmentioned would sit on the panel looking
+    like tonight's measurement. Read AFTER the resolve, so it counts the state the
+    database is in and not the state the caller intended.
+
+    Empty `locations` is 0 without a query: `= ANY('{}')` matches nothing anyway,
+    and a count that is not asked for cannot fail.
+    """
+    if not locations:
+        return 0
+    return int(await db.fetchval(
+        f"""
+        SELECT count(*) FROM findings
+        WHERE scanner = $1 AND asset_id IS NOT DISTINCT FROM $2
+          AND {_RESOLVABLE_STATUSES}
+          AND location = ANY($3::text[])
+        """,
+        scanner, asset_id, list(locations)) or 0)
 
 
 def _scanner_clause(scanners: list[str] | None, column: str,

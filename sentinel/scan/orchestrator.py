@@ -432,6 +432,21 @@ async def _run_trivy_image(db: Database, triggered_by: str) -> dict:
         reparate peste noapte, desi nimic de pe gazda nu s-a schimbat. Ce ramane
         astfel deschis se si NUMARA, si se spune in jurnal: protejat si nespus ar
         fi doar o alta forma de tacere.
+
+    Si doua care vin din bugetul de volum (`trivy_image.MAX_FINDINGS`, pe IMAGINE
+    de la 23 octombrie 2026; vezi „Ingest per image" in modulul scanerului):
+
+      * o imagine care nu incape nu e ingerata, iar `location`-ul ei intra in
+        `skip_locations` al lui `mark_resolved_absent`. Ea lipseste din
+        `seen_keys` din alt motiv decat „s-a reparat": rularea n-a luat-o. Fara
+        garda asta, bugetul depasit de `waha` ar fi anuntat cele 1522 de
+        constatari ale lui ca rezolvate;
+      * ce ramane deschis pe imaginile sarite se NUMARA din baza dupa rezolvare
+        (efectul, nu intentia) si ajunge in `scans.error` al randului `completed`
+        — singurul loc unde un rand `completed` poarta o eroare: rularea spune ce
+        n-a acoperit. De acolo il citeste `check_last_scan` si il da `degraded`.
+        Randul se inchide cu `target` rescris („N din M imagini ingerate"), ca
+        cifra de constatari sa nu circule fara imaginile pe care le acopera.
     """
     probe = await trivy_image.probe_docker()
     if probe.state == trivy_image.DOCKER_ABSENT:
@@ -441,13 +456,15 @@ async def _run_trivy_image(db: Database, triggered_by: str) -> dict:
                 "detail": probe.detail}
 
     scan_id = await fx.start_scan(
-        db, trivy_image.SCANNER,
-        f"docker: imaginile containerelor în rulare, "
-        f"{trivy_image.severity_scope()}",
+        db, trivy_image.SCANNER, trivy_image.scan_target(),
         triggered_by=triggered_by)
+    # Setat dupa ce `scan` a decis ce imagini se ingereaza; folosit si de `except`,
+    # ca o ingestie cazuta la mijloc sa-si spuna imaginile sarite pe randul `failed`.
+    coverage: dict | None = None
     try:
         raw, error, facts = await trivy_image.scan(probe)
         db_version = facts.get("db_version")
+        coverage = facts.get("coverage")
         if error:
             await fx.finish_scan(db, scan_id, status="failed", error=error,
                                  db_version=db_version)
@@ -478,17 +495,36 @@ async def _run_trivy_image(db: Database, triggered_by: str) -> dict:
             seen.append(f["finding_key"])
 
         vazute, nenotate = trivy_image.visible_severities()
+        # Imaginile pe care rularea nu le-a luat: referintele lor (= `location`)
+        # sunt fixate de rezolvare, ca niste constatari absente din alt motiv
+        # decat „s-au reparat".
+        sarite = [sk["reference"] for sk in (coverage or {}).get("skipped", [])]
         resolved = await fx.mark_resolved_absent(
             db, trivy_image.SCANNER, None, seen,
-            visible_severities=list(vazute), visible_unscored=nenotate)
+            visible_severities=list(vazute), visible_unscored=nenotate,
+            skip_locations=sarite)
         # Cate au ramas deschise sub pragul de azi. Se citeste DUPA rezolvare, ca
         # sa numere starea in care ramane baza, nu una de dinaintea ei.
         sub_prag = await fx.count_open_outside_severities(
             db, trivy_image.SCANNER, None,
             visible_severities=list(vazute), visible_unscored=nenotate)
+        # La fel: DUPA rezolvare, din baza. Un numar calculat din ce intentionam
+        # sa lasam deschis ar spune „protejat" chiar si cand garda ar fi cazut.
+        ramase_deschise = await fx.count_open_at_locations(
+            db, trivy_image.SCANNER, None, sarite)
+        avertisment = (trivy_image.coverage_caveat(coverage, ramase_deschise)
+                       if coverage else None)
         await fx.finish_scan(
             db, scan_id, status="completed", findings_count=len(raw),
-            new_findings=new, resolved_findings=resolved, db_version=db_version)
+            new_findings=new, resolved_findings=resolved, db_version=db_version,
+            error=avertisment, target=trivy_image.scan_target(coverage))
+        if avertisment:
+            # WARNING, nu INFO, si cu NUMELE imaginilor: e starea in care panoul
+            # arata o parte din containere cu data de ieri.
+            log.warning("imagini sărite de la ingestie",
+                        extra={"scanner": trivy_image.SCANNER,
+                               "skipped": coverage["skipped"],
+                               "open_untouched": ramase_deschise})
         if sub_prag:
             # WARNING, nu INFO: sunt constatari care raman in panou fara ca ceva
             # sa le mai verifice, iar operatorul trebuie sa afle numarul de la
@@ -509,8 +545,18 @@ async def _run_trivy_image(db: Database, triggered_by: str) -> dict:
                 "containers": facts.get("containers"),
                 "references": facts.get("references"),
                 "severities": facts.get("severities"),
+                "skipped": [sk["reference"] for sk in (coverage or {}).get("skipped", [])],
+                "skipped_open": ramase_deschise,
                 "below_floor_open": sub_prag, "new_items": new_items}
     except Exception as exc:  # noqa: BLE001 - record and surface, do not crash the pass
-        await fx.finish_scan(db, scan_id, status="failed", error=str(exc)[:500])
+        eroare = str(exc)[:500]
+        # Imaginile sarite raman adevarate si pe un rand cazut: ele nu s-au
+        # ingerat si nu s-a rezolvat nimic pentru ele. Lista celor „ingerate" NU
+        # se scrie aici — ingestia a cazut la mijloc si n-am verificat ce a ajuns.
+        if coverage:
+            caveat = trivy_image.coverage_caveat(coverage, ingested_names=False)
+            if caveat:
+                eroare = f"{eroare} | {caveat}"
+        await fx.finish_scan(db, scan_id, status="failed", error=eroare)
         log.error("trivy image scan crashed", extra={"detail": str(exc)})
         return {"status": "failed", "error": str(exc)[:200]}

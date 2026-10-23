@@ -112,13 +112,100 @@ And a run at this floor is not allowed to close what it can no longer see:
 fixed, and what is no longer looked for. `visible_severities()` is what
 `mark_resolved_absent` is fenced with.
 
-Measured on 29 Aug 2026, and worth stating where the mechanism is justified:
-on THIS host the fence protects zero rows. `trivy_image` has exactly one run
-ever, and it failed on the cap, so no image finding was ever ingested —
-`findings` holds only `dnf` (5207) and `trivy_fs` (92). The ~2388 MEDIUM
-findings are on the host but not in this database. The fence is still correct
-for a future floor change or another install; it is not load-bearing today, and
-saying otherwise would be the pattern this repository is named after.
+What the production database holds, read on 23 Oct 2026 (`psql -d sentinel` on
+the host; the counts were taken after a query that has to return rows, so an
+empty answer could not be a broken command):
+
+  * `scans` has 57 `trivy_image` rows: 55 `completed` (30 Aug - 22 Oct) and 2
+    `failed`, both on the volume cap — 29 Aug (2832 findings at MEDIUM, 6 images)
+    and 23 Oct (2532 at the floor above, 11 images); the 29 Aug row records
+    2832, the figure quoted elsewhere in this file was taken from trivy directly.
+    The first version of this paragraph said the scanner had ONE run ever and had
+    never ingested anything; that stopped being true the next night and the
+    sentence stood for eight weeks;
+  * `findings` holds 2687 rows of this scanner: 2484 open, 203 resolved. The
+    resolve path has run on real data;
+  * not one of them is a measured MEDIUM. The 701 open rows that say `medium`
+    are all UNKNOWN, parked there by `map_severity` (`raw.severity_known =
+    false`). The ~2388 MEDIUM findings of 29 Aug were never ingested — the floor
+    was raised before the first run that succeeded. So the SEVERITY fence still
+    protects zero rows on this host today, and saying otherwise would be the
+    pattern this repository is named after. It stays for a future floor change
+    or another install.
+
+The LOCATION fence below protects real rows: on 23 Oct it is what keeps 1522
+open `waha` findings from being announced as fixed.
+
+## Ingest per image: a budget that skips, it does not refuse the whole run
+
+`MAX_FINDINGS` used to be a refusal of the whole run: one finding over, and
+nothing at all was ingested. That is correct as far as it goes — a list cut at
+the cap would be followed by `mark_resolved_absent` and the rest announced as
+fixed — but the failure mode was total blindness. On 23 Oct 2532 findings
+(`waha` 1602, `snipe-it` 530, nine others ~400) were 32 over the 2500 cap, so
+the operator lost the findings on their own applications along with the two
+third-party images that blew the budget. The night before the total had been
+2484, sixteen under; it swings by hundreds between nights (1801, 1725, 2484 on
+the 20th-22nd; the cause was not investigated), so a total that sits near the
+cap can flap across it with nobody having changed anything.
+
+So the budget decides PER IMAGE, and an image that is not ingested is NAMED:
+
+  * every image is scanned and parsed (strictly one at a time, as before);
+  * an image that on its own has more findings than `MAX_FINDINGS`
+    (`REASON_IMAGE`), or whose report is too large to read (`REASON_REPORT`), is
+    not ingested. Not truncated: a partial image is the original sin, and
+    ingesting only its CRITICALs would need a fence on (image, severity) while
+    hiding its HIGHs. Its existing rows are left alone;
+  * the rest are admitted smallest first until their sum would exceed
+    `MAX_FINDINGS`; the ones that do not fit (`REASON_BUDGET`) are not ingested.
+    Smallest first, not by name or by scan order, for two reasons: the outcome
+    does not depend on the order docker lists containers, so a night's result
+    can be explained; and the operator's own applications are the small ones, so
+    the images that blow a budget are the large third-party ones, not them.
+    The price is real and stated: when the sum binds, the LARGEST image is the
+    one skipped, and the largest is not the least exposed. It is named every
+    night it happens, and the number is the operator's to move;
+  * the findings of a skipped image are not in `seen_keys`, so
+    `mark_resolved_absent(skip_locations=...)` leaves its rows exactly as they
+    were — open, with the date of the last run that did look. This is the same
+    fence as `visible_severities`, on the other axis: where the run looked, not
+    how hard. `location` is the image reference, which is already part of the
+    key (see above), and `asset_id` stays `None` for this scanner on purpose.
+
+One number, not two. A per-image cap only means something if it is LOWER than
+the per-run one (an image over the whole run budget is over any larger per-image
+cap too), and nothing in the data justifies a particular lower number: the
+largest image today is 64% of the budget and a lower per-image cap would skip it
+permanently. So the single `MAX_FINDINGS` is the run's budget and "an image
+alone over it" is its degenerate case, reported under a different reason because
+the remedy differs — an image alone over the budget stays skipped whatever the
+others do; one that merely did not fit comes back when the sum drops.
+
+The per-run sum is kept, and not for memory: parsed findings cost ~1.6 KB each
+with full-length descriptions (measured locally with tracemalloc on a synthetic
+payload, not on the host), so 2500 is ~4 MB against `MemoryMax=1G`, and the
+ingest of the 2484-finding run of 22 Oct took 58 s end to end. The sum is a bound
+on how much one night can write and on how much of it is held at once
+(`MAX_IMAGES` x a per-image bound would be 100 000 rows), and a tripwire — if a
+trivy release stops honouring `--severity`, every image goes up by an order of
+magnitude together and the run says so instead of flooding `findings`. That the
+number could safely be several times larger is a fact, not a recommendation: it
+is a trade between noise and coverage, and not this file's to make.
+
+What the operator sees: `scans.target` is rewritten when the row is closed, with
+`N din M imagini ingerate` next to the severity floor — a count is only honest
+next to what it counted; `scans.error` on a `completed` row carries the names of
+the skipped images, with their counts and how many CRITICALs the operator is not
+being shown, and `check_last_scan` reads that back as `degraded`. A `completed`
+row with an `error` is the one place that column is not a failure: it is the run
+saying what it did not cover. If NO image can be ingested the run is `failed`.
+
+What is deliberately still a whole-run failure: trivy failing on an image, a
+report that is not about the image asked for, an unreadable report, the deadline,
+a stale vulnerability database. Those are "could not look" — transient, or a sign
+the tool itself is wrong — and a run that is wrong about one image cannot vouch
+for the others. Making them per-image as well is a separate decision.
 
 ## Budgets: the unit is killed as a whole, so this scanner bounds itself
 
@@ -277,23 +364,60 @@ MAX_IMAGES = 40
 #: constatarile MEDIUM ingerate inainte (`visible_severities`).
 SEVERITIES = ("UNKNOWN", "HIGH", "CRITICAL")
 
-#: Plafonul de volum, ca REFUZ, nu ca trunchiere — acelasi rationament ca la
-#: `trivy_fs.MAX_FINDINGS`: o lista taiata ar fi urmata de
-#: `mark_resolved_absent`, care ar marca restul drept rezolvate, si panoul ar
-#: arata MAI PUTIN tocmai fiindca e mai mult.
+#: Bugetul de volum al UNEI rulari: cate constatari ingeram, la un loc, intr-o
+#: noapte. Se aplica pe IMAGINE, nu pe rulare — vezi sectiunea „Ingest per image"
+#: din docstring-ul modulului. O imagine care nu incape nu e ingerata si e
+#: numita; restul se ingereaza. Niciodata trunchiere: o lista taiata ar fi urmata
+#: de `mark_resolved_absent`, care ar marca restul drept rezolvate, iar garda pe
+#: `location` (`skip_locations`) exista tocmai ca imaginea sarita sa ramana cum era.
 #:
-#: Numarul difera de cel de la `trivy_fs` (500) si asta e intentionat: o imagine
-#: de baza debian sau ubuntu aduce singura ordinul sutelor de intrari >= MEDIUM,
-#: iar sase-noua imagini inseamna ordinul miilor. Cu 500 aici scanerul ar refuza
-#: in fiecare noapte si n-ar raporta niciodata nimic — un plafon care nu poate fi
-#: respectat e o scanare oprita, nu o scanare prudenta.
+#: Pana pe 23 octombrie 2026 era un REFUZ al intregii rulari (acelasi rationament
+#: ca la `trivy_fs.MAX_FINDINGS`, care ramane refuz: 92 de constatari fata de 500,
+#: un singur set de cai). Aici a dus la orbire totala: 2532 de constatari fata de
+#: 2500 si operatorul pierdea si aplicatiile lui, nu doar cele doua imagini care
+#: depasisera bugetul.
 #:
-#: Parghia cand panoul e prea zgomotos e pragul de severitate, si a fost trasa:
-#: `SEVERITIES` e la HIGH de pe 29 august 2026, cu 450 de constatari masurate
-#: fata de plafonul asta. Numarul de aici a ramas neatins dinadins — el
-#: margineste memoria si ingestia, nu zgomotul, iar coborat acum ar lua marja
-#: care face ca urmatoarea imagine adaugata sa nu opreasca scanarea.
+#: Numarul NU a fost mutat. Nu era problema de atunci, si „ridica plafonul" e
+#: chiar mutarea care amana totul: bugetul margineste cat scrie si cat tine o
+#: noapte, si e un prag de alarma daca trivy inceteaza sa respecte `--severity`.
+#: Costul masurat, ca decizia sa se poata lua cu cifre: ~1,6 KB per constatare in
+#: memorie (descrieri la lungime maxima), deci 2500 inseamna ~4 MB fata de
+#: `MemoryMax=1G`; ingestia rularii din 22 octombrie (2484) a durat 58 s cu tot
+#: cu scanarea. Ca ar incapea de cateva ori mai mult e un fapt, nu o recomandare:
+#: cu cat e mai mare, cu atat mai mult zgomot intra in panou, si asta decide
+#: operatorul. Cat timp ramane aici, imaginea cea mai MARE e cea care se sare
+#: cand suma depaseste — spus in text, in fiecare noapte in care se intampla.
 MAX_FINDINGS = 2500
+
+#: De ce nu a fost ingerata o imagine. Trei motive, pentru ca remediul difera:
+#: `image` — singura depaseste tot bugetul (ramane sarita orice ar face celelalte,
+#: se rezolva prin imagine sau prin prag); `budget` — incape singura, dar nu
+#: laolalta cu cele mai mici (revine cand suma scade, se rezolva prin buget);
+#: `report` — raportul ei e prea mare ca sa fie citit in proces, deci nici nu s-a
+#: numarat.
+REASON_IMAGE = "image"
+REASON_BUDGET = "budget"
+REASON_REPORT = "report"
+
+#: Cate imagini se numesc in textul de pe rand, si cate caractere au voie sa
+#: ocupe numele. Textul ajunge pe Telegram prin `/selfcheck` si in `scans.error`
+#: (care pleaca spre agregator cu o limita de 64 KB per coloana — depasita, e
+#: REFUZATA, nu taiata), deci e margine, nu stil. Doua margini pe fiecare lista,
+#: numarul SI caracterele: zece nume de registry pot avea fiecare sute de
+#: caractere. Cele peste margine se numara („si inca N"); lista intreaga e in
+#: jurnal. Marginile sunt pe NUME, nu pe tot textul, ca propozitiile de dupa
+#: ele (cate au ramas deschise) sa nu fie cele taiate.
+MAX_NAMED_SKIPPED = 10
+MAX_NAMED_SKIPPED_CHARS = 600
+MAX_NAMED_INGESTED = 12
+MAX_NAMED_INGESTED_CHARS = 300
+
+#: O referinta mai lunga de-atat se taie in text (intreaga ramane in constatari).
+MAX_REFERENCE_CHARS = 120
+
+#: Plafon dur pe textul de pe rand, ultima plasa sub marginile de mai sus. Cu ele
+#: textul cel mai lung posibil are ~1600 de caractere; peste asta ceva s-a rupt.
+MAX_ROW_TEXT = 2000
 
 #: Starile lui docker. Doar `unreachable` e o eroare; vezi docstring-ul de sus.
 DOCKER_ABSENT = "absent"
@@ -336,11 +460,13 @@ def visible_severities() -> tuple[tuple[str, ...], bool]:
     cautat. Fara garda asta, o instalare care ARE constatari MEDIUM ingerate
     le-ar anunta pe toate ca rezolvate intr-o noapte.
 
-    Pe gazda de productie, masurat pe 29 august 2026, numarul ala e ZERO:
-    `trivy_image` n-a ingerat niciodata nimic, fiindca singura lui rulare a
-    picat pe plafon. Garda e scrisa pentru cazul general si pentru mutarea
-    urmatoare de prag, nu pentru o pierdere observata aici — si asta se spune,
-    ca sa nu para masurata.
+    Pe gazda de productie, citit pe 23 octombrie 2026, numarul ala e tot ZERO,
+    dar din alt motiv decat se scria aici: scanerul a ingerat 2687 de randuri,
+    iar niciunul nu e un MEDIUM masurat — cele 701 care spun `medium` sunt
+    `UNKNOWN` parcate (`raw.severity_known = false`). Pragul a fost ridicat
+    inainte de prima rulare reusita. Garda e scrisa pentru cazul general si
+    pentru mutarea urmatoare de prag, nu pentru o pierdere observata aici — si
+    asta se spune, ca sa nu para masurata.
 
     Derivata din `SEVERITIES` prin chiar maparea folosita la ingestie
     (`trivy_fs.map_severity`), nu scrisa inca o data ca lista: o a doua lista ar
@@ -390,6 +516,227 @@ class RunningImage:
     image_id: str
     reference: str
     containers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SkippedImage:
+    """O imagine scanata (sau incercata) si NEingerata, cu de ce si cu cat.
+
+    `findings` e `None` doar pentru `REASON_REPORT`: raportul n-a fost citit,
+    deci nu stim cate sunt — iar „nu stim" nu se scrie ca 0. `critical`, `high` si
+    `unrated` spun operatorului ce NU i se arata: 34 CRITICAL sarite si 3 LOW
+    sarite nu se pot citi la fel.
+    """
+
+    reference: str
+    image_id: str
+    reason: str
+    findings: int | None
+    critical: int = 0
+    high: int = 0
+    unrated: int = 0
+    report_bytes: int | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"reference": self.reference, "image_id": self.image_id,
+                "reason": self.reason, "findings": self.findings,
+                "critical": self.critical, "high": self.high,
+                "unrated": self.unrated, "report_bytes": self.report_bytes}
+
+
+def _skip(image: RunningImage, items: list[dict[str, Any]], reason: str) -> SkippedImage:
+    """Inregistrarea unei imagini sarite, numarand ce are in raport."""
+    return SkippedImage(
+        reference=image.reference, image_id=image.image_id, reason=reason,
+        findings=len(items),
+        critical=sum(1 for f in items if f.get("severity") == "critical"),
+        high=sum(1 for f in items if f.get("severity") == "high"),
+        unrated=sum(1 for f in items
+                    if (f.get("raw") or {}).get("severity_known") is False))
+
+
+class Admission:
+    """Ce imagini incap in bugetul de constatari al unei rulari.
+
+    Functie de DIMENSIUNI, nu de ordinea in care vin: rezultatul final e cel mai
+    lung prefix, in ordinea crescatoare a (numar de constatari, referinta, id), a
+    carui suma incape in `budget`. Se obtine fara a tine toate imaginile in
+    memorie: dupa fiecare imagine adaugata, cat timp suma depaseste bugetul se
+    scoate cea mai mare. Memoria ramane marginita de buget plus imaginea curenta,
+    iar o imagine scoasa o data nu mai poate reveni (suma doar creste), deci
+    rezultatul incremental e acelasi cu cel calculat la sfarsit pe toate.
+
+    Departajarea e totala (referinta, apoi id), deliberat: doua imagini cu acelasi
+    numar de constatari ar fi altfel scoase in ordinea in care a listat docker
+    containerele, iar o repornire ar muta vinovatul de la o noapte la alta.
+    """
+
+    def __init__(self, budget: int) -> None:
+        self.budget = budget
+        self._held: dict[str, tuple[RunningImage, list[dict[str, Any]]]] = {}
+        self.skipped: list[SkippedImage] = []
+
+    def total(self) -> int:
+        return sum(len(items) for _image, items in self._held.values())
+
+    def offer(self, image: RunningImage, items: list[dict[str, Any]]) -> None:
+        """O imagine cu constatarile ei, deja parsate."""
+        if len(items) > self.budget:
+            # Peste tot bugetul, singura: nu intra nici pe un camp gol. Constatarile
+            # se arunca aici — de la ele ramane doar numaratoarea din `_skip`.
+            self.skipped.append(_skip(image, items, REASON_IMAGE))
+            return
+        self._held[image.image_id] = (image, items)
+        while self.total() > self.budget:
+            victim, victim_items = max(
+                self._held.values(),
+                key=lambda held: (len(held[1]), held[0].reference, held[0].image_id))
+            del self._held[victim.image_id]
+            self.skipped.append(_skip(victim, victim_items, REASON_BUDGET))
+
+    def refuse_report(self, image: RunningImage, size: int) -> None:
+        """Raport prea mare ca sa fie citit: nici nu stim cate constatari are."""
+        self.skipped.append(SkippedImage(
+            reference=image.reference, image_id=image.image_id,
+            reason=REASON_REPORT, findings=None, report_bytes=size))
+
+    def admitted(self) -> list[tuple[RunningImage, list[dict[str, Any]]]]:
+        return sorted(self._held.values(),
+                      key=lambda held: (held[0].reference, held[0].image_id))
+
+    def coverage(self, total_images: int) -> dict[str, Any]:
+        """Ce a acoperit rularea, in forma care ajunge in `facts` si pe rand."""
+        admitted = self.admitted()
+        skipped = sorted(self.skipped,
+                         key=lambda sk: (-(sk.findings or 0), sk.reference, sk.image_id))
+        return {"images": total_images,
+                "ingested": [image.reference for image, _items in admitted],
+                "admitted_findings": self.total(),
+                "budget": self.budget,
+                "skipped": [sk.as_dict() for sk in skipped]}
+
+
+def scan_target(coverage: dict[str, Any] | None = None) -> str:
+    """`scans.target`: ce s-a cerut, si — dupa rulare — cat din el s-a acoperit.
+
+    La deschiderea randului (`coverage=None`) e doar domeniul cerut: containerele
+    in rulare, la pragul de severitate. La incheiere i se adauga „N din M imagini
+    ingerate": o cifra de constatari spusa fara cate imagini acopera se citeste
+    ca starea tuturor containerelor, iar aici „2132 de constatari" si „2532 de
+    constatari" difera tocmai prin imaginile sarite.
+
+    O singura functie pentru ambele momente, ca prefixul sa nu poata diverge: un
+    rand `failed` si unul `completed` se citesc pe acelasi domeniu.
+    """
+    base = f"docker: imaginile containerelor în rulare, {severity_scope()}"
+    if coverage is None:
+        return base
+    return f"{base}; {len(coverage['ingested'])} din {coverage['images']} imagini ingerate"
+
+
+def _cut(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def _fit(items: list[str], max_count: int, max_chars: int) -> int:
+    """Cate din `items` incap in ambele margini. Cel putin unul (taiat), daca exista.
+
+    Primul intra mereu: o lista nevida care ar spune „si inca N" fara niciun nume
+    ar fi exact „zece din unsprezece" fara nume, pe care textul asta il previne.
+    """
+    if not items:
+        return 0
+    used = len(_cut(items[0], max_chars))
+    count = 1
+    for item in items[1:]:
+        if count >= max_count or used + 2 + len(item) > max_chars:
+            break
+        used += 2 + len(item)
+        count += 1
+    return count
+
+
+def _describe_skipped(sk: dict[str, Any]) -> str:
+    ref = _cut(sk["reference"], MAX_REFERENCE_CHARS)
+    if sk["findings"] is None:
+        return f"{ref} (numărul de constatări nu se știe: raportul nu s-a citit)"
+    parts = []
+    if sk["critical"]:
+        parts.append(f"{sk['critical']} CRITICAL")
+    if sk["high"]:
+        parts.append(f"{sk['high']} HIGH")
+    if sk["unrated"]:
+        parts.append(f"{sk['unrated']} fără notă")
+    detail = f": {', '.join(parts)}" if parts else ""
+    return f"{ref} ({sk['findings']} constatări{detail})"
+
+
+def coverage_caveat(coverage: dict[str, Any], held_open: int | None = None, *,
+                    ingested_names: bool = True) -> str | None:
+    """Textul pentru operator despre imaginile NEingerate. `None` daca nu e niciuna.
+
+    E ce ajunge in `scans.error` al unui rand `completed` si, de acolo, in
+    `/selfcheck`. Trebuie sa raspunda la ce ar intreba operatorul la 3 noaptea:
+    CARE imagini, CATE constatari si cate CRITICAL nu i se arata, DE CE, si ce se
+    intampla cu ce stia deja despre ele. „Zece din unsprezece" fara nume nu
+    spune pe ce sa dea cu ochii.
+
+    `held_open` e numarul de randuri deschise ramase pe imaginile sarite, CITIT
+    din baza dupa rezolvare (efectul, nu intentia). `None` = nu s-a citit, si
+    atunci propozitia nu se scrie deloc, nu se scrie cu un 0 inventat.
+
+    `ingested_names=False` pentru calea in care ingestia a cazut la mijloc: acolo
+    „ingerate: …" ar afirma un efect pe care nu l-am verificat.
+    """
+    skipped = coverage.get("skipped") or []
+    if not skipped:
+        return None
+
+    budget = coverage["budget"]
+    admitted = coverage["admitted_findings"]
+    ordered: list[tuple[str, str]] = []
+    for reason in (REASON_IMAGE, REASON_BUDGET, REASON_REPORT):
+        ordered.extend((reason, _describe_skipped(sk))
+                       for sk in skipped if sk["reason"] == reason)
+    shown_n = _fit([desc for _reason, desc in ordered],
+                   MAX_NAMED_SKIPPED, MAX_NAMED_SKIPPED_CHARS)
+    parts: list[str] = []
+    for reason in (REASON_IMAGE, REASON_BUDGET, REASON_REPORT):
+        names = [desc for r, desc in ordered[:shown_n] if r == reason]
+        if not names:
+            continue
+        one = sum(1 for sk in skipped if sk["reason"] == reason) == 1
+        why = {
+            REASON_IMAGE: (f"depășește singură tot plafonul de {budget}" if one
+                           else f"depășesc singure tot plafonul de {budget}"),
+            REASON_BUDGET: (f"încape singură, dar nu și laolaltă cu cele mai mici "
+                            if one else
+                            f"încap singure, dar nu și laolaltă cu cele mai mici ")
+                           + f"(plafonul pe rulare e {budget}, {admitted} admise)",
+            REASON_REPORT: ("raportul trivy e prea mare ca să fie citit în proces"
+                            if one else
+                            "rapoartele trivy sunt prea mari ca să fie citite în proces"),
+        }[reason]
+        parts.append(f"{why}: {', '.join(names)}")
+    if len(ordered) > shown_n:
+        parts.append(f"și încă {len(ordered) - shown_n} nenumite aici (lista "
+                     f"întreagă e în jurnalul `sentinel-scan`)")
+
+    verdict = ("1 imagine din" if len(skipped) == 1 else f"{len(skipped)} imagini din")
+    verb = "NU a fost ingerată" if len(skipped) == 1 else "NU au fost ingerate"
+    text = f"{verdict} {coverage['images']} {verb} — {'; '.join(parts)}."
+    if held_open is not None:
+        text += (f" Constatările lor deja deschise ({held_open}) rămân deschise, "
+                 f"nereîmprospătate și nerezolvate — datează de la ultima rulare "
+                 f"care le-a văzut.")
+    if ingested_names:
+        names = [_cut(n, MAX_REFERENCE_CHARS) for n in (coverage.get("ingested") or [])]
+        k = _fit(names, MAX_NAMED_INGESTED, MAX_NAMED_INGESTED_CHARS)
+        more = len(names) - k
+        text += (f" Ingerate ({len(names)}): "
+                 f"{', '.join(names[:k]) if k else 'niciuna'}"
+                 f"{f' și încă {more}' if more else ''}.")
+    return _cut(text, MAX_ROW_TEXT)
 
 
 def resolve_docker() -> str | None:
@@ -802,6 +1149,11 @@ async def scan(probe: DockerProbe | None = None
     `absent` NU e o eroare si nu are voie sa deschida un rand in `scans`, fiindca
     singurele statusuri disponibile ar face-o sa arate ori ca un esec, ori ca o
     masuratoare cu zero constatari.
+
+    `fapte["coverage"]` e scris DOAR pe drumul de succes: ce imagini s-au ingerat
+    si care au fost sarite (peste buget, sau cu raportul prea mare). Constatarile
+    intoarse sunt ale celor ingerate; ale celor sarite nu sunt, iar apelantul le
+    protejeaza de `mark_resolved_absent`. Pe orice drum de eroare e `None`.
     """
     # `severities` e scris din prima linie, nu la sfarsit: apelantul il duce in
     # sumar si in jurnal, iar o rulare care a esuat inainte sa vada vreo imagine
@@ -810,7 +1162,13 @@ async def scan(probe: DockerProbe | None = None
     facts: dict[str, Any] = {"docker": None, "docker_detail": None,
                              "db_version": None, "containers": 0, "images": 0,
                              "references": [], "total": 0,
-                             "severities": list(SEVERITIES)}
+                             "severities": list(SEVERITIES),
+                             # Ce imagini s-au ingerat si care nu, cu motivul.
+                             # `None` pana se decide: pe un drum de eroare nu
+                             # s-a ingerat NIMIC, si o acoperire „calculata"
+                             # dar neaplicata ar fi o afirmatie despre un efect
+                             # care n-a avut loc.
+                             "coverage": None}
 
     probe = probe or await probe_docker()
     facts["docker"] = probe.state
@@ -846,7 +1204,7 @@ async def scan(probe: DockerProbe | None = None
                     f"lista goală nu spune nimic despre ele"), facts
 
     workdir = tempfile.mkdtemp(prefix="sentinel-trivy-image-")
-    items: list[dict[str, Any]] = []
+    admission = Admission(MAX_FINDINGS)
     deadline = time.monotonic() + TIMEOUT_S
     try:
         for index, image in enumerate(images):
@@ -877,10 +1235,15 @@ async def scan(probe: DockerProbe | None = None
                 return [], (f"trivy a raportat succes pe {image.reference}, dar "
                             f"raportul {output} nu există: {exc}"), facts
             if size > trivy_fs.MAX_OUTPUT_BYTES:
-                return [], (f"raportul trivy pentru {image.reference} are {size} "
-                            f"octeți, peste plafonul de "
-                            f"{trivy_fs.MAX_OUTPUT_BYTES}; nu se citește în proces "
-                            f"sub `MemoryMax=1G`"), facts
+                # Un fapt MASURAT despre imaginea asta (marimea raportului), nu o
+                # cadere a uneltei: o repetare nu il schimba. Se sare si se
+                # numeste, ca o imagine cu raport urias sa nu orbeasca flota.
+                # Nu se citeste in proces sub `MemoryMax=1G`.
+                log.warning("raport trivy prea mare, imaginea nu se ingereaza",
+                            extra={"image": image.reference, "bytes": size,
+                                   "limit": trivy_fs.MAX_OUTPUT_BYTES})
+                admission.refuse_report(image, size)
+                continue
             try:
                 with open(output, "r", encoding="utf-8", errors="replace") as handle:
                     payload = json.load(handle)
@@ -897,12 +1260,14 @@ async def scan(probe: DockerProbe | None = None
                             f"imaginea cerută: {mismatch}. Constatările lui ar fi "
                             f"fost puse pe seama unei imagini pe care nu le are"), facts
 
-            items.extend(parse(payload, reference=image.reference,
-                               image_id=image.image_id,
-                               containers=image.containers))
+            admission.offer(image, parse(payload, reference=image.reference,
+                                         image_id=image.image_id,
+                                         containers=image.containers))
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
+    coverage = admission.coverage(len(images))
+    items = [f for _image, found in admission.admitted() for f in found]
     unique = {f["finding_key"]: f for f in items}
     facts["total"] = len(unique)
 
@@ -924,19 +1289,19 @@ async def scan(probe: DockerProbe | None = None
         log.warning("baza de vulnerabilități trivy nu s-a mai împrospătat",
                     extra={"age_h": int(age_h), "db_version": described})
 
-    if len(unique) > MAX_FINDINGS:
-        # Pragul se NUMESTE in mesaj, nu se scrie de mana: randul `failed` din
-        # `scans` e singurul loc in care operatorul citeste cifra asta, iar
-        # „2838 de constatări" fara pragul la care au fost numarate nu-i spune
-        # daca parghia a fost deja trasa sau nu.
-        return [], (f"trivy a raportat {len(unique)} constatări ({severity_scope()}) "
-                    f"pe {len(images)} imagini, peste plafonul de {MAX_FINDINGS}; nu "
-                    f"se ingerează nimic, fiindcă o listă tăiată ar face ca restul "
-                    f"să fie marcate rezolvate. Ridică pragul de severitate sau "
-                    f"reduce numărul de imagini"), facts
+    if not coverage["ingested"]:
+        # Nicio imagine nu a putut fi ingerata: nimic de predat, deci rularea e
+        # un ESEC, nu un `completed` cu zero constatari — acela ar fi exact
+        # minciuna din 0029. Pragul se NUMESTE in mesaj, nu se scrie de mana.
+        return [], (f"{len(images)} imagini rulează ({severity_scope()}), dar "
+                    f"niciuna nu a putut fi ingerată; nu se ingerează nimic. "
+                    f"{coverage_caveat(coverage, ingested_names=False)}"), facts
 
+    facts["coverage"] = coverage
     log.info("trivy image scan parsed",
              extra={"findings": len(unique), "images": len(images),
+                    "ingested": len(coverage["ingested"]),
+                    "skipped": [sk["reference"] for sk in coverage["skipped"]],
                     "containers": facts["containers"], "db_version": described,
                     "severities": facts["severities"]})
     return list(unique.values()), None, facts

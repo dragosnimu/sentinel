@@ -185,6 +185,46 @@ def test_the_number_of_findings_is_never_spoken_without_its_scope() -> None:
     assert r.facts.get("target") == tinta
 
 
+def test_a_completed_run_that_says_it_did_not_cover_everything_is_degraded() -> None:
+    """O rulare încheiată cu o eroare pe rând nu e „ok", fie și cu cifra proaspătă.
+
+    Eșecul pe care îl previne: de la 23 octombrie 2026 `trivy_image` nu refuză
+    totul când două imagini depășesc bugetul — le sare și le numește în
+    `scans.error` al unui rând `completed`. `check_last_scan` citea doar
+    `status`, deci același rând ar fi ieșit `ok`: noaptea care înainte era roșie
+    ar fi devenit verde exact când o parte din containere sunt măsurate de ieri.
+    Textul scanerului trebuie să ajungă la operator întreg, cu numele imaginilor.
+    """
+    caveat = ("1 din 11 imagini NU au fost ingerate (devlikeapro/waha:latest "
+              "(1602 constatări: 34 CRITICAL))")
+    r = run(checks.check_last_scan(
+        _DB([_row("completed", 2.0, scanner="trivy_image", findings=930,
+                  error=caveat,
+                  target="docker: imaginile containerelor în rulare; 10 din 11 "
+                         "imagini ingerate")]), _cfg()))[0]
+    assert r.key == "scan:last:trivy_image"
+    assert r.status == "degraded", f"rularea parțială a ieșit {r.status}"
+    assert caveat in r.detail, f"numele imaginilor nu ajung la operator: {r.detail!r}"
+    assert "930 constatări" in r.detail and "10 din 11 imagini ingerate" in r.detail, (
+        f"cifra e spusă fără imaginile pe care le acoperă: {r.detail!r}")
+    assert r.action
+    assert r.facts.get("caveat") == caveat
+
+
+def test_a_completed_run_with_an_empty_error_stays_ok() -> None:
+    """Perechea testului de sus: `error` gol sau cu spații nu aprinde nimic.
+
+    Eșecul pe care îl previne: ramura nouă scrisă ca `if r.get("error") is not
+    None` în loc de `if (r.get("error") or "").strip()` — un `''` din bază ar da
+    `degraded` în fiecare noapte, iar o alarmă care sună mereu îl învață pe
+    operator să n-o mai citească.
+    """
+    for gol in (None, "", "   "):
+        r = run(checks.check_last_scan(
+            _DB([_row("completed", 2.0, findings=31, error=gol)]), _cfg()))[0]
+        assert r.status == "ok", f"error={gol!r} a dat {r.status}"
+
+
 def test_a_row_without_a_target_says_so_instead_of_inventing_one() -> None:
     """„Nu știu peste ce" nu are voie să arate ca „peste tot".
 

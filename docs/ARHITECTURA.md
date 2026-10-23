@@ -347,20 +347,69 @@ vedea, fiindcă „nu mai e raportată" acoperă două lucruri diferite — ce s
 reparat, și ce nu mai e căutat. Câte rămân deschise sub prag se scrie în jurnal
 la `WARNING` după fiecare rulare.
 
-**Pe gazda asta, garda protejează zero rânduri, și e cinstit s-o spunem aici.**
-Măsurat pe 29 august 2026: `trivy_image` are o singură rulare, vreodată, și
-aceea `failed` — plafonul a respins-o. În `findings` nu există niciun rând
-`trivy_image` (doar `dnf` 5207 și `trivy_fs` 92). Deci cele ~2388 de constatări
-MEDIUM n-au fost niciodată ingerate; ele există pe gazdă, dar nu în baza asta,
-iar `count_open_outside_severities` va întoarce 0 la fiecare rulare — deci
-`WARNING`-ul nu se va aprinde. Garda rămâne corectă pentru o mutare viitoare de
-prag sau pentru altă instalare, dar nu apără nimic azi.
+**Pe gazda asta, garda de severitate protejează tot zero rânduri, dar nu pentru motivul scris inițial.**
+Citit pe 23 octombrie 2026 din baza de producție: `trivy_image` are 57 de rulări
+— 55 `completed` (30 august – 22 octombrie) și 2 `failed`, ambele pe plafonul de
+volum (29 august și 23 octombrie). În `findings` sunt 2687 de rânduri ale
+scanerului (2484 deschise, 203 rezolvate), deci calea de rezolvare a rulat pe date
+reale. Niciunul nu e un MEDIUM măsurat: cele 701 care spun `medium` sunt `UNKNOWN`
+parcate acolo (`raw.severity_known = false`). Cele ~2388 de constatări MEDIUM din
+29 august n-au fost ingerate niciodată — pragul a fost ridicat înainte de prima
+rulare reușită. (Textul de aici spunea până pe 23 octombrie că scanerul n-a ingerat
+nimic vreodată; era adevărat o noapte și a rămas scris opt săptămâni.)
 
-Singurul loc unde se vede că 2388 de constatări nu mai sunt căutate e textul din
-`scans.target`. Panoul de vulnerabilități numără pe severitate, fără să spună
-pragul fiecărui scaner — cine filtrează „medium" acolo nu are din ce afla că
-imaginile lipsesc din numărătoare. Asta e limita apărării, nu o regresie:
-înainte, scanarea nu raporta absolut nimic.
+**Bugetul de volum se aplică pe imagine, nu pe rulare.** Până pe 23 octombrie 2026
+`MAX_FINDINGS` (2500) era un refuz al întregii rulări. În noaptea aceea scanerul
+a găsit 2532 de constatări pe 11 imagini — `waha` 1602, `snipe-it` 530, celelalte
+nouă ~400 — și n-a ingerat nimic: operatorul și-a pierdut și constatările
+propriilor aplicații, care sunt aproape nimic, odată cu cele două imagini străine
+care adunau 82%. Cu 2484 în ziua dinainte, totalul stătea la 16 sub plafon și
+oscilează cu sute de la o noapte la alta.
+
+Împărțirea pe imagini de mai sus e tot o fotografie, nu o constantă: e citită
+pe 22 octombrie 2026. Remăsurată a doua zi, cu baza de vulnerabilități
+actualizată peste noapte, aceleași două imagini dădeau `waha` 1516 și
+`snipe-it` 601. Cine citește cifrele astea ca pe o proprietate a imaginilor,
+și nu ca pe o măsurătoare datată, va trage concluzii despre un prag pornind
+de la o zi anume.
+
+Acum fiecare imagine e scanată și parsată, iar bugetul decide care se ingerează:
+
+- o imagine care **singură** depășește tot bugetul, sau al cărei raport e prea mare
+  ca să fie citit, nu se ingerează — nu se taie, fiindcă o imagine pe jumătate
+  măsurată e mai rea decât una nemăsurată;
+- restul se admit **cele mai mici întâi** până ce suma ar depăși `MAX_FINDINGS`;
+  imaginile care nu mai încap nu se ingerează. Ordinea e a mărimii și a numelui,
+  nu a lui `docker ps`, deci rezultatul unei nopți se poate explica și nu se mută
+  la o repornire de container. Prețul e spus: când suma se atinge, cade imaginea
+  cea **mai mare**, care nu e cea mai puțin expusă;
+- constatările unei imagini sărite **nu se rezolvă**: `mark_resolved_absent` primește
+  `skip_locations`, aceeași îngrădire ca `visible_severities` dar pe cealaltă axă —
+  *unde* s-a uitat rularea, nu *cât de tare*. Rămân deschise, cu data ultimei rulări
+  care le-a văzut;
+- un singur număr, nu două. Un plafon pe imagine are sens doar dacă e mai mic decât
+  cel pe rulare, iar nimic din date nu justifică o anumită valoare mai mică (cea mai
+  mare imagine are azi 64% din buget);
+- suma pe rulare rămâne ca margine a cât scrie o noapte și ca alarmă dacă trivy
+  încetează să respecte `--severity`, **nu** ca protecție de memorie: ~1,6 KB per
+  constatare (măsurat local pe un raport sintetic cu descrieri la lungime maximă)
+  face din 2500 vreo 4 MB față de `MemoryMax=1G`. Valoarea e decizia operatorului și
+  nu a fost mutată.
+
+Ce vede operatorul: `scans.target` se rescrie la închidere cu „N din M imagini
+ingerate", ca numărul de constatări să nu circule fără imaginile pe care le acoperă;
+`scans.error` al rândului `completed` poartă numele imaginilor sărite, cu
+constatările și CRITICAL-urile lor, motivul, cât a rămas deschis (citit din bază
+după rezolvare) și lista celor ingerate; `check_last_scan` citește un rând
+`completed` cu `error` ca *„nu a acoperit tot"* și îl dă `degraded` — altfel noaptea
+care înainte era roșie ar fi devenit verde exact când o parte din containere sunt
+măsurate de ieri. Dacă nicio imagine nu poate fi ingerată, rularea e `failed`.
+
+Rămân eșecuri ale întregii rulări, deliberat: trivy care cade pe o imagine, un raport
+despre altă imagine, un raport care nu e JSON, termenul de timp, baza de
+vulnerabilități veche și peste 40 de imagini unice. Sunt „n-am putut să mă uit", nu
+„m-am uitat și e prea mare" — unele sunt trecătoare, altele arată că unealta însăși
+e greșită, și o rulare greșită despre o imagine nu poate garanta pe celelalte.
 
 ### 3.15 Familia se detectează o dată, la instalare
 
