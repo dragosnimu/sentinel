@@ -216,27 +216,51 @@
 #   * EVENIMENT, nu stare. Nu are cheie, nu trece prin motorul de diferente, nu are
 #     "problema noua" / "rezolvat" (nu e nimic de rezolvat) si nu se deduplica pe text: un
 #     mesaj `💀 ... nucleul a omorat N proces(e)` pleaca direct. Ultima valoare vazuta sta in
-#     oom_kill.state (un numar), langa restul starii.
+#     oom_kill.state, langa restul starii, ca O PERECHE pe un rand: `<boot_id> <contor>`.
 #   * Prima rulare nu are valoare anterioara: o retine si NU anunta. Fara asta, instalarea
 #     ar anunta ca "nou" kill-ul de acum o zi, din istoria contorului.
-#   * O valoare MAI MICA decat cea retinuta e o repornire (contorul porneste de la 0): baza
-#     se refa, fara mesaj. Limita: dupa o repornire, kill-urile pana la valoarea veche nu
-#     se disting de baza (retinut 1, repornire, un kill => tot 1). Pe gazda repornirile sunt
-#     rare; un `boot_id` in fisierul de stare ar inchide golul si NU s-a construit.
+#   * Contorul porneste de la 0 la FIECARE pornire, deci o valoare nu inseamna nimic fara
+#     pornirea ei. Gazda se reporneste cam o data pe saptamana (`last -x reboot`: 4 sep, 10 sep,
+#     15 sep, 29 sep, 5 oct, 18 oct: sase in 44 de zile), iar `OnBootSec=2min` pune
+#     prima rulare la doua minute dupa pornire, exact cand cele noua containere pornesc deodata
+#     si memoria e cea mai stransa. Fara pornire in stare, un kill de atunci era orb in doua
+#     feluri: retinut 1, repornire, un kill => contorul e tot 1, egal cu baza, nici mesaj, nici
+#     baza refacuta; retinut 3, repornire, doua kill-uri => 2, luat drept "repornire" si baza
+#     refacuta TACUT. `/proc/sys/kernel/random/boot_id` (UUID, 37 de octeti cu newline,
+#     citibil de oricine) se schimba la fiecare pornire: ALTA pornire => valoarea veche se
+#     socoteste 0, deci orice contor > 0 se anunta ("oom_kill 0 -> N", cu o nota ca gazda s-a
+#     repornit), iar un contor 0 reface baza fara mesaj si retine pornirea noua.
+#   * Aceeasi pornire si contorul a SCAZUT: un contor al nucleului nu scade in cursul unei
+#     porniri, deci "a fost o repornire" nu mai explica nimic. `unk:oom`, baza refacuta.
+#   * `boot_id` ilizibil (lipsa, gol, alta forma) => `unk:oom` ("nu pot citi boot_id") si se
+#     compara DOAR contorul, exact ca inainte de boot_id: o crestere se anunta, o scadere reface
+#     baza fara mesaj, nimic nu se inventeaza si nimic nu e declarat sanatos. Starea retine
+#     atunci `-` in loc de pornire; `-` (la scriere sau la citire) inseamna "nu stiu", nu "alta
+#     pornire", iar la prima rulare cu `boot_id` citibil perechea se completeaza.
+#   * Prima rulare (fisier lipsa) tace, deci un kill de dupa o stergere a starii nu se vede.
 #   * Contor ilizibil sau lipsa (/proc/vmstat fara `oom_kill`) => `unk:oom` ("nu pot citi"),
-#     ca la paginare: nici kill inventat, nici "sanatos". Fisier de stare cu continut care nu
-#     e un numar => `unk:oom` o rulare si baza refacuta (un kill dintre timp poate lipsi).
+#     ca la paginare: nici kill inventat, nici "sanatos". Fisier de stare care nu e EXACT o
+#     pereche valida (gol, un singur numar - formatul de dinainte de boot_id -, un camp in
+#     plus, o pornire care nu e UUID) => `unk:oom` o rulare si baza refacuta (un kill dintre
+#     timp poate lipsi). Doar primul rand se citeste.
 #   * O singura citire a /proc/vmstat pe rulare: aceeasi pentru paginare si OOM.
 #   * Mesajul nu uita un kill: baza se muta DOAR dupa ce `curl` a primit 2xx. Un kill in
 #     timpul unei pene de retea (exact cand o gazda sufocata de memorie pierde conexiuni)
 #     se reincearca la urmatoarea rulare, deci poate veni de doua ori daca raspunsul s-a
 #     pierdut dupa livrare - mai bine decat niciodata. Invers, temporarul cu valoarea noua se
 #     scrie INAINTE de trimitere: daca nu se poate scrie, nu se anunta (fiecare minut ar
-#     repeta aceeasi crestere) si apare `unk:oom`.
+#     repeta aceeasi crestere) si apare `unk:oom`. La fel daca `mv` nu poate inlocui starea
+#     (dupa mesaj sau la stabilirea bazei): `unk:oom`, nu o rulare care pare reusita.
 #   * Victima: `journalctl -k` ruland ca root, linia `Killed process PID (nume) ... anon-rss`.
-#     Marginit: `timeout` OOM_JOURNAL_TIMEOUT_S si fereastra OOM_LOOKBACK_MIN (jurnalul
-#     gazdei e mare si volatil - fara /var/log/journal, pierdut la repornire). Se iau cel mult
-#     min(N, OOM_NAMES_MAX) randuri, cele mai noi. Daca nu gaseste nimic, mesajul spune asta
+#     Marginit: `timeout` OOM_JOURNAL_TIMEOUT_S si fereastra OOM_LOOKBACK_MIN. Jurnalul gazdei
+#     e persistent (Storage persistent, /var/log/journal ~1,6 G, istoric de la 26 sept - masurat
+#     pe 22 oct; o nota mai veche il dadea volatil, nu mai e), deci fereastra NU e o scuza
+#     pentru un jurnal care se pierde. 30 de minute acopera cateva reincercari ale unui mesaj
+#     nelivrat (una pe minut); plafonul de timp e cel care tine rularea sub controlul unitatii
+#     pe un jurnal mare. Un kill mai vechi nu e numit - mesajul spune asta si contorul ramane
+#     dovada. `--since` trece peste repornire: dupa una, o victima de dinainte de ea poate fi
+#     numita doar daca jurnalul n-are cele `delta` linii de dupa; `-b` nu s-a adaugat. Se iau
+#     cel mult min(N, OOM_NAMES_MAX) randuri, cele mai noi. Daca nu gaseste nimic, mesajul spune asta
 #     si pleaca oricum: contorul e dovada, numele e doar comoditate. Numele vine de la un
 #     proces, deci se taie la caractere tiparibile si 40 de caractere. Formatul real are
 #     paranteze in nume (`next-server (v`).
@@ -468,9 +492,9 @@ check_paging(){
 # contorului `oom_kill`) se muta doar dupa ce mesajul a plecat.
 
 # oom_victims N - cel mult N randuri `ora|pid|rss_kB|nume` din jurnalul nucleului, cele mai
-# noi. Marginit in timp (`timeout`) si in fereastra (`--since`): jurnalul gazdei e mare si
-# volatil, iar un kill mai vechi decat fereastra nu e gasit - mesajul atunci nu numeste
-# nimic, ceea ce e mai bine decat un mesaj tarziu. Nu esueaza niciodata catre apelant.
+# noi. Marginit in timp (`timeout`) si in fereastra (`--since`): jurnalul gazdei e mare
+# (persistent, ~1,6 G), iar un kill mai vechi decat fereastra nu e gasit - mesajul atunci nu
+# numeste nimic, ceea ce e mai bine decat un mesaj tarziu. Nu esueaza niciodata catre apelant.
 # `[:print:]` scoate din nume orice caracter de control: numele vine de la un proces.
 # Greedy pe nume: `comm` poate contine paranteze (pe gazda: "next-server (v").
 oom_victims(){
@@ -482,29 +506,61 @@ oom_victims(){
   return 0
 }
 
+# boot_id al nucleului: un UUID (litere mici, 36 de caractere), nou la fiecare pornire. Orice
+# altceva - fisier lipsa, gol, alt format - nu e un boot_id si NU se trateaza ca "aceeasi
+# pornire". In fisierul de stare, `-` inseamna "pornirea nu se stia la scriere".
+OOM_BOOT_RE='^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$'
+
 check_oom(){
-  local cur="$VM_OOM" last="" had=0 delta line ts pid rss name names="" nfound=0 msg tmp="$OOM_STATE.tmp"
+  local cur="$VM_OOM" last="" sboot="" extra="" boot="" had=0 rebooted=0 delta line ts pid rss name names="" nfound=0 msg tmp="$OOM_STATE.tmp"
   if ! [[ "$cur" =~ ^[0-9]{1,15}$ ]]; then unknown cap:oom "oom_kill din $PROC/vmstat"; return 0; fi
   cur=$((10#$cur))
+  # Pornirea curenta. Se verifica FORMA citita, nu codul de iesire al `read`: un fisier fara
+  # newline final face `read` sa intoarca 1 desi a citit, iar unul gol sau lipsa lasa variabila goala.
+  { read -r boot < "$PROC/sys/kernel/random/boot_id"; } 2>/dev/null
+  if ! [[ "$boot" =~ $OOM_BOOT_RE ]]; then
+    boot="-"
+    unknown cap:oom "boot_id din $PROC/sys/kernel/random/boot_id (compar doar contorul; un kill dupa o repornire poate trece nevazut)"
+  fi
   if [ -e "$OOM_STATE" ] || [ -L "$OOM_STATE" ]; then
     # Ceva care nu e fisier obisnuit (director, legatura moarta) nu se poate inlocui cu `mv`
     # (ar muta temporarul IN director si rularea ar parea reusita): se spune si se renunta.
     [ -f "$OOM_STATE" ] || { unknown cap:oom "starea contorului oom_kill ($OOM_STATE nu e un fisier obisnuit)"; return 0; }
-    # Un fisier care exista dar nu are un numar nu e "prima rulare": un kill dintre timp poate
-    # lipsi, si asta se spune. Baza se reface oricum, ca sa nu ramana stricat.
-    read -r last < "$OOM_STATE"
-    if [[ "$last" =~ ^[0-9]{1,15}$ ]]; then had=1; last=$((10#$last))
+    # Format: `<boot_id|-> <contor>`, un singur rand. Un fisier care exista dar nu are exact
+    # perechea asta (gol, un singur numar - formatul dinainte de boot_id - sau cu ceva in plus)
+    # nu e "prima rulare": un kill dintre timp poate lipsi, si asta se spune. Baza se reface
+    # oricum, ca sa nu ramana stricat.
+    read -r sboot last extra < "$OOM_STATE"
+    if [[ "$sboot" =~ $OOM_BOOT_RE || "$sboot" = "-" ]] && [[ "$last" =~ ^[0-9]{1,15}$ ]] && [ -z "$extra" ]; then
+      had=1; last=$((10#$last))
     else unknown cap:oom "starea contorului oom_kill din $OOM_STATE (baza refacuta; un kill de dinainte poate lipsi)"; fi
   fi
-  [ "$had" = 1 ] && [ "$cur" -eq "$last" ] && return 0
+  if [ "$had" = 1 ]; then
+    if [ "$boot" != "-" ] && [ "$sboot" != "-" ] && [ "$boot" != "$sboot" ]; then
+      # Alta pornire: contorul a repornit de la 0, deci valoarea veche nu mai e o baza. Tot ce
+      # arata acum s-a intamplat de la pornire, iar o valoare > 0 se anunta - chiar daca e egala
+      # cu sau mai mica decat cea retinuta (asta era fereastra oarba a minutelor de dupa pornire).
+      rebooted=1; last=0
+    elif [ "$boot" != "-" ] && [ "$sboot" = "$boot" ] && [ "$cur" -lt "$last" ]; then
+      # Aceeasi pornire si contorul a scazut: nu e o repornire, iar un contor al nucleului nu
+      # scade in cursul unei porniri. Nu stiu ce s-a intamplat cu el - se spune, nu se tace.
+      unknown cap:oom "contorul oom_kill (a scazut de la $last la $cur fara repornire; baza refacuta, un kill dintre timp poate lipsi)"
+    fi
+    # Nimic de spus si nimic de retinut: aceeasi valoare, aceeasi pornire (sau pornire
+    # necitibila acum - atunci ramane scrisa cea veche, nu se inlocuieste cu `-`). O pornire
+    # schimbata nu intra aici niciodata, chiar daca valoarea (0) a ramas egala: starea trebuie
+    # sa retina pornirea noua.
+    if [ "$cur" -eq "$last" ] && { [ "$sboot" = "$boot" ] || [ "$boot" = "-" ]; }; then return 0; fi
+  fi
   # Valoarea noua se scrie intr-un temporar INAINTE de orice mesaj: daca nu se poate scrie,
   # fiecare rulare ar vedea aceeasi crestere si ar anunta-o din nou, in fiecare minut.
-  if ! printf '%s\n' "$cur" > "$tmp"; then
+  if ! printf '%s %s\n' "$boot" "$cur" > "$tmp"; then
     unknown cap:oom "contorul oom_kill (nu pot scrie $tmp; nu anunt ca sa nu repet in fiecare minut)"; return 0
   fi
-  # Prima rulare (nu exista valoare anterioara) sau repornire (contorul a scazut): baza noua,
-  # fara mesaj. Istoria dinaintea instalarii nu e un eveniment de acum.
-  if [ "$had" = 0 ] || [ "$cur" -lt "$last" ]; then
+  # Prima rulare (nu exista valoare anterioara), repornire fara kill-uri (contor 0), contor scazut,
+  # sau doar pornirea de retinut: baza noua, fara mesaj. Istoria dinaintea instalarii nu e un
+  # eveniment de acum.
+  if [ "$had" = 0 ] || [ "$cur" -le "$last" ]; then
     mv -f "$tmp" "$OOM_STATE" || { rm -f "$tmp"; unknown cap:oom "contorul oom_kill (nu pot scrie $OOM_STATE)"; }
     return 0
   fi
@@ -518,6 +574,7 @@ check_oom(){
     names+=$'\n'"  • ${name:0:40} (pid ${pid}, $((10#$rss / 1024)) MB RSS) la ${ts:11:8}"
   done < <(oom_victims "$(( delta < OOM_NAMES_MAX ? delta : OOM_NAMES_MAX ))")
   msg="💀 VPS ${HOST}: nucleul a omorat ${delta} proces(e) din lipsa de memorie (oom_kill ${last} -> ${cur})."
+  [ "$rebooted" = 1 ] && msg+=$'\n'"Gazda s-a repornit de la ultima rulare: contorul numara de la pornire, nu de la rularea anterioara."
   if [ "$nfound" -gt 0 ]; then msg+=$'\n'"Din jurnalul nucleului (ultimele ${OOM_LOOKBACK_MIN} min):${names}"
   else msg+=$'\n'"Numele victimei nu l-am gasit in jurnalul nucleului (ultimele ${OOM_LOOKBACK_MIN} min); contorul e dovada."; fi
   if send_try "$msg"; then

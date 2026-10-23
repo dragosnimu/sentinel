@@ -1188,15 +1188,22 @@ un minut, deci completează alerta de RAM, nu o înlocuiește. Mesajul are forma
 `💀 VPS <gazdă>: nucleul a omorat N proces(e) din lipsa de memorie (oom_kill A -> B)` și, dacă
 `journalctl -k` mai are linia (fereastră de 30 de minute, plafon de 5 s), numele victimei,
 pid-ul, RSS-ul și ora. Nu trece prin „problemă nouă" / „rezolvat": n-are ce să se rezolve.
-Ultima valoare văzută stă în `/opt/vps-watchdog/state/oom_kill.state`; **prima rulare o
-reține și nu anunță** (altfel instalarea ar anunța kill-ul de acum o zi), iar o valoare
-**mai mică** înseamnă repornire și reface baza fără mesaj. Baza se mută doar după ce
-Telegram a răspuns 2xx — un kill în timpul unei pene de rețea se reîncearcă, deci poate veni
-de două ori dacă răspunsul s-a pierdut după livrare. Contor ilizibil sau fișier de stare
-care nu se poate scrie => `unk:oom` („nu pot citi"), nu „sănătos" și nu un kill inventat.
-**Limită:** după o repornire, kill-urile până la valoarea veche nu se disting de bază
-(reținut 1, repornire, un kill => tot 1); un `boot_id` în fișierul de stare ar închide golul și
-nu s-a construit. Detalii: secțiunea 6 din antetul scriptului.
+Ultima valoare văzută stă în `/opt/vps-watchdog/state/oom_kill.state`, ca o pereche pe un
+rând, `<boot_id> <contor>`; **prima rulare o reține și nu anunță** (altfel instalarea ar
+anunța kill-ul de acum o zi). Contorul pornește de la 0 la fiecare pornire a gazdei, deci
+valoarea nu înseamnă nimic fără pornirea ei: dacă `boot_id`
+(`/proc/sys/kernel/random/boot_id`) s-a schimbat, valoarea veche se socotește 0 și orice
+contor > 0 se anunță (`oom_kill 0 -> N`, cu o notă că gazda s-a repornit) — inclusiv când
+numărul e egal cu sau mai mic decât cel reținut, fereastra în care detectorul era orb.
+Gazda se repornește cam o dată pe săptămână, iar prima rulare după pornire vine la ~2
+minute, exact când containerele pornesc deodată. Baza se mută doar după ce Telegram a
+răspuns 2xx — un kill în timpul unei pene de rețea se reîncearcă, deci poate veni de două
+ori dacă răspunsul s-a pierdut după livrare. Contor ilizibil, fișier de stare care nu e o
+pereche validă (și formatul vechi, un singur număr), un contor care **scade în aceeași
+pornire** sau un fișier de stare care nu se poate scrie => `unk:oom` („nu pot citi"), nu
+„sănătos" și nu un kill inventat. Dacă `boot_id` e ilizibil, apare `unk:oom` și se compară
+doar contorul, ca înainte: o repornire poate ascunde atunci un kill, iar asta se spune.
+Detalii: secțiunea 6 din antetul scriptului.
 
 **De ce nu mai există alerta de swap plin:** un swap plin e consecința unei
 presiuni de RAM care a trecut, nu o defecțiune; sunase ore întregi pe o stare

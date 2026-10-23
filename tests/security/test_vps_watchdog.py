@@ -59,6 +59,12 @@ pytestmark = [pytest.mark.security,
 # fost o gaura permanenta pentru un castig de o linie.
 TOKEN = ":".join(["1234567890", "-".join(["SYNTHETIC", "token", "for", "tests", "only", "0000"])])
 CHAT = "-1001234567890"
+# Doua porniri distincte, in forma reala a lui /proc/sys/kernel/random/boot_id: UUID cu litere
+# mici, 36 de caractere + newline = 37 de octeti (masurat pe gazda pe 22 oct). Valori fictive.
+# Asamblate din bucati, ca TOKEN-ul de mai sus: un literal hex de 36 de caractere seamana cu
+# un secret pentru garda din test_repo_is_sanitised.py, care recunoaste forma, nu intentia.
+BOOT_A = "-".join(["aaaaaaaa", "1111", "4222", "8333", "444444444444"])
+BOOT_B = "-".join(["bbbbbbbb", "5555", "4666", "8777", "888888888888"])
 MB = 1024  # kB per MB, pentru /proc/meminfo
 
 
@@ -131,6 +137,7 @@ class Host:
         (self.state / ".seeded").write_text("", encoding="utf-8")
         self._write_stubs()
         self.set_proc()
+        self.set_boot_id(BOOT_A)
 
     # -- fals-uri -----------------------------------------------------------
     def _write_stubs(self) -> None:
@@ -207,6 +214,16 @@ class Host:
             la.unlink(missing_ok=True)
         else:
             la.write_text(f"{load} 0.20 0.30 1/500 12345\n", encoding="utf-8")
+
+    def set_boot_id(self, boot_id: str | None) -> None:
+        """`boot_id` al nucleului: se schimba la fiecare repornire. `None` = ilizibil/lipsa.
+        Scris ca octeti: gazda reala nu are CR, iar `write_text` pe Windows ar pune unul."""
+        p = self.proc / "sys" / "kernel" / "random" / "boot_id"
+        if boot_id is None:
+            p.unlink(missing_ok=True)
+        else:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(f"{boot_id}\n".encode("utf-8"))
 
     # -- stare, conf, containere ---------------------------------------------
     def write_state(self, lines: list[str]) -> None:
@@ -1340,14 +1357,50 @@ def _oom_msgs(run: Run) -> list[str]:
     return [m for m in run.msgs if "nucleul a omorat" in m]
 
 
-def _put_oom_state(host: Host, text: str) -> None:
-    """Scris ca octeti: `write_text` pe Windows ar pune CR+LF, iar gazda reala nu are CR."""
+def _put_oom_raw(host: Host, text: str) -> None:
+    """Continut brut, ca octeti: `write_text` pe Windows ar pune CR+LF, iar gazda reala nu are CR."""
     (host.state / "oom_kill.state").write_bytes(text.encode("utf-8"))
 
 
-def _oom_state(host: Host) -> str | None:
+def _put_oom_state(host: Host, count: int, boot: str = BOOT_A) -> None:
+    """O stare valida, in formatul `<boot_id> <contor>` pe care il scrie scriptul."""
+    _put_oom_raw(host, f"{boot} {count}\n")
+
+
+def _oom_pair(host: Host) -> tuple[str, str] | None:
+    """(boot_id, contor) din fisierul de stare, sau None daca nu exista. Cere EXACT perechea:
+    un fisier cu alta forma pica aici, nu trece drept "contor"."""
     p = host.state / "oom_kill.state"
-    return p.read_text(encoding="utf-8").strip() if p.exists() else None
+    if not p.exists():
+        return None
+    raw = p.read_bytes().decode("utf-8")
+    assert raw.endswith("\n") and raw.count("\n") == 1 and "\r" not in raw, repr(raw)
+    boot, count = raw.rstrip("\n").split(" ")
+    return boot, count
+
+
+def _oom_state(host: Host) -> str | None:
+    """Doar contorul retinut (al doilea camp)."""
+    pair = _oom_pair(host)
+    return None if pair is None else pair[1]
+
+
+def _oom_boot(host: Host) -> str | None:
+    """Doar pornirea retinuta (primul camp)."""
+    pair = _oom_pair(host)
+    return None if pair is None else pair[0]
+
+
+def _fail_mv_onto_oom_state(host: Host) -> None:
+    """Un `mv` fals care refuza DOAR inlocuirea lui `oom_kill.state`; orice alt `mv` (starea
+    problemelor, contoarele) merge mai departe prin cel real. Pe gazda reala un `mv` in acelasi
+    director esueaza rar - dar tocmai de aceea ramura nu se vede esuand niciodata."""
+    real_mv = subprocess.run([BASH, "-c", "command -v mv"], capture_output=True,
+                             text=True).stdout.strip()
+    assert real_mv, "nu gasesc mv"
+    _stub(host.bin, "mv",
+          'case "$*" in *oom_kill.state) echo "mv: stub refuses" >&2; exit 1 ;; esac\n'
+          f'exec "{real_mv}" "$@"\n')
 
 
 def _assert_kill_channel_works(tmp_path: Path) -> None:
@@ -1376,6 +1429,8 @@ def test_the_first_run_takes_the_kernels_count_as_a_baseline_and_announces_nothi
     assert first.returncode == 0 and again.returncode == 0, (first.stderr, again.stderr)
     assert first.msgs == [] and again.msgs == [], (first.msgs, again.msgs)
     assert _oom_state(host) == "1"
+    # Pornirea sta LANGA contor: fara ea, repornirea de mai jos ar fi iar invizibila.
+    assert _oom_boot(host) == BOOT_A, _oom_pair(host)
     assert first.journal_calls == [] and again.journal_calls == []
     # Prima rulare ABSOLUTA a watchdog-ului (fara `.seeded`) trimite doar mesajul de pornire:
     # istoria contorului nu apare in el si nu apare ca mesaj separat.
@@ -1422,7 +1477,7 @@ def test_a_rise_announces_the_kill_once_by_name_and_outside_the_problem_engine(h
 
 def test_a_counter_that_has_not_moved_says_nothing_and_does_not_touch_the_journal(host, tmp_path):
     """Verificarea ruleaza in fiecare minut, 1440 de ori pe zi. Fara crestere nu are voie nici
-    sa vorbeasca, nici sa deschida jurnalul nucleului (mare si volatil) - altfel costul
+    sa vorbeasca, nici sa deschida jurnalul nucleului (1,6 G pe gazda) - altfel costul
     "nu s-a intamplat nimic" s-ar plati zilnic si ar adauga un punct de agatare in fiecare
     rulare. Contorul poate fi si mare: 14 kill-uri vechi nu sunt 14 evenimente noi."""
     host.set_proc(oom_kill=14)
@@ -1434,22 +1489,105 @@ def test_a_counter_that_has_not_moved_says_nothing_and_does_not_touch_the_journa
     _assert_kill_channel_works(tmp_path)
 
 
-def test_a_counter_that_goes_down_is_a_reboot_and_the_next_kill_is_still_seen(host, tmp_path):
-    """La repornire contorul revine la 0. Daca valoarea retinuta (aici 5) ar ramane, orice kill
-    de dupa repornire ar fi invizibil pana cand contorul depaseste 5 - operatorul ar crede ca
-    nucleul nu omoara nimic. Daca scaderea s-ar citi ca o crestere negativa, ar primi un
-    mesaj fals ("omorat -5"). Scaderea reface baza FARA mesaj, iar primul kill de dupa
-    repornire se anunta."""
-    _put_oom_state(host, "5\n")
+def test_a_reboot_with_no_kills_rebases_silently_and_the_next_kill_is_still_seen(host, tmp_path):
+    """La repornire contorul revine la 0, iar `boot_id` se schimba. Daca valoarea retinuta (aici
+    5) ar ramane, orice kill de dupa repornire ar fi invizibil pana cand contorul depaseste 5 -
+    operatorul ar crede ca nucleul nu omoara nimic. Daca repornirea s-ar citi ca o crestere
+    negativa, ar primi un mesaj fals ("omorat -5"). O repornire FARA kill-uri (contor 0) reface
+    baza fara mesaj SI retine pornirea noua - altfel fiecare rulare ar mai compara cu cea
+    veche - iar primul kill de dupa repornire se anunta."""
+    _put_oom_state(host, 5, BOOT_A)
+    host.set_boot_id(BOOT_B)
     host.set_proc(oom_kill=0)
     rebooted = host.run(now=1_000_000)
     assert rebooted.msgs == [], rebooted.msgs
-    assert _oom_state(host) == "0"
+    assert _oom_pair(host) == (BOOT_B, "0"), _oom_pair(host)
     host.journal.write_text(_kill_line() + "\n", encoding="utf-8")
     host.set_proc(oom_kill=1)
     r = host.run(now=1_000_060)
     assert len(_oom_msgs(r)) == 1 and "oom_kill 0 -> 1" in r.msgs[0], r.msgs
     _assert_kill_channel_works(tmp_path)
+
+
+# Fereastra oarba a minutelor de dupa pornire: timerul are `OnBootSec=2min`, deci prima rulare
+# vine la ~2 minute dupa pornire, exact cand cele noua containere pornesc deodata si memoria e
+# cea mai stransa. Gazda se reporneste cam o data pe saptamana (`last -x reboot`: 6 porniri in 44 de zile).
+@pytest.mark.parametrize("stored, after_reboot", [
+    pytest.param(1, 1, id="stored-1-one-kill-reads-1-equal-to-stored"),
+    pytest.param(3, 2, id="stored-3-two-kills-read-2-below-stored"),
+    pytest.param(1, 4, id="stored-1-four-kills-read-4-above-stored"),
+])
+def test_kills_in_the_first_minutes_after_a_reboot_are_announced_not_swallowed(
+        host, tmp_path, stored, after_reboot):
+    """Contorul `oom_kill` porneste de la 0 la fiecare pornire. Fara `boot_id`, o valoare
+    citita dupa repornire se compara cu cea de DINAINTE de repornire: egala cu ea (retinut 1,
+    un kill => 1) nu e vazuta ca schimbare, iar mai mica (retinut 3, doua kill-uri => 2) e
+    luata drept repornire si baza se reface TACUT. In ambele cazuri kill-urile se pierd si nu
+    mai pot fi aflate - detectorul era orb exact in fereastra in care un OOM e cel mai probabil.
+    Cu `boot_id` schimbat, valoarea veche se socoteste 0: tot ce arata contorul acum s-a
+    intamplat de la pornire si se anunta, cu contorul real (0 -> N), nu cu o scadere."""
+    host.journal.write_text("".join(
+        _kill_line(pid=100 + i, name=f"victim-{i}", hms=f"03:0{i}:00") + "\n"
+        for i in range(after_reboot)), encoding="utf-8")
+    host.set_proc(oom_kill=stored)
+    assert host.run(now=1_000_000).msgs == []
+    assert _oom_pair(host) == (BOOT_A, str(stored))
+    host.set_boot_id(BOOT_B)
+    host.set_proc(oom_kill=after_reboot)
+    r = host.run(now=1_000_090)
+    assert r.returncode == 0, r.stderr
+    assert len(r.msgs) == 1 and len(_oom_msgs(r)) == 1, r.msgs
+    m = r.msgs[0]
+    assert f"omorat {after_reboot} proces" in m and f"oom_kill 0 -> {after_reboot}" in m, m
+    assert "repornit" in m, f"mesajul nu spune ca gazda s-a repornit: {m!r}"
+    assert f"victim-{after_reboot - 1}" in m, m   # cel mai nou, numit din jurnal
+    assert _oom_pair(host) == (BOOT_B, str(after_reboot)), _oom_pair(host)
+    assert host.run(now=1_000_150).msgs == [], "acelasi kill, anuntat a doua oara"
+    # Martor: aceeasi serie, FARA repornire (aceeasi pornire), ramane tacuta cand contorul nu
+    # creste - nu orice schimbare a numarului e un mesaj.
+    ctl = Host(tmp_path / "same-boot")
+    ctl.set_proc(oom_kill=stored)
+    ctl.run(now=1_000_000)
+    ctl.set_proc(oom_kill=stored)
+    assert ctl.run(now=1_000_090).msgs == []
+    _assert_kill_channel_works(tmp_path)
+
+
+def test_a_reboot_kill_that_could_not_be_sent_is_retried_against_zero(host):
+    """Dupa o repornire, un kill al carui mesaj nu a plecat nu are voie sa devina baza: daca
+    starea s-ar muta la trimitere, operatorul n-ar afla niciodata de el. Starea ramane cea
+    VECHE (alta pornire); rularea urmatoare vede din nou pornirea schimbata, compara cu 0 si
+    anunta."""
+    host.set_proc(oom_kill=1)
+    host.run(now=1_000_000)
+    host.set_boot_id(BOOT_B)
+    host.journal.write_text(_kill_line() + "\n", encoding="utf-8")
+    host.set_proc(oom_kill=1)
+    down = host.run(now=1_000_090, env_extra={"FAKE_SEND_RC": "22"})
+    assert down.returncode == 0, down.stderr
+    assert _oom_pair(host) == (BOOT_A, "1"), "starea a avansat desi mesajul nu a plecat"
+    up = host.run(now=1_000_150)
+    assert len(_oom_msgs(up)) == 1 and "oom_kill 0 -> 1" in up.msgs[0], up.msgs
+    assert _oom_pair(host) == (BOOT_B, "1")
+
+
+def test_a_counter_that_goes_down_within_one_boot_is_unknown_not_a_reboot(host):
+    """Un contor al nucleului nu scade in cursul unei porniri. Daca aceeasi pornire arata
+    totusi o valoare mai mica, "a fost o repornire" nu mai e o explicatie (pornirea e aceeasi):
+    a o accepta tacut ar fi exact orbirea veche, cu o scuza. Nu inventez un kill si nu declar
+    sanatos: `unk:oom` o rulare, baza se reface, iar un kill de dupa aceea se anunta."""
+    _put_oom_state(host, 5, BOOT_A)
+    host.set_proc(oom_kill=2)
+    r = host.run(now=1_000_000)
+    assert _oom_msgs(r) == [], r.msgs
+    assert len(r.msgs) == 1 and "NECUNOSCUTA" in r.msgs[0] and "(oom)" in r.msgs[0], r.msgs
+    assert any(l.startswith("unk:oom|") for l in r.state_lines), r.state_lines
+    assert _oom_pair(host) == (BOOT_A, "2"), _oom_pair(host)
+    nxt = host.run(now=1_000_060)   # masuratoarea e din nou coerenta: rezolvat, ca la orice unk:*
+    assert _oom_msgs(nxt) == [] and len(nxt.msgs) == 1 and "rezolvat" in nxt.msgs[0], nxt.msgs
+    host.journal.write_text(_kill_line() + "\n", encoding="utf-8")
+    host.set_proc(oom_kill=3)
+    assert len(_oom_msgs(host.run(now=1_000_120))) == 1
 
 
 @pytest.mark.parametrize("how", ["field_absent", "value_not_a_number", "field_without_value"])
@@ -1459,7 +1597,7 @@ def test_an_unreadable_counter_is_unknown_never_a_kill_and_never_fine(host, tmp_
     pentru totdeauna) si nici ca o crestere (kill inventat). Se raporteaza `unk:oom`,
     NECUNOSCUT, iar ultima valoare buna ramane retinuta, ca primul kill de dupa ce
     contorul redevine citibil sa nu se piarda."""
-    _put_oom_state(host, "3\n")
+    _put_oom_state(host, 3)
     if how == "field_absent":
         host.set_proc(oom_kill=None)
     else:
@@ -1474,15 +1612,15 @@ def test_an_unreadable_counter_is_unknown_never_a_kill_and_never_fine(host, tmp_
     assert any(l.startswith("unk:oom|") for l in r.state_lines), r.state_lines
     assert _oom_state(host) == "3"
     ctl = Host(tmp_path / "ctl")  # martor: acelasi contor, citibil si neschimbat, e tacut
-    _put_oom_state(ctl, "3\n")
+    _put_oom_state(ctl, 3)
     ctl.set_proc(oom_kill=3)
     assert ctl.run().msgs == []
 
 
 @pytest.mark.parametrize("journal", ["empty", "journalctl_fails", "unrecognised_format"])
 def test_a_kill_whose_victim_cannot_be_named_is_still_announced(host, tmp_path, journal):
-    """Jurnalul gazdei e volatil (fara /var/log/journal) si se pierde la repornire; un kill
-    poate fi mai vechi decat fereastra, `journalctl` poate esua, formatul liniei se poate
+    """Jurnalul gazdei e persistent (1,6 G pe disc, istoric de la 26 sept), dar cautarea e
+    marginita de o fereastra si de un plafon de timp; un kill poate fi mai vechi decat fereastra, `journalctl` poate esua, formatul liniei se poate
     schimba. Contorul e dovada, numele doar comoditate: mesajul pleaca oricum, spune ca nu
     a gasit victima, si baza avanseaza. Un mesaj fara nume e mai bun decat niciunul."""
     host.set_proc(oom_kill=1)
@@ -1507,7 +1645,7 @@ def test_the_journal_search_is_bounded_in_time_and_in_window(host):
     """O gazda sufocata de memorie e exact cand `journalctl` poate sa se agate. Cautarea
     victimei ruleaza in aceeasi rulare ca restul verificarilor: fara plafon de timp, un jurnal
     lent ar tine toata rularea pana la TimeoutStartSec (300 s) si ar amuti watchdog-ul pe
-    minutele urmatoare; fara fereastra, ar citi tot jurnalul volatil. Cautarea trece prin
+    minutele urmatoare; fara fereastra, ar citi tot jurnalul (1,6 G pe gazda). Cautarea trece prin
     `timeout` si are `--since`."""
     host.set_proc(oom_kill=1)
     host.run(now=1_000_000)
@@ -1602,19 +1740,36 @@ def test_a_state_that_cannot_be_written_is_reported_and_never_repeated(host):
     assert len(_oom_msgs(ctl.run(now=1_000_060))) == 1
 
 
-@pytest.mark.parametrize("content", ["abc", "", "-3", "1e3", "7 8"])
+# Starea valida are EXACT forma `<boot_id> <contor>`. Fiecare continut de mai jos e ceva ce o
+# citire prea larga ar lua drept valid: formatul de dinainte de boot_id (un singur numar - ce a
+# scris versiunea anterioara a scriptului), perechea cu ceva in plus sau in minus, o pornire
+# care nu e un UUID. Cu contorul real 7, orice citire gresita a unuia dintre ele da un kill
+# inventat (7 - N) sau o baza refacuta pe tacute.
+@pytest.mark.parametrize("content", [
+    pytest.param("abc", id="not-a-pair"),
+    pytest.param("", id="empty"),
+    pytest.param("3\n", id="bare-counter-as-the-previous-script-wrote-it"),
+    pytest.param(f"{BOOT_A}\n", id="boot-id-without-a-counter"),
+    pytest.param(f"{BOOT_A} abc\n", id="counter-not-a-number"),
+    pytest.param(f"{BOOT_A} -3\n", id="counter-negative"),
+    pytest.param(f"{BOOT_A} 1e3\n", id="counter-scientific"),
+    pytest.param(f"{BOOT_A} 2 9\n", id="pair-with-an-extra-field"),
+    pytest.param("7 8\n", id="two-numbers-first-is-not-a-boot-id"),
+    pytest.param("not-a-boot-id 2\n", id="boot-id-with-a-bad-shape"),
+])
 def test_a_garbled_state_file_neither_invents_a_kill_nor_hides_the_damage(host, tmp_path, content):
-    """Daca fisierul de stare s-ar citi ca 0 cand nu e un numar, contorul real (7) ar parea
-    7 kill-uri noi - o alarma falsa; daca s-ar ignora fara un cuvant, un kill dintre timp ar
-    lipsi fara ca cineva sa stie. Raspunsul: baza se reface la valoarea citita acum, fara
-    mesaj de kill, si apare `unk:oom` o rulare; apoi totul e normal si urmatorul kill se
-    anunta."""
-    _put_oom_state(host, content)
+    """Daca un fisier de stare care nu e o pereche `<boot_id> <contor>` s-ar citi totusi ca una
+    (formatul vechi - un singur numar -, o pereche cu un camp in plus, o pornire care nu e un
+    UUID), contorul real (7) ar parea N kill-uri noi - o alarma falsa - sau baza s-ar reface
+    fara un cuvant, iar un kill dintre timp ar lipsi fara ca cineva sa stie. Raspunsul: baza se
+    reface la perechea citita acum, fara mesaj de kill, si apare `unk:oom` o rulare; apoi totul
+    e normal si urmatorul kill se anunta."""
+    _put_oom_raw(host, content)
     host.set_proc(oom_kill=7)
     r = host.run(now=1_000_000)
     assert _oom_msgs(r) == [], r.msgs
     assert len(r.msgs) == 1 and "NECUNOSCUTA" in r.msgs[0], r.msgs
-    assert _oom_state(host) == "7"
+    assert _oom_pair(host) == (BOOT_A, "7"), _oom_pair(host)
     nxt = host.run(now=1_000_060)   # ca orice `unk:*`: rezolvat cand masuratoarea redevine citibila
     assert _oom_msgs(nxt) == [] and len(nxt.msgs) == 1 and "rezolvat" in nxt.msgs[0], nxt.msgs
     assert host.run(now=1_000_090).msgs == []
@@ -1622,6 +1777,103 @@ def test_a_garbled_state_file_neither_invents_a_kill_nor_hides_the_damage(host, 
     host.set_proc(oom_kill=8)
     assert len(_oom_msgs(host.run(now=1_000_120))) == 1
     _assert_kill_channel_works(tmp_path)
+
+
+@pytest.mark.parametrize("how", ["missing", "empty", "not_a_uuid", "truncated"])
+def test_an_unreadable_boot_id_is_reported_and_the_counter_alone_still_decides(host, tmp_path, how):
+    """Fara `boot_id` nu se poate spune daca gazda s-a repornit. Raspunsul nu e nici "sanatos"
+    (o verificare orba care arata verde e exact ce a tacut pe 21 oct), nici un kill inventat din
+    nimic: se raporteaza `unk:oom` ("nu pot citi boot_id") si se compara DOAR contorul, ca inainte
+    - o crestere se anunta in continuare, o scadere reface baza fara mesaj. Pornirea retinuta
+    nu se inlocuieste cu `-` cat timp contorul n-a schimbat nimic."""
+    bad = {"missing": None, "empty": "", "not_a_uuid": "garbage", "truncated": BOOT_A[:20]}[how]
+    host.set_proc(oom_kill=1)
+    host.run(now=1_000_000)
+    host.set_boot_id(bad)
+    same = host.run(now=1_000_060)
+    assert same.returncode == 0, same.stderr
+    assert _oom_msgs(same) == [], same.msgs
+    assert len(same.msgs) == 1 and "NECUNOSCUTA" in same.msgs[0] and "boot_id" in same.msgs[0], same.msgs
+    assert any(l.startswith("unk:oom|") for l in same.state_lines), same.state_lines
+    assert _oom_pair(host) == (BOOT_A, "1"), "pornirea retinuta s-a pierdut fara ca contorul sa se schimbe"
+    host.journal.write_text(_kill_line() + "\n", encoding="utf-8")
+    host.set_proc(oom_kill=2)
+    rise = host.run(now=1_000_120)
+    assert len(rise.msgs) == 1 and len(_oom_msgs(rise)) == 1, rise.msgs
+    assert "oom_kill 1 -> 2" in rise.msgs[0] and "repornit" not in rise.msgs[0], rise.msgs[0]
+    assert _oom_pair(host) == ("-", "2"), _oom_pair(host)
+    host.set_proc(oom_kill=0)
+    down = host.run(now=1_000_180)
+    assert _oom_msgs(down) == [] and down.msgs == [], down.msgs
+    assert _oom_pair(host) == ("-", "0"), _oom_pair(host)
+    # Martor: aceeasi serie cu boot_id citibil nu spune nimic despre boot_id.
+    ctl = Host(tmp_path / "readable")
+    ctl.set_proc(oom_kill=1)
+    ctl.run(now=1_000_000)
+    assert ctl.run(now=1_000_060).msgs == []
+
+
+def test_when_the_boot_id_is_readable_again_the_pair_is_completed_without_a_false_kill(host):
+    """Dupa o rulare cu `boot_id` ilizibil, starea retine `- <contor>`. Cand `boot_id` redevine
+    citibil: (1) `-` nu e "alta pornire" - altfel contorul vechi (1) s-ar compara cu 0 si
+    operatorul ar primi un kill care nu exista; (2) perechea trebuie COMPLETATA chiar daca
+    contorul n-a miscat, altfel starea ar ramane `-` si o repornire de dupa aceea ar fi iar
+    invizibila. Apoi o repornire se vede."""
+    host.set_proc(oom_kill=1)
+    host.set_boot_id(None)
+    first = host.run(now=1_000_000)
+    assert _oom_msgs(first) == [] and len(first.msgs) == 1 and "NECUNOSCUTA" in first.msgs[0], first.msgs
+    assert _oom_pair(host) == ("-", "1"), _oom_pair(host)
+    host.set_boot_id(BOOT_A)
+    back = host.run(now=1_000_060)
+    assert _oom_msgs(back) == [], back.msgs
+    assert len(back.msgs) == 1 and "rezolvat" in back.msgs[0], back.msgs
+    assert _oom_pair(host) == (BOOT_A, "1"), _oom_pair(host)
+    host.set_boot_id(BOOT_B)
+    host.journal.write_text(_kill_line() + "\n", encoding="utf-8")
+    host.set_proc(oom_kill=1)
+    rebooted = host.run(now=1_000_120)
+    assert len(_oom_msgs(rebooted)) == 1 and "oom_kill 0 -> 1" in rebooted.msgs[0], rebooted.msgs
+
+
+@pytest.mark.parametrize("phase", ["after_the_message", "baseline"])
+def test_a_state_file_that_cannot_be_replaced_is_reported_in_both_places(host, tmp_path, phase):
+    """Inlocuirea lui `oom_kill.state` (`mv`) poate esua, iar rularea nu are voie sa para
+    reusita. (a) Dupa un mesaj de kill: daca esecul s-ar ignora, baza n-ar avansa, iar
+    kill-ul s-ar anunta din nou in fiecare minut fara ca operatorul sa afle de ce; (b) la
+    stabilirea bazei: fara fisier, fiecare rulare ar fi "prima" si orice kill ar ramane
+    nevazut pentru totdeauna. In ambele cazuri se spune `unk:oom` si nu ramane temporar.
+    Martor: fara `mv` stricat, aceeasi serie nu spune nimic de acest fel."""
+    def series(h: Host) -> Run:
+        h.journal.write_text(_kill_line() + "\n", encoding="utf-8")
+        if phase == "after_the_message":
+            h.set_proc(oom_kill=1)
+            h.run(now=1_000_000)
+            h.set_proc(oom_kill=2)
+            if h is host:
+                _fail_mv_onto_oom_state(h)
+            return h.run(now=1_000_060)
+        h.set_proc(oom_kill=1)
+        if h is host:
+            _fail_mv_onto_oom_state(h)
+        return h.run(now=1_000_000)
+
+    ctl = Host(tmp_path / "mv-works")
+    ok = series(ctl)
+    assert not [m for m in ok.msgs if "NECUNOSCUTA" in m], ok.msgs
+    assert (ctl.state / "oom_kill.state").exists()
+
+    r = series(host)
+    assert r.returncode == 0, r.stderr
+    unk = [m for m in r.msgs if "NECUNOSCUTA" in m]
+    assert len(unk) == 1 and "(oom)" in unk[0], r.msgs
+    assert any(l.startswith("unk:oom|") for l in r.state_lines), r.state_lines
+    assert not (host.state / "oom_kill.state.tmp").exists(), "temporarul a ramas"
+    if phase == "after_the_message":
+        assert len(_oom_msgs(r)) == 1, r.msgs
+        assert _oom_pair(host) == (BOOT_A, "1"), _oom_pair(host)
+    else:
+        assert _oom_msgs(r) == [] and _oom_pair(host) is None, (r.msgs, _oom_pair(host))
 
 
 def test_a_state_path_that_is_not_a_regular_file_is_reported_not_papered_over(host):
