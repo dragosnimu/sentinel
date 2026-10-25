@@ -28,7 +28,7 @@ import { countByColor, countByGroup, listFindings } from "@/lib/data/findings";
 import { isGroup } from "@/lib/finding-groups";
 import { COLORS } from "@/lib/finding-risk";
 import type { RiskColor } from "@/lib/finding-risk";
-import { scanHealth } from "@/lib/data/scans";
+import { scanHealthAll } from "@/lib/data/scans";
 import { findingsPage } from "@/lib/panel-page";
 
 export const dynamic = "force-dynamic";
@@ -61,11 +61,10 @@ export async function GET(req: Request): Promise<Response> {
       colors: only === null
         ? { red: 0, amber: 0, green: 0, grey: 0 }
         : await countByColor(db, scope, only),
-      // Starea scanarii care a produs cifrele: cand a masurat, si daca ultima
-      // incercare a esuat. Fara ea, pagina arata un numar fara varsta.
-      scan: only === null
-        ? { lastGood: null, latest: null }
-        : await scanHealth(db, scope, only),
+      // Starea scanarii FIECARUI scaner care a produs cifrele: cand a masurat,
+      // daca ultima incercare a esuat, daca a sarit ceva. Lista de constatari
+      // nu filtreaza dupa scaner, deci nici starea nu are voie sa o faca.
+      scans: only === null ? [] : await scanHealthAll(db, scope, only),
       counts: only === null
         ? { neaplicate: 0, rezolvate: 0, inchise: 0, total: 0 }
         : await countByGroup(db, scope, only),

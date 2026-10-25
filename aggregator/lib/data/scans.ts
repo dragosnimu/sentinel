@@ -97,3 +97,45 @@ export async function scanHealth(
     latest: latest.length ? toRun(latest[0]) : null,
   };
 }
+
+export type ScannerHealth = ScanHealth & { scanner: string };
+
+/**
+ * Starea scanării pentru FIECARE scaner care are rulări pe instanța asta.
+ *
+ * Lista de constatări (`listFindings`) nu filtrează după scaner: pe pagină stau
+ * împreună constatările lui `dnf`, ale lui `trivy_fs` și ale lui `trivy_image`.
+ * Vârsta citită numai de la `dnf` scria „Măsurat la <ora lui dnf>" deasupra unei
+ * liste în care o parte din rânduri veneau de la un scaner cu altă oră — sau cu
+ * alt eșec, sau cu un avertisment de acoperire care nu ajungea nicăieri.
+ *
+ * Lista scanerelor se CITEȘTE din rulări, nu se scrie în cod: o listă tastată
+ * rămâne în urma realității, iar un scaner nou ar fi invizibil pe pagină fără ca
+ * nimic să înroșească. Costul e un scaner care rulează dar n-a produs niciodată
+ * constatări, numit și el pe pagină — o cifră de vârstă în plus, nu una lipsă.
+ *
+ * Ordinea e alfabetică, în cod, nu în SQL: `GROUP BY` fără `ORDER BY` nu
+ * promite nicio ordine pe MariaDB, iar pagina n-are voie să-și rearanjeze
+ * paragrafele de la o cerere la alta.
+ *
+ * Filtrul de instanță e al ACESTEI interogări, nu moștenit: numele unui scaner
+ * al altui server (`nuclei` există pe B, nu pe A) ar spune ce rulează acolo.
+ */
+export async function scanHealthAll(
+  db: AuthDb, allowedInstanceIds: InstanceScope, instanceId: string,
+): Promise<ScannerHealth[]> {
+  if (seesNothing(allowedInstanceIds)) return [];
+
+  const scope = scopePlaceholders(allowedInstanceIds);
+  const names = await db.all(
+    "SELECT scanner, COUNT(*) AS n FROM scan_entries " +
+    ` WHERE instance_id IN (${scope}) AND instance_id = ? ` +
+    " GROUP BY scanner",
+    [...allowedInstanceIds.allowedInstanceIds, instanceId]);
+
+  const out: ScannerHealth[] = [];
+  for (const scanner of names.map((row) => String(row.scanner)).sort()) {
+    out.push({ scanner, ...await scanHealth(db, allowedInstanceIds, instanceId, scanner) });
+  }
+  return out;
+}

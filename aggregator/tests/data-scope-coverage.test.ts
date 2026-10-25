@@ -89,7 +89,7 @@ import * as overviewModule from "../lib/data/overview";
 import { summary } from "../lib/data/overview";
 import * as rollupsModule from "../lib/data/rollups";
 import * as scansModule from "../lib/data/scans";
-import { scanHealth } from "../lib/data/scans";
+import { scanHealth, scanHealthAll } from "../lib/data/scans";
 import { listHours } from "../lib/data/rollups";
 import {
   captureError, captureWarn, forgetAuthServer, useAuthServer,
@@ -308,6 +308,28 @@ const PROBES: Record<string, ScopeProbe> = {
     rows: (result) => {
       const h = result as unknown as { lastGood: unknown; latest: unknown };
       return [h.lastGood, h.latest].filter(Boolean) as unknown as Rows;
+    },
+  },
+
+  "lib/data/scans.ts::scanHealthAll": {
+    seed(db) {
+      // Scanere DIFERITE pe cele două servere, dinadins: lista scanerelor se
+      // citește din rulări, iar un filtru de instanță căzut din ACEA interogare
+      // n-ar muta nicio dată a lui A — ar adăuga pe pagina ei numele unui
+      // scaner care rulează doar pe B (`nuclei`), adică ce caută cineva pe
+      // serverul celuilalt. Reuniunea de mai jos nu vede asta: ce ar scăpa
+      // pentru contul lui A, contul „doar B" ar vedea la fel, deci reuniunea
+      // rămâne egală. De-aia există `also`, cu lista numită.
+      db.addScan(INSTANCE_A, { source_id: 1, scanner: "dnf" });
+      db.addScan(INSTANCE_B, { source_id: 2, scanner: "nuclei" });
+      return null;
+    },
+    call: (db, scope) => scanHealthAll(db, scope, INSTANCE_A),
+    rows: (result) => result as unknown as Rows,
+    also: (result) => {
+      const names = (result as unknown as { scanner: string }[]).map((x) => x.scanner);
+      assert.deepEqual(names, ["dnf"],
+                       "pagina ta numește scanerele celuilalt server");
     },
   },
 

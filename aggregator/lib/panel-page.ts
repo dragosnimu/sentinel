@@ -46,7 +46,7 @@ import type {
 } from "./chart";
 import type { Ranked, Summary, Trend } from "./data/overview";
 import { MAX_ROWS_READ, SERIES_HOURS, WINDOW_HOURS } from "./data/overview";
-import type { ScanHealth } from "./data/scans";
+import type { ScanRun, ScannerHealth } from "./data/scans";
 import { escapeHtml } from "./auth/render";
 import { VERSION, releaseStage } from "./version";
 import type { Arrival } from "./data/arrivals";
@@ -873,8 +873,8 @@ export type FindingsView = Chrome & {
   color: RiskColor | null;
   /** Pastilele de culoare, numărate în aceeași grupă ca tabelul. */
   colors: Record<RiskColor, number>;
-  /** Starea scanarii care produce cifrele. Vezi `scanAge`. */
-  scan: ScanHealth;
+  /** Starea fiecarui scaner care produce cifre. Vezi `scanAge`. */
+  scans: ScannerHealth[];
 };
 
 /**
@@ -890,29 +890,108 @@ export type FindingsView = Chrome & {
  * Esecul se scrie MAI TARE decat varsta, si e o alegere: o cifra veche de sase
  * ore poate fi in regula, dar o cifra veche FIINDCA masuratoarea cade e alta
  * situatie, iar cele doua nu au acelasi remediu.
+ *
+ * Un al TREILEA caz sta intre ele: scanarea a REUSIT (`completed`), dar un
+ * scaner a sarit o parte din ce avea de citit si a scris asta in `error` —
+ * `trivy_image` face asa cu imaginile care nu incap in plafon. Nu e un esec, si
+ * nu e o nota de varsta: cifra e proaspata, dar nu cuprinde tot. Fara randul
+ * de acoperire, pagina spunea doar „Masurat la <ora>", adica confirma ca o
+ * masuratoare s-a incheiat, nu ce a masurat.
+ *
+ * Lista de constatari nu filtreaza dupa scaner, deci nici starea nu are voie
+ * sa o faca: esecul si avertismentul se spun PE SCANER, cu numele lui, iar
+ * varsta e a celui mai vechi dintre ei — o lista e atat de proaspata cat cel mai
+ * ramas in urma dintre scanerele care o alimenteaza. Cu un singur scaner,
+ * pagina arata ca inainte.
+ *
+ * Avertismentul se citeste din `lastGood`, NU din `latest`: cifrele vin din
+ * `lastGood`, deci avertismentul lui ramane adevarat si cand ultima rulare e
+ * `running` sau `failed`. Legat de `latest`, ar disparea chiar la urmatoarea
+ * scanare pornita — adica exact cand cifra de pe ecran e inca cea incompleta.
+ * Si nu depinde de un scaner anume: orice rand `completed` cu `error` nenul e
+ * spus asa.
  */
 function scanAge(view: FindingsView): string {
-  const { lastGood, latest } = view.scan;
+  const scans = view.scans;
   const parts: string[] = [];
+  const name = (scanner: string): string => "<code>" + escapeHtml(scanner) + "</code>";
+  /** Ora unei rulari incheiate, ca sir comparabil: aceeasi forma pentru toate. */
+  const finished = (run: ScanRun): string => run.finishedAt ?? run.startedAt;
 
-  if (latest !== null && latest.status !== "completed" && latest.status !== "running") {
-    parts.push('<p class="lipsa"><strong>Ultima scanare a esuat</strong> (' +
-               escapeHtml(moment(latest.startedAt)) + " UTC" +
-               (latest.error ? ", " + escapeHtml(latest.error) : "") +
-               "). Cifrele de mai jos sunt de la masuratoarea dinainte, deci " +
-               "pot fi vechi — o vulnerabilitate reparata intre timp apare in " +
-               "continuare ca deschisa.</p>\n");
+  // 1. Esecurile, cate unul pe scaner, numit pe nume. Un esec al lui `trivy_fs`
+  //    nu are voie sa se piarda sub un `dnf` care a mers.
+  for (const { scanner, lastGood, latest } of scans) {
+    if (latest === null || latest.status === "completed" || latest.status === "running") {
+      continue;
+    }
+    parts.push('<p class="lipsa"><strong>Ultima scanare a esuat</strong> (scanerul ' +
+               name(scanner) + ", " + escapeHtml(moment(latest.startedAt)) + " UTC" +
+               (latest.error ? ", " + escapeHtml(latest.error) : "") + "). " +
+               (lastGood === null
+                 ? "Nu exista nicio masuratoare mai veche a lui, deci nu are ce " +
+                   "cifre sa arate."
+                 : "Constatarile lui de mai jos sunt de la masuratoarea dinainte, " +
+                   "deci pot fi vechi — o vulnerabilitate reparata intre timp " +
+                   "apare in continuare ca deschisa.") + "</p>\n");
   }
 
-  if (lastGood === null) {
+  // 2. Acoperirea partiala, tot pe scaner. `trim()`: un `error` de spatii ar
+  //    desena o casuta de avertisment goala, iar o casuta goala spune „ceva nu
+  //    e in regula" fara sa spuna ce.
+  for (const { scanner, lastGood } of scans) {
+    if (lastGood === null || lastGood.error === null || lastGood.error.trim() === "") {
+      continue;
+    }
+    parts.push('<p class="lipsa"><strong>Acoperire partiala</strong> (scanerul ' +
+               name(scanner) + "). Scanarea care a produs cifrele lui de mai jos " +
+               "s-a incheiat, dar nu pe tot ce avea de scanat — avertismentul ei:<br>" +
+               escapeHtml(lastGood.error) + "<br>Cifrele NU cuprind ce a ramas " +
+               "nescanat: absenta unei vulnerabilitati din lista de mai jos nu " +
+               "dovedeste ca nu exista.</p>\n");
+  }
+
+  // 3. Varsta. Lista e atat de proaspata cat cel mai ramas in urma dintre
+  //    scanerele ei, deci ora afisata e a CELUI MAI VECHI.
+  const measured = scans.filter((s) => s.lastGood !== null) as
+    (ScannerHealth & { lastGood: ScanRun })[];
+  const never = scans.filter((s) => s.lastGood === null);
+
+  if (measured.length === 0) {
     parts.push('<p class="gol">Nicio scanare incheiata cu bine nu a ajuns aici, ' +
                "deci cifrele n-au varsta cunoscuta.</p>\n");
+    return parts.join("");
+  }
+  if (never.length > 0) {
+    parts.push('<p class="gol">' + (never.length === 1 ? "Scanerul " : "Scanerele ") +
+               never.map((s) => name(s.scanner)).join(", ") +
+               (never.length === 1 ? " n-a incheiat" : " n-au incheiat") +
+               " nicio scanare cu bine, deci " +
+               (never.length === 1 ? "constatarile lui n-au" : "constatarile lor n-au") +
+               " varsta cunoscuta.</p>\n");
+  }
+
+  let oldest = measured[0];
+  for (const entry of measured) {
+    if (finished(entry.lastGood).replace("T", " ") < finished(oldest.lastGood).replace("T", " ")) {
+      oldest = entry;
+    }
+  }
+  const tail = "Cifrele nu se schimba intre scanari: ce repari pe server apare " +
+               "aici dupa urmatoarea rulare.";
+  if (measured.length === 1) {
+    parts.push('<p class="nota">Masurat la <strong>' +
+               escapeHtml(moment(finished(oldest.lastGood))) +
+               " UTC</strong>, de scanerul " + name(oldest.scanner) + ". " + tail + "</p>\n");
   } else {
     parts.push('<p class="nota">Masurat la <strong>' +
-               escapeHtml(moment(lastGood.finishedAt ?? lastGood.startedAt)) +
-               " UTC</strong>, de scanerul <code>" + escapeHtml(lastGood.scanner) +
-               "</code>. Cifrele nu se schimba intre scanari: ce repari pe server " +
-               "apare aici dupa urmatoarea rulare.</p>\n");
+               escapeHtml(moment(finished(oldest.lastGood))) +
+               " UTC</strong>, de scanerul " + name(oldest.scanner) +
+               ` — cel mai vechi dintre cele ${measured.length} scanere de la care ` +
+               "vin constatarile de mai jos: lista e atat de proaspata cat cel mai " +
+               "ramas in urma dintre ele. " + tail + "</p>\n");
+    parts.push('<ul class="nota">\n' + measured.map((s) =>
+      "<li>" + name(s.scanner) + ": " +
+      escapeHtml(moment(finished(s.lastGood))) + " UTC</li>\n").join("") + "</ul>\n");
   }
   return parts.join("");
 }

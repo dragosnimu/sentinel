@@ -61,7 +61,7 @@ function render(findings: FindingSummary[]): string {
     active: "/panel/vulnerabilitati", arrivals: new Map(), findings, group: null, color: null,
     colors: { red: 0, amber: 0, green: findings.length, grey: 0 },
     counts: { neaplicate: findings.length, rezolvate: 0, inchise: 0, total: findings.length },
-    scan: { lastGood: null, latest: null },
+    scans: [],
   } as never);
 }
 
