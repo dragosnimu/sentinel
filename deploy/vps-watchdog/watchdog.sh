@@ -308,8 +308,61 @@
 #     Raspunsul docker trece prin tiparul numelor de containere; un nume de cgroup din jurnal, prin
 #     `[A-Za-z0-9@:._-]` si 40 de caractere (altfel ar muta campurile separate cu `|`).
 #
-# Auto-remedierea containerelor (sectiunea docker) e neschimbata fata de
-# versiunea de dinainte: aceleasi reguli, aceleasi plafoane.
+# ---------------------------------------------------------------------------
+# 7. Auto-remedierea containerelor: nu reporni ce n-ai vazut functionand, si inchide
+#    alerta unui container care a disparut.
+#
+# 26 oct 2026, 11:07:57 EET: "auto-remediere: <id12>_<nume> era down -> restart (1/3, ESEC)".
+# Numele vine de la livrare, iar ordinea ei e pe dos fata de cum arata. `docker compose up` recreeaza
+# asa (compose v5.6.0, `planRecreateContainer` din `pkg/compose`): 1. CREEAZA containerul nou
+# cu numele temporar `<primele 12 din id-ul VECHIULUI>_<nume>`, 2. opreste vechiul, 3. sterge vechiul
+# (cu `Force`), 4. redenumeste noul la numele final. Pornirea e o faza separata. Deci prefixul hex e
+# id-ul VECHIULUI, dar containerul care poarta numele acela e cel NOU.
+# Masurat pe gazda, livrarea de la 11:45: noul creat la .222, vechiul oprit la .294 - noul exista cu
+# 72 ms INAINTE de oprirea vechiului, ceea ce exclude ordinea "opreste, apoi redenumeste". La 11:07,
+# `a807d42decc4_clinica-app` era containerul NOU, in stare `created`, nepornit niciodata; `.attempts`
+# s-a scris la .644, iar `docker restart` a cazut pe un nume deja redenumit, de unde ESEC.
+# Un container care nu ruleaza se reporneste la PRIMA observatie, fara streak (streak-ul se aplica
+# doar lui `running` + unhealthy), de aceea a tras in sub doua minute. Aceeasi forma a lasat un
+# `.attempts` pe 22 oct. Nicio lista scrisa de mana nu o prinde: numele temporar difera la fiecare
+# livrare, iar `in_list` potriveste pe token intreg.
+#
+# REGULA: un container se remediaza DOAR daca acelasi container - nume SI id - a fost vazut OK
+# (running + healthy, sau running fara healthcheck) intr-o rulare anterioara. Observatia sta in
+# fix/<nume>.seenok, cu id-ul in ea. Nu se ghiceste conventia de numire a livrarii; se sprijina totusi
+# pe un fapt al ei: ca da containerului oprit un nume nou.
+#   * Containerul NOU al livrarii, cat timp poarta numele temporar, are NUME nou si ID nou - niciunul
+#     vazut OK vreodata - deci nu se atinge. Asta era incidentul din 26 oct.
+#   * ID-ul din observatie inchide un caz diferit: un container recreat sub ACELASI nume are alt id,
+#     deci trebuie vazut OK la randul lui. Fara id, succesorul ar mosteni increderea predecesorului.
+#   * CE NU INCHIDE, si e INAUNTRUL fiecarei recreari, nu in afara ei: intre iesirea procesului vechi
+#     si `rm`-ul lui (~0,1-0,25 s) vechiul sta `exited` sub NUMELE lui, cu id-ul lui in `.seenok`, deci
+#     poarta nu-l opreste si se reporneste. Fereastra mare - creare pana la redenumire, ~0,3-0,5 s -
+#     e inchisa; asta nu. Livrarea nu se rupe, fiindca compose sterge cu `Force`, dar raman doua alerte
+#     false si un `docker restart` care aterizeaza pe ce detine numele in clipa aceea. Ar inchide-o un
+#     streak si pe containerele oprite, ca la `unhealthy`, cu pretul unui minut intarziere pe singurul
+#     caz in care "exited -> restart" aduce ceva: in `daemon/monitor` din moby, o pornire esuata din
+#     restart-manager lasa containerul `exited` sub `always`/`unless-stopped`. Nu s-a facut - e o
+#     alegere a operatorului.
+#   * CE PIERDE: un container deja cazut inainte sa-l vada watchdog-ul OK (stare stearsa, instalare noua,
+#     container nou care n-a trecut niciodata de healthcheck) nu se mai reporneste singur. Nu tace: dupa
+#     UNSEEN_REPORT_RUNS rulari consecutive apare ca problema `ctr:<nume>:unseen` si se inchide cand
+#     revine OK sau dispare. O singura rulare nu raporteaza nimic - fereastra unei livrari dureaza sub o rulare.
+#   * Prima rulare: linia de baza spune pentru fiecare container stricat daca il va remedia sau nu.
+#   * Un container `running` + `starting` ramane PENDING si un `restarting` ramane refuzat, ca inainte.
+#
+# A DOUA PARTE: mesajul "functional din nou" cere ca NUMELE sa redevina OK, dar un container sters sau
+# redenumit nu mai revine - alerta de esec ramanea deschisa pentru totdeauna, iar `.attempts` pe disc la fel.
+# Dupa bucla, un nume din fix/ care nu mai apare in `docker ps -a` se strange, iar daca avea `.attempts`
+# sau `.disabled` (adica o alerta de esec data) se spune O DATA ca a disparut.
+#   * Lista trebuie sa fi fost CITITA: un `docker ps -a` care esueaza sau intoarce nimic nu e dovada ca au
+#     disparut toate containerele (necunoscut != disparut), deci atunci nu se strange si nu se spune nimic.
+#   * Mesajul pleaca prin send_try si starea se sterge doar dupa 2xx: un mesaj pierdut se reincearca la
+#     rularea urmatoare, nu se uita (ca la sectiunea 6; poate veni de doua ori daca raspunsul se pierde
+#     dupa livrare). Fara canal configurat nu e cui sa spui, deci starea se strange oricum.
+#   * Prima rulare nu strange nimic: baza nu e un moment in care sa se inchida alerte.
+#   * Un nume fara alerta de esec (doar `.seenok`, `.unseen`, `.ustreak`) se strange tacut - un container
+#     inlocuit de o livrare e functionare normala, nu un eveniment.
 set -uo pipefail
 
 # Caile se pot muta doar prin mediu - pentru teste, nu pentru operare. Unitatea
@@ -347,6 +400,10 @@ OOM_LOOKBACK_MIN=30; OOM_NAMES_MAX=3; OOM_JOURNAL_TIMEOUT_S=5
 # Numele containerului din id-ul cgroup-ului: o singura chemare `docker inspect` pe victima, cu plafon
 # propriu, si doar daca demonul a raspuns mai devreme in rularea asta (DOCKER_UP).
 OOM_DOCKER_TIMEOUT_S=5; DOCKER_UP=0
+# Auto-remediere (sectiunea 7): cate rulari CONSECUTIVE trebuie sa stea stricat un container nevazut
+# niciodata OK ca sa devina o problema raportata. Sub aceasta valoare e fereastra unei livrari (sub
+# o secunda, masurat), deci o singura rulare nu raporteaza nimic. Constanta de proiectare, nu de operare.
+UNSEEN_REPORT_RUNS=2
 # Chei care nu se mai emit. Se scot din starea anterioara, ca dispari lor sa nu
 # apara ca "rezolvat" (swap-ul nu s-a rezolvat: pur si simplu nu mai e verificat).
 RETIRED_KEYS="cap:swap"
@@ -410,7 +467,7 @@ send(){ send_try "$1" || true; }
 HOST=$(hostname -s)
 in_list(){ case " $2 " in *" $1 "*) return 0;; *) return 1;; esac; }
 SEED=0; [ ! -f "$SEEDED" ] && SEED=1
-baseline_extra=""
+baseline_extra=""; baseline_unseen=""
 
 # Starea anterioara, fara cheile retrase. Citita inainte de orice verificare:
 # `carry` are nevoie de ea.
@@ -436,18 +493,59 @@ unknown(){
   carry "$1"
 }
 
+# reap_fix_state - strange fix/ pentru numele care nu mai exista (sectiunea 7, partea a doua).
+# Citeste CTR_LIST / CTR_LIST_OK din blocul docker de mai jos. Nu esueaza catre apelant.
+reap_fix_state(){
+  local f b n gone="" msg
+  [ "$SEED" = 1 ] && return 0
+  # Lista nu s-a citit (docker ps a esuat sau a intors nimic): nu stim ce exista, deci nu strangem nimic.
+  [ "$CTR_LIST_OK" = 1 ] || return 0
+  # Numele e ce sta inaintea ULTIMULUI punct: scriitorii pun mereu extensia la sfarsit, iar un nume de
+  # container poate avea puncte. Globurile fara potrivire raman literale, de aici `-f`.
+  for f in "$FIXDIR"/*.attempts "$FIXDIR"/*.disabled "$FIXDIR"/*.ustreak "$FIXDIR"/*.seenok "$FIXDIR"/*.unseen; do
+    [ -f "$f" ] || continue
+    b="${f##*/}"; n="${b%.*}"
+    case $'\n'"$CTR_LIST"$'\n' in *$'\n'"$n"$'\n'*) continue ;; esac
+    case $'\n'"$gone" in *$'\n'"$n"$'\n'*) ;; *) gone+="$n"$'\n' ;; esac
+  done
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    if [ -f "$FIXDIR/$n.attempts" ] || [ -f "$FIXDIR/$n.disabled" ]; then
+      msg="🧹 VPS ${HOST}: \"$n\" nu mai exista in docker (sters sau redenumit, de obicei de o livrare) - inchid alerta lui de auto-remediere."
+      [ -f "$FIXDIR/$n.disabled" ] && msg+=" Auto-fix-ul lui era DEZACTIVAT dupa ${MAX_FIX} reporniri."
+      msg+=" Daca nu te asteptai la asta, verifica ce l-a inlocuit."
+      # Cu canal, starea se sterge doar dupa 2xx: un mesaj pierdut se reincearca, nu se uita.
+      if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then send_try "$msg" || continue; fi
+    fi
+    rm -f "$FIXDIR/$n.attempts" "$FIXDIR/$n.disabled" "$FIXDIR/$n.ustreak" "$FIXDIR/$n.seenok" "$FIXDIR/$n.unseen"
+  done <<< "$gone"
+  return 0
+}
+
 if timeout 20 docker info >/dev/null 2>&1; then
   DOCKER_UP=1
+  # Lista se citeste INAINTE de bucla, ca sa se stie daca s-a citit: o bucla peste `<(docker ps ...)`
+  # n-ar deosebi "niciun container" de "docker ps a esuat", iar strangerea de dupa ar sterge tot.
+  CTR_LIST=""; CTR_LIST_OK=0
+  if CTR_LIST=$(docker ps -a --format '{{.Names}}') && [ -n "$CTR_LIST" ]; then CTR_LIST_OK=1; fi
   while read -r name; do
     [ -z "$name" ] && continue
     pol=$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$name" 2>/dev/null || echo "")
     case "$pol" in unless-stopped|always) ;; *) continue ;; esac
     status=$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || echo "?")
     health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$name" 2>/dev/null || echo "")
+    # Id-ul containerului de ACUM sub numele asta (sectiunea 7). Ilizibil sau de alta forma => gol, adica
+    # "nu stiu": nu se inregistreaza ca observatie si nu deschide remedierea.
+    cid=$(docker inspect -f '{{.Id}}' "$name" 2>/dev/null || echo "")
+    [[ "$cid" =~ ^[A-Za-z0-9_.-]{1,128}$ ]] || cid=""
     fa="$FIXDIR/$name.attempts"; fd="$FIXDIR/$name.disabled"; fu="$FIXDIR/$name.ustreak"
+    fo="$FIXDIR/$name.seenok"; fn="$FIXDIR/$name.unseen"
 
     # OK = running + healthy (sau fara healthcheck)
     if [ "$status" = "running" ] && { [ "$health" = "healthy" ] || [ -z "$health" ]; }; then
+      # Observatia care deschide remedierea (sectiunea 7): acest container, cu acest id, a functionat.
+      if [ -n "$cid" ] && [ "$(cat "$fo" 2>/dev/null)" != "$cid" ]; then echo "$cid" > "$fo"; fi
+      rm -f "$fn"
       if [ -f "$fd" ] || [ -f "$fa" ]; then rm -f "$fa" "$fd" "$fu"; send "✅ VPS ${HOST}: \"$name\" functional din nou (auto-fix resetat)."; else rm -f "$fu"; fi
       continue
     fi
@@ -459,8 +557,25 @@ if timeout 20 docker info >/dev/null 2>&1; then
     if [ "$status" = "running" ]; then brk="unhealthy"; else brk="down ($status)"; fi
     if in_list "$name" "$EXCLUDE_AUTOFIX"; then add "ctr:$name:excl|⛔ \"$name\" $brk (auto-fix exclus - manual)"; continue; fi
     if [ -f "$fd" ]; then add "ctr:$name:disabled|⛔ \"$name\" $brk (auto-fix dezactivat dupa esecuri - manual)"; continue; fi
-    if [ "$SEED" = 1 ]; then baseline_extra+="• \"$name\" $brk (se va remedia automat)"$'\n'; continue; fi
+    # Acest container, cu acest id, a fost vazut OK vreodata? (sectiunea 7) Id necitit => nu, nu stim.
+    seen=0; [ -n "$cid" ] && [ "$(cat "$fo" 2>/dev/null)" = "$cid" ] && seen=1
+    if [ "$SEED" = 1 ]; then
+      if [ "$seen" = 1 ]; then baseline_extra+="• \"$name\" $brk (se va remedia automat)"$'\n'
+      else baseline_unseen+="• \"$name\" $brk"$'\n'; fi
+      continue
+    fi
     if [ "$AUTO_FIX" != 1 ]; then add "ctr:$name:brk|⚠️ \"$name\" $brk"; continue; fi
+    # Nevazut niciodata OK: nu se reporneste (sectiunea 7). Se raporteaza abia dupa UNSEEN_REPORT_RUNS
+    # rulari consecutive; pana atunci poate fi doar fereastra unei livrari. Inaintea streak-ului de
+    # `unhealthy`, ca sa nu se promita "repornesc daca persista" pentru ce nu se reporneste.
+    if [ "$seen" != 1 ]; then
+      un=$(cat "$fn" 2>/dev/null || echo 0); [[ "$un" =~ ^[0-9]+$ ]] || un=0
+      un=$((10#$un + 1)); echo "$un" > "$fn"
+      if [ "$un" -ge "$UNSEEN_REPORT_RUNS" ]; then
+        add "ctr:$name:unseen|🔎 \"$name\" $brk - nu l-am vazut niciodata functionand (container nou, recreat sau stare pierduta): NU il repornesc automat, necesita investigatie"
+      fi
+      continue
+    fi
     # unhealthy: cere streak consecutiv
     if [ "$status" = "running" ]; then
       us=$(cat "$fu" 2>/dev/null || echo 0); us=$((us+1)); echo "$us" > "$fu"
@@ -473,7 +588,8 @@ if timeout 20 docker info >/dev/null 2>&1; then
     sleep 3
     ns=$(docker inspect -f '{{.State.Status}}' "$name" 2>/dev/null || echo "?")
     send "🔧 VPS ${HOST} auto-remediere: \"$name\" era $brk → restart ($at/${MAX_FIX}, $r). Status acum: $ns."
-  done < <(docker ps -a --format '{{.Names}}')
+  done <<< "$CTR_LIST"
+  reap_fix_state
 else
   add "sys:docker|🔴 Docker daemon nu raspunde"
 fi
@@ -862,6 +978,7 @@ if [ "$SEED" = 1 ]; then
   msg="🛡️ VPS watchdog pornit pe ${HOST} - verific o data pe minut. Probleme deschise acum: ${n}"
   [ "$n" -gt 0 ] && msg+=$'\n'"$(printf '%s\n' "$cur" | sed '/^$/d' | cut -d'|' -f2-)"
   [ -n "$baseline_extra" ] && msg+=$'\n'"Remediabile automat:"$'\n'"${baseline_extra}"
+  [ -n "$baseline_unseen" ] && msg+=$'\n'"Stricate, dar nevazute niciodata functionand (nu le repornesc, doar le raportez):"$'\n'"${baseline_unseen}"
   send "$msg"; exit 0
 fi
 [ -n "$newp" ] && send "🚨 VPS ${HOST} - problema noua:"$'\n'"$(printf '%s\n' "$newp" | sed '/^$/d' | cut -d'|' -f2-)"

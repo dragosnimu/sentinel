@@ -1143,7 +1143,12 @@ Sentinel** fără să fie produse de detecția lui. Nu are legătură cu
 
 **Ce verifică:** daemonul docker; containerele cu politică de repornire
 (și le repornește, plafonat: 2 verificări `unhealthy` la rând, cel mult 3
-reporniri, apoi cere intervenție); disc ≥ 88%; RAM disponibil sub 1200 MB;
+reporniri, apoi cere intervenție — și **doar un container pe care l-a văzut
+funcționând**, cu același nume și același id; unul nevăzut niciodată OK, de pildă
+cel pe care `docker compose up` îl creează sub numele temporar `<id12>_<nume>`
+înainte de a-l redenumi la numele final, se
+raportează după două verificări, nu se repornește; vezi secțiunea 7 din antetul
+scriptului); disc ≥ 88%; RAM disponibil sub 1200 MB;
 paginare swap peste 100 de pagini/s (medie pe ~5 minute); load peste 2 × nuclee;
 și `/api/health` pe fiecare domeniu din configurație (alertă doar dacă nu
 răspunde deloc).
