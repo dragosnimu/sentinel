@@ -139,7 +139,14 @@ def test_approve_and_run_sends_exactly_the_formatted_result(monkeypatch):
     async def fake_run_plan(*a, **k):
         return _result("rollback_failed", [_rp_step()], error="boom")
 
+    async def get_plan(db, plan_id):
+        # Un plan obișnuit (nu unul de `/update`): doar planurile de update primesc, lângă
+        # rezultat, starea citită de pe gazdă. Fără rând, `_approve_and_run` ar trebui să
+        # spună că nu poate ști — și mesajul n-ar mai fi exact cel al lui format_apply_result.
+        return SimpleNamespace(plan={"target": {"asset_name": "host"}})
+
     monkeypatch.setattr(patches, "approve_plan", approve_plan)
+    monkeypatch.setattr(patches, "get_plan", get_plan)
     monkeypatch.setattr(approvals, "revoke_for_plan", revoke)
     monkeypatch.setattr(runner, "run_plan", fake_run_plan)
 

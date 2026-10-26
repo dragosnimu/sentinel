@@ -107,6 +107,21 @@ def format_plan(row: patches.PlanRow) -> str:
         f"{len(plan.get('backup', []))} de salvat · "
         f"{len(plan.get('rollback', []))} de revenire",
     ]
+    # Un plan de update (`/update`) are alt fel de fapte: lista pachetelor, ce NU se verifică, și
+    # niciun «downtime estimat» — repornirea serviciilor o hotărăsc scriptletele pachetelor, iar
+    # un «0s» scris acolo ar spune că se știe. Citit din blocul `update` al planului, nu din ce
+    # câmp are `risk`.
+    from sentinel.telegram import update_view
+    extra = update_view.plan_lines(plan)
+    if extra:
+        lines = [("⏱️ Downtime estimat: <b>necunoscut</b> — repornirea serviciilor o hotărăsc pachetele"
+                  if ln.startswith("⏱️") else
+                  # «Reversibil: da» ar fi mai mult decât știe planul: are un rollback fixat pe
+                  # versiunile de dinainte, dar că versiunea veche mai e în oglindă nu se vede de aici.
+                  "↩️ Reversibil: rollback fixat pe versiunile de dinainte, <b>nedovedit</b> "
+                  "(cere ca ele să mai fie în oglindă)"
+                  if ln.startswith("↩️") and row.reversible else ln) for ln in lines]
+        lines[3:3] = ["", *extra]
     return "\n".join(lines)
 
 
@@ -278,12 +293,20 @@ async def on_stage1(update: Update, context: ContextTypes.DEFAULT_TYPE,
     target = row.plan.get("target", {})
     warn = ("\n⚠️ <b>Planul se declară IREVERSIBIL</b> — nu există pași de revenire."
             if not row.reversible else "")
-    reboot = ("\n⚠️ <b>Necesită REBOOT</b> — serverul va reporni."
-              if row.requires_reboot else "")
+    from sentinel.telegram import update_view
+    downtime = f"<b>{row.estimated_downtime_s or 0} secunde</b>"
+    if update_view.is_update(row.plan):
+        # Un plan de update nu repornește nimic, iar «0 secunde» ar spune că se știe cât stau
+        # serviciile: repornirea lor o hotărăsc scriptletele pachetelor.
+        downtime = "<b>necunoscut</b> (serviciile pachetelor se pot reporni singure)"
+        reboot = (update_view.reboot_warning(row.plan) if row.requires_reboot else "")
+    else:
+        reboot = ("\n⚠️ <b>Necesită REBOOT</b> — serverul va reporni."
+                  if row.requires_reboot else "")
     await query.edit_message_text(
         f"<b>Confirmi aplicarea?</b>\n\n"
         f"Vei modifica <b>{_esc(target.get('asset_name', '?'))}</b> pe acest server.\n"
-        f"Downtime estimat: <b>{row.estimated_downtime_s or 0} secunde</b>.\n"
+        f"Downtime estimat: {downtime}.\n"
         f"Se creează întâi un punct de restaurare verificat.{warn}{reboot}\n\n"
         f"<i>Confirmarea expiră în 5 minute.</i>",
         parse_mode=ParseMode.HTML,
@@ -517,10 +540,53 @@ async def _approve_and_run(db: Database, cfg: Any, edit: Any, *,
         await edit(f"⛔ Refuzat înainte de execuție: {_esc(exc)}")
         return
 
-    await edit(format_apply_result(result), parse_mode=ParseMode.HTML)
+    await edit(await _result_text(db, cfg, plan_id, result), parse_mode=ParseMode.HTML)
 
 
-def format_apply_result(result: Any) -> str:
+async def _result_text(db: Database, cfg: Any, plan_id: int, result: Any) -> str:
+    """Rezultatul unei aplicări; pentru un plan de update, cu ce spune GAZDA după rulare.
+
+    Executorul spune «cod 0» și runnerul «succeeded», dar un pachet instalat nu e o
+    reparație care rulează, iar «exit 0, nimic instalat» e o formă pe care depozitul ăsta a
+    mai văzut-o. De aceea starea pachetelor se recitește de pe gazdă (`rpm -q`) și se pune
+    alături — nu în locul — verdictului runnerului. Nimic de aici nu poate opri mesajul de
+    bază: orice eșec la citire devine un rând care o spune."""
+    from sentinel.telegram import update_view
+
+    try:
+        row = await patches.get_plan(db, plan_id)
+    except Exception as exc:  # noqa: BLE001 - mesajul de bază trebuie să plece oricum
+        log.error("plan unreadable after apply", extra={"plan": plan_id,
+                                                        "detail": f"{type(exc).__name__}: {exc}"})
+        return (format_apply_result(result)
+                + "\n\n❔ Nu am putut reciti planul din bază, deci nu pot arăta starea reală a "
+                  "pachetelor. Dacă a fost un plan de update, verifică cu <code>rpm -q</code>.")
+    if row is None or not update_view.is_update(row.plan):
+        return format_apply_result(result)
+
+    from sentinel.patch import system_update
+    base = format_apply_result(result, update=True)
+    states: list[Any] = []
+    read_error: str | None = None
+    try:
+        states, read_error = await system_update.reconcile(row.plan, cfg.platform.family)
+    except Exception as exc:  # noqa: BLE001
+        read_error = f"{type(exc).__name__}: {exc}"
+    detections: list[dict[str, Any]] | None = None
+    detections_error: str | None = None
+    try:
+        detections = await system_update.detections_during(db, result.execution_id)
+    except Exception as exc:  # noqa: BLE001
+        detections_error = f"{type(exc).__name__}: {exc}"
+    if read_error is not None or detections_error is not None:
+        log.error("update result could not be fully read back",
+                  extra={"plan": plan_id, "detail": f"{read_error or ''} {detections_error or ''}".strip()})
+    return base + update_view.addendum(
+        states, result.status, read_error=read_error, detections=detections,
+        detections_error=detections_error, budget=max(600, 3900 - len(base)))
+
+
+def format_apply_result(result: Any, *, update: bool = False) -> str:
     """What the operator reads when an apply ends - the one message about a change to a
     production machine, so it carries the EVIDENCE and not only a verdict.
 
@@ -542,6 +608,11 @@ def format_apply_result(result: Any) -> str:
     if unknown is not None:
         icon = "🟠"
     body = [f"{icon} <b>Patch {_esc(result.status)}</b> (execuție #{result.execution_id})"]
+    if update and result.status == "succeeded":
+        # Un update care «a reușit» a instalat pachete; nu a dovedit că rulează codul nou. Titlul
+        # nu promite mai mult decât spune `rpm` mai jos.
+        body = [f"📦 <b>Tranzacția de pachete s-a încheiat</b> (execuție #{result.execution_id}) — "
+                "starea reală, citită de pe gazdă, e mai jos"]
     if result.error:
         body.append(f"Motiv: {_esc(result.error)}")
 

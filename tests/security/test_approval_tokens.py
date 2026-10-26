@@ -139,8 +139,14 @@ def test_applying_revokes_every_other_button():
 
 
 def test_rollback_failure_is_shouted_not_summarised():
-    # The text lives in `format_apply_result`; `_approve_and_run` must send exactly that.
-    assert "format_apply_result(result)" in _func(FLOW, "_approve_and_run")
+    # The text lives in `format_apply_result`. `_approve_and_run` sends it through `_result_text`,
+    # which for a plan made by `/update` appends what the HOST says after the run - and for every
+    # other plan returns `format_apply_result(result)` unchanged. Never a second summary beside it:
+    # both branches of `_result_text` start from `format_apply_result`.
+    assert "_result_text(" in _func(FLOW, "_approve_and_run")
+    sender = _func(FLOW, "_result_text")
+    assert "return format_apply_result(result)" in sender
+    assert "format_apply_result(result, update=True)" in sender
     helper = _func(FLOW, "format_apply_result")
     assert "ROLLBACK-UL A EȘUAT" in helper
     assert "restore.sh" in helper                 # and tells them the way back

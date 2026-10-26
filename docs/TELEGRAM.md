@@ -160,6 +160,7 @@ există, câteva alias-uri românești sau englezești care fac același lucru.
 | `/fp <id>` | `/falspozitiv` | Închide un incident ca fals-pozitiv |
 | `/stiu <cheie> [nu]` | `/ack` | Marchează o expunere ca intenționată, sau anulează marcajul |
 | `/planifica <id vuln>` | `/genereaza` | Cere un plan de remediere pentru o vulnerabilitate anume — vezi §3.2 |
+| `/update [sistem\|tot\|<pachet>]` | `/actualizeaza`, `/actualizare` | Ce e actualizabil (fără argument: doar citește); cu argument, propune UN lot de pachete de sistem — vezi §3.3 |
 | `/block <ip> [durată]` | `/blocheaza` | Blochează un IP, cu confirmare. Durata: `1h`, `30m`, secunde, sau `perm` — între 60s și 30 de zile |
 | `/unblock <ip>` | `/deblocheaza` | Deblochează un IP |
 | `/panic` | — | **Golește tot blocklist-ul, imediat.** Dublă confirmare. Disponibilă chiar și pe mute |
@@ -287,6 +288,48 @@ prin trecerea orară de mentenanță — altfel findingul lui n-ar mai putea pri
 niciodată alt plan.
 
 Comanda cere rol de **operator sau owner**: cheltuie un apel la model.
+
+### 3.3 `/update` — actualizările de sistem
+
+```
+/update              ce e actualizabil, pe categorii, din baza de date — NU pornește nimic
+/update sistem       propune următorul lot de pachete de sistem
+/update tot          la fel, plus ce nu se poate actualiza de aici (containere, aplicații)
+/update <pachet>     un pachet, cu ce se mișcă împreună cu el (aceeași sursă)
+```
+
+Planul nu-l scrie un model: `sentinel/patch/system_update.py` îl construiește în cod, iar
+validatorul e **același** `validate_plan` ca pentru orice plan. Aplicarea nu are un drum
+propriu: planul intră în `patch_flow` (două atingeri, PIN, semnătura de pe stația ta) ca orice
+alt plan, cu același verdict al porții de întoarcere (§3.2). Detaliile de proiectare — de ce
+un plan e o singură tranzacție `dnf`, cum se măsoară un lot, ce se reține și de ce — sunt în
+docstring-ul modulului și în `docs/PATCHING.md` §11.
+
+Ce vezi, în ordine:
+
+1. **Lotul** — pachetele (cu versiunea de acum și cea țintă), o singură tranzacție. Cererea
+   de semnat are cel mult un mesaj Telegram, deci un lot are câteva zeci de comenzi, nu
+   toate cele 33 de pachete ale gazdei de producție: lotul se umple pe măsurătoare, până nu
+   mai încape. Se aplică **pe rând** — cât un plan de update e deschis, nu se propune altul;
+   după ce se termină, `/update sistem` îl propune pe următorul, calculat din starea de atunci.
+2. **Ce se reține, cu motiv**: nucleul (install-only: `downgrade` adaugă lângă cel nou, deci
+   n-are cale de întoarcere), familia `openssh` (`docs/PATCHING.md` §8), un pachet al cărui
+   epoch diferă între instalat și reparație (alt depozit sau altă serie), orice nume pe care
+   validatorul sau executorul l-ar refuza. Nimic nu dispare tăcut.
+3. **Rezultatul**, după rulare: starea pachetelor **citită de pe gazdă** (`rpm -q`), nu doar
+   codul executorului. Cuvântul e «instalat», niciodată «actualizat»: `rpm` dovedește că
+   versiunea e pe disc, nu că procesele o rulează. Pachetele din `REBOOT_REQUIRED_PACKAGES`
+   (glibc, systemd, openssl...) apar ca «instalat, așteaptă repornire»; Sentinel nu repornește
+   nimic. Serviciile nu se verifică, și mesajul o spune.
+
+Un update își declanșează propriii detectori: `rpm` scrie fișiere de unitate sub
+`/usr/lib/systemd/system`, iar regula `unit_change` (critică) nu are filtru de sesiune. Planul
+te avertizează dinainte, iar la sfârșit rezultatul numește detecțiile grave apărute cât a
+rulat execuția. **Sentinel nu le suprimă**: o suprimare ar fi un mecanism nou, cu un compromis
+de securitate (vezi `system_update.detections_during`), iar decizia e a operatorului.
+
+Fără argument comanda e pentru orice chat autorizat; cu argument cere rol de **operator sau
+owner**.
 
 ---
 

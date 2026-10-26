@@ -1116,6 +1116,137 @@ async def _verdict_de_intoarcere(db: Database, row: Any) -> tuple[str, bool]:
             "n-o cunoaște nu deschide singură drumul spre execuție.</i>", False)
 
 
+# --- /update: actualizările de sistem ---------------------------------------
+_UPDATE_SYSTEM_WORDS = frozenset({"sistem", "system", "os"})
+_UPDATE_ALL_WORDS = frozenset({"tot", "toate", "all"})
+
+
+async def _update_overview(update: Update, db: Database, cfg: Config) -> None:
+    """`/update` fără argument: ce e actualizabil, pe categorii. Citește și atât — nu
+    scrie un plan, nu trimite butoane, nu cheamă nimic care schimbă gazda."""
+    from sentinel.patch import system_update
+    from sentinel.scan import os_packages
+    from sentinel.telegram import update_view
+
+    categories = await system_update.category_counts(db)
+    try:
+        sel = await system_update.select(db, cfg)
+    except Exception as exc:  # noqa: BLE001 - cifrele din bază se arată oricum
+        log.error("update overview could not classify packages",
+                  extra={"detail": f"{type(exc).__name__}: {exc}"})
+        sel = system_update.Selection(error=f"{type(exc).__name__}: {exc}")
+    opened = await system_update.open_update_plans(db)
+    scanner = os_packages.scanner_for(str(cfg.platform.family))
+    await update.message.reply_text(
+        update_view.overview_text(categories=categories, sel=sel, scanner=scanner, open_plans=opened),
+        parse_mode=ParseMode.HTML)
+
+
+async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/update` — actualizările de sistem, complet sau un pachet. Doar PROPUNE.
+
+    Fără argument: ce e actualizabil, pe categorii, din ce e în bază (`_update_overview`).
+    `sistem`: următorul lot de pachete de sistem. `tot`: la fel, plus o notă despre ce nu se
+    poate actualiza de aici (containere, aplicații). `<pachet>`: pachetul și ce se mișcă
+    împreună cu el.
+
+    **Nu există un al doilea drum de aplicare.** Comanda construiește un plan
+    (`patch.system_update`, determinist, validat de ACELAȘI `validate_plan` ca orice plan),
+    îl scrie `validated` și îl dă lui `patch_flow.send_plan_for_approval` — cu verdictul porții de
+    întoarcere (`_verdict_de_intoarcere`), ca `/planifica`. Aprobarea, PIN-ul, semnătura de pe
+    stația operatorului și rularea sunt ale lui `patch_flow`; un test ține această comandă
+    departe de runner și de aprobare.
+
+    **Un lot odată.** Cât un plan de update e deschis (în așteptare sau în curs), comanda nu
+    propune altul: loturile sunt tranzacții separate, iar unul care cade nu trebuie să
+    găsească altele deja oferite, cu butoane vii, peste o gazdă pe care nimeni n-a recitit-o.
+    După ce un lot se termină, `/update sistem` îl propune pe următorul, calculat din starea
+    de ATUNCI — nu din cea de acum o oră.
+
+    Rolul: fără argument e citire (orice chat autorizat). Cu argument schimbă pachetele
+    gazdei, deci cere operator sau owner — ca `/planifica`.
+    """
+    from sentinel.db.repo import patches as patch_repo
+    from sentinel.patch import system_update
+    from sentinel.telegram import patch_flow, update_view
+
+    cfg: Config = context.bot_data["cfg"]
+    db: Database = context.bot_data["db"]
+    chat_id = update.effective_chat.id
+    reply = update.message.reply_text
+
+    args = [a for a in (context.args or []) if a.strip()]
+    if not args:
+        await _update_overview(update, db, cfg)
+        return
+    if not _can_act(cfg, chat_id):
+        await reply("Actualizarea schimbă pachetele gazdei, deci cere rol de operator sau owner. "
+                    "Contul tău are acces doar de vizualizare — <code>/update</code> fără argument "
+                    "îți arată ce e actualizabil.", parse_mode=ParseMode.HTML)
+        return
+    if len(args) > 1:
+        await reply("Un singur argument: <code>sistem</code>, <code>tot</code> sau numele unui pachet.",
+                    parse_mode=ParseMode.HTML)
+        return
+
+    word = args[0].strip()
+    only: str | None = None
+    if word.lower() in _UPDATE_SYSTEM_WORDS or word.lower() in _UPDATE_ALL_WORDS:
+        scope_all = word.lower() in _UPDATE_ALL_WORDS
+    elif system_update.is_package_name(word):
+        scope_all = False
+        only = word
+    else:
+        await reply("Nu am înțeles argumentul. Folosire: <code>/update</code>, "
+                    "<code>/update sistem</code>, <code>/update tot</code> sau "
+                    "<code>/update &lt;pachet&gt;</code>.", parse_mode=ParseMode.HTML)
+        return
+
+    opened = await system_update.open_update_plans(db)
+    if opened:
+        plan_id, status = opened[0]
+        await reply(f"Ai deja planul <b>#{plan_id}</b> de actualizare (stare: <code>{_esc(status)}</code>). "
+                    f"Termină-l sau respinge-l (<code>/patch {plan_id}</code>), apoi propun următorul lot — "
+                    "loturile se aplică unul odată.", parse_mode=ParseMode.HTML)
+        return
+
+    try:
+        sel = await system_update.select(db, cfg, only=only)
+    except Exception as exc:  # noqa: BLE001 - operatorul află motivul, nu un «eroare» generic
+        log.error("update selection failed", exc_info=exc,
+                  extra={"chat_id": chat_id, "detail": f"{type(exc).__name__}: {exc}"})
+        await reply(f"❌ Nu am putut stabili ce se poate actualiza: <code>{_esc(type(exc).__name__)}: "
+                    f"{_esc(exc)}</code>", parse_mode=ParseMode.HTML)
+        return
+    if sel.error:
+        await reply(f"⛔ {_esc(sel.error)}", parse_mode=ParseMode.HTML)
+        return
+
+    note = None
+    if scope_all:
+        note = update_view.other_categories_note(await system_update.category_counts(db))
+    text = update_view.selection_text(sel, only=only, category_note=note,
+                                      previous=await system_update.last_finished_update_plan(db))
+    if not sel.lots:
+        await reply(text, parse_mode=ParseMode.HTML)
+        return
+
+    plan_id = await system_update.store_lot(db, sel.lots[0])
+    row = await patch_repo.get_plan(db, plan_id)
+    await reply(text, parse_mode=ParseMode.HTML)
+    if row is None:
+        # Scris și necitit înapoi: a treia stare, spusă ca atare.
+        await reply(f"⚠️ Planul <b>#{plan_id}</b> a fost scris și validat, dar nu l-am putut reciti din "
+                    f"bază ca să ți-l arăt. Încearcă <code>/patch {plan_id}</code>.",
+                    parse_mode=ParseMode.HTML)
+        return
+    nota, cu_aplicare = await _verdict_de_intoarcere(db, row)
+    await patch_flow.send_plan_for_approval(
+        context.bot, db, chat_id, row, gate_note=nota, allow_apply=cu_aplicare)
+    log.warning("system update plan offered",
+                extra={"plan": plan_id, "chat_id": chat_id, "packages": len(sel.lots[0].packages)})
+
+
 async def cmd_intreaba(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """`/intreaba <întrebare>` — întrebări în limbaj natural despre starea
     serverului, răspunse dintr-un catalog fix de interogări scrise de mână
@@ -2390,6 +2521,10 @@ ACTING = [
     # ca mesajul care trimite la ele să nu fie nevoit să explice care e care.
     Command(("planifica", "genereaza"), cmd_planifica,
             "Cere un plan de remediere: /planifica 7 (id din /vulnerabilitati)"),
+    # `update` e și numele pe care îl tipărește HELP. Aliasurile sunt ASCII: un diacritic într-un
+    # nume de comandă a oprit botul o zi (vezi comentariul de la `READ_ONLY`).
+    Command(("update", "actualizeaza", "actualizare"), cmd_update,
+            "Actualizări de sistem: /update, /update sistem, /update <pachet>"),
     Command(("block", "blocheaza"), cmd_block,
             "Blochează un IP: /block 203.0.113.7 24h"),
     Command(("unblock", "deblocheaza"), cmd_unblock,

@@ -630,3 +630,52 @@ pașii de rollback; indexul vine din lista aplatizată a planului
 (`sentinel/patch/approval.py:flatten`), aceeași pe care a semnat-o operatorul. Un dry-run
 nu trimite nimic, iar un dry-run al unui pas `dnf` spune acum, în rezultat, de ce ar fi
 refuzat pasul real — nu mai iese verde pentru un apply care va fi refuzat.
+
+---
+
+## 11. Actualizările de sistem (`/update`)
+
+Un plan de remediere al unui CVE e o judecată, deci îl scrie un model (`planner.py`). Un
+update nu e: pachetul, versiunea instalată și cea care repară sunt fapte, iar comanda e una
+singură pe familie. `sentinel/patch/system_update.py` îl construiește deci **în cod**, iar
+planul trece prin **același** `validate_plan` — fără excepție, fără parametru, fără ramură
+pentru planurile de aici. Dacă validatorul respinge o formă corectă de update, grupul respins
+apare în răspuns cu mesajul lui; validatorul nu se modifică.
+
+| fază | ce conține un lot (rhel) |
+|---|---|
+| preflight | spațiu liber în `/var`; `pkg_version equals` pe fiecare pachet (fixează revenirea) |
+| backup | `rpm_state` pe fiecare pachet (Debian: registrul dpkg, `path`) |
+| apply | **un singur pas**: `dnf -y update <toate pachetele lotului>` |
+| health_check | baza de date de pachete răspunde (`rpm -q rpm`) — NU verifică serviciile |
+| rollback | `dnf -y downgrade <pachet>-<versiunea de dinainte> ...`, un singur pas |
+| post_verification | `pkg_version at_least` pe fiecare pachet |
+
+**De ce un singur pas de apply pe lot.** Când ORICE pas de apply pică, runnerul rulează TOT
+rollback-ul. Cu un pas pe pachet, o cădere la al treilea ar fi făcut `downgrade` și pe pachetele
+patru–zece, neatinse; iar `dnf downgrade` către versiunea deja instalată iese cu cod 1 (după codul dnf, cu «No packages marked for downgrade»; citit din sursă, NEverificat pe o gazdă) — un
+«ROLLBACK-UL A EȘUAT» pentru o mașină sănătoasă. Cu un singur pas, `dnf` face rezolvarea
+dependențelor, verificarea semnăturilor și tranzacția de test pentru tot lotul înainte să
+schimbe ceva. Ce nu promite: `rpm` aplică elementele pe rând, deci un scriptlet care pică la
+mijloc lasă lotul pe jumătate aplicat. De aceea starea reală se recitește de pe gazdă după orice
+rulare, nu se crede din codul de ieșire.
+
+**Cum se măsoară un lot.** Cererea pe care o semnezi pe stația ta (`approval.build_request`) are
+cel mult `MAX_REQUEST_CHARS` caractere — un mesaj Telegram — și ține toate comenzile planului,
+inclusiv cele două verificări `rpm -q` pe pachet; timeouturile declarate au un buget
+(`RUN_BUDGET_S`). Lotul se umple cu familii întregi (pachetele din aceeași sursă) cât timp planul
+construit încape în amândouă. Pe gazda de producție (33 de pachete cu constatări, 14 dintre ele
+planificabile) asta dă două loturi de 8 și 6 pachete, cu cereri de 2387 și 1876 de caractere
+din cel mult 3136. Fiecare lot e o ceremonie de semnare; nu există o cale de a le strânge în una.
+
+**Ce se reține** (cu motivul, în răspuns): pachetele install-only — citite de pe gazdă din
+furnizările `installonlypkg(...)`, nu din nume —, familia `openssh` (§8), un pachet al cărui
+epoch diferă între instalat și reparație, orice are mai multe versiuni instalate deodată, și
+tot ce validatorul sau executorul refuză. Un grup cu un membru reținut se reține întreg.
+
+**Ce rămâne neverificat, și planul o spune.** Că versiunea veche mai e în oglindă (`dnf
+downgrade` o cere); că un `dnf update` nu trage prin dependențe pachete pe care planul nu le
+numește (gramatica executorului nu are simulare); că serviciile care folosesc pachetele rulează
+codul nou (un proces pornit înainte de instalare rulează încă pe cel vechi). Verdictul porții
+de întoarcere pentru un lot rhel e deci «nedovedit» — nu are arhivă `path` —, iar butonul
+rămâne, cu avertismentul scris lângă el, ca la orice plan.

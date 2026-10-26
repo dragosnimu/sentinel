@@ -812,6 +812,7 @@ HELP = f"""🛡️ <b>Sentinel — comenzi</b>
 /patches — planuri în așteptare
 /patch &lt;id&gt; — planul, cu butoane de aprobare
 /planifica &lt;id vuln&gt; — cere un plan pentru o vulnerabilitate anume
+/update [sistem|tot|&lt;pachet&gt;] — ce e actualizabil; propune un lot de pachete de sistem (un plan, o tranzacție)
 
 <b>Trafic și servicii</b>
 /evenimente [ip] — evenimente brute
