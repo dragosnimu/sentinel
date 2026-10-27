@@ -16,6 +16,7 @@ copiate din rulări reale; dublura doar le reproduce.
 
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 from typing import Any
 
@@ -181,3 +182,13 @@ def install(monkeypatch: Any, host: FakeHost) -> FakeHost:
     monkeypatch.setattr(su, "_run", host)
     monkeypatch.setattr(su, "_dnf_conf_override", lambda: None)
     return host
+
+
+def allow_own_programs(monkeypatch: Any) -> None:
+    """Lista albă a lui `_run` nu cunoaște interpretorul testului, și bine că nu-l cunoaște. Testele
+    care verifică MAȘINĂRIA de pornire (cod de ieșire, 127, timeout) rulează totuși `sys.executable`
+    sau un nume inexistent: le lărgește lista, pe durata testului, în mod VIZIBIL — nu printr-o
+    ușă lăsată deschisă în cod."""
+    monkeypatch.setattr(su, "READ_ONLY_MODE", {sys.executable: "-c", "definitely-not-a-program-xyz": "-q"})
+    monkeypatch.setattr(su, "READ_ONLY_FLAGS", {sys.executable: ("-c",),
+                                                "definitely-not-a-program-xyz": ("-q",)})

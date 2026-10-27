@@ -212,15 +212,18 @@ def test_the_install_only_query_needs_its_positive_control_on_its_own(monkeypatc
 # ---------------------------------------------------------------------------
 # Procesul care citește
 # ---------------------------------------------------------------------------
-def test_run_reports_exit_code_and_both_streams():
+def test_run_reports_exit_code_and_both_streams(monkeypatch):
+    sup.allow_own_programs(monkeypatch)
     code, out, err = run(su._run([sys.executable, "-c",
                                   "import sys; print('a'); print('b', file=sys.stderr); sys.exit(3)"]))
     assert (code, out.strip(), err.strip()) == (3, "a", "b")
 
 
-def test_run_says_127_for_a_missing_program_and_124_for_a_timeout():
+def test_run_says_127_for_a_missing_program_and_124_for_a_timeout(monkeypatch):
     """Un program lipsă și un `rpm` agățat nu sunt «niciun pachet». Aceleași coduri ca shell-ul,
-    ca eroarea să se citească."""
+    ca eroarea să se citească. Poarta de la intrare (`_require_read_only`) refuză ambele programe de
+    aici; testul le trece pe lista albă, vizibil, ca să probeze mașinăria de pornire."""
+    sup.allow_own_programs(monkeypatch)
     code, _out, err = run(su._run(["definitely-not-a-program-xyz", "-q"]))
     assert code == 127 and "nu poate fi pornit" in err
     code, _out, err = run(su._run([sys.executable, "-c", "import time; time.sleep(30)"], limit_s=1))

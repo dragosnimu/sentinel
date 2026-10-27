@@ -18,7 +18,7 @@ interogări de citire (`rpm -q`, `dpkg-query -W`), iar singurele scrieri în baz
 Găsit prin AST, nu prin regex: un apel scris pe mai multe linii sau importat sub alt nume ar
 scăpa unui tipar pe text.
 
-## Ce se verifică, și de ce în patru locuri
+## Ce se verifică, și de ce în șase locuri
 
 Promisiunea de mai sus are patru uși, iar garda o păzea doar pe jumătate de ușă: lista de
 atribute permise se uita la ce se ia din TREI module, dar nimic nu limita CARE module se
@@ -38,7 +38,19 @@ porni în afară de `system`/`popen`. O singură mutație (`approvals.issue`, un
      funcția reală, importată, iar textul ei real e cel scanat;
   4. orice formă de a porni un proces din `os` (`posix_spawn`, `spawn*`, `exec*`, `fork`), inclusiv
      prin `os`-ul unui modul `sentinel.*` (`os_packages.os.system`), și orice argv `rpm`/`dpkg-query`
-     care nu e o interogare (`rpm --eval "%(...)"` rulează un shell).
+     care nu e o interogare (`rpm --eval "%(...)"` rulează un shell);
+  5. LA EXECUȚIE, nu doar în text: `_run` însuși refuză (`RefusedCommand`, înainte de orice proces)
+     orice argv care nu e o interogare de citire, indiferent cine îl cheamă sau cum se numește.
+     Primele patru porți verifică ORTOGRAFIA apelanților dintr-un fișier, iar `_run` e o funcție
+     importabilă fără altă limită: patru drumuri au dat verde (`_apply = _run`, un apel din
+     `update_view`, unul din `bot.py`, un `sh -c '... dnf -y update ...'` adăugat ÎN interiorul lui
+     `_run`). Comportamentul îl probează `tests/unit/test_system_update_run_gate.py` (mock pe
+     `create_subprocess_exec`, neatins). Aici se păzește lanțul care face limita adevărată: lista albă
+     e citită din `system_update.py` și trebuie să fie cea aprobată în acest fișier (o lărgire pică),
+     poarta e prima instrucțiune din `_run`, procesul primește exact `*argv`, `argv` nu e legat de
+     nou, iar nicio funcție de pornit procese nu e luată ca valoare (`_launcher_problems`); nimic din
+     pachet nu ia `_run` (`test_nothing_outside_system_update_touches_the_run_function`);
+  6. `bot.py` nu importă runnerul, backup-ul sau clientul executorului nicăieri în fișier.
 
 Garda mărginește FELUL instrucțiunii, nu efectul ei: un `SELECT` care cheamă `pg_terminate_backend`
 sau `nextval` nu se vede de aici (funcțiile schemei `sentinel_*` se văd, vezi poarta 3). Rolul bazei
@@ -47,9 +59,13 @@ de date nu e o limită pentru tabelele acestui modul (`sentinel` are `INSERT`/`U
 
 Uși CUNOSCUTE și lăsate deschise, ca un cititor să nu creadă că sunt păzite: `importlib`/`__import__`,
 `pty`, `ctypes`, `multiprocessing`, `socket`, `run_in_executor(None, os.system, ...)`,
-`asyncio.to_thread(os.system, ...)`, `getattr(os, "posix_spawn")(...)`, `globals()[...] = ...`.
-Niciuna nu e un import sau un apel pe care `_spawns` să-l poată citi; sunt ocoliri deliberate, nu
-greșeli de scriere, iar un revizuitor le vede în diff.
+`asyncio.to_thread(os.system, ...)`, `getattr(os, "posix_spawn")(...)`, `globals()[...] = ...`,
+`getattr(system_update, "_run")`, și în `bot.py` un submodul luat ca atribut al unui pachet deja
+importat (`from sentinel import patch` + `patch.runner`) în loc de import. Niciuna nu e un import sau un
+apel pe care `_spawns` să-l poată citi; sunt ocoliri deliberate, nu greșeli de scriere, iar un revizuitor
+le vede în diff. Ce NU acoperă poarta 5: un proces pornit prin alt drum decât `_run` (`os.system`,
+`ctypes`), pe care îl numără doar `_spawns`; și un `rpm` cu un flag din lista albă pe care o versiune
+viitoare l-ar face să execute ceva (pe RPM 4.16 doar `--eval` execută, dovedit pe gazdă).
 """
 from __future__ import annotations
 
@@ -1202,20 +1218,33 @@ def _spawns(tree: ast.Module) -> list[ast.Call]:
 
 
 #: Modulele standard prin care un cod poate porni procese, umbla în fișiere sau ajunge la altceva,
-#: dacă le ia de pe un modul `sentinel.*` care le importă: `os_packages.os`, `checks.subprocess`.
+#: dacă le ia de pe ALTCEVA decât de pe `import`-ul lor direct: `os_packages.os`, `checks.subprocess`,
+#: `os.sys`, `asyncio.base_events.subprocess`, `asyncio.subprocess.subprocess`.
 REACH_ATTRS = frozenset({"os", "asyncio", "shutil", "subprocess", "sys", "posix"})
+
+#: Singurele atribute pe care `asyncio.subprocess` le are voie în cod: constantele pentru conducte.
+#: `asyncio.subprocess.subprocess.run(...)` (modulul standard, luat prin `asyncio`) pornește un
+#: proces fără să treacă prin `_spawns` și fără să importe `subprocess`.
+ASYNCIO_SUBPROCESS_OK = frozenset({"PIPE", "STDOUT", "DEVNULL"})
 
 
 def _reach_through(tree: ast.Module, current: str = THIS_MODULE) -> tuple[set[str], list[tuple[int, str]]]:
-    """(numele locale ale modulelor `sentinel.*`, `(linie, expresie)` pentru fiecare `<modul>.os` /
-    `.asyncio` / `.shutil` / `.subprocess` / `.sys` / `.posix`).
+    """(numele locale ale modulelor `sentinel.*`, `(linie, expresie)` pentru fiecare `.os` / `.asyncio`
+    / `.shutil` / `.subprocess` / `.sys` / `.posix` luat de pe ORICE bază, și fiecare `from X import
+    os|sys|...`). Singura formă admisă e `asyncio.subprocess.PIPE|STDOUT|DEVNULL`.
 
     Poarta 4 numără procesele pornite și se uită la `os.X` cu `os` importat AICI. Dar `os_packages`
     importă `os` și `shutil` la nivel de modul, deci `os_packages.os.posix_spawn(...)` pornea un
-    proces fără ca importul lui `os` din `system_update` să existe. Lista de module permise nu ajută:
-    `os_packages` e pe ea, legitim. Se semnalează ORICE acces de atribut care ia un modul standard
-    de pe un modul nostru — mai larg decât un lanț `.os.<spawn>`, deci prinde și `.subprocess.run`
-    și `.shutil.rmtree`, pe care `_spawns` nu le numără."""
+    proces fără ca importul lui `os` din `system_update` să existe. Prima versiune semnala doar
+    lanțurile care pornesc de la un modul `sentinel.*`; au rămas libere `asyncio.subprocess.subprocess
+    .run(...)` și `os.sys.modules`, iar `from sentinel.scan.os_packages import os as o` + `o.system(...)`
+    nu era nici import interzis, nici apel numărat. Acum se semnalează ORICE acces de atribut care ia un
+    modul standard de pe altceva (`x.os`, `os.sys`, `asyncio.base_events.subprocess`) și orice
+    `from ... import <modul standard>`: niciun cod din aceste două fișiere nu are un motiv cinstit să
+    facă asta, iar ce nu se poate arăta că e `asyncio.subprocess.PIPE` pică.
+
+    De ce nu rămâne la `sentinel.*`: o listă de baze cunoscute e o listă de nume; «orice cu un
+    atribut de acest fel» nu depinde de cum s-a numit baza."""
     ours: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -1223,14 +1252,19 @@ def _reach_through(tree: ast.Module, current: str = THIS_MODULE) -> tuple[set[st
         elif isinstance(node, ast.ImportFrom) and node.level < len(current.split(".")) \
                 and _is_ours(_absolute(node, current)):
             ours |= {a.asname or a.name for a in node.names}
+    parents = {id(c): p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
     found: list[tuple[int, str]] = []
     for n in ast.walk(tree):
         if isinstance(n, ast.Attribute) and n.attr in REACH_ATTRS:
-            base = n.value
-            while isinstance(base, ast.Attribute):
-                base = base.value
-            if isinstance(base, ast.Name) and base.id in ours:
+            parent = parents.get(id(n))
+            sanctioned = (n.attr == "subprocess" and isinstance(n.value, ast.Name) and n.value.id == "asyncio"
+                          and isinstance(parent, ast.Attribute) and parent.value is n
+                          and parent.attr in ASYNCIO_SUBPROCESS_OK)
+            if not sanctioned:
                 found.append((n.lineno, ast.unparse(n)))
+        elif isinstance(n, ast.ImportFrom):
+            found += [(n.lineno, f"from {'.' * n.level}{n.module or ''} import {a.name}")
+                      for a in n.names if a.name in REACH_ATTRS]
     return ours, sorted(found)
 
 
@@ -1299,12 +1333,40 @@ def test_the_spawn_detector_sees_the_os_a_sentinel_module_re_exports():
     # Controale: ce modulul face azi și nu e ajungere-prin.
     for source in ("import os\nimport asyncio\nos.environ\nasyncio.subprocess.PIPE\nasyncio.wait_for(x)",
                    "from sentinel.scan import os_packages\nos_packages.scanner_for('rhel')",
-                   "from sentinel.patch import checks\nchecks._rpm_evr_cmp(1, 2)\nx.os.getpid()",
-                   "import os\nos.path.join('a')"):
+                   "from sentinel.patch import checks\nchecks._rpm_evr_cmp(1, 2)",
+                   "import os\nos.path.join('a')",
+                   "import asyncio\nawait asyncio.create_subprocess_exec(*argv, stdout=asyncio.subprocess.PIPE, "
+                   "stderr=asyncio.subprocess.STDOUT, stdin=asyncio.subprocess.DEVNULL)"):
         tree = ast.parse(source)
-        assert not _reach_through(tree)[1] and not _spawns(tree), source
+        assert not _reach_through(tree)[1], source
+        assert len(_spawns(tree)) == (1 if "create_subprocess_exec" in source else 0), source
     assert _reach_through(ast.parse("from sentinel.scan import os_packages\nfrom os import path"))[0] \
         == {"os_packages"}
+
+
+def test_reaching_a_standard_module_is_flagged_from_any_base_not_only_from_sentinel_ones():
+    """`asyncio.subprocess.subprocess.run(["dnf", "-y", "update"])` într-un `try/except OSError`
+    pornea un proces fără import de `subprocess`, fără `_run` și fără nicio apariție a lui `os`:
+    `_reach_through` se uita doar la baze `sentinel.*`, iar `asyncio.subprocess.PIPE` îi era caz de
+    control. Un proces de aplicare fără nicio semnătură. Acum: orice `.os/.sys/.subprocess/...` luat de
+    pe orice bază, orice `from X import os|subprocess|sys|...`, și `asyncio.subprocess.<altceva decât
+    PIPE/STDOUT/DEVNULL>` pică. Controalele (conductele, `os.environ`) nu."""
+    for source in ("asyncio.subprocess.subprocess.run(['dnf', '-y', 'update'])",
+                   "import asyncio.subprocess as asp\nasp.subprocess.run(['dnf'])",
+                   "from asyncio import subprocess as sp\nsp.subprocess.run(['dnf'])",
+                   "from asyncio.subprocess import subprocess as sp\nsp.run(['dnf'])",
+                   "asyncio.subprocess.run(['dnf'])", "asyncio.subprocess.Process", "p = asyncio.subprocess",
+                   "os.sys.modules", "os.os.system('x')", "asyncio.base_events.subprocess.run(['x'])",
+                   "asyncio.os.system('x')", "asyncio.asyncio", "x.os.getpid()", "self.sys",
+                   "from sentinel.scan.os_packages import os as o\no.system('dnf -y update')",
+                   "from sentinel.scan import os_packages as p\np.os.system('x')",
+                   "from . import checks\nchecks.subprocess",
+                   "from os import sys", "from asyncio import subprocess", "from shutil import os"):
+        assert _reach_through(ast.parse(source))[1], source
+    for source in ("asyncio.subprocess.PIPE", "asyncio.subprocess.STDOUT", "asyncio.subprocess.DEVNULL",
+                   "os.environ.get('x')\nos.path.join('a')", "asyncio.wait_for(x)\nasyncio.TimeoutError",
+                   "from os import path\nfrom asyncio import wait_for"):
+        assert not _reach_through(ast.parse(source))[1], source
 
 
 def test_neither_update_module_reaches_a_process_or_a_file_through_a_sentinel_module():
@@ -1351,18 +1413,42 @@ def _string_constants(tree: ast.Module) -> dict[str, list[str]]:
     return out
 
 
+def _is_name_filter(value: ast.expr) -> bool:
+    """`[sorted|list|set|tuple](<comprehensiune>)` cu UN generator, elementul = variabila lui și
+    EXACT o condiție: `_NAME_RE.fullmatch(<aceeași variabilă>)`. Potrivire pe structură: prima
+    versiune căuta textul `_NAME_RE.fullmatch(` în expresie, iar `{n for n in names if
+    _NAME_RE.fullmatch(n) or n.startswith('--')}` îl conținea și lăsa un flag să treacă drept nume."""
+    if (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+            and value.func.id in {"sorted", "list", "set", "tuple"} and len(value.args) == 1
+            and not value.keywords):
+        value = value.args[0]
+    if not isinstance(value, (ast.SetComp, ast.ListComp, ast.GeneratorExp)) or len(value.generators) != 1:
+        return False
+    gen = value.generators[0]
+    if gen.is_async or not isinstance(gen.target, ast.Name) or len(gen.ifs) != 1:
+        return False
+    var = gen.target.id
+    test = gen.ifs[0]
+    return (isinstance(value.elt, ast.Name) and value.elt.id == var
+            and isinstance(test, ast.Call) and isinstance(test.func, ast.Attribute)
+            and test.func.attr == "fullmatch" and isinstance(test.func.value, ast.Name)
+            and test.func.value.id == "_NAME_RE" and len(test.args) == 1 and not test.keywords
+            and isinstance(test.args[0], ast.Name) and test.args[0].id == var)
+
+
 def _name_filtered_lists(tree: ast.Module) -> set[str]:
     """Numele legate O SINGURĂ dată, dintr-o expresie care trece fiecare element prin
-    `_NAME_RE.fullmatch` (`safe = sorted({n for n in names if _NAME_RE.fullmatch(n)})`). Ele pot fi
-    desfăcute într-un argv fără să poată deveni un flag: `_NAME_RE` începe cu o cifră sau o literă
-    (verificat separat, pe expresia regulată din cod)."""
+    `_NAME_RE.fullmatch` (`safe = sorted({n for n in names if _NAME_RE.fullmatch(n)})`, vezi
+    `_is_name_filter`). Ele pot fi desfăcute într-un argv fără să poată deveni un flag: `_NAME_RE`
+    începe cu o cifră sau o literă (verificat separat, pe expresia regulată din cod). Plasă de
+    siguranță, nu singura: `_run` refuză oricum un cuvânt care începe cu `-`."""
     stores: dict[str, int] = {}
     filtered: set[str] = set()
     for n in ast.walk(tree):
         if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
             stores[n.id] = stores.get(n.id, 0) + 1
         if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name) \
-                and "_NAME_RE.fullmatch(" in ast.unparse(n.value):
+                and _is_name_filter(n.value):
             filtered.add(n.targets[0].id)
     return {name for name in filtered if stores.get(name) == 1}
 
@@ -1390,10 +1476,16 @@ def _run_problems(tree: ast.Module) -> list[tuple[int, str]]:
     constantă care expandează o macro, iar orice element necunoscut (un nume neresolvabil, un f-string,
     o listă nefiltrată prin `_NAME_RE`) e o problemă — nu se sare."""
     consts = _string_constants(tree)
-    safe = _name_filtered_lists(tree)
+    parents = _parents(tree)
     out: list[tuple[int, str]] = []
     for call in (n for n in ast.walk(tree) if isinstance(n, ast.Call)
                  and isinstance(n.func, ast.Name) and n.func.id == "_run"):
+        # `safe` se judecă în funcția care îl folosește: două funcții cu câte un `safe` filtrat, fiecare
+        # legat o dată, sunt amândouă în regulă (numărarea pe tot modulul le făcea pe amândouă nesigure).
+        scope: ast.AST = call
+        while id(scope) in parents and not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            scope = parents[id(scope)]
+        safe = _name_filtered_lists(scope if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)) else tree)
         argv = call.args[0] if call.args else None
         if not (isinstance(argv, ast.List) and argv.elts and isinstance(argv.elts[0], ast.Constant)):
             out.append((call.lineno, "argv-ul nu e o listă literală cu programul în față"))
@@ -1441,7 +1533,8 @@ def test_the_only_commands_system_update_runs_itself_are_read_only_queries():
     assert len(calls) >= 3, "garda nu mai vede apelurile lui _run"
     bad = _run_problems(tree) + [(0, p) for p in _name_re_problems(tree)]
     assert not bad, "\n".join(f"linia {line}: {what}" for line, what in bad)
-    assert _name_filtered_lists(tree), "nicio listă filtrată prin `_NAME_RE`: garda nu mai vede `safe`"
+    assert any(_name_filtered_lists(fn) for fn in _functions(tree)), \
+        "nicio listă filtrată prin `_NAME_RE`: garda nu mai vede `safe`"
 
 
 def test_the_argv_gate_refuses_a_read_only_program_that_is_told_to_run_something():
@@ -1496,6 +1589,444 @@ def test_the_argv_gate_refuses_a_read_only_program_that_is_told_to_run_something
         assert _run_problems(ast.parse(src + '    await _run(["rpm", "-q", *safe])\n')), rebind
     src = head + '    safe = names\n    await _run(["rpm", "-q", *safe])\n'
     assert _run_problems(ast.parse(src)), "o a doua legare a lui `safe` trebuie să-l scoată din încredere"
+    # Filtrul se potrivește pe STRUCTURĂ: o condiție în plus (`or n.startswith('--')`) lăsa un flag să
+    # treacă drept nume, fiindcă textul `_NAME_RE.fullmatch(` rămânea în expresie.
+    plain = "{n for n in names if _NAME_RE.fullmatch(n)}"
+    for bad in ("{n for n in names if _NAME_RE.fullmatch(n) or n.startswith('--')}",
+                "{n for n in names if _NAME_RE.fullmatch(n) and True}",
+                "{n for n in names if _NAME_RE.fullmatch(n) if n}",
+                "{n for n in names if _NAME_RE.fullmatch(other)}",
+                "{n.strip() for n in names if _NAME_RE.fullmatch(n)}",
+                "{n for n in names if _NAME_RE.match(n)}",
+                "{n for n in names if _NAME_RE.fullmatch(n, 0)}",
+                "{n for n in names}",
+                "{n for n in names if True} | {n for n in names if _NAME_RE.fullmatch(n)}",
+                "{n for m in names for n in m if _NAME_RE.fullmatch(n)}"):
+        src = head.replace(plain, bad)
+        assert src != head
+        assert _run_problems(ast.parse(src + '    await _run(["rpm", "-q", "--qf", _RPM_QF, *safe])\n')), bad
+    for good in ("sorted(" + plain + ")", "list(" + plain + ")", plain,
+                 "sorted([n for n in names if _NAME_RE.fullmatch(n)])"):
+        src = head.replace("sorted(" + plain + ")", good)
+        assert not _run_problems(ast.parse(src + '    await _run(["rpm", "-q", "--qf", _RPM_QF, *safe])\n')), good
+
+
+# ---------------------------------------------------------------------------
+# 5. La execuție: limita e ÎN `_run`, iar ce se păzește aici e limita, nu apelanții
+# ---------------------------------------------------------------------------
+#: Constantele din `system_update.py` din care `_require_read_only` își ia lista albă. Garda le citește
+#: din fișier prin AST și cere ca ele să fie EXACT cele aprobate mai sus (`READ_ONLY_MODE`,
+#: `READ_ONLY_FLAGS`, `_MACRO_EXEC`): o lărgire în producție, fără aceeași schimbare aici, pică. Nu
+#: se importă din teste în producție (ar inversa dependența) și nu se duplică fără legătură (cele
+#: două copii ar diverge): sursa e producția, iar acest fișier ține aprobarea.
+GATE_CONSTANTS = ("READ_ONLY_MODE", "READ_ONLY_FLAGS", "_MACRO_EXEC")
+APPROVED_MACRO_PATTERN = _MACRO_EXEC.pattern
+
+
+def _bound_values(node: ast.stmt, name: str) -> list[ast.expr]:
+    if isinstance(node, ast.Assign):
+        return [node.value] if any(isinstance(t, ast.Name) and t.id == name for t in node.targets) else []
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == name \
+            and node.value is not None:
+        return [node.value]
+    return []
+
+
+def _binders(root: ast.AST, name: str) -> list[tuple[int, str]]:
+    """Fiecare loc din `root` care LEAGĂ `name`, în orice formă: atribuire/ștergere, `for`, `with`,
+    `:=`, `except ... as`, `import ... as`, parametru de funcție/lambda imbricată, `global`/`nonlocal`,
+    tipare `match`, definiția unei funcții sau clase cu acel nume."""
+    out: list[tuple[int, str]] = []
+    for n in ast.walk(root):
+        line = getattr(n, "lineno", 0)
+        if isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, (ast.Store, ast.Del)):
+            out.append((line, "atribuit/șters"))
+        elif isinstance(n, ast.ExceptHandler) and n.name == name:
+            out.append((line, "legat prin `except ... as`"))
+        elif isinstance(n, ast.alias) and (n.asname or n.name.split(".")[0]) == name:
+            out.append((line, "importat"))
+        elif isinstance(n, (ast.Global, ast.Nonlocal)) and name in n.names:
+            out.append((line, "global/nonlocal"))
+        elif isinstance(n, ast.arg) and n.arg == name:
+            out.append((line, "parametru"))
+        elif isinstance(n, (ast.MatchAs, ast.MatchStar)) and n.name == name:
+            out.append((line, "legat într-un `match`"))
+        elif isinstance(n, ast.MatchMapping) and n.rest == name:
+            out.append((line, "legat într-un `match`"))
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == name:
+            out.append((line, "definit"))
+    return out
+
+
+def _parents(tree: ast.AST) -> dict[int, ast.AST]:
+    return {id(c): p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
+
+
+def _only_called(tree: ast.Module, name: str) -> list[tuple[int, str]]:
+    """Fiecare `Name` `name` în context `Load` care NU e chiar `func` al unui apel: `_apply = _run`,
+    `partial(_run, ...)`, `_run.__call__`, `[_run][0]`. O funcție care pornește procese și poate fi
+    pasată e o funcție al cărei nume nu mai contează."""
+    parents = _parents(tree)
+    out = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Load):
+            parent = parents.get(id(n))
+            if not (isinstance(parent, ast.Call) and parent.func is n):
+                out.append((n.lineno, f"`{name}` luat fără să fie chemat: {ast.unparse(parent)[:70]}"))
+    return out
+
+
+def _gate_constant_problems(tree: ast.Module) -> list[str]:
+    """Constantele listei albe: legate O dată, literale, EXACT cele aprobate, și folosite doar ca
+    `X[cheie]` / `cheie in X` (nu `.update`, nu atribuire pe element, nu pasate)."""
+    out: list[str] = []
+    approved = {"READ_ONLY_MODE": READ_ONLY_MODE,
+                "READ_ONLY_FLAGS": {k: set(v) for k, v in READ_ONLY_FLAGS.items()}}
+    for name in GATE_CONSTANTS:
+        values = [v for node in tree.body for v in _bound_values(node, name)]
+        if len(values) != 1:
+            out.append(f"`{name}` e legat de {len(values)} ori la nivel de modul: trebuie exact o dată")
+            continue
+        value = values[0]
+        if name == "_MACRO_EXEC":
+            ok = (isinstance(value, ast.Call) and ast.unparse(value.func) == "re.compile"
+                  and len(value.args) == 2 and not value.keywords
+                  and isinstance(value.args[0], ast.Constant) and isinstance(value.args[0].value, str)
+                  and ast.unparse(value.args[1]) == "re.IGNORECASE")
+            if not ok:
+                out.append("`_MACRO_EXEC` nu e `re.compile(<literal>, re.IGNORECASE)`: nu-l pot citi")
+            elif value.args[0].value != APPROVED_MACRO_PATTERN:
+                out.append(f"`_MACRO_EXEC` nu mai e expresia aprobată: {value.args[0].value!r}")
+            continue
+        try:
+            got = ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            out.append(f"`{name}` nu e un literal: nu-l pot citi")
+            continue
+        if name == "READ_ONLY_FLAGS":
+            if not (isinstance(got, dict) and all(isinstance(v, (tuple, list)) and len(set(v)) == len(v)
+                                                  and all(isinstance(x, str) for x in v)
+                                                  for v in got.values())):
+                out.append("`READ_ONLY_FLAGS` nu e un dicționar de tuple de șiruri, fără dubluri")
+                continue
+            got = {k: set(v) for k, v in got.items()}
+        if got != approved[name]:
+            out.append(f"`{name}` nu mai e lista aprobată: {got!r} (aprobat: {approved[name]!r}). O "
+                       "lărgire e o decizie: schimb-o și aici, în aceeași schimbare, cu motivul")
+    parents = _parents(tree)
+    for n in ast.walk(tree):
+        if not (isinstance(n, ast.Name) and n.id in GATE_CONSTANTS):
+            continue
+        parent = parents.get(id(n))
+        if isinstance(n.ctx, (ast.Store, ast.Del)):
+            continue                                   # numărate mai jos: exact una, cea de la nivel de modul
+        if n.id == "_MACRO_EXEC":
+            ok = isinstance(parent, ast.Attribute) and parent.value is n and parent.attr == "search"
+        else:
+            ok = ((isinstance(parent, ast.Subscript) and parent.value is n and isinstance(parent.ctx, ast.Load))
+                  or (isinstance(parent, ast.Compare) and n in parent.comparators
+                      and all(isinstance(op, (ast.In, ast.NotIn)) for op in parent.ops)))
+        if not ok:
+            out.append(f"linia {n.lineno}: `{n.id}` folosit altfel decât citit "
+                       f"({ast.unparse(parent)[:60]}): lista aprobată nu se modifică din cod")
+    stores_n = {n.id: 0 for n in ast.walk(tree) if isinstance(n, ast.Name) and n.id in GATE_CONSTANTS}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and n.id in stores_n and isinstance(n.ctx, (ast.Store, ast.Del)):
+            stores_n[n.id] += 1
+    out += [f"`{k}` are {v} legări prin `Name`, nu una" for k, v in stores_n.items() if v != 1]
+    return out
+
+
+def _unique_function_problems(tree: ast.Module, name: str, *, is_async: bool) -> list[str]:
+    """`name` e definit O dată, la nivel de modul, fără decoratori, nelegat în altă parte și
+    folosit doar ca `name(...)`."""
+    kind = ast.AsyncFunctionDef if is_async else ast.FunctionDef
+    defs = [n for n in tree.body if isinstance(n, kind) and n.name == name]
+    out: list[str] = []
+    if len(defs) != 1:
+        return [f"`{name}` nu e definit exact o dată la nivel de modul ({len(defs)})"]
+    if defs[0].decorator_list:
+        out.append(f"`{name}` are decoratori: funcția chemată nu mai e cea scrisă")
+    others = [b for b in _binders(tree, name) if b[1] != "definit"]
+    defined = [b for b in _binders(tree, name) if b[1] == "definit"]
+    out += [f"linia {line}: `{name}` {what} în altă parte" for line, what in others]
+    if len(defined) != 1:
+        out.append(f"`{name}` e definit de {len(defined)} ori în modul (inclusiv imbricat)")
+    out += [f"linia {line}: {what}" for line, what in _only_called(tree, name)]
+    return out
+
+
+#: Funcțiile care doar CITESC ce primesc și întorc o valoare nouă: `len(argv)`, `repr(argv)` într-un
+#: mesaj, `" ".join(argv)` într-un jurnal. Orice altă funcție care primește `argv` ar putea să-l
+#: schimbe, iar poarta ar fi verificat o listă, nu ce rulează.
+_PURE_READERS = frozenset({"len", "repr", "str", "tuple", "list", "bool", "sorted"})
+
+
+def _reads_only(parent: ast.AST | None, node: ast.expr) -> bool:
+    if not (isinstance(parent, ast.Call) and node in parent.args and not parent.keywords):
+        return False
+    func = parent.func
+    return ((isinstance(func, ast.Name) and func.id in _PURE_READERS)
+            or (isinstance(func, ast.Attribute) and func.attr == "join" and isinstance(func.value, ast.Constant)
+                and isinstance(func.value.value, str)))
+
+
+def _launcher_problems(tree: ast.Module) -> list[str]:
+    """Tot ce trebuie să fie adevărat în `system_update.py` ca limita din `_run` să conteze: lista
+    albă e cea aprobată și neatinsă; `_run` și `_require_read_only` sunt unice, nedecorate și doar
+    chemate; `_run` cheamă poarta ca primă instrucțiune; singurul proces din modul e
+    `create_subprocess_exec(*argv, stdout=PIPE, stderr=PIPE, env=env)` din `_run`, cu `argv` PARAMETRUL
+    lui `_run`, nelegat și nemutat; nimic nu ia o referință la o funcție de pornit procese fără s-o cheme.
+
+    Fiecare e o legătură a lanțului «ce a verificat poarta = ce rulează». Pe drumul 4 măsurat
+    (`create_subprocess_exec("sh", "-c", '...dnf -y update...; exec "$@"', "sh", *argv, ...)`) poarta
+    verifica argv-ul, iar gazda rula altceva."""
+    out = _gate_constant_problems(tree)
+    out += _unique_function_problems(tree, "_run", is_async=True)
+    out += _unique_function_problems(tree, "_require_read_only", is_async=False)
+    fn = next((n for n in tree.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "_run"), None)
+    if fn is None:
+        return out
+    params = _params(fn)
+    if not params or params[0].arg != "argv":
+        out.append("primul parametru al lui `_run` nu e `argv`")
+        return out
+    body = list(fn.body)
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+            and isinstance(body[0].value.value, str):
+        body = body[1:]
+    gate = body[0].value if body and isinstance(body[0], ast.Expr) else None
+    if not (isinstance(gate, ast.Call) and isinstance(gate.func, ast.Name)
+            and gate.func.id == "_require_read_only" and len(gate.args) == 1 and not gate.keywords
+            and isinstance(gate.args[0], ast.Name) and gate.args[0].id == "argv"):
+        out.append("prima instrucțiune din `_run` (după docstring) nu e `_require_read_only(argv)`, "
+                   "necondiționat: poarta trebuie să vină ÎNAINTE de orice altceva")
+        gate = None
+    spawns = _spawns(tree)
+    inside = {id(n) for n in ast.walk(fn)}
+    if len(spawns) != 1 or id(spawns[0]) not in inside:
+        out.append(f"procese pornite: {len(spawns)} în modul; trebuie exact unul, în `_run`")
+    else:
+        sp = spawns[0]
+        if not (isinstance(sp.func, ast.Attribute) and sp.func.attr == "create_subprocess_exec"
+                and isinstance(sp.func.value, ast.Name) and sp.func.value.id == "asyncio"):
+            out.append("singurul proces din `_run` nu e `asyncio.create_subprocess_exec`")
+        if not (len(sp.args) == 1 and isinstance(sp.args[0], ast.Starred)
+                and isinstance(sp.args[0].value, ast.Name) and sp.args[0].value.id == "argv"):
+            out.append("procesul nu primește EXACT `*argv` (un înveliș, un program în față sau un "
+                       "argument în plus nu au fost verificate de poartă)")
+        kws = {k.arg: k.value for k in sp.keywords}
+        if None in kws or {k: ast.unparse(v) for k, v in kws.items() if k != "env"} != {
+                "stdout": "asyncio.subprocess.PIPE", "stderr": "asyncio.subprocess.PIPE"} \
+                or not isinstance(kws.get("env"), ast.Name):
+            out.append("procesul primește altceva decât stdout/stderr=PIPE și un `env` (un nume): "
+                       f"{ {k: ast.unparse(v) for k, v in kws.items()} }")
+        parents = _parents(fn)
+        for n in ast.walk(fn):
+            if not (isinstance(n, ast.Name) and n.id == "argv"):
+                continue
+            parent = parents.get(id(n))
+            allowed = ((gate is not None and parent is gate)
+                       or (isinstance(parent, ast.Starred) and parents.get(id(parent)) is sp)
+                       or (isinstance(parent, ast.Subscript) and parent.value is n
+                           and isinstance(parent.ctx, ast.Load))
+                       or _reads_only(parent, n))
+            if not allowed or isinstance(n.ctx, (ast.Store, ast.Del)):
+                out.append(f"linia {n.lineno}: `argv` e folosit în `_run` altfel decât dat porții, "
+                           f"desfăcut în proces, citit pe poziție sau dat unei funcții care doar citește "
+                           f"({ast.unparse(parent)[:60]})")
+    out += [f"linia {line}: `argv` {what} în `_run`" for stmt in fn.body for line, what in _binders(stmt, "argv")]
+    # Funcții de pornit procese luate ca valoare: `spawn = asyncio.create_subprocess_exec`, apoi `spawn(...)`.
+    parents = _parents(tree)
+    for n in ast.walk(tree):
+        name = n.attr if isinstance(n, ast.Attribute) else n.id if isinstance(n, ast.Name) else None
+        if name in SPAWN_NAMES | OS_SPAWN_ATTRS and isinstance(getattr(n, "ctx", None), ast.Load):
+            parent = parents.get(id(n))
+            if not (isinstance(parent, ast.Call) and parent.func is n):
+                out.append(f"linia {n.lineno}: `{name}` luat fără să fie chemat (o funcție de pornit "
+                           "procese pasată sau legată sub alt nume)")
+        if isinstance(n, ast.ImportFrom) and n.module == "os" and any(
+                a.name in OS_SPAWN_ATTRS or a.name == "*" for a in n.names):
+            out.append(f"linia {n.lineno}: `from os import` aduce o funcție de pornit procese")
+    return out
+
+
+def test_the_only_process_launcher_is_run_and_the_gate_sits_in_front_of_it():
+    """Miezul rundei 3. Trei runde la rând s-a verificat ORTOGRAFIA apelanților lui `_run`, iar
+    `_run` era o funcție exportată fără nicio limită: patru drumuri au dat verde (`_apply = _run`,
+    un apel din `update_view`, unul din `bot.py`, un `sh -c` în interiorul lui `_run`). Acum limita
+    e în `_run` (`_require_read_only`, testată pe comportament în
+    `tests/unit/test_system_update_run_gate.py`), iar aici se păzește lanțul care o face adevărată:
+    poarta e prima instrucțiune, procesul primește exact `*argv`, lista albă e cea aprobată."""
+    tree = _tree(SYSTEM_UPDATE)
+    problems = _launcher_problems(tree)
+    assert not problems, "\n".join(problems)
+    # Garda nu trece pe gol: vede funcțiile și constantele pe care le păzește.
+    names = {n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    assert {"_run", "_require_read_only"} <= names
+
+
+def _mutated(old: str | None, new: str, *, append: bool = False, then_append: str = "") -> ast.Module:
+    """Codul REAL al lui `system_update.py` cu o singură schimbare: `old` -> `new`, sau `new` adăugat
+    la coadă (`append`); `then_append` se adaugă la coadă după o înlocuire (o funcție ajutătoare)."""
+    src = SYSTEM_UPDATE.read_text(encoding="utf-8")
+    if append:
+        return ast.parse(src + "\n" + new + "\n")
+    assert old is not None and src.count(old) == 1, f"mutația nu se mai potrivește codului: {old!r}"
+    return ast.parse(src.replace(old, new) + "\n" + then_append + "\n")
+
+
+_GATE_LINE = "    _require_read_only(argv)\n"
+_WRAPPER = ('"sh", "-c", \'command -v "$1" || exit 127; dnf -y update; exec "$@"\', "sh", ')
+
+#: Fiecare mutație e o formă pe care un apel de aplicare (`dnf -y update`) ar putea intra pe lângă
+#: poartă; textul `old` e din codul REAL, deci un refactor care o mută strică mutația cu mesaj clar.
+LAUNCHER_MUTATIONS = {
+    "path 1: alias of _run": (None, "_apply = _run", True),
+    "path 1b: _run passed on": (None, "import functools\n_p = functools.partial(_run, ['dnf'])", True),
+    "path 4: sh -c wrapper inside _run": (
+        "*argv, stdout=asyncio", '"sh", "-c", \'command -v "$1" || { echo "$1 nu poate fi pornit" >&2; exit 127; }; '
+        'dnf -y update; exec "$@"\', "sh", *argv, stdout=asyncio', False),
+    "wrapper before *argv": ("*argv, stdout=asyncio", _WRAPPER + "*argv, stdout=asyncio", False),
+    "extra word after *argv": ("*argv, stdout=asyncio", "*argv, 'update', stdout=asyncio", False),
+    "executable= keyword": ("*argv, stdout=asyncio", "*argv, executable='/bin/sh', stdout=asyncio", False),
+    "shell-ish kwarg via **": ("*argv, stdout=asyncio", "*argv, **{'cwd': '/'}, stdout=asyncio", False),
+    "cwd keyword": ("*argv, stdout=asyncio", "*argv, cwd='/', stdout=asyncio", False),
+    "argv given to a function that may mutate it": (_GATE_LINE, _GATE_LINE + "    _helper(argv)\n", False),
+    "argv rebound after the gate": (_GATE_LINE, _GATE_LINE + '    argv = ["dnf", "-y", "update"]\n', False),
+    "argv extended after the gate": (_GATE_LINE, _GATE_LINE + '    argv.append("update")\n', False),
+    "argv item-assigned": (_GATE_LINE, _GATE_LINE + '    argv[0] = "dnf"\n', False),
+    "argv augmented": (_GATE_LINE, _GATE_LINE + '    argv += ["update"]\n', False),
+    "argv rebound by walrus": (_GATE_LINE, _GATE_LINE + '    (argv := ["dnf"])\n', False),
+    "argv passed on": (_GATE_LINE, _GATE_LINE + "    print(argv)\n", False),
+    "gate removed": (_GATE_LINE, "", False),
+    "gate not first": (_GATE_LINE, "    started = 0\n" + _GATE_LINE, False),
+    "gate made conditional": (_GATE_LINE, "    if argv:\n        _require_read_only(argv)\n", False),
+    "gate swallowed": (_GATE_LINE, "    try:\n        _require_read_only(argv)\n    except Exception:\n"
+                                   "        pass\n", False),
+    "gate on a copy": (_GATE_LINE, "    _require_read_only(list(argv))\n", False),
+    "spawn moved into a helper outside _run": (
+        "proc = await asyncio.create_subprocess_exec(", "proc = await _spawner(", False,
+        "async def _spawner(*a, **k):\n    return await asyncio.create_subprocess_exec(*a, **k)"),
+    "second launcher in the module": (None, "os.system('dnf -y update')", True),
+    "launcher referenced, not called": (None, "_spawn = asyncio.create_subprocess_exec", True),
+    "os spawn imported": (None, "from os import posix_spawn as _ps", True),
+    "_run decorated": ("async def _run(argv", "@staticmethod\nasync def _run(argv", False),
+    "_run defined twice": (None, "async def _run(argv, limit_s=1):\n    return 0, '', ''", True),
+    "_run rebound": (None, "_run = _run", True),
+    "gate function rebound": (None, "_require_read_only = lambda argv: None", True),
+    "gate function decorated": ("def _require_read_only(", "@staticmethod\ndef _require_read_only(", False),
+    "mode list widened": ('READ_ONLY_MODE: Final = {', 'READ_ONLY_MODE: Final = {"dnf": "-y", ', False),
+    "flag list widened": ('READ_ONLY_FLAGS: Final = {"rpm": (', 'READ_ONLY_FLAGS: Final = {"rpm": ("--eval", ', False),
+    "macro pattern edited": ('_MACRO_EXEC: Final = re.compile(r"', '_MACRO_EXEC: Final = re.compile(r"(?!)|', False),
+    "flags rebound later": (None, 'READ_ONLY_FLAGS = {"rpm": ("--eval",), "dpkg-query": ("-W",)}', True),
+    "mode item-assigned later": (None, 'READ_ONLY_MODE["dnf"] = "-y"', True),
+    "flags updated later": (None, 'READ_ONLY_FLAGS.update({"rpm": ("--eval",)})', True),
+    "flags augmented later": (None, 'READ_ONLY_FLAGS |= {"dnf": ("-y",)}', True),
+    "flags handed on": (None, "_x = READ_ONLY_FLAGS", True),
+}
+
+@pytest.mark.parametrize("label", list(LAUNCHER_MUTATIONS))
+def test_every_way_around_the_run_gate_turns_the_launcher_guard_red(label):
+    """Cele patru drumuri verzi măsurate de verificator, plus formele vecine, scrise ca mutații ale
+    codului REAL: fiecare trebuie să dea cel puțin o constatare. Fără lista asta, garda ar fi doar
+    «cred că e bine» — ea trece pe codul de azi, dar un `_apply = _run` sau un `sh -c` în `_run` nu
+    erau pe nicio listă."""
+    old, new, append, *rest = LAUNCHER_MUTATIONS[label]
+    assert _launcher_problems(_mutated(old, new, append=append, then_append=rest[0] if rest else "")), label
+
+
+def test_the_launcher_guard_admits_honest_edits_to_the_run_function():
+    """Controale cinstite: o editare obișnuită nu are voie să dea roșu — altfel garda e ștearsă a
+    doua zi. Un mesaj de eroare mai lung, un comentariu, o variabilă locală nouă, un `limit_s`
+    folosit altfel, `argv[0]` în mesaj, un apel nou `_run([...])` către `rpm -q`."""
+    # Ancorele sunt doar liniile pe care garda însăși le cere (`_GATE_LINE`, începutul apelului de
+    # proces): o editare cinstită a mesajului, a lui `env` sau a unei constante NU strică un test-martor.
+    for old, new in (
+            (_GATE_LINE, "    # un comentariu nou\n" + _GATE_LINE),
+            (_GATE_LINE, _GATE_LINE + "    started = 0\n    shown = repr(argv)[:20]\n    first = argv[0]\n"),
+            (_GATE_LINE, _GATE_LINE + "    log.debug('start', extra={'program': argv[0], 'n': len(argv)})\n"),
+            (_GATE_LINE, _GATE_LINE + "    child_env = {**os.environ, 'LC_ALL': 'C'}\n"),
+            ("*argv, stdout=asyncio", "*argv, stdout=asyncio")):
+        assert not _launcher_problems(_mutated(old, new)), (old, new)
+    for new in ('async def _more():\n    return await _run(["rpm", "-q", "--qf", _RPM_QF, "bash"])',
+                'async def _provides():\n    return await _run(["rpm", "-q", "--whatprovides", *_INSTALLONLY_PROVIDES])',
+                # o a doua funcție cu propriul `safe` filtrat: judecat pe funcție, nu pe tot modulul
+                "async def _probe_names(names):\n    safe = sorted({n for n in names if _NAME_RE.fullmatch(n)})\n"
+                "    return await _run(['rpm', '-q', '--qf', _RPM_QF, *safe])",
+                "QUERY_TIMEOUT_S_2: Final = 25",
+                "def _short(out, err):\n    return out[:10]"):
+        assert not _launcher_problems(_mutated(None, new, append=True)), new
+
+
+def test_the_launcher_guard_reads_every_binding_form_of_argv_and_of_the_function_names():
+    """`_binders` e baza regulilor de mai sus: dacă nu ar vedea o formă de legare (`except ... as
+    argv`, `for argv in`, `with ... as argv`, `import ... as argv`, un `def argv` sau un `lambda
+    argv`), `_run` ar putea schimba argv-ul de după poartă fără o constatare."""
+    for source in ("argv = 1", "del argv", "for argv in x: pass", "with a as argv: pass", "(argv := 1)",
+                   "try:\n    pass\nexcept E as argv:\n    pass", "import x as argv", "from m import argv",
+                   "def f(argv): pass", "g = lambda argv: 1", "def argv(): pass", "class argv: pass",
+                   "def f():\n    global argv", "def f():\n    nonlocal argv",
+                   "match x:\n    case [argv]: pass", "match x:\n    case [*argv]: pass",
+                   "match x:\n    case {'a': 1, **argv}: pass", "match x:\n    case 1 as argv: pass"):
+        assert _binders(ast.parse(source), "argv"), source
+    assert not _binders(ast.parse("print(argv)\nargv[0]\nx.argv\nf(argv=1)"), "argv")
+
+
+def _run_touched(tree: ast.Module, current: str) -> set[str]:
+    """`_run` (sau `*`) luat din `system_update` de `tree`, pe orice formă de import. O singură definiție,
+    folosită și de testul pe pachet, și de controlul lui pozitiv: două copii ale expresiei ar putea
+    diverge, iar controlul ar trece pe o expresie pe care testul n-o mai folosește."""
+    taken, used = _module_uses(tree, "sentinel.patch.system_update", current)
+    return (taken | used) & {"_run", "*"}
+
+
+def test_nothing_outside_system_update_touches_the_run_function():
+    """`update_view.py` avea de pus `async def _apply_now(): return await su._run(['dnf', '-y',
+    'update'])`, iar `bot.py` un `if context.args == ['acum']: await system_update._run([...])`: nu
+    sunt apeluri pe care o gardă pe `system_update.py` să le vadă. Poarta din `_run` le-ar refuza
+    oricum; asta le prinde în diff, înainte să ajungă să se bazeze pe ea. Se citește TOT pachetul
+    `sentinel/`, nu trei fișiere: orice import al lui `system_update` (relativ, cu alias, din
+    funcție) care ia `_run`, sau `*`, sau pasează modulul mai departe, e o constatare."""
+    target = "sentinel.patch.system_update"
+    seen = 0
+    problems: list[str] = []
+    for path in sorted((ROOT / "sentinel").rglob("*.py")):
+        if path == SYSTEM_UPDATE:
+            continue
+        text = path.read_text(encoding="utf-8")
+        if "system_update" not in text:
+            continue
+        rel = path.relative_to(ROOT).with_suffix("").parts
+        current = ".".join(rel)
+        tree = ast.parse(text)
+        taken, aliases = _import_forms(tree, target, current)
+        if not (taken or aliases):
+            continue
+        seen += 1
+        problems += [f"{path.name}: atinge `{x}` din system_update" for x in sorted(_run_touched(tree, current))]
+        escaped = _escapes(tree, target, current)
+        if escaped:
+            problems.append(f"{path.name}: pasează modulul system_update ca valoare ({sorted(escaped)})")
+    assert seen >= 3, f"garda vede doar {seen} fișiere care importă system_update (bot, update_view, patch_flow)"
+    assert not problems, "\n".join(problems)
+
+
+def test_the_package_wide_guard_sees_run_taken_through_every_door():
+    """Controlul pozitiv al testului de mai sus, pe formele pe care le-a numit verificatorul și pe
+    vecinele lor: un test care citește tot pachetul și nu găsește nimic nu spune nimic dacă
+    citirea e proastă."""
+    for source in ("from sentinel.patch import system_update as su\nasync def f():\n    return await su._run(['dnf'])",
+                   "from sentinel.patch import system_update\nsystem_update._run(['dnf'])",
+                   "def g():\n    from sentinel.patch import system_update\n    return system_update._run",
+                   "from sentinel.patch.system_update import _run as go",
+                   "from sentinel.patch.system_update import *",
+                   "import sentinel.patch.system_update\nsentinel.patch.system_update._run(['dnf'])",
+                   "from . import system_update as s\ns._run(['dnf'])",
+                   "from .system_update import _run"):
+        assert _run_touched(ast.parse(source), "sentinel.patch.other"), source
+    assert not _run_touched(ast.parse("from sentinel.patch import system_update as su\nsu.select(db, cfg)"),
+                            "sentinel.patch.other")
 
 
 def test_the_command_in_bot_py_reaches_for_nothing_in_the_approval_or_the_runner():
@@ -1509,3 +2040,83 @@ def test_the_command_in_bot_py_reaches_for_nothing_in_the_approval_or_the_runner
         assert not names & FORBIDDEN_NAMES, f"{fname} atinge {sorted(names & FORBIDDEN_NAMES)}"
     used = _attrs_on(ast.Module(body=[_function(tree, "cmd_update")], type_ignores=[]), "patch_flow")
     assert used == {"send_plan_for_approval"}, used
+
+
+# ---------------------------------------------------------------------------
+# 6. Ce importă `bot.py`, oriunde în fișier
+# ---------------------------------------------------------------------------
+BOT_MODULE = "sentinel.telegram.bot"
+
+#: Modulele pe care `bot.py` nu are voie să le importe NICIUNDE (nici la nivel de modul, nici într-o
+#: funcție, nici cu alias): runnerul rulează un plan, backup-ul scrie pe gazdă, clientul executorului
+#: vorbește cu executorul. Aprobarea, PIN-ul și rularea sunt ale lui `patch_flow`.
+BOT_FORBIDDEN_IMPORTS = ("sentinel.patch.runner", "sentinel.patch.backup", "sentinel.respond.executor_client")
+
+#: Din `sentinel.respond`, `bot.py` are voie doar la `actions` (butoanele de blocare/deblocare, deja
+#: purtate de rolul și de poarta lor). Orice alt submodul — nu doar cele trei de mai sus — e o ușă nouă.
+BOT_RESPOND_ALLOWED = "sentinel.respond.actions"
+
+
+def _bot_import_problems(tree: ast.Module, current: str = BOT_MODULE) -> list[str]:
+    """Numele importate de `tree` care sunt interzise `bot.py`. Pe NUME COMPLETE rezolvate (`_imported`),
+    nu pe numele din cod: `from sentinel.patch.runner import run_plan as go` dispărea din
+    `FORBIDDEN_NAMES` (care caută `run_plan`) la `as go`, iar `from ..patch import runner` nu
+    potrivea nimic. Nerezolvabil (`from .... import x`) pică: «nu știu» nu devine «e bine»."""
+    out: list[str] = []
+    for name in sorted(_imported(tree, current)):
+        if name.startswith(UNRESOLVABLE):
+            out.append(name)
+        elif any(name == f or name.startswith(f + ".") for f in BOT_FORBIDDEN_IMPORTS):
+            out.append(name)
+        elif name.startswith("sentinel.respond.") and not (
+                name == BOT_RESPOND_ALLOWED or name.startswith(BOT_RESPOND_ALLOWED + ".")):
+            out.append(name)
+    return out
+
+
+def test_bot_py_imports_nothing_that_runs_a_plan_anywhere_in_the_file():
+    """`cmd_update` și `_update_overview` aveau garda pe NUME (`FORBIDDEN_NAMES`), iar `from
+    sentinel.patch.runner import run_plan as go` în corpul lor o ocolea în două linii. Importul în
+    sine, oriunde în fișier, e ce se interzice: `bot.py` primește un plan de la `patch_flow` și nu
+    are niciun motiv să-l ruleze. Control: importurile pe care le face azi (`from sentinel.respond
+    import actions`) trec, iar garda trebuie să le VADĂ ca să nu treacă pe gol."""
+    tree = _tree(BOT)
+    assert "sentinel.respond.actions" in _imported(tree, BOT_MODULE), "garda nu mai vede importul lui `actions`"
+    assert not _bot_import_problems(tree), _bot_import_problems(tree)
+
+
+def test_the_bot_import_guard_sees_every_door_and_lets_the_honest_imports_through():
+    """Formele prin care `runner`/`backup`/`executor_client` ar intra în `bot.py`, la nivel de modul și în
+    funcție, cu alias și relativ — plus `sentinel.respond.<altceva decât actions>`. Controalele:
+    importurile reale ale fișierului și o editare cinstită (încă un import din `sentinel.respond.actions`)."""
+    for source in ("from sentinel.patch.runner import run_plan as go",
+                   "def f():\n    from sentinel.patch.runner import run_plan as go",
+                   "from sentinel.patch import runner",
+                   "from sentinel.patch import runner as r",
+                   "import sentinel.patch.runner",
+                   "import sentinel.patch.backup as b",
+                   "from sentinel.patch.backup import make_backup",
+                   "from sentinel.respond.executor_client import ExecutorClient",
+                   "from sentinel.respond import executor_client",
+                   "from sentinel.respond import executor_client as ec, actions",
+                   "from ..patch import runner",
+                   "from ..patch.runner import run_plan",
+                   "from ...patch import runner",
+                   "from ..respond.executor_client import ExecutorClient",
+                   "from sentinel.respond import *",
+                   "from sentinel.respond.playbooks import run",
+                   "from sentinel.respond.executor_client.helpers import x",
+                   "from sentinel.patch.runner.helpers import x",
+                   "from .... import x"):
+        assert _bot_import_problems(ast.parse(source)), source
+    for source in ("from sentinel.respond import actions",
+                   "from sentinel.respond import actions as act",
+                   "from sentinel.respond.actions import block_ip",
+                   "import sentinel.respond.actions",
+                   "from ..respond import actions",
+                   "from sentinel.patch import planner, window, system_update",
+                   "from sentinel.telegram import patch_flow, update_view",
+                   "def f():\n    from sentinel.patch import system_update\n    from sentinel.scan import os_packages",
+                   "from sentinel.errors import ExecutorRejected, ExecutorUnavailable",
+                   "from sentinel.patch_helpers import x\nfrom sentinel.respond_extra import y"):
+        assert not _bot_import_problems(ast.parse(source)), source

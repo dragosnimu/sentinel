@@ -310,6 +310,56 @@ def test_a_selection_that_raises_is_reported_with_its_reason(monkeypatch):
     assert w.stored == [] and w.offered == []
 
 
+_REAL_RUN = su._run      # `World` îl înlocuiește cu o dublură; aici vrem poarta reală
+
+
+def _refusing_world(monkeypatch) -> World:
+    """O lume în care `_run` e cel REAL, iar un argv al modulului nu mai e o interogare de citire
+    (formatul `--qf` a devenit o macro care rulează cod), plus un martor că nimic nu pornește."""
+    w = World(monkeypatch)
+    started: list = []
+
+    async def spawn(*args, **kwargs):
+        started.append(args)
+        raise OSError("mock")
+
+    monkeypatch.setattr(su, "_run", _REAL_RUN)
+    monkeypatch.setattr(su, "_RPM_QF", "%(echo X)")
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    w.started = started
+    return w
+
+
+def test_a_refused_command_reaches_the_operator_by_name_and_is_not_dressed_as_a_host_problem(monkeypatch):
+    """Dacă un apel nou al lui `_run` ar fi refuzat, operatorul trebuie să citească «RefusedCommand»
+    — o greșeală de cod — nu «nu pot citi starea pachetelor de pe gazdă» (care l-ar trimite să caute
+    o defecțiune pe gazdă). `except Exception` din `cmd_update` o prinde, o scrie în jurnal și o
+    pune în mesaj; nu se scrie niciun plan și nu pornește niciun proces."""
+    w = _refusing_world(monkeypatch)
+    sent = w.command("sistem")
+    assert len(sent) == 1 and "RefusedCommand" in sent[0], sent
+    assert "nu pot citi starea" not in sent[0]
+    assert w.stored == [] and w.offered == [] and w.started == []
+
+
+def test_a_refused_command_in_the_overview_is_named_too(monkeypatch):
+    """Aceeași regulă pentru `/update` fără argument: cifrele din bază se arată, iar în locul lui
+    «ce se poate actualiza» apare numele excepției, nu un «0» și nu un mesaj despre gazdă."""
+    w = _refusing_world(monkeypatch)
+    text = w.command()[0]
+    assert "347" in text and "RefusedCommand" in text, text
+    assert "de actualizat: <b>0</b>" not in text and w.started == []
+
+
+def test_a_refused_command_after_the_run_is_named_next_to_the_runners_verdict(monkeypatch):
+    """După rulare, `_result_text` recitește starea gazdei. Un refuz acolo nu are voie să înghită
+    mesajul de bază (verdictul runnerului) și nu are voie să tacă: apare numele excepției."""
+    text = _result_text(monkeypatch, _lot_plan(monkeypatch), "succeeded",
+                        states=su.RefusedCommand("argv nu e o interogare de citire"))
+    base = patch_flow.format_apply_result(_result("succeeded"), update=True)
+    assert text.startswith(base) and "RefusedCommand" in text[len(base):], text
+
+
 def test_a_selection_error_is_said_and_proposes_nothing(monkeypatch):
     w = World(monkeypatch, host=sup.FakeHost("garbage\n"))
     sent = w.command("sistem")

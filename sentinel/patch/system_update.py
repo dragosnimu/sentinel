@@ -304,9 +304,72 @@ def needs_reboot(name: str) -> bool:
 # ---------------------------------------------------------------------------
 # Citirea gazdei
 # ---------------------------------------------------------------------------
+#: Singurele programe pe care le pornește acest modul, și modul pe care trebuie să-l aibă ca
+#: `argv[1]`. Cheia e numele GOL al programului (nu o cale): `/tmp/rpm` nu e `rpm`.
+READ_ONLY_MODE: Final = {"rpm": "-q", "dpkg-query": "-W"}
+
+#: Ce flag-uri (cuvinte care încep cu `-`) are voie să primească fiecare program. Nu o listă de
+#: flag-uri INTERZISE: `rpm` are `--eval`/`-E`, `--define`/`-D`, `--macros`, `--rcfile`, `--pipe`
+#: (rulează o comandă), `-i`/`-e` (schimbă gazda) și o listă care crește cu versiunea — o listă de
+#: interzise ar fi mereu cu un cuvânt în urmă. Ce nu e aici pică. Pe RPM 4.16 doar `--eval` execută
+#: `%(...)` din argument; lista albă nu se sprijină pe asta, fiindcă altă versiune poate schimba.
+#:
+#: O LĂRGIRE a acestei liste (sau a lui `READ_ONLY_MODE`) schimbă ce poate porni procesul `sentinel`
+#: (grup `docker`, deci root prin soclu) și e o decizie, nu o corecție: o pază din
+#: `tests/security/test_update_has_no_second_apply_path.py` citește valorile din acest fișier și
+#: pică dacă nu sunt cele aprobate acolo.
+READ_ONLY_FLAGS: Final = {"rpm": ("-q", "--qf", "--whatprovides"), "dpkg-query": ("-W", "-f")}
+
+#: `%(...)` și `%{lua:...}` execută cod când `rpm` expandează o macro (`rpm --eval "%(id)"`).
+_MACRO_EXEC: Final = re.compile(r"%\(|%\{\s*lua\s*:", re.IGNORECASE)
+
+
+class RefusedCommand(Exception):
+    """`_run` a primit un argv care nu e o interogare de citire, deci nu a pornit nimic.
+
+    E o GREȘEALĂ DE PROGRAMARE (cineva a scris un apel nou), nu o stare a gazdei, și de aceea
+    nu e un cod de ieșire: 127 înseamnă «programul lipsește», iar o refuzare confundată cu el
+    ar arăta ca o gazdă fără `rpm`. Nu moștenește `OSError`, `ValueError`, `LookupError` sau
+    `TimeoutError` — ce prind `except`-urile de pe cale ca să transforme o stare a gazdei într-un
+    mesaj. Ce o prinde de fapt sunt cele trei `except Exception` care existau înainte (`/update`
+    în `bot.py`, citirea de după rulare în `patch_flow`), și fiecare o PUNE ÎN MESAJ cu numele
+    tipului și o înscrie în jurnal la nivel `error`: operatorul vede «RefusedCommand: ...», nu «nu
+    pot citi starea pachetelor». Nu moștenește `BaseException` dinadins: un handler Telegram
+    care moare cu o excepție pe care nu o prinde nimeni tace — iar canalul acela e singurul."""
+
+
+def _require_read_only(argv: Any) -> None:
+    """Ridică `RefusedCommand` dacă `argv` nu e o interogare de citire (`rpm -q ...` sau
+    `dpkg-query -W ...`). Se cheamă în `_run` ÎNAINTE de orice proces.
+
+    Aici trăiește limita, nu în numele celor care cheamă `_run`: o gardă pe AST verifică
+    ortografia apelanților dintr-un fișier, dar `_run` e o funcție importabilă, iar un alias
+    (`_apply = _run`), un apel din alt modul sau un `sh -c` adăugat în interiorul ei nu trec
+    prin nicio ortografie. Orice argv care ajunge la un proces trece pe aici, oricine l-ar fi dat."""
+    # Tipul EXACT, nu `isinstance`: o subclasă de `str` cu un `startswith` care minte, sau una de `list`
+    # cu un `__iter__` care dă altceva a doua oară, ar trece de poartă și ar rula altceva.
+    if type(argv) is not list or not argv or any(type(a) is not str for a in argv):
+        raise RefusedCommand(f"argv nu e o listă nevidă de șiruri (list/str exacte): {repr(argv)[:200]}")
+    prog = argv[0]
+    shown = repr(argv)[:200]
+    if prog not in READ_ONLY_MODE:
+        raise RefusedCommand(f"{prog!r} nu e o interogare de citire: {shown}")
+    if len(argv) < 2 or argv[1] != READ_ONLY_MODE[prog]:
+        raise RefusedCommand(f"argv[1] al lui {prog!r} trebuie să fie {READ_ONLY_MODE[prog]!r}: {shown}")
+    for word in argv[1:]:
+        if word.startswith("-") and word not in READ_ONLY_FLAGS[prog]:
+            raise RefusedCommand(f"flag în afara listei pentru {prog!r}: {word!r}")
+        if _MACRO_EXEC.search(word):
+            raise RefusedCommand(f"un cuvânt care expandează o macro (rulează cod): {word!r}")
+
+
 async def _run(argv: list[str], limit_s: int = QUERY_TIMEOUT_S) -> tuple[int, str, str]:
     """`(cod, stdout, stderr)`. 127 = binarul lipsește, 124 = timeout — aceleași coduri ca
-    shell-ul, ca eroarea să se citească. Un cod negativ e un semnal (sandbox), nu «lipsă»."""
+    shell-ul, ca eroarea să se citească. Un cod negativ e un semnal (sandbox), nu «lipsă».
+
+    Ridică `RefusedCommand` dacă `argv` nu e o interogare de citire — ÎNAINTE de orice proces.
+    Procesul primește exact `argv`, fără înveliș: ce a fost verificat e ce rulează."""
+    _require_read_only(argv)
     env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -440,7 +503,9 @@ def _short_err(out: str, err: str) -> str:
 
 
 async def read_host(family: str, names: list[str], *, with_install_only: bool = True) -> HostRead:
-    """Citește ce e instalat din `names`, și ce e install-only. Nu ridică.
+    """Citește ce e instalat din `names`, și ce e install-only. Nu ridică pentru o gazdă care
+    răspunde prost (asta devine `HostRead.error`); ridică `RefusedCommand` dacă un argv de
+    aici nu mai e o interogare de citire — o greșeală de programare, spusă ca atare.
 
     Doar nume care arată a nume de pachet ajung în argv (vezi `_NAME_RE`); restul sunt
     tratate de apelant ca «nume neacceptat», nu trecute lui `rpm` să le citească drept flag.
