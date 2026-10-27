@@ -257,6 +257,22 @@ def test_a_covered_family_tells_the_operator_which_plan_to_open(monkeypatch):
     assert "httpd-core" in text and "validated" in text
 
 
+def test_a_family_held_for_a_member_behind_its_siblings_says_which_one_and_why(monkeypatch):
+    """`httpd-core` e deja la versiunea care îi repară constatarea (2.4.50-1), dar `httpd` merge la
+    2.4.50-2 și l-ar trage după el. Mesajul nu poate spune doar «reținut»: operatorul trebuie să
+    vadă CARE membru și la ce versiune stă, altfel codul nou ar fi un zid fără ușă."""
+    rows = sup.finding_rows()
+    for r in rows:
+        if r["package"] == "httpd-core":
+            r["fixed_version"] = "2.4.50-1.el9"
+    db = sup.FakeDB(rows, scanners=[{"scanner": "dnf", "n": 10, "with_fix": 10}])
+    w = World(monkeypatch, db=db)
+    text = w.command("httpd")[0]
+    assert w.stored == [] and w.offered == []
+    assert "httpd-core" in text and "instalat 2.4.50-1.el9" in text and "2.4.50-2.el9" in text, text
+    assert "dnf" in text and "sub ținta surorilor" in text, text
+
+
 def test_nothing_to_propose_says_why_instead_of_staying_silent(monkeypatch):
     """Un răspuns gol ar fi citit ca «nu e nimic de făcut». Aici nu e nimic de PROPUS, iar motivul
     (nucleul e install-only) trebuie să fie în mesaj."""

@@ -473,6 +473,95 @@ def test_a_covered_package_with_nothing_to_move_does_not_hold_its_family(monkeyp
     assert HTTPD_FAMILY - {"httpd-core"} <= _planned(sel)
 
 
+def _rows_with_fixed(**fixed: str) -> list[dict]:
+    """Constatările stock, cu reparația unor pachete schimbată (`httpd_core="2.4.50-1.el9"`)."""
+    rows = sup.finding_rows()
+    for r in rows:
+        key = r["package"].replace("-", "_")
+        if key in fixed:
+            r["fixed_version"] = fixed[key]
+    return rows
+
+
+def _host_with(old: str, new: str, *, name: str, source: str = "httpd-2.4.50-1.el9.src.rpm"):
+    """Gazda stock, cu `name` instalat la altă versiune."""
+    stock = sup.rpm_query_output(kernel=True)
+    changed = stock.replace(sup.rpm_line(name, old, srpm=source), sup.rpm_line(name, new, srpm=source))
+    assert changed != stock, "fixture-ul n-a schimbat nimic"
+    return sup.FakeHost(changed)
+
+
+def test_a_member_whose_own_fix_is_on_disk_but_is_behind_its_siblings_holds_the_family(monkeypatch):
+    """Reproducerea verificatorului. `httpd-core` e instalat la 2.4.50-1 și constatarea LUI se
+    repară la 2.4.50-1 (nimic de instalat pentru ea), dar `httpd` și surorile merg la 2.4.50-2, iar
+    `httpd` cere `httpd-core` de versiunea exactă. Planul ar fi numit patru pachete și `dnf` l-ar
+    fi mutat pe al cincilea, nenumit: fără pin de revenire, fără verificare — exact «actualizarea
+    pe ascuns» pe care familia indivizibilă o previne. Familia se reține ÎNTREAGĂ, cu motivul
+    spus, iar `httpd-core` nu apare ca «reparat»: nu e, în planul pe care l-ar trage tranzacția."""
+    sel = _select(monkeypatch, db=sup.FakeDB(_rows_with_fixed(httpd_core="2.4.50-1.el9")))
+
+    assert not HTTPD_FAMILY & _planned(sel), _planned(sel)
+    assert not any(n.startswith(("httpd", "mod_lua")) for n in _argv_names(sel)), _argv_names(sel)
+    held = _held(sel)
+    assert HTTPD_FAMILY <= set(held), "familia nu e reținută întreagă"
+    assert {held[n].code for n in HTTPD_FAMILY} == {"behind_siblings"}
+    assert "httpd-core" in held["httpd"].reason and "2.4.50-2.el9" in held["httpd"].reason
+    assert "httpd-core" not in {a[0] for a in sel.already}, "e reținut, nu «reparat»"
+
+
+def test_the_bar_is_the_highest_target_in_the_family_not_the_lowest(monkeypatch):
+    """Țintele surorilor pot diferi. `httpd-core` e la 2.4.50-2, ca ținta lui și ca a mai multor
+    surori — dar `httpd-tools` merge la 2.4.50-3, iar `httpd` cere `httpd-core` de aceeași
+    versiune cu el. Dacă pragul ar fi cea mai MICĂ țintă, `httpd-core` ar trece drept «gata»,
+    iar tranzacția l-ar muta nenumit."""
+    sel = _select(monkeypatch,
+                  db=sup.FakeDB(_rows_with_fixed(httpd_core="2.4.50-2.el9", httpd_tools="2.4.50-3.el9")),
+                  host=_host_with("2.4.50-1.el9", "2.4.50-2.el9", name="httpd-core"))
+    assert not HTTPD_FAMILY & _planned(sel), _planned(sel)
+    assert {_held(sel)[n].code for n in HTTPD_FAMILY} == {"behind_siblings"}
+
+
+def test_a_member_at_or_above_every_target_in_its_family_does_not_hold_it(monkeypatch):
+    """Contrastul care ține regula cinstită: `httpd-core` e la 2.4.50-3, peste ținta tuturor
+    (2.4.50-2). `dnf` nu-l coboară și nu-l mută, deci familia rămasă se planifică, iar el rămâne
+    vizibil ca «instalat». La fel la egalitate (2.4.50-2). Fără contrastul ăsta, regula ar putea
+    fi «reține orice familie cu un membru gata» și ar ascunde patru reparații fără câștig."""
+    for installed in ("2.4.50-3.el9", "2.4.50-2.el9"):
+        sel = _select(monkeypatch, host=_host_with("2.4.50-1.el9", installed, name="httpd-core"))
+        assert HTTPD_FAMILY - {"httpd-core"} <= _planned(sel), (installed, _held(sel).get("httpd"))
+        assert "httpd-core" not in _planned(sel) and "httpd-core" not in _held(sel), installed
+        assert "httpd-core" in {a[0] for a in sel.already}, installed
+
+
+def test_asking_for_one_package_of_a_behind_family_says_why(monkeypatch):
+    """`/update httpd` (sau `/update httpd-core`) cu `httpd-core` rămas în urma țintei: niciun lot,
+    familia reținută întreagă și motivul la vedere — nu «nu e nimic de făcut» și nu un plan
+    cu patru pachete."""
+    for asked in ("httpd", "httpd-core", "mod_lua"):
+        sel = _select(monkeypatch, db=sup.FakeDB(_rows_with_fixed(httpd_core="2.4.50-1.el9")), only=asked)
+        assert not sel.lots, (asked, _planned(sel))
+        assert [h.code for h in sel.held] == ["behind_siblings"], (asked, sel.held)
+        assert set(sel.held[0].packages) == HTTPD_FAMILY, asked
+
+
+def test_a_covered_package_already_at_the_fixed_version_keeps_its_install_line(monkeypatch):
+    """`glibc` e deja pe disc la versiunea care repară, dar planul #5 încă îl acoperă (între
+    instalare și scanarea următoare). Răspunsul spunea doar «deja într-un plan deschis» — linia
+    «instalat, așteaptă repornire» dispărea, iar operatorul nu afla că un plan deschis nu mai
+    schimbă nimic și că de fapt trebuie o repornire."""
+    rows = sup.finding_rows(kernel=False)
+    rows.append(dict(id=9500, package="glibc", cve=None, severity="high", kev=False, priority=1,
+                     fixed_version="2.34-2.el9", ecosystem="rpm", asset_id=None, asset_name=None,
+                     asset_protected=False, fix_pending_reboot=False))
+    rpm = sup.rpm_query_output([sup.rpm_line("glibc", "2.34-3.el9")], kernel=False)
+    covering = [{"id": 5, "status": "validated", "finding_ids": [9500]}]
+    sel = _select(monkeypatch, db=sup.FakeDB(rows, covering=covering), host=sup.FakeHost(rpm))
+
+    assert ("glibc", 5, "validated") in sel.covered
+    assert [a for a in sel.already if a[0] == "glibc"] == [("glibc", "2.34-3.el9", True)]
+    assert "glibc" not in _planned(sel) and "glibc" not in _held(sel)
+
+
 def test_a_protected_sibling_holds_its_whole_family(monkeypatch):
     """Același mecanism ca la planul acoperit: un `httpd-core` pe un asset protejat nu poate fi
     numit într-un plan, dar `dnf update httpd` îl mută oricum. Fără reținerea familiei, un

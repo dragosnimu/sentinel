@@ -38,6 +38,7 @@ HELD_LABELS: dict[str, str] = {
     "not_installed": "nu e instalat",
     "protected_asset": "asset protejat",
     "covered": "un membru al grupului e deja într-un plan deschis",
+    "behind_siblings": "un membru e instalat sub ținta surorilor lui (dnf l-ar muta nenumit)",
     "bad_name": "nume neacceptat",
     "foreign": "nu e un pachet al gazdei",
 }
@@ -82,7 +83,7 @@ def held_lines(held: list[su.Held]) -> list[str]:
         line = f"• {_names(h.packages)} — {_esc(label)}"
         # Mesajul validatorului e ce nu se poate ghici din cod: se arată. La fel planul care
         # acoperă deja un membru: operatorul trebuie să știe ce plan să deschidă.
-        if h.code in ("validator", "covered"):
+        if h.code in ("validator", "covered", "behind_siblings"):
             line += f"\n   <i>{_esc(h.reason[:300])}</i>"
         out.append(line)
     return out

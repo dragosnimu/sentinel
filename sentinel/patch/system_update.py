@@ -72,6 +72,9 @@ Nimic nu dispare tăcut. Un grup reținut apare în răspuns cu motivul:
     oricum, fără pin și fără verificare. Familia întreagă e reținută, cu planul numit. Regula
     după care se alege între «reține membrul» și «reține familia» e în docstring-ul lui
     `classify`;
+  * **un membru rămas în urma țintei surorilor** (`behind_siblings`): constatarea LUI e reparată
+    deja pe disc, dar surorile merg la o versiune mai mare, iar `dnf` îl trage după ele. Aceeași
+    regulă ca mai sus, ajunsă pe altă ușă; vezi `classify`;
   * orice nu se poate dovedi: versiunea instalată necitită, mai multe versiuni instalate, un
     nume pe care executorul l-ar refuza.
 
@@ -793,6 +796,16 @@ class _Member:
     pkg: PlanPkg
 
 
+@dataclass
+class _Settled:
+    """Un pachet aflat la sau peste versiunea care îi repară PROPRIA constatare. Încă nu e
+    «deja instalat»: asta se hotărăște abia când se știe ce versiune vor avea surorile lui."""
+    source: str
+    name: str
+    newest: str
+    hit: tuple[int, str] | None     # planul deschis care îl acoperă, dacă e unul
+
+
 def _short(reason: str, limit: int = 220) -> str:
     return reason if len(reason) <= limit else reason[: limit - 1] + "…"
 
@@ -832,10 +845,18 @@ def classify(cands: CandidateSet, host: HostRead, family: str, sel: Selection,
         ar fi mutat nenumit: tranzacția surorilor îl trage prin dependențe (`httpd` cere
         `httpd-core` de aceeași versiune), fără pin de pregătire, fără pin de revenire și fără
         verificare. De aceea intră în `hard`: se reține FAMILIA ÎNTREAGĂ, cu el cu tot.
-      * `not_installed` și `already` rămân pe membru. Nu sunt la fel: un pachet care nu e instalat
-        nu are ce fi mutat de nicio tranzacție, iar unul aflat deja la versiunea care repară sau
-        peste ea nu are nimic de instalat — nu e nici el «actualizat pe ascuns». Dacă l-ai reține
-        pe el, ai reține familia pentru un pachet pe care nimeni nu-l atinge.
+      * `not_installed` rămâne pe membru: un pachet care nu e instalat nu are ce fi mutat de nicio
+        tranzacție. Dacă l-ai reține pe el, ai reține familia pentru un pachet pe care nimeni nu-l
+        atinge.
+      * «Reparația e deja pe disc» (`already`) e adevărată doar față de constatarea LUI, nu față de
+        ținta surorilor: `httpd-core` instalat la 2.4.50-1 cu reparația proprie la 2.4.50-1 nu are
+        nimic de instalat pentru ea, dar dacă `httpd` și celelalte merg la 2.4.50-2, `httpd` cere
+        `httpd-core` de versiunea exactă a lui și `dnf` îl mută la 2.4.50-2, nenumit. De aceea
+        decizia se amână până sunt cunoscute grupurile: un membru «gata» rămâne pe loc doar dacă
+        versiunea lui e cel puțin cea mai mare țintă din familia planificată; altfel familia se
+        reține (`behind_siblings`). Pe datele de azi nu se declanșează (măsurat de verificator, 27 oct
+        2026, pe cei 32 de membri ai familiilor cu mai multe pachete: aceleași `fixed_version` în
+        fiecare familie), dar regula nu se bazează pe asta.
 
     O excepție spusă pe față: `bad_name` rămâne pe membru, dar din alt motiv. Un nume pe care nu-l
     dau nici lui `rpm` nu are sursă citită, deci nu pot spune din ce familie face parte; nu pot
@@ -845,6 +866,7 @@ def classify(cands: CandidateSet, host: HostRead, family: str, sel: Selection,
     covering = covering or {}
     groups: dict[str, list[_Member]] = {}
     hard: dict[str, list[tuple[str, str, str]]] = {}   # sursă -> (pachet, cod, motiv)
+    settled: list[_Settled] = []                       # decise abia după ce grupurile sunt cunoscute
 
     for cand in cands.candidates:
         name = cand.package
@@ -876,10 +898,7 @@ def classify(cands: CandidateSet, host: HostRead, family: str, sel: Selection,
         # install-only (nucleul) «cea mai nouă instanță» e cea care contează — celelalte două
         # sunt, prin construcție, cele vechi păstrate în paralel.
         if cmp(newest, cand.fixed) >= 0:
-            if hit is not None:
-                sel.covered.append((name, hit[0], hit[1]))
-            else:
-                sel.already.append((name, newest, needs_reboot(name)))
+            settled.append(_Settled(source, name, newest, hit))
             continue
         if hit is not None:
             # Are de actualizat și e deja în planul #N: nu primește un al doilea, dar nici nu
@@ -931,6 +950,37 @@ def classify(cands: CandidateSet, host: HostRead, family: str, sel: Selection,
         sel.held.append(Held(names, sorted(reasons)[0][1],
                              f"grupul «{source}» se mișcă împreună și are un membru care nu se poate "
                              f"actualiza automat — {why}"))
+
+    # Un membru «gata» rămâne pe loc doar dacă tranzacția surorilor nu l-ar mișca: versiunea lui
+    # trebuie să atingă cea mai mare țintă din familia planificată (vezi docstring-ul).
+    target: dict[str, str] = {}
+    for source, members in groups.items():
+        top = members[0].cand.fixed
+        for m in members[1:]:
+            if cmp(m.cand.fixed, top) > 0:
+                top = m.cand.fixed
+        target[source] = top
+    behind: dict[str, list[_Settled]] = {}
+    for st in settled:
+        if st.source in target and cmp(st.newest, target[st.source]) < 0:
+            behind.setdefault(st.source, []).append(st)
+    for source, rows in behind.items():
+        members = groups.pop(source)
+        names = sorted({r.name for r in rows} | {m.cand.package for m in members})
+        why = "; ".join(f"{r.name}: instalat {r.newest}" for r in sorted(rows, key=lambda r: r.name))
+        sel.held.append(Held(names, "behind_siblings",
+                             f"grupul «{source}» se mișcă împreună, iar țintele surorilor "
+                             f"({target[source]}) sunt peste ce are deja un membru fără nimic de "
+                             f"instalat pentru constatarea lui — {why}. `dnf` l-ar muta oricum, "
+                             "fără pin de revenire și fără verificare"))
+    behind_names = {r.name for rows in behind.values() for r in rows}
+    for st in settled:
+        if st.hit is not None:
+            sel.covered.append((st.name, st.hit[0], st.hit[1]))
+        # Un pachet acoperit de un plan DAR deja la versiunea care repară își păstrează și rândul
+        # «instalat»: pentru unul care cere repornire, e singura linie care o spune.
+        if st.name not in behind_names:
+            sel.already.append((st.name, st.newest, needs_reboot(st.name)))
     return groups
 
 
