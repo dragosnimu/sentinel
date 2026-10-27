@@ -67,6 +67,11 @@ Nimic nu dispare tăcut. Un grup reținut apare în răspuns cu motivul:
   * **doar manual** (`MANUAL_ONLY_PACKAGES`): `docs/PATCHING.md` §8 spune că `sshd` nu se
     patchează automat, și verificarea de sănătate nu poate vedea `sshd.service` (executorul
     îl refuză, e în `UNCONTROLLABLE_UNITS`);
+  * **un membru deja într-un plan deschis, sau pe un asset protejat**: nu primește un al doilea
+    plan, dar nici nu poate fi lăsat în afara lotului surorilor lui — tranzacția lor l-ar trage
+    oricum, fără pin și fără verificare. Familia întreagă e reținută, cu planul numit. Regula
+    după care se alege între «reține membrul» și «reține familia» e în docstring-ul lui
+    `classify`;
   * orice nu se poate dovedi: versiunea instalată necitită, mai multe versiuni instalate, un
     nume pe care executorul l-ar refuza.
 
@@ -142,8 +147,10 @@ QUERY_TIMEOUT_S: Final = 20
 MANUAL_ONLY_PACKAGES: Final = frozenset({"openssh-server"})
 
 #: Ce deosebește numele din baza de date de un argument de linie de comandă. Numele vin de
-#: la un scaner; unul care începe cu `-` ar fi citit de `rpm`/`dpkg-query` ca flag.
-_NAME_RE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
+#: la un scaner; unul care începe cu `-` ar fi citit de `rpm`/`dpkg-query` ca flag. Se folosește
+#: DOAR cu `fullmatch`: `$` potrivește și înaintea unui rând nou de la coadă, deci `match` ar fi
+#: lăsat să treacă «expat» urmat de un newline — un nume pe care `rpm` l-ar citi ca două argumente.
+_NAME_RE: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}")
 
 #: Familiile de distribuție pentru care știu să construiesc o comandă.
 FAMILIES: Final = ("rhel", "debian")
@@ -442,7 +449,7 @@ async def read_host(family: str, names: list[str], *, with_install_only: bool = 
     recitirea de după rulare vrea doar versiunile, iar o pană la clasificare n-are de ce să
     ascundă starea pachetelor în clipa în care contează cel mai mult.
     """
-    safe = sorted({n for n in names if _NAME_RE.match(n)})
+    safe = sorted({n for n in names if _NAME_RE.fullmatch(n)})
     if not safe:
         return HostRead()
 
@@ -806,31 +813,57 @@ def _unit_plan(members: list[_Member], family: str, scope: str, number: int, tot
                       total=total, asset_id=one, asset_name=name)
 
 
-def classify(cands: CandidateSet, host: HostRead, family: str, sel: Selection) -> dict[str, list[_Member]]:
+def classify(cands: CandidateSet, host: HostRead, family: str, sel: Selection,
+             covering: dict[int, tuple[int, str]] | None = None) -> dict[str, list[_Member]]:
     """Din candidați + ce a citit gazda: grupurile care pot fi planificate (sursă -> membri).
 
-    Tot ce nu poate fi planificat ajunge în `sel.held`, `sel.already` sau e raportat — cu
-    motiv. Pură în raport cu rețeaua și baza: aceleași intrări, aceleași grupuri.
+    Tot ce nu poate fi planificat ajunge în `sel.held`, `sel.already`, `sel.covered` sau e
+    raportat — cu motiv. Pură în raport cu rețeaua și baza: aceleași intrări, aceleași grupuri.
+    `covering` = finding_id -> (plan, stare) pentru planurile deschise (`_covering_plans`), dat de
+    apelant tocmai ca funcția asta să nu atingă baza.
+
+    ## Ce reține un membru, și ce reține familia lui
+
+    Întrebarea care hotărăște fiecare ramură: **ar muta `dnf`/`apt` pachetul ăsta oricum, ca
+    dependență a surorilor planificate?**
+
+      * Un pachet care ARE de actualizat și pe care refuzăm să-l numim (`covered` — e deja într-un
+        plan deschis; `protected_asset`; `install_only`; `manual_only`; versiuni multiple; epoch)
+        ar fi mutat nenumit: tranzacția surorilor îl trage prin dependențe (`httpd` cere
+        `httpd-core` de aceeași versiune), fără pin de pregătire, fără pin de revenire și fără
+        verificare. De aceea intră în `hard`: se reține FAMILIA ÎNTREAGĂ, cu el cu tot.
+      * `not_installed` și `already` rămân pe membru. Nu sunt la fel: un pachet care nu e instalat
+        nu are ce fi mutat de nicio tranzacție, iar unul aflat deja la versiunea care repară sau
+        peste ea nu are nimic de instalat — nu e nici el «actualizat pe ascuns». Dacă l-ai reține
+        pe el, ai reține familia pentru un pachet pe care nimeni nu-l atinge.
+
+    O excepție spusă pe față: `bad_name` rămâne pe membru, dar din alt motiv. Un nume pe care nu-l
+    dau nici lui `rpm` nu are sursă citită, deci nu pot spune din ce familie face parte; nu pot
+    reține o familie pe care n-o pot numi.
     """
     cmp = _cmp_for(family)
+    covering = covering or {}
     groups: dict[str, list[_Member]] = {}
     hard: dict[str, list[tuple[str, str, str]]] = {}   # sursă -> (pachet, cod, motiv)
 
     for cand in cands.candidates:
         name = cand.package
-        if not _NAME_RE.match(name):
+        if not _NAME_RE.fullmatch(name):
             sel.held.append(Held([name], "bad_name",
-                                 "numele pachetului nu e unul pe care să-l dau unei comenzi"))
+                                 "numele pachetului nu e unul pe care să-l dau unei comenzi — nici "
+                                 "sursa nu i-am citit, deci nu pot spune ce alte pachete ar trage "
+                                 "după el"))
             continue
-        if cand.protected:
-            sel.held.append(Held([name], "protected_asset",
-                                 "asset-ul pachetului e marcat protejat: niciun plan automat"))
-            continue
+        hit = next((covering[i] for i in cand.finding_ids if i in covering), None)
         insts = host.installed.get(name, ())
         if not insts:
-            sel.held.append(Held([name], "not_installed",
-                                 "scanerul îl listează, dar nu e instalat acum — constatarea e "
-                                 "veche și se închide la scanarea următoare"))
+            # Nimic de mutat. Un pachet acoperit rămâne totuși vizibil ca acoperit.
+            if hit is not None:
+                sel.covered.append((name, hit[0], hit[1]))
+            else:
+                sel.held.append(Held([name], "not_installed",
+                                     "scanerul îl listează, dar nu e instalat acum — constatarea e "
+                                     "veche și se închide la scanarea următoare"))
             continue
         source = insts[0].source
         evrs = sorted({i.evr for i in insts})
@@ -843,7 +876,24 @@ def classify(cands: CandidateSet, host: HostRead, family: str, sel: Selection) -
         # install-only (nucleul) «cea mai nouă instanță» e cea care contează — celelalte două
         # sunt, prin construcție, cele vechi păstrate în paralel.
         if cmp(newest, cand.fixed) >= 0:
-            sel.already.append((name, newest, needs_reboot(name)))
+            if hit is not None:
+                sel.covered.append((name, hit[0], hit[1]))
+            else:
+                sel.already.append((name, newest, needs_reboot(name)))
+            continue
+        if hit is not None:
+            # Are de actualizat și e deja în planul #N: nu primește un al doilea, dar nici nu
+            # poate fi lăsat în afara lotului surorilor lui, fiindcă dnf l-ar trage oricum.
+            sel.covered.append((name, hit[0], hit[1]))
+            hard.setdefault(source, []).append((
+                name, "covered",
+                f"e deja în planul #{hit[0]} ({hit[1]}) — vezi /patch {hit[0]}; tranzacția surorilor "
+                "l-ar muta fără pin de revenire și fără verificare"))
+            continue
+        if cand.protected:
+            hard.setdefault(source, []).append((name, "protected_asset",
+                                                "asset-ul pachetului e marcat protejat: niciun plan "
+                                                "automat"))
             continue
         if name in host.installonly:
             hard.setdefault(source, []).append((name, "install_only",
@@ -993,18 +1043,10 @@ async def select(db: Database, cfg: Any, *, only: str | None = None) -> Selectio
                      "ce se poate actualiza, deci nu propun nimic")
         return sel
 
-    # Un pachet deja într-un plan deschis nu primește un al doilea.
+    # Un pachet deja într-un plan deschis nu primește un al doilea — iar familia lui nu se
+    # planifică fără el (vezi `classify`). Interogarea se face aici, `classify` rămâne pură.
     covering = await _covering_plans(db, [i for c in cands.candidates for i in c.finding_ids])
-    free: list[Candidate] = []
-    for c in cands.candidates:
-        hit = next((covering[i] for i in c.finding_ids if i in covering), None)
-        if hit is not None:
-            sel.covered.append((c.package, hit[0], hit[1]))
-        else:
-            free.append(c)
-    cands.candidates = free
-
-    groups = classify(cands, host, family, sel)
+    groups = classify(cands, host, family, sel, covering)
 
     scope = SCOPE_SYSTEM
     if only is not None:
@@ -1108,8 +1150,17 @@ async def reconcile(plan: dict[str, Any], family: str) -> tuple[list[PkgState], 
     return out, None
 
 
+class NoExecutionWindow(LookupError):
+    """Execuția nu are o fereastră de timp în care să se caute: rând lipsă sau neînceput."""
+
+
 async def detections_during(db: Database, execution_id: int) -> list[dict[str, Any]]:
     """Detecțiile `intrusion` grave apărute cât a rulat execuția (plus fereastra detectorului).
+
+    `[]` înseamnă «am căutat în fereastra execuției și n-am găsit». Dacă nu există fereastră
+    (execuția n-are rând, sau n-are ora de început), NU se întoarce `[]` — ar fi aceeași
+    tăcere pentru «n-am putut căuta» —, ci se ridică `NoExecutionWindow`, iar apelantul spune
+    asta operatorului.
 
     Un update își declanșează propriii detectori: `-w /usr/lib/systemd/system -p wa` nu are filtru
     de sesiune, iar `rpm` scrie fișiere de unitate. Aici NU se suprimă nimic — se atribuie, ca
@@ -1134,8 +1185,10 @@ async def detections_during(db: Database, execution_id: int) -> list[dict[str, A
     """
     row = await db.fetchrow(
         "SELECT started_at, finished_at FROM patch_executions WHERE id = $1", execution_id)
-    if row is None or row["started_at"] is None:
-        return []
+    if row is None:
+        raise NoExecutionWindow(f"execuția #{execution_id} nu are niciun rând în patch_executions")
+    if row["started_at"] is None:
+        raise NoExecutionWindow(f"execuția #{execution_id} nu are ora de început înregistrată")
     rows = await db.fetch(
         """
         SELECT rule_id, severity, evidence FROM detections
@@ -1167,4 +1220,4 @@ async def detections_during(db: Database, execution_id: int) -> list[dict[str, A
 
 def is_package_name(value: str) -> bool:
     """Arată `value` a nume de pachet (și nu a flag, cale sau comandă)?"""
-    return bool(_NAME_RE.match(value))
+    return bool(_NAME_RE.fullmatch(value))

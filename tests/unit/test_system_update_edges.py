@@ -140,6 +140,62 @@ def test_a_dnf_conf_that_redefines_installonly_is_not_trusted(monkeypatch, tmp_p
     assert "nu se poate citi" in su._dnf_conf_override(), "un fișier ilizibil NU e «nu spune nimic»"
 
 
+def _select_with_real_dnf_conf(monkeypatch, conf_path):
+    """`select` cu `_dnf_conf_override` REAL, arătând spre `conf_path`. `sup.install` îl
+    înlocuiește cu un stub care întoarce `None`, deci orice test făcut cu el e orb la ștergerea
+    consultării din `read_host`."""
+    real = su._dnf_conf_override
+    sup.install(monkeypatch, sup.FakeHost())
+    monkeypatch.setattr(su, "_dnf_conf_override", real)
+    monkeypatch.setattr(su, "_DNF_CONF_PATHS", (str(conf_path),))
+    return run(su.select(sup.FakeDB(), sup.cfg()))
+
+
+def test_select_refuses_to_plan_on_a_host_whose_dnf_conf_redefines_installonly(monkeypatch, tmp_path):
+    """Pe o gazdă cu `installonlypkgs=` în `dnf.conf`, dnf are altă listă de pachete install-only
+    decât cea pe care o citesc din `rpm`. Dacă `read_host` n-ar consulta fișierul, `select` ar
+    propune loturi pentru pachete pe care dnf le tratează altfel (adaugă lângă cel nou în loc să
+    înlocuiască, deci revenirea n-ar restaura nimic) — fără nicio eroare. Controalele pozitive:
+    aceeași gazdă cu fișierul curat, comentat sau absent propune loturi."""
+    conf = tmp_path / "dnf.conf"
+    conf.write_text("[main]\ninstallonlypkgs=kernel mykernel\n", encoding="utf-8")
+    sel = _select_with_real_dnf_conf(monkeypatch, conf)
+    assert sel.error and "installonlypkgs" in sel.error and not sel.lots, sel
+
+    # Ilizibil (aici: un director în locul fișierului) nu e «nu spune nimic».
+    sel = _select_with_real_dnf_conf(monkeypatch, tmp_path)
+    assert sel.error and "nu se poate citi" in sel.error and not sel.lots, sel
+
+    conf.write_text("[main]\n# installonlypkgs=kernel\ninstallonly_limit=3\n", encoding="utf-8")
+    for path in (conf, tmp_path / "nu-exista.conf"):
+        sel = _select_with_real_dnf_conf(monkeypatch, path)
+        assert sel.error is None and sel.lots, (path.name, sel.error)
+
+
+@pytest.mark.parametrize("name", ["expat\n", "expat\n--root=/x", " expat", "expat ", "", "-a", "a" * 129])
+def test_a_package_name_must_match_whole_not_up_to_a_trailing_newline(name, monkeypatch):
+    """`$` potrivește și înaintea unui rând nou de la coadă, deci un `match` ar fi acceptat
+    «expat\n». Azi nu e atins (argumentele Telegram sunt tăiate la spații, numele din bază sunt
+    curățate), dar e la un apelant distanță: numele ajunge în argv-ul lui `rpm`, care îl citește ca
+    nume și ce urmează. Trei locuri folosesc regula: argumentul comenzii, citirea gazdei, clasificarea."""
+    assert su.is_package_name(name) is False
+    host = sup.FakeHost(sup.rpm_line("expat", "2.5.0-1.el9") + "\n")
+    sup.install(monkeypatch, host)
+    run(su.read_host("rhel", [name, "expat"]))
+    assert all(name not in argv for argv in host.argvs), host.argvs
+    cand = su.Candidate(package=name, fixed="2-1", finding_ids=[1], kev=False, priority=1,
+                        severity="high", rep_id=1, rep_cve=None, asset_id=None, asset_name=None,
+                        protected=False)
+    sel = su.Selection()
+    su.classify(su.CandidateSet(candidates=[cand]), su.HostRead(), "rhel", sel)
+    assert [h.code for h in sel.held] == ["bad_name"]
+
+
+def test_a_plain_package_name_is_still_a_package_name():
+    """Controlul pozitiv al testului de mai sus: o regulă care ar refuza orice ar trece de el."""
+    assert all(su.is_package_name(n) for n in ("expat", "libstdc++", "python3.9", "perl-URI", "a_b"))
+
+
 def test_the_install_only_query_needs_its_positive_control_on_its_own(monkeypatch):
     """Ieșirea fără controlul pozitiv (`rpm`), dar cu codul și numărul de «no package provides»
     în acord, arată exact ca un `rpm` care a răspuns «nimic nu e install-only» — și e o pană

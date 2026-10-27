@@ -401,6 +401,110 @@ def test_a_package_in_an_open_plan_is_not_offered_again(monkeypatch):
     assert "expat" not in _planned(sel)
 
 
+HTTPD_FAMILY = {"httpd", "httpd-core", "httpd-tools", "httpd-filesystem", "mod_lua"}
+
+
+def _plan_covering(package: str, plan_id: int = 5, status: str = "validated") -> dict:
+    return {"id": plan_id, "status": status,
+            "finding_ids": [r["id"] for r in sup.finding_rows() if r["package"] == package]}
+
+
+def _argv_names(sel) -> set[str]:
+    """Tot ce numește comanda de apply a fiecărui lot, fără steguri."""
+    return {a.split("=")[0] for lot in sel.lots for a in lot.plan["apply"][0]["argv"]
+            if not a.startswith("-") and a not in ("dnf", "update", "apt-get", "install")}
+
+
+def test_a_sibling_covered_by_another_open_plan_holds_its_whole_family(monkeypatch):
+    """`httpd` cere `httpd-core` de aceeași versiune, deci `dnf update httpd ...` îl mută și pe
+    el. Dacă `httpd-core` e deja în planul #5, scos din lot în tăcere, tranzacția celorlalte patru
+    ar muta un pachet fără pin de pregătire, fără pin de revenire și fără verificare — exact
+    «actualizarea pe ascuns» pe care familia indivizibilă există s-o prevină. Familia se reține
+    ÎNTREAGĂ, cu planul care o acoperă numit, iar niciun lot nu mai atinge niciun httpd."""
+    sel = _select(monkeypatch, db=sup.FakeDB(covering=[_plan_covering("httpd-core")]))
+
+    assert ("httpd-core", 5, "validated") in sel.covered
+    assert not HTTPD_FAMILY & _planned(sel), _planned(sel)
+    assert not any(n.startswith(("httpd", "mod_lua")) for n in _argv_names(sel)), _argv_names(sel)
+    held = _held(sel)
+    assert HTTPD_FAMILY <= set(held), "familia nu e reținută întreagă"
+    h = held["httpd"]
+    assert h.code == "covered" and set(h.packages) == HTTPD_FAMILY
+    assert "#5" in h.reason and "validated" in h.reason, h.reason
+    assert "expat" in _planned(sel), "un grup acoperit a golit tot răspunsul"
+
+
+def test_asking_for_one_package_of_a_covered_family_still_says_why_and_names_the_plan(monkeypatch):
+    """`/update httpd` cu `httpd-core` în planul #5: dacă răspunsul ar propune celelalte patru, ar
+    muta `httpd-core` nenumit; dacă ar tăcea despre #5, operatorul n-ar ști încotro să meargă.
+    Răspunsul: niciun lot, familia întreagă reținută, rândul «acoperit» păstrat. La fel când
+    pachetul cerut e chiar cel acoperit."""
+    for asked in ("httpd", "httpd-core", "mod_lua"):
+        sel = _select(monkeypatch, db=sup.FakeDB(covering=[_plan_covering("httpd-core")]), only=asked)
+        assert not sel.lots, (asked, _planned(sel))
+        assert [h.code for h in sel.held] == ["covered"], (asked, sel.held)
+        assert set(sel.held[0].packages) == HTTPD_FAMILY, asked
+        assert sel.covered == [("httpd-core", 5, "validated")], (asked, sel.covered)
+
+
+def test_a_covered_package_with_nothing_to_move_does_not_hold_its_family(monkeypatch):
+    """Contrastul care păstrează regula cinstită: ce contează e dacă `dnf` ar MUTA pachetul. Un
+    `httpd-core` acoperit dar aflat deja la versiunea care repară nu are nimic de instalat, iar
+    unul neinstalat nu are ce fi mutat — familia rămasă se planifică, iar el rămâne vizibil ca
+    acoperit. Reținerea familiei pentru un pachet pe care nimeni nu-l atinge ar ascunde patru
+    reparații fără niciun câștig."""
+    stock = sup.rpm_query_output(kernel=True)
+    fixed = stock.replace(
+        sup.rpm_line("httpd-core", "2.4.50-1.el9", srpm="httpd-2.4.50-1.el9.src.rpm"),
+        sup.rpm_line("httpd-core", "2.4.50-2.el9", srpm="httpd-2.4.50-1.el9.src.rpm"))
+    assert fixed != stock, "fixture-ul n-a schimbat nimic"
+    sel = _select(monkeypatch, db=sup.FakeDB(covering=[_plan_covering("httpd-core")]),
+                  host=sup.FakeHost(fixed))
+    assert ("httpd-core", 5, "validated") in sel.covered
+    assert HTTPD_FAMILY - {"httpd-core"} <= _planned(sel)
+
+    lines = [ln for ln in sup.rpm_query_output(kernel=True).splitlines()
+             if not ln.startswith("httpd-core" + chr(9))]
+    gone = chr(10).join(lines) + chr(10) + "package httpd-core is not installed" + chr(10)
+    sel = _select(monkeypatch, db=sup.FakeDB(covering=[_plan_covering("httpd-core")]),
+                  host=sup.FakeHost(gone))
+    assert sel.error is None
+    assert ("httpd-core", 5, "validated") in sel.covered
+    assert HTTPD_FAMILY - {"httpd-core"} <= _planned(sel)
+
+
+def test_a_protected_sibling_holds_its_whole_family(monkeypatch):
+    """Același mecanism ca la planul acoperit: un `httpd-core` pe un asset protejat nu poate fi
+    numit într-un plan, dar `dnf update httpd` îl mută oricum. Fără reținerea familiei, un
+    asset marcat «nu atinge» ar fi actualizat de o tranzacție care nu-l menționează."""
+    rows = sup.finding_rows()
+    for r in rows:
+        if r["package"] == "httpd-core":
+            r["asset_protected"] = True
+    sel = _select(monkeypatch, db=sup.FakeDB(rows))
+    assert not HTTPD_FAMILY & _planned(sel)
+    assert set(_held(sel)["httpd"].packages) == HTTPD_FAMILY
+    assert _held(sel)["httpd"].code == "protected_asset"
+
+
+def test_classify_takes_the_covering_plans_as_an_argument_and_touches_no_database(monkeypatch):
+    """`classify` promite că e pură în raport cu rețeaua și baza. Planurile care acoperă vin ca
+    argument: o funcție care ar interoga singură ar face grupurile dependente de ora la care
+    se apelează, iar testele ei ar cere o bază."""
+    sup.install(monkeypatch, sup.FakeHost())
+    db = sup.FakeDB()
+    cands = run(su.load_candidates(db, "rhel"))
+    host = run(su.read_host("rhel", [c.package for c in cands.candidates]))
+    ids = [r["id"] for r in sup.finding_rows() if r["package"] == "httpd-core"]
+    sel = su.Selection()
+    groups = su.classify(cands, host, "rhel", sel, {ids[0]: (5, "approved")})
+    assert not any(m.cand.package.startswith("httpd") for ms in groups.values() for m in ms)
+    assert ("httpd-core", 5, "approved") in sel.covered
+    assert "covered" in {h.code for h in sel.held}
+    seen = [sql for sql, _ in db.calls]
+    assert not any("patch_plans" in q for q in seen), "classify a interogat planurile"
+
+
 def test_an_applied_plan_does_not_block_a_new_one(monkeypatch):
     """`applied` nu e în statusurile care blochează: un plan aplicat a cărui constatare a rămas
     deschisă n-a avut efect, iar nimic nu expiră un plan `applied` — blocarea ar face constatarea
@@ -483,6 +587,42 @@ def test_a_debian_name_the_host_does_not_know_is_a_missing_package_not_an_error(
     assert _select(monkeypatch, db=sup.FakeDB(_deb_rows()), host=host2, family="debian").error
 
 
+#: Forma măsurată pe gazda n8n (Ubuntu 24.04): un nucleu dezinstalat al cărui fișier de configurare a
+#: rămas — `dpkg-query -W` îl tipărește totuși, cu coloana de stare `rc`, iar `un` e un pachet
+#: cunoscut dar niciodată instalat. Versiunile din rânduri sunt inventate.
+DEB_REMOVED = ("linux-image-6.8.0-100-generic\t6.8.0-100.100\tamd64\tlinux-signed\trc \n"
+               "oldlib\t1.0-1\tamd64\toldlib\tun \n")
+
+
+def test_a_debian_package_that_is_not_installed_is_not_an_instance():
+    """`dpkg-query -W` listează și pachetele dezinstalate cu configurația rămasă (`rc`) sau doar
+    cunoscute (`un`). Numărate drept instalate, ar primi un `apt-get install pachet=versiune`
+    peste ceva ce nu e pe gazdă — sau, mai rău, ar fi judecate «deja la versiunea care repară»."""
+    installed, missing, error = su.parse_dpkg_query(DEB_OUT + DEB_REMOVED, "")
+    assert error is None
+    assert set(installed) == {"openssl", "libc6", "curl", "linux-image-generic"}
+    assert missing == {"linux-image-6.8.0-100-generic", "oldlib"}
+
+
+def test_a_removed_debian_kernel_is_reported_as_not_installed_not_held_as_a_kernel(monkeypatch):
+    """Pe producția n8n există un `linux-image-...-generic` în starea `rc`. Dacă `select` l-ar socoti
+    instalat, operatorul ar citi «install-only (nucleu)» despre un pachet care nu e pe disc — sau
+    un `oldlib` `un` ar intra într-un plan. Spus corect: «nu e instalat», iar restul se planifică."""
+    def row(i, pkg, fixed):
+        return dict(id=i, package=pkg, cve=None, severity="medium", kev=False, priority=1,
+                    fixed_version=fixed, ecosystem="deb", asset_id=None, asset_name=None,
+                    asset_protected=False, fix_pending_reboot=False)
+    rows = [*_deb_rows(), row(5, "linux-image-6.8.0-100-generic", "6.8.0-101.101"),
+            row(6, "oldlib", "1.0-2")]
+    host = sup.FakeHost(dpkg_out=DEB_OUT + DEB_REMOVED, dpkg_code=0)
+    sel = _select(monkeypatch, db=sup.FakeDB(rows), host=host, family="debian")
+    assert sel.error is None, sel.error
+    held = _held(sel)
+    assert held["linux-image-6.8.0-100-generic"].code == "not_installed"
+    assert held["oldlib"].code == "not_installed"
+    assert _planned(sel) == {"openssl", "libc6", "curl"}
+
+
 # ---------------------------------------------------------------------------
 # Stocarea
 # ---------------------------------------------------------------------------
@@ -545,6 +685,50 @@ def test_reconcile_says_unread_not_unchanged_when_the_host_cannot_be_read(monkey
     assert states == [] and error
 
 
+def test_one_garbled_line_spoils_the_answer_even_when_the_package_has_a_good_line():
+    """Un `rpm -q` cu o linie ruptă la un pachet care MAI ARE o linie bună (nucleele se instalează
+    în paralel) nu e un răspuns incomplet pe care să-l treacem cu vederea. Sărită în tăcere, linia
+    ruptă — de obicei cea mai nouă instanță — face ca „cea mai nouă" să fie alta, iar planul spune
+    «neschimbat» sau «reparația nu e pe disc» despre un pachet care o are. Verificarea „fiecare nume
+    cerut a primit un răspuns" NU o prinde: numele a primit un răspuns, cel bun. Doar parserul o
+    prinde."""
+    good = sup.rpm_line("kernel-core", "5.14.0-100.1.el9", srpm="kernel-5.14.0-100.1.el9.src.rpm")
+    garbled = "kernel-core\t(none):5.14.0-100.9.el9\tx86_64"      # tăiat: lipsește SOURCERPM
+    installed, missing, error = su.parse_rpm_query(good + "\n" + garbled + "\n")
+    assert error and "linia 2" in error
+    assert installed == {} and missing == set(), "o parte din răspuns nu se folosește"
+    # Control pozitiv: aceleași două linii, a doua întreagă, se parsează.
+    whole = sup.rpm_line("kernel-core", "5.14.0-100.9.el9", srpm="kernel-5.14.0-100.9.el9.src.rpm")
+    installed, _missing, error = su.parse_rpm_query(good + "\n" + whole + "\n")
+    assert error is None and len(installed["kernel-core"]) == 2
+
+
+def test_select_will_not_guess_the_newest_kernel_when_one_instance_line_is_garbled(monkeypatch):
+    """Același defect, prin `select`: a treia instanță de nucleu vine ruptă. Fără eroare, nucleul
+    ar fi judecat după primele două (mai vechi decât reparația), și răspunsul ar fi un motiv
+    de reținere fals în loc de «nu pot citi starea»."""
+    out = sup.rpm_query_output().splitlines()
+    idx = max(i for i, ln in enumerate(out) if ln.startswith("kernel-core\t"))
+    out[idx] = out[idx].rsplit("\t", 1)[0]                        # a treia instanță, fără SOURCERPM
+    sel = _select(monkeypatch, host=sup.FakeHost("\n".join(out) + "\n"))
+    assert sel.error and "linia" in sel.error and "nu pot" in sel.error, sel.error
+    assert not sel.lots and not sel.held and not sel.already
+
+
+def test_reconcile_will_not_call_a_package_unchanged_from_a_partly_garbled_answer(monkeypatch):
+    """După rulare, «neschimbat» îi spune operatorului că nu e nimic de restaurat. Dacă instanța
+    nouă a unui pachet vine ruptă și e sărită, rămâne doar cea veche — adică exact «neschimbat»,
+    despre un pachet pe care tranzacția l-a instalat."""
+    plan = _plan_for_reconcile(monkeypatch)
+    meta = plan["update"]["packages"][0]
+    lines = [sup.rpm_line(p["name"], p["target"]) for p in plan["update"]["packages"][1:]]
+    lines += [sup.rpm_line(meta["name"], meta["before"]),
+              f"{meta['name']}\t(none):{meta['target']}\tx86_64"]       # instanța nouă, ruptă
+    sup.install(monkeypatch, sup.FakeHost("\n".join(lines) + "\n"))
+    states, error = run(su.reconcile(plan, "rhel"))
+    assert error and states == []
+
+
 def test_detections_during_groups_by_rule_and_names_the_processes():
     """Un update își declanșează detectorii (`unit_change`: rpm scrie fișiere de unitate). Nu se
     suprimă nimic — se atribuie, ca operatorul să vadă că alerta coincide cu tranzacția."""
@@ -564,6 +748,28 @@ def test_detections_during_groups_by_rule_and_names_the_processes():
     assert by["intrusion.module_load"]["count"] == 1
     sql, args = [c for c in db.calls if "FROM detections" in c[0]][0]
     assert args == (t, t + dt.timedelta(minutes=3)), "fereastra nu e cea a execuției"
+
+
+def test_no_detections_and_no_window_to_look_in_are_not_the_same_answer():
+    """`[]` și «n-am avut unde să caut» arătau la fel în mesajul de după rulare: nimic. Pentru un
+    operator care se uită după urma tranzacției în alerte, tăcerea înseamnă «curat» — și e
+    adevărată doar în primul caz. Un rând de execuție lipsă sau fără oră de început nu e
+    «nicio detecție»: se ridică, iar apelantul spune că n-a putut citi."""
+    import datetime as dt
+    t = dt.datetime(2026, 10, 26, 10, 0, tzinfo=dt.timezone.utc)
+    # Control pozitiv: fereastră reală, nicio detecție -> listă goală, fără eroare.
+    looked = sup.FakeDB(execution={"started_at": t, "finished_at": t + dt.timedelta(minutes=3)})
+    assert run(su.detections_during(looked, 5)) == []
+    assert [c for c in looked.calls if "FROM detections" in c[0]], "n-a căutat deloc"
+
+    missing = sup.FakeDB(execution=None)
+    with pytest.raises(su.NoExecutionWindow, match="#5"):
+        run(su.detections_during(missing, 5))
+    unstarted = sup.FakeDB(execution={"started_at": None, "finished_at": None})
+    with pytest.raises(su.NoExecutionWindow, match="#5"):
+        run(su.detections_during(unstarted, 5))
+    assert not [c for c in missing.calls + unstarted.calls if "FROM detections" in c[0]], \
+        "a căutat într-o fereastră inventată"
 
 
 def test_category_counts_use_the_same_classification_as_the_vulnerability_page():

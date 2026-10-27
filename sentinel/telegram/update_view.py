@@ -37,6 +37,7 @@ HELD_LABELS: dict[str, str] = {
     "too_big": "nu încape într-un plan",
     "not_installed": "nu e instalat",
     "protected_asset": "asset protejat",
+    "covered": "un membru al grupului e deja într-un plan deschis",
     "bad_name": "nume neacceptat",
     "foreign": "nu e un pachet al gazdei",
 }
@@ -79,8 +80,9 @@ def held_lines(held: list[su.Held]) -> list[str]:
     for h in held:
         label = HELD_LABELS.get(h.code, h.code)
         line = f"• {_names(h.packages)} — {_esc(label)}"
-        # Mesajul validatorului e ce nu se poate ghici din cod: se arată.
-        if h.code == "validator":
+        # Mesajul validatorului e ce nu se poate ghici din cod: se arată. La fel planul care
+        # acoperă deja un membru: operatorul trebuie să știe ce plan să deschidă.
+        if h.code in ("validator", "covered"):
             line += f"\n   <i>{_esc(h.reason[:300])}</i>"
         out.append(line)
     return out
@@ -252,7 +254,16 @@ def addendum(states: list[su.PkgState], status: str, *, read_error: str | None,
 
     if detections_error is not None:
         tail.append(f"🔔 Nu am putut citi detecțiile din timpul execuției: {_esc(detections_error)}.")
-    elif detections:
+    elif detections is None:
+        # Nici răspuns, nici eroare: nu s-a căutat. Tăcerea s-ar citi ca «nu a apărut nimic».
+        tail.append("🔔 Detecțiile din timpul execuției nu au fost citite, deci nu pot spune dacă a "
+                    "apărut ceva.")
+    elif not detections:
+        # «Am căutat și n-am găsit» e o afirmație, nu o lipsă: se spune, cu limitele ei. Fereastra
+        # se citește la momentul răspunsului; un detector care raportează mai târziu nu apare aici.
+        tail.append("🔔 Nicio detecție gravă (intrusion, high/critical) în fereastra execuției, la "
+                    "momentul citirii. Un detector care raportează cu întârziere nu e inclus.")
+    else:
         total = sum(int(d.get("count", 0)) for d in detections)
         parts = []
         for d in detections[:5]:

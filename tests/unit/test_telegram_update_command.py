@@ -243,6 +243,20 @@ def test_a_package_argument_narrows_the_selection(monkeypatch):
     assert [p["name"] for p in w.stored[0]["plan"]["update"]["packages"]] == ["expat"]
 
 
+def test_a_covered_family_tells_the_operator_which_plan_to_open(monkeypatch):
+    """`/update httpd` cu `httpd-core` în planul #5: nu se propune nimic (celelalte patru l-ar
+    muta pe `httpd-core` nenumit), iar mesajul trebuie să spună ÎNCOTRO să meargă operatorul —
+    altfel «reținut» e un zid fără ușă."""
+    covering = [{"id": 5, "status": "validated",
+                 "finding_ids": [r["id"] for r in sup.finding_rows() if r["package"] == "httpd-core"]}]
+    db = sup.FakeDB(covering=covering, scanners=[{"scanner": "dnf", "n": 10, "with_fix": 10}])
+    w = World(monkeypatch, db=db)
+    text = w.command("httpd")[0]
+    assert w.stored == [] and w.offered == []
+    assert "vezi /patch 5" in text, text
+    assert "httpd-core" in text and "validated" in text
+
+
 def test_nothing_to_propose_says_why_instead_of_staying_silent(monkeypatch):
     """Un răspuns gol ar fi citit ca «nu e nimic de făcut». Aici nu e nimic de PROPUS, iar motivul
     (nucleul e install-only) trebuie să fie în mesaj."""
@@ -376,6 +390,26 @@ def test_the_plan_message_lists_the_packages_and_what_is_not_checked(monkeypatch
     assert "nedovedit" in text and "Reversibil: da" not in text
 
 
+def test_the_update_block_sits_between_the_vulnerabilities_and_the_risk_lines(monkeypatch):
+    """`format_plan` pune blocul de update la un indice fix al listei de rânduri. Dacă cineva adaugă
+    sau scoate un rând de antet, blocul ar aluneca — în mijlocul antetului, sau sub rândurile de
+    risc pe care le înlocuiește — și mesajul pe care se decide ar arăta bine la prima vedere.
+    Ordinea: antet, țintă, vulnerabilități, rând gol, blocul, rând gol, riscul, pașii."""
+    lines = patch_flow.format_plan(_row(_lot_plan(monkeypatch))).split("\n")
+
+    def at(prefix: str) -> int:
+        found = [i for i, ln in enumerate(lines) if ln.startswith(prefix)]
+        assert len(found) == 1, (prefix, found)
+        return found[0]
+
+    vulns, block, alerts = at("<b>Vulnerabilități:</b>"), at("📦 <b>Actualizare de sistem</b>"), at("🔔")
+    downtime, impact, steps = at("⏱️"), at("💥"), at("Pași:")
+    assert at("<b>Țintă:</b>") < vulns
+    assert block == vulns + 2 and lines[vulns + 1] == "", "blocul nu urmează imediat după vulnerabilități"
+    assert lines[alerts + 1] == "" and downtime == alerts + 2, "riscul nu urmează blocului"
+    assert downtime < impact < steps == len(lines) - 1
+
+
 # ---------------------------------------------------------------------------
 # După rulare
 # ---------------------------------------------------------------------------
@@ -474,6 +508,45 @@ def test_detections_that_the_update_triggered_are_attributed_not_suppressed(monk
                      "processes": ["/usr/bin/python3.9"], "count": 3}])
     assert "persistence.unit_change ×3" in text and "python3.9" in text
     assert "nu le-a suprimat" in text
+
+
+def test_the_result_says_whether_it_looked_for_detections_and_found_none(monkeypatch):
+    """Trei stări diferite, trei texte: «am căutat, nimic» (listă goală), «nu am putut căuta» (eroare)
+    și «nu am căutat» (nici listă, nici eroare). Dacă primele două ar tăcea, absența unui rând ar
+    însemna ori «curat», ori «n-am văzut» — iar operatorul n-ar avea cum să le deosebească."""
+    plan = _lot_plan(monkeypatch)
+    states = _states(plan, su.STATE_TARGET)
+    none_found = _result_text(monkeypatch, plan, "succeeded", states=states, detections=[])
+    assert "Nicio detecție gravă" in none_found and "Nu am putut citi detecțiile" not in none_found
+
+    could_not = _result_text(monkeypatch, plan, "succeeded", states=states, detections_error="x")
+    assert "Nu am putut citi detecțiile" in could_not and "Nicio detecție gravă" not in could_not
+
+    not_looked = update_view.addendum(states, "succeeded", read_error=None, detections=None)
+    assert "nu au fost citite" in not_looked and "Nicio detecție gravă" not in not_looked
+
+    found = _result_text(monkeypatch, plan, "succeeded", states=states, detections=[
+        {"rule_id": "intrusion.module_load", "severity": "critical", "processes": [], "count": 1}])
+    assert "Nicio detecție gravă" not in found and "1 detecții grave" in found
+
+
+def test_a_missing_execution_row_reaches_the_operator_as_could_not_read(monkeypatch):
+    """Prin `patch_flow`, cu `detections_during` REAL: o execuție fără rând în bază trebuie să
+    ajungă în mesaj ca «nu am putut citi», nu ca absență."""
+    plan = _lot_plan(monkeypatch)
+    row = _row(plan)
+
+    async def get_plan(db, plan_id):
+        return row
+
+    async def reconcile(plan_, family):
+        return _states(plan, su.STATE_TARGET), None
+
+    monkeypatch.setattr(patch_repo, "get_plan", get_plan)
+    monkeypatch.setattr(su, "reconcile", reconcile)
+    text = run(patch_flow._result_text(sup.FakeDB(execution=None), sup.cfg(), 7, _result("succeeded")))
+    assert "Nu am putut citi detecțiile" in text and "niciun rând" in text
+    assert "Nicio detecție gravă" not in text
 
 
 def test_the_result_always_fits_in_one_telegram_message(monkeypatch):

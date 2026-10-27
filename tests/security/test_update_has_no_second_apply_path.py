@@ -79,15 +79,71 @@ def test_the_update_modules_import_nothing_that_talks_to_the_executor():
         assert not bad, f"{path.name} importă {sorted(bad)}"
 
 
+def _module_uses(tree: ast.Module, base: str) -> tuple[set[str], set[str]]:
+    """(nume luate din modulul `base`, atribute folosite pe el) — pe TOATE formele de import.
+
+    `from sentinel.patch import checks` + `checks.evaluate` e forma pe care o folosește codul azi;
+    `from sentinel.patch.checks import evaluate` (cu sau fără alias) și
+    `from sentinel.patch import checks as ck` + `ck.evaluate` sunt aceleași nume luate pe altă
+    ușă. O gardă care vedea doar prima formă lăsa a doua să treacă: `evaluate` rulează comenzi ca
+    root, iar `register` înregistrează o aprobare."""
+    taken: set[str] = set()
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module == f"sentinel.patch.{base}" or (node.level and module == base):
+                taken |= {a.name for a in node.names}          # `*` rămâne `*`: nu e în nicio listă
+            elif module == "sentinel.patch" or (node.level and module == ""):
+                aliases |= {a.asname or a.name for a in node.names if a.name == base}
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == f"sentinel.patch.{base}":
+                    aliases.add(a.asname or a.name)
+    aliases.add(base)
+    attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute) and (
+        (isinstance(n.value, ast.Name) and n.value.id in aliases)
+        or (isinstance(n.value, ast.Attribute) and n.value.attr == base))}
+    return taken, attrs
+
+
 def test_the_update_modules_use_only_the_pure_parts_of_approval_and_checks():
     """`approval` are `challenge` și `register` (care vorbesc cu executorul), `checks` are `evaluate`
     (care rulează comenzi ca root). Planificatorul are nevoie doar de cele pure: dimensiunea
-    cererii și comparațiile de versiuni."""
+    cererii și comparațiile de versiuni. Garda se uită la ORICE formă de import, nu doar la
+    `approval.X`: `from sentinel.patch.checks import evaluate` ar fi trecut."""
     tree = _tree(SYSTEM_UPDATE)
     for base, allowed in ALLOWED_ATTRS.items():
-        used = _attrs_on(tree, base)
+        if base == "repo":
+            continue
+        taken, used = _module_uses(tree, base)
         assert used, f"nu se mai folosește `{base}` — garda nu mai vede nimic"
         assert used <= allowed, f"system_update.py cheamă {base}.{sorted(used - allowed)}"
+        assert taken <= allowed, f"system_update.py importă din {base}: {sorted(taken - allowed)}"
+
+
+def test_the_import_guard_sees_every_door_into_approval_and_checks():
+    """Garda de mai sus e doar atât de bună cât forma de import pe care o recunoaște. Fiecare formă
+    prin care `evaluate` sau `register` ar putea intra trebuie să iasă în afara listei permise —
+    altfel un import scris altfel ar ocoli poarta cu două atingeri fără ca vreun test să roșească."""
+    doors = {
+        "from sentinel.patch.checks import evaluate": ("checks", {"evaluate"}, set()),
+        "from sentinel.patch.checks import evaluate as run_it": ("checks", {"evaluate"}, set()),
+        "from sentinel.patch.approval import register": ("approval", {"register"}, set()),
+        "from sentinel.patch.approval import *": ("approval", {"*"}, set()),
+        "from sentinel.patch import checks as ck\nck.evaluate()": ("checks", set(), {"evaluate"}),
+        "import sentinel.patch.approval as ap\nap.register()": ("approval", set(), {"register"}),
+        "import sentinel.patch.checks\nsentinel.patch.checks.evaluate()": ("checks", set(), {"evaluate"}),
+        "from sentinel.patch import approval\napproval.challenge()": ("approval", set(), {"challenge"}),
+    }
+    for source, (base, want_taken, want_used) in doors.items():
+        taken, used = _module_uses(ast.parse(source), base)
+        assert (taken, used) == (want_taken, want_used), (source, taken, used)
+        assert not (taken | used) <= ALLOWED_ATTRS[base], f"{source!r} ar trece garda"
+    # Și formele permise rămân permise: garda nu poate fi atât de strictă încât să fie ștearsă.
+    taken, used = _module_uses(ast.parse("from sentinel.patch import checks\nchecks._rpm_evr_cmp(1, 2)"),
+                               "checks")
+    assert (taken | used) <= ALLOWED_ATTRS["checks"] and used == {"_rpm_evr_cmp"}
 
 
 def test_the_only_commands_system_update_runs_itself_are_read_only_queries():

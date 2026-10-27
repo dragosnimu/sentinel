@@ -315,7 +315,10 @@ Ce vezi, în ordine:
 2. **Ce se reține, cu motiv**: nucleul (install-only: `downgrade` adaugă lângă cel nou, deci
    n-are cale de întoarcere), familia `openssh` (`docs/PATCHING.md` §8), un pachet al cărui
    epoch diferă între instalat și reparație (alt depozit sau altă serie), orice nume pe care
-   validatorul sau executorul l-ar refuza. Nimic nu dispare tăcut.
+   validatorul sau executorul l-ar refuza. Un membru al unei familii care e deja într-un plan
+   deschis (sau pe un asset protejat) reține **familia întreagă**: ceilalți l-ar muta oricum prin
+   dependențe, fără pin de revenire și fără verificare. Motivul numește planul (`/patch <id>`).
+   Nimic nu dispare tăcut.
 3. **Rezultatul**, după rulare: starea pachetelor **citită de pe gazdă** (`rpm -q`), nu doar
    codul executorului. Cuvântul e «instalat», niciodată «actualizat»: `rpm` dovedește că
    versiunea e pe disc, nu că procesele o rulează. Pachetele din `REBOOT_REQUIRED_PACKAGES`
@@ -330,6 +333,14 @@ de securitate (vezi `system_update.detections_during`), iar decizia e a operator
 
 Fără argument comanda e pentru orice chat autorizat; cu argument cere rol de **operator sau
 owner**.
+
+Mențiunea botului: `/update` e în tabelul `ACTING`, iar tot ce e acolo trece prin
+`_require_mention_in_group` (§8) — **inclusiv privirea de ansamblu, fără argument**, care doar
+citește. Într-un grup (în producție, singurul chat permis) `/update` fără `@bot` e refuzat cu
+mesajul de mențiune; trebuie scris `/update@<botul_tău>`, cu sau fără argument. Într-un chat
+privat nu se cere nimic. E o consecință a tabelului în care stă comanda, nu o decizie luată pentru
+varianta fără argument: dacă ea ar trebui să răspundă și fără mențiune, comanda ar trebui
+despărțită în două intrări (una `READ_ONLY`, una `ACTING`).
 
 ---
 
