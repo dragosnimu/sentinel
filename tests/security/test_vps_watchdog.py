@@ -160,15 +160,17 @@ class Host:
         _stub(b, "docker",
               'case "$1" in\n'
               '  info) exit "${FAKE_DOCKER_INFO_RC:-0}" ;;\n'
-              '  ps) cut -d"|" -f1 "$CONTAINERS" ;;\n'
-              '  restart) echo "$2" >> "$CALLS/restarts.log"; exit 0 ;;\n'
+              '  ps) [ -n "${FAKE_DOCKER_PS_FAIL:-}" ] && { echo "docker: ps failed" >&2; exit 1; }\n'
+              '      cut -d"|" -f1 "$CONTAINERS" ;;\n'
+              '  restart) echo "$2" >> "$CALLS/restarts.log"; exit "${FAKE_RESTART_RC:-0}" ;;\n'
               '  inspect)\n'
               '    echo "$*" >> "$CALLS/docker-inspect.log"\n'
               '    case "$3" in "{{.Name}}") cat >/dev/null; n=$(grep "^$4|" "$IDS" | cut -d"|" -f2-); [ -n "$n" ] || exit 1\n'
               '                          echo "/$n"; exit 0 ;; esac\n'
               '    line=$(grep "^$4|" "$CONTAINERS") || exit 1\n'
-              '    IFS="|" read -r _n pol status health <<< "$line"\n'
+              '    IFS="|" read -r _n pol status health cid <<< "$line"\n'
               '    case "$3" in\n'
+              '      "{{.Id}}")       echo "${cid:-id-$_n}" ;;\n'
               '      *RestartPolicy*) echo "$pol" ;;\n'
               '      *State.Health*)  echo "$health" ;;\n'
               '      *State.Status*)  echo "$status" ;;\n'
@@ -244,6 +246,8 @@ class Host:
         self.conf.write_text(text, encoding="utf-8")
 
     def set_containers(self, rows: list[str]) -> None:
+        """Randuri `nume|politica|stare|health[|id]`. Fara id, containerul are `id-<nume>`: un id
+        STABIL pe nume, deci doua apeluri cu acelasi nume descriu acelasi container."""
         self.containers.write_text("".join(r + "\n" for r in rows), encoding="utf-8")
 
     def set_ids(self, names: dict[str, str]) -> None:
@@ -729,9 +733,22 @@ def test_docker_info_is_bounded_by_a_timeout(host):
     assert any(l.split()[:3] == ["20", "docker", "info"] for l in r.timeout_calls), r.timeout_calls
 
 
+def _worked(host, *rows: str) -> Run:
+    """Containerele functioneaza si watchdog-ul le VEDE asa: o rulare reala cu randurile OK
+    (`running` + `healthy`, sau `running` fara healthcheck). Asa se obtine observatia care deschide
+    auto-remedierea (sectiunea 7 din antet) - nu scriind de mana fisierul ei. Si un martor: o rulare
+    cu containere sanatoase nu are voie sa spuna nimic."""
+    host.set_containers(list(rows))
+    r = host.run()
+    assert r.returncode == 0, r.stderr
+    assert r.msgs == [] and r.restarts == [], (r.msgs, r.restarts)
+    return r
+
+
 def test_an_unhealthy_container_is_restarted_only_on_the_second_consecutive_run(host):
-    """Auto-remedierea (neschimbata de aceasta schimbare): un container unhealthy
-    cere doua rulari consecutive inainte sa fie repornit."""
+    """Auto-remedierea (neschimbata de sectiunea 7): un container care a functionat si acum e
+    unhealthy cere doua rulari consecutive inainte sa fie repornit."""
+    _worked(host, "api|unless-stopped|running|healthy")
     host.set_containers(["api|unless-stopped|running|unhealthy"])
     first = host.run()
     assert first.restarts == [] and any("urmaresc" in m for m in first.msgs), first.msgs
@@ -742,7 +759,10 @@ def test_an_unhealthy_container_is_restarted_only_on_the_second_consecutive_run(
 
 def test_the_excluded_container_is_never_restarted(host):
     """`root-app-1` e exclus din auto-remediere (implicitul livrat, ca pe gazda
-    de dinaintea schimbarii): se semnaleaza, nu se reporneste."""
+    de dinaintea schimbarii): se semnaleaza, nu se reporneste. A functionat inainte (altfel
+    regula "nevazut niciodata OK" l-ar tine nerepornit si fara exclusiune, iar testul n-ar mai
+    dovedi exclusiunea)."""
+    _worked(host, "root-app-1|always|running|")
     host.set_containers(["root-app-1|always|exited|"])
     for _ in range(3):
         r = host.run()
@@ -754,7 +774,8 @@ def test_the_exclusion_list_comes_from_the_conf(host):
     """Lista de containere excluse e a gazdei, nu a scriptului: din conf, `api`
     ramane nerepornit, iar implicitul (`root-app-1`) nu mai conteaza. Un conf
     ignorat ar reporni exact containerul pe care operatorul a cerut sa nu fie
-    atins."""
+    atins. Ambele au functionat inainte: altfel `root-app-1` n-ar fi repornit din alt motiv."""
+    _worked(host, "api|always|running|", "root-app-1|always|running|")
     host.set_containers(["api|always|exited|", "root-app-1|always|exited|"])
     host.write_conf('EXCLUDE_AUTOFIX="api"\n')
     r = host.run()
@@ -763,7 +784,9 @@ def test_the_exclusion_list_comes_from_the_conf(host):
 
 
 def test_auto_fix_can_be_switched_off_from_the_conf(host):
-    """AUTO_FIX=0 din conf: containerul cazut se semnaleaza, nu se reporneste."""
+    """AUTO_FIX=0 din conf: containerul cazut se semnaleaza, nu se reporneste. A functionat
+    inainte, ca refuzul sa vina din conf si nu din regula "nevazut niciodata OK"."""
+    _worked(host, "api|always|running|")
     host.set_containers(["api|always|exited|"])
     host.write_conf("AUTO_FIX=0\n")
     r = host.run()
@@ -772,7 +795,9 @@ def test_auto_fix_can_be_switched_off_from_the_conf(host):
 
 
 def test_a_crash_looping_container_is_reported_never_restarted(host):
-    """Auto-fix nu reporneste un crash-loop: ar masca cauza."""
+    """Auto-fix nu reporneste un crash-loop: ar masca cauza. A functionat inainte, ca refuzul sa
+    vina din `restarting` si nu din regula "nevazut niciodata OK"."""
+    _worked(host, "worker|always|running|")
     host.set_containers(["worker|always|restarting|"])
     r = host.run()
     assert r.restarts == []
@@ -781,11 +806,20 @@ def test_a_crash_looping_container_is_reported_never_restarted(host):
 
 def test_auto_fix_gives_up_after_max_fix_restarts(host):
     """Dupa MAX_FIX=3 reporniri esuate, auto-fix se dezactiveaza si cere
-    interventie manuala - nu reporneste la nesfarsit."""
+    interventie manuala - nu reporneste la nesfarsit. Containerul a functionat inainte (altfel
+    n-ar fi repornit deloc, iar `[1, 1, 1, 0, 0]` nu s-ar fi putut intampla).
+    Si dezactivarea se spune O DATA: dupa ea containerul ramane o problema raportata
+    (`ctr:db:disabled`), nu un "DEZACTIVAT" retrimis in fiecare minut (fara `.disabled` verificat,
+    operatorul ar primi mesajul la fiecare rulare, in loc de unul)."""
+    _worked(host, "db|always|running|")
     host.set_containers(["db|always|exited|"])
-    restarts = [len(host.run().restarts) for _ in range(5)]
+    runs = [host.run() for _ in range(5)]
+    restarts = [len(r.restarts) for r in runs]
     assert restarts == [1, 1, 1, 0, 0], restarts
     assert (host.state / "fix" / "db.disabled").exists()
+    assert [any("DEZACTIVAT" in m for m in r.msgs) for r in runs] == [False, False, False, True, False], \
+        [r.msgs for r in runs]
+    assert any(l.startswith("ctr:db:disabled|") for l in runs[-1].state_lines), runs[-1].state_lines
 
 
 def test_the_first_ever_run_announces_the_baseline_and_restarts_nothing(host):
@@ -797,6 +831,282 @@ def test_the_first_ever_run_announces_the_baseline_and_restarts_nothing(host):
     assert r.restarts == []
     assert len(r.msgs) == 1 and "watchdog" in r.msgs[0] and "Disk / la 95%" in r.msgs[0]
     assert "problema noua" not in r.msgs[0] and (host.state / ".seeded").exists()
+
+
+# ===========================================================================
+# G. Auto-remedierea: nevazut niciodata functionand, si strangerea starii
+#    (sectiunea 7 din antetul scriptului)
+# ===========================================================================
+#
+# Forma pe care `docker compose up` o da containerului OPRIT cand il recreeaza: `<id12>_<nume>`.
+# Masurat pe gazda pe 26 oct 2026 (oprire 11:07:57.058, container nou in retea la 11:07:57.732).
+RENAMED = "4f9a1c0b7d3e_app"
+HEALTHY = "|unless-stopped|running|healthy"
+
+
+def _fix(host) -> list[str]:
+    """Ce a ramas in fix/ (numele fisierelor), ordonat."""
+    d = host.state / "fix"
+    return sorted(p.name for p in d.iterdir()) if d.is_dir() else []
+
+
+def _remediation_msgs(r: Run) -> list[str]:
+    return [m for m in r.msgs if "auto-remediere" in m]
+
+
+def test_the_container_a_delivery_renamed_and_stopped_is_not_brought_back(host):
+    """Un nume nevazut OK nu se reporneste nici cand ii cunoastem id-ul, iar un succesor cu nume
+    cunoscut nu se reporneste cat timp e `starting`.
+
+    Esecul pe care il previne: operatorul primeste "auto-remediere ... ESEC" pe un container pe care o
+    livrare il manevreaza, si - daca repornirea reuseste - watchdog-ul calca peste pasii livrarii.
+
+    ATENTIE la ce NU e asta. Perechea de aici (nume temporar cu id VECHI, oprit; succesor cu id nou)
+    nu e forma reala a incidentului din 26 oct 2026. Ordinea adevarata a lui `docker compose up`,
+    citita din `planRecreateContainer` din `pkg/compose` la v5.6.0 si masurata pe gazda (noul creat cu 72 ms INAINTE
+    de oprirea vechiului), e: creeaza noul sub numele temporar `<id12 al VECHIULUI>_<nume>`, opreste
+    vechiul, sterge vechiul, redenumeste noul. Deci containerul cu nume temporar e cel NOU, in stare
+    `created` si cu id NOU - forma acoperita de
+    `test_only_a_running_healthy_observation_lets_auto_fix_act[created]`. Testul de aici pastreaza
+    perechea pe care o fixeaza regula nume+id, nu cronologia livrarii; vezi sectiunea 7 din antetul
+    scriptului pentru fereastra care RAMANE deschisa (vechiul `exited` sub numele lui)."""
+    _worked(host, "app" + HEALTHY + "|id-old")
+    host.set_containers([f"{RENAMED}|unless-stopped|exited||id-old",
+                         "app|unless-stopped|running|starting|id-new"])
+    window = host.run()
+    assert window.returncode == 0, window.stderr
+    assert window.restarts == [], f"a repornit ce livrarea sterge: {window.restarts}"
+    assert window.msgs == [], window.msgs
+    # Livrarea s-a terminat: vechiul a fost sters, noul e sanatos.
+    host.set_containers(["app" + HEALTHY + "|id-new"])
+    after = host.run()
+    assert after.restarts == [] and after.msgs == [], (after.restarts, after.msgs)
+    assert not [n for n in _fix(host) if n.startswith(RENAMED)], _fix(host)
+    assert (host.state / "fix" / "app.seenok").read_text(encoding="utf-8").strip() == "id-new"
+
+
+@pytest.mark.parametrize("ok_row", ["svc|unless-stopped|running|healthy", "svc|unless-stopped|running|"],
+                         ids=["healthy", "no_healthcheck"])
+def test_a_container_that_worked_and_then_stopped_is_still_restarted_at_once(host, ok_row):
+    """Reparatia cazului pentru care exista auto-fix: un container care MERGEA (healthy, sau `running`
+    fara healthcheck) si s-a oprit se reporneste la prima observatie, ca inainte. Daca regula "vazut OK"
+    ar fi inchisa prea strans, o cadere reala nu s-ar mai repara singura si operatorul ar afla tarziu."""
+    _worked(host, ok_row)
+    host.set_containers(["svc|unless-stopped|exited|"])
+    r = host.run()
+    assert r.restarts == ["svc"], r.restarts
+    assert any("auto-remediere" in m and "(1/3" in m for m in r.msgs), r.msgs
+
+
+def test_a_container_recreated_under_the_same_name_must_be_seen_working_again(host):
+    """Un container nou sub ACELASI nume (recreat de o livrare: alt id) nu mosteneste increderea
+    predecesorului. Fara id in observatie, un succesor care cade la pornire ar fi repornit pe baza unui
+    OK al altui container - exact "remediez ce n-am vazut functionand", doar cu numele stabil. Dupa ce
+    a fost vazut OK el insusi, se repara ca oricare."""
+    _worked(host, "app" + HEALTHY + "|id-old")
+    host.set_containers(["app|unless-stopped|exited||id-new"])
+    for _ in range(3):
+        r = host.run()
+        assert r.restarts == [], f"succesorul nevazut a fost repornit: {r.restarts}"
+    host.set_containers(["app" + HEALTHY + "|id-new"])      # (nu `_worked`: alerta "nevazut" e deschisa)
+    assert host.run().restarts == []
+    host.set_containers(["app|unless-stopped|exited||id-new"])
+    assert host.run().restarts == ["app"]
+
+
+@pytest.mark.parametrize("never_ok", ["running|unhealthy", "running|starting", "created|", "exited|"])
+def test_only_a_running_healthy_observation_opens_auto_remediation(host, never_ok):
+    """Un container care n-a fost niciodata `running` + `healthy` (sau fara healthcheck) nu se
+    reporneste, oricum ar arata de rau: nici unhealthy de la pornire (streak-ul de doua rulari ar fi
+    repornit si pe el), nici `starting`, nici `created`, nici `exited`. Si dupa ce ajunge `exited`
+    ramane nerepornit - starea in care l-am vazut cel mai des nu e dovada ca a mers."""
+    host.set_containers([f"svc|unless-stopped|{never_ok}"])
+    for _ in range(3):
+        r = host.run()
+        assert r.restarts == [], f"a repornit un container nevazut OK ({never_ok}): {r.restarts}"
+        assert not _remediation_msgs(r), r.msgs
+        # "Urmaresc; repornesc daca persista" ar fi o promisiune pe care regula nu o tine.
+        assert not any("urmaresc" in m for m in r.msgs), r.msgs
+    host.set_containers(["svc|unless-stopped|exited|"])
+    assert host.run().restarts == []
+
+
+def test_a_container_in_its_health_grace_period_is_waited_for_not_restarted(host):
+    """`running` + `starting` e perioada de gratie de dupa pornire: un container care A functionat si
+    acum se reporneste singur (docker, sau o livrare) nu are voie sa fie atins cat healthcheck-ul inca
+    nu s-a pronuntat. Fara asta, fiecare repornire normala ar primi un `docker restart` peste ea si ar
+    reincepe gratia la nesfarsit - exact ce face un container sa nu ajunga niciodata healthy. Containerul
+    a fost vazut OK, ca refuzul sa vina din PENDING si nu din regula "nevazut niciodata OK"."""
+    _worked(host, "svc" + HEALTHY)
+    host.set_containers(["svc|unless-stopped|running|starting"])
+    for _ in range(4):
+        r = host.run()
+        assert r.restarts == [] and r.msgs == [], (r.restarts, r.msgs)
+
+
+def test_a_container_that_cannot_be_identified_is_not_trusted_either_way(host):
+    """Id ilizibil (docker inspect nu da un id de forma cunoscuta) inseamna "nu stiu": nu se inregistreaza
+    ca observatie OK si nu deschide remedierea. "Nu pot citi" nu e "e bine" - un id necitit tratat ca
+    egal cu orice altul ar repune exact fereastra din care s-a pornit."""
+    _worked(host, "svc" + HEALTHY + "|not an id")
+    assert "svc.seenok" not in _fix(host), _fix(host)
+    host.set_containers(["svc|unless-stopped|exited||not an id"])
+    assert host.run().restarts == []
+
+
+def test_a_broken_container_never_seen_working_is_reported_after_two_runs_not_restarted(host):
+    """Ce primeste operatorul pentru un container nevazut niciodata functionand (container nou care n-a
+    trecut de healthcheck, sau starea watchdog-ului pierduta): NU o repornire, ci o problema raportata,
+    ca "nu repornesc" sa nu devina tacere. Abia a doua rulare consecutiva o raporteaza - prima poate fi
+    fereastra unei livrari, iar un mesaj nou + unul rezolvat pe fiecare livrare ar fi alarma falsa
+    care invata operatorul sa nu mai citeasca. Se inchide singura cand revine OK."""
+    host.set_containers(["svc|unless-stopped|exited|"])
+    first = host.run()
+    assert first.restarts == [] and first.msgs == [] and first.state_lines == [], (first.msgs, first.state_lines)
+    second = host.run()
+    assert second.restarts == []
+    assert any(l.startswith("ctr:svc:unseen|") for l in second.state_lines), second.state_lines
+    assert len(second.msgs) == 1 and "problema noua" in second.msgs[0] and "niciodata functionand" in second.msgs[0]
+    third = host.run()
+    assert third.restarts == [] and third.msgs == [], "problema neschimbata nu se repeta"
+    host.set_containers(["svc" + HEALTHY])
+    back = host.run()
+    assert len(back.msgs) == 1 and "rezolvat" in back.msgs[0], back.msgs
+    assert not any("unseen" in l for l in back.state_lines)
+    assert "svc.unseen" not in _fix(host)
+
+
+def test_the_baseline_does_not_promise_to_fix_what_it_has_never_seen_working(host):
+    """Prima rulare (linia de baza) spunea "se va remedia automat" despre ORICE container stricat. Acum e
+    fals pentru cele nevazute functionand, iar operatorul ar astepta o reparatie care nu vine. Mesajul le
+    separa: unul cu observatie veche (starea din fix/ pastrata, fara `.seeded`) e remediabil, celalalt nu.
+    Nimic nu se reporneste in rularea de baza."""
+    (host.state / ".seeded").unlink()
+    fixd = host.state / "fix"
+    fixd.mkdir(exist_ok=True)
+    (fixd / "known.seenok").write_text("id-known\n", encoding="utf-8")   # formatul observatiei: id-ul
+    host.set_containers(["known|unless-stopped|exited|", "fresh|unless-stopped|exited|"])
+    r = host.run()
+    assert r.restarts == [] and len(r.msgs) == 1, (r.restarts, r.msgs)
+    msg = r.msgs[0]
+    fixable, _, unseen = msg.partition("Stricate")
+    assert '"known" down (exited) (se va remedia automat)' in fixable, msg
+    assert '"fresh"' not in fixable and '"fresh" down (exited)' in unseen, msg
+    assert "nu le repornesc" in unseen, msg
+
+
+def _alarm_then_gone(host, *, extra: str = "web" + HEALTHY) -> None:
+    """`app` a functionat, a cazut, repornirea a esuat (`ESEC`, ca in incident) - alerta de esec e data
+    si `.attempts` sta pe disc. `extra` ramane in lista, ca lista sa nu fie goala."""
+    _worked(host, "app" + HEALTHY, extra)
+    host.set_containers(["app|unless-stopped|exited|", extra])
+    r = host.run(env_extra={"FAKE_RESTART_RC": "1"})
+    assert any("ESEC" in m for m in r.msgs), r.msgs
+    assert "app.attempts" in _fix(host), _fix(host)
+
+
+def test_a_failed_remediation_alarm_is_closed_once_when_the_container_disappears(host):
+    """Mesajul "functional din nou" cere ca NUMELE sa redevina OK, dar un container sters sau redenumit
+    nu mai revine: operatorul ramanea cu "auto-remediere ... ESEC" si nicio inchidere, iar `.attempts`
+    ramanea pe disc pe veci. Dispari se spune O DATA, cu numele, si starea lui se strange."""
+    _alarm_then_gone(host)
+    host.set_containers(["web" + HEALTHY])
+    gone = host.run()
+    assert len(gone.msgs) == 1 and '"app"' in gone.msgs[0] and "nu mai exista" in gone.msgs[0], gone.msgs
+    assert not [n for n in _fix(host) if n.startswith("app.")], _fix(host)
+    again = host.run()
+    assert again.msgs == [], f"dispari s-a spus de doua ori: {again.msgs}"
+
+
+def test_a_disabled_auto_fix_is_closed_the_same_way_and_says_it_was_disabled(host):
+    """Dupa MAX_FIX esecuri auto-fix-ul e DEZACTIVAT si cere interventie manuala. Daca apoi containerul
+    e inlocuit, `.disabled` nu are voie sa ramana pe un nume care nu mai exista (un container nou cu
+    acelasi nume ar porni dezactivat, fara sa stie cineva de ce), iar operatorul trebuie sa afle ca
+    dezactivarea a luat sfarsit odata cu el."""
+    _worked(host, "app" + HEALTHY, "web" + HEALTHY)
+    host.set_containers(["app|unless-stopped|exited|", "web" + HEALTHY])
+    for _ in range(4):
+        host.run(env_extra={"FAKE_RESTART_RC": "1"})
+    assert "app.disabled" in _fix(host), _fix(host)
+    host.set_containers(["web" + HEALTHY])
+    gone = host.run()
+    assert len(gone.msgs) == 1 and "DEZACTIVAT" in gone.msgs[0] and "nu mai exista" in gone.msgs[0], gone.msgs
+    assert not [n for n in _fix(host) if n.startswith("app.")], _fix(host)
+
+
+def test_a_name_that_leaves_without_an_open_alarm_is_swept_silently(host, tmp_path):
+    """Un container inlocuit de o livrare, care nu avusese nicio alerta de esec, e functionare normala: nu
+    se anunta (operatorul ar primi un mesaj la fiecare livrare), dar nici nu ramane in fix/. Martorul
+    pozitiv al lui "zero mesaje" e `_assert_channel_works`."""
+    _assert_channel_works(tmp_path)
+    _worked(host, "app" + HEALTHY, "web" + HEALTHY)
+    assert "app.seenok" in _fix(host), _fix(host)
+    host.set_containers(["web" + HEALTHY])
+    r = host.run()
+    assert r.msgs == [] and r.restarts == [], (r.msgs, r.restarts)
+    assert _fix(host) == ["web.seenok"], _fix(host)
+
+
+@pytest.mark.parametrize("how", ["ps_fails", "ps_empty"])
+def test_an_unreadable_container_list_never_counts_as_everything_gone(host, how):
+    """`docker ps -a` care esueaza (sau intoarce nimic) nu e dovada ca au disparut toate containerele:
+    "necunoscut" nu e "disparut". Altfel o clipa proasta a demonului ar sterge observatiile tuturor si
+    ar trimite cate un mesaj "nu mai exista" pentru fiecare alerta deschisa - apoi, cu starea stearsa,
+    nimic nu s-ar mai putea remedia pana la o noua observatie OK. Martorul e ultimul pas: aceeasi stare,
+    cu lista citita, chiar inchide alerta - deci "zero mesaje" de mai sus nu e o comanda stricata."""
+    _alarm_then_gone(host)
+    before = _fix(host)
+    if how == "ps_fails":
+        r = host.run(env_extra={"FAKE_DOCKER_PS_FAIL": "1"})
+    else:
+        host.set_containers([])
+        r = host.run()
+    assert r.msgs == [] and r.returncode == 0, (r.msgs, r.stderr)
+    assert _fix(host) == before, (before, _fix(host))
+    host.set_containers(["web" + HEALTHY])
+    control = host.run()
+    assert len(control.msgs) == 1 and "nu mai exista" in control.msgs[0], control.msgs
+
+
+def test_a_disappearance_message_that_was_not_delivered_is_retried_not_forgotten(host):
+    """Daca mesajul "nu mai exista" nu pleaca (retea cazuta), starea ramane si se reincearca la rularea
+    urmatoare: altfel alerta de esec ar ramane deschisa tocmai cand canalul a fost cel stricat. Dupa
+    livrare se spune o singura data."""
+    _alarm_then_gone(host)
+    host.set_containers(["web" + HEALTHY])
+    lost = host.run(env_extra={"FAKE_SEND_RC": "22"})
+    assert any("nu mai exista" in m for m in lost.msgs), lost.msgs    # s-a incercat
+    assert "app.attempts" in _fix(host), "starea s-a sters desi mesajul nu a plecat"
+    ok = host.run()
+    assert len(ok.msgs) == 1 and "nu mai exista" in ok.msgs[0], ok.msgs
+    assert not [n for n in _fix(host) if n.startswith("app.")], _fix(host)
+    assert host.run().msgs == []
+
+
+def test_sweeping_one_name_does_not_touch_names_that_merely_share_its_prefix(host):
+    """`app` dispare; `app-2` si `web.v2` (cu punct, ca multe nume reale) raman. Strangerea potriveste
+    numele INTREG: un tipar pe prefix ar sterge observatia unui container viu, iar acela nu s-ar mai
+    putea repara (ar aparea ca "nevazut niciodata functionand" fara sa fie)."""
+    _worked(host, "app" + HEALTHY, "app-2" + HEALTHY, "web" + HEALTHY, "web.v2" + HEALTHY)
+    host.set_containers(["app-2" + HEALTHY, "web.v2" + HEALTHY])
+    r = host.run()
+    assert r.msgs == [], r.msgs
+    assert _fix(host) == ["app-2.seenok", "web.v2.seenok"], _fix(host)
+    host.set_containers(["app-2|unless-stopped|exited|", "web.v2" + HEALTHY])
+    assert host.run().restarts == ["app-2"]
+
+
+def test_the_first_run_sweeps_nothing_and_the_next_one_closes_the_alarm(host):
+    """Prima rulare (baza) nu inchide alerte: mesajul ei e linia de baza si atat. O alerta lasata de o
+    stare veche se inchide la rularea urmatoare, nu se pierde."""
+    _alarm_then_gone(host)
+    (host.state / ".seeded").unlink()
+    host.set_containers(["web" + HEALTHY])
+    base = host.run()
+    assert len(base.msgs) == 1 and "nu mai exista" not in base.msgs[0], base.msgs
+    assert "app.attempts" in _fix(host)
+    nxt = host.run()
+    assert len(nxt.msgs) == 1 and "nu mai exista" in nxt.msgs[0], nxt.msgs
 
 
 # ===========================================================================
@@ -2307,6 +2617,7 @@ ALLOWED_SUFFIXES = {
     "sh": "script", "conf": "fisier de configurare", "env": "secrets.env",
     "ring": "istoricul vmstat", "tmp": "fisier temporar", "state": "problems.state",
     "ustreak": "contor auto-fix", "disabled": "marcaj auto-fix", "attempts": "contor auto-fix",
+    "seenok": "observatie auto-fix (id-ul vazut OK)", "unseen": "contor auto-fix (nevazut OK)",
     "service": "unitate systemd", "timer": "unitate systemd", "target": "tinta systemd",
     "example": "fisier-sablon", "Status": "sablon docker", "Health": "sablon docker",
     "Name": "sablon docker", "py": "fisier de test",
