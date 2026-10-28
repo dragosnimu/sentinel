@@ -86,10 +86,14 @@ Forma dunder nu e «ca un Store»: e o citire care întoarce dicționarul, iar s
 Uși rămase deschise după ce scrierile și dunder-ele pe modul sunt închise (la execuție parametrii porții
 nu mai depind de numele din modul, deci o atribuire nu o mai lărgește): cod care ajunge la poartă fără
 să numească modulul (`gc.get_objects()`, `sys.modules[...]`, `sentinel.patch.__dict__["system_update"]`);
-o funcție a modulului luată într-o VARIABILĂ înainte de dunder (`f = su.read_host` + `f.__globals__`;
-garda vede un dunder doar pe un lanț care pornește de la modul sau de la un nume luat din el) și
-`getattr(su.read_host, "__globals__")`; `asyncio.create_subprocess_exec = ...` pus din alt fișier (schimbă
-ce PORNEȘTE, nu ce refuză poarta); și orice fișier în afara lui `sentinel/` — testele își lărgesc poarta
+o funcție SAU O CLASĂ a modulului luată într-o VARIABILĂ înainte de dunder (`f = su.read_host` +
+`f.__globals__`, `c = su.Selection` + `c.__init__.__globals__`; garda vede un dunder doar pe un lanț care
+pornește de la modul sau de la un nume luat din el — iar o variabilă locală rupe lanțul, fără niciun
+import exotic: ASTA e cea mai ieftină dintre ușile de aici, nu e de aceeași clasă cu `gc`) și
+`getattr(su.read_host, "__globals__")`; modulul adus prin `importlib.import_module(...)` în loc de
+`import` (numit și în lista de mai jos, dar rămâne și o cale spre dunder-e);
+`asyncio.create_subprocess_exec = ...` pus din alt fișier (schimbă ce PORNEȘTE, nu ce
+refuză poarta); și orice fișier în afara lui `sentinel/` — testele își lărgesc poarta
 înfășurând-o (`tests/unit/_system_update_support.py::widen_gate`), și asta e calea lor vizibilă.
 Un `Subscript` pe `argv` în `_run` rămâne permis dinadins: vezi `LAUNCHER_MUTATIONS`, intrările «spawn
 behind a helper».
