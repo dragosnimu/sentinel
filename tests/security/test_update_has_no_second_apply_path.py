@@ -65,10 +65,11 @@ sau `nextval` nu se vede de aici (funcțiile schemei `sentinel_*` se văd, vezi 
 de date nu e o limită pentru tabelele acestui modul (`sentinel` are `INSERT`/`UPDATE`/`DELETE` pe
 `patch_plans`), deci poarta 3 e singura.
 
-Uși CUNOSCUTE și lăsate deschise, ca un cititor să nu creadă că sunt păzite: `importlib`/`__import__`,
+Uși CUNOSCUTE și lăsate deschise, ca un cititor să nu creadă că sunt păzite: `importlib`/`__import__` cu un
+nume care nu e literal (cu nume literal le vede `_imports_target`),
 `pty`, `ctypes`, `multiprocessing`, `socket`, `run_in_executor(None, os.system, ...)`,
 `asyncio.to_thread(os.system, ...)`, `getattr(os, "posix_spawn")(...)`, `globals()[...] = ...`,
-`getattr(system_update, "_run")`, și în `bot.py` un submodul luat ca atribut al unui pachet deja
+și în `bot.py` un submodul luat ca atribut al unui pachet deja
 importat (`from sentinel import patch` + `patch.runner`) în loc de import. Niciuna nu e un import sau un
 apel pe care `_spawns` să-l poată citi; sunt ocoliri deliberate, nu greșeli de scriere, iar un revizuitor
 le vede în diff. Ce NU acoperă poarta 5: un proces pornit prin alt drum decât `_run` (`os.system`,
@@ -83,15 +84,28 @@ dunder pe un lanț pornit de la modul sau de la un nume luat din el (`su.__dict_
 `su.read_host.__globals__[...]`, `from ...system_update import read_host` + `read_host.__globals__`).
 Forma dunder nu e «ca un Store»: e o citire care întoarce dicționarul, iar scrierea se face pe el.
 
+Aliasurile locale sunt urmărite (măsurat pe `f507bcf`: `f = su.read_host` + `f.__globals__.update(...)`
+lăsa garda la 138 passed, iar mock-ul de proces primea `rpm -q --flag-inventat bash`): un nume legat dintr-o
+valoare care pornește de la modul e o rădăcină, până la punct fix, prin `Assign`, `AnnAssign`, `:=`,
+`with ... as`, `for ... in` și comprehensiuni, destructurare, valoarea implicită a unui parametru, ramurile
+unui `if`/`or`, un container cu elemente luate din modul, `getattr`/`setattr`/`delattr(<rădăcină>, "nume")`
+și `importlib.import_module("<numele modulului>")` cu numele LITERAL (`_rooted_at`). O valoare care iese din
+lanț printr-un APEL nu mai e rădăcină (`su.Selection(...).__class__`, `copy.copy(su.Selection(...))`,
+`functools.wraps(su.read_host)`): asta e o hotărâre de proiectare, nu o scăpare, și tot ea lasă deschise
+formele de mai jos. Dunder-ele admise sunt doar CITIRILE numelor din `INERT_DUNDERS` (`su.__name__` într-un
+log); mesajul pentru restul spune ce e adevărat despre ele (garda nu le poate dovedi inofensive), nu că
+«ajung la poartă».
+
 Uși rămase deschise după ce scrierile și dunder-ele pe modul sunt închise (la execuție parametrii porții
 nu mai depind de numele din modul, deci o atribuire nu o mai lărgește): cod care ajunge la poartă fără
 să numească modulul (`gc.get_objects()`, `sys.modules[...]`, `sentinel.patch.__dict__["system_update"]`);
-o funcție SAU O CLASĂ a modulului luată într-o VARIABILĂ înainte de dunder (`f = su.read_host` +
-`f.__globals__`, `c = su.Selection` + `c.__init__.__globals__`; garda vede un dunder doar pe un lanț care
-pornește de la modul sau de la un nume luat din el — iar o variabilă locală rupe lanțul, fără niciun
-import exotic: ASTA e cea mai ieftină dintre ușile de aici, nu e de aceeași clasă cu `gc`) și
-`getattr(su.read_host, "__globals__")`; modulul adus prin `importlib.import_module(...)` în loc de
-`import` (numit și în lista de mai jos, dar rămâne și o cale spre dunder-e);
+o valoare a modulului care trece printr-un APEL sau printr-un obiect înainte de dunder (măsurat: toate
+dau zero constatări): `def g(f): return f.__globals__` + `g(su.read_host)`, `self.f = su.read_host`,
+`fs.append(su.read_host)` sau `d["k"] = su.read_host` + `fs[0].__globals__`, `d.get("k")`, `d.values()`, o
+funcție care întoarce `su.read_host`, `class K: f = su.read_host` + `K.f.__globals__`, și `setattr(su.X,
+"nume", ...)` cu un nume care nu e dunder. A le urma ar însemna să tratăm apelul ca pe un atribut, iar atunci
+`su.Selection(...).__class__` și `copy.copy(su.Selection(...))` ar deveni roșii: aliasul prin legare
+(`f = su.read_host`) e închis, curgerea prin apel nu; `importlib.import_module(<nume neliteral>)`;
 `asyncio.create_subprocess_exec = ...` pus din alt fișier (schimbă ce PORNEȘTE, nu ce
 refuză poarta); și orice fișier în afara lui `sentinel/` — testele își lărgesc poarta
 înfășurând-o (`tests/unit/_system_update_support.py::widen_gate`), și asta e calea lor vizibilă.
@@ -2202,16 +2216,78 @@ def _module_writes(tree: ast.Module, target: str, current: str = THIS_MODULE) ->
             and rooted(n.value if isinstance(n, ast.Subscript) else n)]
 
 
+#: Dunder-ele pe care un lanț pornit de la modul le poate CITI fără să poată duce la poartă. Nu e o listă de
+#: nume «care par nevinovate»: fiecare e aici fiindcă valoarea citită e un `str` sau `None`, iar dintr-un
+#: șir nu se ajunge la nimic prin atribute (cele dunder de pe valoarea citită, `su.__name__.__class__`, rămân
+#: semnalate ca orice altă ușă). Argumentul, pe nume:
+#:   `__name__`, `__qualname__`, `__module__`: numele ca șir, pe modul, funcție sau clasă;
+#:   `__file__`: calea modulului ca șir (pe funcții și clase nu există);
+#:   `__doc__`: `str` sau `None`. E SCRIIBIL pe modul, funcție și clasă, dar admiterea e doar pentru `Load`:
+#:   `su.__doc__ = ...` e o țintă `Store`, deci rămâne o constatare (și în `_module_writes`).
+#: NU e pe listă `__annotations__`: e un dicționar MUTABIL, iar `su.X.__annotations__.update(...)` nu e o țintă
+#: `Store`; ce conține depinde de cum e scris modulul (șiruri cu `from __future__ import annotations`, obiecte
+#: de tip fără el), și garda nu poate spune de aici că o citire nu dă un obiect cu care se lucrează mai departe.
+#: Premisa («nimeni nu redefinește aceste nume ca altceva decât un șir») e MĂSURATĂ de
+#: `test_the_inert_dunders_are_strings_on_every_object_the_module_exposes`, nu doar afirmată aici.
+INERT_DUNDERS = frozenset({"__name__", "__qualname__", "__module__", "__file__", "__doc__"})
+
+#: `getattr(obiect, "nume")` e `obiect.nume` cu numele ca șir; `setattr`/`delattr` sunt scrierea și ștergerea.
+_ATTR_BUILTINS = frozenset({"getattr", "setattr", "delattr"})
+
+
+def _by_string_attr(node: ast.AST) -> tuple[ast.expr, ast.expr | None] | None:
+    """`(obiect, nume)` pentru `getattr`/`setattr`/`delattr(obiect, nume, ...)`, altfel `None`. `nume` e `None`
+    când nu se poate citi care sunt cele două argumente (`getattr(*perechea)`): «nu știu» nu devine «e bine»."""
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _ATTR_BUILTINS
+            and node.args):
+        return None
+    first = node.args[0]
+    if isinstance(first, ast.Starred) or len(node.args) < 2 or isinstance(node.args[1], ast.Starred):
+        return first, None
+    return first, node.args[1]
+
+
+def _imports_target(node: ast.AST, target: str) -> bool:
+    """`importlib.import_module("sentinel.patch.system_update")`, `import_module(".system_update", package=...)`
+    și `__import__("sentinel.patch.system_update")`, cu numele ca LITERAL: aduc modulul fără niciun `import` pe
+    care `_import_forms` să-l vadă. Un nume care nu e literal nu se poate citi și rămâne ușă cunoscută."""
+    if not (isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)):
+        return False
+    func = node.func
+    name = func.attr if isinstance(func, ast.Attribute) else func.id if isinstance(func, ast.Name) else ""
+    if name not in {"import_module", "__import__"}:
+        return False
+    named = node.args[0].value
+    return named == target or (named.startswith(".") and named.lstrip(".") == target.rpartition(".")[2])
+
+
 def _rooted_at(tree: ast.Module, target: str, current: str = THIS_MODULE, *, by_name: bool = False):
-    """Predicatul «lanțul de atribute și indici `node` pornește de la modulul `target`»: de la un alias al
-    lui (`su`), de la numele complet (`sentinel.patch.system_update`) sau de la `patch.system_update`.
+    """Predicatul «expresia `node` pornește de la modulul `target`»: de la un alias al lui (`su`), de la numele
+    complet (`sentinel.patch.system_update`), de la `patch.system_update`, de la `importlib.import_module(
+    "<numele complet>")`, sau de la un nume LEGAT dintr-o valoare care pornește de acolo.
     Cu `by_name`, pornește și de la un nume LUAT din modul (`from ... import read_host`): pentru o
     funcție luată așa, `read_host.__globals__` e aceeași ușă ca `su.read_host.__globals__`. O singură
     definiție, folosită de scrieri și de dunder-e: două copii ale regulii de «rădăcină» ar putea diverge,
-    iar una dintre garde ar vedea o formă pe care cealaltă o lasă să treacă."""
+    iar una dintre garde ar vedea o formă pe care cealaltă o lasă să treacă.
+
+    Aliasurile locale (`f = su.read_host` + `f.__globals__`, măsurat pe `f507bcf`: 138 passed cu poarta
+    deschisă la execuție) sunt urmărite până la punct fix, deci și un alias al unui alias: `Assign`,
+    `AnnAssign`, `:=`, `with ... as`, `for ... in` și comprehensiunile, destructurarea (element cu
+    element când ambele părți sunt afișări de aceeași lungime), valorile implicite ale parametrilor. O
+    valoare care IESE din lanț printr-un apel nu mai e rădăcină: `su.Selection(...)`, `copy.copy(su.X)`,
+    `functools.wraps(su.X)` dau obiecte noi. Singurele apeluri tratate ca atribut sunt
+    `getattr`/`setattr`/`delattr(<rădăcină>, nume)` și `import_module(<numele modulului>)`.
+    Un nume legat la un container (`fs = [su.read_host]`) ține elemente înrădăcinate, nu e el însuși
+    rădăcină: `fs[0].__globals__` e semnalat, `fs["k"] = 1` nu (e o scriere în dicționarul local).
+
+    Regula e fără flux și fără domeniu de vizibilitate: un nume legat undeva dintr-o valoare înrădăcinată
+    e rădăcină oriunde în fișier. Greșește doar într-o direcție (semnalează în plus un alt nume la fel),
+    niciodată în sens invers."""
     _, aliases = _import_forms(tree, target, current)
     base = target.rpartition(".")[2]
     roots = set(aliases)
+    holders: set[str] = set()
     if by_name:
         # Numele LOCAL al fiecărui nume luat: `from ...system_update import read_host as rh` e `rh`, nu
         # `read_host` (`_import_forms` le dă pe cele din modul, nu pe cele de pe partea cealaltă a lui `as`).
@@ -2220,12 +2296,90 @@ def _rooted_at(tree: ast.Module, target: str, current: str = THIS_MODULE, *, by_
                   for a in n.names if a.name != "*"}
 
     def rooted(node: ast.AST) -> bool:
-        while isinstance(node, (ast.Attribute, ast.Subscript)):
-            if isinstance(node, ast.Attribute) and node.attr == base:
-                return True
-            node = node.value
-        return isinstance(node, ast.Name) and node.id in roots
+        if isinstance(node, ast.Attribute):
+            return node.attr == base or rooted(node.value)
+        if isinstance(node, ast.Subscript):
+            return rooted(node.value) or holds(node.value)
+        if isinstance(node, ast.Name):
+            return node.id in roots
+        if isinstance(node, ast.Call):
+            attr = _by_string_attr(node)
+            return _imports_target(node, target) or (attr is not None and rooted(attr[0]))
+        if isinstance(node, (ast.NamedExpr, ast.Starred)):
+            return rooted(node.value) or (isinstance(node, ast.Starred) and holds(node.value))
+        if isinstance(node, ast.IfExp):
+            return rooted(node.body) or rooted(node.orelse)
+        if isinstance(node, ast.BoolOp):
+            return any(rooted(v) for v in node.values)
+        return False
 
+    def holds(node: ast.AST) -> bool:
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            return any(rooted(e) or holds(e) for e in node.elts)
+        if isinstance(node, ast.Dict):
+            return any(rooted(v) or holds(v) for v in node.values)
+        return isinstance(node, ast.Name) and node.id in holders
+
+    def leaves(target_: ast.AST) -> list[str]:
+        if isinstance(target_, ast.Name):
+            return [target_.id]
+        if isinstance(target_, (ast.Tuple, ast.List)):
+            return [name for e in target_.elts for name in leaves(e)]
+        return leaves(target_.value) if isinstance(target_, ast.Starred) else []
+
+    def bind(target_: ast.AST, value: ast.AST, *, iterate: bool = False) -> bool:
+        """Pune numele din `target_` în `roots`/`holders` dacă `value` o cere; spune dacă s-a schimbat ceva."""
+        if (not iterate and isinstance(target_, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List))
+                and len(target_.elts) == len(value.elts)
+                and not any(isinstance(e, ast.Starred) for e in (*target_.elts, *value.elts))):
+            # `strict=True`: lungimile sunt egale prin condiția de mai sus, deci nu se poate declanșa; dacă cineva
+            # scoate condiția, o destructurare inegală ridică `ValueError` în loc să piardă tăcut elementele de
+            # la coadă (`a, b = 1, 2, su.read_host`: fără el, `b` n-ar mai fi rădăcină).
+            return any([bind(t, v) for t, v in zip(target_.elts, value.elts, strict=True)])
+        unpack = iterate or isinstance(target_, (ast.Tuple, ast.List, ast.Starred))
+        # Un nume despachetat devine rădăcină; că ajunge și în `holders` nu schimbă nimic (`rooted` se uită
+        # întâi la `roots`), deci nu are rost să-l scoată cineva de acolo.
+        as_root = rooted(value) or (unpack and holds(value))
+        as_holder = holds(value)
+        changed = False
+        for name in leaves(target_):
+            if as_root and name not in roots:
+                roots.add(name)
+                changed = True
+            if as_holder and name not in holders:
+                holders.add(name)
+                changed = True
+        return changed
+
+    def step() -> bool:
+        changed = False
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Assign):
+                for t in n.targets:
+                    changed |= bind(t, n.value)
+            elif isinstance(n, ast.AnnAssign) and n.value is not None:
+                changed |= bind(n.target, n.value)
+            elif isinstance(n, ast.NamedExpr):
+                changed |= bind(n.target, n.value)
+            elif isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)):
+                changed |= bind(n.target, n.iter, iterate=True)
+            elif isinstance(n, ast.withitem) and n.optional_vars is not None:
+                changed |= bind(n.optional_vars, n.context_expr)
+            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                a = n.args
+                positional = [*a.posonlyargs, *a.args]
+                # Ambele `strict=True`: parserul garantează lungimile (`defaults` sunt ultimele n argumente
+                # poziționale, `kw_defaults` are câte o intrare, `None` pentru cele obligatorii) — măsurat în
+                # `test_every_parameter_shape_the_parser_accepts_...`. Un AST care le rupe ridică `ValueError`,
+                # nu trunchiază tăcut: o felie cu început negativ ar lega un implicit de ALT parametru.
+                pairs = list(zip(positional[len(positional) - len(a.defaults):], a.defaults, strict=True))
+                pairs += [(p, d) for p, d in zip(a.kwonlyargs, a.kw_defaults, strict=True) if d is not None]
+                for param, default in pairs:
+                    changed |= bind(ast.Name(id=param.arg, ctx=ast.Store()), default)
+        return changed
+
+    while step():
+        pass
     return rooted
 
 
@@ -2235,8 +2389,10 @@ def _is_dunder(name: str) -> bool:
 
 def _module_dunders(tree: ast.Module, target: str, current: str = THIS_MODULE) -> list[tuple[int, str]]:
     """`(linie, text)` pentru fiecare atribut dunder (`__dict__`, `__globals__`, `__kwdefaults__`,
-    `__code__`, `__setitem__`...) pe un lanț care pornește de la modulul `target` sau de la un nume luat
-    din el, în ORICE context (`Load` la fel ca `Store`).
+    `__code__`, `__setitem__`...) pe un lanț care pornește de la modulul `target`, de la un nume luat
+    din el sau de la un alias local al lor, în ORICE context (`Load` la fel ca `Store`), fie scris ca
+    atribut, fie ca nume literal în `getattr`/`setattr`/`delattr`. Singura excepție: CITIREA unui nume din
+    `INERT_DUNDERS` (`su.__name__` într-un mesaj de log, `getattr(su.X, "__doc__")`).
 
     `_module_writes` vede doar ținte `Store`/`Del`, iar `_run_touched` doar numele porții. Patru forme
     n-au fost nici una, nici alta, și au dat verde cu poarta deschisă la execuție (mock-ul de proces a
@@ -2244,10 +2400,43 @@ def _module_dunders(tree: ast.Module, target: str, current: str = THIS_MODULE) -
     `su.__dict__.__setitem__(...)`, `su.read_host.__globals__.update({...})` și
     `su.read_host.__globals__['_require_read_only'].__kwdefaults__.update(...)`. Toate sunt `Load` pe un
     apel de metodă; ce le trădează e numele dunder, nu ținta. Nicio folosire cinstită a unui dunder pe
-    acest modul nu există în `sentinel/` (căutat), deci regula nu latră la nimic real."""
+    acest modul în afară de `INERT_DUNDERS` nu există în `sentinel/` (căutat), deci regula nu latră la
+    nimic real."""
     rooted = _rooted_at(tree, target, current, by_name=True)
-    return [(n.lineno, ast.unparse(n)) for n in ast.walk(tree)
-            if isinstance(n, ast.Attribute) and _is_dunder(n.attr) and rooted(n.value)]
+    found: list[tuple[int, str]] = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Attribute) and _is_dunder(n.attr) and rooted(n.value):
+            if not (n.attr in INERT_DUNDERS and isinstance(n.ctx, ast.Load)):
+                found.append((n.lineno, ast.unparse(n)))
+            continue
+        attr = _by_string_attr(n)
+        if attr is None or not rooted(attr[0]) or not isinstance(attr[1], ast.Constant):
+            continue
+        name = attr[1].value
+        if isinstance(name, str) and _is_dunder(name) and not (name in INERT_DUNDERS and n.func.id == "getattr"):
+            found.append((n.lineno, ast.unparse(n)))
+    return found
+
+
+def _unreadable_attr_names(tree: ast.Module, target: str, current: str = THIS_MODULE) -> list[tuple[int, str]]:
+    """`(linie, text)` pentru `getattr`/`setattr`/`delattr` pe un lanț înrădăcinat în `target` al cărui NUME nu
+    e un șir literal (`getattr(su.read_host, nume)`, `getattr(*perechea)`): garda nu poate ști dacă numește un
+    dunder. Separat de `_module_dunders`, ca mesajul să nu pretindă că a găsit un dunder acolo unde nu poate ști."""
+    rooted = _rooted_at(tree, target, current, by_name=True)
+    out = []
+    for n in ast.walk(tree):
+        attr = _by_string_attr(n)
+        if attr is not None and rooted(attr[0]) and not (
+                isinstance(attr[1], ast.Constant) and isinstance(attr[1].value, str)):
+            out.append((n.lineno, ast.unparse(n)))
+    return out
+
+
+def _dynamic_imports(tree: ast.Module, target: str) -> list[ast.Call]:
+    """Apelurile `import_module("<modulul>")`/`__import__("<modulul>")` din `tree`: un fișier care aduce
+    modulul DOAR așa n-are niciun import pe care `_import_forms` să-l vadă, deci scanarea pachetului l-ar
+    sări (`if not (taken or aliases): continue`) fără să-l citească."""
+    return [n for n in ast.walk(tree) if _imports_target(n, target)]
 
 
 def test_nothing_outside_system_update_touches_the_run_function():
@@ -2269,6 +2458,11 @@ def test_nothing_outside_system_update_touches_the_run_function():
     assert not problems, "\n".join(problems)
 
 
+_DUNDER_ADVICE = ("garda îl poate admite doar ca CITIRE a unuia dintre " + ", ".join(sorted(INERT_DUNDERS))
+                  + " (valori `str`/`None`); orice altceva, inclusiv o scriere, nu poate fi dovedit aici inofensiv, "
+                  "iar `__dict__`, `__globals__`, `__kwdefaults__` și `__code__` duc la globalele sau la implicitele porții")
+
+
 def _package_problems(package: Path, base: Path) -> tuple[int, list[str]]:
     """(câte fișiere importă `system_update`, constatările) pentru TOATE fișierele din `package`, în afară
     de `system_update.py`. O funcție de sine stătătoare, ca un control să o poată rula pe un arbore făcut
@@ -2287,15 +2481,17 @@ def _package_problems(package: Path, base: Path) -> tuple[int, list[str]]:
         current = ".".join(path.relative_to(base).with_suffix("").parts)
         tree = ast.parse(text)
         taken, aliases = _import_forms(tree, target, current)
-        if not (taken or aliases):
+        if not (taken or aliases or _dynamic_imports(tree, target)):
             continue
         seen += 1
         problems += [f"{path.name}: atinge `{x}` din system_update" for x in sorted(_run_touched(tree, current))]
         problems += [f"{path.name}:{line}: scrie în system_update (`{shown}`)"
                      for line, shown in _module_writes(tree, target, current)]
-        problems += [f"{path.name}:{line}: atribut dunder pe system_update (`{shown}`): ajunge la globalele "
-                     "sau la implicitele porții fără să numească poarta"
+        problems += [f"{path.name}:{line}: atribut dunder pe system_update (`{shown}`): {_DUNDER_ADVICE}"
                      for line, shown in _module_dunders(tree, target, current)]
+        problems += [f"{path.name}:{line}: nume de atribut care nu e un șir literal pe un lanț pornit de la "
+                     f"system_update (`{shown}`): garda nu poate ști dacă numește un dunder"
+                     for line, shown in _unreadable_attr_names(tree, target, current)]
         escaped = _escapes(tree, target, current)
         if escaped:
             problems.append(f"{path.name}: pasează modulul system_update ca valoare ({sorted(escaped)})")
@@ -2461,7 +2657,375 @@ def test_the_package_scan_reports_a_dunder_on_the_module_and_stays_quiet_on_an_h
     assert seen == 3
     dunders = [p for p in problems if "atribut dunder pe system_update" in p]
     assert {p.split(":")[0] for p in dunders} == {"bot.py", "patch_flow.py"}, problems
-    assert len(dunders) >= 4, problems
+    # Exact, nu `>=`: cu `by_name=False` în `_module_dunders` cele două dunder-e din `d()` (nume luat din modul)
+    # dispar, iar `su.__dict__.__setitem__` din `b()` numără oricum două — `>= 4` rămânea verde.
+    assert len(dunders) == 6, problems
+    assert not [p for p in problems if p.startswith("honest.py")], problems
+
+
+_ALIAS_DUNDER_FORMS = (
+    # cele patru forme măsurate pe `f507bcf`, fiecare cu poarta deschisă la execuție și garda la 138 passed
+    f"f = su.read_host\nf.__globals__.update({_GATE_OFF})",
+    f"c = su.Selection\nc.__init__.__globals__.update({_GATE_OFF})",
+    f"import importlib\nimportlib.import_module('sentinel.patch.system_update').__dict__.update({_GATE_OFF})",
+    f"getattr(su.read_host, '__globals__').update({_GATE_OFF})",
+    # un alias al unui alias, pe câteva trepte (punctul fix)
+    "f = su.read_host\ng = f\nh = g\nh.__globals__",
+    "h = g\ng = f\nf = su.read_host\nh.__globals__",     # legate în ordine inversă: cere mai multe treceri
+    # fiecare formă de legare
+    "f: object = su.read_host\nf.__globals__",
+    "(f := su.read_host).__globals__",
+    "if (f := su.read_host):\n    f.__globals__",
+    "with su.lock as l:\n    l.__class__",
+    "async def h():\n    async with su.lock as l:\n        l.__dict__",
+    "for f in (su.read_host,):\n    f.__globals__",
+    "for f in su.TABLE:\n    f.__globals__",
+    "async def h():\n    async for f in su.stream:\n        f.__globals__",
+    "[f.__globals__ for f in (su.read_host,)]",
+    "def h():\n    f = su.read_host\n    return f.__globals__",
+    # destructurare: pe elemente, într-un tuplu imbricat, într-o listă, cu stea
+    "a, b = su.read_host, su.Selection\nb.__init__.__globals__",
+    "(a, b), c = (su.read_host, 1), 2\na.__globals__",
+    "[f] = [su.read_host]\nf.__globals__",
+    "x, *y = su.a, su.b\ny[0].__globals__",
+    "a = b = su.read_host\nb.__globals__",
+    # lungimi inegale (nu se împerechează element cu element; ramura conservatoare, nu o trunchiere)
+    "a, b = su.read_host, 1, 2\na.__globals__",
+    "a, b = 1, 2, su.read_host\nb.__globals__",
+    "(a, (b, c)) = (su.read_host, (1, 2, 3))\na.__globals__",
+    "(a, (b, c)) = (1, (2, 3, su.read_host))\nc.__globals__",
+    "[a, b] = (su.read_host,)\nb.__globals__",
+    # valoarea implicită a unui parametru
+    "def g(f=su.read_host):\n    return f.__globals__",
+    "def g(x, f=su.read_host):\n    return f.__globals__",
+    "def g(*, f=su.read_host):\n    return f.__globals__",
+    "g = lambda f=su.read_host: f.__globals__",
+    # ramuri ale unei expresii
+    "f = su.read_host if x else None\nf.__globals__",
+    "f = x or su.read_host\nf.__globals__",
+    "(su.read_host if x else su.select).__globals__",
+    # un container cu elemente luate din modul
+    "fs = [su.read_host]\nfs[0].__globals__",
+    "(su.read_host,)[0].__globals__",
+    "t = su.read_host,\nt[0].__globals__",
+    # numele atributului dat ca șir, cu `getattr`/`setattr`/`delattr`, și alias al rezultatului
+    "getattr(getattr(su, 'read_host'), '__globals__')",
+    "f = getattr(su.read_host, '__call__')\nf.__globals__",
+    "setattr(su.read_host, '__kwdefaults__', {})",
+    "delattr(su.read_host, '__kwdefaults__')",
+    "getattr(su.read_host, '__annotations__')",
+    # modulul adus prin nume literal, fără niciun `import` pe care `_import_forms` să-l vadă
+    "from importlib import import_module\nimport_module('sentinel.patch.system_update').__dict__",
+    "__import__('sentinel.patch.system_update', fromlist=['x']).__dict__",
+    "import importlib\nimportlib.import_module('.system_update', package='sentinel.patch').__dict__",
+    "import importlib\nm = importlib.import_module('sentinel.patch.system_update')\nm.__dict__",
+)
+_ALIAS_WRITE_FORMS = (
+    "m = su\nm.X = 1",
+    "f = su.READ_ONLY_FLAGS\nf['rpm'] = ('--flag-inventat',)",
+    "f = su.read_host\nf.X = 1",
+    "import importlib\nimportlib.import_module('sentinel.patch.system_update').READ_ONLY_MODE['dnf'] = '-y'",
+    "d = {'a': su.READ_ONLY_MODE}\nd['a']['dnf'] = '-y'",
+    "for f in (su.READ_ONLY_FLAGS,):\n    f['rpm'] = ()",
+)
+_ALIAS_HONEST_FORMS = (
+    # un obiect NOU, scos din lanț printr-un apel: cele două forme pe care verificatorul le-a cerut verzi
+    "su.Selection(error='x').__class__",
+    "import copy\ncopy.copy(su.Selection(error='x'))",
+    "import copy\nx = copy.copy(su.Selection(error='x'))\nx.__class__",
+    "import functools\nfunctools.wraps(su.read_host)",
+    "import functools\nw = functools.wraps(su.read_host)\nw.__wrapped__",
+    "sel = su.Selection(error='x')\nsel.error = 'y'\nsel.__class__",
+    "async def f(db, cfg):\n    sel = await su.select(db, cfg)\n    sel.error = None\n    sel.__class__",
+    # același nume de variabilă, dar legat din altă parte decât din modul
+    "f = other.thing\nf.__globals__",
+    "for f in other:\n    f.__globals__",
+    "def g(f=other.x):\n    return f.__globals__",
+    "def g(f, x=su.select):\n    return f.__globals__",
+    "[f.__globals__ for f in others]",
+    "a, b = x, y\nb.__globals__",
+    "a, b = su.read_host, make()\nb.__globals__",
+    "fs = [su.read_host]\nfs.__class__",
+    "getattr(sel, '__class__')",
+    "getattr(obj, name)",
+    "import_module(name).__dict__",
+    "import_module('other.module').__dict__",
+    # un dicționar LOCAL cu funcții ale modulului: citirea elementelor nu îl face scriere în modul
+    "table = {'a': su.select}\ntable['b'] = 1\ntable.update({'c': 2})",
+    "x = su.GENERATED_BY\ny = su._private\nz = su.Selection",
+)
+
+
+def test_a_local_alias_of_the_module_or_of_what_it_exposes_is_followed_like_the_name_itself():
+    """Garda urmărea un dunder doar pe un lanț care pornește de la numele modulului sau de la un nume luat din
+    el. Două linii fără niciun import exotic o ocoleau: `f = su.read_host` + `f.__globals__.update({...})`
+    lăsa garda la 138 passed (măsurat pe `f507bcf`), iar procesul pornea cu `rpm -q --flag-inventat bash`.
+    Operatorul ar fi crezut că `/update` doar propune, cu poarta deschisă dintr-o funcție din `bot.py`. La
+    fel `c = su.Selection` + `c.__init__.__globals__`, `getattr(su.read_host, "__globals__")` și modulul adus
+    prin `importlib.import_module("sentinel.patch.system_update")`, plus fiecare formă de legare (`:=`,
+    `with`, `for`, destructurare, valoare implicită), un alias al unui alias, și un container cu funcții ale
+    modulului. Mai e și partea inversă, care ține regula în viață: un obiect NOU scos din lanț printr-un apel
+    (`su.Selection(...).__class__`, `copy.copy(su.Selection(...))`, `functools.wraps(su.read_host)`) nu e
+    modulul, iar o regulă care l-ar semnala ar fi ștearsă de primul om care scrie un `repr`."""
+    target, current = "sentinel.patch.system_update", "sentinel.telegram.bot"
+    for source in _ALIAS_DUNDER_FORMS:
+        found = _module_dunders(ast.parse(_SU_HEAD + source), target, current)
+        assert found, f"alias form not seen by the dunder rule: {source!r}"
+    for source in _ALIAS_WRITE_FORMS:
+        found = _module_writes(ast.parse(_SU_HEAD + source), target, current)
+        assert found, f"alias form not seen by the write rule: {source!r}"
+    for source in _ALIAS_HONEST_FORMS:
+        tree = ast.parse(_SU_HEAD + source)
+        assert not _module_dunders(tree, target, current), f"honest form reported by dunder rule: {source!r}"
+        assert not _module_writes(tree, target, current), f"honest form reported by write rule: {source!r}"
+        assert not _unreadable_attr_names(tree, target, current), f"honest form reported as unreadable: {source!r}"
+
+
+def _parameter_shapes():
+    """Fiecare semnătură cu 0-1 poziționale-only, 0-2 obișnuite și 0-2 kw-only, fiecare parametru cu implicit
+    înrădăcinat, implicit obișnuit sau fără implicit, ca `def` și ca `lambda`. Întoarce `(sursa, {parametru:
+    are_implicit_din_modul})` pentru cele pe care parserul le acceptă și numără cele pe care le refuză."""
+    import itertools
+
+    valid, refused = [], 0
+    for npo, nn, nk in itertools.product(range(2), range(3), range(3)):
+        names = [f"p{i}" for i in range(npo)] + [f"n{i}" for i in range(nn)] + [f"k{i}" for i in range(nk)]
+        for kinds in itertools.product(("none", "plain", "rooted"), repeat=len(names)):
+            parts = [n if k == "none" else f"{n}=1" if k == "plain" else f"{n}=su.read_host"
+                     for n, k in zip(names, kinds, strict=True)]
+            if npo:
+                parts.insert(npo, "/")
+            if nk:
+                parts.insert(len(parts) - nk, "*")
+            rooted = {n: k == "rooted" for n, k in zip(names, kinds, strict=True)}
+            for source in (f"def f({', '.join(parts)}): pass", f"f = lambda {', '.join(parts)}: 0"):
+                try:
+                    ast.parse(source)
+                except SyntaxError:
+                    refused += 1
+                    continue
+                valid.append((source, rooted))
+    return valid, refused
+
+
+def test_every_parameter_shape_the_parser_accepts_binds_the_default_to_its_own_parameter():
+    """Regula de alias leagă valoarea implicită a unui parametru de PARAMETRUL ei cu `zip(..., strict=True)`
+    pe `defaults` și `kw_defaults`. `strict=True` ridică `ValueError` dacă lungimile diferă, iar într-o gardă
+    de securitate o excepție în loc de o constatare arată ca un defect al testului, nu ca un abuz. Asta e
+    sigur DOAR dacă parserul nu poate produce lungimi inegale: se măsoară pe toate semnăturile generate
+    (documentația `ast.arguments`: «If there are fewer defaults, they correspond to the last n arguments»;
+    `kw_defaults` are o intrare pe parametru kw-only, `None` pentru cele obligatorii). Cele pe care parserul
+    nu le acceptă (`def f(a=1, b)`) dau `SyntaxError` la `ast.parse`, înainte de orice `zip`: un fișier
+    otrăvit nu poate pune pe disc inegalitatea. Verifică și rezultatul: exact parametrii cu implicit din
+    modul devin rădăcini, niciun alt parametru (o aliniere greșită a feliei ar lega implicitul de alt nume)."""
+    target, current = "sentinel.patch.system_update", "sentinel.telegram.bot"
+    valid, refused = _parameter_shapes()
+    assert len(valid) >= 900 and refused >= 400, (len(valid), refused)
+    for source, expected in valid:
+        rooted = _rooted_at(ast.parse(_SU_HEAD + source), target, current)
+        got = {name: rooted(ast.Name(id=name, ctx=ast.Load())) for name in expected}
+        assert got == expected, (source, got)
+
+
+def test_an_argument_list_that_breaks_the_default_alignment_makes_the_rule_raise_instead_of_truncating():
+    """Un AST pe care parserul nu l-ar produce (lungimi inegale, construit de mână) nu are voie să fie
+    trunchiat tăcut: cu o felie cu început negativ, `def f(a, b=su.read_host)` cu trei implicite ar lega
+    un implicit de alt parametru, iar garda ar tăcea. Cu `strict=True` ridică `ValueError`, cu un mesaj
+    care numește `zip()`. `compile()` din CPython refuză aceleași AST-uri («length of kwonlyargs is not the
+    same as kw_defaults»), deci invarianta nu e o presupunere a acestui fișier."""
+    target, current = "sentinel.patch.system_update", "sentinel.telegram.bot"
+    broken_kw = ast.parse(_SU_HEAD + "def f(a, *, k=su.read_host): pass")
+    broken_kw.body[-1].args.kw_defaults.pop()
+    broken_pos = ast.parse(_SU_HEAD + "def f(a, b=su.read_host): pass")
+    broken_pos.body[-1].args.defaults.extend([ast.Constant(1), ast.Constant(2)])
+    for tree in (broken_kw, broken_pos):
+        with pytest.raises(ValueError, match=r"zip\(\) argument"):
+            _rooted_at(tree, target, current)
+    with pytest.raises(ValueError):
+        compile(broken_kw, "<broken>", "exec")
+
+
+def test_getattr_on_the_module_itself_is_reported_as_handing_the_module_on(tmp_path):
+    """Docstring-ul modulului listase `getattr(system_update, "_run")` printre ușile lăsate deschise, dar
+    `_escapes` o vede: numele gol al modulului, folosit ca valoare, e o constatare în scanarea pachetului.
+    Fără testul ăsta, propoziția din docstring ar putea să se întoarcă la «deschisă» fără ca cineva să afle
+    că ușa s-a închis sau deschis la loc."""
+    tele = tmp_path / "sentinel" / "telegram"
+    tele.mkdir(parents=True)
+    (tele / "bot.py").write_text("from sentinel.patch import system_update\n"
+                                 "go = getattr(system_update, '_run')\n", encoding="utf-8")
+    seen, problems = _package_problems(tmp_path / "sentinel", tmp_path)
+    assert seen == 1
+    assert any("pasează modulul system_update" in p for p in problems), problems
+
+
+def test_a_name_given_to_getattr_that_the_guard_cannot_read_is_reported_not_passed():
+    """`getattr(su.read_host, nume)` cu `nume = "__glo" + "bals__"` sau cu `getattr(*perechea)` nu arată ce
+    atribut citește. A-l lăsa să treacă ar fi socotit «nu știu» drept «e bine»: același `f.__globals__`, scris
+    cu un șir construit, ar fi deschis poarta fără nicio constatare. Se raportează cu un mesaj propriu (garda
+    nu a găsit un dunder, nu poate ști), iar un `getattr` pe un obiect care nu pornește din modul nu are
+    voie să dea nimic: `getattr(obj, field)` e cod obișnuit."""
+    target, current = "sentinel.patch.system_update", "sentinel.telegram.bot"
+    for source in ("getattr(su.read_host, name)", "getattr(su.read_host, '__glo' + 'bals__')",
+                   "pair = (su.read_host, '__globals__')\ngetattr(*pair)", "setattr(su.read_host, name, {})",
+                   "f = su.read_host\ngetattr(f, name)", "getattr(su.read_host, 5)"):
+        tree = ast.parse(_SU_HEAD + source)
+        assert _unreadable_attr_names(tree, target, current), f"unreadable name passed: {source!r}"
+    for source in ("getattr(obj, field)", "getattr(su.read_host, 'name_of_something')", "getattr(sel, name, None)",
+                   "getattr(su.read_host, '__name__')"):
+        assert not _unreadable_attr_names(ast.parse(_SU_HEAD + source), target, current), source
+
+
+_INERT_READS = tuple(
+    form.format(name=name)
+    for name in sorted(INERT_DUNDERS)
+    for form in ("log.info(su.{name})", "su.read_host.{name}", "su.Selection.{name}", "x = su.{name}",
+                 "f = su.read_host\nf.{name}", "getattr(su.read_host, '{name}')",
+                 "getattr(su.read_host, '{name}', None)", "from sentinel.patch.system_update import read_host\n"
+                 "read_host.{name}"))
+
+
+def test_only_the_reading_of_an_inert_dunder_is_admitted():
+    """`su.__name__` într-un mesaj de log, `su.Selection.__doc__` sau `su.__file__` nu duc la poartă, dar
+    garda le respingea cu un mesaj care spunea altceva decât s-a întâmplat («ajunge la globalele porții»):
+    primul om care scrie un log cu `su.__name__` ar fi primit un roșu care nu se potrivește, iar așa se
+    slăbesc gărzile — cineva citește mesajul, vede că nu se potrivește și lărgește regula ca să treacă.
+    Admiterea e îngustă: DOAR citirea (nu scrierea, nu ștergerea) a numelor din `INERT_DUNDERS`, iar o
+    continuare dunder pe valoarea citită (`su.__name__.__class__`) rămâne o constatare. `__annotations__`
+    (dicționar mutabil), `__dict__`, `__class__`, `__init__` și `__wrapped__` nu sunt pe listă."""
+    target, current = "sentinel.patch.system_update", "sentinel.telegram.bot"
+    for source in _INERT_READS:
+        src = source if "import" in source else _SU_HEAD + source
+        assert not _module_dunders(ast.parse(src), target, current), f"inert read reported: {source!r}"
+    for name in sorted(INERT_DUNDERS):
+        for source in (f"su.{name} = 'x'", f"su.read_host.{name} = 'x'", f"del su.{name}",
+                       f"setattr(su.read_host, '{name}', 'x')", f"delattr(su.read_host, '{name}')",
+                       f"f = su.read_host\nf.{name} += 'x'"):
+            assert _module_dunders(ast.parse(_SU_HEAD + source), target, current), f"inert write passed: {source!r}"
+        assert _module_dunders(ast.parse(_SU_HEAD + f"su.{name}.__class__"), target, current), name
+    for name in ("__annotations__", "__dict__", "__class__", "__init__", "__wrapped__", "__globals__", "__spec__",
+                 "__loader__", "__package__", "__builtins__", "__repr__", "__code__", "__call__"):
+        assert name not in INERT_DUNDERS, name
+        for source in (f"su.{name}", f"su.read_host.{name}", f"getattr(su.Selection, '{name}')"):
+            assert _module_dunders(ast.parse(_SU_HEAD + source), target, current), f"{source!r} passed"
+
+
+def _inert_dunder_values(objects) -> tuple[int, list[str]]:
+    """(câte atribute inerte s-au măsurat, cele a căror valoare nu e `str`/`None`) pe `objects`."""
+    measured, wrong = 0, []
+    for obj in objects:
+        for name in sorted(INERT_DUNDERS):
+            if hasattr(obj, name):
+                measured += 1
+                value = getattr(obj, name)
+                if not isinstance(value, (str, type(None))):
+                    wrong.append(f"{obj!r}.{name} is a {type(value).__name__}")
+    return measured, wrong
+
+
+def test_the_inert_dunders_are_strings_on_every_object_the_module_exposes():
+    """Argumentul pentru `INERT_DUNDERS` e «valoarea citită e un `str` sau `None`». Dacă cineva definește în
+    `system_update.py` o proprietate `__doc__` sau un `__name__` care întoarce un dicționar, citirea lui ar
+    deveni o ușă, iar garda ar continua să o lase să treacă cu aceeași listă. Se măsoară pe obiectele REALE:
+    modulul, fiecare funcție, clasă și modul pe care le expune, metodele claselor lui și o instanță. Un
+    control pozitiv cere ca bucla să fi măsurat ceva: o listă goală ar trece pe orice."""
+    import types
+
+    from sentinel.patch import system_update as real
+
+    tree = _tree(SYSTEM_UPDATE)
+    bound = ({n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+             | {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Store)}
+             | {n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))})
+    assert not bound & INERT_DUNDERS, f"system_update.py binds an inert dunder: {sorted(bound & INERT_DUNDERS)}"
+
+    objects = [real, real.Selection(error="x")]
+    for value in list(vars(real).values()):
+        if isinstance(value, (types.ModuleType, types.FunctionType, type)):
+            objects.append(value)
+            if isinstance(value, type):
+                objects += [m for m in vars(value).values() if isinstance(m, (types.FunctionType, property))]
+    measured, wrong = _inert_dunder_values(objects)
+    assert not wrong, f"an inert dunder is not a string: {wrong}"
+    assert measured >= 100, f"the premise was measured on only {measured} attributes"
+
+    # Controlul pozitiv al măsurătorii: un obiect care întoarce un dicționar la `__doc__` (pe instanță) sau o
+    # proprietate la `__doc__` (pe clasă) trebuie să iasă în `wrong`. Pe codul real nu există niciunul, deci
+    # fără el o măsurătoare stricată (`hasattr` mereu fals) ar trece la fel de verde.
+    class Sneaky:
+        __doc__ = property(lambda self: {"k": 1})
+
+    assert _inert_dunder_values([Sneaky()])[1] and _inert_dunder_values([Sneaky])[1]
+
+
+def test_the_dunder_message_is_true_for_the_shape_it_reports(tmp_path):
+    """Mesajul vechi spunea, pentru orice dunder, «ajunge la globalele sau la implicitele porții fără să
+    numească poarta». Pentru `su.__name__` era neadevărat, și un roșu cu mesaj fals e cel care învață omul să
+    lărgească regula. Acum, pentru ce rămâne semnalat, mesajul spune ce e adevărat despre FORMA respectivă:
+    ce admite garda (citirea numelor inerte, enumerate), că o scriere sau un alt nume nu poate fi dovedit
+    inofensiv, și care dunder-e duc la poartă. Se verifică pe un fișier făcut pe loc: textul pentru o scriere
+    pe un nume inert, pentru `__annotations__` și pentru un nume care nu se poate citi, iar un fișier care
+    doar CITEȘTE nume inerte nu dă nimic."""
+    tele = tmp_path / "sentinel" / "telegram"
+    tele.mkdir(parents=True)
+    imp = "from sentinel.patch import system_update as su\n"
+    (tele / "bot.py").write_text(imp + "su.__name__ = 'x'\n", encoding="utf-8")
+    (tele / "patch_flow.py").write_text(imp + "def f():\n    return su.HostRead.__annotations__\n", encoding="utf-8")
+    (tele / "update_view.py").write_text(imp + "def g(name):\n    return getattr(su.read_host, name)\n",
+                                         encoding="utf-8")
+    (tele / "honest.py").write_text(
+        imp + "import logging\nlog = logging.getLogger(su.__name__)\n"
+        "def h(exc):\n    log.info('%s %s', su.read_host.__qualname__, su.__file__)\n"
+        "    return su.Selection.__doc__, type(exc).__name__\n", encoding="utf-8")
+    seen, problems = _package_problems(tmp_path / "sentinel", tmp_path)
+    assert seen == 4
+    assert not [p for p in problems if p.startswith("honest.py")], problems
+    inert_list = ", ".join(sorted(INERT_DUNDERS))
+    by_file = {}
+    for p in problems:
+        by_file.setdefault(p.split(":")[0], []).append(p)
+    for file in ("bot.py", "patch_flow.py"):
+        message = [p for p in by_file[file] if "atribut dunder" in p]
+        assert message, problems
+        assert all("fără să numească poarta" not in p for p in message), message
+        assert all(inert_list in p and "scriere" in p and "__globals__" in p for p in message), message
+    assert "su.HostRead.__annotations__" in "".join(by_file["patch_flow.py"])
+    unreadable = by_file["update_view.py"]
+    assert len(unreadable) == 1 and "nu e un șir literal" in unreadable[0] and "atribut dunder" not in unreadable[0]
+
+
+def test_the_package_scan_follows_local_aliases_and_reads_a_file_that_only_uses_import_module(tmp_path):
+    """Controlul scanării pachetului pentru regulile de alias, pe un arbore făcut pe loc. Două capcane
+    separate: (1) ștergerea liniei care adună `_module_dunders` sau `_unreadable_attr_names` în
+    `_package_problems` n-ar înroși nimic pe arborele real, unde nimeni nu le folosește; (2) un fișier care
+    aduce modulul DOAR prin `importlib.import_module("sentinel.patch.system_update")` n-are niciun import
+    pe care `_import_forms` să-l vadă, deci scanarea îl sărea (`if not (taken or aliases): continue`) fără
+    să-l citească — exact fișierul pe care o ocolire l-ar folosi. Un fișier cinstit în același arbore, cu
+    obiecte NOI scoase din lanț prin apel, nu are voie să dea nimic."""
+    tele = tmp_path / "sentinel" / "telegram"
+    tele.mkdir(parents=True)
+    imp = "from sentinel.patch import system_update as su\n"
+    (tele / "bot.py").write_text(
+        imp + f"def a():\n    f = su.read_host\n    f.__globals__.update({_GATE_OFF})\n", encoding="utf-8")
+    (tele / "patch_flow.py").write_text(
+        imp + "def b(name):\n    return getattr(su.read_host, name)\n"
+        "def c():\n    m = su\n    m.READ_ONLY_FLAGS = {}\n", encoding="utf-8")
+    (tele / "update_view.py").write_text(
+        "import importlib\n"
+        f"importlib.import_module('sentinel.patch.system_update').__dict__.update({_GATE_OFF})\n", encoding="utf-8")
+    (tele / "honest.py").write_text(
+        imp + "import copy\nimport functools\n"
+        "async def g(db, cfg):\n    sel = copy.copy(su.Selection(error='x'))\n    sel.error = None\n"
+        "    return sel.__class__, su.Selection(error='y').__class__, functools.wraps(su.read_host)\n",
+        encoding="utf-8")
+    seen, problems = _package_problems(tmp_path / "sentinel", tmp_path)
+    assert seen == 4, (seen, problems)
+    assert {p.split(":")[0] for p in problems if not p.startswith("honest.py:") and ":" in p} == {
+        "bot.py", "patch_flow.py", "update_view.py"}, problems
+    assert [p for p in problems if p.startswith("bot.py:") and "atribut dunder" in p], problems
+    assert [p for p in problems if p.startswith("patch_flow.py:") and "nu e un șir literal" in p], problems
+    assert [p for p in problems if p.startswith("patch_flow.py:") and "scrie în system_update" in p], problems
+    assert [p for p in problems if p.startswith("update_view.py:") and "atribut dunder" in p], problems
     assert not [p for p in problems if p.startswith("honest.py")], problems
 
 
