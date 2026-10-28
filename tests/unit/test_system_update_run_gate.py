@@ -15,6 +15,7 @@ lista albă — asta s-a măsurat pe RPM 4.16 (doar `--eval` execută `%(...)`) 
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 
 import pytest
@@ -162,21 +163,107 @@ def test_the_queries_the_module_really_makes_pass_through_unchanged_and_without_
     assert [a for a, _ in spawns.calls] == [("dpkg-query", "-W", "-f", su._DPKG_QF, "openssl")]
 
 
-def test_an_unlisted_flag_is_refused_until_the_list_names_it(monkeypatch):
+def test_an_unlisted_flag_is_refused_until_the_gate_is_widened_on_purpose(monkeypatch):
     """Prețul unei liste albe, spus pe față: un flag de citire pe care azi nu-l folosește nimeni e
     refuzat până când lista îl numește (`--queryformat` e sinonimul lui `--qf` și e refuzat azi). Aici,
     cu un flag inventat, ca testul să nu devină fals în ziua în care `--queryformat` e adăugat cu
-    adevărat. Adăugat în `READ_ONLY_FLAGS`, flagul trece și procesul pornește: lista citită la
-    execuție e cea din modul, nu o copie."""
+    adevărat. Lărgirea o face `widen_gate` (împachetează poarta, vizibil în test), iar martorul pozitiv
+    arată că argv-ul era altfel în regulă: refuzul de la început era al flagului, nu al altui cuvânt."""
     spawns = _spawns(monkeypatch, sup.FakeHost())
     argv = ["rpm", "-q", "--flag-inventat-de-test", su._RPM_QF, "bash"]
     with pytest.raises(su.RefusedCommand):
         run(su._run(argv))
     assert spawns.calls == []
-    monkeypatch.setattr(su, "READ_ONLY_FLAGS", {**su.READ_ONLY_FLAGS,
-                                                "rpm": (*su.READ_ONLY_FLAGS["rpm"], "--flag-inventat-de-test")})
+    sup.widen_gate(monkeypatch, flags={**su.READ_ONLY_FLAGS,
+                                       "rpm": (*su.READ_ONLY_FLAGS["rpm"], "--flag-inventat-de-test")})
     run(su._run(argv))
     assert len(spawns.calls) == 1
+
+
+_WIDE_FLAGS = {"rpm": ("-q", "--qf", "--whatprovides", "--flag-inventat"), "dpkg-query": ("-W", "-f")}
+
+#: Fiecare formă prin care parametrii limitei se rescriau din ALT fișier cu o simplă atribuire pe
+#: numele din modul (măsurat de verificator pe `e6e9768`: trei linii în `bot.py` lăsau garda pe AST la
+#: 71 verzi, iar la execuție `rpm -q --flag-inventat bash` pornea). Fiecare caz: atribuirile care
+#: ar lărgi poarta, argv-ul interzis pe care l-ar lăsa să treacă, și cum se lărgește poarta LEGITIM
+#: (martorul pozitiv: argv-ul e bine format, deci refuzul vine doar din listă).
+FROM_OUTSIDE = {
+    "flag list replaced": (
+        [("READ_ONLY_FLAGS", _WIDE_FLAGS)],
+        ["rpm", "-q", "--flag-inventat", "bash"], dict(flags=_WIDE_FLAGS)),
+    "program and mode added": (
+        [("READ_ONLY_MODE", {"rpm": "-q", "dpkg-query": "-W", "dnf": "-y"}),
+         ("READ_ONLY_FLAGS", {**_WIDE_FLAGS, "dnf": ("-y",)})],
+        ["dnf", "-y", "update"], dict(modes={"rpm": "-q", "dnf": "-y"}, flags={"dnf": ("-y",)})),
+    "macro pattern disabled": (
+        [("_MACRO_EXEC", re.compile(r"(?!)"))],
+        ["rpm", "-q", "--qf", "%(echo X)", "bash"], dict(macro_exec=re.compile(r"(?!)"))),
+}
+
+
+@pytest.mark.parametrize("label", list(FROM_OUTSIDE))
+def test_assigning_to_the_module_names_from_outside_does_not_change_what_the_gate_refuses(monkeypatch, label):
+    """Operatorul nu vede un `system_update.READ_ONLY_FLAGS = {...}` pus în `bot.py` sau în `patch_flow`:
+    garda pe AST citea atribuirea LITERALĂ din `system_update.py`, nu starea de la rulare, iar poarta
+    citea globalele modulului la fiecare apel. Rezultatul: `rpm -q --flag-inventat bash` (sau
+    `dnf -y update`) pornea ca utilizatorul `sentinel`, din grupul `docker`, cu suita verde. Poarta
+    își leagă acum lista la definire: atribuirea ia efect pe NUME (verificat mai jos, ca testul să
+    nu treacă pe gol) și nu schimbă nimic din ce se refuză."""
+    assignments, argv, widen = FROM_OUTSIDE[label]
+    spawns = _spawns(monkeypatch)
+    for name, value in assignments:
+        monkeypatch.setattr(su, name, value)
+        assert getattr(su, name) is value, "atribuirea n-a ajuns pe modul: testul nu probează nimic"
+    with pytest.raises(su.RefusedCommand):
+        run(su._run(argv))
+    assert spawns.calls == [], f"a pornit ceva după o atribuire din afară: {spawns.calls}"
+    # martorul pozitiv: același argv trece când poarta e lărgită pe calea vizibilă a testelor
+    sup.widen_gate(monkeypatch, **widen)
+    run(su._run(argv))
+    assert len(spawns.calls) == 1
+
+
+def test_a_provides_list_rewritten_from_outside_is_still_stopped_by_the_gate(monkeypatch):
+    """`_INSTALLONLY_PROVIDES` e citită de `read_host` când construiește argv-ul; un fișier care o
+    înlocuiește cu un flag, împreună cu lista de flag-uri, făcea ca `rpm -q --whatprovides` să primească
+    un cuvânt pe care nu l-a aprobat nimeni. Primul argv (numele pachetelor) e legitim și pornește;
+    al doilea trebuie să ridice `RefusedCommand`, iar flagul inventat să nu ajungă la niciun proces."""
+    spawns = _spawns(monkeypatch, sup.FakeHost())
+    monkeypatch.setattr(su, "_INSTALLONLY_PROVIDES", ("--flag-inventat", "installonlypkg(kernel)"))
+    monkeypatch.setattr(su, "READ_ONLY_FLAGS", _WIDE_FLAGS)
+    with pytest.raises(su.RefusedCommand):
+        run(su.read_host("rhel", ["httpd"]))
+    started = [a for a, _ in spawns.calls]
+    assert len(started) == 1 and "--whatprovides" not in started[0], started
+    assert all("--flag-inventat" not in a for a in started), started
+
+
+def test_the_listed_constants_cannot_be_edited_in_place():
+    """`system_update.READ_ONLY_MODE["dnf"] = "-y"` e o linie, iar un dicționar legat la definire ca
+    parametru implicit ar fi rămas mutabil prin numele lui. Vederile nu se pot scrie, iar valorile din
+    `READ_ONLY_FLAGS` sunt tuple: nicio formă de editare pe loc nu lărgește poarta."""
+    def item_assign():
+        su.READ_ONLY_MODE["dnf"] = "-y"
+
+    def flags_item_assign():
+        su.READ_ONLY_FLAGS["dnf"] = ("-y",)
+
+    def flags_augment():
+        su.READ_ONLY_FLAGS["rpm"] += ("--eval",)
+
+    def flags_update():
+        su.READ_ONLY_FLAGS.update({"dnf": ("-y",)})
+
+    def mode_pop():
+        su.READ_ONLY_MODE.pop("rpm")
+
+    def rpm_tuple_append():
+        su.READ_ONLY_FLAGS["rpm"].append("--eval")
+
+    for attempt in (item_assign, flags_item_assign, flags_augment, flags_update, mode_pop, rpm_tuple_append):
+        with pytest.raises((TypeError, AttributeError)):
+            attempt()
+    assert "dnf" not in su.READ_ONLY_MODE and "--eval" not in su.READ_ONLY_FLAGS["rpm"]
 
 
 def test_a_refusal_inside_read_host_is_raised_not_turned_into_a_host_error(monkeypatch):

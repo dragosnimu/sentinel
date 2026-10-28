@@ -47,9 +47,13 @@ porni în afară de `system`/`popen`. O singură mutație (`approvals.issue`, un
      `_run`). Comportamentul îl probează `tests/unit/test_system_update_run_gate.py` (mock pe
      `create_subprocess_exec`, neatins). Aici se păzește lanțul care face limita adevărată: lista albă
      e citită din `system_update.py` și trebuie să fie cea aprobată în acest fișier (o lărgire pică),
-     poarta e prima instrucțiune din `_run`, procesul primește exact `*argv`, `argv` nu e legat de
-     nou, iar nicio funcție de pornit procese nu e luată ca valoare (`_launcher_problems`); nimic din
-     pachet nu ia `_run` (`test_nothing_outside_system_update_touches_the_run_function`);
+     iar poarta și-o LEAGĂ la definire (implicite kw-only peste vederi `MappingProxyType`), nu o citește
+     din modul la apel — altfel o atribuire pe numele din modul, din ORICE fișier, schimba ce refuză
+     poarta cu garda verde; poarta e prima instrucțiune din `_run`, procesul primește exact `*argv`,
+     `argv` nu e legat de nou, procesul pornește ÎN `_run`, iar nicio funcție de pornit procese nu e luată
+     ca valoare (`_launcher_problems`); nimic din pachet nu ia `_run`, nu numește poarta sau
+     constantele ei, nu atribuie, nu șterge și nu scrie pe un indice al modulului (`_module_writes`,
+     în `test_nothing_outside_system_update_touches_the_run_function`);
   6. `bot.py` nu importă runnerul, backup-ul sau clientul executorului nicăieri în fișier.
 
 Garda mărginește FELUL instrucțiunii, nu efectul ei: un `SELECT` care cheamă `pg_terminate_backend`
@@ -66,6 +70,16 @@ apel pe care `_spawns` să-l poată citi; sunt ocoliri deliberate, nu greșeli d
 le vede în diff. Ce NU acoperă poarta 5: un proces pornit prin alt drum decât `_run` (`os.system`,
 `ctypes`), pe care îl numără doar `_spawns`; și un `rpm` cu un flag din lista albă pe care o versiune
 viitoare l-ar face să execute ceva (pe RPM 4.16 doar `--eval` execută, dovedit pe gazdă).
+
+Uși rămase deschise după ce scrierile în modul sunt închise (la execuție parametrii porții nu mai
+depind de numele din modul, deci o atribuire nu o mai lărgește; ce urmează schimbă FUNCȚIA, nu
+parametrii): cod care ajunge la poartă fără să numească modulul (`gc.get_objects()`,
+`sys.modules[...]`), `__kwdefaults__`/`__code__` ale funcției luate printr-o referință pe care garda nu
+o vede ca pornind de la modul, `asyncio.create_subprocess_exec = ...` pus din alt fișier (schimbă ce
+PORNEȘTE, nu ce refuză poarta), și orice fișier în afara lui `sentinel/` — testele își lărgesc poarta
+înfășurând-o (`tests/unit/_system_update_support.py::widen_gate`), și asta e calea lor vizibilă.
+Un `Subscript` pe `argv` în `_run` rămâne permis dinadins: vezi `LAUNCHER_MUTATIONS`, intrările «spawn
+behind a helper».
 """
 from __future__ import annotations
 
@@ -1622,6 +1636,18 @@ def test_the_argv_gate_refuses_a_read_only_program_that_is_told_to_run_something
 GATE_CONSTANTS = ("READ_ONLY_MODE", "READ_ONLY_FLAGS", "_MACRO_EXEC")
 APPROVED_MACRO_PATTERN = _MACRO_EXEC.pattern
 
+#: Parametrul prin care poarta primește fiecare constantă. Poarta le LEAGĂ la definire (implicite
+#: kw-only), nu le citește din modul la apel: cu citire la apel, o atribuire din ORICE fișier pe numele
+#: din modul (`system_update.READ_ONLY_FLAGS = {...}`) schimba ce refuză poarta, iar garda pe AST,
+#: care citește atribuirea LITERALĂ din `system_update.py`, rămânea verde (71 passed, măsurat pe
+#: `e6e9768`). Singura citire permisă a unei constante, deci, e ca implicită a parametrului ei.
+GATE_PARAMS = {"READ_ONLY_MODE": "modes", "READ_ONLY_FLAGS": "flags", "_MACRO_EXEC": "macro_exec"}
+
+#: Tot ce din `system_update` alcătuiește poarta: niciun alt fișier din `sentinel/` nu are un motiv să
+#: numească vreunul dintre ele. Un dicționar luat de pe modul și modificat cu `.update(...)` nu e o
+#: atribuire pe care `_module_writes` s-o vadă, dar e un nume pe care garda de pachet îl refuză.
+GATE_SURFACE = frozenset(GATE_CONSTANTS) | {"_require_read_only"}
+
 
 def _bound_values(node: ast.stmt, name: str) -> list[ast.expr]:
     if isinstance(node, ast.Assign):
@@ -1676,12 +1702,18 @@ def _only_called(tree: ast.Module, name: str) -> list[tuple[int, str]]:
     return out
 
 
-def _gate_constant_problems(tree: ast.Module) -> list[str]:
-    """Constantele listei albe: legate O dată, literale, EXACT cele aprobate, și folosite doar ca
-    `X[cheie]` / `cheie in X` (nu `.update`, nu atribuire pe element, nu pasate)."""
+def _gate_constant_problems(tree: ast.Module, approved_mode=READ_ONLY_MODE, approved_flags=READ_ONLY_FLAGS,
+                            approved_macro: str = APPROVED_MACRO_PATTERN) -> list[str]:
+    """Constantele listei albe: legate O dată, EXACT cele aprobate, vederi doar-citire peste un literal
+    (`MappingProxyType(...)`), iar singura lor citire e ca implicită kw-only a parametrului lor din
+    `_require_read_only`. Corpul porții citește parametrii, nu constantele: de asta o atribuire din
+    afară pe numele din modul nu o mai lărgește.
+
+    `approved_*` sunt parametri doar ca un control să poată arăta că o lărgire APROBATĂ (schimbată și în
+    producție, și aici) trece; apelul normal le ia pe cele din acest fișier."""
     out: list[str] = []
-    approved = {"READ_ONLY_MODE": READ_ONLY_MODE,
-                "READ_ONLY_FLAGS": {k: set(v) for k, v in READ_ONLY_FLAGS.items()}}
+    approved = {"READ_ONLY_MODE": dict(approved_mode),
+                "READ_ONLY_FLAGS": {k: set(v) for k, v in approved_flags.items()}}
     for name in GATE_CONSTANTS:
         values = [v for node in tree.body for v in _bound_values(node, name)]
         if len(values) != 1:
@@ -1695,11 +1727,18 @@ def _gate_constant_problems(tree: ast.Module) -> list[str]:
                   and ast.unparse(value.args[1]) == "re.IGNORECASE")
             if not ok:
                 out.append("`_MACRO_EXEC` nu e `re.compile(<literal>, re.IGNORECASE)`: nu-l pot citi")
-            elif value.args[0].value != APPROVED_MACRO_PATTERN:
+            elif value.args[0].value != approved_macro:
                 out.append(f"`_MACRO_EXEC` nu mai e expresia aprobată: {value.args[0].value!r}")
             continue
+        # Un dicționar legat ca parametru implicit rămâne mutabil prin numele lui din modul
+        # (`su.READ_ONLY_MODE["dnf"] = "-y"`); o vedere nu. Forma face parte din ce e aprobat.
+        if not (isinstance(value, ast.Call) and ast.unparse(value.func) == "MappingProxyType"
+                and len(value.args) == 1 and not value.keywords):
+            out.append(f"`{name}` nu e `MappingProxyType(<literal>)`: legat la definire ca parametru "
+                       "implicit, un dicționar obișnuit ar rămâne mutabil prin numele lui din modul")
+            continue
         try:
-            got = ast.literal_eval(value)
+            got = ast.literal_eval(value.args[0])
         except (ValueError, SyntaxError):
             out.append(f"`{name}` nu e un literal: nu-l pot citi")
             continue
@@ -1709,26 +1748,44 @@ def _gate_constant_problems(tree: ast.Module) -> list[str]:
                                                   for v in got.values())):
                 out.append("`READ_ONLY_FLAGS` nu e un dicționar de tuple de șiruri, fără dubluri")
                 continue
+            if not all(isinstance(v, tuple) for v in got.values()):
+                out.append("`READ_ONLY_FLAGS` ține liste, nu tuple: o listă se poate lărgi pe loc")
             got = {k: set(v) for k, v in got.items()}
         if got != approved[name]:
             out.append(f"`{name}` nu mai e lista aprobată: {got!r} (aprobat: {approved[name]!r}). O "
                        "lărgire e o decizie: schimb-o și aici, în aceeași schimbare, cu motivul")
-    parents = _parents(tree)
-    for n in ast.walk(tree):
-        if not (isinstance(n, ast.Name) and n.id in GATE_CONSTANTS):
-            continue
-        parent = parents.get(id(n))
-        if isinstance(n.ctx, (ast.Store, ast.Del)):
-            continue                                   # numărate mai jos: exact una, cea de la nivel de modul
-        if n.id == "_MACRO_EXEC":
-            ok = isinstance(parent, ast.Attribute) and parent.value is n and parent.attr == "search"
+
+    gate = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_require_read_only"), None)
+    bound: dict[int, str] = {}
+    if gate is None:
+        out.append("`_require_read_only` lipsește: nu există unde să se lege lista albă")
+    else:
+        a = gate.args
+        if not ([x.arg for x in a.args] == ["argv"] and not a.posonlyargs and a.vararg is None
+                and a.kwarg is None and not a.defaults
+                and [x.arg for x in a.kwonlyargs] == list(GATE_PARAMS.values())):
+            out.append("semnătura lui `_require_read_only` nu e `(argv, *, modes, flags, macro_exec)`")
         else:
-            ok = ((isinstance(parent, ast.Subscript) and parent.value is n and isinstance(parent.ctx, ast.Load))
-                  or (isinstance(parent, ast.Compare) and n in parent.comparators
-                      and all(isinstance(op, (ast.In, ast.NotIn)) for op in parent.ops)))
-        if not ok:
-            out.append(f"linia {n.lineno}: `{n.id}` folosit altfel decât citit "
-                       f"({ast.unparse(parent)[:60]}): lista aprobată nu se modifică din cod")
+            for arg, default in zip(a.kwonlyargs, a.kw_defaults, strict=True):
+                want = next(k for k, v in GATE_PARAMS.items() if v == arg.arg)
+                if isinstance(default, ast.Name) and default.id == want:
+                    bound[id(default)] = want
+                else:
+                    out.append(f"parametrul `{arg.arg}` nu are ca implicită numele `{want}` (e "
+                               f"{ast.unparse(default) if default is not None else 'fără implicită'}): "
+                               "poarta trebuie să lege constanta la definire, ca atare")
+            loaded = {n.id for stmt in gate.body for n in ast.walk(stmt)
+                      if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+            for param in GATE_PARAMS.values():
+                if param not in loaded:
+                    out.append(f"corpul porții nu citește `{param}`: lista legată la definire nu ar conta")
+                out += [f"linia {line}: `{param}` {what} în corpul porții"
+                        for stmt in gate.body for line, what in _binders(stmt, param)]
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and n.id in GATE_CONSTANTS and isinstance(n.ctx, ast.Load) \
+                and id(n) not in bound:
+            out.append(f"linia {n.lineno}: `{n.id}` citit în afara implicitei lui `{GATE_PARAMS[n.id]}` din "
+                       "poartă: poarta citește valoarea legată la definire, nu numele din modul")
     stores_n = {n.id: 0 for n in ast.walk(tree) if isinstance(n, ast.Name) and n.id in GATE_CONSTANTS}
     for n in ast.walk(tree):
         if isinstance(n, ast.Name) and n.id in stores_n and isinstance(n.ctx, (ast.Store, ast.Del)):
@@ -1866,18 +1923,36 @@ def test_the_only_process_launcher_is_run_and_the_gate_sits_in_front_of_it():
     assert {"_run", "_require_read_only"} <= names
 
 
-def _mutated(old: str | None, new: str, *, append: bool = False, then_append: str = "") -> ast.Module:
+def _mutated(old: str | tuple[str, ...] | None, new: str | tuple[str, ...], *, append: bool = False,
+             then_append: str = "") -> ast.Module:
     """Codul REAL al lui `system_update.py` cu o singură schimbare: `old` -> `new`, sau `new` adăugat
     la coadă (`append`); `then_append` se adaugă la coadă după o înlocuire (o funcție ajutătoare)."""
     src = SYSTEM_UPDATE.read_text(encoding="utf-8")
     if append:
         return ast.parse(src + "\n" + new + "\n")
-    assert old is not None and src.count(old) == 1, f"mutația nu se mai potrivește codului: {old!r}"
-    return ast.parse(src.replace(old, new) + "\n" + then_append + "\n")
+    # `old`/`new` pot fi tupluri de aceeași lungime: mutații care schimbă două locuri, aplicate pe rând,
+    # fiecare cu ancora ei, ca să nu depindă de felul în care e rupt apelul pe linii.
+    for o, n in (zip(old, new, strict=True) if isinstance(old, tuple) else [(old, new)]):
+        assert o is not None and src.count(o) == 1, f"mutația nu se mai potrivește codului: {o!r}"
+        src = src.replace(o, n)
+    return ast.parse(src + "\n" + then_append + "\n")
 
 
 _GATE_LINE = "    _require_read_only(argv)\n"
 _WRAPPER = ('"sh", "-c", \'command -v "$1" || exit 127; dnf -y update; exec "$@"\', "sh", ')
+
+_SPAWN_CALL = "proc = await asyncio.create_subprocess_exec("
+_SPAWN_ARGS = "*argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env)"
+_SPAWNER = ("async def _spawner(*argv, env):\n    return await asyncio.create_subprocess_exec(\n"
+            "        *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env)")
+
+
+def _behind_a_helper(passed: str) -> tuple:
+    """Mutația «procesul pornește într-un ajutor din afara lui `_run`»: apelul din `_run` devine
+    `_spawner(<passed>, env=env)`, iar ajutorul are propriul `create_subprocess_exec(*argv, ...)`. Două
+    ancore, fiecare pe textul real, ca să nu depindă de cum e rupt apelul pe linii."""
+    return ((_SPAWN_CALL, _SPAWN_ARGS), ("proc = await _spawner(", f"{passed}, env=env)"), False, _SPAWNER)
+
 
 #: Fiecare mutație e o formă pe care un apel de aplicare (`dnf -y update`) ar putea intra pe lângă
 #: poartă; textul `old` e din codul REAL, deci un refactor care o mută strică mutația cu mesaj clar.
@@ -1916,14 +1991,40 @@ LAUNCHER_MUTATIONS = {
     "_run rebound": (None, "_run = _run", True),
     "gate function rebound": (None, "_require_read_only = lambda argv: None", True),
     "gate function decorated": ("def _require_read_only(", "@staticmethod\ndef _require_read_only(", False),
-    "mode list widened": ('READ_ONLY_MODE: Final = {', 'READ_ONLY_MODE: Final = {"dnf": "-y", ', False),
-    "flag list widened": ('READ_ONLY_FLAGS: Final = {"rpm": (', 'READ_ONLY_FLAGS: Final = {"rpm": ("--eval", ', False),
+    "mode list widened": ('READ_ONLY_MODE: Final = MappingProxyType({',
+                          'READ_ONLY_MODE: Final = MappingProxyType({"dnf": "-y", ', False),
+    "flag list widened": ('{"rpm": (', '{"rpm": ("--eval", ', False),
+    "mode constant made a plain dict": ('READ_ONLY_MODE: Final = MappingProxyType({"rpm": "-q", "dpkg-query": "-W"})',
+                                        'READ_ONLY_MODE: Final = {"rpm": "-q", "dpkg-query": "-W"}', False),
+    "flags constant made a plain dict": ('READ_ONLY_FLAGS: Final = MappingProxyType(\n    {"rpm"',
+                                         'READ_ONLY_FLAGS: Final = dict(\n    {"rpm"', False),
+    "gate reads the module mode, not its parameter": ("if prog not in modes:", "if prog not in READ_ONLY_MODE:", False),
+    "gate reads the module flags, not its parameter": (
+        'word not in flags[prog]', 'word not in READ_ONLY_FLAGS[prog]', False),
+    "gate reads the module macro pattern, not its parameter": (
+        "if macro_exec.search(word):", "if _MACRO_EXEC.search(word):", False),
+    "gate default is a copy taken from the module": (
+        "flags: Mapping[str, tuple[str, ...]] = READ_ONLY_FLAGS,",
+        "flags: Mapping[str, tuple[str, ...]] = dict(READ_ONLY_FLAGS),", False),
+    "gate default is a literal of its own": (
+        "modes: Mapping[str, str] = READ_ONLY_MODE,", "modes: Mapping[str, str] = {'rpm': '-q'},", False),
+    "gate parameter rebound in its body": (
+        "    prog = argv[0]\n", "    modes = {**modes, 'dnf': '-y'}\n    prog = argv[0]\n", False),
+    "gate handed its own lists by the caller": (_GATE_LINE, "    _require_read_only(argv, modes={})\n", False),
     "macro pattern edited": ('_MACRO_EXEC: Final = re.compile(r"', '_MACRO_EXEC: Final = re.compile(r"(?!)|', False),
     "flags rebound later": (None, 'READ_ONLY_FLAGS = {"rpm": ("--eval",), "dpkg-query": ("-W",)}', True),
     "mode item-assigned later": (None, 'READ_ONLY_MODE["dnf"] = "-y"', True),
     "flags updated later": (None, 'READ_ONLY_FLAGS.update({"rpm": ("--eval",)})', True),
     "flags augmented later": (None, 'READ_ONLY_FLAGS |= {"dnf": ("-y",)}', True),
     "flags handed on": (None, "_x = READ_ONLY_FLAGS", True),
+    # Procesul pornit într-un ajutor din afara lui `_run`, hrănit cu o valoare DERIVATĂ din `argv`. Fiecare
+    # trece toate celelalte reguli (derivarea e o citire permisă; ajutorul are propriul `*argv` exact):
+    # doar «procesul e în `_run`» le înroșește. Un `Subscript` pe `argv` rămâne permis dinadins — a-l
+    # interzice ar închide o ortografie (`argv[0:]`) și ar lăsa deschise `tuple(argv)` sau
+    # `sorted(argv)[1:]`, care trec prin `_PURE_READERS`. Ce îi dă greutate e clauza, nu ortografia.
+    "spawn behind a helper, fed a slice of argv": _behind_a_helper("*argv[0:]"),
+    "spawn behind a helper, fed a tuple copy of argv": _behind_a_helper("*tuple(argv)"),
+    "spawn behind a helper, fed argv sorted and cut": _behind_a_helper("*sorted(argv)[1:]"),
 }
 
 @pytest.mark.parametrize("label", list(LAUNCHER_MUTATIONS))
@@ -1959,6 +2060,30 @@ def test_the_launcher_guard_admits_honest_edits_to_the_run_function():
         assert not _launcher_problems(_mutated(None, new, append=True)), new
 
 
+def test_a_widening_approved_in_both_places_passes_and_one_approved_only_in_production_does_not():
+    """Controlul cinstit al listei albe: o lărgire e o DECIZIE, și garda cere ca ea să apară în două
+    locuri, în aceeași schimbare — în `system_update.py` și aici. Cu amândouă schimbate (flag nou, program
+    nou, tipar de macro nou) nu trebuie să dea nimic: altfel prima lărgire cinstită ar șterge garda. Doar
+    în producție, fără aprobarea de aici, trebuie să dea roșu — asta e proba că aprobarea contează."""
+    # Ancorele sunt începuturile stabile ale celor trei declarații, nu textul listelor: o lărgire
+    # cinstită (un flag în plus) nu are voie să strice controlul care o păzește. Valorile adăugate sunt
+    # inventate, ca să nu se ciocnească de o lărgire reală aprobată între timp.
+    wider_flags = {**READ_ONLY_FLAGS, "rpm": READ_ONLY_FLAGS["rpm"] | {"--flag-de-control"}}
+    widened_flags = _mutated('{"rpm": (', '{"rpm": ("--flag-de-control", ')
+    assert _gate_constant_problems(widened_flags, approved_flags=wider_flags) == []
+    assert _gate_constant_problems(widened_flags), "lărgirea neaprobată aici trebuie să pice"
+    wider_mode = {**READ_ONLY_MODE, "program-de-control": "-q"}
+    widened_mode = _mutated('MappingProxyType({"rpm": "-q"', 'MappingProxyType({"program-de-control": "-q", "rpm": "-q"')
+    assert _gate_constant_problems(widened_mode, approved_mode=wider_mode) == []
+    assert _gate_constant_problems(widened_mode)
+    extra = r"%\{\s*tipar-de-control\s*:|"
+    widened_macro = _mutated('_MACRO_EXEC: Final = re.compile(r"', '_MACRO_EXEC: Final = re.compile(r"' + extra)
+    assert _gate_constant_problems(widened_macro, approved_macro=extra + APPROVED_MACRO_PATTERN) == []
+    assert _gate_constant_problems(widened_macro)
+    # și forma de azi, nemodificată, trece cu aprobările de azi
+    assert _gate_constant_problems(_tree(SYSTEM_UPDATE)) == []
+
+
 def test_the_launcher_guard_reads_every_binding_form_of_argv_and_of_the_function_names():
     """`_binders` e baza regulilor de mai sus: dacă nu ar vedea o formă de legare (`except ... as
     argv`, `for argv in`, `with ... as argv`, `import ... as argv`, un `def argv` sau un `lambda
@@ -1978,7 +2103,32 @@ def _run_touched(tree: ast.Module, current: str) -> set[str]:
     folosită și de testul pe pachet, și de controlul lui pozitiv: două copii ale expresiei ar putea
     diverge, iar controlul ar trece pe o expresie pe care testul n-o mai folosește."""
     taken, used = _module_uses(tree, "sentinel.patch.system_update", current)
-    return (taken | used) & {"_run", "*"}
+    return (taken | used) & ({"_run", "*"} | GATE_SURFACE)
+
+
+def _module_writes(tree: ast.Module, target: str, current: str = THIS_MODULE) -> list[tuple[int, str]]:
+    """`(linie, text)` pentru fiecare țintă de scriere (`Store`/`Del`) al cărei lanț de atribute și
+    indici pornește de la modulul `target`: `su.X = ...`, `su.X += ...`, `del su.X`,
+    `su.READ_ONLY_MODE["dnf"] = "-y"`, `su._require_read_only.__kwdefaults__ = ...`,
+    `sentinel.patch.system_update.X = ...`, `patch.system_update = fake` — în orice context (`for`, `with`,
+    destructurare). Un dicționar rămâne mutabil chiar dacă numele lui nu se rescrie, de-aia și indicele.
+
+    Garda pe `system_update.py` citește atribuirea LITERALĂ din acel fișier; asta e forma pe care o face
+    un ALT fișier, și pe care garda aceea n-o poate vedea (măsurat pe `e6e9768`: trei linii în `bot.py`,
+    71 passed)."""
+    _, aliases = _import_forms(tree, target, current)
+    base = target.rpartition(".")[2]
+
+    def rooted(node: ast.AST) -> bool:
+        while isinstance(node, (ast.Attribute, ast.Subscript)):
+            if isinstance(node, ast.Attribute) and node.attr == base:
+                return True
+            node = node.value
+        return isinstance(node, ast.Name) and node.id in aliases
+
+    return [(n.lineno, ast.unparse(n)) for n in ast.walk(tree)
+            if isinstance(n, (ast.Attribute, ast.Subscript)) and isinstance(n.ctx, (ast.Store, ast.Del))
+            and rooted(n.value if isinstance(n, ast.Subscript) else n)]
 
 
 def test_nothing_outside_system_update_touches_the_run_function():
@@ -1987,29 +2137,70 @@ def test_nothing_outside_system_update_touches_the_run_function():
     sunt apeluri pe care o gardă pe `system_update.py` să le vadă. Poarta din `_run` le-ar refuza
     oricum; asta le prinde în diff, înainte să ajungă să se bazeze pe ea. Se citește TOT pachetul
     `sentinel/`, nu trei fișiere: orice import al lui `system_update` (relativ, cu alias, din
-    funcție) care ia `_run`, sau `*`, sau pasează modulul mai departe, e o constatare."""
+    funcție) care ia `_run`, sau `*`, sau numește poarta ori constantele ei, sau pasează modulul mai
+    departe, sau SCRIE pe modul (atribuire, ștergere, indice: `_module_writes`), e o constatare.
+
+    Scrierile contează fiindcă un alt fișier poate lărgi limita cu o linie — `system_update
+    .READ_ONLY_FLAGS = {...}` în `bot.py`, sau același lucru într-o funcție din `patch_flow` — fără să
+    atingă nimic din `system_update.py`, pe care garda de lanț îl citește. Poarta nu mai depinde de
+    numele din modul (e legată la definire), dar o scriere de felul ăsta rămâne o încercare, iar un
+    diff trebuie să o arate."""
+    seen, problems = _package_problems(ROOT / "sentinel", ROOT)
+    assert seen >= 3, f"garda vede doar {seen} fișiere care importă system_update (bot, update_view, patch_flow)"
+    assert not problems, "\n".join(problems)
+
+
+def _package_problems(package: Path, base: Path) -> tuple[int, list[str]]:
+    """(câte fișiere importă `system_update`, constatările) pentru TOATE fișierele din `package`, în afară
+    de `system_update.py`. O funcție de sine stătătoare, ca un control să o poată rula pe un arbore făcut
+    pe loc: dacă citirea pachetului ar pierde o regulă (cineva șterge linia care adună scrierile), testul
+    de pe arborele real ar rămâne verde — nimic nu scrie azi în modul —, și doar un fișier otrăvit pus în
+    față o vede lipsind."""
     target = "sentinel.patch.system_update"
     seen = 0
     problems: list[str] = []
-    for path in sorted((ROOT / "sentinel").rglob("*.py")):
+    for path in sorted(package.rglob("*.py")):
         if path == SYSTEM_UPDATE:
             continue
         text = path.read_text(encoding="utf-8")
         if "system_update" not in text:
             continue
-        rel = path.relative_to(ROOT).with_suffix("").parts
-        current = ".".join(rel)
+        current = ".".join(path.relative_to(base).with_suffix("").parts)
         tree = ast.parse(text)
         taken, aliases = _import_forms(tree, target, current)
         if not (taken or aliases):
             continue
         seen += 1
         problems += [f"{path.name}: atinge `{x}` din system_update" for x in sorted(_run_touched(tree, current))]
+        problems += [f"{path.name}:{line}: scrie în system_update (`{shown}`)"
+                     for line, shown in _module_writes(tree, target, current)]
         escaped = _escapes(tree, target, current)
         if escaped:
             problems.append(f"{path.name}: pasează modulul system_update ca valoare ({sorted(escaped)})")
-    assert seen >= 3, f"garda vede doar {seen} fișiere care importă system_update (bot, update_view, patch_flow)"
-    assert not problems, "\n".join(problems)
+    return seen, problems
+
+
+def test_the_package_scan_finds_a_poisoned_file_and_stays_quiet_on_an_honest_one(tmp_path):
+    """Controlul scanării în sine, pe un arbore făcut pe loc, cu cele două forme măsurate pe `e6e9768`
+    (atribuiri la nivel de modul într-un fișier ca `bot.py`; import în funcție + atribuire într-unul ca
+    `patch_flow.py`). Fără el, ștergerea liniei care adună scrierile în scanarea pachetului nu ar înroși
+    nimic: pe arborele real nu scrie nimeni în modul. Un fișier cinstit în același arbore nu are voie să
+    dea nimic — altfel garda ar fi una pe care cineva o șterge."""
+    tele = tmp_path / "sentinel" / "telegram"
+    tele.mkdir(parents=True)
+    imp = "from sentinel.patch import system_update as _su\n"
+    (tele / "bot.py").write_text(imp + '_su.READ_ONLY_FLAGS = {"rpm": ("--flag-inventat",)}\n'
+                                 "_su.READ_ONLY_MODE['dnf'] = '-y'\n", encoding="utf-8")
+    (tele / "patch_flow.py").write_text(
+        "def f():\n    from sentinel.patch import system_update\n"
+        "    system_update._MACRO_EXEC = None\n", encoding="utf-8")
+    (tele / "honest.py").write_text(imp + "async def g(db, cfg):\n    return await _su.select(db, cfg)\n",
+                                    encoding="utf-8")
+    seen, problems = _package_problems(tmp_path / "sentinel", tmp_path)
+    assert seen == 3
+    assert {p.split(":")[0] for p in problems} == {"bot.py", "patch_flow.py"}, problems
+    writes = [p for p in problems if "scrie în system_update" in p]
+    assert len(writes) == 3, problems
 
 
 def test_the_package_wide_guard_sees_run_taken_through_every_door():
@@ -2027,6 +2218,58 @@ def test_the_package_wide_guard_sees_run_taken_through_every_door():
         assert _run_touched(ast.parse(source), "sentinel.patch.other"), source
     assert not _run_touched(ast.parse("from sentinel.patch import system_update as su\nsu.select(db, cfg)"),
                             "sentinel.patch.other")
+
+
+_SU_HEAD = "from sentinel.patch import system_update as su\n"
+
+
+def test_the_package_wide_guard_sees_every_write_into_the_module_and_admits_honest_use():
+    """Controlul pozitiv al scrierilor: `s = su.X = ...` pe `READ_ONLY_FLAGS`, `_MACRO_EXEC`,
+    `_INSTALLONLY_PROVIDES` și pe poartă, atribuire, atribuire augmentată, ștergere, pe indice
+    (`su.READ_ONLY_MODE["dnf"] = "-y"`, o linie, pe un dicționar mutabil), pe atributele funcției, în
+    destructurare, `for`, `with`, într-o funcție, prin `import sentinel.patch.system_update` și prin
+    pachetul `patch`. Fără ele, `test_nothing_outside_...` ar putea citi pachetul și nu găsi nimic cu un
+    cititor stricat. Controalele cinstite: apeluri și citiri ale modulului, atribute scrise pe ALTE
+    obiecte, inclusiv unul întors de o funcție a modulului."""
+    for source in (
+            "su.READ_ONLY_FLAGS = {'rpm': ('--flag-inventat',)}",
+            "su._MACRO_EXEC = re.compile('(?!)')",
+            "su._INSTALLONLY_PROVIDES = ('--flag-inventat',)",
+            "su._require_read_only = lambda argv: None",
+            "su.READ_ONLY_MODE['dnf'] = '-y'",
+            "su.READ_ONLY_FLAGS['rpm'] += ('--eval',)",
+            "su.READ_ONLY_FLAGS |= {}",
+            "del su.READ_ONLY_MODE",
+            "del su.READ_ONLY_MODE['rpm']",
+            "(su.A, su.B) = 1, 2",
+            "for su.X in y:\n    pass",
+            "with f() as su.X:\n    pass",
+            "su._require_read_only.__kwdefaults__ = {}",
+            "su._run.__defaults__ = (1,)",
+            "su.asyncio.create_subprocess_exec = hook",
+            "def f():\n    from sentinel.patch import system_update as s2\n    s2.X = 1",
+            "def f():\n    from sentinel.patch import system_update\n    system_update.READ_ONLY_MODE['x'] = 'y'"):
+        found = _module_writes(ast.parse(_SU_HEAD + source if "import" not in source else source),
+                               "sentinel.patch.system_update", "sentinel.telegram.bot")
+        assert found, source
+    for source in ("import sentinel.patch.system_update\nsentinel.patch.system_update.X = 1",
+                   "import sentinel.patch.system_update\nsentinel.patch.system_update.D['k'] = 1",
+                   "from sentinel import patch\npatch.system_update = fake",
+                   "from . import system_update as s\ns.X = 1"):
+        assert _module_writes(ast.parse(source), "sentinel.patch.system_update", "sentinel.patch.other"), source
+    for source in ("su.select(db, cfg)", "x = su.GENERATED_BY", "obj.field = 1", "d['k'] = su.SCOPE_SYSTEM",
+                   "su.Selection(error='x').error = 'y'", "cfg.platform.family = 'rhel'",
+                   "async def f(db):\n    sel = await su.select(db, None)\n    sel.error = None"):
+        assert not _module_writes(ast.parse(_SU_HEAD + source), "sentinel.patch.system_update",
+                                  "sentinel.telegram.bot"), source
+    # Numele porții și ale constantelor ei: citite, pasate sau importate, nu doar scrise.
+    for source in (_SU_HEAD + "su.READ_ONLY_FLAGS.update({'dnf': ('-y',)})",
+                   _SU_HEAD + "x = su.READ_ONLY_MODE",
+                   _SU_HEAD + "su._require_read_only(['x'])",
+                   _SU_HEAD + "su._MACRO_EXEC.search('x')",
+                   "from sentinel.patch.system_update import READ_ONLY_MODE as m\nm['dnf'] = '-y'",
+                   "from sentinel.patch.system_update import _require_read_only"):
+        assert _run_touched(ast.parse(source), "sentinel.telegram.bot") & GATE_SURFACE, source
 
 
 def test_the_command_in_bot_py_reaches_for_nothing_in_the_approval_or_the_runner():

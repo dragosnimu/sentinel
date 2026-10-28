@@ -101,7 +101,9 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Final
 
 from sentinel.constants import REBOOT_REQUIRED_PACKAGES
@@ -306,7 +308,12 @@ def needs_reboot(name: str) -> bool:
 # ---------------------------------------------------------------------------
 #: Singurele programe pe care le pornește acest modul, și modul pe care trebuie să-l aibă ca
 #: `argv[1]`. Cheia e numele GOL al programului (nu o cale): `/tmp/rpm` nu e `rpm`.
-READ_ONLY_MODE: Final = {"rpm": "-q", "dpkg-query": "-W"}
+#:
+#: `MappingProxyType`, nu `dict`: poarta (`_require_read_only`) își leagă valorile la DEFINIREA ei, ca
+#: parametri cu implicită, iar un dicționar legat așa ar rămâne mutabil prin numele lui din modul
+#: (`system_update.READ_ONLY_MODE["dnf"] = "-y"` — o linie, din orice fișier). Vederea nu se poate
+#: scrie. Pe nume se poate încă REATRIBUI, dar poarta nu mai citește numele: citește ce a legat atunci.
+READ_ONLY_MODE: Final = MappingProxyType({"rpm": "-q", "dpkg-query": "-W"})
 
 #: Ce flag-uri (cuvinte care încep cu `-`) are voie să primească fiecare program. Nu o listă de
 #: flag-uri INTERZISE: `rpm` are `--eval`/`-E`, `--define`/`-D`, `--macros`, `--rcfile`, `--pipe`
@@ -318,7 +325,8 @@ READ_ONLY_MODE: Final = {"rpm": "-q", "dpkg-query": "-W"}
 #: (grup `docker`, deci root prin soclu) și e o decizie, nu o corecție: o pază din
 #: `tests/security/test_update_has_no_second_apply_path.py` citește valorile din acest fișier și
 #: pică dacă nu sunt cele aprobate acolo.
-READ_ONLY_FLAGS: Final = {"rpm": ("-q", "--qf", "--whatprovides"), "dpkg-query": ("-W", "-f")}
+READ_ONLY_FLAGS: Final = MappingProxyType(
+    {"rpm": ("-q", "--qf", "--whatprovides"), "dpkg-query": ("-W", "-f")})
 
 #: `%(...)` și `%{lua:...}` execută cod când `rpm` expandează o macro (`rpm --eval "%(id)"`).
 _MACRO_EXEC: Final = re.compile(r"%\(|%\{\s*lua\s*:", re.IGNORECASE)
@@ -338,9 +346,21 @@ class RefusedCommand(Exception):
     care moare cu o excepție pe care nu o prinde nimeni tace — iar canalul acela e singurul."""
 
 
-def _require_read_only(argv: Any) -> None:
+def _require_read_only(argv: Any, *, modes: Mapping[str, str] = READ_ONLY_MODE,
+                       flags: Mapping[str, tuple[str, ...]] = READ_ONLY_FLAGS,
+                       macro_exec: re.Pattern[str] = _MACRO_EXEC) -> None:
     """Ridică `RefusedCommand` dacă `argv` nu e o interogare de citire (`rpm -q ...` sau
     `dpkg-query -W ...`). Se cheamă în `_run` ÎNAINTE de orice proces.
+
+    Lista albă e legată aici, la DEFINIRE (cele trei implicite de mai sus), nu citită din globalele
+    modulului la fiecare apel. Cu globale, parametrii limitei se puteau înlocui din orice fișier cu o
+    atribuire (`system_update.READ_ONLY_FLAGS = {...}`), fără `getattr`, fără `globals()` — și poarta
+    ar fi lăsat să treacă `rpm -q --flag-inventat bash`. Acum o atribuire pe numele din modul nu mai
+    schimbă nimic din ce refuză poarta. `modes`/`flags`/`macro_exec` NU sunt o cale de lărgire pentru
+    cei care cheamă: singurul apel e `_require_read_only(argv)` din `_run`, iar garda din
+    `tests/security/` cere exact asta și interzice orice alt fișier să numească poarta. Testele care
+    probează mașinăria de pornire o lărgesc pe durata testului împachetând funcția
+    (`tests/unit/_system_update_support.py::allow_own_programs`), vizibil, nu prin cod de producție.
 
     Aici trăiește limita, nu în numele celor care cheamă `_run`: o gardă pe AST verifică
     ortografia apelanților dintr-un fișier, dar `_run` e o funcție importabilă, iar un alias
@@ -352,14 +372,14 @@ def _require_read_only(argv: Any) -> None:
         raise RefusedCommand(f"argv nu e o listă nevidă de șiruri (list/str exacte): {repr(argv)[:200]}")
     prog = argv[0]
     shown = repr(argv)[:200]
-    if prog not in READ_ONLY_MODE:
+    if prog not in modes:
         raise RefusedCommand(f"{prog!r} nu e o interogare de citire: {shown}")
-    if len(argv) < 2 or argv[1] != READ_ONLY_MODE[prog]:
-        raise RefusedCommand(f"argv[1] al lui {prog!r} trebuie să fie {READ_ONLY_MODE[prog]!r}: {shown}")
+    if len(argv) < 2 or argv[1] != modes[prog]:
+        raise RefusedCommand(f"argv[1] al lui {prog!r} trebuie să fie {modes[prog]!r}: {shown}")
     for word in argv[1:]:
-        if word.startswith("-") and word not in READ_ONLY_FLAGS[prog]:
+        if word.startswith("-") and word not in flags[prog]:
             raise RefusedCommand(f"flag în afara listei pentru {prog!r}: {word!r}")
-        if _MACRO_EXEC.search(word):
+        if macro_exec.search(word):
             raise RefusedCommand(f"un cuvânt care expandează o macro (rulează cod): {word!r}")
 
 

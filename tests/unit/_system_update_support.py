@@ -16,8 +16,10 @@ copiate din rulări reale; dublura doar le reproduce.
 
 from __future__ import annotations
 
+import functools
+import re
 import sys
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 from sentinel.patch import system_update as su
@@ -184,11 +186,31 @@ def install(monkeypatch: Any, host: FakeHost) -> FakeHost:
     return host
 
 
+def widen_gate(monkeypatch: Any, *, modes: dict[str, str] | None = None,
+               flags: dict[str, tuple[str, ...]] | None = None,
+               macro_exec: re.Pattern[str] | None = None) -> None:
+    """Lărgește poarta lui `_run` pe durata testului, ÎMPACHETÂND funcția, nu rescriind lista din modul.
+
+    Poarta își leagă lista albă la definire (`_require_read_only(argv, *, modes=..., flags=...)`), deci
+    `monkeypatch.setattr(su, "READ_ONLY_FLAGS", ...)` nu mai schimbă nimic din ce refuză — exact asta e
+    proprietatea păzită. Un test care are nevoie de o listă mai largă spune așa, la vedere: `_run` caută
+    `_require_read_only` în modul la fiecare apel, iar `partial` îi pune parametrii. Niciun parametru nou
+    în `_run`, nicio ușă în codul de producție."""
+    kwargs: dict[str, Any] = {}
+    if modes is not None:
+        kwargs["modes"] = MappingProxyType(dict(modes))
+    if flags is not None:
+        kwargs["flags"] = MappingProxyType(dict(flags))
+    if macro_exec is not None:
+        kwargs["macro_exec"] = macro_exec
+    monkeypatch.setattr(su, "_require_read_only", functools.partial(su._require_read_only, **kwargs))
+
+
 def allow_own_programs(monkeypatch: Any) -> None:
     """Lista albă a lui `_run` nu cunoaște interpretorul testului, și bine că nu-l cunoaște. Testele
     care verifică MAȘINĂRIA de pornire (cod de ieșire, 127, timeout) rulează totuși `sys.executable`
-    sau un nume inexistent: le lărgește lista, pe durata testului, în mod VIZIBIL — nu printr-o
-    ușă lăsată deschisă în cod."""
-    monkeypatch.setattr(su, "READ_ONLY_MODE", {sys.executable: "-c", "definitely-not-a-program-xyz": "-q"})
-    monkeypatch.setattr(su, "READ_ONLY_FLAGS", {sys.executable: ("-c",),
-                                                "definitely-not-a-program-xyz": ("-q",)})
+    sau un nume inexistent: le lărgește lista, pe durata testului, în mod VIZIBIL (`widen_gate`) — nu
+    printr-o ușă lăsată deschisă în cod."""
+    widen_gate(monkeypatch,
+               modes={sys.executable: "-c", "definitely-not-a-program-xyz": "-q"},
+               flags={sys.executable: ("-c",), "definitely-not-a-program-xyz": ("-q",)})
