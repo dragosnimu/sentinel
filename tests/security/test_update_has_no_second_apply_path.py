@@ -117,6 +117,7 @@ from __future__ import annotations
 import ast
 import inspect
 import re
+from collections import deque
 from pathlib import Path
 
 import pytest
@@ -2200,6 +2201,16 @@ def _run_touched(tree: ast.Module, current: str) -> set[str]:
     return (taken | used) & ({"_run", "*"} | GATE_SURFACE)
 
 
+def _shown(node: ast.AST) -> str:
+    """Textul lui `node` într-o constatare. `ast.unparse` e recursiv (câteva cadre pe nivel), deci un lanț de
+    500 de atribute (`su.a.a.a...`) ridica `RecursionError` DUPĂ ce garda hotărâse deja că e o constatare:
+    un roșu fără text, care nu spune ce e greșit. Pe un lanț prea adânc se spune exact asta, cu linia."""
+    try:
+        return ast.unparse(node)
+    except RecursionError:
+        return f"<{type(node).__name__} prea adânc ca să fie afișat, linia {getattr(node, 'lineno', '?')}>"
+
+
 def _module_writes(tree: ast.Module, target: str, current: str = THIS_MODULE) -> list[tuple[int, str]]:
     """`(linie, text)` pentru fiecare țintă de scriere (`Store`/`Del`) al cărei lanț de atribute și
     indici pornește de la modulul `target`: `su.X = ...`, `su.X += ...`, `del su.X`,
@@ -2211,7 +2222,7 @@ def _module_writes(tree: ast.Module, target: str, current: str = THIS_MODULE) ->
     un ALT fișier, și pe care garda aceea n-o poate vedea (măsurat pe `e6e9768`: trei linii în `bot.py`,
     71 passed)."""
     rooted = _rooted_at(tree, target, current)
-    return [(n.lineno, ast.unparse(n)) for n in ast.walk(tree)
+    return [(n.lineno, _shown(n)) for n in ast.walk(tree)
             if isinstance(n, (ast.Attribute, ast.Subscript)) and isinstance(n.ctx, (ast.Store, ast.Del))
             and rooted(n.value if isinstance(n, ast.Subscript) else n)]
 
@@ -2295,91 +2306,204 @@ def _rooted_at(tree: ast.Module, target: str, current: str = THIS_MODULE, *, by_
                   if isinstance(n, ast.ImportFrom) and _absolute(n, current) == target
                   for a in n.names if a.name != "*"}
 
-    def rooted(node: ast.AST) -> bool:
-        if isinstance(node, ast.Attribute):
-            return node.attr == base or rooted(node.value)
-        if isinstance(node, ast.Subscript):
-            return rooted(node.value) or holds(node.value)
-        if isinstance(node, ast.Name):
-            return node.id in roots
-        if isinstance(node, ast.Call):
-            attr = _by_string_attr(node)
-            return _imports_target(node, target) or (attr is not None and rooted(attr[0]))
-        if isinstance(node, (ast.NamedExpr, ast.Starred)):
-            return rooted(node.value) or (isinstance(node, ast.Starred) and holds(node.value))
-        if isinstance(node, ast.IfExp):
-            return rooted(node.body) or rooted(node.orelse)
-        if isinstance(node, ast.BoolOp):
-            return any(rooted(v) for v in node.values)
+    def reaches(start: ast.AST, *, holder: bool) -> bool:
+        """«`start` e rădăcină» (`holder=False`) sau «`start` ține elemente înrădăcinate» (`holder=True`).
+        ITERATIV, cu o stivă: lanțurile de atribute și de indici se pot face oricât de adânci
+        (`su.a.a.a...` x 500 dădea `RecursionError`, adică un roșu fără constatare, iar codul înlocuit era
+        iterativ). Regula e doar «sau» peste sub-expresii, deci ordinea nu contează și prima găsită oprește
+        căutarea. Fiecare pereche (nod, mod) intră în stivă cel mult o dată (arborele are un singur părinte pe
+        nod, iar un nod în mod «rădăcină» și unul în mod «ține» nu împing amândoi aceiași copii): liniar."""
+        stack = [(start, holder)]
+        while stack:
+            node, as_holder = stack.pop()
+            if as_holder:
+                if isinstance(node, ast.Name):
+                    if node.id in holders:
+                        return True
+                elif isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+                    for e in node.elts:
+                        stack += [(e, False), (e, True)]
+                elif isinstance(node, ast.Dict):
+                    for v in node.values:
+                        stack += [(v, False), (v, True)]
+            elif isinstance(node, ast.Attribute):
+                if node.attr == base:
+                    return True
+                stack.append((node.value, False))
+            elif isinstance(node, ast.Subscript):
+                stack += [(node.value, False), (node.value, True)]
+            elif isinstance(node, ast.Name):
+                if node.id in roots:
+                    return True
+            elif isinstance(node, ast.Call):
+                if _imports_target(node, target):
+                    return True
+                attr = _by_string_attr(node)
+                if attr is not None:
+                    stack.append((attr[0], False))
+            elif isinstance(node, ast.NamedExpr):
+                stack.append((node.value, False))
+            elif isinstance(node, ast.Starred):
+                stack += [(node.value, False), (node.value, True)]
+            elif isinstance(node, ast.IfExp):
+                stack += [(node.body, False), (node.orelse, False)]
+            elif isinstance(node, ast.BoolOp):
+                stack += [(v, False) for v in node.values]
         return False
 
+    def rooted(node: ast.AST) -> bool:
+        return reaches(node, holder=False)
+
     def holds(node: ast.AST) -> bool:
-        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
-            return any(rooted(e) or holds(e) for e in node.elts)
-        if isinstance(node, ast.Dict):
-            return any(rooted(v) or holds(v) for v in node.values)
-        return isinstance(node, ast.Name) and node.id in holders
+        return reaches(node, holder=True)
 
     def leaves(target_: ast.AST) -> list[str]:
-        if isinstance(target_, ast.Name):
-            return [target_.id]
-        if isinstance(target_, (ast.Tuple, ast.List)):
-            return [name for e in target_.elts for name in leaves(e)]
-        return leaves(target_.value) if isinstance(target_, ast.Starred) else []
+        names: list[str] = []
+        stack = [target_]
+        while stack:
+            t = stack.pop()
+            if isinstance(t, ast.Name):
+                names.append(t.id)
+            elif isinstance(t, (ast.Tuple, ast.List)):
+                stack.extend(t.elts)
+            elif isinstance(t, ast.Starred):
+                stack.append(t.value)
+        return names
 
-    def bind(target_: ast.AST, value: ast.AST, *, iterate: bool = False) -> bool:
-        """Pune numele din `target_` în `roots`/`holders` dacă `value` o cere; spune dacă s-a schimbat ceva."""
-        if (not iterate and isinstance(target_, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List))
-                and len(target_.elts) == len(value.elts)
-                and not any(isinstance(e, ast.Starred) for e in (*target_.elts, *value.elts))):
-            # `strict=True`: lungimile sunt egale prin condiția de mai sus, deci nu se poate declanșa; dacă cineva
-            # scoate condiția, o destructurare inegală ridică `ValueError` în loc să piardă tăcut elementele de
-            # la coadă (`a, b = 1, 2, su.read_host`: fără el, `b` n-ar mai fi rădăcină).
-            return any([bind(t, v) for t, v in zip(target_.elts, value.elts, strict=True)])
-        unpack = iterate or isinstance(target_, (ast.Tuple, ast.List, ast.Starred))
-        # Un nume despachetat devine rădăcină; că ajunge și în `holders` nu schimbă nimic (`rooted` se uită
-        # întâi la `roots`), deci nu are rost să-l scoată cineva de acolo.
-        as_root = rooted(value) or (unpack and holds(value))
-        as_holder = holds(value)
-        changed = False
-        for name in leaves(target_):
-            if as_root and name not in roots:
-                roots.add(name)
-                changed = True
-            if as_holder and name not in holders:
-                holders.add(name)
-                changed = True
+    def bind(target_: ast.AST, value: ast.AST, *, iterate: bool = False) -> list[str]:
+        """Pune numele din `target_` în `roots`/`holders` dacă `value` o cere; întoarce numele care s-au
+        schimbat (gol = nimic nou), ca iterația să știe CE să reia."""
+        changed: list[str] = []
+        work = [(target_, value, iterate)]
+        while work:
+            t, v, it = work.pop()
+            if (not it and isinstance(t, (ast.Tuple, ast.List)) and isinstance(v, (ast.Tuple, ast.List))
+                    and len(t.elts) == len(v.elts)
+                    and not any(isinstance(e, ast.Starred) for e in (*t.elts, *v.elts))):
+                # `strict=True`: lungimile sunt egale prin condiția de mai sus, deci nu se poate declanșa; dacă
+                # cineva scoate condiția, o destructurare inegală ridică `ValueError` în loc să piardă tăcut
+                # elementele de la coadă (`a, b = 1, 2, su.read_host`: fără el, `b` n-ar mai fi rădăcină).
+                work.extend((et, ev, False) for et, ev in zip(t.elts, v.elts, strict=True))
+                continue
+            unpack = it or isinstance(t, (ast.Tuple, ast.List, ast.Starred))
+            # Un nume despachetat devine rădăcină; că ajunge și în `holders` nu schimbă nimic (`rooted` se uită
+            # întâi la `roots`), deci nu are rost să-l scoată cineva de acolo.
+            as_root = rooted(v) or (unpack and holds(v))
+            as_holder = holds(v)
+            for name in leaves(t):
+                if as_root and name not in roots:
+                    roots.add(name)
+                    changed.append(name)
+                if as_holder and name not in holders:
+                    holders.add(name)
+                    changed.append(name)
         return changed
 
-    def step() -> bool:
-        changed = False
-        for n in ast.walk(tree):
-            if isinstance(n, ast.Assign):
-                for t in n.targets:
-                    changed |= bind(t, n.value)
-            elif isinstance(n, ast.AnnAssign) and n.value is not None:
-                changed |= bind(n.target, n.value)
-            elif isinstance(n, ast.NamedExpr):
-                changed |= bind(n.target, n.value)
-            elif isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)):
-                changed |= bind(n.target, n.iter, iterate=True)
-            elif isinstance(n, ast.withitem) and n.optional_vars is not None:
-                changed |= bind(n.optional_vars, n.context_expr)
-            elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
-                a = n.args
-                positional = [*a.posonlyargs, *a.args]
-                # Ambele `strict=True`: parserul garantează lungimile (`defaults` sunt ultimele n argumente
-                # poziționale, `kw_defaults` are câte o intrare, `None` pentru cele obligatorii) — măsurat în
-                # `test_every_parameter_shape_the_parser_accepts_...`. Un AST care le rupe ridică `ValueError`,
-                # nu trunchiază tăcut: o felie cu început negativ ar lega un implicit de ALT parametru.
-                pairs = list(zip(positional[len(positional) - len(a.defaults):], a.defaults, strict=True))
-                pairs += [(p, d) for p, d in zip(a.kwonlyargs, a.kw_defaults, strict=True) if d is not None]
-                for param, default in pairs:
-                    changed |= bind(ast.Name(id=param.arg, ctx=ast.Store()), default)
-        return changed
+    def pattern_sites(pattern: ast.AST, subject: ast.AST) -> list[tuple[ast.AST, ast.AST]]:
+        """Perechile `(nume, valoare)` pe care un tipar `case` le leagă din `subject`, în forma pe care o
+        primește `bind`: un tipar nu e o țintă de atribuire, dar fiecare nume pe care îl capturează primește o
+        valoare care se POATE scrie ca expresie peste subiect, iar `rooted`/`holds` o citesc deja (un element e
+        `Subscript`, un atribut e `Attribute`). Așa regula de rădăcină rămâne una singură. Expresiile
+        construite nu se compilează niciodată; contează doar forma lor.
 
-    while step():
-        pass
+        Ce leagă fiecare formă (de verificat în `_MATCH_BINDINGS`, care îl și execută):
+          `case f` / `case P as f`    `f` = subiectul însuși (rădăcină dacă subiectul e, ține dacă ține);
+                                      `P` se potrivește pe același subiect
+          `case P | Q`                fiecare alternativă pe același subiect
+          `case [P, Q]`               elementele: `subiect[0]`; cu subiect `(x, y)` de aceeași lungime și fără
+                                      stea, pe perechi (ca la `a, b = x, y`)
+          `case [*rest]`              `rest` e o listă NOUĂ de elemente: ține, nu e rădăcină
+          `case {"k": P}`             `subiect["k"]`
+          `case {**rest}`             `rest` e un dicționar NOU cu valorile subiectului: ține, nu e rădăcină
+          `case C(P)`                 `P` pe subiectul însuși: pentru tipurile predefinite (`dict(f)`, `list(f)`)
+                                      un singur tipar pozițional primește subiectul întreg; pentru restul
+                                      ar fi `subiect.<__match_args__[0]>`, un atribut al lui, rădăcină la fel
+                                      cât timp subiectul e; garda nu caută `__match_args__`
+          `case C(nume=P)`            `subiect.nume`
+          `case 1` / `case None` / `case su.X`   nu leagă nimic (o comparație, nu un alias)
+        Garda `if ...` nu schimbă ce se leagă: capturile se fac înainte de ea și rămân și când ea pică, iar
+        regula e oricum fără flux."""
+        out: list[tuple[ast.AST, ast.AST]] = []
+        stack = [(pattern, subject)]
+        while stack:
+            pat, value = stack.pop()
+            if isinstance(pat, ast.MatchAs):
+                if pat.name is not None:
+                    out.append((ast.Name(id=pat.name, ctx=ast.Store()), value))
+                if pat.pattern is not None:
+                    stack.append((pat.pattern, value))
+            elif isinstance(pat, ast.MatchOr):
+                stack.extend((alt, value) for alt in pat.patterns)
+            elif isinstance(pat, ast.MatchSequence):
+                paired = (isinstance(value, (ast.Tuple, ast.List)) and len(value.elts) == len(pat.patterns)
+                          and not any(isinstance(e, ast.Starred) for e in value.elts)
+                          and not any(isinstance(p, ast.MatchStar) for p in pat.patterns))
+                element = ast.Subscript(value=value, slice=ast.Constant(value=0), ctx=ast.Load())
+                for i, sub in enumerate(pat.patterns):
+                    if isinstance(sub, ast.MatchStar):
+                        if sub.name is not None:
+                            rest = ast.List(elts=[element], ctx=ast.Load())
+                            out.append((ast.Name(id=sub.name, ctx=ast.Store()), rest))
+                    else:
+                        stack.append((sub, value.elts[i] if paired else element))
+            elif isinstance(pat, ast.MatchMapping):
+                for key, sub in zip(pat.keys, pat.patterns, strict=True):
+                    stack.append((sub, ast.Subscript(value=value, slice=key, ctx=ast.Load())))
+                if pat.rest is not None:
+                    out.append((ast.Name(id=pat.rest, ctx=ast.Store()), ast.Dict(keys=[None], values=[value])))
+            elif isinstance(pat, ast.MatchClass):
+                stack.extend((sub, value) for sub in pat.patterns)
+                for attr, sub in zip(pat.kwd_attrs, pat.kwd_patterns, strict=True):
+                    stack.append((sub, ast.Attribute(value=value, attr=attr, ctx=ast.Load())))
+        return out
+
+    # Locurile care leagă un nume, adunate O DATĂ: `(țintă, valoare, iterează)`. Înainte, fiecare trecere
+    # a punctului fix reparcurgea tot arborele cu `ast.walk`, iar un lanț de alias-uri scris în ordine inversă
+    # (`a3 = a2`, `a2 = a1`, `a1 = su.f`) învață un nume pe trecere: pătratic (măsurat: 3000 de nume, 34 s).
+    sites: list[tuple[ast.AST, ast.AST, bool]] = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Assign):
+            sites += [(t, n.value, False) for t in n.targets]
+        elif isinstance(n, ast.AnnAssign) and n.value is not None:
+            sites.append((n.target, n.value, False))
+        elif isinstance(n, ast.NamedExpr):
+            sites.append((n.target, n.value, False))
+        elif isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)):
+            sites.append((n.target, n.iter, True))
+        elif isinstance(n, ast.withitem) and n.optional_vars is not None:
+            sites.append((n.optional_vars, n.context_expr, False))
+        elif isinstance(n, ast.Match):
+            for case in n.cases:
+                sites += [(t, v, False) for t, v in pattern_sites(case.pattern, n.subject)]
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            a = n.args
+            positional = [*a.posonlyargs, *a.args]
+            # Ambele `strict=True`: parserul garantează lungimile (`defaults` sunt ultimele n argumente
+            # poziționale, `kw_defaults` are câte o intrare, `None` pentru cele obligatorii) — măsurat în
+            # `test_every_parameter_shape_the_parser_accepts_...`. Un AST care le rupe ridică `ValueError`,
+            # nu trunchiază tăcut: o felie cu început negativ ar lega un implicit de ALT parametru.
+            pairs = list(zip(positional[len(positional) - len(a.defaults):], a.defaults, strict=True))
+            pairs += [(p, d) for p, d in zip(a.kwonlyargs, a.kw_defaults, strict=True) if d is not None]
+            sites += [(ast.Name(id=param.arg, ctx=ast.Store()), default, False) for param, default in pairs]
+
+    # Punctul fix pe o coadă de lucru, nu pe treceri: un loc se reevaluează doar când se schimbă un nume pe
+    # care îl CITEȘTE. `uses` indexează TOATE numele din valoare (nu doar pe cele pe care `reaches` le
+    # urmează), deci nu poate diverge de regulă: un nume pe care regula îl ignoră doar costă o reevaluare
+    # în plus. Mulțimile doar cresc și toate regulile sunt monotone, deci punctul fix e același.
+    uses: dict[str, list[int]] = {}
+    for i, (_, value, _) in enumerate(sites):
+        for name in {x.id for x in ast.walk(value) if isinstance(x, ast.Name)}:
+            uses.setdefault(name, []).append(i)
+    queue = deque(range(len(sites)))
+    queued = [True] * len(sites)
+    while queue:
+        i = queue.popleft()
+        queued[i] = False
+        for name in bind(*sites[i][:2], iterate=sites[i][2]):
+            for j in uses.get(name, ()):
+                if not queued[j]:
+                    queued[j] = True
+                    queue.append(j)
     return rooted
 
 
@@ -2407,14 +2531,14 @@ def _module_dunders(tree: ast.Module, target: str, current: str = THIS_MODULE) -
     for n in ast.walk(tree):
         if isinstance(n, ast.Attribute) and _is_dunder(n.attr) and rooted(n.value):
             if not (n.attr in INERT_DUNDERS and isinstance(n.ctx, ast.Load)):
-                found.append((n.lineno, ast.unparse(n)))
+                found.append((n.lineno, _shown(n)))
             continue
         attr = _by_string_attr(n)
         if attr is None or not rooted(attr[0]) or not isinstance(attr[1], ast.Constant):
             continue
         name = attr[1].value
         if isinstance(name, str) and _is_dunder(name) and not (name in INERT_DUNDERS and n.func.id == "getattr"):
-            found.append((n.lineno, ast.unparse(n)))
+            found.append((n.lineno, _shown(n)))
     return found
 
 
@@ -2428,7 +2552,7 @@ def _unreadable_attr_names(tree: ast.Module, target: str, current: str = THIS_MO
         attr = _by_string_attr(n)
         if attr is not None and rooted(attr[0]) and not (
                 isinstance(attr[1], ast.Constant) and isinstance(attr[1].value, str)):
-            out.append((n.lineno, ast.unparse(n)))
+            out.append((n.lineno, _shown(n)))
     return out
 
 
