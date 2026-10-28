@@ -374,6 +374,12 @@ def _require_read_only(argv: Any, *, modes: Mapping[str, str] = READ_ONLY_MODE,
     shown = repr(argv)[:200]
     if prog not in modes:
         raise RefusedCommand(f"{prog!r} nu e o interogare de citire: {shown}")
+    # Un program cu mod și fără listă de flag-uri e o greșeală de programare în cele două tabele, nu un
+    # argv rău: fără rândul ăsta ar ieși un `KeyError` (arată a defect, nu a refuz, și nu spune ce s-a
+    # întâmplat). Tot fail-closed — nimic nu pornește — dar cu excepția care se citește.
+    if prog not in flags:
+        raise RefusedCommand(f"{prog!r} are mod, dar nu și listă de flag-uri: tabelele "
+                             f"`READ_ONLY_MODE` și `READ_ONLY_FLAGS` nu se potrivesc: {shown}")
     if len(argv) < 2 or argv[1] != modes[prog]:
         raise RefusedCommand(f"argv[1] al lui {prog!r} trebuie să fie {modes[prog]!r}: {shown}")
     for word in argv[1:]:

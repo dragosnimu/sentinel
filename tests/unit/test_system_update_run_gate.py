@@ -180,6 +180,25 @@ def test_an_unlisted_flag_is_refused_until_the_gate_is_widened_on_purpose(monkey
     assert len(spawns.calls) == 1
 
 
+def test_a_program_with_a_mode_and_no_flag_list_is_refused_not_a_key_error(monkeypatch):
+    """Cineva adaugă un program în `READ_ONLY_MODE` și uită `READ_ONLY_FLAGS`. Garda din `tests/security/`
+    o prinde în CI, dar poarta e și ultima linie la execuție: fără refuzul ei, `flags[prog]` dă `KeyError`,
+    care în jurnal și în mesajul de pe Telegram arată ca un defect al lui `/update` («KeyError: 'xyz'»),
+    nu ca ce este — două tabele care nu se potrivesc. Tot nu pornește nimic; diferența e excepția, care
+    trebuie să fie `RefusedCommand` și să numească programul. Martorul pozitiv: cu lista de flag-uri
+    adăugată, ACELAȘI argv pornește, deci refuzul vine din lipsa listei, nu din altceva."""
+    spawns = _spawns(monkeypatch, sup.FakeHost())
+    argv = ["program-de-control", "-q", "bash"]
+    sup.widen_gate(monkeypatch, modes={**su.READ_ONLY_MODE, "program-de-control": "-q"})
+    with pytest.raises(su.RefusedCommand) as info:
+        run(su._run(argv))
+    assert "program-de-control" in str(info.value)
+    assert spawns.calls == [], f"a pornit ceva: {spawns.calls}"
+    sup.widen_gate(monkeypatch, flags={**su.READ_ONLY_FLAGS, "program-de-control": ("-q",)})
+    run(su._run(argv))
+    assert [a for a, _ in spawns.calls] == [tuple(argv)]
+
+
 _WIDE_FLAGS = {"rpm": ("-q", "--qf", "--whatprovides", "--flag-inventat"), "dpkg-query": ("-W", "-f")}
 
 #: Fiecare formă prin care parametrii limitei se rescriau din ALT fișier cu o simplă atribuire pe

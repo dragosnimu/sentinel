@@ -46,14 +46,18 @@ porni în afară de `system`/`popen`. O singură mutație (`approvals.issue`, un
      `update_view`, unul din `bot.py`, un `sh -c '... dnf -y update ...'` adăugat ÎN interiorul lui
      `_run`). Comportamentul îl probează `tests/unit/test_system_update_run_gate.py` (mock pe
      `create_subprocess_exec`, neatins). Aici se păzește lanțul care face limita adevărată: lista albă
-     e citită din `system_update.py` și trebuie să fie cea aprobată în acest fișier (o lărgire pică),
-     iar poarta și-o LEAGĂ la definire (implicite kw-only peste vederi `MappingProxyType`), nu o citește
-     din modul la apel — altfel o atribuire pe numele din modul, din ORICE fișier, schimba ce refuză
-     poarta cu garda verde; poarta e prima instrucțiune din `_run`, procesul primește exact `*argv`,
-     `argv` nu e legat de nou, procesul pornește ÎN `_run`, iar nicio funcție de pornit procese nu e luată
-     ca valoare (`_launcher_problems`); nimic din pachet nu ia `_run`, nu numește poarta sau
-     constantele ei, nu atribuie, nu șterge și nu scrie pe un indice al modulului (`_module_writes`,
-     în `test_nothing_outside_system_update_touches_the_run_function`);
+     e citită din `system_update.py` și trebuie să fie cea aprobată în acest fișier (o lărgire pică), iar
+     `READ_ONLY_MODE` și `READ_ONLY_FLAGS` numesc ACELEAȘI programe (un program cu mod și fără listă de
+     flag-uri trecea garda, iar poarta dădea `KeyError`, nu `RefusedCommand`); poarta și-o LEAGĂ la
+     definire (implicite kw-only peste vederi `MappingProxyType`), nu o citește din modul la apel — altfel
+     o atribuire pe numele din modul, din ORICE fișier, schimba ce refuză poarta cu garda verde; poarta e
+     prima instrucțiune din `_run`, procesul primește exact `*argv`, `argv` nu e legat de nou, procesul
+     pornește ÎN `_run`, iar nicio funcție de pornit procese nu e luată ca valoare (`_launcher_problems`);
+     nimic din pachet nu ia `_run`, nu numește poarta sau constantele ei, nu atribuie, nu șterge și nu
+     scrie pe un indice al modulului (`_module_writes`), și nu atinge NICIUN atribut dunder (`__dict__`,
+     `__globals__`, `__kwdefaults__`, `__code__`...) pe un lanț care pornește de la modul sau de la un
+     nume luat din el, nici măcar citit (`_module_dunders`); ambele în
+     `test_nothing_outside_system_update_touches_the_run_function`;
   6. `bot.py` nu importă runnerul, backup-ul sau clientul executorului nicăieri în fișier.
 
 Garda mărginește FELUL instrucțiunii, nu efectul ei: un `SELECT` care cheamă `pg_terminate_backend`
@@ -71,12 +75,21 @@ le vede în diff. Ce NU acoperă poarta 5: un proces pornit prin alt drum decât
 `ctypes`), pe care îl numără doar `_spawns`; și un `rpm` cu un flag din lista albă pe care o versiune
 viitoare l-ar face să execute ceva (pe RPM 4.16 doar `--eval` execută, dovedit pe gazdă).
 
-Uși rămase deschise după ce scrierile în modul sunt închise (la execuție parametrii porții nu mai
-depind de numele din modul, deci o atribuire nu o mai lărgește; ce urmează schimbă FUNCȚIA, nu
-parametrii): cod care ajunge la poartă fără să numească modulul (`gc.get_objects()`,
-`sys.modules[...]`), `__kwdefaults__`/`__code__` ale funcției luate printr-o referință pe care garda nu
-o vede ca pornind de la modul, `asyncio.create_subprocess_exec = ...` pus din alt fișier (schimbă ce
-PORNEȘTE, nu ce refuză poarta), și orice fișier în afara lui `sentinel/` — testele își lărgesc poarta
+Ce acoperă garda de pachet pe modul, spus pe față (măsurat pe `5b72386`: patru forme dunder dădeau
+verde static și lăsau poarta deschisă la execuție, mock-ul primind `rpm -q --flag-inventat bash`):
+atribuirea, ștergerea și indicele pe lanțuri care pornesc de la modul (`Store`/`Del`, deci și înlocuirea
+funcției porții cu o atribuire), orice nume al porții sau al constantelor ei, `_run`, și orice atribut
+dunder pe un lanț pornit de la modul sau de la un nume luat din el (`su.__dict__.update(...)`,
+`su.read_host.__globals__[...]`, `from ...system_update import read_host` + `read_host.__globals__`).
+Forma dunder nu e «ca un Store»: e o citire care întoarce dicționarul, iar scrierea se face pe el.
+
+Uși rămase deschise după ce scrierile și dunder-ele pe modul sunt închise (la execuție parametrii porții
+nu mai depind de numele din modul, deci o atribuire nu o mai lărgește): cod care ajunge la poartă fără
+să numească modulul (`gc.get_objects()`, `sys.modules[...]`, `sentinel.patch.__dict__["system_update"]`);
+o funcție a modulului luată într-o VARIABILĂ înainte de dunder (`f = su.read_host` + `f.__globals__`;
+garda vede un dunder doar pe un lanț care pornește de la modul sau de la un nume luat din el) și
+`getattr(su.read_host, "__globals__")`; `asyncio.create_subprocess_exec = ...` pus din alt fișier (schimbă
+ce PORNEȘTE, nu ce refuză poarta); și orice fișier în afara lui `sentinel/` — testele își lărgesc poarta
 înfășurând-o (`tests/unit/_system_update_support.py::widen_gate`), și asta e calea lor vizibilă.
 Un `Subscript` pe `argv` în `_run` rămâne permis dinadins: vezi `LAUNCHER_MUTATIONS`, intrările «spawn
 behind a helper».
@@ -1714,6 +1727,7 @@ def _gate_constant_problems(tree: ast.Module, approved_mode=READ_ONLY_MODE, appr
     out: list[str] = []
     approved = {"READ_ONLY_MODE": dict(approved_mode),
                 "READ_ONLY_FLAGS": {k: set(v) for k, v in approved_flags.items()}}
+    programs: dict[str, set[str]] = {}
     for name in GATE_CONSTANTS:
         values = [v for node in tree.body for v in _bound_values(node, name)]
         if len(values) != 1:
@@ -1751,9 +1765,18 @@ def _gate_constant_problems(tree: ast.Module, approved_mode=READ_ONLY_MODE, appr
             if not all(isinstance(v, tuple) for v in got.values()):
                 out.append("`READ_ONLY_FLAGS` ține liste, nu tuple: o listă se poate lărgi pe loc")
             got = {k: set(v) for k, v in got.items()}
+        programs[name] = set(got)
         if got != approved[name]:
             out.append(f"`{name}` nu mai e lista aprobată: {got!r} (aprobat: {approved[name]!r}). O "
                        "lărgire e o decizie: schimb-o și aici, în aceeași schimbare, cu motivul")
+    # Un program cu mod și fără listă de flag-uri (sau invers) trece de «e lista aprobată» dacă și aprobarea
+    # de aici are aceeași asimetrie, iar la execuție poarta ar da un `KeyError`, nu un refuz. Cele două
+    # tabele descriu aceleași programe; garda cere asta, nu doar fiecare tabel luat separat.
+    if len(programs) == 2 and programs["READ_ONLY_MODE"] != programs["READ_ONLY_FLAGS"]:
+        no_flags = sorted(programs["READ_ONLY_MODE"] - programs["READ_ONLY_FLAGS"])
+        no_mode = sorted(programs["READ_ONLY_FLAGS"] - programs["READ_ONLY_MODE"])
+        out.append(f"`READ_ONLY_MODE` și `READ_ONLY_FLAGS` nu numesc aceleași programe: fără listă de "
+                   f"flag-uri {no_flags}, fără mod {no_mode}. Un program nou se adaugă în ambele tabele")
 
     gate = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_require_read_only"), None)
     bound: dict[int, str] = {}
@@ -1924,10 +1947,11 @@ def test_the_only_process_launcher_is_run_and_the_gate_sits_in_front_of_it():
 
 
 def _mutated(old: str | tuple[str, ...] | None, new: str | tuple[str, ...], *, append: bool = False,
-             then_append: str = "") -> ast.Module:
+             then_append: str = "", source: str | None = None) -> ast.Module:
     """Codul REAL al lui `system_update.py` cu o singură schimbare: `old` -> `new`, sau `new` adăugat
-    la coadă (`append`); `then_append` se adaugă la coadă după o înlocuire (o funcție ajutătoare)."""
-    src = SYSTEM_UPDATE.read_text(encoding="utf-8")
+    la coadă (`append`); `then_append` se adaugă la coadă după o înlocuire (o funcție ajutătoare).
+    `source` înlocuiește textul real (un control care vrea mutația peste o editare cinstită)."""
+    src = SYSTEM_UPDATE.read_text(encoding="utf-8") if source is None else source
     if append:
         return ast.parse(src + "\n" + new + "\n")
     # `old`/`new` pot fi tupluri de aceeași lungime: mutații care schimbă două locuri, aplicate pe rând,
@@ -1994,10 +2018,12 @@ LAUNCHER_MUTATIONS = {
     "mode list widened": ('READ_ONLY_MODE: Final = MappingProxyType({',
                           'READ_ONLY_MODE: Final = MappingProxyType({"dnf": "-y", ', False),
     "flag list widened": ('{"rpm": (', '{"rpm": ("--eval", ', False),
-    "mode constant made a plain dict": ('READ_ONLY_MODE: Final = MappingProxyType({"rpm": "-q", "dpkg-query": "-W"})',
-                                        'READ_ONLY_MODE: Final = {"rpm": "-q", "dpkg-query": "-W"}', False),
-    "flags constant made a plain dict": ('READ_ONLY_FLAGS: Final = MappingProxyType(\n    {"rpm"',
-                                         'READ_ONLY_FLAGS: Final = dict(\n    {"rpm"', False),
+    # Ancore pe începutul declarației, nu pe textul literalului: un program nou adăugat în ambele locuri
+    # (cum cere garda) nu are voie să strice aceste mutații (`test_every_launcher_mutation_still_finds_its_anchor...`).
+    "mode constant made a plain dict": ('READ_ONLY_MODE: Final = MappingProxyType(',
+                                        'READ_ONLY_MODE: Final = dict(', False),
+    "flags constant made a plain dict": ('READ_ONLY_FLAGS: Final = MappingProxyType(',
+                                         'READ_ONLY_FLAGS: Final = dict(', False),
     "gate reads the module mode, not its parameter": ("if prog not in modes:", "if prog not in READ_ONLY_MODE:", False),
     "gate reads the module flags, not its parameter": (
         'word not in flags[prog]', 'word not in READ_ONLY_FLAGS[prog]', False),
@@ -2037,6 +2063,41 @@ def test_every_way_around_the_run_gate_turns_the_launcher_guard_red(label):
     assert _launcher_problems(_mutated(old, new, append=append, then_append=rest[0] if rest else "")), label
 
 
+def _with_a_new_program() -> str:
+    """Codul real al lui `system_update.py` după editarea pe care garda o cere pentru un program nou:
+    intrare în `READ_ONLY_MODE` ȘI în `READ_ONLY_FLAGS`, la coadă, fără să atingă restul fișierului."""
+    src = SYSTEM_UPDATE.read_text(encoding="utf-8")
+    src, n_mode = re.subn(r'(READ_ONLY_MODE: Final = MappingProxyType\(\{[^}]*)\}\)',
+                          r'\1, "program-de-control": "-q"})', src, count=1)
+    src, n_flags = re.subn(r'(READ_ONLY_FLAGS: Final = MappingProxyType\(\s*\{[^}]*)\}\)',
+                           r'\1, "program-de-control": ("-q",)})', src, count=1)
+    assert (n_mode, n_flags) == (1, 1), "editarea cinstită nu se mai potrivește declarațiilor"
+    return src
+
+
+def test_an_honest_new_program_in_both_tables_passes_the_constants_check():
+    """Martorul editării cinstite pentru testul de mai jos: programul nou adăugat în ambele tabele, cu
+    aprobarea de aici de aceeași formă, nu dă nicio constatare. Fără el, «ancora supraviețuiește» ar putea
+    fi adevărat peste o editare pe care garda o respinge oricum."""
+    mode = {**READ_ONLY_MODE, "program-de-control": "-q"}
+    flags = {**READ_ONLY_FLAGS, "program-de-control": frozenset({"-q"})}
+    honest = ast.parse(_with_a_new_program())
+    assert _gate_constant_problems(honest, approved_mode=mode, approved_flags=flags) == []
+    assert _gate_constant_problems(honest), "fără aprobarea de aici, programul nou trebuie să pice"
+
+
+@pytest.mark.parametrize("label", list(LAUNCHER_MUTATIONS))
+def test_every_launcher_mutation_still_finds_its_anchor_after_an_honest_new_program(label):
+    """Prima persoană care adaugă un program (în ambele tabele, cum cere garda) nu are voie să vadă 1 roșu
+    pe o mutație al cărei text-ancoră era CHIAR literalul lui `READ_ONLY_MODE`: ar crede că garda e
+    stricată, nu că ancora e prea lungă (așa a fost «mode constant made a plain dict»). Aici mutația se
+    aplică peste editarea cinstită; ce se verifică e că ancora se potrivește exact o dată (`_mutated`
+    cere asta), nu că e roșie: peste o editare neaprobată în acest fișier orice mutație ar fi roșie oricum."""
+    old, new, append, *rest = LAUNCHER_MUTATIONS[label]
+    tree = _mutated(old, new, append=append, then_append=rest[0] if rest else "", source=_with_a_new_program())
+    assert isinstance(tree, ast.Module)
+
+
 def test_the_launcher_guard_admits_honest_edits_to_the_run_function():
     """Controale cinstite: o editare obișnuită nu are voie să dea roșu — altfel garda e ștearsă a
     doua zi. Un mesaj de eroare mai lung, un comentariu, o variabilă locală nouă, un `limit_s`
@@ -2072,10 +2133,25 @@ def test_a_widening_approved_in_both_places_passes_and_one_approved_only_in_prod
     widened_flags = _mutated('{"rpm": (', '{"rpm": ("--flag-de-control", ')
     assert _gate_constant_problems(widened_flags, approved_flags=wider_flags) == []
     assert _gate_constant_problems(widened_flags), "lărgirea neaprobată aici trebuie să pice"
+    # Un program nou are mod ȘI listă de flag-uri, în aceeași schimbare: lărgirea cinstită e cea în ambele
+    # tabele, în producție și aici. (Înainte controlul lărgea doar `READ_ONLY_MODE`; asta nu mai e o
+    # lărgire cinstită, fiindcă poarta ar da `KeyError` pe program: vezi controlul de mai jos.)
     wider_mode = {**READ_ONLY_MODE, "program-de-control": "-q"}
-    widened_mode = _mutated('MappingProxyType({"rpm": "-q"', 'MappingProxyType({"program-de-control": "-q", "rpm": "-q"')
-    assert _gate_constant_problems(widened_mode, approved_mode=wider_mode) == []
-    assert _gate_constant_problems(widened_mode)
+    wider_both = {**READ_ONLY_FLAGS, "program-de-control": frozenset({"-q"})}
+    widened_both = _mutated(('MappingProxyType({"rpm": "-q"', '{"rpm": ('),
+                            ('MappingProxyType({"program-de-control": "-q", "rpm": "-q"',
+                             '{"program-de-control": ("-q",), "rpm": ('))
+    assert _gate_constant_problems(widened_both, approved_mode=wider_mode, approved_flags=wider_both) == []
+    assert _gate_constant_problems(widened_both), "lărgirea neaprobată aici trebuie să pice"
+    # Doar într-un tabel, chiar și cu aprobarea de aici de aceeași formă, e o constatare pe ea însăși.
+    only_mode = _mutated('MappingProxyType({"rpm": "-q"', 'MappingProxyType({"program-de-control": "-q", "rpm": "-q"')
+    unmatched = [p for p in _gate_constant_problems(only_mode, approved_mode=wider_mode)
+                 if "nu numesc aceleași programe" in p]
+    assert unmatched and "program-de-control" in unmatched[0], unmatched
+    only_flags = _mutated('{"rpm": (', '{"program-de-control": ("-q",), "rpm": (')
+    unmatched = [p for p in _gate_constant_problems(only_flags, approved_flags=wider_both)
+                 if "nu numesc aceleași programe" in p]
+    assert unmatched and "program-de-control" in unmatched[0], unmatched
     extra = r"%\{\s*tipar-de-control\s*:|"
     widened_macro = _mutated('_MACRO_EXEC: Final = re.compile(r"', '_MACRO_EXEC: Final = re.compile(r"' + extra)
     assert _gate_constant_problems(widened_macro, approved_macro=extra + APPROVED_MACRO_PATTERN) == []
@@ -2116,19 +2192,58 @@ def _module_writes(tree: ast.Module, target: str, current: str = THIS_MODULE) ->
     Garda pe `system_update.py` citește atribuirea LITERALĂ din acel fișier; asta e forma pe care o face
     un ALT fișier, și pe care garda aceea n-o poate vedea (măsurat pe `e6e9768`: trei linii în `bot.py`,
     71 passed)."""
+    rooted = _rooted_at(tree, target, current)
+    return [(n.lineno, ast.unparse(n)) for n in ast.walk(tree)
+            if isinstance(n, (ast.Attribute, ast.Subscript)) and isinstance(n.ctx, (ast.Store, ast.Del))
+            and rooted(n.value if isinstance(n, ast.Subscript) else n)]
+
+
+def _rooted_at(tree: ast.Module, target: str, current: str = THIS_MODULE, *, by_name: bool = False):
+    """Predicatul «lanțul de atribute și indici `node` pornește de la modulul `target`»: de la un alias al
+    lui (`su`), de la numele complet (`sentinel.patch.system_update`) sau de la `patch.system_update`.
+    Cu `by_name`, pornește și de la un nume LUAT din modul (`from ... import read_host`): pentru o
+    funcție luată așa, `read_host.__globals__` e aceeași ușă ca `su.read_host.__globals__`. O singură
+    definiție, folosită de scrieri și de dunder-e: două copii ale regulii de «rădăcină» ar putea diverge,
+    iar una dintre garde ar vedea o formă pe care cealaltă o lasă să treacă."""
     _, aliases = _import_forms(tree, target, current)
     base = target.rpartition(".")[2]
+    roots = set(aliases)
+    if by_name:
+        # Numele LOCAL al fiecărui nume luat: `from ...system_update import read_host as rh` e `rh`, nu
+        # `read_host` (`_import_forms` le dă pe cele din modul, nu pe cele de pe partea cealaltă a lui `as`).
+        roots |= {a.asname or a.name for n in ast.walk(tree)
+                  if isinstance(n, ast.ImportFrom) and _absolute(n, current) == target
+                  for a in n.names if a.name != "*"}
 
     def rooted(node: ast.AST) -> bool:
         while isinstance(node, (ast.Attribute, ast.Subscript)):
             if isinstance(node, ast.Attribute) and node.attr == base:
                 return True
             node = node.value
-        return isinstance(node, ast.Name) and node.id in aliases
+        return isinstance(node, ast.Name) and node.id in roots
 
+    return rooted
+
+
+def _is_dunder(name: str) -> bool:
+    return len(name) > 4 and name.startswith("__") and name.endswith("__")
+
+
+def _module_dunders(tree: ast.Module, target: str, current: str = THIS_MODULE) -> list[tuple[int, str]]:
+    """`(linie, text)` pentru fiecare atribut dunder (`__dict__`, `__globals__`, `__kwdefaults__`,
+    `__code__`, `__setitem__`...) pe un lanț care pornește de la modulul `target` sau de la un nume luat
+    din el, în ORICE context (`Load` la fel ca `Store`).
+
+    `_module_writes` vede doar ținte `Store`/`Del`, iar `_run_touched` doar numele porții. Patru forme
+    n-au fost nici una, nici alta, și au dat verde cu poarta deschisă la execuție (mock-ul de proces a
+    primit `rpm -q --flag-inventat bash`, măsurat pe `5b72386`): `su.__dict__.update({...})`,
+    `su.__dict__.__setitem__(...)`, `su.read_host.__globals__.update({...})` și
+    `su.read_host.__globals__['_require_read_only'].__kwdefaults__.update(...)`. Toate sunt `Load` pe un
+    apel de metodă; ce le trădează e numele dunder, nu ținta. Nicio folosire cinstită a unui dunder pe
+    acest modul nu există în `sentinel/` (căutat), deci regula nu latră la nimic real."""
+    rooted = _rooted_at(tree, target, current, by_name=True)
     return [(n.lineno, ast.unparse(n)) for n in ast.walk(tree)
-            if isinstance(n, (ast.Attribute, ast.Subscript)) and isinstance(n.ctx, (ast.Store, ast.Del))
-            and rooted(n.value if isinstance(n, ast.Subscript) else n)]
+            if isinstance(n, ast.Attribute) and _is_dunder(n.attr) and rooted(n.value)]
 
 
 def test_nothing_outside_system_update_touches_the_run_function():
@@ -2174,6 +2289,9 @@ def _package_problems(package: Path, base: Path) -> tuple[int, list[str]]:
         problems += [f"{path.name}: atinge `{x}` din system_update" for x in sorted(_run_touched(tree, current))]
         problems += [f"{path.name}:{line}: scrie în system_update (`{shown}`)"
                      for line, shown in _module_writes(tree, target, current)]
+        problems += [f"{path.name}:{line}: atribut dunder pe system_update (`{shown}`): ajunge la globalele "
+                     "sau la implicitele porții fără să numească poarta"
+                     for line, shown in _module_dunders(tree, target, current)]
         escaped = _escapes(tree, target, current)
         if escaped:
             problems.append(f"{path.name}: pasează modulul system_update ca valoare ({sorted(escaped)})")
@@ -2270,6 +2388,77 @@ def test_the_package_wide_guard_sees_every_write_into_the_module_and_admits_hone
                    "from sentinel.patch.system_update import READ_ONLY_MODE as m\nm['dnf'] = '-y'",
                    "from sentinel.patch.system_update import _require_read_only"):
         assert _run_touched(ast.parse(source), "sentinel.telegram.bot") & GATE_SURFACE, source
+
+
+_GATE_OFF = "{'_require_read_only': lambda a: None}"
+
+
+def test_a_dunder_on_the_module_is_seen_in_every_context_and_honest_use_passes():
+    """Controlul pozitiv al regulii dunder: cele patru forme măsurate pe `5b72386`, fiecare cu poarta
+    DESCHISĂ la execuție (mock-ul de proces a primit `rpm -q --flag-inventat bash`) și cu garda statică
+    verde, fiindcă nu sunt nici `Store`/`Del` pe modul, nici un nume al porții. Fără regulă, un `su.__dict__
+    .update({...})` într-o funcție din `bot.py` ar lăsa orice argv să treacă și operatorul n-ar afla:
+    comanda ar continua să arate ca `/update` obișnuit. Formele vecine: citire simplă, indice, ștergere,
+    clasa, `__code__`, calea completă, calea relativă, aliasul unui import și numele LUATE din modul (cu și
+    fără `as`). Controalele cinstite sunt folosirile pe care codul le face azi, plus dunder-e pe ALTE
+    obiecte și pe nume luate din ALTE module: o regulă care latră la `type(exc).__name__` ar fi ștearsă."""
+    target, current = "sentinel.patch.system_update", "sentinel.telegram.bot"
+    for source in (
+            f"su.__dict__.update({_GATE_OFF})",
+            "su.__dict__.__setitem__('_require_read_only', lambda a: None)",
+            f"su.read_host.__globals__.update({_GATE_OFF})",
+            "su.read_host.__globals__['_require_read_only'].__kwdefaults__.update(flags={'rpm': ('--x',)})",
+            "x = su.__dict__", "su.__dict__['k'] = 1", "del su.__dict__['k']", "su.__class__ = object",
+            "su.read_host.__code__", "su.Selection.__init__.__globals__", "(su.read_host).__wrapped__",
+            "su.__spec__.loader",
+            "import sentinel.patch.system_update\nsentinel.patch.system_update.__dict__",
+            "from sentinel import patch\npatch.system_update.__dict__",
+            "import sentinel\nsentinel.patch.system_update.__dict__",
+            "import sentinel.patch.system_update as m\nm.__dict__",
+            "from sentinel.patch.system_update import read_host\nread_host.__globals__",
+            "from sentinel.patch.system_update import read_host as rh\nrh.__globals__",
+            "from sentinel.patch.system_update import Selection\nSelection.__init__"):
+        src = source if "import" in source else _SU_HEAD + source
+        assert _module_dunders(ast.parse(src), target, current), source
+    # relativ: se rezolvă față de pachetul fișierului, deci `bot.py` din `telegram` nu e locul lui
+    assert _module_dunders(ast.parse("from . import system_update as s\ns.__dict__"), target,
+                           "sentinel.patch.other")
+    for source in (_SU_HEAD + "async def f(db, cfg, exc):\n    sel = await su.select(db, cfg)\n"
+                              "    return su.Selection(error=f'{type(exc).__name__}: {exc}')",
+                   _SU_HEAD + "x = su.GENERATED_BY\ny = su._private\nz = su.__mangled",
+                   _SU_HEAD + "su.Selection(error='x').__class__",
+                   _SU_HEAD + "obj.__dict__\nself.__class__.__name__\ntype(exc).__name__",
+                   "from sentinel.patch import checks as su\nsu.__dict__",
+                   "from sentinel.patch.checks import evaluate\nevaluate.__globals__",
+                   "from sentinel.patch.other import read_host\nread_host.__globals__",
+                   "from sentinel.patch.system_update import read_host as rh\nread_host.__globals__"):
+        assert not _module_dunders(ast.parse(source), target, current), source
+
+
+def test_the_package_scan_reports_a_dunder_on_the_module_and_stays_quiet_on_an_honest_file(tmp_path):
+    """Controlul scanării pachetului pentru regula dunder, pe un arbore făcut pe loc, cu formele de pe disc
+    măsurate pe `5b72386` (două în `bot.py`, două în `patch_flow.py`, plus un nume luat din modul). Pe
+    arborele real nu folosește nimeni un dunder pe modul, deci ștergerea liniei care le adună în
+    `_package_problems` n-ar înroși nimic acolo: doar un fișier otrăvit pus în față o vede lipsind."""
+    tele = tmp_path / "sentinel" / "telegram"
+    tele.mkdir(parents=True)
+    imp = "from sentinel.patch import system_update as su\n"
+    (tele / "bot.py").write_text(
+        imp + f"def a():\n    su.__dict__.update({_GATE_OFF})\n"
+        "def b():\n    su.__dict__.__setitem__('_require_read_only', lambda a: None)\n", encoding="utf-8")
+    (tele / "patch_flow.py").write_text(
+        imp + f"def c():\n    su.read_host.__globals__.update({_GATE_OFF})\n"
+        "def d():\n    from sentinel.patch.system_update import read_host\n"
+        "    read_host.__globals__['_require_read_only'].__kwdefaults__.update(flags={})\n", encoding="utf-8")
+    (tele / "honest.py").write_text(
+        imp + "async def g(db, cfg, exc):\n    sel = await su.select(db, cfg)\n"
+        "    return su.Selection(error=f'{type(exc).__name__}: {exc}')\n", encoding="utf-8")
+    seen, problems = _package_problems(tmp_path / "sentinel", tmp_path)
+    assert seen == 3
+    dunders = [p for p in problems if "atribut dunder pe system_update" in p]
+    assert {p.split(":")[0] for p in dunders} == {"bot.py", "patch_flow.py"}, problems
+    assert len(dunders) >= 4, problems
+    assert not [p for p in problems if p.startswith("honest.py")], problems
 
 
 def test_the_command_in_bot_py_reaches_for_nothing_in_the_approval_or_the_runner():
