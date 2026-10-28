@@ -87,8 +87,8 @@ Forma dunder nu e «ca un Store»: e o citire care întoarce dicționarul, iar s
 Aliasurile locale sunt urmărite (măsurat pe `f507bcf`: `f = su.read_host` + `f.__globals__.update(...)`
 lăsa garda la 138 passed, iar mock-ul de proces primea `rpm -q --flag-inventat bash`): un nume legat dintr-o
 valoare care pornește de la modul e o rădăcină, până la punct fix, prin `Assign`, `AnnAssign`, `:=`,
-`with ... as`, `for ... in` și comprehensiuni, destructurare, tiparele `case` ale unui `match`, valoarea implicită a unui parametru, ramurile
-unui `if`/`or`, un container cu elemente luate din modul, `getattr`/`setattr`/`delattr(<rădăcină>, "nume")`
+`with ... as`, `for ... in` și comprehensiuni, destructurare, tiparele `case` ale unui `match`, valoarea implicită a unui
+parametru, ramurile unui `if`/`or`, un container cu elemente luate din modul, `getattr`/`setattr`/`delattr(<rădăcină>, "nume")`
 și `importlib.import_module("<numele modulului>")` cu numele LITERAL (`_rooted_at`). O valoare care iese din
 lanț printr-un APEL nu mai e rădăcină (`su.Selection(...).__class__`, `copy.copy(su.Selection(...))`,
 `functools.wraps(su.read_host)`): asta e o hotărâre de proiectare, nu o scăpare, și tot ea lasă deschise
@@ -100,8 +100,8 @@ log); mesajul pentru restul spune ce e adevărat despre ele (garda nu le poate d
 `_module_dunders` întorcea `[]`, iar la execuție `f.__globals__ is vars(su)` și poarta se înlocuia). Acum un tipar
 `case` leagă numele ca o atribuire; ce NU urmărește, în `_rooted_at`: valorile comparate (`case su.X:`), `__match_args__`
 (un tipar pozițional ia subiectul însuși) și garda `if` a unui `case`. Parcurgerea expresiilor și a punctului fix e
-iterativă și pe coadă de lucru: un lanț de 500 de atribute dă o constatare (cu textul scurtat dacă `ast.unparse` nu-l
-poate afișa), nu `RecursionError`, iar un lanț de alias-uri scris în ordine inversă se urmărește liniar. O formă rămâne
+iterativă și pe coadă de lucru: un lanț de 500 de atribute dă o constatare (cu un text de înlocuire dacă `ast.unparse`
+nu-l poate afișa), nu `RecursionError`, iar un lanț de alias-uri scris în ordine inversă se urmărește liniar. O formă rămâne
 pătratică (o listă literală cu mii de nume care devin rădăcini pe rând): vezi docstring-ul lui `_rooted_at`.
 
 Uși rămase deschise după ce scrierile și dunder-ele pe modul sunt închise (la execuție parametrii porții
