@@ -115,8 +115,10 @@ behind a helper».
 from __future__ import annotations
 
 import ast
+import contextlib
 import inspect
 import re
+import sys
 from collections import deque
 from pathlib import Path
 
@@ -2410,8 +2412,8 @@ def _rooted_at(tree: ast.Module, target: str, current: str = THIS_MODULE, *, by_
           `case f` / `case P as f`    `f` = subiectul însuși (rădăcină dacă subiectul e, ține dacă ține);
                                       `P` se potrivește pe același subiect
           `case P | Q`                fiecare alternativă pe același subiect
-          `case [P, Q]`               elementele: `subiect[0]`; cu subiect `(x, y)` de aceeași lungime și fără
-                                      stea, pe perechi (ca la `a, b = x, y`)
+          `case [P, Q]`               elementele: `subiect[0]`; cu subiect `(x, y)` de aceeași lungime, pe
+                                      perechi (ca la `a, b = x, y`)
           `case [*rest]`              `rest` e o listă NOUĂ de elemente: ține, nu e rădăcină
           `case {"k": P}`             `subiect["k"]`
           `case {**rest}`             `rest` e un dicționar NOU cu valorile subiectului: ține, nu e rădăcină
@@ -2435,17 +2437,18 @@ def _rooted_at(tree: ast.Module, target: str, current: str = THIS_MODULE, *, by_
             elif isinstance(pat, ast.MatchOr):
                 stack.extend((alt, value) for alt in pat.patterns)
             elif isinstance(pat, ast.MatchSequence):
+                # Cu un subiect `(x, y)` de aceeași lungime, elementele se împerechează (și o stea ia exact
+                # unul: `[a, *rest]` pe `(x, y)` e `a = x`, `rest = [y]`); altfel, orice element e `subiect[0]`.
                 paired = (isinstance(value, (ast.Tuple, ast.List)) and len(value.elts) == len(pat.patterns)
-                          and not any(isinstance(e, ast.Starred) for e in value.elts)
-                          and not any(isinstance(p, ast.MatchStar) for p in pat.patterns))
+                          and not any(isinstance(e, ast.Starred) for e in value.elts))
                 element = ast.Subscript(value=value, slice=ast.Constant(value=0), ctx=ast.Load())
                 for i, sub in enumerate(pat.patterns):
+                    one = value.elts[i] if paired else element
                     if isinstance(sub, ast.MatchStar):
                         if sub.name is not None:
-                            rest = ast.List(elts=[element], ctx=ast.Load())
-                            out.append((ast.Name(id=sub.name, ctx=ast.Store()), rest))
+                            out.append((ast.Name(id=sub.name, ctx=ast.Store()), ast.List(elts=[one], ctx=ast.Load())))
                     else:
-                        stack.append((sub, value.elts[i] if paired else element))
+                        stack.append((sub, one))
             elif isinstance(pat, ast.MatchMapping):
                 for key, sub in zip(pat.keys, pat.patterns, strict=True):
                     stack.append((sub, ast.Subscript(value=value, slice=key, ctx=ast.Load())))
@@ -2905,6 +2908,254 @@ def test_a_local_alias_of_the_module_or_of_what_it_exposes_is_followed_like_the_
         assert not _unreadable_attr_names(tree, target, current), f"honest form reported as unreadable: {source!r}"
 
 
+#: Modulul de mână pe care se EXECUTĂ formele `match` de mai jos. Se execută în dicționarul lui, deci `read_host.
+#: __globals__ is vars(modul)` și poarta (`_require_read_only`) stă în el, ca la `system_update` adevărat: ce probează
+#: execuția e ce s-ar întâmpla cu modulul real, nu cu o imitație care n-are aceleași legături.
+_MATCH_MODULE_SRC = '''
+from types import SimpleNamespace
+def _require_read_only(argv):
+    raise SystemExit("refuzat")
+def read_host():
+    pass
+TABLE = {"k": read_host, "j": read_host}
+SEQ = [read_host, read_host]
+MIXED = (read_host, "text")
+class Selection:
+    __match_args__ = ("error",)
+    def __init__(self, error=None):
+        self.error = error
+class Note:
+    __match_args__ = ("text",)
+    text = "hi"
+sel = Selection(read_host)
+note = Note()
+obj = SimpleNamespace(attr=read_host)
+'''
+
+#: `(sursa, nume legat, ce spune garda, ce este la execuție)`, cu «root» = un obiect al modulului însuși, «holder» =
+#: un container NOU care ține unul, «nothing» = niciuna. Garda poate spune MAI MULT decât e adevărat (ultimele
+#: rânduri: nu caută `__match_args__`, nu deosebește elementele unui subiect de lungime necunoscută), niciodată mai
+#: puțin; testul verifică ambele jumătăți. Fiecare formă de tipar are cel puțin un rând care o atinge singură.
+_MATCH_BINDINGS = (
+    # MatchAs: fără și cu sub-tipar (numele ia subiectul întreg, sub-tiparul îl potrivește pe același subiect)
+    ("match su.read_host:\n    case f:\n        pass", "f", "root", "root"),
+    ("match su.read_host:\n    case object() as f:\n        pass", "f", "root", "root"),
+    ("match su.SEQ:\n    case [g, _] as f:\n        pass", "f", "root", "root"),
+    ("match su.SEQ:\n    case [g, _] as f:\n        pass", "g", "root", "root"),
+    # MatchSequence: elementele unui subiect-rădăcină, pe perechi când subiectul e o afișare de aceeași lungime
+    ("match su.SEQ:\n    case [a, b]:\n        pass", "a", "root", "root"),
+    ("match su.SEQ:\n    case [a, b]:\n        pass", "b", "root", "root"),
+    ("match su.read_host, make():\n    case (a, b):\n        pass", "a", "root", "root"),
+    ("match su.read_host, make():\n    case (a, b):\n        pass", "b", "nothing", "nothing"),
+    ("match su.read_host, 1:\n    case (f, _):\n        pass", "f", "root", "root"),
+    ("fs = [su.read_host]\nmatch fs:\n    case [f]:\n        pass", "f", "root", "root"),
+    # MatchStar: o listă NOUĂ de elemente, deci «ține», nu e rădăcină
+    ("match su.SEQ:\n    case [a, *rest]:\n        pass", "rest", "holder", "holder"),
+    ("match [su.read_host, 1]:\n    case [*rest]:\n        pass", "rest", "holder", "holder"),
+    ("match [other]:\n    case [*rest]:\n        pass", "rest", "nothing", "nothing"),
+    ("match [other, su.read_host]:\n    case [a, *rest]:\n        pass", "a", "nothing", "nothing"),
+    ("match [other, su.read_host]:\n    case [a, *rest]:\n        pass", "rest", "holder", "holder"),
+    ("match [su.read_host, other]:\n    case [a, *rest]:\n        pass", "rest", "nothing", "nothing"),
+    # MatchMapping: valorile sunt rădăcini, `**rest` e un dicționar NOU care le ține
+    ("match su.TABLE:\n    case {'k': f}:\n        pass", "f", "root", "root"),
+    ("match su.TABLE:\n    case {'k': _, **rest}:\n        pass", "rest", "holder", "holder"),
+    # MatchOr: fiecare alternativă pe același subiect
+    ("match su.TABLE:\n    case {'k': f} | {'j': f}:\n        pass", "f", "root", "root"),
+    # MatchClass: poziționale (subiectul însuși) și pe cuvânt-cheie (un atribut al lui)
+    ("match su.sel:\n    case su.Selection(f):\n        pass", "f", "root", "root"),
+    ("match su.TABLE:\n    case dict(f):\n        pass", "f", "root", "root"),
+    ("match su.obj:\n    case SimpleNamespace(attr=f):\n        pass", "f", "root", "root"),
+    # garda nu schimbă nimic: la execuție numele rămâne legat și când ea pică (`f is None` e fals aici)
+    ("match su.read_host:\n    case f if f is None:\n        pass", "f", "root", "root"),
+    # un alias al numelui legat de `case`, și un container local ca subiect
+    ("match su.read_host:\n    case f:\n        pass\ng = f", "g", "root", "root"),
+    ("fs = [su.read_host]\nmatch fs:\n    case f:\n        pass", "f", "holder", "holder"),
+    # subiecte care NU pornesc din modul: un obiect oarecare, un obiect nou scos printr-un apel
+    ("match other:\n    case f:\n        pass", "f", "nothing", "nothing"),
+    ("match su.Selection(error='x'):\n    case f:\n        pass", "f", "nothing", "nothing"),
+    # garda spune MAI MULT decât e adevărat: un tipar pozițional ia subiectul însuși (nu caută `__match_args__`),
+    # iar elementele unui subiect care nu e o afișare se tratează toate ca rădăcini
+    ("match su.note:\n    case su.Note(t):\n        pass", "t", "root", "nothing"),
+    ("match su.MIXED:\n    case [a, b]:\n        pass", "b", "root", "nothing"),
+)
+_KIND_RANK = {"nothing": 0, "holder": 1, "root": 2}
+
+
+def _match_kinds(source: str, name: str) -> tuple[str, str]:
+    """`(ce spune garda, ce este la execuție)` pentru numele `name` legat de `source`."""
+    import types
+    from types import SimpleNamespace
+
+    mod = types.ModuleType("su")
+    exec(_MATCH_MODULE_SRC, mod.__dict__)
+    reachable = {id(v) for k, v in vars(mod).items() if not k.startswith("__")}
+    namespace = {"su": mod, "other": object(), "make": object, "SimpleNamespace": SimpleNamespace}
+    exec(source, namespace)
+    value = namespace[name]
+    items = list(value.values()) if isinstance(value, dict) else list(value) if isinstance(value, (list, tuple)) else []
+    ran = ("root" if id(value) in reachable
+           else "holder" if any(id(i) in reachable for i in items) else "nothing")
+    rooted = _rooted_at(ast.parse(_SU_HEAD + source), "sentinel.patch.system_update", "sentinel.telegram.bot")
+    judged = ("root" if rooted(ast.Name(id=name, ctx=ast.Load()))
+              else "holder" if rooted(ast.parse(f"{name}[0]", mode="eval").body) else "nothing")
+    return judged, ran
+
+
+def test_a_match_pattern_binds_names_like_an_assignment_and_every_form_is_measured_at_runtime():
+    """`match su.read_host: case f: f.__globals__.update({...})` nu dădea nicio constatare (măsurat pe
+    `0f27fd7`: `_module_dunders` întoarce `[]`), iar la execuție `f is su.read_host`, `f.__globals__ is
+    vars(su)` și poarta se înlocuia: aceeași ușă ca `f = su.read_host`, închisă în runda 5, redeschisă
+    printr-o formă de legare pe care `_rooted_at` n-o urma. Operatorul ar fi crezut că `/update` doar propune,
+    cu poarta deschisă dintr-o funcție din `bot.py`.
+
+    Un tipar `case` nu e o țintă de atribuire, deci fiecare formă a fost HOTĂRÂTĂ (vezi `pattern_sites`) și
+    fiecare rând din `_MATCH_BINDINGS` o EXECUTĂ pe un modul de mână: ce spune garda trebuie să se potrivească
+    cu ce e adevărat, iar când nu se potrivește garda trebuie să spună MAI MULT (rădăcină unde la execuție nu e
+    nimic), niciodată mai puțin. Un rând unde garda ar spune «nimic» pentru o rădăcină adevărată e exact ușa
+    asta. Asta nu e un test de «am scris regula»: o formă pe care am hotărât-o greșit pică aici, pe execuție."""
+    checked = 0
+    for source, name, want_judged, want_ran in _MATCH_BINDINGS:
+        judged, ran = _match_kinds(source, name)
+        assert (judged, ran) == (want_judged, want_ran), (source, name, judged, ran)
+        assert _KIND_RANK[judged] >= _KIND_RANK[ran], f"the guard says LESS than what is true: {source!r} {name!r}"
+        checked += 1
+    assert checked == len(_MATCH_BINDINGS) >= 28, checked
+
+
+def test_the_match_door_measured_in_round_6_is_reported_and_really_opens_the_gate(tmp_path):
+    """Forma exactă a verificatorului din runda 6, pe fișiere: o scanare a pachetului trebuie s-o raporteze, iar
+    execuția ei trebuie să înlocuiască poarta (altfel testul ar proba o ușă care nu e una). Al doilea fișier e
+    de partea cealaltă: cod `match` cinstit, care folosește modulul fără să-l dea mai departe (un tipar de
+    clasă pe rezultatul unui apel, o comparație cu o valoare a modulului, un wildcard, un subiect care nu e
+    din modul), nu are voie să dea nimic — altfel primul om care scrie un `match` pe `Selection` ar primi un
+    roșu care nu se potrivește și ar lărgi regula ca să treacă."""
+    import types
+
+    door = f"match su.read_host:\n    case f:\n        f.__globals__.update({_GATE_OFF})\n"
+    mod = types.ModuleType("su")
+    exec(_MATCH_MODULE_SRC, mod.__dict__)
+    gate = mod._require_read_only
+    exec(door, {"su": mod})
+    assert mod._require_read_only is not gate, "the door does not open the gate; this test would prove nothing"
+
+    tele = tmp_path / "sentinel" / "telegram"
+    tele.mkdir(parents=True)
+    (tele / "bot.py").write_text(_SU_HEAD + "def go():\n" + "".join("    " + ln + "\n" for ln in door.splitlines()),
+                                 encoding="utf-8")
+    (tele / "honest.py").write_text(
+        _SU_HEAD + "async def g(db, cfg, other, make):\n"
+        "    match await su.select(db, cfg):\n"
+        "        case su.Selection(error=None) as sel:\n            return sel.error\n"
+        "    match other:\n        case su.GENERATED_BY:\n            return other.__class__\n"
+        "    match su.read_host:\n        case _:\n            return f.__globals__\n"
+        "    match su.Selection(error='x'):\n        case f:\n            return f.__class__\n"
+        "    match su.read_host, make():\n        case (a, b):\n            return b.__globals__\n"
+        "    match [other]:\n        case [*rest]:\n            return rest[0].__globals__\n", encoding="utf-8")
+    seen, problems = _package_problems(tmp_path / "sentinel", tmp_path)
+    assert seen == 2
+    assert [p for p in problems if p.startswith("bot.py") and "f.__globals__" in p and "dunder" in p], problems
+    assert not [p for p in problems if p.startswith("honest.py")], problems
+
+
+def test_a_long_alias_chain_written_in_reverse_is_followed_in_time_proportional_to_its_length():
+    """Punctul fix reparcurgea tot arborele la fiecare trecere, iar un lanț `a3 = a2`, `a2 = a1`, `a1 = su.f`
+    scris în ordine inversă învață un singur nume pe trecere: pătratic. Măsurat pe `0f27fd7`: 1000 de nume
+    3,68 s, 3000 de nume 32,7 s (același lanț în ordine directă: 0,04 s). Garda rulează în CI la fiecare
+    commit, deci un fișier din `sentinel/` scris așa o făcea lentă pentru oricine, fără nicio constatare care
+    să spună de ce. Acum: 0,04 s la 3000. Pragul de 5 s e de o sută de ori peste ce se măsoară și de șase ori
+    sub vechiul: nu e un cronometru care depinde de cât de repede e gazda, ci un prag pe care doar o formă
+    pătratică îl depășește. Rezultatul se verifică (o constatare, pe linia potrivită): viteza obținută prin
+    sărirea lanțului n-ar conta."""
+    import time
+
+    n = 3000
+    source = (_SU_HEAD + "\n".join(f"a{i} = a{i - 1}" for i in range(n, 0, -1))
+              + f"\na0 = su.read_host\na{n}.__globals__\n")
+    tree = ast.parse(source)
+    started = time.perf_counter()
+    found = _module_dunders(tree, "sentinel.patch.system_update", "sentinel.telegram.bot")
+    elapsed = time.perf_counter() - started
+    assert found == [(n + 3, f"a{n}.__globals__")], found[:3]
+    assert elapsed < 5.0, f"{n} aliases in reverse order took {elapsed:.1f} s (quadratic fixed point?)"
+
+
+@contextlib.contextmanager
+def _recursion_budget(frames: int):
+    """Limita de recursie coborâtă la `frames` cadre PESTE adâncimea curentă, apoi restaurată. Un lanț adânc
+    de 400 nu ar întrece limita implicită (1000) printr-un `rooted` recursiv cu un cadru pe nivel, deci fără
+    asta un test pe adâncime ar trece și cu varianta recursivă."""
+    depth, frame = 0, sys._getframe()
+    while frame is not None:
+        depth += 1
+        frame = frame.f_back
+    previous = sys.getrecursionlimit()
+    sys.setrecursionlimit(depth + frames)
+    try:
+        yield
+    finally:
+        sys.setrecursionlimit(previous)
+
+
+def test_a_chain_far_deeper_than_the_stack_gives_a_finding_not_an_exception(tmp_path):
+    """`su.a.a.a...` de 500 de ori ridica `RecursionError` (măsurat pe `0f27fd7`): întâi din `rooted`/`holds`,
+    care coborau un cadru pe nivel, apoi — cu ele iterative — din `ast.unparse`, care formează textul
+    constatării și are câteva cadre pe nivel. Un roșu din excepție nu spune ce e greșit; fișierul ajunge să
+    fie «cel care strică garda» în loc de «cel care scrie în modul». Aici fiecare formă de constatare pe un
+    lanț adânc cât să nu încapă în stivă (limita coborâtă la 200 de cadre peste cea curentă, deci și o
+    recursie cu un singur cadru pe nivel pică) dă exact O constatare, iar același lanț pornit de la un nume
+    oarecare nu dă nimic. Parsarea se face ÎNAINTE de limita coborâtă (`ast.parse` o respectă și el)."""
+    depth = 400
+    chain = ".a" * depth
+    forms = {
+        "dunder": ("x = su" + chain + ".__globals__\n", _module_dunders),
+        "write": ("su" + chain + ".b = 1\n", _module_writes),
+        "write on an index": ("su" + chain + "['k'] = 1\n", _module_writes),
+        "subscripts": ("x = su" + "[0]" * depth + ".__globals__\n", _module_dunders),
+        "unreadable name": ("getattr(su" + chain + ", name)\n", _unreadable_attr_names),
+        "dunder as a string": ("getattr(su" + chain + ", '__globals__')\n", _module_dunders),
+    }
+    parsed = {label: (ast.parse(_SU_HEAD + src), rule) for label, (src, rule) in forms.items()}
+    honest = ast.parse(_SU_HEAD + "x = other" + chain + ".__globals__\nother" + chain + ".b = 1\n"
+                       "getattr(other" + chain + ", name)\n")
+    target, current = "sentinel.patch.system_update", "sentinel.telegram.bot"
+    with _recursion_budget(200):
+        with pytest.raises(RecursionError):
+            ast.unparse(parsed["dunder"][0].body[-1])    # control: the budget really is too small for a plain unparse
+        found = {label: rule(tree, target, current) for label, (tree, rule) in parsed.items()}
+        quiet = [rule(honest, target, current) for rule in (_module_dunders, _module_writes, _unreadable_attr_names)]
+    for label, result in found.items():
+        assert len(result) == 1 and result[0][0] == 2 and result[0][1], (label, result)
+    assert quiet == [[], [], []], quiet
+
+    # și de-a lungul întregii scanări a pachetului, cu limita implicită: aceeași constatare, cu text
+    tele = tmp_path / "sentinel" / "telegram"
+    tele.mkdir(parents=True)
+    for stem, body in {"dunder": forms["dunder"][0], "honest": "x = other" + chain + ".b\n"}.items():
+        (tele / f"{stem}.py").write_text(_SU_HEAD + body, encoding="utf-8")
+    seen, problems = _package_problems(tmp_path / "sentinel", tmp_path)
+    assert seen == 2 and len(problems) == 1 and problems[0].startswith("dunder.py:2:"), problems
+
+
+def test_binding_forms_nested_as_deep_as_the_parser_allows_follow_their_aliases_without_recursing():
+    """`bind`, `leaves` și parcurgerea tiparelor coborau recursiv în destructurări și tipare imbricate. Parserul
+    acceptă ~200 de paranteze imbricate, deci un fișier le putea scrie cât să ridice `RecursionError` în loc
+    să fie citit: un roșu fără constatare. Cu limita coborâtă la 100 de cadre peste cea curentă, 150 de niveluri
+    de destructurare și 150 de tipare `[[[...f...]]]` trebuie să lege în continuare numele către poartă."""
+    levels = 150
+    def nest(inner: str) -> str:
+        return "(" * levels + inner + ",)" * levels
+
+    sources = {
+        "destructuring": f"{nest('a')} = {nest('su.read_host')}\n",
+        "pattern": "match su.SEQ:\n    case " + "[" * levels + "a" + ", _]" * levels + ":\n        pass\n",
+    }
+    trees = {label: ast.parse(_SU_HEAD + src) for label, src in sources.items()}
+    with _recursion_budget(100):
+        got = {label: _rooted_at(tree, "sentinel.patch.system_update", "sentinel.telegram.bot")(
+            ast.Name(id="a", ctx=ast.Load())) for label, tree in trees.items()}
+    assert got == {"destructuring": True, "pattern": True}, got
+
+
 def _parameter_shapes():
     """Fiecare semnătură cu 0-1 poziționale-only, 0-2 obișnuite și 0-2 kw-only, fiecare parametru cu implicit
     înrădăcinat, implicit obișnuit sau fără implicit, ca `def` și ca `lambda`. Întoarce `(sursa, {parametru:
@@ -2988,16 +3239,54 @@ def test_a_name_given_to_getattr_that_the_guard_cannot_read_is_reported_not_pass
     atribut citește. A-l lăsa să treacă ar fi socotit «nu știu» drept «e bine»: același `f.__globals__`, scris
     cu un șir construit, ar fi deschis poarta fără nicio constatare. Se raportează cu un mesaj propriu (garda
     nu a găsit un dunder, nu poate ști), iar un `getattr` pe un obiect care nu pornește din modul nu are
-    voie să dea nimic: `getattr(obj, field)` e cod obișnuit."""
+    voie să dea nimic: `getattr(obj, field)` e cod obișnuit.
+
+    Cu argumente împachetate, al doilea argument LITERAL nu e numele: `getattr(*pair, 'x')` cu `pair = (su.read_host,
+    '__globals__')` e `getattr(su.read_host, '__globals__', 'x')`, iar `'x'` e valoarea implicită (măsurat: întoarce
+    `vars(su)`). Citit ca nume, ar fi un șir literal obișnuit și nu s-ar raporta nimic, nici aici, nici la dunder-e
+    (`getattr(*pair, '__name__')` ar trece drept citire inertă). De aceea `_by_string_attr` întoarce «nume necitibil»
+    de îndată ce PRIMUL argument e împachetat, nu doar al doilea; ștergerea acelei clauze lasă fără constatare exact
+    formele de mai jos cu un literal după stea."""
     target, current = "sentinel.patch.system_update", "sentinel.telegram.bot"
+    pair = "pair = (su.read_host, '__globals__')\n"
     for source in ("getattr(su.read_host, name)", "getattr(su.read_host, '__glo' + 'bals__')",
                    "pair = (su.read_host, '__globals__')\ngetattr(*pair)", "setattr(su.read_host, name, {})",
-                   "f = su.read_host\ngetattr(f, name)", "getattr(su.read_host, 5)"):
+                   "f = su.read_host\ngetattr(f, name)", "getattr(su.read_host, 5)",
+                   # primul argument împachetat, cu un literal după el: literalul e valoarea implicită, nu numele
+                   pair + "getattr(*pair, 'x')", pair + "getattr(*pair, '__name__')", pair + "setattr(*pair, 'x')",
+                   "getattr(*(su.read_host, '__globals__'), 'x')", "getattr(*su.pair, 'x')",
+                   # al doilea împachetat, și un singur argument (apel invalid la execuție, dar un fișier îl poate conține)
+                   pair + "getattr(su.read_host, *pair)", "getattr(su.read_host)"):
         tree = ast.parse(_SU_HEAD + source)
         assert _unreadable_attr_names(tree, target, current), f"unreadable name passed: {source!r}"
     for source in ("getattr(obj, field)", "getattr(su.read_host, 'name_of_something')", "getattr(sel, name, None)",
-                   "getattr(su.read_host, '__name__')"):
+                   "getattr(su.read_host, '__name__')",
+                   # aceleași forme pe un obiect care nu pornește din modul: cod obișnuit, nimic de raportat
+                   "pair = (obj, 'x')\ngetattr(*pair, 'x')", "getattr(*pair, '__name__')", "getattr(obj)", "getattr()"):
         assert not _unreadable_attr_names(ast.parse(_SU_HEAD + source), target, current), source
+        assert not _module_dunders(ast.parse(_SU_HEAD + source), target, current), source
+
+
+def test_the_attribute_name_helper_returns_no_name_whenever_the_arguments_cannot_be_read():
+    """`_by_string_attr` e singurul loc care hotărăște dacă `getattr(obiect, nume)` are un nume pe care garda îl
+    poate citi; cele trei reguli care o folosesc (`_rooted_at`, dunder-ele, numele necitibile) citesc doar
+    întoarcerea ei. Contractul: «nume» = al doilea argument când apelul are exact formă `f(obiect, nume, ...)`
+    fără stea, altfel `None` (nu știu), iar un apel fără argumente nu e deloc un apel de acest fel. Fiecare clauză
+    are o intrare care îi simte lipsa: fără `Starred` pe primul argument `getattr(*pair, 'x')` ar întoarce `'x'` ca
+    nume; fără `len < 2`, `getattr(obj)` ar ridica `IndexError` pe orice fișier care îl conține; fără `Starred` pe
+    al doilea, întoarcerea ar fi un `Starred` în loc de `None` (regulile de azi le tratează la fel, deci asta se
+    vede DOAR aici: contractul scris în docstring-ul funcției, nu o ieșire a gărzii)."""
+    for source, expected in (
+        ("getattr(x, 'n')", "'n'"), ("setattr(x, 'n', 1)", "'n'"), ("delattr(x, 'n')", "'n'"),
+        ("getattr(x, name, None)", "name"),
+        ("getattr(*pair)", None), ("getattr(*pair, 'x')", None), ("setattr(*pair, 'x')", None),
+        ("getattr(x, *pair)", None), ("getattr(x)", None),
+    ):
+        found = _by_string_attr(ast.parse(source).body[0].value)
+        assert found is not None, source
+        assert (None if found[1] is None else ast.unparse(found[1])) == expected, (source, found)
+    for source in ("getattr()", "hasattr(x, 'n')", "obj.getattr(x, 'n')", "len(x)", "x"):
+        assert _by_string_attr(ast.parse(source).body[0].value) is None, source
 
 
 _INERT_READS = tuple(
