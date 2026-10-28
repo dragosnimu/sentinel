@@ -87,7 +87,7 @@ Forma dunder nu e «ca un Store»: e o citire care întoarce dicționarul, iar s
 Aliasurile locale sunt urmărite (măsurat pe `f507bcf`: `f = su.read_host` + `f.__globals__.update(...)`
 lăsa garda la 138 passed, iar mock-ul de proces primea `rpm -q --flag-inventat bash`): un nume legat dintr-o
 valoare care pornește de la modul e o rădăcină, până la punct fix, prin `Assign`, `AnnAssign`, `:=`,
-`with ... as`, `for ... in` și comprehensiuni, destructurare, valoarea implicită a unui parametru, ramurile
+`with ... as`, `for ... in` și comprehensiuni, destructurare, tiparele `case` ale unui `match`, valoarea implicită a unui parametru, ramurile
 unui `if`/`or`, un container cu elemente luate din modul, `getattr`/`setattr`/`delattr(<rădăcină>, "nume")`
 și `importlib.import_module("<numele modulului>")` cu numele LITERAL (`_rooted_at`). O valoare care iese din
 lanț printr-un APEL nu mai e rădăcină (`su.Selection(...).__class__`, `copy.copy(su.Selection(...))`,
@@ -95,6 +95,14 @@ lanț printr-un APEL nu mai e rădăcină (`su.Selection(...).__class__`, `copy.
 formele de mai jos. Dunder-ele admise sunt doar CITIRILE numelor din `INERT_DUNDERS` (`su.__name__` într-un
 log); mesajul pentru restul spune ce e adevărat despre ele (garda nu le poate dovedi inofensive), nu că
 «ajung la poartă».
+
+`match su.read_host: case f: f.__globals__.update(...)` n-a dat nicio constatare până aici (măsurat pe `0f27fd7`:
+`_module_dunders` întorcea `[]`, iar la execuție `f.__globals__ is vars(su)` și poarta se înlocuia). Acum un tipar
+`case` leagă numele ca o atribuire; ce NU urmărește, în `_rooted_at`: valorile comparate (`case su.X:`), `__match_args__`
+(un tipar pozițional ia subiectul însuși) și garda `if` a unui `case`. Parcurgerea expresiilor și a punctului fix e
+iterativă și pe coadă de lucru: un lanț de 500 de atribute dă o constatare (cu textul scurtat dacă `ast.unparse` nu-l
+poate afișa), nu `RecursionError`, iar un lanț de alias-uri scris în ordine inversă se urmărește liniar. O formă rămâne
+pătratică (o listă literală cu mii de nume care devin rădăcini pe rând): vezi docstring-ul lui `_rooted_at`.
 
 Uși rămase deschise după ce scrierile și dunder-ele pe modul sunt închise (la execuție parametrii porții
 nu mai depind de numele din modul, deci o atribuire nu o mai lărgește): cod care ajunge la poartă fără
@@ -2287,16 +2295,36 @@ def _rooted_at(tree: ast.Module, target: str, current: str = THIS_MODULE, *, by_
     Aliasurile locale (`f = su.read_host` + `f.__globals__`, măsurat pe `f507bcf`: 138 passed cu poarta
     deschisă la execuție) sunt urmărite până la punct fix, deci și un alias al unui alias: `Assign`,
     `AnnAssign`, `:=`, `with ... as`, `for ... in` și comprehensiunile, destructurarea (element cu
-    element când ambele părți sunt afișări de aceeași lungime), valorile implicite ale parametrilor. O
+    element când ambele părți sunt afișări de aceeași lungime), tiparele `case` ale unui `match` (mai jos) și
+    valorile implicite ale parametrilor. O
     valoare care IESE din lanț printr-un apel nu mai e rădăcină: `su.Selection(...)`, `copy.copy(su.X)`,
     `functools.wraps(su.X)` dau obiecte noi. Singurele apeluri tratate ca atribut sunt
     `getattr`/`setattr`/`delattr(<rădăcină>, nume)` și `import_module(<numele modulului>)`.
     Un nume legat la un container (`fs = [su.read_host]`) ține elemente înrădăcinate, nu e el însuși
     rădăcină: `fs[0].__globals__` e semnalat, `fs["k"] = 1` nu (e o scriere în dicționarul local).
 
+    `match`: un tipar `case` nu e o țintă de atribuire, dar fiecare nume pe care îl capturează primește o
+    valoare care se poate scrie ca expresie peste subiect, deci trece prin aceeași `bind` (`pattern_sites`
+    spune ce leagă fiecare formă, iar `_MATCH_BINDINGS` EXECUTĂ fiecare rând pe un modul de mână și cere ca
+    garda să spună cel puțin cât e adevărat). Nu se urmărește: o comparație (`case su.X:`, `case 1:`, `case
+    None:`) nu leagă nimic; clasa dintr-un `case C(...)` se citește, nu se leagă; `__match_args__` nu se caută
+    (un tipar pozițional ia subiectul însuși, deci garda poate spune «rădăcină» unde la execuție e un șir);
+    garda `if` a unui `case` nu schimbă ce se leagă (capturile se fac înainte de ea și rămân și când pică);
+    un subiect care iese din lanț printr-un apel (`match su.select(...)`, `match await ...`) nu mai e rădăcină,
+    ca oriunde în regulă.
+
     Regula e fără flux și fără domeniu de vizibilitate: un nume legat undeva dintr-o valoare înrădăcinată
     e rădăcină oriunde în fișier. Greșește doar într-o direcție (semnalează în plus un alt nume la fel),
-    niciodată în sens invers."""
+    niciodată în sens invers — în limitele a ce numește docstring-ul modulului ca ușă lăsată deschisă.
+
+    Cost: locurile care leagă un nume se adună o dată, iar punctul fix merge pe o coadă de lucru (un loc se
+    reia doar când se schimbă un nume pe care îl citește), nu pe treceri peste tot arborele; `rooted`, `holds`,
+    `bind`, `leaves` și `pattern_sites` sunt iterative, deci un lanț de 500 de atribute dă o constatare, nu
+    `RecursionError`. Măsurat (același lanț de alias-uri scris în ordine inversă): 1000 de nume 3,68 s
+    -> 0,01 s, 3000 de nume 32,7 s -> 0,04 s, 10000 de nume 0,12 s (liniar). NU e liniar în orice formă: o
+    singură listă literală care citește n nume ce devin rădăcini pe rând se reevaluează de n ori (măsurat:
+    3000 de nume 1,2 s, 10000 de nume 22,8 s). Cere un fișier de zece mii de linii scris anume, și rămâne
+    spus aici, nu rezolvat."""
     _, aliases = _import_forms(tree, target, current)
     base = target.rpartition(".")[2]
     roots = set(aliases)
@@ -2432,8 +2460,8 @@ def _rooted_at(tree: ast.Module, target: str, current: str = THIS_MODULE, *, by_
             if isinstance(pat, ast.MatchAs):
                 if pat.name is not None:
                     out.append((ast.Name(id=pat.name, ctx=ast.Store()), value))
-                if pat.pattern is not None:
-                    stack.append((pat.pattern, value))
+                # `case f` nu are sub-tipar: `None` nu potrivește nicio ramură de mai jos, deci nu face nimic
+                stack.append((pat.pattern, value))
             elif isinstance(pat, ast.MatchOr):
                 stack.extend((alt, value) for alt in pat.patterns)
             elif isinstance(pat, ast.MatchSequence):
@@ -2462,7 +2490,7 @@ def _rooted_at(tree: ast.Module, target: str, current: str = THIS_MODULE, *, by_
 
     # Locurile care leagă un nume, adunate O DATĂ: `(țintă, valoare, iterează)`. Înainte, fiecare trecere
     # a punctului fix reparcurgea tot arborele cu `ast.walk`, iar un lanț de alias-uri scris în ordine inversă
-    # (`a3 = a2`, `a2 = a1`, `a1 = su.f`) învață un nume pe trecere: pătratic (măsurat: 3000 de nume, 34 s).
+    # (`a3 = a2`, `a2 = a1`, `a1 = su.f`) învață un nume pe trecere: pătratic (măsurat: 3000 de nume, 32,7 s).
     sites: list[tuple[ast.AST, ast.AST, bool]] = []
     for n in ast.walk(tree):
         if isinstance(n, ast.Assign):
@@ -2961,6 +2989,9 @@ _MATCH_BINDINGS = (
     ("match su.TABLE:\n    case {'k': _, **rest}:\n        pass", "rest", "holder", "holder"),
     # MatchOr: fiecare alternativă pe același subiect
     ("match su.TABLE:\n    case {'k': f} | {'j': f}:\n        pass", "f", "root", "root"),
+    ("match su.read_host, other:\n    case (f, _) | (_, f):\n        pass", "f", "root", "root"),
+    # alternativa care se potrivește la execuție e prima, dar garda le unește pe amândouă (nu știe care): ordinea nu contează
+    ("match su.read_host, other:\n    case (_, f) | (f, _):\n        pass", "f", "root", "nothing"),
     # MatchClass: poziționale (subiectul însuși) și pe cuvânt-cheie (un atribut al lui)
     ("match su.sel:\n    case su.Selection(f):\n        pass", "f", "root", "root"),
     ("match su.TABLE:\n    case dict(f):\n        pass", "f", "root", "root"),
@@ -2977,6 +3008,10 @@ _MATCH_BINDINGS = (
     # iar elementele unui subiect care nu e o afișare se tratează toate ca rădăcini
     ("match su.note:\n    case su.Note(t):\n        pass", "t", "root", "nothing"),
     ("match su.MIXED:\n    case [a, b]:\n        pass", "b", "root", "nothing"),
+    # un subiect cu element împachetat nu se împerechează (ca la destructurarea `a, b = *s, x`): `b` ar putea fi din `s`
+    ("match *su.SEQ[:1], 1:\n    case [a, b]:\n        pass", "b", "root", "nothing"),
+    # lungimi diferite: elementul de rădăcină nu e pe poziția tiparului, deci NU se împerechează după indice
+    ("match [other, su.read_host]:\n    case [*rest]:\n        pass", "rest", "holder", "holder"),
 )
 _KIND_RANK = {"nothing": 0, "holder": 1, "root": 2}
 
@@ -3019,7 +3054,17 @@ def test_a_match_pattern_binds_names_like_an_assignment_and_every_form_is_measur
         assert (judged, ran) == (want_judged, want_ran), (source, name, judged, ran)
         assert _KIND_RANK[judged] >= _KIND_RANK[ran], f"the guard says LESS than what is true: {source!r} {name!r}"
         checked += 1
-    assert checked == len(_MATCH_BINDINGS) >= 28, checked
+    assert checked == len(_MATCH_BINDINGS) >= 32, checked
+    # Un wildcard (`_`, `*_`, o mapare fără `**rest`) nu leagă niciun nume. `ast.Name(id=None)` nu apare niciodată
+    # într-un fișier parsat, deci nimic din afară nu l-ar întreba: se întreabă aici direct, altfel o verificare
+    # `is not None` ștearsă ar lăsa un nume fără nume printre rădăcini fără ca vreo constatare să se schimbe.
+    nameless = ast.Name(id=None, ctx=ast.Load())
+    element_of_nameless = ast.Subscript(value=nameless, slice=ast.Constant(value=0), ctx=ast.Load())
+    for source in ("match su.read_host:\n    case _:\n        pass",
+                   "match su.SEQ:\n    case [a, *_]:\n        pass",
+                   "match su.TABLE:\n    case {'k': _}:\n        pass"):
+        rooted = _rooted_at(ast.parse(_SU_HEAD + source), "sentinel.patch.system_update", "sentinel.telegram.bot")
+        assert not rooted(nameless) and not rooted(element_of_nameless), source
 
 
 def test_the_match_door_measured_in_round_6_is_reported_and_really_opens_the_gate(tmp_path):
@@ -3062,7 +3107,7 @@ def test_a_long_alias_chain_written_in_reverse_is_followed_in_time_proportional_
     scris în ordine inversă învață un singur nume pe trecere: pătratic. Măsurat pe `0f27fd7`: 1000 de nume
     3,68 s, 3000 de nume 32,7 s (același lanț în ordine directă: 0,04 s). Garda rulează în CI la fiecare
     commit, deci un fișier din `sentinel/` scris așa o făcea lentă pentru oricine, fără nicio constatare care
-    să spună de ce. Acum: 0,04 s la 3000. Pragul de 5 s e de o sută de ori peste ce se măsoară și de șase ori
+    să spună de ce. Acum: 0,04 s la 3000. Pragul de 5 s e de peste o sută de ori peste ce se măsoară și de peste șase ori
     sub vechiul: nu e un cronometru care depinde de cât de repede e gazda, ci un prag pe care doar o formă
     pătratică îl depășește. Rezultatul se verifică (o constatare, pe linia potrivită): viteza obținută prin
     sărirea lanțului n-ar conta."""
@@ -3147,13 +3192,52 @@ def test_binding_forms_nested_as_deep_as_the_parser_allows_follow_their_aliases_
 
     sources = {
         "destructuring": f"{nest('a')} = {nest('su.read_host')}\n",
+        # valoarea nu e o afișare, deci ținta nu se desface pe perechi: `leaves` coboară prin toată imbricarea
+        "unpacking": f"{nest('a')} = su.read_host\n",
         "pattern": "match su.SEQ:\n    case " + "[" * levels + "a" + ", _]" * levels + ":\n        pass\n",
     }
     trees = {label: ast.parse(_SU_HEAD + src) for label, src in sources.items()}
     with _recursion_budget(100):
         got = {label: _rooted_at(tree, "sentinel.patch.system_update", "sentinel.telegram.bot")(
             ast.Name(id="a", ctx=ast.Load())) for label, tree in trees.items()}
-    assert got == {"destructuring": True, "pattern": True}, got
+    assert got == {"destructuring": True, "unpacking": True, "pattern": True}, got
+
+
+def test_the_parallel_lists_of_a_mapping_and_a_class_pattern_are_as_long_as_the_parser_makes_them():
+    """`pattern_sites` împerechează `keys` cu `patterns` (mapare) și `kwd_attrs` cu `kwd_patterns` (clasă) cu
+    `zip(..., strict=True)`. Ca la parametri, `strict` nu e nici o presupunere, nici o decorație: se MĂSOARĂ că
+    parserul nu produce niciodată liste inegale (0-3 chei cu și fără `**rest`, 0-2 poziționale și 0-2 pe
+    cuvânt-cheie), așa că un fișier otrăvit nu poate declanșa excepția; iar un AST făcut de mână cu liste
+    inegale ridică `ValueError` în loc să piardă tăcut tiparele de la coadă (`strict=False` ar lega doar
+    perechile care există și ar lăsa `f` din ultimul tipar nelegat: garda ar tăcea). `compile()` refuză la fel
+    aceleași AST-uri, deci invarianta nu e doar a acestui fișier."""
+    import itertools
+
+    target, current = "sentinel.patch.system_update", "sentinel.telegram.bot"
+    patterns = []
+    for nkeys, rest in itertools.product(range(4), (False, True)):
+        body = [f"'k{i}': p{i}" for i in range(nkeys)] + (["**rest"] if rest else [])
+        patterns.append("{" + ", ".join(body) + "}")
+    for npos, nkw in itertools.product(range(3), range(3)):
+        body = [f"q{i}" for i in range(npos)] + [f"kw{i}=r{i}" for i in range(nkw)]
+        patterns.append("Cls(" + ", ".join(body) + ")")
+    assert len(patterns) == 8 + 9
+    for pattern in patterns:
+        case = ast.parse(f"match su.X:\n    case {pattern}:\n        pass").body[0].cases[0].pattern
+        if isinstance(case, ast.MatchMapping):
+            assert len(case.keys) == len(case.patterns), pattern
+        else:
+            assert len(case.kwd_attrs) == len(case.kwd_patterns), pattern
+
+    mapping = ast.parse(_SU_HEAD + "match su.TABLE:\n    case {'k': f, 'j': g}:\n        pass")
+    mapping.body[-1].cases[0].pattern.patterns.pop()
+    clazz = ast.parse(_SU_HEAD + "match su.obj:\n    case Cls(a=f, b=g):\n        pass")
+    clazz.body[-1].cases[0].pattern.kwd_patterns.pop()
+    for tree in (mapping, clazz):
+        with pytest.raises(ValueError, match=r"zip\(\) argument"):
+            _rooted_at(tree, target, current)
+        with pytest.raises(ValueError):
+            compile(tree, "<broken>", "exec")
 
 
 def _parameter_shapes():
