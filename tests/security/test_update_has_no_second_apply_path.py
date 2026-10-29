@@ -114,7 +114,7 @@ pătratică (o listă literală cu mii de nume care devin rădăcini pe rând): 
 Containerele: `holds` urmărește afișările (`[su.f]`, `(su.f,)`, `{k: su.f}`, și cheile), comprehensiunile de orice fel
 (`[f for f in su.SEQ]`, `{..}`, generatoare, `{k: v ...}`, cu `async`, condiții, imbricate), operatorii binari
 (`su.SEQ + []`, `[f] * 2`, `su.TABLE | {}`, în lanț) și `x += ...`, ramurile `a if c else b` / `a or b` și `(x := [...])`.
-Măsurat pe `b5b15b7` (și pe `0f27fd7`): `x = [f for f in su.SEQ]` și `x = su.SEQ + []`, urmate de
+Măsurat pe `0f27fd7`, `47e6158` și `b5b15b7`: `x = [f for f in su.SEQ]` și `x = su.SEQ + []`, urmate de
 `x[0].__globals__.update({...})`, dădeau zero constatări, iar poarta se înlocuia: propoziția «un container cu elemente
 luate din modul e urmărit» era adevărată doar pentru afișări (`_CONTAINER_DOORS` execută fiecare formă). Un container care
 trece printr-un operator rămâne containerul: regula raportează în plus, niciodată în minus.
@@ -3470,6 +3470,39 @@ def test_the_doors_the_module_docstring_names_as_open_are_really_open_and_really
                  + _unreadable_attr_names(tree, target, current))
         assert not found, (f"`{label}` is now followed by the guard: move it out of the «uși rămase deschise» "
                            f"paragraph of the module docstring and out of _OPEN_DOORS", found)
+
+
+#: Uși numite în docstring-ul modulului care nu numesc modulul deloc: fișierul nu e nici măcar citit de scanare.
+#: Nu se execută (ar cere modulul real și procesul real); ce se probează e partea gărzii: ele nu produc nimic.
+_UNNAMED_DOORS = (
+    ("gc.get_objects()", "import gc\nfor o in gc.get_objects():\n    if getattr(o, '__name__', '') == 'read_host':\n"
+                         "        o.__globals__.update({})\n"),
+    ("sys.modules[...]", "import sys\nsys.modules['sentinel.patch.system_update'].read_host.__globals__.update({})\n"),
+    ("package __dict__", "import sentinel.patch\n"
+                         "sentinel.patch.__dict__['system_update'].read_host.__globals__.update({})\n"),
+    ("import_module(name)", "import importlib\nimportlib.import_module(name).read_host.__globals__.update({})\n"),
+    ("assigning on asyncio", "import asyncio\nasyncio.create_subprocess_exec = None\n"),
+)
+
+
+def test_the_doors_that_never_name_the_module_and_the_nondunder_setattr_are_open_as_the_docstring_says(tmp_path):
+    """Restul propozițiilor din paragraful «uși rămase deschise» care nu sunt acoperite de `_OPEN_DOORS`: cod care
+    ajunge la poartă fără să numească modulul (`gc.get_objects()`, `sys.modules[...]`, `__dict__` al pachetului,
+    `import_module(<nume neliteral>)`) sau care schimbă ce PORNEȘTE, nu ce refuză poarta (`asyncio.create_subprocess_exec
+    = ...`), și `setattr(su.X, "nume", ...)` cu un nume care nu e dunder. Fiecare e cerut deschis, ca paragraful să nu
+    poată mai minți: când una se închide, testul pică spre bine și propoziția se mută din docstring. Scanarea pachetului
+    nu citește deloc un fișier care nu importă modulul (`seen == 0`), iar un `setattr` cu nume literal obișnuit pe o
+    valoare luată din modul nu dă nicio constatare în nicio regulă."""
+    target, current = "sentinel.patch.system_update", "sentinel.telegram.bot"
+    tele = tmp_path / "sentinel" / "telegram"
+    tele.mkdir(parents=True)
+    for i, (_label, source) in enumerate(_UNNAMED_DOORS):
+        (tele / f"unnamed{i}.py").write_text(source, encoding="utf-8")
+    seen, problems = _package_problems(tmp_path / "sentinel", tmp_path)
+    assert (seen, problems) == (0, []), (seen, problems)
+    tree = ast.parse(_SU_HEAD + "setattr(su.sel, 'error', None)\n")
+    assert not (_module_dunders(tree, target, current) + _module_writes(tree, target, current)
+                + _unreadable_attr_names(tree, target, current))
 
 
 def test_a_long_alias_chain_written_in_reverse_is_followed_in_time_proportional_to_its_length():
