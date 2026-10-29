@@ -3338,6 +3338,7 @@ _CONTAINER_DOORS = (
     ("binop right", "x = [] + su.SEQ\nx[0].__globals__.update(GATE)\n"),
     ("binop chain", "x = [] + su.SEQ + [] + []\nx[0].__globals__.update(GATE)\n"),
     ("binop on a display", "x = [su.read_host] * 2\nx[0].__globals__.update(GATE)\n"),
+    ("binop right operand is a display", "x = [] + [su.read_host]\nx[0].__globals__.update(GATE)\n"),
     ("binop on a dict", "x = su.TABLE | {}\nx['k'].__globals__.update(GATE)\n"),
     ("augmented assignment", "x = []\nx += su.SEQ\nx[0].__globals__.update(GATE)\n"),
     # ocolișuri ale propriei reparații: imbricare, condiție, element comprehensiune sau operator, walrus, async
@@ -3355,6 +3356,7 @@ _CONTAINER_DOORS = (
     ("inline comprehension", "[f for f in su.SEQ][0].__globals__.update(GATE)\n"),
     # același container pe ramuri ale unei expresii, care îl trec mai departe
     ("conditional", "x = [su.read_host] if True else []\nx[0].__globals__.update(GATE)\n"),
+    ("conditional, else branch", "x = [] if False else [su.read_host]\nx[0].__globals__.update(GATE)\n"),
     ("or", "x = [] or [su.read_host]\nx[0].__globals__.update(GATE)\n"),
     ("walrus", "z = (x := [su.read_host])\nz[0].__globals__.update(GATE)\n"),
     # aceleași două forme ca subiect de `match`
