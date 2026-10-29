@@ -122,8 +122,8 @@ trece printr-un operator rămâne containerul: regula raportează în plus, nici
 Uși rămase deschise după ce scrierile și dunder-ele pe modul sunt închise (la execuție parametrii porții
 nu mai depind de numele din modul, deci o atribuire nu o mai lărgește): cod care ajunge la poartă fără
 să numească modulul (`gc.get_objects()`, `sys.modules[...]`, `sentinel.patch.__dict__["system_update"]`);
-o valoare a modulului care trece printr-un APEL sau printr-un obiect înainte de dunder (măsurat: toate
-dau zero constatări): `def g(f): return f.__globals__` + `g(su.read_host)`, `self.f = su.read_host`,
+o valoare a modulului care trece printr-un APEL sau printr-un obiect înainte de dunder (măsurat; `_OPEN_DOORS` și
+`_UNNAMED_DOORS` cer ca fiecare să dea zero constatări): `def g(f): return f.__globals__` + `g(su.read_host)`, `self.f = su.read_host`,
 `fs.append(su.read_host)` sau `d["k"] = su.read_host` + `fs[0].__globals__`, `d.get("k")`, `d.values()`, o
 funcție care întoarce `su.read_host`, `class K: f = su.read_host` + `K.f.__globals__`, și `setattr(su.X,
 "nume", ...)` cu un nume care nu e dunder. Același lucru pentru un container care trece printr-un APEL, nu printr-un
