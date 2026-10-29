@@ -2708,10 +2708,12 @@ _DUNDER_ADVICE = ("garda îl poate admite doar ca CITIRE a unuia dintre " + ", "
                   "iar `__dict__`, `__globals__`, `__kwdefaults__` și `__code__` duc la globalele sau la implicitele porții")
 
 
-#: Ce găsește `_module_writes`: o ȚINTĂ de scriere pe un lanț care pornește de la modul, nu neapărat o scriere ÎN modul
-#: (`x[0].error = None` cu `x` luat din modul scrie pe un element). Constanta e și în teste, ca mesajul să nu mai poată
-#: deriva de ele.
-_WRITE_WORDING = "scriere pe un lanț pornit de la system_update"
+#: Ce găsește `_module_writes`: o ȚINTĂ de scriere SAU de ștergere (`Store`/`Del`: `su.X = 1`, `del su.X`) pe un lanț care
+#: pornește de la modul, nu neapărat o scriere ÎN modul (`x[0].error = None` cu `x` luat din modul scrie pe un element).
+#: Constanta e folosită și de teste ca să găsească mesajul, dar CONȚINUTUL ei îl fixează o aserțiune cu textul literal, în
+#: `test_a_write_on_an_element_...`: altfel o propoziție falsă pusă aici (măsurat: «citire inofensivă pe un lanț…») trecea
+#: prin ea și prin toate testele.
+_WRITE_WORDING = "scriere sau ștergere pe un lanț pornit de la system_update"
 
 _UNREADABLE_MESSAGES = {
     "getattr": ("{file}:{line}: nume de atribut care nu e un șir literal pe un lanț pornit de la "
@@ -2745,7 +2747,7 @@ def _package_problems(package: Path, base: Path) -> tuple[int, list[str]]:
         seen += 1
         problems += [f"{path.name}: atinge `{x}` din system_update" for x in sorted(_run_touched(tree, current))]
         problems += [f"{path.name}:{line}: {_WRITE_WORDING} (`{shown}`): ținta poate fi modulul însuși sau un obiect "
-                     f"luat din el (un element, un atribut), iar garda nu poate dovedi că scrierea nu duce la poartă"
+                     f"luat din el (un element, un atribut), iar garda nu poate dovedi că nu duce la poartă"
                      for line, shown in _module_writes(tree, target, current)]
         problems += [f"{path.name}:{line}: atribut dunder pe system_update (`{shown}`): {_DUNDER_ADVICE}"
                      for line, shown in _module_dunders(tree, target, current)]
@@ -3277,6 +3279,9 @@ _CLASS_PATTERN_DOORS = (
     ("match {'k': su.read_host}:\n    case {'k': object(__globals__=g)}:\n        g.update(GATE)\n", "dunder"),
     ("match su.read_host, 1:\n    case (object(__globals__=g), _):\n        g.update(GATE)\n", "dunder"),
     (_METACLASS_MATCH_ARGS + "match [su.read_host]:\n    case [P(g)]:\n        g.update(GATE)\n", "unreadable"),
+    # pozițional ȘI cuvânt-cheie în același tipar: `n` vine din `__match_args__`, `h` din `__globals__=`; două constatări
+    (_METACLASS_MATCH_ARGS.replace("('__globals__',)", "('__name__',)")
+     + "match su.read_host:\n    case P(n, __globals__=h):\n        h.update(GATE)\n", "unreadable+dunder"),
 )
 
 
@@ -3323,7 +3328,10 @@ def test_a_class_pattern_reads_an_attribute_the_tree_never_shows_and_the_dunder_
     wording = {"dunder": "atribut dunder pe system_update", "unreadable": "tipar de clasă pozițional"}
     for i, (template, kind) in enumerate(_CLASS_PATTERN_DOORS):
         mine = [p for p in problems if p.startswith(f"door{i}.py:")]
-        assert mine and all(wording[kind] in p for p in mine), (template, kind, mine)
+        kinds = kind.split("+")
+        # fiecare constatare are cuvintele unei categorii cerute, și fiecare categorie cerută apare cel puțin o dată
+        assert mine and all(any(wording[k] in p for k in kinds) for p in mine), (template, kind, mine)
+        assert all(any(wording[k] in p for p in mine) for k in kinds), (template, kind, mine)
         # `_unreadable_attr_names` e proiecția `(linie, text)` a lui `_unreadable_reads`, cu aceleași intrări: dacă
         # ar pierde în tăcere intrările «class», mesajul din `_package_problems` ar rămâne, iar cine o cheamă direct
         # ar vedea zero (a rămas verde până când a fost cerut aici)
@@ -3331,7 +3339,7 @@ def test_a_class_pattern_reads_an_attribute_the_tree_never_shows_and_the_dunder_
         reads = _unreadable_reads(tree, "sentinel.patch.system_update", "sentinel.telegram.bot")
         projected = _unreadable_attr_names(tree, "sentinel.patch.system_update", "sentinel.telegram.bot")
         assert projected == [(line, text) for line, text, _k in reads], (template, projected, reads)
-        assert bool(projected) == (kind == "unreadable") and {k for _l, _t, k in reads} <= {"class"}, template
+        assert bool(projected) == ("unreadable" in kinds) and {k for _l, _t, k in reads} <= {"class"}, template
     assert not [p for p in problems if p.startswith("honest.py")], problems
 
 
@@ -3546,15 +3554,23 @@ def test_a_write_on_an_element_taken_from_the_module_is_not_described_as_a_write
     el, un element. Un operator care citește mesajul caută un `system_update.X = ...` care nu există și poate
     concluziona că e o alarmă falsă. Mesajul spune ce s-a găsit: o scriere pe un lanț pornit de la modul, a cărei țintă
     poate fi modulul sau un obiect luat din el. Textul se pune de aceeași constantă pentru scrierea directă
-    (`su.X = 1`) și pentru cea pe element, iar «scrie în» nu mai apare."""
+    (`su.X = 1`), pentru cea pe element și pentru `del su.X`, iar «scrie în» nu mai apare. `del` se numește la fel:
+    constatarea vine din ținte `Store` ȘI `Del`, iar «scriere» singur ar fi spus un lucru fals despre ea.
+
+    Textul propoziției e fixat LITERAL aici, nu prin constanta `_WRITE_WORDING`: o aserțiune care citește constanta
+    trece oricare ar fi conținutul ei (măsurat: «citire inofensivă pe un lanț pornit de la system_update» lăsa suita
+    la 159 passed), deci un mesaj care numește o scriere «citire inofensivă» ar fi ajuns la operator nevăzut."""
+    literal = "scriere sau ștergere pe un lanț pornit de la system_update"
     tele = tmp_path / "sentinel" / "telegram"
     tele.mkdir(parents=True)
     (tele / "element.py").write_text(_SU_HEAD + "x = [s for s in [su.sel]]\nx[0].error = None\n", encoding="utf-8")
     (tele / "direct.py").write_text(_SU_HEAD + "su.X = 1\n", encoding="utf-8")
+    (tele / "deleted.py").write_text(_SU_HEAD + "del su.read_host\n", encoding="utf-8")
     seen, problems = _package_problems(tmp_path / "sentinel", tmp_path)
-    assert seen == 2
-    for stem in ("element", "direct"):
-        mine = [p for p in problems if p.startswith(f"{stem}.py:") and _WRITE_WORDING in p]
+    assert seen == 3
+    assert _WRITE_WORDING == literal
+    for stem in ("element", "direct", "deleted"):
+        mine = [p for p in problems if p.startswith(f"{stem}.py:") and literal in p]
         assert len(mine) == 1 and "obiect luat din el" in mine[0], (stem, problems)
     assert not [p for p in problems if "scrie în system_update" in p], problems
 
