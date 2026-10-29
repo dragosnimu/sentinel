@@ -126,10 +126,12 @@ o valoare a modulului care trece printr-un APEL sau printr-un obiect înainte de
 `_UNNAMED_DOORS` cer ca fiecare să dea zero constatări): `def g(f): return f.__globals__` + `g(su.read_host)`, `self.f = su.read_host`,
 `fs.append(su.read_host)` sau `d["k"] = su.read_host` + `fs[0].__globals__`, `d.get("k")`, `d.values()`, o
 funcție care întoarce `su.read_host`, `class K: f = su.read_host` + `K.f.__globals__`, și `setattr(su.X,
-"nume", ...)` cu un nume care nu e dunder. Același lucru pentru un container care trece printr-un APEL, nu printr-un
-operator: `list(su.SEQ)`, `tuple(...)`, `sorted(...)`, `reversed(...)`, `filter(...)`, `map(...)`, `enumerate(...)`,
-`zip(...)`, `next(iter(...))`, `min(...)`, `su.SEQ.copy()`, `.pop()` pe o copie, `.get("k")`, `.values()`, `list(
-.values())` (măsurat pe `b5b15b7`: fiecare dă zero constatări și înlocuiește poarta; `_OPEN_DOORS` le execută și cere
+"nume", ...)` cu un nume care nu e dunder. Același lucru pentru ORICE metodă sau apel prin care trece un container,
+nu printr-un operator: lista de mai jos e de EXEMPLE ale unei clase, nu clasa întreagă. `list(su.SEQ)`, `tuple(...)`,
+`sorted(...)`, `reversed(...)`, `filter(...)`, `map(...)`, `enumerate(...)`, `zip(...)`, `dict(...)`, `type(x)(x)`,
+`next(iter(...))`, `min(...)`, `su.SEQ.copy()`, `.pop()` pe o copie, `.get("k")`, `.values()`, `.items()`, `.insert()`,
+`.extend()`, `list(.values())`, `await`, `yield from`, și atribuirea pe felie (`x[0:0] = su.SEQ`) (măsurat pe `87659d9`:
+fiecare dă zero constatări și înlocuiește poarta; `_OPEN_DOORS` le execută și cere
 ambele jumătăți, deci o ușă care se închide face testul să pice, nu paragraful să mintă). S-a ales să nu se urmărească un
 set mic de funcții predefinite: ar lăsa metodele (`.copy()`, `.get()`) și funcțiile proprii deschise, iar paragraful ar
 trebui să explice de ce `list(x)` e urmărit și `x.copy()` nu. A le urma ar însemna să tratăm apelul ca pe un atribut, iar atunci
@@ -2706,6 +2708,11 @@ _DUNDER_ADVICE = ("garda îl poate admite doar ca CITIRE a unuia dintre " + ", "
                   "iar `__dict__`, `__globals__`, `__kwdefaults__` și `__code__` duc la globalele sau la implicitele porții")
 
 
+#: Ce găsește `_module_writes`: o ȚINTĂ de scriere pe un lanț care pornește de la modul, nu neapărat o scriere ÎN modul
+#: (`x[0].error = None` cu `x` luat din modul scrie pe un element). Constanta e și în teste, ca mesajul să nu mai poată
+#: deriva de ele.
+_WRITE_WORDING = "scriere pe un lanț pornit de la system_update"
+
 _UNREADABLE_MESSAGES = {
     "getattr": ("{file}:{line}: nume de atribut care nu e un șir literal pe un lanț pornit de la "
                 "system_update (`{shown}`): garda nu poate ști dacă numește un dunder"),
@@ -2737,7 +2744,8 @@ def _package_problems(package: Path, base: Path) -> tuple[int, list[str]]:
             continue
         seen += 1
         problems += [f"{path.name}: atinge `{x}` din system_update" for x in sorted(_run_touched(tree, current))]
-        problems += [f"{path.name}:{line}: scrie în system_update (`{shown}`)"
+        problems += [f"{path.name}:{line}: {_WRITE_WORDING} (`{shown}`): ținta poate fi modulul însuși sau un obiect "
+                     f"luat din el (un element, un atribut), iar garda nu poate dovedi că scrierea nu duce la poartă"
                      for line, shown in _module_writes(tree, target, current)]
         problems += [f"{path.name}:{line}: atribut dunder pe system_update (`{shown}`): {_DUNDER_ADVICE}"
                      for line, shown in _module_dunders(tree, target, current)]
@@ -2768,7 +2776,7 @@ def test_the_package_scan_finds_a_poisoned_file_and_stays_quiet_on_an_honest_one
     seen, problems = _package_problems(tmp_path / "sentinel", tmp_path)
     assert seen == 3
     assert {p.split(":")[0] for p in problems} == {"bot.py", "patch_flow.py"}, problems
-    writes = [p for p in problems if "scrie în system_update" in p]
+    writes = [p for p in problems if _WRITE_WORDING in p]
     assert len(writes) == 3, problems
 
 
@@ -3316,6 +3324,14 @@ def test_a_class_pattern_reads_an_attribute_the_tree_never_shows_and_the_dunder_
     for i, (template, kind) in enumerate(_CLASS_PATTERN_DOORS):
         mine = [p for p in problems if p.startswith(f"door{i}.py:")]
         assert mine and all(wording[kind] in p for p in mine), (template, kind, mine)
+        # `_unreadable_attr_names` e proiecția `(linie, text)` a lui `_unreadable_reads`, cu aceleași intrări: dacă
+        # ar pierde în tăcere intrările «class», mesajul din `_package_problems` ar rămâne, iar cine o cheamă direct
+        # ar vedea zero (a rămas verde până când a fost cerut aici)
+        tree = ast.parse(_SU_HEAD + template.replace("GATE", _GATE_OFF))
+        reads = _unreadable_reads(tree, "sentinel.patch.system_update", "sentinel.telegram.bot")
+        projected = _unreadable_attr_names(tree, "sentinel.patch.system_update", "sentinel.telegram.bot")
+        assert projected == [(line, text) for line, text, _k in reads], (template, projected, reads)
+        assert bool(projected) == (kind == "unreadable") and {k for _l, _t, k in reads} <= {"class"}, template
     assert not [p for p in problems if p.startswith("honest.py")], problems
 
 
@@ -3379,6 +3395,15 @@ _CONTAINER_HONEST = (
     "x = {k: 1 for k in other}\nfor g in x:\n    g.__globals__\n",
     "x = (f for f in other)\nfor g in x:\n    g.__globals__\n",
     "match [f for f in other]:\n    case [x, _]:\n        x.__globals__\n",
+    # un rezultat de operator sau de comprehensiune e un DETINATOR, nu o rădăcină: o scriere pe un indice al lui e o
+    # scriere într-un container local (ca la `fs["k"] = 1`), nu în modul
+    "x = su.SEQ + []\nx['k'] = 1\n",
+    "x = [] + su.SEQ\nx[0] = 1\n",
+    "x = [su.read_host] * 2\nx[0] = 1\n",
+    "x = su.TABLE | {}\nx['k'] = 1\n",
+    "x = [f for f in su.SEQ]\nx[0] = 1\n",
+    "x = {1: f for f in su.SEQ}\nx[1] = 1\n",
+    "x = []\nx += su.SEQ\nx[0] = 1\n",
 )
 
 
@@ -3444,6 +3469,16 @@ _OPEN_DOORS = (
      "class K:\n    def __init__(self):\n        self.f = su.read_host\n    def go(self):\n        self.f.__globals__.update(GATE)\nK().go()\n"),
     ("a class attribute", "class K:\n    f = su.read_host\nK.f.__globals__.update(GATE)\n"),
     (".append()", "fs = []\nfs.append(su.read_host)\nfs[0].__globals__.update(GATE)\n"),
+    (".extend()", "fs = []\nfs.extend(su.SEQ)\nfs[0].__globals__.update(GATE)\n"),
+    (".insert()", "fs = []\nfs.insert(0, su.read_host)\nfs[0].__globals__.update(GATE)\n"),
+    (".items()", "for k, v in su.TABLE.items():\n    v.__globals__.update(GATE)\n"),
+    ("dict()", "x = dict(su.TABLE)\nx['k'].__globals__.update(GATE)\n"),
+    ("type(x)(x)", "x = type(su.SEQ)(su.SEQ)\nx[0].__globals__.update(GATE)\n"),
+    ("await", "async def ident(v):\n    return v\nasync def go():\n    x = await ident(su.SEQ)\n"
+              "    x[0].__globals__.update(GATE)\nasyncio.run(go())\n"),
+    ("yield from", "def inner():\n    return su.SEQ\n    yield\ndef outer():\n    x = yield from inner()\n"
+                   "    x[0].__globals__.update(GATE)\nfor _ in outer():\n    pass\n"),
+    ("slice assignment", "x = [0]\nx[0:0] = su.SEQ\nx[0].__globals__.update(GATE)\n"),
     ("item assignment", "d = {}\nd['k'] = su.read_host\nd['k'].__globals__.update(GATE)\n"),
 )
 
@@ -3467,7 +3502,7 @@ def test_the_doors_the_module_docstring_names_as_open_are_really_open_and_really
         assert mod._require_read_only is not gate, f"{label}: does not open the gate, so it is not a door"
         tree = ast.parse(_SU_HEAD + source)
         found = (_module_dunders(tree, target, current) + _module_writes(tree, target, current)
-                 + _unreadable_attr_names(tree, target, current))
+                 + _unreadable_reads(tree, target, current))
         assert not found, (f"`{label}` is now followed by the guard: move it out of the «uși rămase deschise» "
                            f"paragraph of the module docstring and out of _OPEN_DOORS", found)
 
@@ -3502,7 +3537,26 @@ def test_the_doors_that_never_name_the_module_and_the_nondunder_setattr_are_open
     assert (seen, problems) == (0, []), (seen, problems)
     tree = ast.parse(_SU_HEAD + "setattr(su.sel, 'error', None)\n")
     assert not (_module_dunders(tree, target, current) + _module_writes(tree, target, current)
-                + _unreadable_attr_names(tree, target, current))
+                + _unreadable_reads(tree, target, current))
+
+
+def test_a_write_on_an_element_taken_from_the_module_is_not_described_as_a_write_into_the_module(tmp_path):
+    """`x = [s for s in [su.sel]]` + `x[0].error = None` raporta «scrie în system_update (`x[0].error`)»: constatarea e
+    corectă (lanțul pornește din modul), dar propoziția nu: nimic nu se scrie în modul, se scrie pe un OBIECT luat din
+    el, un element. Un operator care citește mesajul caută un `system_update.X = ...` care nu există și poate
+    concluziona că e o alarmă falsă. Mesajul spune ce s-a găsit: o scriere pe un lanț pornit de la modul, a cărei țintă
+    poate fi modulul sau un obiect luat din el. Textul se pune de aceeași constantă pentru scrierea directă
+    (`su.X = 1`) și pentru cea pe element, iar «scrie în» nu mai apare."""
+    tele = tmp_path / "sentinel" / "telegram"
+    tele.mkdir(parents=True)
+    (tele / "element.py").write_text(_SU_HEAD + "x = [s for s in [su.sel]]\nx[0].error = None\n", encoding="utf-8")
+    (tele / "direct.py").write_text(_SU_HEAD + "su.X = 1\n", encoding="utf-8")
+    seen, problems = _package_problems(tmp_path / "sentinel", tmp_path)
+    assert seen == 2
+    for stem in ("element", "direct"):
+        mine = [p for p in problems if p.startswith(f"{stem}.py:") and _WRITE_WORDING in p]
+        assert len(mine) == 1 and "obiect luat din el" in mine[0], (stem, problems)
+    assert not [p for p in problems if "scrie în system_update" in p], problems
 
 
 def test_a_long_alias_chain_written_in_reverse_is_followed_in_time_proportional_to_its_length():
@@ -3924,7 +3978,7 @@ def test_the_package_scan_follows_local_aliases_and_reads_a_file_that_only_uses_
         "bot.py", "patch_flow.py", "update_view.py"}, problems
     assert [p for p in problems if p.startswith("bot.py:") and "atribut dunder" in p], problems
     assert [p for p in problems if p.startswith("patch_flow.py:") and "nu e un șir literal" in p], problems
-    assert [p for p in problems if p.startswith("patch_flow.py:") and "scrie în system_update" in p], problems
+    assert [p for p in problems if p.startswith("patch_flow.py:") and _WRITE_WORDING in p], problems
     assert [p for p in problems if p.startswith("update_view.py:") and "atribut dunder" in p], problems
     assert not [p for p in problems if p.startswith("honest.py")], problems
 
