@@ -3295,7 +3295,10 @@ def test_a_class_pattern_reads_an_attribute_the_tree_never_shows_and_the_dunder_
 
     Fiecare rând din `_CLASS_PATTERN_DOORS` (1) se EXECUTĂ și trebuie să înlocuiască poarta, altfel ar proba o ușă
     care nu e una, și (2) trebuie să dea, prin `_package_problems`, constatarea categoriei lui: un dunder scris în
-    `kwd_attrs`, sau un nume de atribut necitibil pentru orice tipar pozițional. Partea cealaltă: tipare de clasă
+    `kwd_attrs`, sau un nume de atribut necitibil pentru orice tipar pozițional. Un tipar MIXT (`case P(n,
+    __globals__=h)`, `__match_args__ = ('__name__',)`) cere ambele mesaje: o regulă care ar culege dunder-ul cu
+    cuvânt-cheie doar când nu există tipare poziționale (sau invers) ar lăsa un singur mesaj, iar operatorul ar citi
+    jumătate din ce s-a găsit. Partea cealaltă: tipare de clasă
     pe un subiect care NU pornește din modul (un parametru, al doilea element al unui tuplu cu primul din modul, un
     rezultat de apel) și clasa însăși luată din modul (`case su.Selection(error=None)`) nu dau nimic, iar un dunder
     inert (`object(__name__=n)`) trece ca orice citire de `__name__`."""
