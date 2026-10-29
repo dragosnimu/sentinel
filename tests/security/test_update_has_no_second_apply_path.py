@@ -111,6 +111,14 @@ iterativă și pe coadă de lucru: un lanț de 500 de atribute dă o constatare 
 nu-l poate afișa), nu `RecursionError`, iar un lanț de alias-uri scris în ordine inversă se urmărește liniar. O formă rămâne
 pătratică (o listă literală cu mii de nume care devin rădăcini pe rând): vezi docstring-ul lui `_rooted_at`.
 
+Containerele: `holds` urmărește afișările (`[su.f]`, `(su.f,)`, `{k: su.f}`, și cheile), comprehensiunile de orice fel
+(`[f for f in su.SEQ]`, `{..}`, generatoare, `{k: v ...}`, cu `async`, condiții, imbricate), operatorii binari
+(`su.SEQ + []`, `[f] * 2`, `su.TABLE | {}`, în lanț) și `x += ...`, ramurile `a if c else b` / `a or b` și `(x := [...])`.
+Măsurat pe `b5b15b7` (și pe `0f27fd7`): `x = [f for f in su.SEQ]` și `x = su.SEQ + []`, urmate de
+`x[0].__globals__.update({...})`, dădeau zero constatări, iar poarta se înlocuia: propoziția «un container cu elemente
+luate din modul e urmărit» era adevărată doar pentru afișări (`_CONTAINER_DOORS` execută fiecare formă). Un container care
+trece printr-un operator rămâne containerul: regula raportează în plus, niciodată în minus.
+
 Uși rămase deschise după ce scrierile și dunder-ele pe modul sunt închise (la execuție parametrii porții
 nu mai depind de numele din modul, deci o atribuire nu o mai lărgește): cod care ajunge la poartă fără
 să numească modulul (`gc.get_objects()`, `sys.modules[...]`, `sentinel.patch.__dict__["system_update"]`);
@@ -118,7 +126,13 @@ o valoare a modulului care trece printr-un APEL sau printr-un obiect înainte de
 dau zero constatări): `def g(f): return f.__globals__` + `g(su.read_host)`, `self.f = su.read_host`,
 `fs.append(su.read_host)` sau `d["k"] = su.read_host` + `fs[0].__globals__`, `d.get("k")`, `d.values()`, o
 funcție care întoarce `su.read_host`, `class K: f = su.read_host` + `K.f.__globals__`, și `setattr(su.X,
-"nume", ...)` cu un nume care nu e dunder. A le urma ar însemna să tratăm apelul ca pe un atribut, iar atunci
+"nume", ...)` cu un nume care nu e dunder. Același lucru pentru un container care trece printr-un APEL, nu printr-un
+operator: `list(su.SEQ)`, `tuple(...)`, `sorted(...)`, `reversed(...)`, `filter(...)`, `map(...)`, `enumerate(...)`,
+`zip(...)`, `next(iter(...))`, `min(...)`, `su.SEQ.copy()`, `.pop()` pe o copie, `.get("k")`, `.values()`, `list(
+.values())` (măsurat pe `b5b15b7`: fiecare dă zero constatări și înlocuiește poarta; `_OPEN_DOORS` le execută și cere
+ambele jumătăți, deci o ușă care se închide face testul să pice, nu paragraful să mintă). S-a ales să nu se urmărească un
+set mic de funcții predefinite: ar lăsa metodele (`.copy()`, `.get()`) și funcțiile proprii deschise, iar paragraful ar
+trebui să explice de ce `list(x)` e urmărit și `x.copy()` nu. A le urma ar însemna să tratăm apelul ca pe un atribut, iar atunci
 `su.Selection(...).__class__` și `copy.copy(su.Selection(...))` ar deveni roșii: aliasul prin legare
 (`f = su.read_host`) e închis, curgerea prin apel nu; `importlib.import_module(<nume neliteral>)`;
 `asyncio.create_subprocess_exec = ...` pus din alt fișier (schimbă ce PORNEȘTE, nu ce
@@ -2392,6 +2406,12 @@ def _rooted_at(tree: ast.Module, target: str, current: str = THIS_MODULE, *, by_
     `getattr`/`setattr`/`delattr(<rădăcină>, nume)` și `import_module(<numele modulului>)`.
     Un nume legat la un container (`fs = [su.read_host]`) ține elemente înrădăcinate, nu e el însuși
     rădăcină: `fs[0].__globals__` e semnalat, `fs["k"] = 1` nu (e o scriere în dicționarul local).
+    Containerul poate fi o afișare (cheile unui dicționar la fel ca valorile), o comprehensiune de orice fel
+    (`ListComp`, `SetComp`, `GeneratorExp`: ține `elt`; `DictComp`: cheia și valoarea; și cu `async`, condiții,
+    imbricate), un operator binar pe care îl trece mai departe (`su.SEQ + []`, `[f] * 2`, `su.TABLE | {}`, lanț), `x
+    += ...`, o ramură `a if c else b` / `a or b`, sau `(x := [...])`. Ține ce ține ORICARE operand; raportează în
+    plus (un `[f] * 2` unde `f` e un șir), niciodată în minus. Prin APEL nu trece (`list(su.SEQ)`): vezi docstring-ul
+    modulului.
 
     `match`: un tipar `case` nu e o țintă de atribuire, dar fiecare nume pe care îl capturează primește o
     valoare care se poate scrie ca expresie peste subiect, deci trece prin aceeași `bind` (`_pattern_sites`
@@ -2445,8 +2465,24 @@ def _rooted_at(tree: ast.Module, target: str, current: str = THIS_MODULE, *, by_
                     for e in node.elts:
                         stack += [(e, False), (e, True)]
                 elif isinstance(node, ast.Dict):
-                    for v in node.values:
+                    # cheile contează: `for k in {su.read_host: 1}` iterază chiar pe ele (`None` = `**altul`)
+                    for v in (*(k for k in node.keys if k is not None), *node.values):
                         stack += [(v, False), (v, True)]
+                elif isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+                    # `[f for f in su.SEQ]`: elementele sunt `elt`; `for g in x` și `x[0]` ajung la ele
+                    stack += [(node.elt, False), (node.elt, True)]
+                elif isinstance(node, ast.DictComp):
+                    stack += [(node.key, False), (node.key, True), (node.value, False), (node.value, True)]
+                elif isinstance(node, ast.BinOp):
+                    # un container care trece printr-un operator rămâne containerul (`su.SEQ + []`, `[f] * 2`,
+                    # `su.TABLE | {}`); și `x += ...`, vezi AugAssign mai jos. Raportează în plus, niciodată în minus
+                    stack += [(node.left, False), (node.left, True), (node.right, False), (node.right, True)]
+                elif isinstance(node, ast.IfExp):
+                    stack += [(node.body, True), (node.orelse, True)]
+                elif isinstance(node, ast.BoolOp):
+                    stack += [(v, True) for v in node.values]
+                elif isinstance(node, ast.NamedExpr):
+                    stack.append((node.value, True))
             elif isinstance(node, ast.Attribute):
                 if node.attr == base:
                     return True
@@ -2531,6 +2567,9 @@ def _rooted_at(tree: ast.Module, target: str, current: str = THIS_MODULE, *, by_
             sites.append((n.target, n.value, False))
         elif isinstance(n, ast.NamedExpr):
             sites.append((n.target, n.value, False))
+        elif isinstance(n, ast.AugAssign):
+            # `x += su.SEQ` e `x = x + su.SEQ`: același operator ca mai sus, pe numele din stânga
+            sites.append((n.target, ast.BinOp(left=n.target, op=n.op, right=n.value), False))
         elif isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)):
             sites.append((n.target, n.iter, True))
         elif isinstance(n, ast.withitem) and n.optional_vars is not None:
@@ -2609,22 +2648,31 @@ def _module_dunders(tree: ast.Module, target: str, current: str = THIS_MODULE) -
     return found
 
 
-def _unreadable_attr_names(tree: ast.Module, target: str, current: str = THIS_MODULE) -> list[tuple[int, str]]:
-    """`(linie, text)` pentru `getattr`/`setattr`/`delattr` pe un lanț înrădăcinat în `target` al cărui NUME nu
-    e un șir literal (`getattr(su.read_host, nume)`, `getattr(*perechea)`): garda nu poate ști dacă numește un
-    dunder. Separat de `_module_dunders`, ca mesajul să nu pretindă că a găsit un dunder acolo unde nu poate ști."""
+def _unreadable_reads(tree: ast.Module, target: str, current: str = THIS_MODULE) -> list[tuple[int, str, str]]:
+    """`(linie, text, fel)` pentru citirile de atribut pe un lanț înrădăcinat în `target` al căror NUME garda nu-l
+    poate citi: «getattr» = `getattr`/`setattr`/`delattr` cu un nume care nu e un șir literal (`getattr(su.
+    read_host, nume)`, `getattr(*perechea)`); «class» = un tipar pozițional `case C(P)`, care citește atributul
+    numit în `C.__match_args__`. Felul există ca mesajul să numească mecanismul adevărat: la un tipar de clasă nu
+    e nicio chemare, iar la un tip predefinit (`case str(s)`) nu e niciun nume de atribut, ci subiectul însuși."""
     rooted = _rooted_at(tree, target, current, by_name=True)
     out = []
     for cls, value in _match_class_reads(tree):
         # `case C(P)` citește un atribut numit în `__match_args__`, un șir pe care garda nu-l citește nicăieri
         if cls.patterns and rooted(value):
-            out.append((cls.lineno, _shown(cls)))
+            out.append((cls.lineno, _shown(cls), "class"))
     for n in ast.walk(tree):
         attr = _by_string_attr(n)
         if attr is not None and rooted(attr[0]) and not (
                 isinstance(attr[1], ast.Constant) and isinstance(attr[1].value, str)):
-            out.append((n.lineno, _shown(n)))
+            out.append((n.lineno, _shown(n), "getattr"))
     return out
+
+
+def _unreadable_attr_names(tree: ast.Module, target: str, current: str = THIS_MODULE) -> list[tuple[int, str]]:
+    """`(linie, text)` pentru citirile de atribut pe un lanț înrădăcinat în `target` al căror nume garda nu-l poate
+    citi (vezi `_unreadable_reads`, care spune și felul): garda nu poate ști dacă numește un dunder. Separat de
+    `_module_dunders`, ca mesajul să nu pretindă că a găsit un dunder acolo unde nu poate ști."""
+    return [(line, shown) for line, shown, _kind in _unreadable_reads(tree, target, current)]
 
 
 def _dynamic_imports(tree: ast.Module, target: str) -> list[ast.Call]:
@@ -2658,6 +2706,15 @@ _DUNDER_ADVICE = ("garda îl poate admite doar ca CITIRE a unuia dintre " + ", "
                   "iar `__dict__`, `__globals__`, `__kwdefaults__` și `__code__` duc la globalele sau la implicitele porții")
 
 
+_UNREADABLE_MESSAGES = {
+    "getattr": ("{file}:{line}: nume de atribut care nu e un șir literal pe un lanț pornit de la "
+                "system_update (`{shown}`): garda nu poate ști dacă numește un dunder"),
+    "class": ("{file}:{line}: tipar de clasă pozițional pe un lanț pornit de la system_update (`{shown}`): "
+              "`case C(...)` citește atributele numite în `C.__match_args__` (la un tip predefinit, subiectul "
+              "însuși), iar garda nu poate citi `__match_args__`, deci nu poate ști dacă numește un dunder"),
+}
+
+
 def _package_problems(package: Path, base: Path) -> tuple[int, list[str]]:
     """(câte fișiere importă `system_update`, constatările) pentru TOATE fișierele din `package`, în afară
     de `system_update.py`. O funcție de sine stătătoare, ca un control să o poată rula pe un arbore făcut
@@ -2684,9 +2741,8 @@ def _package_problems(package: Path, base: Path) -> tuple[int, list[str]]:
                      for line, shown in _module_writes(tree, target, current)]
         problems += [f"{path.name}:{line}: atribut dunder pe system_update (`{shown}`): {_DUNDER_ADVICE}"
                      for line, shown in _module_dunders(tree, target, current)]
-        problems += [f"{path.name}:{line}: nume de atribut care nu e un șir literal pe un lanț pornit de la "
-                     f"system_update (`{shown}`): garda nu poate ști dacă numește un dunder"
-                     for line, shown in _unreadable_attr_names(tree, target, current)]
+        problems += [_UNREADABLE_MESSAGES[kind].format(file=path.name, line=line, shown=shown)
+                     for line, shown, kind in _unreadable_reads(tree, target, current)]
         escaped = _escapes(tree, target, current)
         if escaped:
             problems.append(f"{path.name}: pasează modulul system_update ca valoare ({sorted(escaped)})")
@@ -2888,6 +2944,15 @@ _ALIAS_DUNDER_FORMS = (
     "def g(f=a):\n    return f.__globals__\na = su.read_host",
     "match a:\n    case f:\n        f.__globals__\na = su.read_host",
     "match x:\n    case [f]:\n        f.__globals__\nx = [su.read_host]",
+    # comprehensiuni, operatori și ramuri, legate în ordine inversă (muchia de dependență a cozii, pe formele noi)
+    "x = [f for f in a]\na = su.SEQ\nx[0].__globals__",
+    "x = {f: 1 for f in a}\na = su.SEQ\nfor g in x:\n    g.__globals__",
+    "x = [(y := f) for f in a]\na = su.SEQ\nx[0].__globals__",
+    "b = a + []\na = su.SEQ\nb[0].__globals__",
+    "x = []\nx += a\na = su.SEQ\nx[0].__globals__",
+    "x = [a] if c else []\na = su.read_host\nx[0].__globals__",
+    "x = [] or [a]\na = su.read_host\nx[0].__globals__",
+    "x = {a: 1}\na = su.read_host\nfor g in x:\n    g.__globals__",
     # fiecare formă de legare
     "f: object = su.read_host\nf.__globals__",
     "(f := su.read_host).__globals__",
@@ -2969,6 +3034,10 @@ _ALIAS_HONEST_FORMS = (
     # un dicționar LOCAL cu funcții ale modulului: citirea elementelor nu îl face scriere în modul
     "table = {'a': su.select}\ntable['b'] = 1\ntable.update({'c': 2})",
     "x = su.GENERATED_BY\ny = su._private\nz = su.Selection",
+    # un container făcut din altceva decât din modul, sau din modul doar printr-un apel
+    "x = [1 for f in su.SEQ]\nx[0].__globals__",
+    "x = other + []\nx[0].__globals__",
+    "x = [len(f) for f in su.SEQ]\nx[0].__class__",
 )
 
 
@@ -3009,6 +3078,19 @@ def read_host():
 TABLE = {"k": read_host, "j": read_host}
 SEQ = [read_host, read_host]
 MIXED = (read_host, "text")
+SEQS = [SEQ, SEQ]
+KEYED = {read_host: 1}
+class _AStream:
+    def __init__(self):
+        self.n = 0
+    def __aiter__(self):
+        return self
+    async def __anext__(self):
+        if self.n:
+            raise StopAsyncIteration
+        self.n += 1
+        return read_host
+ASTREAM = _AStream()
 class Selection:
     __match_args__ = ("error",)
     def __init__(self, error=None):
@@ -3230,11 +3312,162 @@ def test_a_class_pattern_reads_an_attribute_the_tree_never_shows_and_the_dunder_
 
     seen, problems = _package_problems(tmp_path / "sentinel", tmp_path)
     assert seen == len(_CLASS_PATTERN_DOORS) + 1
-    wording = {"dunder": "atribut dunder pe system_update", "unreadable": "nu e un șir literal"}
+    wording = {"dunder": "atribut dunder pe system_update", "unreadable": "tipar de clasă pozițional"}
     for i, (template, kind) in enumerate(_CLASS_PATTERN_DOORS):
         mine = [p for p in problems if p.startswith(f"door{i}.py:")]
         assert mine and all(wording[kind] in p for p in mine), (template, kind, mine)
     assert not [p for p in problems if p.startswith("honest.py")], problems
+
+
+#: `(sursa, ce arată)` pentru un container ZIS de modul și trecut printr-o comprehensiune sau un operator înainte de
+#: `x[0].__globals__`. «GATE» se înlocuiește cu dicționarul care deschide poarta. Toate se EXECUTĂ (poarta se înlocuiește
+#: cu adevărat), deci sunt uși, nu forme. `su.SEQ`, `su.SEQS`, `su.TABLE`, `su.KEYED` și `su.ASTREAM` sunt în
+#: `_MATCH_MODULE_SRC`.
+_CONTAINER_DOORS = (
+    # cele două forme măsurate de verificator pe `b5b15b7` (și pe `0f27fd7`): zero constatări, poarta înlocuită
+    ("listcomp", "x = [f for f in su.SEQ]\nx[0].__globals__.update(GATE)\n"),
+    ("binop plus", "x = su.SEQ + []\nx[0].__globals__.update(GATE)\n"),
+    # fiecare fel de comprehensiune, fiecare cu propria ei regulă
+    ("setcomp", "x = {f for f in su.SEQ}\nfor g in x:\n    g.__globals__.update(GATE)\n"),
+    ("generator", "x = (f for f in su.SEQ)\nfor g in x:\n    g.__globals__.update(GATE)\n"),
+    ("dictcomp value", "x = {1: f for f in su.SEQ}\nx[1].__globals__.update(GATE)\n"),
+    ("dictcomp key", "x = {f: 1 for f in su.SEQ}\nfor g in x:\n    g.__globals__.update(GATE)\n"),
+    ("dict display key", "x = {su.read_host: 1}\nfor g in x:\n    g.__globals__.update(GATE)\n"),
+    # operatorul, pe fiecare parte și în lanț
+    ("binop left", "x = su.SEQ * 2\nx[0].__globals__.update(GATE)\n"),
+    ("binop right", "x = [] + su.SEQ\nx[0].__globals__.update(GATE)\n"),
+    ("binop chain", "x = [] + su.SEQ + [] + []\nx[0].__globals__.update(GATE)\n"),
+    ("binop on a display", "x = [su.read_host] * 2\nx[0].__globals__.update(GATE)\n"),
+    ("binop on a dict", "x = su.TABLE | {}\nx['k'].__globals__.update(GATE)\n"),
+    ("augmented assignment", "x = []\nx += su.SEQ\nx[0].__globals__.update(GATE)\n"),
+    # ocolișuri ale propriei reparații: imbricare, condiție, element comprehensiune sau operator, walrus, async
+    ("nested comprehension", "x = [g for f in [su.SEQ] for g in f]\nx[0].__globals__.update(GATE)\n"),
+    ("nested over names", "x = [g for f in su.SEQS for g in f]\nx[0].__globals__.update(GATE)\n"),
+    ("comprehension with a condition", "x = [f for f in su.SEQ if f]\nx[0].__globals__.update(GATE)\n"),
+    ("element is a comprehension", "x = [[f for f in su.SEQ]]\nx[0][0].__globals__.update(GATE)\n"),
+    ("element is a binop", "x = [[f] + [f] for f in su.SEQ]\nx[0][0].__globals__.update(GATE)\n"),
+    ("walrus in the element", "x = [(y := f) for f in su.SEQ]\nx[0].__globals__.update(GATE)\n"),
+    ("async comprehension",
+     "async def go():\n    x = [f async for f in su.ASTREAM]\n    x[0].__globals__.update(GATE)\nasyncio.run(go())\n"),
+    ("comprehension then operator", "x = [f for f in su.SEQ] + []\nx[0].__globals__.update(GATE)\n"),
+    ("operator then comprehension", "x = [f for f in su.SEQ + []]\nx[0].__globals__.update(GATE)\n"),
+    ("inline, no name", "(su.SEQ + [])[0].__globals__.update(GATE)\n"),
+    ("inline comprehension", "[f for f in su.SEQ][0].__globals__.update(GATE)\n"),
+    # același container pe ramuri ale unei expresii, care îl trec mai departe
+    ("conditional", "x = [su.read_host] if True else []\nx[0].__globals__.update(GATE)\n"),
+    ("or", "x = [] or [su.read_host]\nx[0].__globals__.update(GATE)\n"),
+    ("walrus", "(x := [su.read_host])\nx[0].__globals__.update(GATE)\n"),
+    # aceleași două forme ca subiect de `match`
+    ("match on a comprehension", "match [f for f in su.SEQ]:\n    case [x, _]:\n        x.__globals__.update(GATE)\n"),
+    ("match on an operator", "match su.SEQ + []:\n    case [x, _]:\n        x.__globals__.update(GATE)\n"),
+)
+
+#: Containere care NU țin nimic din modul sau îl țin doar printr-un APEL: nu au voie să dea constatări.
+_CONTAINER_HONEST = (
+    "x = [f for f in other]\nx[0].__globals__\n",
+    "x = [1 for f in su.SEQ]\nx[0].__globals__\n",
+    "x = [len(f) for f in su.SEQ]\nx[0].__class__\n",
+    "x = other + []\nx[0].__globals__\n",
+    "x = {k: v for k, v in other.items()}\nx['a'].__globals__\n",
+    "x = [su.Selection(error=str(f)) for f in other]\nx[0].__class__\n",
+    "x = other or [1]\nx[0].__globals__\n",
+    "x = [1] if True else [2]\nx[0].__class__\n",
+    "x = []\nx += other\nx[0].__globals__\n",
+    "x = {1: 2}\nfor k in x:\n    k.__class__\n",
+    "x = {k: 1 for k in other}\nfor g in x:\n    g.__globals__\n",
+    "x = (f for f in other)\nfor g in x:\n    g.__globals__\n",
+    "match [f for f in other]:\n    case [x, _]:\n        x.__globals__\n",
+)
+
+
+def test_a_container_built_by_a_comprehension_or_an_operator_still_holds_what_the_module_gave_it(tmp_path):
+    """`x = [f for f in su.SEQ]` + `x[0].__globals__.update({...})` și `x = su.SEQ + []` + același rând dădeau zero
+    constatări (măsurat pe `b5b15b7`, `47e6158` și `0f27fd7`: `findings=0`), iar la execuție poarta se înlocuia.
+    `holds` urma afișările (`[su.f]`, `(su.f,)`, `{k: su.f}`), nu comprehensiunile și nu operatorii: docstring-ul
+    spunea că un container cu elemente luate din modul e urmărit, deci cine citea «afișări» înțelegea «orice
+    container». Operatorul a primit și un neam: `x += su.SEQ`, `x = [...] if c else []`, `a or [...]`, `(x := [...])` și
+    cheile unui dicționar (`for k in {su.read_host: 1}` iterează chiar pe ele).
+
+    Fiecare rând din `_CONTAINER_DOORS` se EXECUTĂ pe modulul de mână și trebuie să înlocuiască poarta (altfel ar fi o
+    formă, nu o ușă), apoi o scanare a pachetului (`_package_problems`) trebuie să dea o constatare de dunder pe
+    fișierul lui. Rândurile sunt alese ca să încerce să ocolească propria reparație: imbricare, condiție, element
+    care e el însuși comprehensiune sau operator, lanț de operatori, walrus, `async`, aceleași forme ca subiect de
+    `match`. Partea cealaltă: `_CONTAINER_HONEST` (containere fără nimic din modul, sau care îl ating doar printr-un
+    apel) nu dă nimic, altfel regula ar fi «orice comprehensiune», iar primul `[len(f) for f in lista]` ar fi un roșu
+    care nu se potrivește."""
+    import asyncio
+    import types
+
+    tele = tmp_path / "sentinel" / "telegram"
+    tele.mkdir(parents=True)
+    for i, (label, template) in enumerate(_CONTAINER_DOORS):
+        source = template.replace("GATE", _GATE_OFF)
+        mod = types.ModuleType("su")
+        exec(_MATCH_MODULE_SRC, mod.__dict__)
+        gate = mod._require_read_only
+        exec(source, {"su": mod, "asyncio": asyncio})
+        assert mod._require_read_only is not gate, f"{label}: the form does not open the gate; it is not a door"
+        (tele / f"door{i}.py").write_text(_SU_HEAD + source, encoding="utf-8")
+    for i, source in enumerate(_CONTAINER_HONEST):
+        (tele / f"honest{i}.py").write_text(_SU_HEAD + source, encoding="utf-8")
+    seen, problems = _package_problems(tmp_path / "sentinel", tmp_path)
+    assert seen == len(_CONTAINER_DOORS) + len(_CONTAINER_HONEST)
+    for i, (label, _template) in enumerate(_CONTAINER_DOORS):
+        assert [p for p in problems if p.startswith(f"door{i}.py:") and "atribut dunder" in p], (label, problems)
+    assert not [p for p in problems if p.startswith("honest")], problems
+
+
+#: Uși care RĂMÂN deschise și sunt numite ca atare în docstring-ul modulului: fiecare se EXECUTĂ (poarta se înlocuiește)
+#: și garda tace. Dacă una începe să fie urmărită, testul pică spre bine: se mută din paragraful «uși rămase deschise»
+#: și de aici, nu se șterge testul.
+_OPEN_DOORS = (
+    ("list()", "x = list(su.SEQ)\nx[0].__globals__.update(GATE)\n"),
+    ("tuple()", "x = tuple(su.SEQ)\nx[0].__globals__.update(GATE)\n"),
+    ("sorted()", "x = sorted(su.SEQ, key=id)\nx[0].__globals__.update(GATE)\n"),
+    ("reversed()", "for f in reversed(su.SEQ):\n    f.__globals__.update(GATE)\n"),
+    ("filter()", "for f in filter(None, su.SEQ):\n    f.__globals__.update(GATE)\n"),
+    ("map()", "for f in map(lambda q: q, su.SEQ):\n    f.__globals__.update(GATE)\n"),
+    ("enumerate()", "for i, f in enumerate(su.SEQ):\n    f.__globals__.update(GATE)\n"),
+    ("zip()", "for f, _ in zip(su.SEQ, su.SEQ):\n    f.__globals__.update(GATE)\n"),
+    ("next(iter())", "next(iter(su.SEQ)).__globals__.update(GATE)\n"),
+    ("min()", "min(su.SEQ, key=id).__globals__.update(GATE)\n"),
+    (".copy()", "x = su.SEQ.copy()\nx[0].__globals__.update(GATE)\n"),
+    (".pop() on a copy", "su.SEQ.copy().pop().__globals__.update(GATE)\n"),
+    (".get()", "su.TABLE.get('k').__globals__.update(GATE)\n"),
+    (".values()", "x = su.TABLE.values()\nfor g in x:\n    g.__globals__.update(GATE)\n"),
+    ("list(.values())", "x = list(su.TABLE.values())\nx[0].__globals__.update(GATE)\n"),
+    ("a function taking it", "def g(f):\n    return f.__globals__\ng(su.read_host).update(GATE)\n"),
+    ("a function returning it", "def r():\n    return su.read_host\nr().__globals__.update(GATE)\n"),
+    ("an attribute of self",
+     "class K:\n    def __init__(self):\n        self.f = su.read_host\n    def go(self):\n        self.f.__globals__.update(GATE)\nK().go()\n"),
+    ("a class attribute", "class K:\n    f = su.read_host\nK.f.__globals__.update(GATE)\n"),
+    (".append()", "fs = []\nfs.append(su.read_host)\nfs[0].__globals__.update(GATE)\n"),
+    ("item assignment", "d = {}\nd['k'] = su.read_host\nd['k'].__globals__.update(GATE)\n"),
+)
+
+
+def test_the_doors_the_module_docstring_names_as_open_are_really_open_and_really_doors():
+    """Paragraful «uși rămase deschise» a fost fals de două ori: o propoziție despre ce nu se urmărește, nemăsurată,
+    iar un cititor care o credea era mai puțin în siguranță decât fără ea. Fiecare rând din `_OPEN_DOORS` e o formă
+    numită acolo, și testul cere ambele jumătăți: la execuție ea ÎNLOCUIEȘTE poarta (e o ușă, nu o ipoteză), iar garda
+    nu dă nicio constatare (e deschisă). Când una devine urmărită, testul pică și mesajul spune ce să se mute în
+    docstring; când cineva adaugă o ușă în paragraf fără rând aici, paragraful nu mai e măsurat."""
+    import asyncio
+    import types
+
+    target, current = "sentinel.patch.system_update", "sentinel.telegram.bot"
+    for label, template in _OPEN_DOORS:
+        source = template.replace("GATE", _GATE_OFF)
+        mod = types.ModuleType("su")
+        exec(_MATCH_MODULE_SRC, mod.__dict__)
+        gate = mod._require_read_only
+        exec(source, {"su": mod, "asyncio": asyncio})
+        assert mod._require_read_only is not gate, f"{label}: does not open the gate, so it is not a door"
+        tree = ast.parse(_SU_HEAD + source)
+        found = (_module_dunders(tree, target, current) + _module_writes(tree, target, current)
+                 + _unreadable_attr_names(tree, target, current))
+        assert not found, (f"`{label}` is now followed by the guard: move it out of the «uși rămase deschise» "
+                           f"paragraph of the module docstring and out of _OPEN_DOORS", found)
 
 
 def test_a_long_alias_chain_written_in_reverse_is_followed_in_time_proportional_to_its_length():
