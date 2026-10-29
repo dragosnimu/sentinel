@@ -3356,7 +3356,7 @@ _CONTAINER_DOORS = (
     # același container pe ramuri ale unei expresii, care îl trec mai departe
     ("conditional", "x = [su.read_host] if True else []\nx[0].__globals__.update(GATE)\n"),
     ("or", "x = [] or [su.read_host]\nx[0].__globals__.update(GATE)\n"),
-    ("walrus", "(x := [su.read_host])\nx[0].__globals__.update(GATE)\n"),
+    ("walrus", "z = (x := [su.read_host])\nz[0].__globals__.update(GATE)\n"),
     # aceleași două forme ca subiect de `match`
     ("match on a comprehension", "match [f for f in su.SEQ]:\n    case [x, _]:\n        x.__globals__.update(GATE)\n"),
     ("match on an operator", "match su.SEQ + []:\n    case [x, _]:\n        x.__globals__.update(GATE)\n"),
