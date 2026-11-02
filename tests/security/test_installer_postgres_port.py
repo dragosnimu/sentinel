@@ -69,6 +69,16 @@ def _func(source: str, name: str) -> str:
     return match.group(0)
 
 
+def _ensure_listening_funcs() -> str:
+    """`pg_ensure_listening` LIVRATĂ ȘI ajutoarele de care depinde. Ele au fost
+    inline; de când „necunoscut" oprește sondele (pg_probe_or_die) și coada
+    mesajului se compune din ce a întors restaurarea (pg_restore_tail),
+    un harnaș care încarcă doar funcția principală moare cu «command not
+    found» la prima sondă."""
+    return "\n".join(_func(INSTALL, name) for name in (
+        "pg_probe_or_die", "pg_restore_to", "pg_restore_tail", "pg_ensure_listening"))
+
+
 def _stub(directory: Path, name: str, body: str) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / name
@@ -772,7 +782,7 @@ exit 0
         '    fi\n'
         '}\n'
         'port_owner() { printf "container/other"; }\n'
-        + _func(INSTALL, "pg_ensure_listening") + "\n"
+        + _ensure_listening_funcs() + "\n"
         # timeout scurtat la 1s: doar viteza testului, comportamentul livrat
         # e neschimbat — pg_ensure_listening ia asta ca al 4-lea argument opțional.
         f'pg_ensure_listening "{pgconf_posix}" 5432 "{explicit}" 1\n'
@@ -849,7 +859,7 @@ exit 0
         # odată cu `_func` — setat aici ca să nu pice pe "unbound variable"
         # sub `set -u`; production o are deja definită la sursă.
         'PG_LISTEN_TIMEOUT_S=15\n'
-        + _func(INSTALL, "pg_ensure_listening") + "\n"
+        + _ensure_listening_funcs() + "\n"
         f'pg_ensure_listening "{pgconf_posix}" 5433 ""\n'
         'printf "RESOLVED=%s\\n" "$PG_RESOLVED_PORT"\n'
     )
@@ -899,7 +909,7 @@ exit 0
         'port_free() { [[ "$(cat "$BOUND_FILE")" == "$1" ]] && return 1; return 0; }\n'
         'port_owner_unit() { [[ "$(cat "$BOUND_FILE")" == "$1" ]] && printf "postgresql@16-main.service"; }\n'
         'port_owner() { printf "postgres"; }\n'
-        + _func(INSTALL, "pg_ensure_listening") + "\n"
+        + _ensure_listening_funcs() + "\n"
         # step_postgres rescrie postgresql.conf ÎNAINTE să cheme
         # pg_ensure_listening — exact ce (nu) făcea corect runda 1.
         f'pg_set_port "{pgconf_posix}" 5440\n'
@@ -934,8 +944,7 @@ def test_explicit_db_port_failure_restores_the_previous_port_line(tmp_path):
         'port_free() { return 0; }\n'          # 5440 rămâne mereu liber — nimic nu pornește
         'port_owner_unit() { printf ""; }\n'
         'port_owner() { printf ""; }\n'
-        + _func(INSTALL, "pg_restore_to") + "\n"
-        + _func(INSTALL, "pg_ensure_listening") + "\n"
+        + _ensure_listening_funcs() + "\n"
         f'pg_set_port "{pgconf_posix}" 5440\n'
         'pg_ensure_listening '
         f'"{pgconf_posix}" 5440 "1" 1 5433 || true\n'
@@ -984,8 +993,7 @@ def test_explicit_db_port_failure_recovers_the_cluster_onto_the_previous_port(tm
         'port_free() { [[ "$(cat "$BOUND_FILE")" == "$1" ]] && return 1; return 0; }\n'
         'port_owner_unit() { [[ "$(cat "$BOUND_FILE")" == "$1" ]] && printf "postgresql@16-main.service"; }\n'
         'port_owner() { printf "postgres"; }\n'
-        + _func(INSTALL, "pg_restore_to") + "\n"
-        + _func(INSTALL, "pg_ensure_listening") + "\n"
+        + _ensure_listening_funcs() + "\n"
         f'pg_ensure_listening "{pgconf_posix}" 5440 "1" 1 5433 || true\n'
     )
     proc = _run(script, tmp_path, extra_path=binpath)
@@ -1022,8 +1030,7 @@ def test_explicit_db_port_failure_and_recovery_both_fail_says_database_is_down(t
         'port_free() { [[ "$(cat "$BOUND_FILE")" == "$1" ]] && return 1; return 0; }\n'
         'port_owner_unit() { [[ "$(cat "$BOUND_FILE")" == "$1" ]] && printf "postgresql@16-main.service"; }\n'
         'port_owner() { printf "postgres"; }\n'
-        + _func(INSTALL, "pg_restore_to") + "\n"
-        + _func(INSTALL, "pg_ensure_listening") + "\n"
+        + _ensure_listening_funcs() + "\n"
         f'pg_ensure_listening "{pgconf_posix}" 5440 "1" 1 5433 || true\n'
     )
     proc = _run(script, tmp_path, extra_path=binpath)
@@ -1079,8 +1086,7 @@ def _auto_move_failure_harness(tmp_path: Path, *, recovers: bool
         '    [[ "$(cat "$BOUND_FILE")" == "$1" ]] && printf "postgresql@16-main.service"\n'
         '}\n'
         'port_owner() { printf "container/other"; }\n'
-        + _func(INSTALL, "pg_restore_to") + "\n"
-        + _func(INSTALL, "pg_ensure_listening") + "\n"
+        + _ensure_listening_funcs() + "\n"
         f'pg_ensure_listening "{pgconf_posix}" 5432 "" 1 5544 || true\n'
     )
     proc = _run(script, tmp_path, extra_path=binpath)
@@ -1124,10 +1130,13 @@ def test_pg_restore_to_is_wired_into_both_die_paths_of_pg_ensure_listening():
     nici ea nu ajunge să asculte. Ambele trebuie să treacă prin recuperarea
     reală, nu doar unul dintre ele."""
     body = _func(INSTALL, "pg_ensure_listening")
-    calls = re.findall(r'pg_restore_to "', body)
+    calls = re.findall(r'pg_restore_tail "', body)
     assert len(calls) == 2, \
-        f"pg_restore_to e CHEMATĂ de {len(calls)} ori, nu 2 — " \
+        f"pg_restore_tail e CHEMATĂ de {len(calls)} ori, nu 2 — " \
         "una dintre cele două căi de eșec a rămas cu restaurare doar de fișier"
+    # Și coada chiar trece prin pg_restore_to — altfel cele două apeluri de mai
+    # sus ar compune un mesaj fără să fi restaurat nimic.
+    assert 'pg_restore_to "' in _func(INSTALL, "pg_restore_tail")
 
 
 # ---------------------------------------------------------------------------
@@ -1306,7 +1315,7 @@ exit 0
         'port_owner_unit() { [[ "$(cat "$BOUND_FILE")" == "$1" ]] && printf "postgresql@16-main.service"; }\n'
         'port_owner() { printf "postgres"; }\n'
         f'pg_confdir() {{ printf "%s\\n" "{pgconf_posix}"; }}\n'
-        + _func(INSTALL, "pg_ensure_listening") + "\n"
+        + _ensure_listening_funcs() + "\n"
         + _func(INSTALL, "step_postgres") + "\n"
         "step_postgres\n"
     )
@@ -1381,8 +1390,7 @@ exit 0
         'port_owner_unit() { [[ "$(cat "$BOUND_FILE")" == "$1" ]] && printf "postgresql@16-main.service"; }\n'
         'port_owner() { printf "postgres"; }\n'
         f'pg_confdir() {{ printf "%s\\n" "{pgconf_posix}"; }}\n'
-        + _func(INSTALL, "pg_restore_to") + "\n"
-        + _func(INSTALL, "pg_ensure_listening") + "\n"
+        + _ensure_listening_funcs() + "\n"
         + _func(INSTALL, "step_postgres") + "\n"
         "step_postgres\n"
     )

@@ -73,6 +73,16 @@ def _func(source: str, name: str) -> str:
     return match.group(0)
 
 
+def _ensure_listening_funcs() -> str:
+    """`pg_ensure_listening` LIVRATĂ ȘI ajutoarele de care depinde. Ele au fost
+    inline; de când „necunoscut" oprește sondele (pg_probe_or_die) și coada
+    mesajului se compune din ce a întors restaurarea (pg_restore_tail),
+    un harnaș care încarcă doar funcția principală moare cu «command not
+    found» la prima sondă."""
+    return "\n".join(_func(INSTALL, name) for name in (
+        "pg_probe_or_die", "pg_restore_to", "pg_restore_tail", "pg_ensure_listening"))
+
+
 def _stub(directory: Path, name: str, body: str) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / name
@@ -309,7 +319,7 @@ exit 0
         # doar ca step_postgres să ajungă la blocul de rol/parolă.
         'port_free() { return 1; }\n'
         'pg_port_owned_by_postgres() { return 0; }\n'
-        + _func(INSTALL, "pg_ensure_listening") + "\n"
+        + _ensure_listening_funcs() + "\n"
         + _func(INSTALL, "step_postgres") + "\n"
         "step_postgres\n"
     )
