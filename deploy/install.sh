@@ -577,9 +577,31 @@ step_snapshot() {
     ln -sfn "$SNAPSHOT_DIR" "${SENTINEL_BACKUP_DIR}/predeploy-latest"
 
     # Preflight normally captures this. Capture it here too, so that a run with
-    # --skip-preflight still has something to compare against at step 38 — an
+    # --skip-preflight still has something to compare against at step 39 — an
     # install with no baseline cannot tell whether it broke anything.
-    [[ -f "${STATE_MARKERS}/baseline-services.txt" ]] || capture_baseline
+    #
+    # "Is there a services file" was the test here, and an EMPTY file left by a
+    # failed `systemctl` satisfied it: the baseline was never taken, nothing
+    # re-took it, and every later run compared against nothing. The question is
+    # whether every dimension can be compared against (baseline_complete in
+    # lib/common.sh) — a legacy file with content can, an unmeasured or legacy-
+    # empty one cannot.
+    #
+    # capture_baseline's rc is not read: it warns for each dimension it could
+    # not measure, and step 39 reads the baseline itself and stops on what is
+    # still unusable. `|| true` only keeps `set -e` from ending the run HERE.
+    if ! baseline_complete "$STATE_MARKERS"; then
+        # Step 19 done means a previous run already changed this host. A
+        # baseline taken now describes the host AFTER that, so a pass at step 39
+        # proves nothing stopped from here on, not that the install broke
+        # nothing. Still better than no baseline, but it has to say so.
+        if step_done "19_user_and_dirs"; then
+            warn "re-taking the pre-install baseline AFTER an earlier run already changed \
+this host (step 19 is marked done): the earlier one was unusable. What step 39 \
+reports will hold from now on only, not for the install as a whole."
+        fi
+        capture_baseline || true
+    fi
 }
 
 # --- 19 -------------------------------------------------------------------
@@ -5868,23 +5890,51 @@ step_verify_nothing_broken() {
     # The check that matters most. Sentinel installing perfectly while stopping
     # something the server was already doing is a failed deployment, not a
     # partial success — and the operator would find out from their users.
-    if ! assert_nothing_broken "after install"; then
-        warn "rolling back automatically"
-        "${SCRIPT_DIR}/rollback.sh" "$SNAPSHOT_DIR" --yes || true
-        # Citit DUPA rollback, nu presupus: vps-watchdog e pierdut doar daca a fost adoptat
-        # (exista copia veche) SI scriptul nu mai e acolo. Daca rollback-ul nu l-a scos,
-        # nu se pretinde ca l-a scos.
-        local wd_note=""
-        if [[ -e "${VPS_WATCHDOG_DIR}/watchdog.sh${VPS_WATCHDOG_BACKUP_SUFFIX}" \
-              && ! -e "${VPS_WATCHDOG_DIR}/watchdog.sh" ]]; then
-            wd_note=" LOST: vps-watchdog was removed by that rollback, and this host now has \
+    #
+    # THREE answers (assert_nothing_broken in lib/common.sh): 0 nothing lost,
+    # 1 something lost, anything else could-not-tell. This used to be
+    # `if ! assert_nothing_broken`, which read "could not tell" as "lost": a
+    # failed `ss` made every baseline port look closed and rollback.sh --yes
+    # ran against a healthy install (reproduced with a stub rollback.sh that
+    # logged the call). Only a MEASURED loss may roll back; an unmeasurable
+    # comparison stops the run and undoes nothing, because rolling back is
+    # itself a change to a host nobody has been able to look at.
+    local verdict=0
+    assert_nothing_broken "after install" || verdict=$?
+    case "$verdict" in
+        0) return 0 ;;
+        1) ;;
+        *)
+            local dim cmds="" unknown="${BASELINE_UNKNOWN:-${BASELINE_DIMENSIONS}}"
+            for dim in $unknown; do
+                cmds+="${cmds:+ ;  }$(baseline_cmd_text "$dim")"
+            done
+            die "could not verify that the deployment left the host as it found it \
+(${unknown# }: the warnings above say why for each). This is neither a pass nor a \
+failure — a measurement that could not be taken says nothing about the host — so \
+nothing was rolled back and nothing is reported fine. Run by hand and compare with \
+what you expect to be running (${cmds}). The baseline that was recorded is in \
+${STATE_MARKERS}/baseline-*.txt (a dimension with no file was never recorded). \
+Once the cause is fixed, run the deploy again: this step was not marked done, so \
+it runs again. If the baseline was unusable, the re-run takes a new one and says \
+so — that one proves only that nothing stops from then on." ;;
+    esac
+
+    warn "rolling back automatically"
+    "${SCRIPT_DIR}/rollback.sh" "$SNAPSHOT_DIR" --yes || true
+    # Citit DUPA rollback, nu presupus: vps-watchdog e pierdut doar daca a fost adoptat
+    # (exista copia veche) SI scriptul nu mai e acolo. Daca rollback-ul nu l-a scos,
+    # nu se pretinde ca l-a scos.
+    local wd_note=""
+    if [[ -e "${VPS_WATCHDOG_DIR}/watchdog.sh${VPS_WATCHDOG_BACKUP_SUFFIX}" \
+          && ! -e "${VPS_WATCHDOG_DIR}/watchdog.sh" ]]; then
+        wd_note=" LOST: vps-watchdog was removed by that rollback, and this host now has \
 no availability/capacity alerts. The hand-copied version this installer replaced (with the \
 client domains it checked) is saved, not restored, as ${VPS_WATCHDOG_DIR}/*${VPS_WATCHDOG_BACKUP_SUFFIX} \
 — restore it by hand, after reading it."
-        fi
-        die "the deployment stopped a service that was running before it started. \
-Rolled back. Compare ${STATE_MARKERS}/baseline-services.txt with the current state.${wd_note}"
     fi
+    die "the deployment stopped a service that was running before it started. \
+Rolled back. Compare ${STATE_MARKERS}/baseline-services.txt with the current state.${wd_note}"
 }
 
 # --- 39 -------------------------------------------------------------------

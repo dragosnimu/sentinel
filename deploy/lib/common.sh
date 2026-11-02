@@ -905,100 +905,316 @@ disk_free_gb() {
 # on any host, catches port conflicts and accidental restarts, and does not go
 # stale the moment the machine changes.
 
+# Three answers per dimension (services, ports, containers), and the third is
+# neither of the other two:
+#
+#   measured   the command ran, exited 0, and what it printed — possibly
+#              NOTHING — is what was running
+#   none       there was nothing to ask: containers on a host with no `docker`
+#              on PATH. Nothing can be lost from a set that was never there.
+#   unknown    anything else: the command failed, was never run, or what is on
+#              disk cannot be told apart from a failure
+#
+# The old code wrote every collector as `... 2>/dev/null | ... > file || true`.
+# A failed `ss` left an EMPTY file that EXISTED, and that one file had to mean
+# both "nothing was listening" and "I could not ask". The comparison then went
+# wrong in both directions. At capture: an empty baseline is a permanent
+# all-clear (comm -23 of nothing finds nothing lost), printed as "baseline
+# captured: 0 services, 0 listening ports". At verify: a failed `ss` made the
+# NOW side empty, so every baseline port read as closed, and install.sh ran
+# rollback.sh --yes on a healthy host. Reproduced against that code with stub
+# collectors that exit 1: rc 0 "nothing has stopped" from the first, rollback.sh
+# invoked from the second.
+#
+# So the exit status is captured on its own, never through a pipe, and the fact
+# that a dimension WAS measured is written down beside the data:
+#
+#   baseline-<dim>.txt     unchanged: one name per line, sorted. Exists only for
+#                          a dimension that was measured, so an old reader
+#                          (smoke-test.sh, `diff` in docs/DEPANARE.md) sees
+#                          "no baseline" where it used to see an empty list.
+#   baseline-state.txt     <dim>=measured|unmeasured|none, one per line. Written
+#                          LAST, by rename. Removed FIRST on every capture, so a
+#                          capture that dies half-way leaves no record of the
+#                          previous one standing over new data.
+#
+# A baseline written by the code that came before this has no record. What the
+# reader does with one — measured on both production hosts on 2 Nov 2026 (read
+# only): all three files present, non-empty, no baseline-state.txt:
+#
+#   * a NON-EMPTY file is trusted. The old collectors could only produce an
+#     empty file by failing, so content is itself proof the command ran.
+#   * an EMPTY file is UNKNOWN. It cannot be told from a failed collector, and
+#     guessing "nothing was listening" is the fail-open this exists to close.
+#     (A host with no running service or no TCP listener is not one anybody
+#     reaches over ssh; an empty list of running containers is the plausible
+#     case, and it costs one re-capture: preflight or step 18 take a new one
+#     and the new record settles it.)
+#   * an ABSENT file is unknown for services and ports — the old code always
+#     created both — and `none` for containers, which the old code created only
+#     when `have docker` held.
+#
+# Both live hosts therefore keep comparing exactly as before; only a legacy
+# empty file changes meaning, from "fine" to "could not tell".
 BASELINE_SERVICES=""
 BASELINE_PORTS=""
+# Why the last baseline_measure failed: exit status and first line of stderr.
+BASELINE_WHY=""
+# Set by assert_nothing_broken: dimensions it could not compare / did compare.
+# Globals, because callers call it directly rather than through $(...).
+BASELINE_UNKNOWN=""
+BASELINE_COMPARED=""
+BASELINE_DIMENSIONS="services ports containers"
 
-capture_baseline() {
-    local dir="${1:-$STATE_MARKERS}"
-    mkdir -p "$dir"
-
-    # LC_ALL=C throughout so the on-disk baseline is in byte order — the same
-    # order assert_nothing_broken re-sorts into before comparing. Consistency here
-    # is not strictly required (the comparison re-sorts) but avoids a misleading
-    # file and keeps the two functions honest about collation.
-    systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null \
-        | awk '{print $1}' | LC_ALL=C sort > "${dir}/baseline-services.txt" || true
-    ss -tlnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' | LC_ALL=C sort -u \
-        > "${dir}/baseline-ports.txt" || true
-
-    if have docker; then
-        docker ps --format '{{.Names}}' 2>/dev/null | LC_ALL=C sort > "${dir}/baseline-containers.txt" || true
-    fi
-
-    BASELINE_SERVICES="${dir}/baseline-services.txt"
-    BASELINE_PORTS="${dir}/baseline-ports.txt"
-
-    ok "baseline captured: $(wc -l < "${dir}/baseline-services.txt" 2>/dev/null || echo 0) services, \
-$(wc -l < "${dir}/baseline-ports.txt" 2>/dev/null || echo 0) listening ports"
+# The command that measures a dimension, as text for a message. The operator is
+# told to run THIS by hand, so it must be the one baseline_measure runs; a test
+# compares it against what a stub recorded being invoked.
+baseline_cmd_text() {
+    case "$1" in
+        services)   printf '%s' 'systemctl list-units --type=service --state=running --no-legend --plain' ;;
+        ports)      printf '%s' 'ss -tlnH' ;;
+        containers) printf '%s' "docker ps --format '{{.Names}}'" ;;
+        *)          return 1 ;;
+    esac
 }
 
-# Compare against the baseline. A service that was running and now is not, or a
-# port that was listening and now is not, means Sentinel disturbed something it
-# had no business touching.
-assert_nothing_broken() {
-    local when="$1" dir="${2:-$STATE_MARKERS}" broken=0
-
-    if [[ -f "${dir}/baseline-services.txt" ]]; then
-        local now_services
-        now_services="$(mktemp)"
-        systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null \
-            | awk '{print $1}' | sort > "$now_services"
-
-        # Both inputs are re-sorted with LC_ALL=C right here, immediately before
-        # comm. comm checks sortedness with the current locale's collation, and a
-        # plain `sort` uses locale collation too — but service names carry `@`,
-        # `-` and `.`, which locale and byte order disagree on. A baseline sorted
-        # in one run and compared in another (different locale, or sort vs comm
-        # disagreeing) makes comm emit "file N is not in sorted order" and garbage
-        # output, which reads as "a service stopped" and triggers a false
-        # rollback of a perfectly good install. C collation makes it deterministic.
-        local lost
-        lost="$(comm -23 <(LC_ALL=C sort "${dir}/baseline-services.txt") <(LC_ALL=C sort "$now_services") \
-            | grep -v '^sentinel-' || true)"
-        rm -f "$now_services"
-
-        if [[ -n "$lost" ]]; then
-            broken=1
-            fail "services that were running before the deploy are no longer running (${when}):"
-            printf '        %s\n' $lost >&2
-        fi
-    fi
-
-    if [[ -f "${dir}/baseline-ports.txt" ]]; then
-        local now_ports lost_ports
-        now_ports="$(mktemp)"
-        ss -tlnH 2>/dev/null | awk '{print $4}' | sed 's/.*://' > "$now_ports"
-        # LC_ALL=C lexical sort on both sides: the baseline was written with a
-        # NUMERIC sort, but comm compares lexically, so "80" vs "443" vs "8787"
-        # would otherwise look out of order. Sort both the same way, here.
-        lost_ports="$(comm -23 <(LC_ALL=C sort -u "${dir}/baseline-ports.txt") <(LC_ALL=C sort -u "$now_ports") || true)"
-        rm -f "$now_ports"
-
-        if [[ -n "$lost_ports" ]]; then
-            broken=1
-            fail "ports that were listening before the deploy are now closed (${when}): \
-$(tr '\n' ' ' <<< "$lost_ports")"
-        fi
-    fi
-
-    if have docker && [[ -f "${dir}/baseline-containers.txt" ]]; then
-        local now_containers lost_containers
-        now_containers="$(mktemp)"
-        docker ps --format '{{.Names}}' 2>/dev/null > "$now_containers"
-        lost_containers="$(comm -23 <(LC_ALL=C sort "${dir}/baseline-containers.txt") <(LC_ALL=C sort "$now_containers") || true)"
-        rm -f "$now_containers"
-
-        if [[ -n "$lost_containers" ]]; then
-            broken=1
-            fail "containers that were running before the deploy have stopped (${when}): \
-$(tr '\n' ' ' <<< "$lost_containers")"
-        fi
-    fi
-
-    if (( broken )); then
+# baseline_measure DIM OUTFILE — ask the host ONE question.
+#   0  measured: OUTFILE holds the answer, sorted, one name per line (maybe empty)
+#   1  not measured: the command failed, or OUTFILE could not be written;
+#      BASELINE_WHY says why
+#   2  nothing to ask (containers, no `docker` on PATH)
+# The exit status is the command's own. It is read from the substitution that
+# ran the command alone, and stderr goes to a file instead of /dev/null so the
+# reason survives to the warning.
+baseline_measure() {
+    local dim="$1" out="$2" errf raw rc=0 first
+    BASELINE_WHY=""
+    errf="$(mktemp)" || { BASELINE_WHY="mktemp failed"; return 1; }
+    case "$dim" in
+        services)
+            raw="$(systemctl list-units --type=service --state=running --no-legend --plain 2>"$errf")" || rc=$? ;;
+        ports)
+            raw="$(ss -tlnH 2>"$errf")" || rc=$? ;;
+        containers)
+            if ! have docker; then rm -f "$errf"; return 2; fi
+            raw="$(docker ps --format '{{.Names}}' 2>"$errf")" || rc=$? ;;
+        *)
+            rm -f "$errf"; BASELINE_WHY="unknown dimension '${dim}'"; return 1 ;;
+    esac
+    first="$(head -n 1 "$errf")" || first=""
+    rm -f "$errf"
+    if (( rc != 0 )); then
+        BASELINE_WHY="exit ${rc}${first:+: ${first}}"
         return 1
     fi
-    ok "nothing that was running before the deploy has stopped (${when})"
+
+    : > "$out" || { BASELINE_WHY="could not write ${out}"; return 1; }
+    if [[ -n "$raw" ]]; then
+        case "$dim" in
+            services)   printf '%s\n' "$raw" | awk '{print $1}' | LC_ALL=C sort -u > "$out" ;;
+            ports)      printf '%s\n' "$raw" | awk '{print $4}' | sed 's/.*://' | LC_ALL=C sort -u > "$out" ;;
+            containers) printf '%s\n' "$raw" | LC_ALL=C sort -u > "$out" ;;
+        esac || { BASELINE_WHY="could not process or write the output"; return 1; }
+    fi
+    return 0
+}
+
+# baseline_state DIR DIM — what the baseline on disk is worth. One word:
+#   measured | none          comparable (see above)
+#   unmeasured               capture recorded that it could not ask
+#   legacy-empty             no record, and an empty file (cannot tell)
+#   missing                  no record and no file
+#   inconsistent             the record says measured, the file is not there
+#   unrecognised             a record exists but says nothing usable about DIM
+# Callers: `measured` and `none` are the answers, EVERYTHING ELSE is unknown.
+baseline_state() {
+    local dir="$1" dim="$2" file rec record
+    file="${dir}/baseline-${dim}.txt"
+    record="${dir}/baseline-state.txt"
+    if [[ -e "$record" || -L "$record" ]]; then
+        rec="$(sed -n "s/^${dim}=//p" "$record" | head -n 1)" || rec=""
+        case "$rec" in
+            measured)   if [[ -f "$file" ]]; then echo measured; else echo inconsistent; fi ;;
+            unmeasured) echo unmeasured ;;
+            none)       if [[ "$dim" == containers ]]; then echo none; else echo unrecognised; fi ;;
+            *)          echo unrecognised ;;
+        esac
+        return 0
+    fi
+    if [[ -s "$file" ]]; then
+        echo measured
+    elif [[ -f "$file" ]]; then
+        echo legacy-empty
+    elif [[ "$dim" == containers ]]; then
+        echo none
+    else
+        echo missing
+    fi
+}
+
+# 0 when every dimension of the baseline in $1 can be compared against.
+# install.sh's step 18 re-captures when this is false; "services file exists"
+# was the old test and an empty file from a failed `systemctl` satisfied it.
+baseline_complete() {
+    local dir="${1:-$STATE_MARKERS}" dim st
+    for dim in $BASELINE_DIMENSIONS; do
+        st="$(baseline_state "$dir" "$dim")"
+        case "$st" in measured|none) ;; *) return 1 ;; esac
+    done
+    return 0
+}
+
+# Take the baseline. 0 when every dimension was measured (or is `none`), 2 when
+# at least one was not — each of those has a warning of its own, and NO success
+# line: the "baseline captured" line names only what was actually measured.
+capture_baseline() {
+    local dir="${1:-$STATE_MARKERS}" dim file rc n state="" notes="" unmeasured="" tmp
+    mkdir -p "$dir"
+    rm -f "${dir}/baseline-state.txt"
+    BASELINE_SERVICES=""; BASELINE_PORTS=""
+
+    for dim in $BASELINE_DIMENSIONS; do
+        file="${dir}/baseline-${dim}.txt"
+        rc=0; baseline_measure "$dim" "${file}.new" || rc=$?
+        if (( rc == 0 )) && ! mv -f "${file}.new" "$file"; then
+            rc=1; BASELINE_WHY="could not move ${file}.new into place"
+        fi
+        case $rc in
+            0)
+                n="$(wc -l < "$file")"; n="${n//[[:space:]]/}"
+                state+="${dim}=measured"$'\n'
+                case "$dim" in
+                    services)   BASELINE_SERVICES="$file"; notes+=", ${n} services" ;;
+                    ports)      BASELINE_PORTS="$file";    notes+=", ${n} listening ports" ;;
+                    containers) notes+=", ${n} running containers" ;;
+                esac ;;
+            2)
+                rm -f "$file" "${file}.new"
+                state+="${dim}=none"$'\n'
+                notes+=", no docker on PATH (no containers to compare)" ;;
+            *)
+                rm -f "$file" "${file}.new"
+                state+="${dim}=unmeasured"$'\n'
+                unmeasured+=" ${dim}"
+                warn "baseline of ${dim} NOT captured: $(baseline_cmd_text "$dim") failed (${BASELINE_WHY}). \
+Step 39 cannot check ${dim} against anything and will stop with 'could not verify'. \
+Run it by hand to see why." ;;
+        esac
+    done
+
+    tmp="$(mktemp "${dir}/.baseline-state.XXXXXX")" || tmp=""
+    if [[ -z "$tmp" ]] || ! printf '%s' "$state" > "$tmp" || ! mv -f "$tmp" "${dir}/baseline-state.txt"; then
+        [[ -z "$tmp" ]] || rm -f "$tmp"
+        warn "could not write ${dir}/baseline-state.txt. The baseline files stay, but an EMPTY one \
+will be read as unknown, not as 'nothing was running'."
+        return 2
+    fi
+
+    [[ -z "$notes" ]] || ok "baseline captured: ${notes#, }"
+    [[ -z "$unmeasured" ]] || return 2
+    return 0
+}
+
+# Say, as a warning, that DIM could not be compared. Always returns 2.
+_baseline_unknown() {
+    warn "could not verify ${1} (${2}): ${3}. That is neither 'nothing was lost' nor 'something was \
+lost'. Run by hand: $(baseline_cmd_text "$1")"
+    return 2
+}
+
+# baseline_compare DIM DIR WHEN
+#   0  nothing lost (or nothing to compare against: containers=none)
+#   1  something that was there is gone; printed with fail()
+#   2  could not tell; printed with warn(), via _baseline_unknown
+# Callers: 0 is fine, 1 is bad, EVERYTHING ELSE is unknown.
+baseline_compare() {
+    local dim="$1" dir="$2" when="$3" st file tmpd rc=0 result=0 why="" lost="" line kept=""
+    file="${dir}/baseline-${dim}.txt"
+    st="$(baseline_state "$dir" "$dim")"
+    case "$st" in
+        measured) ;;
+        none) return 0 ;;
+        unmeasured)   _baseline_unknown "$dim" "$when" "the baseline of ${dim} could not be taken when it was recorded"; return 2 ;;
+        legacy-empty) _baseline_unknown "$dim" "$when" "${file} is empty and has no record: written before records existed, so it cannot be told from a failed capture"; return 2 ;;
+        missing)      _baseline_unknown "$dim" "$when" "no baseline of ${dim} was recorded"; return 2 ;;
+        *)            _baseline_unknown "$dim" "$when" "the baseline record for ${dim} is unusable (${st})"; return 2 ;;
+    esac
+
+    tmpd="$(mktemp -d)" || { _baseline_unknown "$dim" "$when" "mktemp failed"; return 2; }
+    baseline_measure "$dim" "${tmpd}/now" || rc=$?
+    if (( rc == 2 )); then
+        why="the baseline lists containers but there is no docker on PATH now"; result=2
+    elif (( rc != 0 )); then
+        why="$(baseline_cmd_text "$dim") failed now (${BASELINE_WHY})"; result=2
+    elif ! LC_ALL=C sort -u "$file" > "${tmpd}/was" || ! LC_ALL=C sort -u "${tmpd}/now" > "${tmpd}/is"; then
+        why="sort failed"; result=2
+    elif ! lost="$(LC_ALL=C comm -23 "${tmpd}/was" "${tmpd}/is")"; then
+        why="comm failed"; result=2
+    fi
+    rm -rf "$tmpd"
+    if (( result != 0 )); then
+        _baseline_unknown "$dim" "$when" "$why"
+        return 2
+    fi
+
+    # sentinel's own units are expected to move during a deploy, and are not
+    # what this check is about. Plain bash, not `grep -v ... || true`: grep's
+    # "no line left" (1) and "could not run" (2) both vanished into the `true`.
+    if [[ "$dim" == services ]]; then
+        while IFS= read -r line; do
+            [[ -z "$line" || "$line" == sentinel-* ]] || kept+="${line}"$'\n'
+        done <<< "$lost"
+        lost="${kept%$'\n'}"
+    fi
+
+    BASELINE_COMPARED+=" ${dim}"
+    [[ -n "$lost" ]] || return 0
+    case "$dim" in
+        services)
+            fail "services that were running before the deploy are no longer running (${when}):"
+            printf '        %s\n' $lost >&2 ;;
+        ports)
+            fail "ports that were listening before the deploy are now closed (${when}): \
+$(tr '\n' ' ' <<< "$lost")" ;;
+        containers)
+            fail "containers that were running before the deploy have stopped (${when}): \
+$(tr '\n' ' ' <<< "$lost")" ;;
+    esac
+    return 1
+}
+
+# Compare against the baseline. A service that was running and now is not, a
+# port that was listening and now is not, a container that stopped: Sentinel
+# disturbed something it had no business touching.
+#
+#   0  every dimension compared, nothing lost
+#   1  something was lost (fail() said what). Other dimensions may ALSO have
+#      been unknown; their warnings and BASELINE_UNKNOWN say so.
+#   2  nothing proven lost, but at least one dimension could not be compared
+#
+# Same rule as port_free: 0 is fine, 1 is bad, EVERYTHING ELSE is unknown. A
+# caller must never turn 2 into an action (install.sh used to roll back on a
+# non-zero) and must never print a success line for it.
+assert_nothing_broken() {
+    local when="$1" dir="${2:-$STATE_MARKERS}" lost=0 unknown=0 rc dim
+    BASELINE_UNKNOWN=""
+    BASELINE_COMPARED=""
+    for dim in $BASELINE_DIMENSIONS; do
+        rc=0; baseline_compare "$dim" "$dir" "$when" || rc=$?
+        case $rc in
+            0) ;;
+            1) lost=1 ;;
+            *) unknown=1; BASELINE_UNKNOWN+=" ${dim}" ;;
+        esac
+    done
+
+    if (( lost )); then
+        return 1
+    fi
+    if (( unknown )); then
+        return 2
+    fi
+    ok "nothing that was running before the deploy has stopped (${when}); compared:${BASELINE_COMPARED}"
     return 0
 }
 

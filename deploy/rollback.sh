@@ -312,15 +312,28 @@ section "9. Servicii preexistente"
 
 # The rollback itself must not break anything either. Compare against the same
 # baseline the install used.
-if [[ -f "${STATE_MARKERS}/baseline-services.txt" ]]; then
-    assert_nothing_broken "after rollback" || \
+#
+# Three answers, as in lib/common.sh: 0 nothing lost, 1 something lost, anything
+# else could-not-tell. The "no baseline" branch below used to be the ONLY honest
+# one here: an unmeasurable comparison fell into `|| fail` as if it were a loss,
+# and a baseline file that existed but was empty (a capture whose `ss` failed)
+# printed the reassuring line. assert_nothing_broken now says per dimension what
+# it could not tell, and a missing baseline is one of those, so the gate on the
+# services file is gone — it hid the ports and containers that WERE recorded.
+verdict=0
+assert_nothing_broken "after rollback" || verdict=$?
+case "$verdict" in
+    0) ;;
+    1)
         fail "Something that was running before Sentinel was installed is still not \
 running after the rollback. Investigate now — compare with \
-${STATE_MARKERS}/baseline-services.txt"
-else
-    info "no pre-install baseline recorded; cannot verify automatically"
-    info "check by hand: systemctl --failed && ss -tlnp"
-fi
+${STATE_MARKERS}/baseline-*.txt" ;;
+    *)
+        warn "could not verify that nothing that was running before Sentinel was installed \
+is still stopped${BASELINE_UNKNOWN:+ (${BASELINE_UNKNOWN# }: the warnings above say why)}. \
+That is not a pass: the rollback itself is done, but whether it left the host as it \
+was is UNKNOWN. Check by hand: systemctl --failed && ss -tlnp" ;;
+esac
 
 # Done here, at the very end, because the baseline check above still needs the
 # files in this directory. The install-step completion markers record what the

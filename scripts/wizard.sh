@@ -208,8 +208,23 @@ PROBE="$(remote '
     echo "MEM=$(awk "/MemAvailable/{print int(\$2/1024)}" /proc/meminfo 2>/dev/null || echo 0)"
     echo "DISK=$(df -Pm / 2>/dev/null | awk "NR==2{print \$4}")"
     echo "NGINX=$(command -v nginx >/dev/null 2>&1 && echo yes || echo no)"
-    echo "P80=$(ss -tln 2>/dev/null | grep -qE ":80 " && echo busy || echo free)"
-    echo "P443=$(ss -tln 2>/dev/null | grep -qE ":443 " && echo busy || echo free)"
+    # Trei raspunsuri, nu doua: busy, free, unknown. Vechiul `ss | grep -qE`
+    # lasa un ss lipsa sau refuzat sa ajunga la grep fara nicio linie, iar
+    # nicio linie este exact cum arata liber. ss se intreaba o data, codul lui
+    # de iesire se citeste separat, iar un raspuns gol nu e masurat nici el
+    # (ss -tln tipareste mereu capul de tabel).
+    if SS_OUT="$(ss -tln 2>/dev/null)" && [ -n "$SS_OUT" ]; then
+        for p in 80 443; do
+            if printf "%s\n" "$SS_OUT" | grep -qE ":$p "; then
+                echo "P$p=busy"
+            else
+                echo "P$p=free"
+            fi
+        done
+    else
+        echo "P80=unknown"
+        echo "P443=unknown"
+    fi
     # Doar o căutare în tabela de rutare — nu pleacă niciun pachet. Adresa e din
     # spațiul de documentație (RFC 5737), nu a unui rezolver public: o adresă
     # reală scrisă aici ajunge, mai devreme sau mai târziu, copiată într-o
@@ -253,16 +268,31 @@ title "3. Interfața web"
 ask DOMAIN "Domeniul pentru panou (trebuie să indice deja spre acest server)" \
     "sentinel.exemplu.ro"
 
-if [[ "$PORT443" == "busy" ]]; then
-    info "portul 443 e deja ocupat — probabil de nginx-ul tău."
-    ask_choice NGINX_MODE "Cum expunem panoul?" \
-        "shared:vhost lângă site-urile existente, pe 443 (URL curat)" \
-        "dedicated:port propriu, nu atinge nginx-ul existent"
-else
-    ask_choice NGINX_MODE "Cum expunem panoul?" \
-        "dedicated:port propriu, izolat (implicit sigur)" \
-        "shared:vhost pe 80/443, URL curat, are nevoie de nginx"
-fi
+# Trei raspunsuri de la sonda (busy, free, unknown), iar „unknown" nu e un fel
+# de „free": `ss` lipsa sau refuzat tipareste unknown, si ce nu e exact busy ori
+# free (inclusiv un camp lipsa din raspuns) se citeste tot unknown. Vechiul
+# `[[ == busy ]] ... else` trata orice altceva drept liber si recomanda in
+# consecinta; acum nu se afirma nimic despre un port care nu a fost masurat.
+case "$PORT443" in
+    busy)
+        info "portul 443 e deja ocupat — probabil de nginx-ul tău."
+        ask_choice NGINX_MODE "Cum expunem panoul?" \
+            "shared:vhost lângă site-urile existente, pe 443 (URL curat)" \
+            "dedicated:port propriu, nu atinge nginx-ul existent"
+        ;;
+    free)
+        ask_choice NGINX_MODE "Cum expunem panoul?" \
+            "dedicated:port propriu, izolat (implicit sigur)" \
+            "shared:vhost pe 80/443, URL curat, are nevoie de nginx"
+        ;;
+    *)
+        warn "nu am putut afla dacă portul 443 e ocupat (ss lipsește sau a refuzat \
+interogarea) — NECUNOSCUT, nu liber. Rulează pe server: ss -tln"
+        ask_choice NGINX_MODE "Cum expunem panoul?" \
+            "dedicated:port propriu, nu atinge nginx-ul existent (sigur și fără să știu ce ține 443)" \
+            "shared:vhost pe 80/443, are nevoie de nginx — alege-l doar dacă știi că nginx ține 443"
+        ;;
+esac
 
 if [[ "$NGINX_MODE" == "dedicated" ]]; then
     ask PUBLIC_PORT "Portul public al panoului" "8443"
@@ -271,8 +301,15 @@ else
     PUBLIC_PORT="443"
 fi
 
-if [[ "$PORT80" == "free" && "$NGINX_MODE" == "dedicated" ]]; then
-    warn "portul 80 e liber, dar în modul dedicat certbot nu-l poate folosi"
+if [[ "$NGINX_MODE" == "dedicated" ]]; then
+    case "$PORT80" in
+        free)
+            warn "portul 80 e liber, dar în modul dedicat certbot nu-l poate folosi" ;;
+        busy) ;;
+        *)
+            warn "nu am putut afla dacă portul 80 e liber (ss lipsește sau a refuzat \
+interogarea) — NECUNOSCUT. În modul dedicat certbot nu-l poate folosi oricum" ;;
+    esac
 fi
 
 # ---------------------------------------------------------------- 4. safety

@@ -314,7 +314,11 @@ elif grep -qi nginx <<< "$owner80"; then
         fail "nginx -t EȘUEAZĂ deja, înainte ca Sentinel să atingă ceva. Modul shared va refuza să continue: nu adaugă un vhost la un nginx rupt. Repară configurația existentă."
     fi
 else
-    info "${owner80} deține :80. Pentru un certificat real, fie îl lași să servească"
+    # `port_owner` întreabă doar tcp și poate rămâne gol pe un :80 ținut (un
+    # listener doar udp; un proces pe care `ss` nu are voie să-l numească). Gol,
+    # linia începea cu « deține :80 » — un subiect lipsă, în singurul loc în care
+    # operatorul citește cine ține portul.
+    info "${owner80:-un proces pe care ss nu l-a putut numi} deține :80. Pentru un certificat real, fie îl lași să servească"
     info "/.well-known/acme-challenge/ din /var/lib/letsencrypt (--cert-mode webroot),"
     info "fie folosești o provocare DNS-01. install.sh testează accesibilitatea"
     info "înainte să încerce, ca să nu consume din rate-limit-ul Let's Encrypt."
@@ -327,7 +331,18 @@ section "Ce rulează deja pe acest server"
 # something. Whatever that is, installing a security agent must not break it.
 # This records the baseline; install.sh compares against it afterwards and
 # rolls back if anything that was running has stopped.
-capture_baseline
+#
+# Not a bare call: capture_baseline answers 2 for a dimension it could not
+# measure, and `set -e` would end the preflight HERE with no message of its own.
+# It has already warned, per dimension, with the command that failed, and has
+# written no baseline for that dimension. Preflight is advisory about it —
+# nothing has been changed yet — and the consequence is stated: install.sh
+# step 18 tries again before touching anything, and if that still cannot
+# measure, step 39 stops with "could not verify" rather than passing on a
+# baseline that was never taken.
+capture_baseline || warn "baseline incomplete: the dimensions named above have nothing \
+recorded. Step 18 of install.sh tries once more before anything is changed; if it \
+still cannot, step 39 will stop with 'could not verify' for them."
 
 running_count="$(systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null | wc -l)"
 listening_count="$(ss -tlnH 2>/dev/null | wc -l)"
