@@ -1126,3 +1126,107 @@ def test_the_certbot_hint_is_still_given_when_nothing_really_listens(tmp_path):
     """Contra-proba: măsurat liber -> sfatul apare, e util și corect acolo."""
     _, warns, out = _preflight_run(tmp_path, _certbot_hint_block(), "exit 0\n")
     assert warns >= 1 and "nimic nu ascultă pe :80" in out, out
+
+
+# ---------------------------------------------------------------------------
+# Brațele blocului de sfat certbot: fiecare condiție care deosebește un braț
+# de vecinul lui trebuie să aibă un test care o vede dispărând.
+# ---------------------------------------------------------------------------
+NGINX_OWNER_LINE = (
+    'LISTEN 0      511          0.0.0.0:80         0.0.0.0:*    '
+    'users:(("nginx",pid=1234,fd=6))'
+)
+
+
+def _say(line: str) -> str:
+    """Comanda de shell care tipărește `line` (sau nimic, dacă e goală)."""
+    return f"printf '%s\\n' '{line}'" if line else ":"
+
+
+def _ss_by_query(*, tcp: str = "", tcp_owner: str = "", udp: str = "",
+                 tcp_fails: bool = False) -> str:
+    """O momeală `ss` care răspunde DIFERIT la cele trei întrebări pe care le
+    pune blocul: `-tlnH` (port_free, tcp), `-ulnH` (port_free, udp) și
+    `-tlnpH` (port_owner). Un singur `ss` care răspunde la fel la toate trei nu
+    poate reprezenta exact situațiile în care `port_free` și `port_owner` nu
+    sunt de acord — iar în ele stă fiecare condiție de mai jos."""
+    return (
+        'case "$*" in\n'
+        f"  *-tlnpH*) {_say(tcp_owner)} ;;\n"
+        f"  *-tlnH*)  {'exit 1' if tcp_fails else _say(tcp)} ;;\n"
+        f"  *-ulnH*)  {_say(udp)} ;;\n"
+        "esac\nexit 0\n"
+    )
+
+
+@pytest.mark.parametrize("ss_body", [
+    pytest.param(_ss_by_query(udp=SS_UDP_LINE), id="listener-udp-pe-80-fara-proprietar-tcp"),
+    pytest.param(_ss_by_query(tcp=SS_LISTEN_LINE), id="listener-tcp-pe-80-proprietar-ascuns"),
+])
+def test_the_certbot_hint_is_not_given_when_80_is_held_but_the_owner_is_unknown(tmp_path, ss_body):
+    """`port_owner` întreabă doar tcp și poate rămâne gol pe un :80 ținut (un
+    listener doar udp; un proces pe care `ss` nu are voie să-l numească).
+    Sfatul «nimic nu ascultă pe :80 … DNS-01 sau self-signed» se bazează pe
+    `owner gol`, deci fără condiția `port80_state == 0` ar apărea tocmai pe un
+    port pe care cineva ÎL ȚINE, iar operatorul ar renunța la certbot pentru o
+    constatare falsă (și WARN_COUNT ar crește)."""
+    _, warns, out = _preflight_run(tmp_path, _certbot_hint_block(), ss_body)
+    assert "deține :80" in out, f"blocul n-a ajuns la niciun braț cunoscut: {out}"
+    assert "nimic nu ascultă pe :80" not in out and "DNS-01 sau self-signed" not in out, out
+    assert "NECUNOSCUT" not in out, f"ss a răspuns, deci nu e necunoscut: {out}"
+    assert warns == 0, f"WARN_COUNT={warns}: {out}"
+
+
+def test_the_unknown_arm_is_not_taken_when_the_owner_is_known(tmp_path):
+    """Dacă `port_owner` a numit deja nginx, «nu se poate stabili cine deține
+    :80» e fals — owner-ul e numit chiar sub ochii operatorului — chiar dacă un
+    `port_free` ulterior n-a putut întreba (stare trecătoare). Brațul
+    «necunoscut» se ia doar cu owner gol."""
+    ss = _ss_by_query(tcp_owner=NGINX_OWNER_LINE, tcp_fails=True)
+    _, warns, out = _preflight_run(
+        tmp_path, _certbot_hint_block(), ss, pre="nginx() { return 0; }\n")
+    assert "nginx deține :80" in out, f"owner-ul numit nu s-a văzut: {out}"
+    assert "nu se poate stabili cine deține :80" not in out, out
+    assert warns == 0, f"WARN_COUNT={warns}: {out}"
+
+
+def test_the_nothing_listens_arm_is_not_taken_when_the_owner_is_known(tmp_path):
+    """Dacă `port_owner` a numit nginx, «nimic nu ascultă pe :80» e fals chiar
+    dacă `port_free` a răspuns «liber» (un listener care a apărut între cele
+    două întrebări). Brațul «nimic nu ascultă» cere owner gol ȘI port liber."""
+    ss = _ss_by_query(tcp_owner=NGINX_OWNER_LINE)
+    _, warns, out = _preflight_run(
+        tmp_path, _certbot_hint_block(), ss, pre="nginx() { return 0; }\n")
+    assert "nginx deține :80" in out, f"owner-ul numit nu s-a văzut: {out}"
+    assert "nimic nu ascultă pe :80" not in out, out
+    assert warns == 0, f"WARN_COUNT={warns}: {out}"
+
+
+def test_an_nginx_owner_gets_the_shared_mode_advice_and_a_failing_nginx_t_fails(tmp_path):
+    """Brațul nginx e singurul care poate face preflight-ul să pice pe :80: un
+    nginx care deține portul dar al cărui `nginx -t` eșuează înseamnă că modul
+    `shared` ar scrie într-un config rupt. Fără el (sau fără `fail`), operatorul
+    ar primi sfatul «--nginx-mode shared» pe o gazdă unde nu are voie."""
+    ss = _ss_by_query(tcp=SS_LISTEN_LINE, tcp_owner=NGINX_OWNER_LINE)
+    fails, _, out = _preflight_run(
+        tmp_path, _certbot_hint_block(), ss, pre="nginx() { return 0; }\n")
+    assert fails == 0 and "--nginx-mode shared" in out and "nginx -t trece" in out, out
+    (tmp_path / "rupt").mkdir()
+    fails, _, out = _preflight_run(
+        tmp_path / "rupt", _certbot_hint_block(), ss, pre="nginx() { return 1; }\n")
+    assert fails == 1 and "nginx -t EȘUEAZĂ" in out and "nginx -t trece" not in out, out
+
+
+def test_a_non_nginx_owner_gets_the_webroot_advice_and_no_shared_mode_advice(tmp_path):
+    """Un alt proprietar al lui :80 (apache2) primește sfatul de webroot/DNS-01,
+    numit după el; sfatul «--nginx-mode shared» și verificarea `nginx -t` n-au
+    ce căuta acolo — ar trimite operatorul să scrie într-un nginx care nu
+    servește portul."""
+    apache = ('LISTEN 0      511          0.0.0.0:80         0.0.0.0:*    '
+              'users:(("apache2",pid=77,fd=4))')
+    ss = _ss_by_query(tcp=SS_LISTEN_LINE, tcp_owner=apache)
+    fails, warns, out = _preflight_run(
+        tmp_path, _certbot_hint_block(), ss, pre="nginx() { return 1; }\n")
+    assert "apache2" in out and "deține :80" in out and "acme-challenge" in out, out
+    assert "--nginx-mode shared" not in out and "nginx -t" not in out, out
+    assert fails == 0 and warns == 0, f"fails={fails} warns={warns}: {out}"
