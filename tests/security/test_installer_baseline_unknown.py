@@ -1199,9 +1199,35 @@ def test_an_unreadable_record_tells_the_operator_which_file_and_why_it_is_unknow
     assert res.rc == 2 and res.vars["UNKNOWN"] == "[ services ports containers]", res.out
     assert res.vars["COUNTS"] == "0 3", res.out
     assert f"{host.state.as_posix()}/baseline-state.txt exists but cannot be read" in res.out, res.out
+    assert "(a directory, a link to nowhere, or no permission)" in res.out, res.out
     assert "unrecognised" not in res.out, res.out
     assert OK_LINE not in res.out, res.out
     assert not re.search(r"^(sed|cat):", res.out, re.M), res.out
+
+
+def test_a_baseline_directory_whose_name_starts_with_a_dash_is_still_read(host):
+    """Directorul cu baseline-ul dat ca argument relativ și începând cu `-` (cineva rulează
+    funcția dintr-un director de lucru, cu un nume ca `-d`): fără `--`, `cat` ia calea drept
+    opțiune, eșuează, iar o înregistrare perfect bună ar fi numită `unreadable` — un baseline
+    măsurat tratat ca necunoscut, deci un deploy refuzat sau un pas reluat fără motiv."""
+    d = host.tmp / "cwd" / "-d"
+    d.mkdir(parents=True)
+    (d / "baseline-ports.txt").write_text("22\n", encoding="utf-8", newline="\n")
+    (d / "baseline-state.txt").write_text("ports=measured\n", encoding="utf-8", newline="\n")
+    res = host.run(f'cd "{(host.tmp / "cwd").as_posix()}"\nbaseline_state -d ports\n')
+    assert res.proc.returncode == 0 and res.proc.stdout.strip() == "measured", res.out
+
+
+def test_reading_the_record_does_not_clobber_a_variable_of_the_caller(host):
+    """`baseline_state` ține conținutul înregistrării într-o variabilă; dacă nu e `local`, un
+    apelant care are propriul `body` îl găsește suprascris cu textul înregistrării, iar o
+    decizie luată din el mai târziu se bazează pe un fișier care nu e al lui."""
+    host.legacy(services="sshd.service\n", ports="22\n", containers="web\n")
+    (host.state / "baseline-state.txt").write_text(
+        "services=measured\nports=measured\ncontainers=measured\n", encoding="utf-8", newline="\n")
+    res = host.run('body=MINE\nbaseline_state "$STATE_MARKERS" services > /dev/null\n'
+                   'echo "BODY=$body"\n')
+    assert res.vars["BODY"] == "MINE", res.out
 
 
 def test_a_record_that_cannot_be_written_is_reported_even_when_the_temp_file_exists(host):
