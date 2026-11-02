@@ -214,7 +214,7 @@ class Host:
         path = self.state / f"baseline-{dim}.txt"
         return path.read_text(encoding="utf-8") if path.is_file() else None
 
-    def captured(self, **kw) -> "Host":
+    def captured(self, **kw) -> Host:
         """Capturează pe gazda sănătoasă și verifică, ca restul testului să nu stea pe o
         capturare pe care nu s-a uitat nimeni la ea."""
         res = self.capture(**kw)
@@ -545,6 +545,7 @@ def test_an_unmeasured_capture_is_never_a_permanent_all_clear(host):
     assert res.rc == 2, res.out
     assert OK_LINE not in res.out, res.out
     assert res.vars["UNKNOWN"] == "[ services ports containers]", res.out
+    assert res.vars["COUNTS"] == "0 3", res.out   # câte unul per dimensiune, nu două
     assert res.vars["COUNTS"].split()[0] == "0", "un necunoscut s-a numărat ca eșec al instalării"
     assert res.out.count("could not be taken when it was recorded") == 3,         "fiecare dimensiune nemăsurată trebuie să-și spună motivul"
 
@@ -561,6 +562,7 @@ def test_a_legacy_empty_file_is_unknown_even_when_every_collector_works(host, di
     res = host.assert_()
     assert res.rc == 2, res.out
     assert res.vars["UNKNOWN"] == f"[ {dim}]", res.out
+    assert res.vars["COUNTS"] == "0 1", res.out   # un singur avertisment, nu două
     assert "empty and has no record" in res.out, res.out
     assert OK_LINE not in res.out
 
@@ -574,6 +576,7 @@ def test_no_baseline_at_all_is_unknown_for_services_and_ports(host):
     res = host.assert_()
     assert res.rc == 2, res.out
     assert res.vars["UNKNOWN"] == "[ services ports]", res.out
+    assert res.vars["COUNTS"] == "0 2", res.out   # câte unul per dimensiune, nu două
     assert "no baseline of services was recorded" in res.out, res.out
     assert OK_LINE not in res.out
 
@@ -586,6 +589,7 @@ def test_an_unusable_record_is_unknown_not_a_pass(host):
         "services=maybe\nports=measured\ncontainers=measured\n", encoding="utf-8", newline="\n")
     res = host.assert_()
     assert res.rc == 2 and res.vars["UNKNOWN"] == "[ services]", res.out
+    assert res.vars["COUNTS"] == "0 1", res.out   # un singur avertisment, nu două
     assert "unusable (unrecognised)" in res.out, res.out
 
 
@@ -1137,6 +1141,7 @@ def test_a_record_that_says_measured_while_its_file_is_gone_is_unusable(host):
         "services=measured\nports=measured\ncontainers=measured\n", encoding="utf-8", newline="\n")
     res = host.assert_()
     assert res.rc == 2 and res.vars["UNKNOWN"] == "[ containers]", res.out
+    assert res.vars["COUNTS"] == "0 1", res.out   # un singur avertisment, nu două
     assert "unusable (inconsistent)" in res.out, res.out
 
 
@@ -1175,3 +1180,59 @@ def test_a_comparison_that_cannot_sort_the_current_state_is_unknown(host):
     res = host.assert_()
     assert res.rc == 2 and "sort failed" in res.out, res.out
     assert not re.search(r"no longer running|now closed|have stopped", res.out), res.out
+
+
+# ===========================================================================
+# scripts/smoke-test.sh — citește aceleași fișiere, direct
+# ===========================================================================
+SMOKE = (REPO / "scripts" / "smoke-test.sh").read_text(encoding="utf-8")
+
+
+def _smoke_block(baseline_dir: Path) -> str:
+    start = SMOKE.index("baseline_dir=/var/lib/sentinel-install")
+    end = SMOKE.index("failed_units=", start)
+    block = SMOKE[start:end]
+    assert "baseline-ports.txt" in block and "pass " in block, block[:200]
+    return block.replace("baseline_dir=/var/lib/sentinel-install",
+                         f'baseline_dir="{baseline_dir.as_posix()}"', 1)
+
+
+def _smoke_run(host: Host) -> str:
+    """Blocul «Regresie» din smoke-test.sh, LIVRAT, cu `r` înlocuit de o rulare locală (în
+    producție `r` e `ssh … "$@"`) și `pass`/`fail`/`warn` care tipăresc un cuvânt-cheie."""
+    script = host.tmp / "smoke.sh"
+    script.write_text(
+        "set -euo pipefail\n"
+        'pass() { echo "PASS $*"; }\nfail() { echo "FAIL $*"; }\nwarn() { echo "WARN $*"; }\n'
+        'r() { bash -c "$1"; }\n' + _smoke_block(host.state) + "\n", encoding="utf-8", newline="\n")
+    environ = {**os.environ}
+    environ["PATH"] = host.bin.as_posix() + os.pathsep + environ.get("PATH", "")
+    proc = subprocess.run([BASH, script.as_posix()], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", env=environ)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return proc.stdout + proc.stderr
+
+
+def test_smoke_test_does_not_pass_the_ports_when_their_baseline_was_never_taken(host):
+    """De când un `ss` căzut nu mai lasă un `baseline-ports.txt` gol, fișierul poate LIPSI în
+    timp ce cel de servicii există. `comm` pe un fișier lipsă iese cu eroare, `|| true` o
+    înghițea, iar `lost_ports` gol se citea «fiecare port care asculta înainte ascultă încă»:
+    un PASS pentru o comparație care n-a avut loc. Acum e un avertisment care spune de ce."""
+    host.fail("ports")
+    assert host.capture().rc == 2
+    host.healthy()
+    out = _smoke_run(host)
+    assert "WARN no pre-install baseline of listening ports" in out, out
+    assert "every port that was listening" not in out, out
+    assert "PASS every service that was running" in out, "serviciile măsurate trebuiau comparate"
+
+
+def test_smoke_test_still_compares_ports_when_their_baseline_exists(host):
+    """Contra-proba: cu ambele fișiere, porturile se compară ca înainte — PASS când sunt la loc,
+    FAIL când unul s-a închis."""
+    host.captured()
+    out = _smoke_run(host)
+    assert "PASS every port that was listening" in out and "WARN" not in out, out
+    host.set("ss", "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*")
+    out = _smoke_run(host)
+    assert "FAIL ports closed since the install: 80" in out, out

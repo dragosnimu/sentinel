@@ -161,8 +161,11 @@ def test_an_unknown_443_is_not_recommended_as_free(tmp_path, value):
     câmp lipsit (răspuns trunchiat: «») sau o valoare necunoscută se citesc la fel ca
     `unknown`: avertisment cu «NECUNOSCUT», iar «dedicated» (nu atinge nginx-ul existent)
     primul."""
-    out = _consume(tmp_path, "unknown", value)
-    assert "WARN:" in out and "NECUNOSCUT" in out and "portul 443" in out, out
+    # PORT80=busy: singurul avertisment posibil e al lui 443 (altfel unul despre :80 ar acoperi
+    # un avertisment 443 retrogradat la `info`).
+    out = _consume(tmp_path, "busy", value)
+    warns = [ln for ln in out.splitlines() if ln.startswith("WARN:")]
+    assert len(warns) == 1 and "NECUNOSCUT" in warns[0] and "portul 443" in warns[0], out
     assert "(implicit sigur)" not in out and "deja ocupat" not in out, out
     options = next(ln for ln in out.splitlines() if ln.startswith("OPTIONS:"))
     assert options.index("dedicated:") < options.index("shared:"), options

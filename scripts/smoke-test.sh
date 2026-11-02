@@ -953,12 +953,22 @@ if r "test -f ${baseline_dir}/baseline-services.txt"; then
         fail "services stopped since the install: $(tr '\n' ' ' <<< "$lost")"
     fi
 
-    lost_ports="$(r "comm -23 ${baseline_dir}/baseline-ports.txt \
+    # Fișierul de porturi poate LIPSI chiar dacă cel de servicii există: de la
+    # lib/common.sh `capture_baseline`, o dimensiune pe care `ss` n-a putut-o
+    # măsura nu mai lasă un fișier gol (care mințea «nimic nu asculta»), nu
+    # lasă niciun fișier. `comm` pe un fișier lipsă iese cu eroare, `|| true` o
+    # înghițea, iar `lost_ports` gol se citea ca «toate porturile sunt la loc».
+    if r "test -f ${baseline_dir}/baseline-ports.txt"; then
+        lost_ports="$(r "comm -23 ${baseline_dir}/baseline-ports.txt \
 <(ss -tlnH | awk '{print \$4}' | sed 's/.*://' | sort -un)" || true)"
-    if [[ -z "$lost_ports" ]]; then
-        pass "every port that was listening before the install still is"
+        if [[ -z "$lost_ports" ]]; then
+            pass "every port that was listening before the install still is"
+        else
+            fail "ports closed since the install: $(tr '\n' ' ' <<< "$lost_ports")"
+        fi
     else
-        fail "ports closed since the install: $(tr '\n' ' ' <<< "$lost_ports")"
+        warn "no pre-install baseline of listening ports at ${baseline_dir} (ss could not \
+be asked when it was taken) — cannot verify automatically. Check by hand: ss -tlnp"
     fi
 else
     warn "no pre-install baseline at ${baseline_dir} — cannot verify automatically. \
