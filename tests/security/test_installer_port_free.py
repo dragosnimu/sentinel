@@ -466,6 +466,16 @@ def test_wait_listening_does_not_call_a_strangers_port_ours(tmp_path):
     assert rc == 1
 
 
+def test_wait_listening_never_calls_a_free_port_ours(tmp_path):
+    """«Ocupat ȘI al nostru» cere ambele. Dacă verificarea de proprietar ar
+    putea răspunde singură, un port pe care nu ascultă nimeni (liber, măsurat)
+    ar trece drept PostgreSQL-ul nostru de îndată ce proprietarul e interogabil
+    — iar apelantul ar lua un cluster care nu a pornit drept pornit."""
+    rc, _, _ = _call(tmp_path, "exit 0\n", 'pg_wait_listening 5432 1',
+                     pre='pg_port_owned_by_postgres() { return 0; }\n')
+    assert rc == 1
+
+
 def test_pick_free_port_stops_at_the_first_unknown_instead_of_scanning_twenty(tmp_path):
     """Douăzeci de «necunoscut» urmate de «nu am găsit port liber» ar fi o
     căutare care n-a avut loc. Se oprește la prima, cu 2 — iar `ss` e chemat o
@@ -661,6 +671,26 @@ def test_a_healthy_free_port_still_restarts_exactly_once_and_resolves(tmp_path):
     assert "RESOLVED=5432" in proc.stdout, out
 
 
+def test_unknown_while_picking_with_the_range_exhausted_names_the_range_not_ss(tmp_path):
+    """De la 65535 în sus nu mai e nimic de scanat. Dacă «a ieșit din interval»
+    ar fi spus «ss nu răspunde», operatorul ar căuta un iproute2 stricat pe o
+    gazdă sănătoasă, în loc să mute PostgreSQL mai jos."""
+    proc, sysc, conf = _ensure(tmp_path, "H H H", port="65535", conf_port="65535")
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0 and "ran past the end of the port range" in out, out
+    assert "could not determine" not in out and _restarts(sysc) == 0, (out, sysc)
+
+
+def test_pick_free_port_exhausted_after_twenty_held_ports_says_none_found(tmp_path):
+    """Contra-proba pentru brațul «1»: douăzeci de porturi MĂSURATE ca ținute
+    înseamnă «nu am găsit», nu «necunoscut» — mesajul ăsta e adevărat doar
+    când căutarea chiar a avut loc."""
+    proc, sysc, _ = _ensure(tmp_path, " ".join(["H"] * 23))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0 and "no free port found near 5432" in out, out
+    assert "UNKNOWN" not in out and _restarts(sysc) == 0, (out, sysc)
+
+
 # --- calea --db-port explicită: linia de port se pune la loc, fără repornire --
 def test_unknown_with_an_explicit_db_port_puts_the_config_line_back_without_restarting(tmp_path):
     """`--db-port 5440` pe un cluster sănătos pe 5433: pasul 22 a scris deja
@@ -819,6 +849,59 @@ def test_pg_probe_or_die_does_not_write_a_non_port_back_into_the_config(tmp_path
     proc, conf = _probe(tmp_path, "2", restore="70000")
     assert proc.returncode != 0
     assert "70000" not in conf and "port = 5440" in conf, conf
+
+
+def test_pg_probe_or_die_does_not_claim_a_restore_when_the_line_already_matched(tmp_path):
+    """Pe o rulare FĂRĂ --db-port linia e chiar portul de la intrare: nu e nimic
+    de pus la loc. Un mesaj care ar spune «was put back» ar fi o afirmație
+    despre un efect care n-a existat."""
+    proc, _ = _probe(tmp_path, "2", restore="5433", conf_port="5433", probed="5433")
+    assert proc.returncode != 0
+    assert "put back" not in proc.stderr and "postgresql.conf names 5433" in proc.stderr, proc.stderr
+
+
+def test_pg_probe_or_die_says_so_when_putting_the_line_back_did_not_take(tmp_path):
+    """Mesajul despre fișier e CITIT din fișier după încercare. Dacă scrierea
+    n-a prins (disc plin, fișier doar-citire), «was put back» ar fi o minciună
+    spusă exact când operatorul are cea mai mare nevoie de adevăr."""
+    pgconf = tmp_path / "pgdata"
+    pgconf.mkdir(parents=True, exist_ok=True)
+    (pgconf / "postgresql.conf").write_text("port = 5440\n", encoding="utf-8", newline="\n")
+    script = (
+        "set -euo pipefail\nsource ./lib/common.sh\nsource ./lib/distro.sh\n"
+        "pg_set_port() { :; }\n"
+        + _func(INSTALL, "pg_probe_or_die") + "\n"
+        f'pg_probe_or_die 2 5440 "{str(pgconf).replace(chr(92), "/")}" 5433 0\n'
+    )
+    proc = _run(script, tmp_path)
+    assert proc.returncode != 0
+    assert "did not take, it names 5440" in proc.stderr and "was put back" not in proc.stderr, proc.stderr
+
+
+@pytest.mark.parametrize("rc,must,must_not", [
+    ("0", "confirmed back on the previous port 5433", "DOWN"),
+    ("1", "PostgreSQL is DOWN", "UNKNOWN"),
+    ("2", "restore issued NO restart", "DOWN"),
+    ("3", "'5433' is not a usable port", "WAS restarted"),
+    ("4", "WAS restarted onto it, but whether it came up there could not be determined", "NO restart"),
+    ("9", "internal: pg_restore_to returned 9", "DOWN"),
+])
+def test_pg_restore_tail_says_what_each_code_observed_and_no_more(tmp_path, rc, must, must_not):
+    """Fiecare cod al lui `pg_restore_to` e un FAPT diferit despre gazdă, iar
+    coada die()-ului nu are voie să le contopească: «am repornit și nu se știe»
+    (4) nu e «n-am repornit» (2), iar «nu se știe» nu e «PostgreSQL e jos» (1).
+    Fraza interzisă e cea pe care o contopire ar fi tipărit."""
+    script = (
+        "set -euo pipefail\nsource ./lib/common.sh\nsource ./lib/distro.sh\n"
+        + _func(INSTALL, "pg_restore_tail") + "\n"
+        f"pg_restore_to() {{ return {rc}; }}\n"
+        "pg_configured_port() { printf 5440; }\n"
+        'pg_restore_tail /x 5433 1\nprintf "%s" "$PG_RESTORE_TAIL"\n'
+    )
+    proc = _run(script, tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert must in proc.stdout, proc.stdout
+    assert must_not not in proc.stdout, proc.stdout
 
 
 def test_pg_probe_or_die_does_not_rewrite_the_line_after_a_restart(tmp_path):
