@@ -156,8 +156,32 @@ done
 # ---------------------------------------------------------------------------
 section "Porturi"
 
+# `port_free` answers 0 free / 1 held, and ANYTHING ELSE is unknown: 2 is `ss`
+# that could not be asked, 3 is a value that is not a port. Unknown is a preflight
+# FINDING here, never a pass. Before, a failing `ss` came back as "free" and this
+# loop printed "port 8443 free" for a host where nothing had been measured — and
+# the installer needs the very same `ss` later, in pg_ensure_listening, to decide
+# whether to restart PostgreSQL. A preflight that cannot look is exactly what
+# preflight exists to say out loud.
+#
+# 2 and 3 are two messages because the repairs differ: a --web-port of 70000
+# used to be reported as "install iproute2" on a host whose iproute2 was fine.
 for port in "${SENTINEL_PORTS[@]}"; do
-    if port_free "$port"; then
+    port_state=0
+    port_free "$port" || port_state=$?
+    if (( port_state == 3 )); then
+        fail "port '${port}' is not a usable port number (1-65535, ASCII digits, no \
+leading zero), so nothing was measured about it. Check --web-port."
+        continue
+    fi
+    if (( port_state != 0 && port_state != 1 )); then
+        fail "cannot determine whether port ${port} is free: ss could not be asked \
+(missing, refused the query, or denied). This is UNKNOWN, not free — and the installer \
+needs the same ss later to decide whether to restart PostgreSQL. Install iproute2 if it \
+is missing, or run  ss -tlnH 'sport = :${port}'  by hand to see why."
+        continue
+    fi
+    if (( port_state == 0 )); then
         ok "port ${port} free"
     else
         owner="$(port_owner "$port")"
@@ -228,8 +252,19 @@ done
 # them decides how a certificate can be obtained, so report it.
 section "Porturile 80 și 443 — ale altcuiva"
 
+# Advisory, deci `warn`, nu `fail`: Sentinel nu ia porturile astea oricum. Dar
+# „nu s-a putut afla" nu are voie să se scrie „liber" — de aici se decide ce fel
+# de certificat e posibil, iar un „liber" inventat trimite operatorul spre webroot
+# pe un port pe care nu l-a măsurat nimeni. Liber e `== 0`, ocupat e `== 1`, orice
+# altceva e necunoscut.
 for port in 80 443; do
-    if port_free "$port"; then
+    port_state=0
+    port_free "$port" || port_state=$?
+    if (( port_state != 0 && port_state != 1 )); then
+        warn "nu se poate stabili dacă portul ${port} e ocupat: ss nu a putut fi întrebat \
+(lipsește, a refuzat interogarea sau accesul e refuzat). NECUNOSCUT, nu liber. Rulează \
+ss -tlnH 'sport = :${port}' de mână ca să vezi de ce."
+    elif (( port_state == 0 )); then
         info "port ${port} liber (Sentinel nu îl folosește oricum)"
     else
         owner="$(port_owner "$port")"
@@ -238,7 +273,18 @@ for port in 80 443; do
 done
 
 owner80="$(port_owner 80)"
-if [[ -z "$owner80" ]] && port_free 80; then
+# Sfatul de mai jos („nimeni nu ascultă pe :80, deci HTTP-01 nu e disponibil") se
+# dă DOAR pe un port_free care chiar a putut întreba. Cu `ss` rupt, vechiul
+# `port_free 80` ieșea adevărat și sfatul apărea pe o gazdă unde nginx ascultă pe
+# :80 de ani de zile. `port_owner` îi lasă pe amândoi goi când `ss` nu merge, deci
+# „owner gol" singur nu dovedește nimic.
+port80_state=0
+port_free 80 || port80_state=$?
+if [[ -z "$owner80" ]] && (( port80_state != 0 && port80_state != 1 )); then
+    warn "nu se poate stabili cine deține :80 (ss nu a putut fi întrebat), deci nu se \
+poate spune nici dacă provocarea HTTP-01 a lui certbot e disponibilă. NECUNOSCUT, nu \
+„n-are nimeni portul”."
+elif [[ -z "$owner80" ]] && (( port80_state == 0 )); then
     warn "nimic nu ascultă pe :80. Provocarea HTTP-01 a lui certbot are nevoie de el, \
 iar Sentinel nu îl deține — deci certificatul va avea nevoie de DNS-01, sau vei primi \
 unul self-signed. Vezi docs/DEPLOYMENT.md §2.1."

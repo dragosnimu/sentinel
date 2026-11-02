@@ -1482,6 +1482,76 @@ PG_RESOLVED_PORT=""
 # threading a 4th argument through step_postgres. Production never sets it.
 PG_LISTEN_TIMEOUT_S=15
 
+# The ONE place in this file where a port probe's "unknown" becomes a stop.
+#
+# Every probe in `pg_ensure_listening` is a decision taken from `ss`: free means
+# restart PostgreSQL, held means move the cluster to another port. When `ss`
+# cannot be asked, or the port is not a port, there is no decision to take, and
+# both available ones are wrong — "free" restarts a database that may be
+# perfectly healthy, "held" rewrites postgresql.conf and restarts it onto a port
+# nobody measured. So an unknown stops everything, here.
+#
+# It is a function, and not a four-line block pasted after each probe, because
+# a block pasted after each probe can lose one copy and leave that probe falling
+# through into the move with every other probe still guarded. With one body, a
+# deleted branch fails every behaviour test that passes through any probe, and a
+# probe that forgot to call it is caught structurally (tests/security/
+# test_installer_port_free.py).
+#
+# RC is whatever the probe returned: 0 and 1 are observations and are left to
+# the caller (return 0); EVERYTHING ELSE is unknown and dies. 3 ("not a port")
+# and the rest are told apart only in the words, because the repairs differ.
+#
+# $4 is the port postgresql.conf named before this run changed anything ("" if
+# not known) and $5 is 1 once THIS function's caller has restarted PostgreSQL.
+# The line is put back only while $5 is 0: nothing has moved the cluster yet, so
+# a line naming a port the cluster is not on is a time-bomb for the next
+# unrelated restart (the shape: --db-port 5433 on a healthy 5432 cluster, one
+# failed `ss`, a die() with the file still saying 5433). After a restart the
+# cluster followed the file, so putting the line back would be what splits them.
+# Either way the sentence about the file is READ from the file after the
+# attempt, not deduced from what was meant.
+pg_probe_or_die() {
+    local rc="$1" probed="$2" pgconf="$3" restore_port="${4:-}" restarted="${5:-0}"
+    (( rc == 0 || rc == 1 )) && return 0
+
+    local before after conf_note="" state what
+    before="$(pg_configured_port "$pgconf")"
+    if (( ! restarted )) && [[ -n "$restore_port" && "$before" != "$restore_port" ]] \
+       && port_is_canonical "$restore_port"; then
+        pg_set_port "$pgconf" "$restore_port"
+        after="$(pg_configured_port "$pgconf")"
+        if [[ "$after" == "$restore_port" ]]; then
+            conf_note="postgresql.conf named ${before} when this probe failed and was put \
+back to ${restore_port}, the port it named when this run started."
+        else
+            conf_note="postgresql.conf named ${before} when this probe failed; putting it \
+back to ${restore_port} did not take, it names ${after}. Fix the port line by hand."
+        fi
+    else
+        conf_note="postgresql.conf names ${before}."
+    fi
+
+    if (( restarted )); then
+        state="This run RESTARTED PostgreSQL and nothing could confirm it came back, so \
+whether it is up is UNKNOWN — check that by hand NOW"
+    else
+        state="This step issued no restart (only 'systemctl enable --now', which does \
+nothing to a running unit) and moved nothing"
+    fi
+
+    if (( rc == 3 )); then
+        what="port '${probed}' is not a usable port number (1-65535, ASCII digits only, \
+no leading zero), so nothing was measured about it and PostgreSQL cannot be shown to \
+listen on it. If it came from postgresql.conf, fix that port line"
+    else
+        what="could not determine whether port ${probed} is listening: ss could not be \
+asked (missing, refused the query, or denied). UNKNOWN, not free and not held. Run  \
+ss -tlnH 'sport = :${probed}'  by hand to see why"
+    fi
+    die "${what}. ${state}. ${conf_note}"
+}
+
 # Restoring postgresql.conf to the port it held before this run touched it is
 # not restoring the database — a live cluster does not re-read its config
 # file on its own, and CLAUDE.md's own `systemctl reload nginx` row is exactly
@@ -1491,11 +1561,27 @@ PG_LISTEN_TIMEOUT_S=15
 # $2 — the same `pg_wait_listening` every other path here is judged by, never
 # the restart's own exit code.
 #
-# Returns 0 only once $2 is confirmed listening again. Returns 1, and prints
-# nothing itself, when it is not — the caller decides how loud to be about
-# that, because "the previous port came back" and "PostgreSQL is now down and
-# nothing brought it back" are different die() messages, not the same one
-# with a config line quietly wrong underneath it.
+# Never dies and prints nothing; it returns what was OBSERVED, and the caller —
+# the only one who knows what it restarted before getting here — composes the
+# message (`pg_restore_tail`):
+#
+#   0  postgresql.conf names $2 and the cluster is confirmed listening there
+#      (it already was, or the restart here brought it)
+#   1  postgresql.conf names $2, the cluster WAS restarted here and did NOT
+#      come up on $2 — PostgreSQL is down
+#   2  postgresql.conf names $2, but `ss` could not be asked BEFORE any restart
+#      here, so none was issued: a restart on a non-fact is exactly the outage
+#      this function exists to avoid. Where the cluster listens is UNKNOWN
+#   3  $2 is not a usable port: nothing was written and nothing restarted
+#   4  postgresql.conf names $2, the cluster WAS restarted here, and whether it
+#      came up is UNKNOWN (`ss` failed after the restart)
+#
+# 2 and 4 are different facts about the host ("not restarted" and "restarted,
+# unknown"); a die() that says "the cluster was NOT restarted" right after a
+# `systemctl restart` is a sentence about intent, not effect.
+#
+# The first probe runs BEFORE the config write: for 3 the old order had already
+# written a `port = 70000` that PostgreSQL refuses to start on.
 #
 # The restart itself is skipped, not the config write, when restore_port is
 # already confirmed listening: when the port this run was actually asked
@@ -1509,7 +1595,9 @@ PG_LISTEN_TIMEOUT_S=15
 # see below — because that mismatch is possible independently of whether
 # the cluster itself ever moved.
 pg_restore_to() {
-    local pgconf="$1" restore_port="$2" timeout="$3"
+    local pgconf="$1" restore_port="$2" timeout="$3" rc=0
+    pg_wait_listening "$restore_port" 1 || rc=$?
+    (( rc == 3 )) && return 3
     # The config write happens regardless of what is already listening: a
     # cluster that never left restore_port does not excuse postgresql.conf
     # still naming the port this run tried and failed on — that mismatch is
@@ -1521,9 +1609,53 @@ pg_restore_to() {
     # confirmed listening on restore_port, so a stranger holding the
     # explicitly requested port (which pg_ensure_listening's primary path
     # never restarts for) does not cost a second restart here for nothing.
-    pg_wait_listening "$restore_port" 1 && return 0
+    (( rc == 0 )) && return 0
+    # 2 is "could not look", not "not there", and it is the one answer that must
+    # not lead to a restart.
+    (( rc == 2 )) && return 2
     systemctl restart postgresql >/dev/null 2>&1 || true
-    pg_wait_listening "$restore_port" "$timeout"
+    rc=0
+    pg_wait_listening "$restore_port" "$timeout" || rc=$?
+    # Only 0 and 1 are observations. Anything else, including a 3 that cannot
+    # happen (the probe above judged this same argument), is "restarted and
+    # unknown" rather than "restarted and down".
+    case $rc in
+        0) return 0 ;;
+        1) return 1 ;;
+        *) return 4 ;;
+    esac
+}
+
+# The tail of a die() after `pg_restore_to`, composed from what it returned and
+# from what postgresql.conf says AFTER the attempt (read back, not assumed).
+# A global, not stdout, for the reason PG_RESOLVED_PORT documents.
+PG_RESTORE_TAIL=""
+pg_restore_tail() {
+    local pgconf="$1" restore_port="$2" timeout="$3" rc=0
+    pg_restore_to "$pgconf" "$restore_port" "$timeout" || rc=$?
+    local now; now="$(pg_configured_port "$pgconf")"
+    local jt="Inspect:  journalctl -u postgresql -n 50 --no-pager"
+    local st="Inspect:  systemctl status postgresql ; ss -tlnp"
+    case $rc in
+        0) PG_RESTORE_TAIL="postgresql.conf names ${now} and the running cluster is \
+confirmed back on the previous port ${restore_port}. ${jt}" ;;
+        1) PG_RESTORE_TAIL="postgresql.conf names ${now} and the cluster WAS restarted \
+onto it, but it did NOT come up there — PostgreSQL is DOWN. Inspect immediately:  \
+journalctl -u postgresql -n 50 --no-pager" ;;
+        2) PG_RESTORE_TAIL="postgresql.conf names ${now}, but whether the cluster \
+listens there could not be determined: ss could not be asked. The restore issued NO \
+restart, so the cluster is wherever the steps above left it. UNKNOWN, not fine. ${st}" ;;
+        3) PG_RESTORE_TAIL="the previous port '${restore_port}' is not a usable port \
+(1-65535, ASCII digits only, no leading zero), so there is nothing to put the cluster \
+back on: the restore wrote nothing and restarted nothing. postgresql.conf names \
+${now}. Fix that port line by hand. ${jt}" ;;
+        4) PG_RESTORE_TAIL="postgresql.conf names ${now} and the cluster WAS restarted \
+onto it, but whether it came up there could not be determined: ss could not be asked. \
+UNKNOWN, not fine. ${st}" ;;
+        *) PG_RESTORE_TAIL="internal: pg_restore_to returned ${rc}, which nothing here \
+knows how to describe; postgresql.conf names ${now} and nothing about the cluster was \
+established. ${jt}" ;;
+    esac
 }
 
 # Makes PostgreSQL actually listen on $2 (config dir $1), or dies with a
@@ -1554,20 +1686,43 @@ pg_restore_to() {
 # us or a stranger, bound to it — because that is the one situation a restart
 # can fix. A port a stranger already holds stays held through a restart; that
 # case is handled further down by moving off it instead.
+#
+# "Free" and "held" are OBSERVATIONS of `ss`, and there is a third answer,
+# unknown (`ss` could not be asked; the port is not a port). Every probe below
+# goes through `pg_probe_or_die`, which stops on it: unknown is neither a reason
+# to restart a database nor a reason to move one. `port_free` and
+# `pg_wait_listening` are never used as a bare `if` here — that would read
+# unknown as "not listening yet" and the next line is a restart.
 pg_ensure_listening() {
     local pgconf="$1" port="$2" explicit="${3:-}" timeout="${4:-$PG_LISTEN_TIMEOUT_S}" \
           restore_port="${5:-}"
     PG_RESOLVED_PORT=""
 
+    # 1 once THIS function has issued `systemctl restart`. It only changes what
+    # the unknown-case message may say and whether the config line is put back
+    # (see pg_probe_or_die); it is set the line after the restart, not before.
+    local restarted=0 wrc=0 prc=0
+
     systemctl enable --now postgresql >/dev/null 2>&1 || true
-    if pg_wait_listening "$port" "$timeout"; then
+    pg_wait_listening "$port" "$timeout" || wrc=$?
+    pg_probe_or_die "$wrc" "$port" "$pgconf" "$restore_port" "$restarted"
+    if (( wrc == 0 )); then
         PG_RESOLVED_PORT="$port"
         return 0
     fi
 
-    if port_free "$port"; then
+    # Measured again, not inferred from the poll above: pg_wait_listening says
+    # "not ours or not there", which is two different situations, and the one
+    # that justifies a restart is "nobody holds it".
+    port_free "$port" || prc=$?
+    pg_probe_or_die "$prc" "$port" "$pgconf" "$restore_port" "$restarted"
+    if (( prc == 0 )); then
         systemctl restart postgresql >/dev/null 2>&1 || true
-        if pg_wait_listening "$port" "$timeout"; then
+        restarted=1
+        wrc=0
+        pg_wait_listening "$port" "$timeout" || wrc=$?
+        pg_probe_or_die "$wrc" "$port" "$pgconf" "$restore_port" "$restarted"
+        if (( wrc == 0 )); then
             PG_RESOLVED_PORT="$port"
             return 0
         fi
@@ -1583,18 +1738,19 @@ pg_ensure_listening() {
         # DOWN just because the config line looks right again.
         local tail="Inspect:  journalctl -u postgresql -n 50 --no-pager"
         if [[ -n "$restore_port" ]]; then
-            if pg_restore_to "$pgconf" "$restore_port" "$timeout"; then
-                tail="postgresql.conf and the running cluster are both back on the \
-previous port ${restore_port}. ${tail}"
-            else
-                tail="restoring postgresql.conf to the previous port ${restore_port} did \
-NOT bring the cluster back up — PostgreSQL is DOWN. Inspect immediately:  \
-journalctl -u postgresql -n 50 --no-pager"
-            fi
+            pg_restore_tail "$pgconf" "$restore_port" "$timeout"
+            tail="$PG_RESTORE_TAIL"
         fi
         die "PostgreSQL did not come up listening on --db-port ${port}. ${tail}"
     fi
-    if port_free "$port"; then
+    # Measured again: the poll above ran for $timeout seconds and can have been
+    # overtaken. "Free, so the service is broken", "could not look" and "that is
+    # not a port" are three different repairs. This is the probe whose unknown
+    # used to fall straight into the move below.
+    prc=0
+    port_free "$port" || prc=$?
+    pg_probe_or_die "$prc" "$port" "$pgconf" "$restore_port" "$restarted"
+    if (( prc == 0 )); then
         die "PostgreSQL service did not start, and port ${port} is free — \
 this is not a port conflict. Inspect:  journalctl -u postgresql -n 50 --no-pager"
     fi
@@ -1603,24 +1759,33 @@ this is not a port conflict. Inspect:  journalctl -u postgresql -n 50 --no-pager
     warn "port ${port} is held by ${occupant:-something else}, not this \
 PostgreSQL cluster. Moving Sentinel's cluster to a free port instead of \
 connecting to whatever that is."
-    local new_port; new_port="$(pg_pick_free_port "$port")" || \
-        die "no free port found near ${port} for PostgreSQL"
+    local new_port pick_rc=0
+    new_port="$(pg_pick_free_port "$port")" || pick_rc=$?
+    case $pick_rc in
+        0) ;;
+        1) die "no free port found near ${port} for PostgreSQL" ;;
+        3) die "the search for a free port from ${port} ran past the end of the port \
+range (65535). Nothing was moved; postgresql.conf names $(pg_configured_port "$pgconf"). \
+Move PostgreSQL lower with --db-port, or free ${port}." ;;
+        *) die "could not determine which ports near ${port} are free: ss could not be \
+asked (missing, refused the query, or denied). UNKNOWN, not free. Nothing was moved on a \
+guess; postgresql.conf names $(pg_configured_port "$pgconf"). Run  ss -tlnH  by hand to \
+see why." ;;
+    esac
     pg_set_port "$pgconf" "$new_port"
     systemctl restart postgresql >/dev/null 2>&1 || true
-    if pg_wait_listening "$new_port" "$timeout"; then
+    restarted=1
+    wrc=0
+    pg_wait_listening "$new_port" "$timeout" || wrc=$?
+    pg_probe_or_die "$wrc" "$new_port" "$pgconf" "" "$restarted"
+    if (( wrc == 0 )); then
         PG_RESOLVED_PORT="$new_port"
         return 0
     fi
     local tail="Inspect:  journalctl -u postgresql -n 50 --no-pager"
     if [[ -n "$restore_port" ]]; then
-        if pg_restore_to "$pgconf" "$restore_port" "$timeout"; then
-            tail="postgresql.conf and the running cluster are both back on the \
-previous port ${restore_port}. ${tail}"
-        else
-            tail="restoring postgresql.conf to the previous port ${restore_port} did NOT \
-bring the cluster back up — PostgreSQL is DOWN. Inspect immediately:  \
-journalctl -u postgresql -n 50 --no-pager"
-        fi
+        pg_restore_tail "$pgconf" "$restore_port" "$timeout"
+        tail="$PG_RESTORE_TAIL"
     fi
     die "PostgreSQL still not listening on ${new_port} after moving off \
 the conflicting port ${occupant:-unknown}. ${tail}"
@@ -3776,7 +3941,18 @@ step_nginx() {
     # 20, before the package install. It is also what settles the question the
     # previous writer left open — whether sites-enabled/default is ours to
     # remove. It is, on exactly the hosts where we are the ones who put it there.
-    if ! port_free 80 && [[ "${NGINX_WAS_PREEXISTING:-0}" != "1" ]]; then
+    #
+    # Probed ONCE, and read as three answers. `! port_free 80` read a broken `ss`
+    # as "port 80 is held" and went on to take nginx's own :80 listener out of
+    # service on the strength of it: a real config edit on somebody's host,
+    # decided by a non-fact (and a second `! port_free 80` below could disagree
+    # with the first). Held is `== 1`, and ONLY that edits anything. Unknown
+    # touches nothing and says so; if :80 really is taken, `systemctl enable
+    # --now nginx` further down fails loudly on the bind, which is a stop and
+    # not a silent success.
+    local port80_probe=0
+    port_free 80 || port80_probe=$?
+    if (( port80_probe == 1 )) && [[ "${NGINX_WAS_PREEXISTING:-0}" != "1" ]]; then
         local owner80 default_site undo
         owner80="$(port_owner 80)"
         default_site="$(nginx_default_site)"
@@ -3811,10 +3987,16 @@ the port. Find the block with:
             2) warn "nginx would not dump its effective configuration, so whether \
 :80 was released is UNKNOWN — not 'fine'. Check by hand: nginx -T" ;;
         esac
-    elif ! port_free 80; then
+    elif (( port80_probe == 1 )); then
         warn "port 80 is in use and nginx was already installed here. Not touching \
 nginx.conf — it is yours. If nginx fails to start, a server block in it is \
 competing for :80."
+    elif (( port80_probe != 0 )); then
+        warn "whether port 80 is held could not be determined (port_free answered \
+${port80_probe}; 2 means ss could not be asked). UNKNOWN, not free and not held: NOT \
+touching nginx's own :80 listener on an unmeasured port. Run  ss -tlnH 'sport = :80'  \
+by hand to see why. If nginx then fails to start, a server block competing for :80 is \
+the first thing to look at."
     fi
 
     # Measured BEFORE our own files are rewritten, and with BOTH of our own

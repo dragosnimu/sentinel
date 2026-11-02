@@ -641,9 +641,98 @@ install_config() {
     warn "    diff -u ${dst} ${dst}.new"
 }
 
+# Is $1 a port number in the one spelling `ss` answers honestly for?
+#
+# 1-65535, ASCII digits, no leading zero. This is its own function because two
+# places need the SAME definition: port_free (below) refuses anything else
+# before it reaches `ss`, and the PostgreSQL recovery code in install.sh refuses
+# to write anything else back into postgresql.conf.
+#
+# LC_ALL=C in a subshell, and acceptance as the whole `&&` chain — the same two
+# measured reasons as `_db_port_is_usable` in install.sh: under a UTF-8 locale
+# `[0-9]` is a collating class that admits fullwidth digits, and an error inside
+# `(( ))` returns 1, which is indistinguishable from a clean false. Here a
+# false is the SAFE answer, so the error cannot hurt in either direction; it is
+# written the same way anyway so that this and its sibling do not drift apart.
+# The length is bounded by the regex BEFORE `10#` sees the value: a 20-digit
+# string wraps the 64-bit arithmetic and was measured to evaluate to 5432.
+port_is_canonical() {
+    local v="${1:-}"
+    ( LC_ALL=C
+      [[ "$v" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$v <= 65535 )) )
+}
+
+# Is $1 free? Three observations, and the third is not a kind of "free":
+#
+#   0  free     — `ss` ran, exited 0 for tcp AND for udp, and printed nothing
+#   1  held     — `ss` printed a listening socket
+#   2  unknown  — `ss` could not be asked: missing, refused the query, denied
+#   3  unknown  — the ARGUMENT is not a canonical port (see port_is_canonical);
+#                 `ss` was not invoked, so nothing at all was observed
+#
+# THE RULE FOR EVERY CALLER: free is `== 0`, held is `== 1`, and EVERYTHING ELSE
+# is unknown. Never `!= 0` for held, never `== 2 || == 3` for unknown — the
+# first reads a failure to ask as "someone holds it", the second lets a future
+# code 4 (or a 127 from a missing function) fall through to "free". Unknown is
+# not free and it is not held; a caller that cannot tell has to stop or leave
+# things exactly as they are, and say so. Both 2 and 3 are unknown; they differ
+# only so that the message can name the right repair (below).
+#
+# The old body was
+#
+#     ! ss -tlnH "sport = :$1" 2>/dev/null | grep -q . \
+#         && ! ss -ulnH "sport = :$1" 2>/dev/null | grep -q .
+#
+# The exit status of a pipeline is the last command's, so a missing `ss` (127),
+# one that refused the argument (1) or one denied by policy reached `grep -q .`
+# with no input — and no input is exactly what "free" looks like. The error
+# went to /dev/null and the rc went into the pipe. Callers restart PostgreSQL,
+# take nginx's own :80 listener out of service and pass a preflight on the
+# strength of that answer. Reproduced against the body above with a stub `ss`
+# that exits 1: verdict "free".
+#
+# The rc is captured separately from the output, never through a pipe.
+#
+# Why 3 exists, and why the argument is checked before `ss` is asked: `ss` does
+# not refuse everything a caller can get wrong. Measured on the production host
+# (iproute2-6.17.0, read only):
+#
+#   sport = :5432    rc 0, one LISTEN line   — a real cluster
+#   sport = :05432   rc 0, ZERO lines        — a zero-padded port matches
+#                                              nothing, silently
+#   sport = :        rc 0, EVERY listening socket
+#   sport = :65536   rc 0, zero lines        — "free" for a non-port
+#   sport = :abc     rc 1, "does not look like a port"
+#
+# The first reachable one is `05432`: `pg_configured_port` (lib/distro.sh)
+# returns whatever digits postgresql.conf has, verbatim, so a hand-edited
+# `port = 05432` reaches port_free as an argument and `ss` answers "nothing
+# there" about a port PostgreSQL is serving. Only the last row is honest on its
+# own. NOT re-measured from the machine this was written on (no `ss` there);
+# the figures are the ones recorded with the earlier fix for this defect.
+#
+# 2 and 3 are two codes because merging them produced a measured misdiagnosis:
+# a `port = 70000` in postgresql.conf was reported as "ss failed or is missing
+# — install iproute2" on a host whose iproute2 was fine. A value that is not a
+# port is a fact about the value; a failure to ask is a fact about the tooling.
+#
+# `ss`'s own stderr still goes to /dev/null, and that is not the bug being
+# fixed: pg_wait_listening calls this once a second for up to fifteen seconds,
+# so surfacing it here would print the same line fifteen times. The fact
+# travels as the rc, and every caller that acts on 2 tells the operator the
+# command to run by hand, which shows the real message once.
 port_free() {
-    ! ss -tlnH "sport = :$1" 2>/dev/null | grep -q . \
-        && ! ss -ulnH "sport = :$1" 2>/dev/null | grep -q .
+    # ${1:-}, not $1: with no argument at all, `set -u` would abort the whole
+    # installer instead of answering 3, the one answer a missing argument can
+    # honestly get.
+    local port="${1:-}" out
+    port_is_canonical "$port" || return 3
+
+    out="$(ss -tlnH "sport = :${port}" 2>/dev/null)" || return 2
+    [[ -n "$out" ]] && return 1
+    out="$(ss -ulnH "sport = :${port}" 2>/dev/null)" || return 2
+    [[ -n "$out" ]] && return 1
+    return 0
 }
 
 port_owner() {
@@ -696,10 +785,26 @@ pg_port_owned_by_postgres() {
 # not merely "not free" — a systemctl exit code of 0 is not proof the server
 # came up, and an occupied port is not proof it is ours. See CLAUDE.md: an
 # exit code is not evidence of effect.
+#
+# 0 listening and ours, 1 the timeout expired without it, 2 or 3 when port_free
+# could not answer (2 `ss` could not be asked, 3 the argument is not a port).
+# 2 and 3 come back AT ONCE and are never folded into 1: fifteen polls of a
+# non-answer end in "PostgreSQL never came up", a claim about the database made
+# out of a fact about something else, and the repairs differ ("journalctl",
+# "run ss by hand", "fix the port line"). A port that is not a port cannot
+# become one by waiting, either.
+#
+# Callers MUST NOT use this as a bare `if pg_wait_listening`: that reads 2 and
+# 3 as "not listening yet", and what follows a "not listening" is a restart.
 pg_wait_listening() {
-    local port="$1" timeout="${2:-15}" waited=0
+    local port="$1" timeout="${2:-15}" waited=0 rc
     while (( waited < timeout )); do
-        if ! port_free "$port" && pg_port_owned_by_postgres "$port"; then
+        rc=0; port_free "$port" || rc=$?
+        if (( rc != 0 && rc != 1 )); then
+            (( rc == 3 )) && return 3
+            return 2
+        fi
+        if (( rc == 1 )) && pg_port_owned_by_postgres "$port"; then
             return 0
         fi
         sleep 1
@@ -712,11 +817,24 @@ pg_wait_listening() {
 # PostgreSQL was configured for turns out to be held by something else — never
 # when the operator gave an explicit --db-port, which is refused outright
 # instead of silently moved.
+#
+# 0 with the port on stdout, 1 nothing free in the window, 2 `ss` could not be
+# asked, 3 a candidate was not a port (the scan ran past 65535). A candidate
+# whose freeness is UNKNOWN is never picked and never skipped over either:
+# twenty probes that all answer "unknown" followed by "no free port found
+# near N" would be a search that never happened, so it stops at the first.
 pg_pick_free_port() {
-    local start="$1" candidate tries=0
+    local start="$1" candidate tries=0 rc
     candidate=$((start + 1))
     while (( tries < 20 )); do
-        port_free "$candidate" && { printf '%s\n' "$candidate"; return 0; }
+        rc=0; port_free "$candidate" || rc=$?
+        case $rc in
+            0) printf '%s
+' "$candidate"; return 0 ;;
+            1) ;;
+            3) return 3 ;;
+            *) return 2 ;;
+        esac
         candidate=$((candidate + 1))
         tries=$((tries + 1))
     done
