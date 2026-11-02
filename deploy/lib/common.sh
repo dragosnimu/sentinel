@@ -648,18 +648,18 @@ install_config() {
 # before it reaches `ss`, and the PostgreSQL recovery code in install.sh refuses
 # to write anything else back into postgresql.conf.
 #
-# LC_ALL=C in a subshell, and acceptance as the whole `&&` chain — the same two
-# measured reasons as `_db_port_is_usable` in install.sh: under a UTF-8 locale
-# `[0-9]` is a collating class that admits fullwidth digits, and an error inside
-# `(( ))` returns 1, which is indistinguishable from a clean false. Here a
-# false is the SAFE answer, so the error cannot hurt in either direction; it is
-# written the same way anyway so that this and its sibling do not drift apart.
-# The length is bounded by the regex BEFORE `10#` sees the value: a 20-digit
-# string wraps the 64-bit arithmetic and was measured to evaluate to 5432.
+# Acceptance is the WHOLE `&&` chain: the regex AND a clean arithmetic compare.
+# Anything that makes either step misbehave lands on "not canonical" (3, fail
+# closed), never on "canonical": if a locale let `[0-9]` admit non-ASCII digits,
+# `10#` would ERROR on them, and an error inside `(( ))` returns 1, which is the
+# same as a clean false here. There is no `LC_ALL=C` and no subshell on purpose:
+# neither would change a verdict this function can give, and a line no test can
+# show doing work is a line that only looks like a defence. The length is
+# bounded by the regex BEFORE `10#` sees the value: a 20-digit string wraps the
+# 64-bit arithmetic and was measured to evaluate to 5432.
 port_is_canonical() {
     local v="${1:-}"
-    ( LC_ALL=C
-      [[ "$v" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$v <= 65535 )) )
+    [[ "$v" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$v <= 65535 ))
 }
 
 # Is $1 free? Three observations, and the third is not a kind of "free":

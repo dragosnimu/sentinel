@@ -225,6 +225,32 @@ def test_a_listening_tcp_socket_is_reported_held(tmp_path):
     assert calls.strip()
 
 
+def test_a_tcp_only_listener_is_held_even_when_the_udp_query_is_empty(tmp_path):
+    """Un serviciu care ține portul DOAR pe tcp (cazul PostgreSQL) cu o
+    interogare udp goală: «ocupat» vine din tcp, nu din întâmplarea că ambele
+    interogări tipăresc la fel. Dacă verdictul tcp s-ar pierde, un cluster
+    care ascultă ar fi raportat liber și repornit."""
+    rc, _ = _port_free_rc(
+        tmp_path, "5432",
+        'case "$1" in\n'
+        f'  -tlnH) printf "%s\\n" "{SS_LISTEN_LINE}" ;;\n'
+        'esac\nexit 0\n')
+    assert rc == 1, f"rc={rc} — un listener tcp a fost raportat ca port liber"
+
+
+def test_a_failing_tcp_query_is_unknown_even_when_udp_would_have_been_empty(tmp_path):
+    """Oglinda testului pentru udp: tcp eșuează, udp ar fi răspuns «nimic».
+    «Liber» ar fi o afirmație despre tcp — singurul protocol pe care PostgreSQL
+    îl folosește — pe care nimeni n-a verificat-o. Se întoarce 2 înainte ca udp
+    să mai fie întrebat."""
+    rc, _ = _port_free_rc(
+        tmp_path, "5432",
+        'case "$1" in\n'
+        f'  -tlnH) printf "%s\\n" \'{SS_BAD_PORT_ERR}\' >&2; exit 1 ;;\n'
+        'esac\nexit 0\n')
+    assert rc == 2, f"rc={rc} — tcp a eșuat și răspunsul a fost totuși «liber»"
+
+
 def test_silence_from_a_working_ss_is_free(tmp_path):
     """Și cealaltă contra-probă: `ss` a rulat, a ieșit cu 0 și n-a tipărit
     nimic — singurul caz în care «liber» e o măsurătoare. Fără el, fiecare port
