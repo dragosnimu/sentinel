@@ -3951,9 +3951,10 @@ step_nginx() {
     # service on the strength of it: a real config edit on somebody's host,
     # decided by a non-fact (and a second `! port_free 80` below could disagree
     # with the first). Held is `== 1`, and ONLY that edits anything. Unknown
-    # touches nothing and says so; if :80 really is taken, `systemctl enable
-    # --now nginx` further down fails loudly on the bind, which is a stop and
-    # not a silent success.
+    # touches nothing and says so. The price, if :80 really is taken, is that
+    # nginx may fail to start further down; the `systemctl enable --now nginx`
+    # there is what would report it (not exercised from here: no nginx on the
+    # machine this was written on).
     local port80_probe=0
     port_free 80 || port80_probe=$?
     if (( port80_probe == 1 )) && [[ "${NGINX_WAS_PREEXISTING:-0}" != "1" ]]; then

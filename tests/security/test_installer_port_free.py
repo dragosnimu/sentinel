@@ -174,7 +174,7 @@ def _port_free_rc(tmp_path: Path, argument: str, ss_body: str,
     else:
         proc = _run(script, tmp_path, extra_path=binpath)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    line = next(l for l in proc.stdout.splitlines() if l.startswith("RC="))
+    line = next(ln for ln in proc.stdout.splitlines() if ln.startswith("RC="))
     return int(line.split("=")[1]), calls.read_text(encoding="utf-8")
 
 
@@ -280,7 +280,7 @@ def test_a_udp_only_listener_still_counts_as_held(tmp_path):
     "0",                       # nu e un port
     "65536",                   # «liber» fals pentru un ne-port (măsurat anterior)
     "5432x",
-    "５４３２",                 # cifre fullwidth — trec de `[0-9]` sub UTF-8
+    chr(0xFF15) + chr(0xFF14) + chr(0xFF13) + chr(0xFF12),  # cifre fullwidth (U+FF12..U+FF15)
     "18446744073709557048",    # 20 de cifre: `(( ))` îl evaluează la 5432
 ])
 def test_a_non_canonical_port_answers_3_and_never_reaches_ss(tmp_path, argument):
@@ -394,8 +394,8 @@ def test_every_probe_in_pg_ensure_listening_goes_through_pg_probe_or_die():
 
     Sondele sunt cele cu `|| wrc=$?` / `|| prc=$?`; rândul următor de cod
     trebuie să fie apelul, cu aceeași variabilă."""
-    lines = [l for l in _ensure_body().splitlines() if not l.lstrip().startswith("#")]
-    probes = [i for i, l in enumerate(lines) if re.search(r"\|\|\s*(wrc|prc)=\$\?", l)]
+    lines = [ln for ln in _ensure_body().splitlines() if not ln.lstrip().startswith("#")]
+    probes = [i for i, ln in enumerate(lines) if re.search(r"\|\|\s*(wrc|prc)=\$\?", ln)]
     assert len(probes) == 5, f"{len(probes)} sonde, nu 5 — enumerarea sau funcția s-a schimbat"
     for i in probes:
         var = re.search(r"\|\|\s*(wrc|prc)=\$\?", lines[i]).group(1)
@@ -444,8 +444,8 @@ def _call(tmp_path: Path, ss_body: str, call: str, pre: str = "") -> tuple[int, 
         tmp_path, extra_path=binpath)
     elapsed = time.monotonic() - started
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    rc = int(next(l for l in proc.stdout.splitlines() if l.startswith("RC=")).split("=")[1])
-    out = next(l for l in proc.stdout.splitlines() if l.startswith("OUT="))[4:]
+    rc = int(next(ln for ln in proc.stdout.splitlines() if ln.startswith("RC=")).split("=")[1])
+    out = next(ln for ln in proc.stdout.splitlines() if ln.startswith("OUT="))[4:]
     return rc, out, elapsed
 
 
@@ -571,13 +571,13 @@ def _ensure(tmp_path: Path, plan: str, *, port: str = "5432", explicit: str = ""
         'printf "RESOLVED=%s\\n" "$PG_RESOLVED_PORT"\n'
     )
     proc = _run(script, tmp_path, extra_path=binpath)
-    sysc = [l for l in calls.read_text(encoding="utf-8").splitlines() if l]
+    sysc = [ln for ln in calls.read_text(encoding="utf-8").splitlines() if ln]
     conf = (pgconf / "postgresql.conf").read_text(encoding="utf-8")
     return proc, sysc, conf
 
 
 def _restarts(sysc: list[str]) -> int:
-    return sum(1 for l in sysc if l.startswith("restart"))
+    return sum(1 for ln in sysc if ln.startswith("restart"))
 
 
 def test_a_broken_ss_stops_pg_ensure_listening_before_it_restarts_anything(tmp_path):
@@ -624,7 +624,7 @@ def test_unknown_after_the_restart_says_the_database_was_restarted(tmp_path):
     «nu s-a repornit nimic»: operatorul ar crede că baza e neatinsă. Mesajul
     spune că a fost repornită o dată și că dacă a revenit e NECUNOSCUT, iar
     configurația nu e «pusă la loc» (clusterul a urmat fișierul)."""
-    proc, sysc, conf = _ensure(tmp_path, "E E F")
+    proc, sysc, _conf = _ensure(tmp_path, "E E F")
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, out
     assert _restarts(sysc) == 1, sysc
@@ -701,7 +701,7 @@ def test_unknown_while_picking_with_the_range_exhausted_names_the_range_not_ss(t
     """De la 65535 în sus nu mai e nimic de scanat. Dacă «a ieșit din interval»
     ar fi spus «ss nu răspunde», operatorul ar căuta un iproute2 stricat pe o
     gazdă sănătoasă, în loc să mute PostgreSQL mai jos."""
-    proc, sysc, conf = _ensure(tmp_path, "H H H", port="65535", conf_port="65535")
+    proc, sysc, _conf = _ensure(tmp_path, "H H H", port="65535", conf_port="65535")
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0 and "ran past the end of the port range" in out, out
     assert "could not determine" not in out and _restarts(sysc) == 0, (out, sysc)
@@ -779,8 +779,8 @@ def _restore_to(tmp_path: Path, plan: str, restore: str, conf_port: str = "5440"
         f'rc=0\npg_restore_to "{pgconf_posix}" "{restore}" 1 || rc=$?\nprintf "RC=%d\\n" "$rc"\n'
     )
     proc = _run(script, tmp_path, extra_path=binpath)
-    rc = int(next(l for l in proc.stdout.splitlines() if l.startswith("RC=")).split("=")[1])
-    sysc = [l for l in calls.read_text(encoding="utf-8").splitlines() if l]
+    rc = int(next(ln for ln in proc.stdout.splitlines() if ln.startswith("RC=")).split("=")[1])
+    sysc = [ln for ln in calls.read_text(encoding="utf-8").splitlines() if ln]
     return rc, sysc, (pgconf / "postgresql.conf").read_text(encoding="utf-8")
 
 
@@ -944,7 +944,7 @@ def _nginx_port80_block() -> str:
     """Blocul LIVRAT din `step_nginx` care decide ce se face cu :80, de la
     `local port80_probe=0` până la `fi` de la patru spații."""
     lines = INSTALL.splitlines()
-    start = next(i for i, l in enumerate(lines) if l == "    local port80_probe=0")
+    start = next(i for i, ln in enumerate(lines) if ln == "    local port80_probe=0")
     end = next(i for i in range(start + 1, len(lines)) if lines[i] == "    fi")
     block = "\n".join(lines[start:end + 1])
     assert "port_free 80" in block and "nginx_disable_default_listener" in block
@@ -1024,7 +1024,7 @@ def _block(text: str, start_line: str, end_line: str, must_contain: str) -> str:
     rulează, iar una goală ar face fiecare test de mai jos să treacă fără să
     verifice nimic."""
     lines = text.splitlines()
-    start = next(i for i, l in enumerate(lines) if l == start_line)
+    start = next(i for i, ln in enumerate(lines) if ln == start_line)
     end = next(i for i in range(start + 1, len(lines)) if lines[i] == end_line)
     block = "\n".join(lines[start:end + 1])
     assert must_contain in block
@@ -1051,7 +1051,7 @@ def _preflight_run(tmp_path: Path, block: str, ss_body: str, pre: str = ""):
     )
     proc = _run(script, tmp_path, extra_path=binpath)
     assert proc.returncode == 0, "blocul s-a oprit sub set -e:\n" + proc.stdout + proc.stderr
-    counts = next(l for l in proc.stdout.splitlines() if l.startswith("COUNTS"))
+    counts = next(ln for ln in proc.stdout.splitlines() if ln.startswith("COUNTS"))
     _, fails, warns = counts.split()
     return int(fails), int(warns), proc.stdout + proc.stderr
 
@@ -1102,7 +1102,7 @@ def test_preflight_80_and_443_are_not_reported_free_when_ss_cannot_look(tmp_path
     """Porturile 80/443 sunt informative (`warn`, nu `fail`), dar «liber» spus
     fără măsurătoare trimite operatorul spre webroot pe un port pe care nu l-a
     văzut nimeni."""
-    fails, warns, out = _preflight_run(tmp_path, _p80_443_block(), SS_FAILS)
+    _fails, warns, out = _preflight_run(tmp_path, _p80_443_block(), SS_FAILS)
     assert warns >= 2 and "NECUNOSCUT" in out, out
     assert "liber" not in out.replace("nu liber", ""), f"a spus «liber» fără măsurătoare: {out}"
 
