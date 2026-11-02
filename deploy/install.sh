@@ -5934,7 +5934,8 @@ client domains it checked) is saved, not restored, as ${VPS_WATCHDOG_DIR}/*${VPS
 — restore it by hand, after reading it."
     fi
     die "the deployment stopped a service that was running before it started. \
-Rolled back. Compare ${STATE_MARKERS}/baseline-services.txt with the current state.${wd_note}"
+Rolled back. Compare ${STATE_MARKERS}/baseline-*.txt with the current state (a \
+dimension with no file there was never measured).${wd_note}"
 }
 
 # --- 39 -------------------------------------------------------------------

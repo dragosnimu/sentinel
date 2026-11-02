@@ -780,6 +780,9 @@ def test_step_39_rolls_back_only_on_a_measured_loss(host):
     assert res.proc.returncode == 1, res.out
     assert "ROLLBACK" in _rollback_calls(host) and "--yes" in _rollback_calls(host)
     assert "Rolled back." in res.out
+    # Dimensiunea pierdută poate fi alta decât serviciile, iar fișierul de servicii poate să nu
+    # existe (nemăsurat): mesajul trimite la toate fișierele, nu la unul care poate lipsi.
+    assert "baseline-*.txt" in res.out and "baseline-services.txt" not in res.out, res.out
 
 
 @pytest.mark.parametrize("verdict", [2, 3, 5, 127, 255])

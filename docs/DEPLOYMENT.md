@@ -472,6 +472,7 @@ informative. Cele mai frecvente:
 | `port 80 is in use` | Altceva ascultă acolo. Află ce cu `ss -tlnp` înainte să presupui că poți lua portul |
 | `DOMAIN does not resolve` | Creează înregistrarea A și așteaptă propagarea |
 | `services … no longer running` | Instalarea a oprit ceva. Rollback automat. Compară cu `baseline-services.txt` înainte să reîncerci |
+| `baseline of … NOT captured` / `could not verify …` | Comanda numită în mesaj (`systemctl`, `ss`, `docker`) n-a putut fi întrebată, la captură sau la verificare. Nu e nici „nu s-a oprit nimic", nici „s-a oprit tot": instalarea **nu** face rollback și **nu** raportează succes. Rulează comanda de mână, repară cauza, apoi rulează din nou deploy-ul (pasul 39 se repetă). Dacă baseline-ul era nefolosibil, pasul 18 îl reia și spune asta — iar o reluare după ce gazda a fost deja modificată dovedește doar că nimic nu se oprește de acum încolo |
 | `CRLF line endings found` | Repo clonat pe Windows fără `.gitattributes` aplicat. Re-clonează |
 
 #### Pasul 3 — Instalarea propriu-zisă
