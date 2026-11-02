@@ -1513,7 +1513,11 @@ PG_LISTEN_TIMEOUT_S=15
 # attempt, not deduced from what was meant.
 pg_probe_or_die() {
     local rc="$1" probed="$2" pgconf="$3" restore_port="${4:-}" restarted="${5:-0}"
-    (( rc == 0 || rc == 1 )) && return 0
+    # A string match, not `(( rc == 0 || rc == 1 ))`: inside (( )) an EMPTY rc
+    # (a probe whose status was never captured) evaluates as 0 — a free
+    # observation — and arithmetic on garbage returns 1, which reads as a
+    # false. Here an empty or non-numeric rc falls through to the die.
+    case "$rc" in 0|1) return 0 ;; esac
 
     local before after conf_note="" state what
     before="$(pg_configured_port "$pgconf")"
@@ -1540,7 +1544,7 @@ whether it is up is UNKNOWN — check that by hand NOW"
 nothing to a running unit) and moved nothing"
     fi
 
-    if (( rc == 3 )); then
+    if [[ "$rc" == 3 ]]; then
         what="port '${probed}' is not a usable port number (1-65535, ASCII digits only, \
 no leading zero), so nothing was measured about it and PostgreSQL cannot be shown to \
 listen on it. If it came from postgresql.conf, fix that port line"
@@ -3992,7 +3996,7 @@ the port. Find the block with:
 nginx.conf — it is yours. If nginx fails to start, a server block in it is \
 competing for :80."
     elif (( port80_probe != 0 )); then
-        warn "whether port 80 is held could not be determined (port_free answered \
+        warn "whether port 80 is held could not be determined (the probe answered \
 ${port80_probe}; 2 means ss could not be asked). UNKNOWN, not free and not held: NOT \
 touching nginx's own :80 listener on an unmeasured port. Run  ss -tlnH 'sport = :80'  \
 by hand to see why. If nginx then fails to start, a server block competing for :80 is \
