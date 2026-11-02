@@ -33,7 +33,7 @@ Ce NU are mediul ăsta:
     producție (2 nov 2026, doar citire): `ss -tlnH` fără antet, `systemctl list-units
     --no-legend --plain` cu UNIT pe prima coloană, `docker ps --format '{{.Names}}'`;
   * „fără docker pe PATH” e simulat prin umbrirea lui `have` (o funcție), NU prin scoaterea
-    binarului: pe o gazdă CI cu docker real, PATH-ul nu poate fi golit fără să dispară și
+    binarului: pe o gazdă cu docker real, PATH-ul nu poate fi golit fără să dispară și
     `sort`/`awk`. Ce se dovedește e DECIZIA luată din `have docker`, nu căutarea în PATH.
 """
 
@@ -463,7 +463,7 @@ def _state_cases() -> list[tuple[str, str, dict, str | None, str]]:
         ("rec-prefix-collision", "services", {"services": "a\n"}, "xservices=measured\n",
          "unrecognised"),
         ("rec-truncated-to-zero-bytes", "services", {"services": "a\n"}, "", "unrecognised"),
-        ("rec-is-a-directory", "services", {"services": "a\n"}, "DIR", "unrecognised"),
+        ("rec-is-a-directory", "services", {"services": "a\n"}, "DIR", "unreadable"),
     ]
 
 
@@ -1154,16 +1154,54 @@ def test_a_record_that_says_measured_while_its_file_is_gone_is_unusable(host):
 
 def test_a_record_that_is_a_dangling_symlink_is_unusable_not_absent(host):
     """Un `baseline-state.txt` care e un link spre nicăieri nu există pentru `-e`, dar nici nu e
-    «lipsă»: cade pe regula veche («are conținut, deci e bun») doar dacă gărzii îi lipsește
-    `-L`. Aici e «necunoscut». (Linkurile simbolice cer drepturi pe Windows; fără ele testul
-    se sare cu motivul spus, nu trece în tăcere.)"""
+    «lipsă»: dacă gărzii îi lipsește `-L`, cade pe regula veche («are conținut, deci e bun») și
+    deploy-ul de după compară cu un baseline despre care nimeni nu știe ce spune. Aici e
+    `unreadable`, adică necunoscut.
+
+    ACEST TEST SE SARE fără dreptul de a crea linkuri simbolice (Windows: `WinError 1314`, iar
+    `ln -s` din git-bash eșuează la fel), deci pe mașina de dezvoltare Windows `-L` NU are
+    observator. În depozit nu există niciun CI care să-l ruleze. A fost rulat doar sub WSL
+    (bash 5.2, pytest într-un director propriu): verde cu `-L`, ROȘU fără el. Pe Windows
+    rămâne neacoperit, și spus."""
     host.legacy(services="sshd.service\n", ports="22\n", containers="web\n")
     try:
         os.symlink(host.tmp / "nowhere", host.state / "baseline-state.txt")
     except (OSError, NotImplementedError) as err:
         pytest.skip(f"nu pot crea un link simbolic pe această mașină: {err}")
     res = host.run('baseline_state "$STATE_MARKERS" services\n')
-    assert res.proc.stdout.strip() == "unrecognised", res.out
+    assert res.proc.returncode == 0 and res.proc.stdout.strip() == "unreadable", res.out
+    assert not re.search(r"^(sed|cat):", res.out, re.M), res.out
+
+
+def test_an_unreadable_record_is_its_own_answer_not_an_abort_and_not_a_bare_error(host):
+    """Un `baseline-state.txt` care există dar nu se poate citi (aici: un DIRECTOR, care merge
+    și pe Windows, spre deosebire de linkul spre nicăieri) făcea `sed` să iasă cu 2, iar sub
+    `set -e -o pipefail` funcția murea ÎNAINTE de orice `echo`: apelul direct nu întorcea niciun
+    răspuns. Pe căile din producție (`$( … )`, `||`) rămânea doar un `sed: can't read …` gol,
+    fără dimensiune și fără consecință. Acum: un cuvânt (`unreadable`, deosebit de «am citit și
+    nu spune nimic»), cod 0, nimic pe stderr."""
+    host.legacy(services="sshd.service\n", ports="22\n", containers="web\n")
+    (host.state / "baseline-state.txt").mkdir()
+    res = host.run('baseline_state "$STATE_MARKERS" services\n')
+    assert res.proc.returncode == 0, res.out
+    assert res.proc.stdout.strip() == "unreadable", res.out
+    assert res.proc.stderr == "", res.out
+
+
+def test_an_unreadable_record_tells_the_operator_which_file_and_why_it_is_unknown(host):
+    """Cuvântul `unreadable` ajunge la operator ca un avertisment care NUMEȘTE fișierul și felurile
+    în care nu se poate citi; nu «unusable (unrecognised)», care ar trimite omul să caute o
+    valoare greșită într-un fișier pe care nimeni nu l-a citit. Verdictul e același (2,
+    necunoscut, un avertisment pe dimensiune, nicio linie de succes), fără `sed:`/`cat:` gol."""
+    host.legacy(services="sshd.service\n", ports="22\n", containers="web\n")
+    (host.state / "baseline-state.txt").mkdir()
+    res = host.assert_()
+    assert res.rc == 2 and res.vars["UNKNOWN"] == "[ services ports containers]", res.out
+    assert res.vars["COUNTS"] == "0 3", res.out
+    assert f"{host.state.as_posix()}/baseline-state.txt exists but cannot be read" in res.out, res.out
+    assert "unrecognised" not in res.out, res.out
+    assert OK_LINE not in res.out, res.out
+    assert not re.search(r"^(sed|cat):", res.out, re.M), res.out
 
 
 def test_a_record_that_cannot_be_written_is_reported_even_when_the_temp_file_exists(host):

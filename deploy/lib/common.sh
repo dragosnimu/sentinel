@@ -1025,13 +1025,29 @@ baseline_measure() {
 #   missing                  no record and no file
 #   inconsistent             the record says measured, the file is not there
 #   unrecognised             a record exists but says nothing usable about DIM
+#   unreadable               a record exists (a directory, a link to nowhere, no
+#                            permission) and could not be read at all
 # Callers: `measured` and `none` are the answers, EVERYTHING ELSE is unknown.
 baseline_state() {
-    local dir="$1" dim="$2" file rec record
+    local dir="$1" dim="$2" file rec record body
     file="${dir}/baseline-${dim}.txt"
     record="${dir}/baseline-state.txt"
     if [[ -e "$record" || -L "$record" ]]; then
-        rec="$(sed -n "s/^${dim}=//p" "$record" | head -n 1)"
+        # Read it first, on its own: `sed` on a dangling link exits 2, and under
+        # `set -e -o pipefail` that aborted this function before any `echo`
+        # (measured under bash 5.2: rc=2, empty stdout), after printing a bare
+        # `sed: can't read ...` that names neither the dimension nor what it
+        # means. "Could not read it" is its own answer, `unreadable`, not
+        # `unrecognised` ("read it, it says nothing about DIM"): both are unknown
+        # to every caller, but the operator must know which file to go and look
+        # at. stderr is dropped here BECAUSE the word carries the reason; the
+        # errno is not carried, and baseline_compare's text names the file and
+        # the ways it fails instead.
+        if ! body="$(cat -- "$record" 2>/dev/null)"; then
+            echo unreadable
+            return 0
+        fi
+        rec="$(printf '%s\n' "$body" | sed -n "s/^${dim}=//p" | head -n 1)"
         case "$rec" in
             measured)   if [[ -f "$file" ]]; then echo measured; else echo inconsistent; fi ;;
             unmeasured) echo unmeasured ;;
@@ -1138,6 +1154,7 @@ baseline_compare() {
         unmeasured)   _baseline_unknown "$dim" "$when" "the baseline of ${dim} could not be taken when it was recorded"; return 2 ;;
         legacy-empty) _baseline_unknown "$dim" "$when" "${file} is empty and has no record: written before records existed, so it cannot be told from a failed capture"; return 2 ;;
         missing)      _baseline_unknown "$dim" "$when" "no baseline of ${dim} was recorded"; return 2 ;;
+        unreadable)   _baseline_unknown "$dim" "$when" "${dir}/baseline-state.txt exists but cannot be read (a directory, a link to nowhere, or no permission)"; return 2 ;;
         *)            _baseline_unknown "$dim" "$when" "the baseline record for ${dim} is unusable (${st})"; return 2 ;;
     esac
 
