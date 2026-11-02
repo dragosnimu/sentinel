@@ -649,11 +649,19 @@ install_config() {
 # to write anything else back into postgresql.conf.
 #
 # Acceptance is the WHOLE `&&` chain: the regex AND a clean arithmetic compare,
-# and the regex ALONE is not enough. Measured on both production hosts (read
-# only): under LC_ALL=en_US.UTF-8, production's actual LANG,
-# `[[ "５４３２" =~ ^[1-9][0-9]{0,4}$ ]]` MATCHES — in a glibc UTF-8 locale
-# `[0-9]` admits fullwidth digits — while under C.UTF-8 it does not. What
-# refuses them is the base-10 conversion: `10#５４３２` ERRORS inside `(( ))`,
+# and the regex ALONE is not enough. Measured on both hosts (read only, glibc
+# 2.34 and 2.39, each fullwidth digit tested on its own): under
+# LC_ALL=en_US.UTF-8 — the AlmaLinux host's actual LANG; the Ubuntu one runs
+# C.UTF-8 — `[[ "５４３２" =~ ^[1-9][0-9]{0,4}$ ]]` MATCHES. A bracket RANGE in
+# a glibc *language* locale is resolved by collation, and a fullwidth digit
+# collates immediately AFTER its ASCII twin, so it falls inside a range whose
+# upper bound is a higher ASCII digit and outside one whose upper bound is its
+# own twin: `[0-9]` admits fullwidth ０ through ８ and refuses ９, `[0-8]`
+# refuses ８, `[1-9]` refuses ０. `[[:digit:]]` admits none of them, and under
+# C.UTF-8, C and POSIX the ranges admit none either. So a test case built from
+# fullwidth ９ shows "no match" and proves nothing about the range — the digit,
+# not the locale, is what that case measured. What actually refuses the ones
+# that DO match is the base-10 conversion: `10#５４３２` ERRORS inside `(( ))`,
 # which returns 1, the same as a clean false, so the chain still answers "not
 # canonical" (rc 1 here, 3 from port_free) on both hosts. Anything that makes
 # either step misbehave lands on "not canonical" (fail closed), never on
