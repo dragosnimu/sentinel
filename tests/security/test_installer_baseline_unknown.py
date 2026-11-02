@@ -495,7 +495,11 @@ def test_baseline_complete_says_when_a_baseline_can_be_compared_against(host):
     """Condiția de la `install.sh` pasul 18 («e nevoie de o capturare nouă?»). Forma de pe
     gazdele de producție (trei fișiere cu conținut, fără înregistrare) e COMPLETĂ: următorul
     deploy nu o re-captură. Una cu servicii goale, una cu o dimensiune «unmeasured» sau lipsă
-    nu e: pasul 18 o reia. «containers=none» e completă."""
+    nu e: pasul 18 o reia. «containers=none» e completă. O înregistrare care e un DIRECTOR
+    (`unreadable`) nu e completă, chiar dacă cele trei fișiere au conținut: dacă lista albă din
+    `baseline_complete` ar primi și `unreadable`, pasul 18 ar sări peste re-capturarea unui
+    baseline necitibil și oprirea ar veni abia la pasul 39; cuvântul nou ar fi apărat la un
+    singur cititor din doi («necunoscutul rămâne necunoscut» în ambele)."""
     cases = {
         "production-shape": (dict(services="a\n", ports="22\n", containers="web\n"), None, True),
         "legacy-services-empty": (dict(services="", ports="22\n", containers="web\n"), None, False),
@@ -509,6 +513,8 @@ def test_baseline_complete_says_when_a_baseline_can_be_compared_against(host):
                                   False),
         "record-containers-none": (dict(services="a\n", ports="22\n"),
                                    "services=measured\nports=measured\ncontainers=none\n", True),
+        "record-is-a-directory": (dict(services="a\n", ports="22\n", containers="web\n"),
+                                  "DIR", False),
     }
     lines = []
     for cid, (files, record, _exp) in cases.items():
@@ -516,7 +522,9 @@ def test_baseline_complete_says_when_a_baseline_can_be_compared_against(host):
         d.mkdir(parents=True)
         for fdim, content in files.items():
             (d / f"baseline-{fdim}.txt").write_text(content, encoding="utf-8", newline="\n")
-        if record is not None:
+        if record == "DIR":
+            (d / "baseline-state.txt").mkdir()
+        elif record is not None:
             (d / "baseline-state.txt").write_text(record, encoding="utf-8", newline="\n")
         lines.append(f'if baseline_complete "{d.as_posix()}"; then echo "{cid}=yes"; '
                      f'else echo "{cid}=no"; fi')
@@ -1200,6 +1208,12 @@ def test_an_unreadable_record_tells_the_operator_which_file_and_why_it_is_unknow
     assert res.vars["COUNTS"] == "0 3", res.out
     assert f"{host.state.as_posix()}/baseline-state.txt exists but cannot be read" in res.out, res.out
     assert "(a directory, a link to nowhere, or no permission)" in res.out, res.out
+    # încadrarea pusă de `_baseline_unknown` (dimensiunea, momentul, comanda de rulat de mână):
+    # fără ea operatorul primește un avertisment fără să știe ce nu s-a putut verifica sau cum
+    # să afle singur, deși verdictul (2) și numărătoarea rămân corecte
+    for dim in DIMS:
+        assert f"could not verify {dim} (after install)" in res.out, (dim, res.out)
+    assert "Run by hand: systemctl list-units" in res.out, res.out
     assert "unrecognised" not in res.out, res.out
     assert OK_LINE not in res.out, res.out
     assert not re.search(r"^(sed|cat):", res.out, re.M), res.out
