@@ -1001,7 +1001,7 @@ baseline_measure() {
         *)
             rm -f "$errf"; BASELINE_WHY="unknown dimension '${dim}'"; return 1 ;;
     esac
-    first="$(head -n 1 "$errf")" || first=""
+    first="$(sed -n 1p "$errf")"
     rm -f "$errf"
     if (( rc != 0 )); then
         BASELINE_WHY="exit ${rc}${first:+: ${first}}"
@@ -1016,7 +1016,6 @@ baseline_measure() {
             containers) printf '%s\n' "$raw" | LC_ALL=C sort -u > "$out" ;;
         esac || { BASELINE_WHY="could not process or write the output"; return 1; }
     fi
-    return 0
 }
 
 # baseline_state DIR DIM — what the baseline on disk is worth. One word:
@@ -1032,7 +1031,7 @@ baseline_state() {
     file="${dir}/baseline-${dim}.txt"
     record="${dir}/baseline-state.txt"
     if [[ -e "$record" || -L "$record" ]]; then
-        rec="$(sed -n "s/^${dim}=//p" "$record" | head -n 1)" || rec=""
+        rec="$(sed -n "s/^${dim}=//p" "$record" | head -n 1)"
         case "$rec" in
             measured)   if [[ -f "$file" ]]; then echo measured; else echo inconsistent; fi ;;
             unmeasured) echo unmeasured ;;
@@ -1102,9 +1101,11 @@ Run it by hand to see why." ;;
         esac
     done
 
-    tmp="$(mktemp "${dir}/.baseline-state.XXXXXX")" || tmp=""
-    if [[ -z "$tmp" ]] || ! printf '%s' "$state" > "$tmp" || ! mv -f "$tmp" "${dir}/baseline-state.txt"; then
-        [[ -z "$tmp" ]] || rm -f "$tmp"
+    tmp=""
+    if ! tmp="$(mktemp "${dir}/.baseline-state.XXXXXX")" \
+       || ! printf '%s' "$state" > "$tmp" \
+       || ! mv -f "$tmp" "${dir}/baseline-state.txt"; then
+        rm -f "$tmp"
         warn "could not write ${dir}/baseline-state.txt. The baseline files stay, but an EMPTY one \
 will be read as unknown, not as 'nothing was running'."
         return 2
@@ -1115,11 +1116,11 @@ will be read as unknown, not as 'nothing was running'."
     return 0
 }
 
-# Say, as a warning, that DIM could not be compared. Always returns 2.
+# Say, as a warning, that DIM could not be compared. The CALLER returns 2: the
+# status is part of baseline_compare's contract, not a side effect of printing.
 _baseline_unknown() {
     warn "could not verify ${1} (${2}): ${3}. That is neither 'nothing was lost' nor 'something was \
 lost'. Run by hand: $(baseline_cmd_text "$1")"
-    return 2
 }
 
 # baseline_compare DIM DIR WHEN
@@ -1162,7 +1163,7 @@ baseline_compare() {
     # "no line left" (1) and "could not run" (2) both vanished into the `true`.
     if [[ "$dim" == services ]]; then
         while IFS= read -r line; do
-            [[ -z "$line" || "$line" == sentinel-* ]] || kept+="${line}"$'\n'
+            [[ "$line" == sentinel-* ]] || kept+="${line}"$'\n'
         done <<< "$lost"
         lost="${kept%$'\n'}"
     fi

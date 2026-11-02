@@ -110,6 +110,8 @@ def test_a_working_ss_still_gives_busy_and_free(tmp_path, ss_body, expected):
     pytest.param("echo 'Error: netlink' >&2\nexit 1\n", "iese 1", id="ss-refuza"),
     pytest.param("echo 'ss: command not found' >&2\nexit 127\n", "lipseste", id="ss-lipseste"),
     pytest.param("exit 0\n", "iese 0 fara nimic", id="ss-tace"),
+    pytest.param(f"cat <<'EOF'\n{HEADER}\n{L80}\nEOF\nexit 1\n",
+                 "tipareste o tabela si iese 1", id="ss-tabela-si-esec"),
 ])
 def test_an_ss_that_could_not_be_asked_is_unknown_not_free(tmp_path, ss_body, why):
     """Reproducerea. `ss | grep -qE` lăsa un `ss` căzut să ajungă la `grep` fără nicio linie —

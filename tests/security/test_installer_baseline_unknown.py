@@ -214,10 +214,10 @@ class Host:
         path = self.state / f"baseline-{dim}.txt"
         return path.read_text(encoding="utf-8") if path.is_file() else None
 
-    def captured(self) -> "Host":
+    def captured(self, **kw) -> "Host":
         """Capturează pe gazda sănătoasă și verifică, ca restul testului să nu stea pe o
         capturare pe care nu s-a uitat nimeni la ea."""
-        res = self.capture()
+        res = self.capture(**kw)
         assert res.rc == 0, res.out
         assert self.record() == "services=measured\nports=measured\ncontainers=measured\n", res.out
         return self
@@ -366,6 +366,8 @@ def test_a_failed_record_write_is_reported_and_celebrated_nowhere(host):
     assert host.record() is None
     assert "could not write" in res.out and "baseline captured" not in res.out, res.out
     assert host.data("services"), "datele măsurate trebuiau să rămână"
+    hidden = sorted(p.name for p in host.state.iterdir() if p.name.startswith("."))
+    assert hidden == [], f"fișier temporar rămas în directorul de stare: {hidden}"
 
 
 def test_a_state_record_that_cannot_even_get_a_temp_file_is_reported_the_same_way(host):
@@ -544,6 +546,7 @@ def test_an_unmeasured_capture_is_never_a_permanent_all_clear(host):
     assert OK_LINE not in res.out, res.out
     assert res.vars["UNKNOWN"] == "[ services ports containers]", res.out
     assert res.vars["COUNTS"].split()[0] == "0", "un necunoscut s-a numărat ca eșec al instalării"
+    assert res.out.count("could not be taken when it was recorded") == 3,         "fiecare dimensiune nemăsurată trebuie să-și spună motivul"
 
 
 @pytest.mark.parametrize("dim", ("services", "ports", "containers"))
@@ -628,6 +631,7 @@ def test_a_measured_loss_is_still_a_loss(host, dim, tweak):
     assert res.vars["UNKNOWN"] == "[]", res.out
     lost = {"services": "nginx.service", "ports": "80", "containers": "db"}[dim]
     assert lost in res.out, res.out
+    assert res.vars["COUNTS"].split()[0] == "1", "o pierdere măsurată trebuie numărată ca eșec"
     assert OK_LINE not in res.out
 
 
@@ -921,7 +925,8 @@ def test_rollback_does_not_print_the_reassuring_line_for_an_unmeasured_baseline(
     assert res.vars.get("RC") == "0", res.out
     assert "could not verify" in res.out and "UNKNOWN" in res.out, res.out
     assert OK_LINE not in res.out, res.out
-    assert res.vars["COUNTS"].split()[0] == "0", res.out
+    assert res.vars["COUNTS"] == "0 2", res.out   # 0 eșecuri; 2 avertismente (dimensiunea + rezumatul)
+    assert "(services: the warnings above say why)" in res.out, res.out
 
 
 def test_rollback_with_no_baseline_at_all_says_it_cannot_verify(host):
@@ -1031,3 +1036,139 @@ def test_the_certbot_hint_keeps_a_named_owner_in_its_own_sentence(host):
         '  *-tlnH*) echo "LISTEN 0 511 0.0.0.0:80 0.0.0.0:*" ;;\nesac\nexit 0\n')
     assert '"httpd",pid=7,fd=4 deține :80' in res.out, res.out
     assert "un proces pe care ss nu l-a putut numi" not in res.out, res.out
+
+
+# ===========================================================================
+# Ramuri care ar fi rămas nesupravegheate (scoase din lista de mutații)
+# ===========================================================================
+def test_the_command_text_refuses_a_dimension_it_does_not_know(host):
+    """Textul comenzii e ce i se spune operatorului să ruleze de mână. Pentru o dimensiune pe
+    care n-o cunoaște nu inventează o comandă: iese 1 și nu tipărește nimic."""
+    res = host.run('rc=0; out="$(baseline_cmd_text bogus)" || rc=$?\n'
+                   'echo "RC=$rc"\necho "OUT=[$out]"\n')
+    assert res.rc == 1 and res.vars["OUT"] == "[]", res.out
+
+
+@pytest.mark.parametrize("scenario", ["healthy", "capture-fails", "verify-fails", "verify-cannot-sort"])
+def test_no_temp_file_is_left_behind(host, scenario):
+    """Fiecare capturare și fiecare comparație își fac fișiere temporare (stderr-ul
+    colectorului, directorul comparației). O verificare rulată o dată pe minut într-un alt
+    context ar umple /tmp; pe calea de eșec, unde curățenia e cel mai ușor de uitat, la fel.
+    TMPDIR e un director al testului, iar la sfârșit trebuie să fie gol."""
+    tmpdir = host.tmp / "tmpdir"
+    tmpdir.mkdir()
+    env = {"TMPDIR": tmpdir.as_posix()}
+    if scenario == "healthy":
+        host.captured(env=env)
+        assert host.assert_(env=env).rc == 0
+    elif scenario == "capture-fails":
+        for dim in DIMS:
+            host.fail(dim)
+        assert host.capture(env=env).rc == 2
+    elif scenario == "verify-fails":
+        host.captured(env=env)
+        host.fail("ports")
+        assert host.assert_(env=env).rc == 2
+    else:
+        host.captured(env=env)
+        host.passthrough("sort", "*baseline-*")
+        assert host.assert_(env=env).rc == 2
+    left = sorted(p.name for p in tmpdir.iterdir())
+    assert left == [], f"{scenario}: fișiere temporare rămase: {left}"
+
+
+def test_a_second_capture_does_not_keep_the_first_ones_file_paths(host):
+    """`BASELINE_SERVICES`/`BASELINE_PORTS` indică fișierele luate. După o a doua capturare în
+    ACELAȘI proces, în care `systemctl` cade, variabila nu mai are voie să arate spre un fișier
+    care nu există."""
+    flag = host.tmp / "fail-services"
+    _stub(host.bin, "systemctl",
+          f'if [ -e "{flag.as_posix()}" ]; then echo boom >&2; exit 1; fi\n'
+          "echo 'sshd.service loaded active running x'\n")
+    res = host.run('capture_baseline > /dev/null\necho "FIRST=$BASELINE_SERVICES"\n'
+                   f'touch "{flag.as_posix()}"\n'
+                   'rc=0; capture_baseline > /dev/null 2>&1 || rc=$?\n'
+                   'echo "SECOND=[$BASELINE_SERVICES]"\necho "RC=$rc"\n')
+    assert res.vars["FIRST"].endswith("baseline-services.txt"), res.out
+    assert res.rc == 2 and res.vars["SECOND"] == "[]", res.out
+
+
+def test_a_padded_line_count_does_not_leak_into_the_success_line(host):
+    """Pe unele sisteme (BSD, macOS) `wc -l` umple numărul cu spații. Linia de succes trebuie să
+    spună «3 services», nu «       3 services»."""
+    _stub(host.bin, "wc", 'PATH="${PATH#*:}"\nn="$(wc "$@")"\necho "      $n"\n')
+    res = host.capture()
+    assert res.rc == 0, res.out
+    assert "baseline captured: 3 services, 2 listening ports, 2 running containers" in res.out, res.out
+
+
+def test_a_second_verdict_does_not_keep_the_first_ones_lists(host):
+    """`BASELINE_UNKNOWN` și `BASELINE_COMPARED` sunt globale. A treia verificare dintr-un proces
+    (după una cu necunoscut) trebuie să le vadă goale / exacte, nu cumulate: altfel pasul 39 ar
+    numi dimensiuni care nu mai sunt necunoscute."""
+    host.captured()
+    flag = host.tmp / "fail-ports"
+    _stub(host.bin, "ss",
+          f'if [ -e "{flag.as_posix()}" ]; then echo boom >&2; exit 1; fi\n'
+          f"cat <<'EOF'\n{PORTS_OUT}\nEOF\n")
+    res = host.run(
+        'assert_nothing_broken one > /dev/null 2>&1\n'
+        f'touch "{flag.as_posix()}"\n'
+        'rc2=0; assert_nothing_broken two > /dev/null 2>&1 || rc2=$?\n'
+        'echo "SECOND_UNKNOWN=[$BASELINE_UNKNOWN]"\n'
+        f'rm -f "{flag.as_posix()}"\n'
+        'rc=0; assert_nothing_broken three > /dev/null 2>&1 || rc=$?\n'
+        'echo "RC=$rc"\necho "RC2=$rc2"\n'
+        'echo "THIRD_UNKNOWN=[$BASELINE_UNKNOWN]"\necho "THIRD_COMPARED=[$BASELINE_COMPARED]"\n')
+    assert res.vars["RC2"] == "2" and res.vars["SECOND_UNKNOWN"] == "[ ports]", res.out
+    assert res.rc == 0, res.out
+    assert res.vars["THIRD_UNKNOWN"] == "[]", res.out
+    assert res.vars["THIRD_COMPARED"] == "[ services ports containers]", res.out
+
+
+def test_a_record_that_says_measured_while_its_file_is_gone_is_unusable(host):
+    """Înregistrarea spune «measured», fișierul a dispărut (șters de mână, disc). Nu e «nimic
+    de comparat» și nu e «nimic pierdut»: e o inconsistență, deci necunoscut."""
+    host.legacy(services="sshd.service\n", ports="22\n")
+    (host.state / "baseline-state.txt").write_text(
+        "services=measured\nports=measured\ncontainers=measured\n", encoding="utf-8", newline="\n")
+    res = host.assert_()
+    assert res.rc == 2 and res.vars["UNKNOWN"] == "[ containers]", res.out
+    assert "unusable (inconsistent)" in res.out, res.out
+
+
+def test_a_record_that_is_a_dangling_symlink_is_unusable_not_absent(host):
+    """Un `baseline-state.txt` care e un link spre nicăieri nu există pentru `-e`, dar nici nu e
+    «lipsă»: cade pe regula veche («are conținut, deci e bun») doar dacă gărzii îi lipsește
+    `-L`. Aici e «necunoscut». (Linkurile simbolice cer drepturi pe Windows; fără ele testul
+    se sare cu motivul spus, nu trece în tăcere.)"""
+    host.legacy(services="sshd.service\n", ports="22\n", containers="web\n")
+    try:
+        os.symlink(host.tmp / "nowhere", host.state / "baseline-state.txt")
+    except (OSError, NotImplementedError) as err:
+        pytest.skip(f"nu pot crea un link simbolic pe această mașină: {err}")
+    res = host.run('baseline_state "$STATE_MARKERS" services\n')
+    assert res.proc.stdout.strip() == "unrecognised", res.out
+
+
+def test_a_record_that_cannot_be_written_is_reported_even_when_the_temp_file_exists(host):
+    """`mktemp` reușește dar scrierea în fișierul temporar eșuează (disc plin, aici: numele e un
+    DIRECTOR, ceea ce eșuează și ca root). O înregistrare trunchiată ar fi mutată la locul ei și
+    citită abia mai târziu; aici se spune imediat: avertisment, 2, nicio linie de succes."""
+    _stub(host.bin, "mktemp",
+          'case "$*" in *baseline-state*) PATH="${PATH#*:}"; exec mktemp -d ;; esac\n'
+          'PATH="${PATH#*:}"\nexec mktemp "$@"\n')
+    res = host.capture()
+    assert res.rc == 2 and host.record() is None, res.out
+    assert "could not write" in res.out and "baseline captured" not in res.out, res.out
+
+
+def test_a_comparison_that_cannot_sort_the_current_state_is_unknown(host):
+    """A doua jumătate a comparației: `sort` pe starea de ACUM. Dacă pică doar el, `comm` ar
+    primi un fișier lipsă/gol și ar raporta tot baseline-ul ca pierdut (direcția B) sau nimic;
+    răspunsul cinstit e «necunoscut»."""
+    host.captured()
+    host.passthrough("sort", "*/now*")
+    res = host.assert_()
+    assert res.rc == 2 and "sort failed" in res.out, res.out
+    assert not re.search(r"no longer running|now closed|have stopped", res.out), res.out
