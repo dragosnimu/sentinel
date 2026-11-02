@@ -1056,7 +1056,8 @@ def test_the_command_text_refuses_a_dimension_it_does_not_know(host):
     assert res.rc == 1 and res.vars["OUT"] == "[]", res.out
 
 
-@pytest.mark.parametrize("scenario", ["healthy", "capture-fails", "verify-fails", "verify-cannot-sort"])
+@pytest.mark.parametrize("scenario", ["healthy", "capture-fails", "verify-fails", "verify-cannot-sort",
+                                      "no-docker", "unknown-dimension"])
 def test_no_temp_file_is_left_behind(host, scenario):
     """Fiecare capturare și fiecare comparație își fac fișiere temporare (stderr-ul
     colectorului, directorul comparației). O verificare rulată o dată pe minut într-un alt
@@ -1076,6 +1077,12 @@ def test_no_temp_file_is_left_behind(host, scenario):
         host.captured(env=env)
         host.fail("ports")
         assert host.assert_(env=env).rc == 2
+    elif scenario == "no-docker":
+        assert host.capture(env=env, no_docker=True).rc == 0
+    elif scenario == "unknown-dimension":
+        res = host.run(f'rc=0; baseline_measure bogus "{host.tmp.as_posix()}/x" || rc=$?\n'
+                       'echo "RC=$rc"\n', env=env)
+        assert res.rc == 1, res.out
     else:
         host.captured(env=env)
         host.passthrough("sort", "*baseline-*")
