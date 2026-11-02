@@ -648,13 +648,18 @@ install_config() {
 # before it reaches `ss`, and the PostgreSQL recovery code in install.sh refuses
 # to write anything else back into postgresql.conf.
 #
-# Acceptance is the WHOLE `&&` chain: the regex AND a clean arithmetic compare.
-# Anything that makes either step misbehave lands on "not canonical" (3, fail
-# closed), never on "canonical": if a locale let `[0-9]` admit non-ASCII digits,
-# `10#` would ERROR on them, and an error inside `(( ))` returns 1, which is the
-# same as a clean false here. There is no `LC_ALL=C` and no subshell on purpose:
-# neither would change a verdict this function can give, and a line no test can
-# show doing work is a line that only looks like a defence. The length is
+# Acceptance is the WHOLE `&&` chain: the regex AND a clean arithmetic compare,
+# and the regex ALONE is not enough. Measured on both production hosts (read
+# only): under LC_ALL=en_US.UTF-8, production's actual LANG,
+# `[[ "５４３２" =~ ^[1-9][0-9]{0,4}$ ]]` MATCHES — in a glibc UTF-8 locale
+# `[0-9]` admits fullwidth digits — while under C.UTF-8 it does not. What
+# refuses them is the base-10 conversion: `10#５４３２` ERRORS inside `(( ))`,
+# which returns 1, the same as a clean false, so the chain still answers "not
+# canonical" (rc 1 here, 3 from port_free) on both hosts. Anything that makes
+# either step misbehave lands on "not canonical" (fail closed), never on
+# "canonical". There is no `LC_ALL=C` and no subshell on purpose: neither would
+# change a verdict this function can give, and a line no test can show doing
+# work is a line that only looks like a defence. The length is
 # bounded by the regex BEFORE `10#` sees the value: a 20-digit string wraps the
 # 64-bit arithmetic and was measured to evaluate to 5432.
 port_is_canonical() {
@@ -829,8 +834,7 @@ pg_pick_free_port() {
     while (( tries < 20 )); do
         rc=0; port_free "$candidate" || rc=$?
         case $rc in
-            0) printf '%s
-' "$candidate"; return 0 ;;
+            0) printf '%s\n' "$candidate"; return 0 ;;
             1) ;;
             3) return 3 ;;
             *) return 2 ;;
