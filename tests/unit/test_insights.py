@@ -1427,9 +1427,12 @@ def test_the_clock_probe_admits_what_it_cannot_count(monkeypatch):
         _citiri_de_ceas("import time\nX = time.gmtime().tm_year", monkeypatch)
     assert "întoarce 0" in str(exc.value), exc.value
     # Eroarea ORIGINALĂ, nu mesajul: acela conține și el „tm_year” (exemplul din
-    # sfat), deci o aserțiune pe `exc.value` ar trece și fără `{exc}` în text.
+    # sfat), deci „tm_year” în `exc.value` ar trece și cu altă sondă, și fără
+    # `{exc}` în text. Două aserțiuni: sonda chiar a dat „tm_year”, iar mesajul
+    # chiar o citează (`__cause__` nu depinde de textul mesajului).
     assert isinstance(exc.value.__cause__, AttributeError), exc.value.__cause__
     assert "tm_year" in str(exc.value.__cause__), exc.value.__cause__
+    assert str(exc.value.__cause__) in str(exc.value), exc.value
     # Fereastra se închide și după o eroare.
     assert time.time() > 1_000_000_000
 
