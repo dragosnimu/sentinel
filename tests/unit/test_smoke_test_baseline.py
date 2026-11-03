@@ -93,6 +93,11 @@ class Fleet:
         self.ports_out = PORTS_NOW
         self.systemctl_rc = 0
         self.ss_rc = 0
+        self.extra: dict[str, str] = {}
+
+    def stub(self, name: str, body: str) -> None:
+        """O momeală în plus pe PATH (instalată ultima, deci umbrește una mai veche)."""
+        self.extra[name] = body
 
     def _install_stubs(self) -> None:
         calls = self.calls.as_posix()
@@ -107,15 +112,24 @@ class Fleet:
               'exec bash -c "${@: -1}"\n')
         _stub(self.bin, "sudo",
               'if [[ -n "${SUDO_REFUSES:-}" ]]; then echo "sudo: a password is required" >&2; exit 1; fi\n'
-              '[[ "$1" == -n ]] && shift\nexec "$@"\n')
-        for name, out, rc, err in (("systemctl", self.services_out, self.systemctl_rc,
-                                    "Failed to connect to bus"),
-                                   ("ss", self.ports_out, self.ss_rc, "ss: netlink error")):
-            body = f"echo {name} >> \"{calls}\"\n"
+              # fără `-n`, un sudo real ar cere parola; fără terminal, eșuează — iar baseline-ul
+              # n-ar mai fi citit. Momeala refuză la fel, ca absența lui `-n` să se vadă.
+              '[[ "$1" == -n ]] || { echo "sudo: a password is required" >&2; exit 1; }\n'
+              'shift\nexec "$@"\n')
+        # Comenzile exacte pe care le cere gazdei: o momeală care răspunde la orice argumente ar
+        # lăsa trecut un `--state=running` căzut, adică o listă cu și serviciile oprite.
+        for name, want, out, rc, err in (
+                ("systemctl", "list-units --type=service --state=running --no-legend --plain",
+                 self.services_out, self.systemctl_rc, "Failed to connect to bus"),
+                ("ss", "-tlnH", self.ports_out, self.ss_rc, "ss: netlink error")):
+            body = (f"echo {name} \"$*\" >> \"{calls}\"\n"
+                    f'[[ "$*" == "{want}" ]] || {{ echo "{name}: argumente neașteptate: $*" >&2; exit 2; }}\n')
             if rc:
                 body += f"echo '{err}' >&2\nexit {rc}\n"
             else:
                 body += f"cat <<'EOF'\n{out}EOF\n"
+            _stub(self.bin, name, body)
+        for name, body in self.extra.items():
             _stub(self.bin, name, body)
 
     def run(self, script: str) -> subprocess.CompletedProcess:
@@ -143,8 +157,13 @@ pass() { PASS=$((PASS+1)); printf 'PASS %s\n' "$*"; }
 fail() { FAIL=$((FAIL+1)); printf 'FAIL %s\n' "$*"; }
 warn() { WARN=$((WARN+1)); printf 'WARN %s\n' "$*"; }
 HOST=h; USER=u; SSH_OPTS=(-p 22)
-REGRESSION_UNMEASURED=""
 """
+
+# Inițializarea LIVRATĂ, nu una scrisă aici: dacă linia dispare din script, `set -u` trebuie să
+# se plângă la sfârșit, iar un harnaș care o pune el însuși ar ascunde exact asta.
+_INIT = re.search(r'^REGRESSION_UNMEASURED=""$', SMOKE, re.M)
+assert _INIT, "inițializarea lui REGRESSION_UNMEASURED nu mai e în smoke-test.sh"
+PRELUDE += _INIT.group(0) + "\n"
 
 
 def _section(fleet: Fleet) -> str:
@@ -235,7 +254,7 @@ def test_an_unanswered_comparison_does_not_end_with_the_green_sentence(fleet):
     Pentru ce n-a putut fi măsurat nu se știe nici asta, nici contrariul."""
     tail_start = SMOKE.rindex("if [[ -n \"$REGRESSION_UNMEASURED\" ]]; then")
     tail = SMOKE[tail_start:]
-    script = (PRELUDE.replace('REGRESSION_UNMEASURED=""', 'REGRESSION_UNMEASURED=" services ports"')
+    script = (PRELUDE + 'REGRESSION_UNMEASURED=" services ports"\n'
               + "_G=''; _R=''; _Y=''; _B=''; _0=''\nWARN=2\n" + tail)
     proc = fleet.run(script)
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -289,6 +308,7 @@ def test_a_missing_ports_baseline_is_a_warning_and_the_services_are_still_compar
     out = _regression(fleet)
     assert out.passes == 1 and out.warns == 1 and out.fails == 0, out.text
     assert "no pre-install baseline of listening ports" in out.lines("WARN")[0], out.text
+    assert out.unmeasured == ["ports"], out.text
     assert any("every service" in ln for ln in out.lines("PASS")), out.text
     assert not any("every port" in ln for ln in out.lines("PASS")), out.text
 
@@ -315,6 +335,7 @@ def test_a_baseline_that_sudo_cannot_read_is_not_reported_as_missing(fleet):
         assert "could not read the pre-install baseline" in warning, warning
         assert "a password is required" in warning, warning
         assert "no pre-install baseline" not in warning, warning
+        assert "Run by hand: sudo cat " in warning, warning
 
 
 def test_an_empty_baseline_compares_nothing_and_says_so(fleet):
@@ -325,6 +346,88 @@ def test_an_empty_baseline_compares_nothing_and_says_so(fleet):
     out = _regression(fleet)
     assert out.passes == 1 and out.warns == 1 and out.unmeasured == ["ports"], out.text
     assert "is empty" in out.lines("WARN")[0] and "0 compared" not in out.text, out.text
+    assert "Check by hand: ss -tlnp" in out.lines("WARN")[0], out.text
+
+
+def test_a_baseline_with_repeated_lines_is_counted_and_compared_once_each(fleet):
+    """Un baseline cu o linie repetată (un fișier editat de mână, două capturi lipite): fără
+    deduplicare, `comm` vede al doilea «22» ca fără pereche în lista de acum și raportează un
+    port care ascultă drept închis, iar numărul «comparate» ar fi umflat."""
+    (fleet.state / "baseline-ports.txt").write_text("22\n22\n80\n", encoding="utf-8", newline="\n")
+    out = _regression(fleet)
+    assert out.fails == 0 and any("(2 compared)" in ln for ln in out.lines("PASS")), out.text
+
+
+@pytest.mark.parametrize("was,now,lost", [
+    ("a-c.service\nab.service\n", "a-c.service loaded active running x\n", "ab.service"),
+    ("a-c.service\nab.service\nzz.service\n",
+     "a-c.service loaded active running x\nab.service loaded active running x\n", "zz.service"),
+])
+def test_the_comparison_does_not_depend_on_the_locale_of_the_machine_running_it(fleet, was, now, lost):
+    """Baseline-ul e scris cu `sort` lexical C (`capture_baseline`). Un `sort` local care ține
+    cont de locale (en_US ignoră punctuația) pune `ab.service` înaintea lui `a-c.service`, iar
+    `comm` — care așteaptă ordinea C — raportează ca pierdut un serviciu care rulează. Momeala
+    pentru `sort` se poartă ca acea colație (`-d`) oricând LC_ALL nu e C, deci un `sort` fără
+    LC_ALL=C pe oricare parte a comparației se vede."""
+    (fleet.state / "baseline-services.txt").write_text(was, encoding="utf-8", newline="\n")
+    fleet.services_out = now
+    fleet.env["LC_ALL"] = "en_US.UTF-8"
+    fleet.stub("sort", 'if [[ "${LC_ALL:-}" != C ]]; then PATH="${PATH#*:}"; exec sort -d "$@"; fi\n'
+                       'PATH="${PATH#*:}"\nexec sort "$@"\n')
+    out = _regression(fleet)
+    fails = out.lines("FAIL")
+    assert len(fails) == 1 and fails[0].split(": ", 1)[1].split() == [lost], out.text
+
+
+# --- ce nu poate fi prelucrat local nu e nici «nimic pierdut», nici «totul pierdut» -----------
+
+def test_a_local_sort_that_fails_on_the_baseline_means_nothing_was_compared(fleet):
+    """Prima prelucrare locală (baseline-ul) cade, a doua nu: `was` ar rămâne gol, iar comparația
+    ar fi pe un baseline inexistent. Se vede numai dacă momeala cade DOAR la primul apel."""
+    counter = (fleet.tmp / "sort.count").as_posix()
+    fleet.stub("sort", f'n=$(( $(cat "{counter}" 2>/dev/null || echo 0) + 1 )); echo "$n" > "{counter}"\n'
+                       '[[ "$n" != 1 ]] || { echo "sort: boom" >&2; exit 2; }\n'
+                       'PATH="${PATH#*:}"\nexec sort "$@"\n')
+    out = _regression(fleet)
+    assert not any("services" in ln for ln in out.lines("PASS") + out.lines("FAIL")), out.text
+    assert any("could not process the services lists locally" in ln for ln in out.lines("WARN")), out.text
+    assert "services" in out.unmeasured and not out.lines("FAIL"), out.text
+
+
+def test_a_local_awk_that_fails_on_the_current_list_means_nothing_was_compared(fleet):
+    """A doua prelucrare locală (lista de acum) cade: `now` gol ar face ca tot baseline-ul să
+    pară pierdut — aceeași pană generală ca la un `ss` căzut, produsă de data asta local."""
+    fleet.stub("awk", 'echo "awk: boom" >&2; exit 2\n')
+    out = _regression(fleet)
+    assert not out.lines("FAIL") and out.passes == 0 and out.warns == 2, out.text
+    assert all("could not process the" in ln for ln in out.lines("WARN")), out.text
+    warns = out.lines("WARN")
+    assert "Run by hand: systemctl --failed" in warns[0] and "Run by hand: ss -tlnp" in warns[1], warns
+    assert out.unmeasured == ["services", "ports"], out.text
+
+
+def test_a_comm_that_fails_means_nothing_was_compared(fleet):
+    """`comm` iese cu eroare (ordine greșită, resursă lipsă): ieșirea lui goală nu e «nimic
+    pierdut». Înainte, `|| true` o făcea PASS."""
+    fleet.stub("comm", 'echo "comm: file 1 is not in sorted order" >&2; exit 1\n')
+    out = _regression(fleet)
+    assert out.passes == 0 and out.warns == 2 and not out.lines("FAIL"), out.text
+    assert all("comm failed (exit 1)" in ln for ln in out.lines("WARN")), out.text
+    warns = out.lines("WARN")
+    assert "Run by hand: systemctl --failed" in warns[0] and "Run by hand: ss -tlnp" in warns[1], warns
+    assert out.unmeasured == ["services", "ports"], out.text
+
+
+def test_an_unknown_dimension_is_a_failure_not_a_silent_skip(fleet):
+    """Un apel cu un nume de dimensiune greșit (o tastare în script) n-ar compara nimic și n-ar
+    spune nimic: secțiunea ar arăta mai scurtă și la fel de verde. Aici cade zgomotos."""
+    script = (PRELUDE + _function("measure_remote") + "\n" + _function("baseline_lines") + "\n"
+              + _function("compare_baseline_dim") + '\ncompare_baseline_dim bogus "/nu/conteaza"\n'
+              'printf "CONTOARE %s %s %s\\n" "$PASS" "$WARN" "$FAIL"\n'
+              'printf "NEMASURAT [%s]\\n" "$REGRESSION_UNMEASURED"\n')
+    out = Out(fleet.run(script))
+    assert out.fails == 1 and "unknown dimension 'bogus'" in out.lines("FAIL")[0], out.text
+    assert "ssh" not in fleet.calls_text(), "o dimensiune necunoscută nu are de ce să cheme gazda"
 
 
 # --- contra-probe: ce e pierdut cu adevărat tot e găsit ----------------------------------------
@@ -363,8 +466,11 @@ def test_only_sentinel_units_lost_is_a_pass_not_a_failure_and_not_a_silent_skip(
 
 # --- măsurătoarea însăși -------------------------------------------------------------------
 
-def _measure(fleet: Fleet, stdout: str, stderr: str, rc: int) -> dict[str, str]:
+def _measure(fleet: Fleet, stdout: str, stderr: str, rc: int, mktemp_fails: bool = False) -> dict[str, str]:
+    if mktemp_fails:
+        _stub(fleet.bin, "mktemp", 'echo "mktemp: cannot create temp file" >&2; exit 1\n')
     _stub(fleet.bin, "ssh",
+          f'echo ssh >> "{fleet.calls.as_posix()}"\n'
           '[[ -z "$STUB_STDOUT" ]] || printf \'%s\\n\' "$STUB_STDOUT"\n'
           '[[ -z "$STUB_STDERR" ]] || printf \'%s\\n\' "$STUB_STDERR" >&2\n'
           'exit "$STUB_RC"\n')
@@ -396,6 +502,36 @@ def test_what_a_failed_command_managed_to_print_is_not_a_measurement(fleet):
     got = _measure(fleet, stdout="22\n80", stderr="ss: boom", rc=7)
     assert got["RC"] == "7" and got["OUT"] == "[]", got
     assert "exited 7" in got["WHY"] and "ss: boom" in got["WHY"], got
+
+
+def test_the_stderr_file_of_every_measurement_is_removed(fleet):
+    """Fiecare măsurătoare își ține stderr-ul într-un fișier temporar; scriptul rulează de zeci
+    de ori pe an pe laptopul operatorului. Fără `rm`, /tmp acumulează câte un fișier pe apel,
+    iar nimeni nu vede asta până când un `mktemp` eșuează de plin."""
+    tmpdir = fleet.tmp / "scratch"
+    tmpdir.mkdir()
+    fleet.env["TMPDIR"] = tmpdir.as_posix()
+    _measure(fleet, stdout="22", stderr="ceva", rc=0)
+    _measure(fleet, stdout="", stderr="boom", rc=3)
+    assert sorted(p.name for p in tmpdir.iterdir()) == [], list(tmpdir.iterdir())
+
+
+def test_a_wc_that_pads_its_count_does_not_garble_the_compared_number(fleet):
+    """`wc -l` din BSD/macOS tipărește «       3», nu «3». Fără tăierea spațiilor, linia ar
+    spune «(       3 compared)» — un număr pe care operatorul nu-l mai poate citi dintr-o
+    ochire și un tipar care nu mai e același între mașini."""
+    fleet.stub("wc", 'PATH="${PATH#*:}"\nn="$(wc "$@")"\nprintf "       %s\\n" "${n// /}"\n')
+    out = _regression(fleet)
+    assert any("still running (3 compared)" in ln for ln in out.lines("PASS")), out.text
+
+
+def test_a_machine_that_cannot_make_a_temp_file_does_not_ask_the_host_at_all(fleet):
+    """Fără fișier pentru stderr, `measure_remote` nu are cum să spună DE CE a eșuat o comandă.
+    Sub `set -e` un `mktemp` căzut ar fi oprit tot scriptul, la mijlocul raportului, fără o
+    linie despre motiv; aici întoarce 1 cu motivul, iar gazda nu e întrebată."""
+    got = _measure(fleet, stdout="22", stderr="", rc=0, mktemp_fails=True)
+    assert got["RC"] == "1" and "mktemp failed" in got["WHY"], got
+    assert "ssh" not in fleet.calls_text(), fleet.calls_text()
 
 
 def test_ssh_failing_itself_is_told_apart_from_the_command_failing(fleet):

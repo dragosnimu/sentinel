@@ -484,10 +484,10 @@ report_loopback_probe() {
 # sortată LC_ALL=C, fără dubluri. WHICH = baseline | now: baseline-ul e DEJA o intrare pe
 # linie (scris de capture_baseline), lista de acum e ieșirea brută a lui systemctl / ss.
 # Aceleași coloane ca `baseline_measure` din deploy/lib/common.sh — dacă una se schimbă,
-# schimbă-o și pe cealaltă. O intrare goală dă listă goală, nu o linie goală.
+# schimbă-o și pe cealaltă. O intrare goală dă o linie goală, pe care `$(...)` din apelant
+# o taie: lista rămâne goală, nu are o intrare «».
 baseline_lines() {
     local dim="$1" raw="$2" which="$3"
-    [[ -n "$raw" ]] || return 0
     if [[ "$which" == baseline ]]; then
         printf '%s\n' "$raw" | LC_ALL=C sort -u
         return
@@ -552,7 +552,7 @@ be asked when it was taken) — cannot verify automatically. Check by hand: ss -
 
     # Citirea baseline-ului: cod 3 = fișierul lipsește (ales de noi; nici `sudo`, nici
     # `cat`, nici ssh nu-l folosesc). Orice alt cod diferit de 0 = n-am putut citi.
-    reader='if [ -f "$1" ]; then exec cat -- "$1"; fi; exit 3'
+    reader='if [ -f "$1" ]; then exec cat "$1"; fi; exit 3'
     measure_remote "sudo -n sh -c '${reader}' sh ${file}" || rc=$?
     case $rc in
         0) was_raw="$MEASURE_OUT" ;;
@@ -564,7 +564,6 @@ neither 'nothing was lost' nor 'something was lost'. Run by hand: sudo cat ${fil
 
     # Lista de ACUM: comanda singură, fără conductă, ca să-i vedem codul. Prelucrarea
     # (awk/sed/sort) se face aici, LC_ALL=C pe ambele părți.
-    rc=0
     measure_remote "$now_cmd" || rc=$?
     if (( rc != 0 )); then
         warn "could not ask the host what is running now for ${dim} (${MEASURE_WHY}). That is \
@@ -585,7 +584,6 @@ compared. Run by hand: ${by_hand}"
         REGRESSION_UNMEASURED+=" ${dim}"; return 0
     fi
 
-    rc=0
     lost="$(LC_ALL=C comm -23 <(printf '%s\n' "$was") <(printf '%s\n' "$now"))" || rc=$?
     if (( rc != 0 )); then
         warn "comm failed (exit ${rc}) comparing ${dim}, so nothing was compared. Run by hand: ${by_hand}"
