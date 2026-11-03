@@ -169,10 +169,17 @@ def _run(script: str, tmp_path: Path, extra_path: Path | None = None,
 #     pe PATH, deci nu lipsesc, iar bash le raportează altfel;
 #   * o unealtă care există, dar eșuează;
 #   * o unealtă chemată într-un `bash -c` / `sh -c`: alt shell, fără funcția;
+#   * un PATH gol sau nesetat: bash caută în directorul curent și raportează
+#     „No such file or directory", fără handler (un PATH către un director
+#     inexistent, în schimb, îl cheamă). Codul testat nu atinge PATH-ul;
 #   * un handler înlocuit sau scos (`unset -f`) de codul testat. Nici
-#     `lib/common.sh`, nici `install.sh`, nici altceva din `deploy/` sau `tests/`
-#     nu definesc `command_not_found_handle` (verificat cu grep, cu martor
-#     pozitiv), deci nimic din ce rulează aici nu-l poate umbri.
+#     `lib/common.sh`, nici `install.sh`, nici altceva din repository, în afara
+#     acestui fișier, nu definesc `command_not_found_handle` și nu fac `unset -f`
+#     (verificat cu grep, cu martor pozitiv; scos din cele trei funcții extrase
+#     la fel), deci nimic din ce rulează aici nu-l poate umbri. Harness-ul îl
+#     definește DUPĂ `source ./lib/common.sh`, deci unul din `common.sh` ar fi
+#     fost suprascris, nu ar fi ascuns capcana. Subshell-urile, `set +o …`,
+#     `set -o posix` și `hash -r` nu-l opresc (măsurat).
 # Ce rămâne în afara handler-ului se prinde citind codul, nu rulând testul.
 #
 # Dacă trambulina însăși e stricată (ex. nu e executabilă), testul pică cu
@@ -550,9 +557,9 @@ _HOOK_ALIVE = "HOOK_ALIVE"
 def _not_found_hook(tripwire: Path) -> str:
     """Harness: o unealtă căutată pe PATH și negăsită lasă un nume în `tripwire`.
 
-    Doar builtin-uri (`printf`, `[[`, `$(<…)`, `:`): handler-ul rulează chiar și
-    când PATH-ul n-are nimic, iar o unealtă externă chemată de el ar fi ea
-    însăși „negăsită". Controlul de la capăt e DOVADA că mecanismul merge:
+    Doar builtin-uri (`printf`, `[[`, `$(<…)`, `:`): pe PATH-ul lui `ABSENT`
+    n-au ce căuta `rm` sau `grep`, iar o unealtă externă chemată de handler ar
+    fi ea însăși „negăsită" și ar polua capcana. Controlul de la capăt e DOVADA că mecanismul merge:
     handler-ul e pus la lucru sub forma pe care stderr-ul n-o vedea
     (`$(… 2>/dev/null)`), iar harness-ul iese cu 96 dacă n-a lăsat numele sau
     n-a întors 127 (cu 0, o unealtă lipsă ar părea că a reușit).
