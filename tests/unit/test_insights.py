@@ -726,13 +726,32 @@ def _apeluri_de_ceas_la_import(sursa: str) -> list[str]:
     dintr-o funcție face din orice `f()` de la import un ceas. Greșește spre
     roșu, nu spre verde.
 
-    Ce NU vede, pe față — fiecare e un defect care ar trece de cercetare:
-    * `exec`/`eval` peste un șir și `getattr(datetime, 'now')()` (numele e text);
-    * un alias prin `:=` sau prin desfacerea unui tuplu (`a, b = datetime.now, 1`);
-    * modulul `time` redenumit prin atribuire (`t = time`, apoi `t.time()`);
-    * un ajutor adus din alt modul al cărui nume nu e în `_CITITORI_DE_CEAS`.
-    Pentru ele rămâne garda de vârstă din `_ruleaza_gap`, care măsoară timp:
-    o rulare de o secundă nu le prinde, una lungă da.
+    Ce NU vede. Lista e pe CLASE, nu pe exemple, fiindcă o listă de exemple
+    s-a dovedit incompletă: un verificator a găsit 35 de forme nedeclarate care
+    chiar îngheață o referință, printre ele un argument implicit dovedit pe
+    fișierul ăsta. Fiecare clasă e un defect care ar trece de cercetare:
+    * un nume legat altfel decât prin `=`, `:=` sau `from … import` — argument
+      implicit (`def _g(clock=datetime.now)`), `for … in`, `with … as`, țintă
+      de comprehensiune, parametru de lambda, captură de `match … case`, sau
+      desfacerea unui tuplu (`a, b = datetime.now, 1`);
+    * un alias din altceva decât nume/atribut/`partial`: `a or b`, ternar,
+      `(…,)[0]`, valoarea întoarsă de un ajutor (`h()()`), dispecerat prin
+      dicționar (`D['a']()`), sau modulul redenumit (`t = time`, `t.time()`);
+    * numele ca TEXT: `exec`/`eval`, `getattr(datetime, 'now')()`,
+      `attrgetter`, `methodcaller`, `vars(datetime)['now']`,
+      `importlib.import_module`, `from time import *`;
+    * o instanță al cărei `__init__`/`__post_init__` sau property citește
+      ceasul: `k = K()` la import nu arată ca un apel de ceas;
+    * un cititor de ceas care nu e în `_CITITORI_DE_CEAS` — `time_ns`,
+      `monotonic_ns`, `gmtime`, `localtime`, `ctime`, `process_time`,
+      `os.times`, `uuid1` — sau un ajutor adus din alt modul sub alt nume.
+    Enumerarea din fiecare clasă e ce s-a măsurat, nu ce există: clasa e
+    afirmația, exemplele doar o ilustrează.
+
+    Cercetarea e al TREILEA strat, nu singurul. Înaintea ei stau fixtura per
+    test și `_ACUM_GAP = None` cu `_t()` care aruncă la import; după ea, garda
+    de vârstă din `_ruleaza_gap`, care măsoară timp și vede fiecare gaură de
+    mai sus — dar numai pe o rulare lungă, nu pe una de o secundă.
     """
     arbore = ast.parse(sursa)
     noduri = list(ast.walk(arbore))
@@ -874,7 +893,7 @@ def test_no_module_level_code_reads_the_clock():
     fișierului (1 s) nici o referință de la import nu apucă să fie veche. Aici
     nu e niciun ceas: se citește sursa și se cere ca la import să nu se cheme
     nimic care întoarce „acum”. Pentru formele pe care le vede cercetarea cade la
-    fel de o rulare de o secundă; cele care îi scapă (lista, pe față, în
+    fel de o rulare de o secundă; cele care îi scapă (clasele lor, în
     docstring-ul lui `_apeluri_de_ceas_la_import`) rămân doar la garda de vârstă,
     care nu le vede într-o rulare scurtă.
     """
