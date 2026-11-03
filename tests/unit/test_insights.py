@@ -527,8 +527,8 @@ def _ruleaza_gap(rollup=(), raw=()):
         f"referința ceasului avea {scurs:.1f} s la rularea interogării (maxim "
         f"{_VARSTA_MAXIMA_REF_S} s). Două cauze dau același număr: (1) referința "
         f"s-a luat din nou la import, iar rezultatul depinde iar de cât a durat "
-        f"suita — atunci `test_no_module_level_code_reads_the_clock` e roșu și "
-        f"el; (2) procesul a stat oprit între fixtură și interogare (VM "
+        f"suita — atunci `{test_no_module_level_code_reads_the_clock.__name__}` "
+        f"e roșu și el; (2) procesul a stat oprit între fixtură și interogare (VM "
         f"suspendată, SIGSTOP, swap) — atunci acela e verde, nu e o regresie, "
         f"și testul se rulează din nou")
     return randuri, t0, t1
@@ -692,8 +692,11 @@ def test_the_reference_never_lands_on_second_zero(monkeypatch):
 
 
 #: Ce citește ceasul prin nume. `_ahora`, `_t` și `_minut` sunt ale fișierului;
-#: restul sunt apelurile standard care întorc „acum”.
-_CITITORI_DE_CEAS = frozenset({"now", "utcnow", "today", "time", "monotonic",
+#: restul sunt apelurile standard care întorc „acum”. `time` NU e aici: ca nume
+#: sau atribut e și constructorul `time(12, 0)` / `datetime.time(12, 0)` (o oră
+#: din zi, nu ceasul), deci îl recunoaște doar `_apeluri_de_ceas_la_import`, ca
+#: `time.time()` sau ca `from time import time`.
+_CITITORI_DE_CEAS = frozenset({"now", "utcnow", "today", "monotonic",
                                "perf_counter", "_ahora", "_t", "_minut"})
 
 
@@ -702,17 +705,38 @@ def _apeluri_de_ceas_la_import(sursa: str) -> list[str]:
 
     Fără ceas și fără import: se citește sursa. Intră în „la import”: corpul
     modulului, blocurile `if`/`for`/`with`/`try` de la nivelul lui, corpul
-    claselor, decoratorii și valorile implicite ale funcțiilor (de acolo vine
+    claselor, decoratorii (și cei fără paranteze, `@_stamp`, care se CHEAMĂ la
+    definire) și valorile implicite ale funcțiilor (de acolo vine
     `parametrize(…, [_t(…)])`). Nu intră corpul funcțiilor și al lambdelor,
     care rulează abia la apel.
 
-    O funcție din modul care cheamă, direct sau prin alta, un citit de ceas
-    devine și ea citit de ceas (punct fix): `X = ajutor()` nu ascunde
-    `datetime.now()` din `ajutor`. Ce NU vede: un ajutor adus din alt modul, un
-    nume ocolit prin `getattr` și o lambdă chemată pe loc — pentru ele rămâne
-    garda de vârstă din `_ruleaza_gap`.
+    Ce numește „ceas”, pe lângă `datetime.now()` și celelalte din
+    `_CITITORI_DE_CEAS`:
+    * o funcție din modul care cheamă, direct sau prin alta, un ceas — punct
+      fix: `X = ajutor()` nu ascunde `datetime.now()` din `ajutor`;
+    * un nume sub care a fost adus ceasul, oricât de înlănțuit: `_now =
+      datetime.now`, `f: object = _now`, `K.f = datetime.now`, `from time
+      import time as clock`, `partial(datetime.now)`;
+    * `time` doar ca `time.time()` (sau `import time as t` -> `t.time()`, sau
+      `from time import time`): `time(12, 0)` și `NOW.time()` sunt ore din zi.
+    Un obiect chemat care nu e nume sau atribut (`{…}['n']()`, `(lambda:
+    datetime.now())()`) e citit de ceas dacă ORICE nume din el e.
+
+    Numele se potrivesc pe tot fișierul, nu pe domeniu: un `f = datetime.now`
+    dintr-o funcție face din orice `f()` de la import un ceas. Greșește spre
+    roșu, nu spre verde.
+
+    Ce NU vede, pe față — fiecare e un defect care ar trece de cercetare:
+    * `exec`/`eval` peste un șir și `getattr(datetime, 'now')()` (numele e text);
+    * un alias prin `:=` sau prin desfacerea unui tuplu (`a, b = datetime.now, 1`);
+    * modulul `time` redenumit prin atribuire (`t = time`, apoi `t.time()`);
+    * un ajutor adus din alt modul al cărui nume nu e în `_CITITORI_DE_CEAS`.
+    Pentru ele rămâne garda de vârstă din `_ruleaza_gap`, care măsoară timp:
+    o rulare de o secundă nu le prinde, una lungă da.
     """
     arbore = ast.parse(sursa)
+    noduri = list(ast.walk(arbore))
+    def_fn = (ast.FunctionDef, ast.AsyncFunctionDef)
 
     def nume_apel(n: ast.Call) -> str:
         f = n.func
@@ -721,9 +745,20 @@ def _apeluri_de_ceas_la_import(sursa: str) -> list[str]:
     def valori_implicite(f):
         return [d for d in (*f.args.defaults, *f.args.kw_defaults) if d is not None]
 
+    def fara_paranteze(d) -> bool:
+        return isinstance(d, (ast.Name, ast.Attribute))
+
+    def ca_apel(d):
+        """`@_stamp` înseamnă `_stamp(functia)`: un apel fără nod `Call`."""
+        return ast.copy_location(ast.Call(func=d, args=[], keywords=[]), d)
+
     def la_import(nod):
-        if isinstance(nod, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            for d in (*nod.decorator_list, *valori_implicite(nod)):
+        if isinstance(nod, def_fn):
+            for d in nod.decorator_list:
+                yield from la_import(d)
+                if fara_paranteze(d):
+                    yield ca_apel(d)
+            for d in valori_implicite(nod):
                 yield from la_import(d)
             return
         if isinstance(nod, ast.Lambda):
@@ -731,25 +766,97 @@ def _apeluri_de_ceas_la_import(sursa: str) -> list[str]:
                 yield from la_import(d)
             return
         yield nod
+        if isinstance(nod, ast.ClassDef):
+            yield from (ca_apel(d) for d in nod.decorator_list if fara_paranteze(d))
         for copil in ast.iter_child_nodes(nod):
             yield from la_import(copil)
 
-    functii = [n for n in ast.walk(arbore)
-               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
-    ceas = set(_CITITORI_DE_CEAS)
-    # Fiecare tură adaugă cel puțin o funcție sau iese, deci `len(functii)` ture
-    # ajung; bucla e mărginită ca o greșeală aici să pice testul, nu să-l agațe.
-    for _ in functii:
+    # `import time as t` redenumește modulul; `__import__('time')` îl ocolește.
+    module_time = {"time"} | {a.asname for n in noduri if isinstance(n, ast.Import)
+                              for a in n.names if a.name == "time" and a.asname}
+
+    def e_modul_time(v) -> bool:
+        if isinstance(v, ast.Name):
+            return v.id in module_time
+        return (isinstance(v, ast.Call) and getattr(v.func, "id", "") == "__import__"
+                and bool(v.args) and isinstance(v.args[0], ast.Constant)
+                and v.args[0].value == "time")
+
+    ceas = set(_CITITORI_DE_CEAS)  # nume SAU atribute care citesc ceasul
+    doar_nume = set()              # nume goale: `from time import time` -> `time`
+
+    def e_ceas(x) -> bool:
+        if isinstance(x, ast.Name):
+            return x.id in ceas or x.id in doar_nume
+        if isinstance(x, ast.Attribute):
+            return x.attr in ceas or (x.attr == "time" and e_modul_time(x.value))
+        return False
+
+    def e_referinta(v) -> bool:
+        """`v` ESTE un citit de ceas (nu îl cheamă): aliasul lui e tot unul."""
+        if isinstance(v, ast.Call) and nume_apel(v) == "partial" and v.args:
+            return e_referinta(v.args[0])
+        return e_ceas(v)
+
+    def cheama_ceas(e) -> bool:
+        """Obiectul chemat `e` (din `e(...)`) citește ceasul."""
+        if isinstance(e, (ast.Name, ast.Attribute)):
+            return e_ceas(e)
+        return any(e_ceas(m) for m in ast.walk(e)
+                   if isinstance(m, (ast.Name, ast.Attribute)))
+
+    aliasuri = []   # (nume nou, expresia din care vine)
+    importuri = []  # (nume nou, numele original)
+    for n in noduri:
+        if isinstance(n, ast.ImportFrom):
+            for a in n.names:
+                nou = a.asname or a.name
+                if n.module == "time" and a.name == "time":
+                    (doar_nume if nou == "time" else ceas).add(nou)
+                else:
+                    importuri.append((nou, a.name))
+            continue
+        if isinstance(n, ast.Assign):
+            tinte, valoare = n.targets, n.value
+        elif isinstance(n, ast.AnnAssign) and n.value is not None:
+            tinte, valoare = [n.target], n.value
+        else:
+            continue
+        for t in tinte:
+            nume = (t.id if isinstance(t, ast.Name)
+                    else t.attr if isinstance(t, ast.Attribute) else None)
+            if nume:
+                aliasuri.append((nume, valoare))
+
+    functii = [n for n in noduri if isinstance(n, def_fn)]
+
+    def chemate_in(f):
+        """Obiectele pe care le cheamă `f` când rulează (și decoratorii simpli)."""
+        r = []
+        for n in ast.walk(f):
+            if isinstance(n, ast.Call):
+                r.append(n.func)
+            elif isinstance(n, (*def_fn, ast.ClassDef)):
+                r.extend(d for d in n.decorator_list if fara_paranteze(d))
+        return r
+
+    chemate = {f: chemate_in(f) for f in functii}
+    candidati = ({f.name for f in functii} | {nou for nou, _ in aliasuri}
+                 | {nou for nou, _ in importuri}) - ceas
+    # Fiecare tură adaugă cel puțin un nume din `candidati` (mulțime finită,
+    # fixată mai sus) sau iese, deci `len(candidati)` ture ajung; bucla e
+    # mărginită ca o greșeală aici să pice testul, nu să-l agațe.
+    for _ in range(len(candidati)):
         noi = {f.name for f in functii
-               if f.name not in ceas and any(
-                   isinstance(n, ast.Call) and nume_apel(n) in ceas
-                   for n in ast.walk(f))}
+               if f.name not in ceas and any(cheama_ceas(e) for e in chemate[f])}
+        noi |= {nou for nou, v in aliasuri if nou not in ceas and e_referinta(v)}
+        noi |= {nou for nou, orig in importuri if nou not in ceas and orig in ceas}
         if not noi:
             break
         ceas |= noi
     return [f"linia {n.lineno}: {ast.unparse(n)[:80]}"
             for n in la_import(arbore)
-            if isinstance(n, ast.Call) and nume_apel(n) in ceas]
+            if isinstance(n, ast.Call) and cheama_ceas(n.func)]
 
 
 def test_no_module_level_code_reads_the_clock():
@@ -766,12 +873,36 @@ def test_no_module_level_code_reads_the_clock():
     timp, deci o referință veche de sub 120 s o trece, iar pe o rulare scurtă a
     fișierului (1 s) nici o referință de la import nu apucă să fie veche. Aici
     nu e niciun ceas: se citește sursa și se cere ca la import să nu se cheme
-    nimic care întoarce „acum”. Cade la fel de o rulare de o secundă.
+    nimic care întoarce „acum”. Pentru formele pe care le vede cercetarea cade la
+    fel de o rulare de o secundă; cele care îi scapă (lista, pe față, în
+    docstring-ul lui `_apeluri_de_ceas_la_import`) rămân doar la garda de vârstă,
+    care nu le vede într-o rulare scurtă.
     """
     gasite = _apeluri_de_ceas_la_import(Path(__file__).read_text(encoding="utf-8"))
     assert not gasite, (
         "la importul modulului se citește ceasul, deci referința se îngheață "
         f"la colectare: {gasite}. Referința se ia în `_ceas_per_test`.")
+
+
+def test_the_staleness_message_points_at_a_test_that_exists(monkeypatch):
+    """Mesajul gărzii de vârstă numește un test care chiar există.
+
+    Pana pe care o previne: garda din `_ruleaza_gap` trimite omul la
+    `test_no_module_level_code_reads_the_clock` ca să deosebească cele două
+    cauze. Dacă numele e text scris de mână și testul e redenumit, mesajul
+    arată spre un test care nu mai există, iar cine citește un roșu la 3
+    dimineața caută în gol. Aici garda e declanșată pe bune (o referință veche
+    de 3 minute) și fiecare nume de test din mesaj trebuie să fie o funcție din
+    fișier.
+    """
+    veche = _ahora() - timedelta(seconds=_VARSTA_MAXIMA_REF_S + 60)
+    monkeypatch.setitem(globals(), "_ACUM_GAP", veche)
+    with pytest.raises(AssertionError) as exc:
+        _ruleaza_gap()
+    nume = re.findall(r"`(test_\w+)`", str(exc.value))
+    assert nume, f"mesajul gărzii nu mai numește niciun test: {exc.value}"
+    lipsa = [n for n in nume if not callable(globals().get(n))]
+    assert not lipsa, f"mesajul gărzii numește teste care nu există: {lipsa}"
 
 
 def test_the_import_scan_sees_every_way_a_clock_can_be_frozen():
@@ -791,12 +922,49 @@ def test_the_import_scan_sees_every_way_a_clock_can_be_frozen():
         "ajutor": "def h():\n    return datetime.now()\nX = h()",
         "ajutor prin altul": ("def a():\n    return datetime.now()\n"
                               "def b():\n    return a()\nX = b()"),
+        # Lanț fără nicio atribuire în plus: nume noi nu sunt decât `a` și `b`,
+        # deci lanțul cere exact atâtea ture câte nume noi are. Marginea buclei
+        # nu poate fi cu unul mai mică fără ca una din aceste forme să nu se vadă.
+        "ajutor prin altul, fără atribuire": (
+            "def a():\n    return datetime.now()\n"
+            "def b():\n    return a()\nb()"),
+        "alias de alias, fără atribuire": "a = datetime.now\nb = a\nb()",
         "decorator parametrize": ("@pytest.mark.parametrize('x', [_t(hours=1)])\n"
                                   "def test_x(x):\n    pass"),
         "valoare implicită": "def f(x=datetime.now()):\n    pass",
         "bloc if": "if True:\n    X = time.time()",
+        "bloc for": "for _ in range(1):\n    X = datetime.now()",
+        "bloc with": "with open(__file__):\n    X = datetime.now()",
+        "bloc try": "try:\n    X = datetime.now()\nexcept Exception:\n    pass",
+        "bloc except": ("try:\n    X = int('x')\nexcept ValueError:\n"
+                        "    X = datetime.now()"),
         "corp de clasă": "class C:\n    X = datetime.now()",
         "comprehensiune": "X = [datetime.now() for _ in range(2)]",
+        # Același ceas, sub alt nume — fiecare a trecut cândva de cercetare.
+        "alias": "_now = datetime.now\nX = _now()",
+        "alias de alias": "a = datetime.now\nb = a\nX = b()",
+        "alias adnotat": "f: object = datetime.now\nX = f()",
+        "alias pe atribut": "K.f = datetime.now\nX = K.f()",
+        "alias din import": "from time import time as clock\nX = clock()",
+        "time importat gol": "from time import time\nX = time()",
+        "modul time redenumit": "import time as t\nX = t.time()",
+        "time prin __import__": "X = __import__('time').time()",
+        "alias de import, nume din listă": "from time import monotonic as m\nX = m()",
+        "alias în ajutor": ("def h():\n    f = datetime.now\n    return f()\n"
+                            "X = h()"),
+        "partial pe loc": "X = functools.partial(datetime.now)()",
+        "partial prin nume": "P = functools.partial(datetime.now)\nX = P()",
+        "obiect chemat din subscript": "X = {'n': datetime.now}['n']()",
+        "lambdă chemată pe loc": "X = (lambda: datetime.now())()",
+        "decorator fără paranteze": ("def _stamp(f):\n    global X\n"
+                                     "    X = datetime.now()\n    return f\n"
+                                     "@_stamp\ndef g():\n    pass"),
+        "decorator fără paranteze pe clasă": (
+            "def _stamp(c):\n    c.t = datetime.now()\n    return c\n"
+            "@_stamp\nclass K:\n    pass"),
+        "decorator fără paranteze într-un ajutor": (
+            "def _stamp(f):\n    f.t = datetime.now()\n    return f\n"
+            "def h():\n    @_stamp\n    def g():\n        pass\nX = h()"),
     }
     for forma, cod in de_prins.items():
         assert _apeluri_de_ceas_la_import(cod), f"nu a prins forma: {forma}"
@@ -809,6 +977,17 @@ def test_the_import_scan_sees_every_way_a_clock_can_be_frozen():
                        "def g(monkeypatch):\n"
                        "    monkeypatch.setitem(globals(), 'X', datetime.now())"),
         "în lambdă": "F = lambda: datetime.now()",
+        # Ore din zi, nu ceasul: `time` în sine nu citește nimic.
+        "ora din zi, datetime.time": "NOON = datetime.time(12, 0)",
+        "ora din zi, time importat": "from datetime import time\nNOON = time(12, 0)",
+        "ora din zi, .time()": ("NOW = datetime(2026, 8, 3, 12, 0)\n"
+                                "NOON = NOW.time()"),
+        "variabilă numită now": ("now = datetime(2026, 8, 3, 12, 0)\n"
+                                 "X = now.replace(hour=1)"),
+        "time.sleep": "import time as t\nt.sleep(0)",
+        "ceasul numit, nu chemat": "F = datetime.now",
+        "partial pe altceva": "X = functools.partial(int, base=2)('10')",
+        "decorator fără paranteze, fără ceas": "@staticmethod\ndef g():\n    pass",
     }
     for forma, cod in curate.items():
         assert not _apeluri_de_ceas_la_import(cod), f"a prins pe nedrept: {forma}"
