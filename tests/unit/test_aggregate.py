@@ -42,12 +42,13 @@ def run(coro):
 #: împreună" — mută doar pe ale testului, nu și pe `now()`.
 #:
 #: Cât are voie să dureze: cea mai strâmtă siguranță a fișierului e coada de
-#: `_PLAFON_COADA_ORE` = 6 ore din `test_the_fresh_tail_reaches_back_to_the_rollup_frontier`,
-#: unde rândul stă la 70 de minute — deci 6 h - 70 min = 4 h 50 min (17400 s).
-#: Măsurat la 3 noiembrie 2026, cu `_ACUM` mutat înapoi: 17300 s verde, 17500 s
-#: roșu. O suită întreagă (35-65 de minute) încape cu mult sub ea; o gazdă
-#: suspendată câteva ore, nu. Spre deosebire de test_insights.py, fișierul nu
-#: reia referința la fiecare test.
+#: `_PLAFON_COADA_ORE` = 6 ore. În
+#: `test_the_fresh_tail_reaches_back_to_the_rollup_frontier` rândul stă la 70 de
+#: minute, deci cade din coadă după 6 h - 70 min = 4 h 50 min (17400 s).
+#: Măsurat la 3 noiembrie 2026, cu `_ACUM` mutat înapoi: 17300 s verde, 17400 s
+#: și 17500 s roșu, în ambele cazuri doar acest test. O suită întreagă (35-65 de
+#: minute) încape cu mult sub prag; o gazdă suspendată câteva ore, nu. Spre
+#: deosebire de test_insights.py, fișierul nu reia referința la fiecare test.
 _ACUM = datetime.now(timezone.utc)
 
 
