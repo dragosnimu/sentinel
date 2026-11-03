@@ -1556,6 +1556,18 @@ def test_capturing_does_not_clobber_the_variables_of_the_caller(host):
     assert res.rc == 2 and res.vars["VARS"] == "MINE,MINE,MINE", res.out
 
 
+def test_storing_does_not_clobber_the_variables_of_the_caller(host):
+    """`baseline_store` ține destinația, motivul lui `mv` și calea din interiorul directorului în
+    variabile. Dacă nu sunt `local`, un apelant cu propriile `dest`, `mverr` sau `inside` (instalatorul
+    are zeci de variabile globale) le găsește suprascrise. Cursa pe înregistrare trece prin toate
+    trei: mutarea (`mverr`), destinația (`dest`) și scoaterea din director (`inside`)."""
+    _race_mv(host, "baseline-state.txt")
+    res = host.run('dest=MINE; mverr=MINE; inside=MINE\n'
+                   'rc=0; capture_baseline > /dev/null 2>&1 || rc=$?\n'
+                   'echo "RC=$rc"\necho "VARS=$dest,$mverr,$inside"\n')
+    assert res.rc == 2 and res.vars["VARS"] == "MINE,MINE,MINE", res.out
+
+
 @pytest.mark.parametrize("collector_works", [True, False], ids=["collector-ok", "collector-fails"])
 def test_a_link_to_a_directory_at_a_data_path_is_removed_not_followed_or_filled(host, collector_works):
     """Un LINK către un director la `baseline-ports.txt`. `[[ -d ]]` îl vede ca director, deci `mv` nu

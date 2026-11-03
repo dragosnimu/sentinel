@@ -1113,12 +1113,12 @@ baseline_store() {
     fi
     if [[ ! -f "$dest" ]]; then
         BASELINE_WHY="mv reported success but ${dest} is not a file"
-        if [[ -d "$dest" ]]; then
-            inside="${dest}/${tmp##*/}"
-            rmerr="$(rm -f -- "$inside" 2>&1)" || true
-            if [[ -e "$inside" || -L "$inside" ]]; then
-                BASELINE_WHY+="; ${inside} was left inside it and could not be removed (${rmerr:-rm said nothing})"
-            fi
+        # Where mv would have put TMP if DEST is a directory. If it is not one,
+        # this names nothing and `rm -f` has nothing to do.
+        inside="${dest}/${tmp##*/}"
+        rmerr="$(rm -f -- "$inside" 2>&1)" || true
+        if [[ -e "$inside" || -L "$inside" ]]; then
+            BASELINE_WHY+="; ${inside} was left inside it and could not be removed (${rmerr:-rm said nothing})"
         fi
         return 1
     fi
