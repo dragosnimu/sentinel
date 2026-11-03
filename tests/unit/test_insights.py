@@ -10,7 +10,10 @@ from __future__ import annotations
 import asyncio
 import re
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from sentinel.analytics import insights as ins
 
@@ -390,15 +393,37 @@ def test_the_two_screens_agree_on_which_sources_a_human_drives():
 # Ce NU se dovedește aici: planul ales de PostgreSQL și timpul câștigat pe
 # gazdă. Alea se măsoară acolo.
 
-#: Momentul de referință al secțiunii, luat O SINGURĂ DATĂ — vezi `_ACUM` din
-#: test_aggregate.py: `_t()` chemat de două ori pentru același moment putea
-#: cădea de o parte și de alta a unei granițe de secundă, iar un roșu fals la
-#: câteva sute de rulări îl învață pe om că suita minte uneori.
-_ACUM_GAP = datetime.now(timezone.utc)
+#: Momentul de referință al testului curent, luat O SINGURĂ DATĂ PE TEST — vezi
+#: `_ACUM` din test_aggregate.py: `_t()` chemat de două ori pentru același
+#: moment putea cădea de o parte și de alta a unei granițe de secundă, iar un
+#: roșu fals la câteva sute de rulări îl învață pe om că suita minte uneori.
+#:
+#: Unitatea e testul, nu modulul. Interogarea citește ceasul VIU al lui SQLite
+#: (`julianday('now')`), deci o referință luată la import — adică la colectarea
+#: suitei — se depărta de el cu tot ce făcea suita între timp: 35-65 de minute
+#: pe mașina asta, față de o marjă de 30 de minute în
+#: `…several_actions…` și de 60 în `…alive_only_in_the_rollup…`. Fișierul rulat
+#: singur (0,7 s) era verde, suita întreagă roșie: un test care nu mai spunea
+#: nimic despre interogare, doar cât a durat suita. Fixtura `_ceas_per_test` o
+#: reia la începutul fiecărui test; `None` aici e intenționat, ca un `_t()`
+#: chemat la import să cadă zgomotos, nu să înghețe iar un moment vechi.
+_ACUM_GAP: datetime | None = None
+
+
+def _ahora() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _ceas_per_test(monkeypatch):
+    monkeypatch.setitem(globals(), "_ACUM_GAP", _ahora())
 
 
 def _t(**delta) -> str:
     """Un moment din trecut, în formatul în care SQLite compară text cu text."""
+    if _ACUM_GAP is None:
+        raise RuntimeError("_t() chemat în afara unui test: referința se ia în "
+                           "`_ceas_per_test`, nu la import")
     return (_ACUM_GAP - timedelta(**delta)).strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -429,8 +454,28 @@ def _tradu_gap(sql: str) -> str:
     return sql
 
 
+#: Cât poate diferi ceasul lui SQLite de cel al lui Python, în secunde. Cel al
+#: lui SQLite are rezoluție de o milisecundă și vine din alt apel al sistemului
+#: de operare; măsurat aici pe 3000 de perechi, abaterea n-a depășit ±1 ms. 0,1 s
+#: e de o sută de ori marja asta și de ordinul 10⁵ ori mai mic decât vârstele
+#: aserate (ore), deci o unitate greșită sau un ceas înghețat nu încap în ea.
+_EPS_CEAS_S = 0.1
+
+#: Cât are voie să treacă între luarea referinței (`_ceas_per_test`) și rularea
+#: interogării, în secunde. Un test durează milisecunde; 120 s e de ordinul
+#: duratei unui minut de suită, nu al unui test. Dacă referința revine la import,
+#: depășirea apare la primul minut de suită, nu la 30.
+_VARSTA_MAXIMA_REF_S = 120
+
+
 def _ruleaza_gap(rollup=(), raw=()):
-    """`_GAP_SQL` peste rollup-ul și evenimentele brute date."""
+    """`_GAP_SQL` peste rollup-ul și evenimentele brute date.
+
+    Întoarce `(rânduri, t0, t1)`: ceasul lui Python citit imediat înainte și
+    imediat după interogare. `hours_silent` se măsoară din ceasul VIU al lui
+    SQLite, deci singura aserțiune onestă pe el stă între cele două citiri —
+    vezi `_aserteaza_varsta`.
+    """
     con = sqlite3.connect(":memory:")
     con.row_factory = sqlite3.Row
     con.execute("CREATE TABLE event_rollup_1m (bucket TEXT, asset_id INTEGER, "
@@ -442,9 +487,45 @@ def _ruleaza_gap(rollup=(), raw=()):
     con.executemany("INSERT INTO raw_events (ts, source, action) VALUES (?, ?, ?)",
                     list(raw))
     try:
-        return [dict(r) for r in con.execute(_tradu_gap(ins._GAP_SQL)).fetchall()]
+        sql = _tradu_gap(ins._GAP_SQL)
+        t0 = _ahora()
+        randuri = [dict(r) for r in con.execute(sql).fetchall()]
+        t1 = _ahora()
     finally:
         con.close()
+    # Gardă de proaspătețe: ferestrele din `_GAP_SQL` (30 de zile pe rollup, 6
+    # ore pe coadă) se măsoară tot de la ceasul viu. O referință veche nu mai
+    # strică doar o cifră: mută rândurile spre marginea ferestrei, până unde
+    # ies din ea și interogarea întoarce „nicio sursă" în loc de o valoare greșită.
+    scurs = (t0 - _ACUM_GAP).total_seconds()
+    assert scurs < _VARSTA_MAXIMA_REF_S, (
+        f"referința ceasului a fost luată cu {scurs:.0f} s înainte de interogare "
+        f"(maxim {_VARSTA_MAXIMA_REF_S} s): a revenit o referință pe modul, iar "
+        f"rezultatul depinde din nou de cât a durat suita până aici")
+    return randuri, t0, t1
+
+
+def _aserteaza_varsta(ore, moment: str, t0: datetime, t1: datetime):
+    """`ore` e vârsta lui `moment`, măsurată de SQL undeva între `t0` și `t1`.
+
+    `moment` e șirul PUS în fixtură (`_t(...)`, deja trunchiat la secundă de
+    `strftime`, sau bucketul de minut), nu un moment nominal: așteptarea pornește
+    din ce a văzut chiar SQL-ul, deci trunchierea nu cere nicio marjă în plus.
+
+    Cele două proprietăți pe care le poartă, separat:
+    * ceasul VIU — `t0`/`t1` sunt citite în jurul interogării, nu înghețate
+      altundeva. O interogare care nu mai pleacă din `now()` (un literal, `NULL`,
+      `max(ultim)` din ambele părți) iese din cadru cu ore, nu cu milisecunde;
+    * independența de durata suitei — cadrul are lățimea interogării (ms) și
+      nu depinde de cât a trecut de la colectare.
+    """
+    assert ore is not None, "hours_silent a ieșit NULL, deci nu s-a măsurat nimic"
+    de_la = datetime.strptime(moment, "%Y-%m-%d %H:%M:%S").replace(tzinfo=t0.tzinfo)
+    jos = ((t0 - de_la).total_seconds() - _EPS_CEAS_S) / 3600
+    sus = ((t1 - de_la).total_seconds() + _EPS_CEAS_S) / 3600
+    assert jos <= ore <= sus, (
+        f"vechimea raportată nu e cea reală: {ore!r} h, așteptat între "
+        f"{jos:.6f} și {sus:.6f} h (de la {moment} la ceasul viu)")
 
 
 def test_a_source_alive_only_in_the_rollup_keeps_its_real_age():
@@ -462,16 +543,19 @@ def test_a_source_alive_only_in_the_rollup_keeps_its_real_age():
     există niciun rând brut, deci o interogare care ar întreba `raw_events`
     n-ar găsi nimic aici.
     """
-    randuri = {r["source"]: r for r in _ruleaza_gap(
+    rezultat, t0, t1 = _ruleaza_gap(
         rollup=[(_minut(_t(days=20)), "suricata", "alert", 3),
                 (_minut(_t(minutes=4)), "nginx", "request", 9)],
-        raw=[(_t(minutes=4), "nginx", "request")])}
+        raw=[(_t(minutes=4), "nginx", "request")])
+    randuri = {r["source"]: r for r in rezultat}
     assert "suricata" in randuri, "sursa tăcută a dispărut din inventar"
     assert randuri["suricata"]["last_seen"] == _minut(_t(days=20)), (
         f"ultima activitate s-a pierdut odată cu rândurile brute: "
         f"{randuri['suricata']['last_seen']}")
-    assert 479 < randuri["suricata"]["hours_silent"] < 481, (
-        f"vechimea raportată nu e cea reală: {randuri['suricata']['hours_silent']}")
+    # 480 de ore, nu cele 720 ale plafonului inventat: cadrul e de milisecunde
+    # în jurul lui `_minut(_t(days=20))`, deci 720 (sau 479 / 481) nu încape.
+    _aserteaza_varsta(randuri["suricata"]["hours_silent"],
+                      _minut(_t(days=20)), t0, t1)
 
 
 def test_a_source_with_several_actions_produces_one_row():
@@ -485,7 +569,7 @@ def test_a_source_with_several_actions_produces_one_row():
     Un panou care se contrazice singur nu mai poate fi folosit ca să se decidă
     ceva.
     """
-    randuri = _ruleaza_gap(
+    randuri, t0, t1 = _ruleaza_gap(
         rollup=[(_minut(_t(hours=3)), "sshd", "auth_fail", 12),
                 (_minut(_t(hours=40)), "sshd", "auth_ok", 1)],
         raw=[(_t(hours=3), "sshd", "auth_fail")])
@@ -493,7 +577,64 @@ def test_a_source_with_several_actions_produces_one_row():
         f"o sursă cu două acțiuni a ieșit pe mai multe rânduri: {randuri}")
     assert randuri[0]["last_seen"] == _t(hours=3), (
         f"a rămas cu activitatea perechii mai vechi: {randuri[0]['last_seen']}")
-    assert 2.9 < randuri[0]["hours_silent"] < 3.5
+    # Cifra afișată în card („a amuțit de N ore”) e o altă coloană din același
+    # SELECT decât `last_seen`: un `min` strecurat doar în ea ar lăsa verde
+    # aserțiunea de mai sus și ar scrie tot „40 de ore”.
+    _aserteaza_varsta(randuri[0]["hours_silent"], _t(hours=3), t0, t1)
+
+
+def test_hours_silent_is_read_from_the_live_clock():
+    """Vechimea unei surse crește cu timpul real — nu e un număr înghețat.
+
+    Pana pe care o previne: o interogare care nu mai pleacă din `now()` — un
+    moment scris în text la import, un parametru luat o dată și ținut — dă la
+    prima citire cifra potrivită și rămâne pe ea. `_gap_insights` ar judeca
+    atunci tăcerea unui colector pe vârsta de la ultima pornire a serviciului:
+    o sursă moartă de două zile ar părea moartă de trei ore, tocmai pe gazda pe
+    care nimeni nu a repornit nimic de mult, deci fix unde e nevoie de alarmă.
+
+    Aserțiunea de vârstă din celelalte teste prinde un ceas înghețat doar dacă
+    între înghețare și rulare a trecut mai mult decât `_EPS_CEAS_S`; aici nu se
+    lasă la voia întâmplării — două citiri la 0,3 s distanță trebuie să difere
+    cu cât a trecut între ele, măsurat de Python.
+    """
+    date = dict(rollup=[(_minut(_t(hours=3)), "sshd", "auth_fail", 12)],
+                raw=[(_t(hours=3), "sshd", "auth_fail")])
+    prima, a0, a1 = _ruleaza_gap(**date)
+    time.sleep(0.3)
+    a_doua, b0, b1 = _ruleaza_gap(**date)
+
+    scurs = (a_doua[0]["hours_silent"] - prima[0]["hours_silent"]) * 3600
+    jos = (b0 - a1).total_seconds() - _EPS_CEAS_S
+    sus = (b1 - a0).total_seconds() + _EPS_CEAS_S
+    assert jos <= scurs <= sus, (
+        f"între două citiri la {(b0 - a1).total_seconds():.2f} s distanță, "
+        f"vechimea s-a mișcat cu {scurs:.4f} s (așteptat între {jos:.4f} și "
+        f"{sus:.4f}): interogarea nu mai citește ceasul viu")
+
+
+def test_the_reference_moment_is_never_read_from_the_clock_again(monkeypatch):
+    """`_t()` dă același șir oriunde e chemat în test — nu citește ceasul.
+
+    Pana pe care o previne: o „reparație” a referinței înghețate prin
+    `datetime.now()` chemat în `_t` ar rezolva decalajul și ar aduce înapoi
+    exact ce explică comentariul de deasupra lui `_ACUM_GAP`: două `_t(hours=3)`
+    din același test cad, la câteva sute de rulări, de o parte și de alta a unei
+    granițe de secundă, iar `last_seen == _t(hours=3)` pică fără ca ceva să fie
+    stricat. Un roșu fals la rulări rare învață omul că suita minte uneori, și
+    atunci nu mai crede nici roșul adevărat.
+
+    Ceasul e interzis în loc să se aștepte o secundă: o așteptare ar prinde
+    granița o dată la câteva sute de rulări, aici cade de fiecare dată.
+    """
+    class _CeasInterzis:
+        @staticmethod
+        def now(*_a, **_k):
+            raise AssertionError("_t() a citit ceasul: referința nu mai e una singură")
+
+    inainte = _t(hours=3)
+    monkeypatch.setitem(globals(), "datetime", _CeasInterzis)
+    assert _t(hours=3) == inainte
 
 
 # --- multi-vector attackers -------------------------------------------------
