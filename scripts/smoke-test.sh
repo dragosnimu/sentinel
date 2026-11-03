@@ -531,9 +531,13 @@ baseline_lines() {
 # (config nginx pe care `nginx -t` nu-l poate citi), iar aici baseline-ul nu are o
 # „stare" — are un motiv, în MEASURE_WHY, spus în cuvinte.
 REGRESSION_UNMEASURED=""
+# «Fișierul de servicii a fost CITIT» e singurul fapt din care se poate spune ceva despre
+# CAUZA unui fișier de porturi lipsă (vezi `cause` în compare_baseline_dim). Se pune pe 1
+# doar la o citire reușită, iar apelul pentru servicii vine înaintea celui pentru porturi.
+BASELINE_SERVICES_READ=""
 compare_baseline_dim() {
     local dim="$1" dir="$2" file now_cmd by_hand what_pass what_fail absent
-    local reader rc=0 was_raw was now_raw now lost line kept="" n
+    local reader rc=0 was_raw was now_raw now lost line kept="" n cause=""
     file="${dir}/baseline-${dim}.txt"
     case "$dim" in
         services)
@@ -548,8 +552,14 @@ Check by hand: systemctl --failed" ;;
             by_hand="ss -tlnp"
             what_pass="every port that was listening before the install still is"
             what_fail="ports closed since the install"
-            absent="no pre-install baseline of listening ports at ${dir} (ss could not \
-be asked when it was taken) — cannot verify automatically. Check by hand: ss -tlnp" ;;
+            # Cauza («ss n-a răspuns la captură») se afirmă numai dacă baseline-ul de servicii
+            # a fost citit: atunci captura a rulat și lipsesc doar porturile. Cu ambele lipsă
+            # (sau fără director) scriptul nu știe dacă s-a captat vreodată ceva.
+            if [[ -n "$BASELINE_SERVICES_READ" ]]; then
+                cause=" (ss could not be asked when it was taken)"
+            fi
+            absent="no pre-install baseline of listening ports at ${dir}${cause} — cannot \
+verify automatically. Check by hand: ss -tlnp" ;;
         *) fail "compare_baseline_dim: unknown dimension '${dim}'"; return 0 ;;
     esac
 
@@ -557,10 +567,18 @@ be asked when it was taken) — cannot verify automatically. Check by hand: ss -
     # `cat`, nici ssh nu-l folosesc). Orice alt cod diferit de 0 = n-am putut citi.
     # `-e`, nu `-f`: un director (sau orice altceva) la calea baseline-ului EXISTĂ, dar nu se
     # poate citi — «n-am putut citi», cu eroarea lui `cat`, nu «nu există baseline».
-    reader='if [ -e "$1" ]; then exec cat "$1"; fi; exit 3'
+    # `-e || -L`, nu doar `-e`: `-e` urmărește legăturile, deci o legătură atârnândă (ținta
+    # ștearsă) i se pare lipsă, deși ceva ESTE acolo. `cat` iese cu 1 pe ea și spune de ce.
+    # Aceeași formă ca `baseline_state` din deploy/lib/common.sh.
+    reader='if [ -e "$1" ] || [ -L "$1" ]; then exec cat "$1"; fi; exit 3'
+    # ${file} intră NECITAT în șirul trimis gazdei, pe care îl reinterpretează shell-ul de
+    # acolo. E sigur numai pentru că vine dintr-un literal (`baseline_dir=` mai jos) și dintr-un
+    # `dim` validat de `case`: nicio valoare de la operator sau de la gazdă nu ajunge aici.
+    # Nu-i da o variabilă care poate conține spații sau metacaractere shell.
     measure_remote "sudo -n sh -c '${reader}' sh ${file}" || rc=$?
     case $rc in
-        0) was_raw="$MEASURE_OUT" ;;
+        0) was_raw="$MEASURE_OUT"
+           if [[ "$dim" == services ]]; then BASELINE_SERVICES_READ=1; fi ;;
         3) warn "$absent"; REGRESSION_UNMEASURED+=" ${dim}"; return 0 ;;
         *) warn "could not read the pre-install baseline of ${dim} (${MEASURE_WHY}). That is \
 neither 'nothing was lost' nor 'something was lost'. Run by hand: sudo cat ${file}"

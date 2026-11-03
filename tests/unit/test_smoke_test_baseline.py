@@ -164,8 +164,9 @@ HOST=h; USER=u; SSH_OPTS=(-p 22)
 # Dacă linia lipsește, harnașul NU o înlocuiește: `set -u` face scriptul să cadă la prima citire
 # a variabilei, iar testele de mai jos devin roșii cu o eroare numită (nu o eroare de import,
 # care ar fi un roșu cu zero teste trecute).
-_INIT = re.search(r'^REGRESSION_UNMEASURED=""$', SMOKE, re.M)
-PRELUDE += (_INIT.group(0) if _INIT else "") + "\n"
+for _var in ("REGRESSION_UNMEASURED", "BASELINE_SERVICES_READ"):
+    _INIT = re.search(rf'^{_var}=""$', SMOKE, re.M)
+    PRELUDE += (_INIT.group(0) if _INIT else "") + "\n"
 
 
 def _section(fleet: Fleet) -> str:
@@ -352,6 +353,89 @@ def test_a_baseline_path_that_is_a_directory_is_unreadable_not_missing(fleet):
     warning = out.lines("WARN")[0]
     assert "could not read the pre-install baseline of ports" in warning, warning
     assert "Is a directory" in warning and "no pre-install baseline" not in warning, warning
+
+
+@pytest.mark.parametrize("what", ["both files are absent", "the whole directory is absent"])
+def test_the_cause_of_a_missing_ports_baseline_is_not_guessed_when_nothing_was_recorded(fleet, what):
+    """Cu ambele fișiere lipsă (sau cu directorul lipsă) avertismentul pentru porturi spunea
+    totuși «ss could not be asked when it was taken» — o cauză pe care scriptul nu o poate ști:
+    baseline-ul poate să nu fi fost luat deloc, sau să fi fost șters. Operatorul ar fi căutat un
+    `ss` căzut la captură când adevărul e «nu s-a captat nimic». Cauza se poate afirma numai
+    când fișierul de servicii A FOST citit și cel de porturi nu (vezi testul de mai sus)."""
+    if what == "both files are absent":
+        (fleet.state / "baseline-services.txt").unlink()
+        (fleet.state / "baseline-ports.txt").unlink()
+    else:
+        shutil.rmtree(fleet.state)
+    out = _regression(fleet)
+    assert out.passes == 0 and out.warns == 2 and not out.lines("FAIL"), out.text
+    assert out.unmeasured == ["services", "ports"], out.text
+    ports_warning = out.lines("WARN")[1]
+    assert "no pre-install baseline of listening ports" in ports_warning, ports_warning
+    assert "ss could not be asked" not in out.text, out.text
+
+
+def test_a_services_baseline_that_could_not_be_read_does_not_license_the_ss_explanation(fleet):
+    """Citirea baseline-ului de servicii cade (sudo refuză) înainte să se știe dacă a fost
+    captat: nu e «fișierul de servicii a fost citit», deci nici o cauză pentru porturi. Garda e
+    pe CITIT cu succes, nu pe «dimensiunea a fost încercată»."""
+    fleet.env["SUDO_REFUSES"] = "1"
+    out = _regression(fleet)
+    assert out.warns == 2 and "ss could not be asked" not in out.text, out.text
+
+
+def _dangling_link(link: Path, target: Path) -> str:
+    """Face din `link` o legătură spre `target` (care NU există) și întoarce cum a făcut-o.
+
+    Un symlink real când sistemul de operare lasă (Linux, WSL); pe Windows fără drept de symlink
+    (`os.symlink` -> WinError 1314) o joncțiune de director, pe care bash-ul MSYS o arată ca pe un
+    symlink (`[ -L ]` adevărat, `[ -e ]` fals, `cat` iese cu 1) — verificat mai jos cu același
+    bash, nu presupus. Dacă nici asta nu merge, sare cu motivul spus: un skip tăcut ar lăsa
+    ramura fără niciun martor."""
+    try:
+        os.symlink(target, link)
+        how = "symlink"
+    except (OSError, NotImplementedError) as symlink_err:
+        if os.name != "nt":
+            pytest.skip(f"nu pot crea un symlink aici ({symlink_err!r}); ramura «legătură atârnândă» "
+                        "nu e verificată pe această mașină")
+        target.mkdir()
+        made = subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(link), str(target)],
+                              capture_output=True, text=True)
+        target.rmdir()
+        if made.returncode != 0:
+            pytest.skip(f"nu pot crea nici symlink ({symlink_err!r}), nici joncțiune "
+                        f"({made.stdout.strip()} {made.stderr.strip()}); ramura «legătură atârnândă» "
+                        "nu e verificată pe această mașină")
+        how = "joncțiune NTFS"
+    state = subprocess.run([BASH, "-c", '[ -L "$1" ] && ! [ -e "$1" ]', "sh", link.as_posix()],
+                           capture_output=True, text=True)
+    if state.returncode != 0:
+        pytest.skip(f"{how} creată, dar bash nu o vede ca legătură atârnândă ([ -L ] adevărat, "
+                    "[ -e ] fals): precondiția testului nu e stabilită pe această mașină")
+    return how
+
+
+def test_a_dangling_link_at_the_baseline_path_is_unreadable_not_missing(fleet):
+    """La calea baseline-ului e o legătură simbolică a cărei țintă a dispărut. `[ -e ]` urmărește
+    legătura, deci o citește fals: cititorul ieșea cu 3 și scriptul spunea «nu există baseline»,
+    deși ceva ARE acolo. «Lipsește» și «nu pot citi» sunt răspunsuri diferite, iar acesta e al
+    doilea; aceeași formă (`-e` orb la legături) a costat o rundă în `baseline_state` din
+    deploy/lib/common.sh, unde remediul a fost `-e || -L`.
+
+    Pe mașina de unde a fost scris testul nu se poate crea un symlink (WinError 1314); de aceea
+    `_dangling_link` cade pe o joncțiune, iar în absența ambelor testul SARE cu motivul spus.
+    Pe Linux (CI, WSL) rulează cu un symlink adevărat."""
+    link = fleet.state / "baseline-ports.txt"
+    link.unlink()
+    how = _dangling_link(link, fleet.state / "tinta-disparuta")
+    out = _regression(fleet)
+    assert out.passes == 1 and out.warns == 1 and not out.lines("FAIL"), (how, out.text)
+    warning = out.lines("WARN")[0]
+    assert "could not read the pre-install baseline of ports" in warning, (how, warning)
+    assert "No such file or directory" in warning and "no pre-install baseline" not in warning, (how, warning)
+    assert "ss could not be asked" not in warning, (how, warning)
+    assert out.unmeasured == ["ports"], (how, out.text)
 
 
 def test_an_empty_baseline_compares_nothing_and_says_so(fleet):
