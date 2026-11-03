@@ -1090,7 +1090,6 @@ baseline_complete() {
 # The reader tests the path with `-f` as well (baseline_state).
 baseline_store() {
     local tmp="$1" dest="$2" rc=0
-    BASELINE_WHY=""
     if [[ -d "$dest" ]]; then
         BASELINE_WHY="${dest} is a directory, not a file"
         return 1

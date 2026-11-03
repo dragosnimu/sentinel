@@ -1292,6 +1292,22 @@ def test_a_directory_where_the_record_goes_is_refused_not_celebrated(host):
     assert probe.proc.stdout.strip() == "unreadable", probe.out
 
 
+def test_an_old_record_that_rm_cannot_remove_is_refused_even_when_rm_says_nothing(host):
+    """`rm` iese cu 1 fără să tipărească nimic (un sistem de fișiere doar-citire poate face asta
+    printr-un wrapper). Avertismentul nu are voie să iasă cu motivul gol, «could not be removed
+    ()»: spune codul de ieșire. Capturarea e refuzată (2), niciun colector nu e chemat, nicio
+    linie de succes."""
+    host.state.mkdir(parents=True)
+    (host.state / "baseline-state.txt").write_text(
+        "services=measured\nports=measured\ncontainers=measured\n", encoding="utf-8", newline="\n")
+    _stub(host.bin, "rm", 'case "$*" in *baseline-state.txt) exit 1 ;; esac\n'
+          'PATH="${PATH#*:}"\nexec rm "$@"\n')
+    res = host.capture()
+    assert res.rc == 2, res.out
+    assert "could not be removed (exit 1)" in res.out, res.out
+    assert host.calls_text() == "" and "baseline captured" not in res.out, res.out
+
+
 def test_a_refused_capture_does_not_leave_the_previous_file_paths_standing(host):
     """O capturare refuzată (înregistrarea veche nu poate fi ștearsă) lasă `BASELINE_SERVICES` și
     `BASELINE_PORTS` goale, nu îndreptate spre fișierele capturării de dinainte: cine le citește
@@ -1400,6 +1416,71 @@ def test_a_failed_collector_with_a_directory_in_its_place_leaves_it_alone_quietl
     assert "baseline of ports NOT captured: ss -tlnH failed" in res.out, res.out
     assert not re.search(r"^rm:", res.out, re.M), res.out
     assert target.is_dir() and _tree(target) == [], _tree(host.state)
+
+
+def test_the_record_warning_does_not_borrow_the_reason_of_an_earlier_dimension(host):
+    """`ss` cade (motivul «boom» ajunge în `BASELINE_WHY`), iar apoi înregistrarea nu poate primi
+    un fișier temporar. Avertismentul despre înregistrare nu are voie să poarte motivul portului:
+    operatorul ar căuta un `ss` stricat, nu discul plin care a oprit scrierea."""
+    host.fail("ports", err="ss: boom (ports)")
+    host.passthrough("mktemp", "*baseline-state*")
+    res = host.capture()
+    assert res.rc == 2 and host.record() is None, res.out
+    record_warning = [ln for ln in res.out.splitlines() if "could not write" in ln]
+    assert len(record_warning) == 1, res.out
+    assert "boom" not in record_warning[0] and "(" not in record_warning[0].split("The baseline")[0], \
+        record_warning[0]
+
+
+def test_a_store_failure_does_not_color_the_next_dimensions_collector_failure(host):
+    """Serviciile nu se pot STOCA (director în loc), apoi `ss` cade. Avertismentul portului spune
+    că `ss` a eșuat, cu motivul lui, nu «was measured but NOT stored» moștenit de la dimensiunea
+    dinainte: operatorul ar căuta un director care nu există la porturi."""
+    (host.state / "baseline-services.txt").mkdir(parents=True)
+    host.fail("ports", err="ss: boom (ports)")
+    res = host.capture()
+    assert res.rc == 2, res.out
+    assert "baseline of services was measured but NOT stored" in res.out, res.out
+    assert "baseline of ports NOT captured: ss -tlnH failed (exit 1: ss: boom (ports))" in res.out, res.out
+    assert "baseline of ports was measured" not in res.out, res.out
+
+
+def test_capturing_does_not_clobber_the_variables_of_the_caller(host):
+    """`capture_baseline` își ține calea înregistrării, mesajul lui `rm` și faza eșecului în
+    variabile. Dacă nu sunt `local`, un apelant care are propriile `record`, `rmerr` sau `where`
+    (instalatorul are zeci de variabile globale) le găsește suprascrise, iar o decizie luată
+    din ele mai târziu se bazează pe o cale care nu e a lui."""
+    (host.state / "baseline-services.txt").mkdir(parents=True)
+    res = host.run('record=MINE; rmerr=MINE; where=MINE\n'
+                   'rc=0; capture_baseline > /dev/null 2>&1 || rc=$?\n'
+                   'echo "RC=$rc"\necho "VARS=$record,$rmerr,$where"\n')
+    assert res.rc == 2 and res.vars["VARS"] == "MINE,MINE,MINE", res.out
+
+
+@pytest.mark.parametrize("collector_works", [True, False], ids=["collector-ok", "collector-fails"])
+def test_a_link_to_a_directory_at_a_data_path_is_removed_not_followed_or_filled(host, collector_works):
+    """Un LINK către un director la `baseline-ports.txt`. `[[ -d ]]` îl vede ca director, deci `mv` nu
+    mută nimic în directorul-țintă, iar curățarea scoate linkul (`rm -f` pe un link nu atinge
+    ținta), în loc să-l lase în picioare ca un «fișier» vechi pe care un cititor vechi l-ar
+    citi. Ținta rămâne goală.
+
+    ACEST TEST SE SARE fără dreptul de a crea linkuri simbolice (Windows: `WinError 1314`). Pe
+    mașina de dezvoltare Windows `! -L` din `baseline_unstore` NU are observator; testul a fost
+    rulat sub WSL (bash 5.2, Linux), verde cu `! -L` și ROȘU fără el."""
+    elsewhere = host.tmp / "elsewhere"
+    elsewhere.mkdir()
+    host.state.mkdir(parents=True)
+    try:
+        os.symlink(elsewhere, host.state / "baseline-ports.txt")
+    except (OSError, NotImplementedError) as err:
+        pytest.skip(f"nu pot crea un link simbolic pe această mașină: {err}")
+    if not collector_works:
+        host.fail("ports")
+    res = host.capture()
+    assert res.rc == 2 and "ports=unmeasured" in host.record(), res.out
+    assert os.listdir(elsewhere) == [], f"ceva a fost mutat prin link: {os.listdir(elsewhere)}"
+    assert not os.path.lexists(host.state / "baseline-ports.txt"), "linkul a rămas în picioare"
+    assert not re.search(r"^rm:", res.out, re.M), res.out
 
 
 def test_no_docker_with_a_directory_at_the_containers_path_is_none_without_noise(host):
