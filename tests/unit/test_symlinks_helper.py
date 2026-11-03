@@ -122,9 +122,18 @@ def test_a_taken_path_is_refused_before_anything_is_created(tmp_path):
     taken.mkdir()
     (taken / "data").write_text("d\n", encoding="utf-8", newline="\n")
     maker = LinkMaker()
-    with pytest.raises(AssertionError, match="există deja"):
+    try:
         maker(taken, tmp_path)
-    maker.cleanup()
+    except AssertionError as refusal:
+        assert "există deja" in str(refusal), refusal
+    except pytest.skip.Exception:
+        # fără garda de cale liberă, `ln -s` ar fi pus o legătură ÎNĂUNTRUL directorului,
+        # verificarea ar fi respins-o, iar testul ar fi SĂRIT în loc să pice
+        pytest.fail("calea ocupată n-a fost refuzată la creare; a ajuns să sară mai târziu")
+    else:
+        pytest.fail("calea ocupată a fost acceptată")
+    finally:
+        maker.cleanup()
     assert (taken / "data").read_text(encoding="utf-8") == "d\n", "ajutorul a șters datele testului"
 
 
