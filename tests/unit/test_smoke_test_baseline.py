@@ -161,9 +161,11 @@ HOST=h; USER=u; SSH_OPTS=(-p 22)
 
 # Inițializarea LIVRATĂ, nu una scrisă aici: dacă linia dispare din script, `set -u` trebuie să
 # se plângă la sfârșit, iar un harnaș care o pune el însuși ar ascunde exact asta.
+# Dacă linia lipsește, harnașul NU o înlocuiește: `set -u` face scriptul să cadă la prima citire
+# a variabilei, iar testele de mai jos devin roșii cu o eroare numită (nu o eroare de import,
+# care ar fi un roșu cu zero teste trecute).
 _INIT = re.search(r'^REGRESSION_UNMEASURED=""$', SMOKE, re.M)
-assert _INIT, "inițializarea lui REGRESSION_UNMEASURED nu mai e în smoke-test.sh"
-PRELUDE += _INIT.group(0) + "\n"
+PRELUDE += (_INIT.group(0) if _INIT else "") + "\n"
 
 
 def _section(fleet: Fleet) -> str:
@@ -308,6 +310,7 @@ def test_a_missing_ports_baseline_is_a_warning_and_the_services_are_still_compar
     out = _regression(fleet)
     assert out.passes == 1 and out.warns == 1 and out.fails == 0, out.text
     assert "no pre-install baseline of listening ports" in out.lines("WARN")[0], out.text
+    assert "(ss could not be asked when it was taken)" in out.lines("WARN")[0], out.text
     assert out.unmeasured == ["ports"], out.text
     assert any("every service" in ln for ln in out.lines("PASS")), out.text
     assert not any("every port" in ln for ln in out.lines("PASS")), out.text
@@ -336,6 +339,19 @@ def test_a_baseline_that_sudo_cannot_read_is_not_reported_as_missing(fleet):
         assert "a password is required" in warning, warning
         assert "no pre-install baseline" not in warning, warning
         assert "Run by hand: sudo cat " in warning, warning
+
+
+def test_a_baseline_path_that_is_a_directory_is_unreadable_not_missing(fleet):
+    """Ceva EXISTĂ la calea baseline-ului, dar nu e un fișier (un director lăsat de o mutare
+    greșită). «Nu există baseline» ar trimite operatorul să-l recapteze; adevărul e că acolo e
+    altceva, iar `cat` spune ce. De aceea cititorul întreabă `-e`, nu `-f`."""
+    (fleet.state / "baseline-ports.txt").unlink()
+    (fleet.state / "baseline-ports.txt").mkdir()
+    out = _regression(fleet)
+    assert out.passes == 1 and out.warns == 1 and not out.lines("FAIL"), out.text
+    warning = out.lines("WARN")[0]
+    assert "could not read the pre-install baseline of ports" in warning, warning
+    assert "Is a directory" in warning and "no pre-install baseline" not in warning, warning
 
 
 def test_an_empty_baseline_compares_nothing_and_says_so(fleet):
@@ -532,6 +548,38 @@ def test_a_machine_that_cannot_make_a_temp_file_does_not_ask_the_host_at_all(fle
     got = _measure(fleet, stdout="22", stderr="", rc=0, mktemp_fails=True)
     assert got["RC"] == "1" and "mktemp failed" in got["WHY"], got
     assert "ssh" not in fleet.calls_text(), fleet.calls_text()
+
+
+def test_what_ssh_printed_before_it_was_cut_is_not_a_measurement(fleet):
+    """Aceeași regulă ca la o comandă căzută, pe codul 255: o conexiune tăiată după jumătate din
+    listă nu dă «lista». Jumătatea, luată drept întreg, ar face ca restul să pară pierdut."""
+    got = _measure(fleet, stdout="22\n80", stderr="client_loop: send disconnect", rc=255)
+    assert got["RC"] == "255" and got["OUT"] == "[]", got
+
+
+def test_a_failed_measurement_does_not_leak_into_the_next_one(fleet):
+    """Două măsurători în același shell, prima căzută (255), a doua bună. Codul de ieșire și
+    motivul primei nu au voie să rămână în a doua: altfel, după prima eroare, TOT ce urmează în
+    script ar fi raportat ca eșuat, chiar dacă gazda răspunde. (Apelantul își numește variabila
+    tot `rc`, ca o `rc` nelocală în `measure_remote` să o calce.)"""
+    counter = (fleet.tmp / "seq.count").as_posix()
+    _stub(fleet.bin, "ssh",
+          f'n=$(( $(cat "{counter}" 2>/dev/null || echo 0) + 1 )); echo "$n" > "{counter}"\n'
+          'if [[ "$n" == 1 ]]; then echo "boom" >&2; exit 255; fi\n'
+          'echo ok\n')
+    script = (PRELUDE + _function("measure_remote") + "\n"
+              'rc=0; measure_remote one || rc=$?\n'
+              'printf "FIRST=%s\\n" "$rc"\n'
+              'second=0; measure_remote two || second=$?\n'
+              'printf "SECOND=%s OUT=[%s] WHY=[%s]\\n" "$second" "$MEASURE_OUT" "$MEASURE_WHY"\n')
+    path = fleet.tmp / "seq.sh"
+    path.write_text(script, encoding="utf-8", newline="\n")
+    env = {**os.environ, **fleet.env}
+    env["PATH"] = fleet.bin.as_posix() + os.pathsep + env["PATH"]
+    proc = subprocess.run([BASH, path.as_posix()], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", env=env, timeout=60)
+    assert "FIRST=255" in proc.stdout, proc.stdout + proc.stderr
+    assert "SECOND=0 OUT=[ok] WHY=[]" in proc.stdout, proc.stdout + proc.stderr
 
 
 def test_ssh_failing_itself_is_told_apart_from_the_command_failing(fleet):

@@ -120,8 +120,7 @@ r() { ssh "${SSH_OPTS[@]}" "${USER}@${HOST}" "$@" 2>/dev/null; }
 #   altul codul comenzii de pe gazdă
 # MEASURE_WHY spune în cuvinte care dintre ele și prima linie de stderr. La eșec
 # MEASURE_OUT e golit: ce a apucat să tipărească o comandă căzută nu e o măsurătoare.
-MEASURE_OUT=""
-MEASURE_WHY=""
+# MEASURE_OUT și MEASURE_WHY sunt globale, setate de funcție la fiecare apel.
 measure_remote() {
     local errf rc=0 first
     MEASURE_OUT=""; MEASURE_WHY=""
@@ -488,14 +487,18 @@ report_loopback_probe() {
 # o taie: lista rămâne goală, nu are o intrare «».
 baseline_lines() {
     local dim="$1" raw="$2" which="$3"
-    if [[ "$which" == baseline ]]; then
-        printf '%s\n' "$raw" | LC_ALL=C sort -u
-        return
-    fi
-    case "$dim" in
-        services) printf '%s\n' "$raw" | awk '{print $1}' | LC_ALL=C sort -u ;;
-        ports)    printf '%s\n' "$raw" | awk '{print $4}' | sed 's/.*://' | LC_ALL=C sort -u ;;
-    esac
+    # Un singur `sort`, la capătul ambelor căi: o sortare scrisă pe fiecare cale putea
+    # rămâne fără `LC_ALL=C` pe una dintre ele fără ca vreo cifră de port să o trădeze.
+    {
+        if [[ "$which" == baseline ]]; then
+            printf '%s\n' "$raw"
+        else
+            case "$dim" in
+                services) printf '%s\n' "$raw" | awk '{print $1}' ;;
+                ports)    printf '%s\n' "$raw" | awk '{print $4}' | sed 's/.*://' ;;
+            esac
+        fi
+    } | LC_ALL=C sort -u
 }
 
 # Compară o dimensiune (services | ports) a gazdei CU baseline-ul luat înainte de
@@ -552,7 +555,9 @@ be asked when it was taken) — cannot verify automatically. Check by hand: ss -
 
     # Citirea baseline-ului: cod 3 = fișierul lipsește (ales de noi; nici `sudo`, nici
     # `cat`, nici ssh nu-l folosesc). Orice alt cod diferit de 0 = n-am putut citi.
-    reader='if [ -f "$1" ]; then exec cat "$1"; fi; exit 3'
+    # `-e`, nu `-f`: un director (sau orice altceva) la calea baseline-ului EXISTĂ, dar nu se
+    # poate citi — «n-am putut citi», cu eroarea lui `cat`, nu «nu există baseline».
+    reader='if [ -e "$1" ]; then exec cat "$1"; fi; exit 3'
     measure_remote "sudo -n sh -c '${reader}' sh ${file}" || rc=$?
     case $rc in
         0) was_raw="$MEASURE_OUT" ;;
