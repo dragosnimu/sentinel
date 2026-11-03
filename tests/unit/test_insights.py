@@ -7,11 +7,13 @@ its interesting branch without a live PostgreSQL.
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import re
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -416,7 +418,17 @@ def _ahora() -> datetime:
 
 @pytest.fixture(autouse=True)
 def _ceas_per_test(monkeypatch):
-    monkeypatch.setitem(globals(), "_ACUM_GAP", _ahora())
+    referinta = _ahora()
+    # Niciodată pe secunda :00. Toate deltele din fișier sunt minute întregi,
+    # deci secunda referinței e secunda fiecărui moment pus în fixtură, iar un
+    # moment pe :00 este chiar propriul lui bucket de minut (`_minut`). O
+    # interogare care ar trunchia coada la minut (`max(ts)` -> `…:00`) întoarce
+    # atunci exact șirul așteptat și defectul trece nevăzut: una din 60 de
+    # rulări. Se scade o secundă, nu se adaugă: o referință din viitor ar pune
+    # rânduri înaintea ceasului viu al interogării.
+    if referinta.second == 0:
+        referinta -= timedelta(seconds=1)
+    monkeypatch.setitem(globals(), "_ACUM_GAP", referinta)
 
 
 def _t(**delta) -> str:
@@ -465,6 +477,12 @@ _EPS_CEAS_S = 0.1
 #: interogării, în secunde. Un test durează milisecunde; 120 s e de ordinul
 #: duratei unui minut de suită, nu al unui test. Dacă referința revine la import,
 #: depășirea apare la primul minut de suită, nu la 30.
+#:
+#: E o aserțiune pe timp, deci are și ea o fereastră: o referință veche de mai
+#: puțin de 120 s trece. Revenirea la import nu atârnă de ea —
+#: `test_no_module_level_code_reads_the_clock` o prinde fără ceas, din sursă.
+#: Garda rămâne ca plasă pentru ce nu vede sursa (o referință adusă dintr-un alt
+#: modul, de pildă) și ca martor pentru un test lăsat să stea.
 _VARSTA_MAXIMA_REF_S = 120
 
 
@@ -499,9 +517,13 @@ def _ruleaza_gap(rollup=(), raw=()):
     # ies din ea și interogarea întoarce „nicio sursă" în loc de o valoare greșită.
     scurs = (t0 - _ACUM_GAP).total_seconds()
     assert scurs < _VARSTA_MAXIMA_REF_S, (
-        f"referința ceasului a fost luată cu {scurs:.0f} s înainte de interogare "
-        f"(maxim {_VARSTA_MAXIMA_REF_S} s): a revenit o referință pe modul, iar "
-        f"rezultatul depinde din nou de cât a durat suita până aici")
+        f"referința ceasului avea {scurs:.1f} s la rularea interogării (maxim "
+        f"{_VARSTA_MAXIMA_REF_S} s). Două cauze dau același număr: (1) referința "
+        f"s-a luat din nou la import, iar rezultatul depinde iar de cât a durat "
+        f"suita — atunci `test_no_module_level_code_reads_the_clock` e roșu și "
+        f"el; (2) procesul a stat oprit între fixtură și interogare (VM "
+        f"suspendată, SIGSTOP, swap) — atunci acela e verde, nu e o regresie, "
+        f"și testul se rulează din nou")
     return randuri, t0, t1
 
 
@@ -635,6 +657,138 @@ def test_the_reference_moment_is_never_read_from_the_clock_again(monkeypatch):
     inainte = _t(hours=3)
     monkeypatch.setitem(globals(), "datetime", _CeasInterzis)
     assert _t(hours=3) == inainte
+
+
+#: Ce citește ceasul prin nume. `_ahora`, `_t` și `_minut` sunt ale fișierului;
+#: restul sunt apelurile standard care întorc „acum”.
+_CITITORI_DE_CEAS = frozenset({"now", "utcnow", "today", "time", "monotonic",
+                               "perf_counter", "_ahora", "_t", "_minut"})
+
+
+def _apeluri_de_ceas_la_import(sursa: str) -> list[str]:
+    """Apelurile care citesc ceasul în cod ce rulează la IMPORTUL modulului.
+
+    Fără ceas și fără import: se citește sursa. Intră în „la import”: corpul
+    modulului, blocurile `if`/`for`/`with`/`try` de la nivelul lui, corpul
+    claselor, decoratorii și valorile implicite ale funcțiilor (de acolo vine
+    `parametrize(…, [_t(…)])`). Nu intră corpul funcțiilor și al lambdelor,
+    care rulează abia la apel.
+
+    O funcție din modul care cheamă, direct sau prin alta, un citit de ceas
+    devine și ea citit de ceas (punct fix): `X = ajutor()` nu ascunde
+    `datetime.now()` din `ajutor`. Ce NU vede: un ajutor adus din alt modul și
+    un nume ocolit prin `getattr` — pentru ele rămâne garda de vârstă din
+    `_ruleaza_gap`.
+    """
+    arbore = ast.parse(sursa)
+
+    def nume_apel(n: ast.Call) -> str:
+        f = n.func
+        return f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+
+    def valori_implicite(f):
+        return [d for d in (*f.args.defaults, *f.args.kw_defaults) if d is not None]
+
+    def la_import(nod):
+        if isinstance(nod, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for d in (*nod.decorator_list, *valori_implicite(nod)):
+                yield from la_import(d)
+            return
+        if isinstance(nod, ast.Lambda):
+            for d in valori_implicite(nod):
+                yield from la_import(d)
+            return
+        yield nod
+        for copil in ast.iter_child_nodes(nod):
+            yield from la_import(copil)
+
+    functii = [n for n in ast.walk(arbore)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    ceas = set(_CITITORI_DE_CEAS)
+    mai_merge = True
+    while mai_merge:
+        mai_merge = False
+        for f in functii:
+            if f.name not in ceas and any(
+                    isinstance(n, ast.Call) and nume_apel(n) in ceas
+                    for n in ast.walk(f)):
+                ceas.add(f.name)
+                mai_merge = True
+    return [f"linia {n.lineno}: {ast.unparse(n)[:80]}"
+            for n in la_import(arbore)
+            if isinstance(n, ast.Call) and nume_apel(n) in ceas]
+
+
+def test_no_module_level_code_reads_the_clock():
+    """Nicio referință de ceas nu se mai ia la importul modulului.
+
+    Pana pe care o previne: `_ACUM_GAP = datetime.now(...)` la nivel de modul
+    îngheța momentul la COLECTAREA suitei, iar `_GAP_SQL` măsoară de la ceasul
+    viu al lui SQLite. Pe o rulare întreagă (35-65 de minute) rândurile ieșeau
+    din marja testelor: fișierul rulat singur era verde, suita roșie, și roșul
+    nu mai spunea nimic despre interogare. Operatorul ar fi ajuns să nu mai
+    creadă nici roșul când interogarea chiar e stricată.
+
+    Garda de vârstă din `_ruleaza_gap` nu ține locul acestui test: ea măsoară
+    timp, deci o referință veche de sub 120 s o trece, iar pe o rulare scurtă a
+    fișierului (1 s) nici o referință de la import nu apucă să fie veche. Aici
+    nu e niciun ceas: se citește sursa și se cere ca la import să nu se cheme
+    nimic care întoarce „acum”. Cade la fel de o rulare de o secundă.
+    """
+    gasite = _apeluri_de_ceas_la_import(Path(__file__).read_text(encoding="utf-8"))
+    assert not gasite, (
+        "la importul modulului se citește ceasul, deci referința se îngheață "
+        f"la colectare: {gasite}. Referința se ia în `_ceas_per_test`.")
+
+
+def test_the_import_scan_sees_every_way_a_clock_can_be_frozen():
+    """Cercetarea de mai sus prinde fiecare formă a defectului, nu doar una.
+
+    Pana pe care o previne: un test care citește sursa și nu găsește nimic arată
+    la fel când modulul e curat și când cercetarea e oarbă (un nume schimbat, un
+    nod pe care nu-l vizitează). Un „nu s-a găsit nimic” care n-a văzut niciodată
+    ceva nu dovedește nimic; aici fiecare formă are un exemplu care TREBUIE să
+    iasă, iar perechea lor curată TREBUIE să nu iasă.
+    """
+    de_prins = {
+        "atribuire": "X = datetime.now(timezone.utc)",
+        "atribuire adnotată": "X: datetime | None = datetime.now()",
+        "referința modulului": "X = _t(hours=3)",
+        "bucket din referință": "X = _minut(_t(hours=3))",
+        "ajutor": "def h():\n    return datetime.now()\nX = h()",
+        "ajutor prin altul": ("def a():\n    return datetime.now()\n"
+                              "def b():\n    return a()\nX = b()"),
+        "decorator parametrize": ("@pytest.mark.parametrize('x', [_t(hours=1)])\n"
+                                  "def test_x(x):\n    pass"),
+        "valoare implicită": "def f(x=datetime.now()):\n    pass",
+        "bloc if": "if True:\n    X = time.time()",
+        "corp de clasă": "class C:\n    X = datetime.now()",
+        "comprehensiune": "X = [datetime.now() for _ in range(2)]",
+    }
+    for forma, cod in de_prins.items():
+        assert _apeluri_de_ceas_la_import(cod), f"nu a prins forma: {forma}"
+
+    curate = {
+        "constantă": "X = datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc)",
+        "None": "X = None",
+        "în corpul unei funcții": "def f():\n    return datetime.now()",
+        "în fixtură": ("@pytest.fixture(autouse=True)\n"
+                       "def g(monkeypatch):\n"
+                       "    monkeypatch.setitem(globals(), 'X', datetime.now())"),
+        "în lambdă": "F = lambda: datetime.now()",
+    }
+    for forma, cod in curate.items():
+        assert not _apeluri_de_ceas_la_import(cod), f"a prins pe nedrept: {forma}"
+
+    # Aceeași cercetare, pe sursa REALĂ a fișierului cu defectul pus înapoi:
+    # leagă exemplele de mai sus de forma pe care o are `_ACUM_GAP` aici.
+    sursa = Path(__file__).read_text(encoding="utf-8")
+    inapoi = sursa.replace(
+        "_ACUM_GAP: datetime | None = None",
+        "_ACUM_GAP: datetime | None = datetime.now(timezone.utc)", 1)
+    assert inapoi != sursa, "linia `_ACUM_GAP` nu mai are forma căutată"
+    assert _apeluri_de_ceas_la_import(inapoi), (
+        "cu referința pusă înapoi la nivel de modul, cercetarea n-a văzut-o")
 
 
 # --- multi-vector attackers -------------------------------------------------
