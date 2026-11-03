@@ -112,6 +112,53 @@ def _run(script: str, tmp_path: Path, extra_path: Path | None = None,
     )
 
 
+# ---------------------------------------------------------------------------
+# O unealtă care LIPSEȘTE de-adevăratelea, nu una pe care mașina o are sau nu
+# ---------------------------------------------------------------------------
+# `_run` PREPUNE directorul de stub-uri la PATH-ul mașinii, nu îl înlocuiește.
+# Un test care „nu are `getent`" doar fiindcă n-a scris un stub moștenește deci
+# ce are mașina: trece pe Git Bash (n-are getent) și pică pe Linux (glibc îl
+# are, rulează cel real, iar scriptul spune cu totul altceva). Un verde pe
+# Windows care nu poate fi verde pe singura platformă unde rulează instalatorul
+# e mai rău decât niciun test — se citește ca acoperire.
+#
+# Așa că absența se FACE: scriptul primește un PATH format din stub-uri plus
+# câteva „trambuline" către uneltele de care chiar are nevoie, rezolvate acum,
+# în procesul de test, pe PATH-ul real. Directoarele reale NU intră pe PATH —
+# pe Linux `getent` stă în /usr/bin, lângă `bash`, deci filtrarea pe directoare
+# nu poate separa una de cealaltă; singura listă care se poate ține e cea
+# pozitivă, a uneltelor numite.
+#
+# Lista e MINIMUL măsurat al drumului „getent lipsește" prin
+# `verify_dashboard_answers`, nu o presupunere: o unealtă nouă în drumul ăsta
+# face testul să pice zgomotos (`command not found`, cod 127, textul în
+# mesajul aserțiunii), nu să treacă tăcut.
+ABSENT = object()   # `getent=ABSENT`: nu există pe PATH-ul scriptului
+
+_PATH_TOOLS_WITHOUT_GETENT = ("bash",)
+
+
+def _path_tools_only(directory: Path, tools: tuple[str, ...]) -> Path:
+    """Un director cu câte o trambulină pentru fiecare unealtă din `tools`.
+
+    Trambulina e un script `#!/bin/sh` care face `exec` pe calea ABSOLUTĂ a
+    uneltei reale, găsită pe PATH-ul procesului de test. Nu e o copie și nu e o
+    legătură simbolică: pe Windows o copie a lui `bash.exe` fără DLL-ul de lângă
+    ea nu pornește, iar legăturile simbolice cer privilegii. `/bin/sh` în
+    shebang, nu `env`: `env bash` ar căuta chiar unealta pe care trambulina o
+    furnizează.
+    """
+    assert "getent" not in tools, "lista de unelte ar readuce chiar unealta care trebuie să lipsească"
+    for name in tools:
+        real = shutil.which(name)
+        assert real, f"`{name}` nu e pe PATH-ul mașinii de test — drumul „getent lipsește” nu poate rula"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / name
+        path.write_text(f'#!/bin/sh\nexec "{_p(Path(real))}" "$@"\n', encoding="utf-8", newline="\n")
+        path.chmod(path.stat().st_mode | stat_module.S_IEXEC | stat_module.S_IXGRP | stat_module.S_IXOTH)
+    return directory
+
+
 _PREAMBLE = (
     "set -euo pipefail\n"
     "source ./lib/common.sh\n"
@@ -449,13 +496,42 @@ _CURL_STUB = (
 )
 
 
-def _run_verify(tmp_path: Path, *, domain: str, getent: str | None = None,
+def _run_verify(tmp_path: Path, *, domain: str, getent: str | object | None = None,
                 **codes: str) -> subprocess.CompletedProcess:
+    """Rulează `verify_dashboard_answers` livrat, cu `getent` DECLARAT.
+
+    `getent=<corp>`  un stub cu corpul ăsta, înaintea oricărui `getent` real;
+    `getent=ABSENT`  nicio unealtă `getent` pe PATH-ul scriptului (vezi mai sus),
+                     iar scriptul DOVEDEȘTE asta cu `have` — cel livrat — înainte
+                     să pornească verificarea;
+    `getent=None`    testul nu spune nimic despre `getent`. Nu mai înseamnă „ce
+                     are mașina": se pune un stub-capcană, și dacă drumul ajunge
+                     totuși la el, ASTA e eroarea — un test care depinde de
+                     `getent` trebuie să-l declare.
+    """
     stubs = tmp_path / "bin"
+    tripwire = tmp_path / "getent-was-asked"
     _write_stub(stubs, "curl", _CURL_STUB)
     _write_stub(stubs, "ip", 'printf "1: eth0    inet 203.0.113.9/24 scope global eth0\\n"\n')
-    if getent is not None:
-        _write_stub(stubs, "getent", getent)
+    if getent is None:
+        _write_stub(stubs, "getent", f': > "{_p(tripwire)}"\nexit 99\n')
+    elif getent is not ABSENT:
+        _write_stub(stubs, "getent", str(getent))
+    proof = ""
+    env = {k: v for k, v in codes.items()}
+    if getent is ABSENT:
+        # Dovada vine din ACELAȘI `have` pe care îl folosește codul testat, rulat
+        # de același shell: dacă `getent` e totuși ajungător, testul moare aici
+        # cu 97, nu mai departe pe o ramură care nu e cea numită.
+        proof = (
+            "if have getent; then\n"
+            '    echo "PRECONDITION: getent is reachable at $(command -v getent)" >&2\n'
+            "    exit 97\n"
+            "fi\n"
+            'echo "GETENT_UNREACHABLE"\n'
+        )
+        shim = _path_tools_only(tmp_path / "shim", _PATH_TOOLS_WITHOUT_GETENT)
+        env["PATH"] = _p(stubs) + os.pathsep + _p(shim)
     script = (
         _PREAMBLE
         + f'DOMAIN="{domain}"\n'
@@ -465,13 +541,18 @@ def _run_verify(tmp_path: Path, *, domain: str, getent: str | None = None,
         + _line(r"^closing_note\(\).*$") + "\n"
         + _line(r"^SENTINEL_ANSWERED=.*$") + "\n"
         + _funcs("https_code", "name_resolution_note", "verify_dashboard_answers")
+        + proof
         + "verify_dashboard_answers\n"
         + 'echo "PASSED_CHECK"\n'
         + 'if (( ${#PENDING_OBSTACLES[@]} )); then\n'
         + '    printf "OBSTACLE: %s\\n" "${PENDING_OBSTACLES[@]}"\n'
         + "fi\n"
     )
-    return _run(script, tmp_path, extra_path=stubs, env={k: v for k, v in codes.items()})
+    proc = _run(script, tmp_path, extra_path=stubs, env=env)
+    assert not tripwire.exists(), (
+        "drumul a chemat `getent`, dar testul nu l-a declarat: dă `getent=<corp>` "
+        "sau `getent=ABSENT`, nu ce are mașina")
+    return proc
 
 
 def _fatal_text(proc: subprocess.CompletedProcess) -> str:
@@ -631,16 +712,42 @@ def test_with_domain_a_name_that_does_not_arrive_weakens_the_check_out_loud(tmp_
 
 
 def test_a_missing_getent_is_reported_as_unknown_not_as_a_clean_name(tmp_path):
-    """CLAUDE.md: „nu pot verifica" ≠ „e curat". Fără `getent` pe PATH, motivul
-    pentru care numele nu răspunde e NECUNOSCUT, și se spune ca atare în loc să
-    se tacă."""
-    proc = _run_verify(tmp_path, domain="panou.example.test",
+    """CLAUDE.md: „nu pot verifica" ≠ „e curat". Pe o gazdă fără `getent`,
+    instalatorul NU a putut întreba dacă numele rezolvă; dacă i-ar atribui
+    totuși răspunsul „nu rezolvă deloc", operatorul ar căuta o pană de DNS pe
+    care nimeni n-a măsurat-o, în loc să afle că gazda n-are cu ce o măsura.
+    Cele două răspunsuri trebuie să se deosebească pe ecran: „NECUNOSCUT, nu am
+    avut cu ce întreba" vs „am întrebat și nu rezolvă" (testul de mai sus).
+
+    Condiția e FĂCUTĂ de test (`getent=ABSENT`: niciun `getent` pe PATH-ul
+    scriptului, dovedit în script cu `have`), nu moștenită. Versiunea
+    anterioară nu scria niciun stub și trecea pe Git Bash doar fiindcă
+    mașina n-are `getent`; pe Linux rula `getent`-ul real și pica.
+
+    Falsificat scoțând ramura `if ! have getent` din `name_resolution_note`:
+    `getent` lipsă ajunge pe `|| true`, iese un răspuns gol, iar mesajul devine
+    „nu rezolvă deloc" — afirmația pe care nimeni n-a măsurat-o.
+    """
+    proc = _run_verify(tmp_path, domain="panou.example.test", getent=ABSENT,
                        NAME_CODE="000", LOOP_CODE="200", UNKNOWN_CODE="444")
     assert proc.returncode == 0, proc.stdout + proc.stderr
+    # Condiția a fost cea numită: scriptul a verificat el însuși, cu `have`.
+    assert "GETENT_UNREACHABLE" in proc.stdout, proc.stdout + proc.stderr
+    assert "PASSED_CHECK" in proc.stdout, proc.stdout + proc.stderr
     out = proc.stdout + proc.stderr
     # Fraza întreagă, nu cuvântul: „UNKNOWN" singur ar fi putut veni din orice
     # alt mesaj al pasului.
     assert "resolves at all is UNKNOWN" in out, out
+    # Și cauza, ca operatorul să știe ce îi lipsește gazdei.
+    assert "getent is missing from this host" in out, out
+    # Nu doar „spune UNKNOWN": nu spune ȘI contrariul. „Nu rezolvă deloc" e
+    # rezultatul unei măsurători, iar aici nu s-a făcut niciuna.
+    assert "does not resolve on this host at all" not in out, out
+    # Ajunge și în rezumatul final (obstacolul), nu doar în avertismentul care
+    # trece pe ecran în mijlocul instalării.
+    obstacles = [ln for ln in proc.stdout.splitlines() if ln.startswith("OBSTACLE:")]
+    assert len(obstacles) == 1, proc.stdout
+    assert "resolves at all is UNKNOWN" in obstacles[0], obstacles[0]
 
 
 def test_with_domain_the_deny_block_is_proven_to_refuse_not_assumed(tmp_path):
