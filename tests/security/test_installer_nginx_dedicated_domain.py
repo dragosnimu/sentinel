@@ -130,9 +130,32 @@ def _run(script: str, tmp_path: Path, extra_path: Path | None = None,
 # pozitivă, a uneltelor numite.
 #
 # Lista e MINIMUL măsurat al drumului „getent lipsește" prin
-# `verify_dashboard_answers`, nu o presupunere: o unealtă nouă în drumul ăsta
-# face testul să pice zgomotos (`command not found`, cod 127, textul în
-# mesajul aserțiunii), nu să treacă tăcut.
+# `verify_dashboard_answers`, nu o presupunere. Ce se întâmplă când drumul
+# ajunge la o unealtă nouă, nelistată, NU e un cod 127 care oprește testul:
+# `name_resolution_note` e chemată doar ca `note="$(name_resolution_note …)"`,
+# iar substituția de comandă pierde `errexit` (installer-ul nu pune niciodată
+# `inherit_errexit`). `command not found` ajunge pe stderr, 127 se pierde în
+# substituție, nota iese oricum, iar fiecare aserțiune pe ieșire trece — măsurat:
+# un `hostname >/dev/null` fără pază pus în ramura „getent lipsește" dădea 46
+# verzi pe Git Bash și pe WSL. De aceea `_run_verify` verifică STDERR-ul: fraza
+# `command not found` acolo face testul să pice, cu textul în mesaj.
+#
+# LIMITA CARE RĂMÂNE: o unealtă pusă sub `2>/dev/null || true` nu lasă nicio
+# urmă pe stderr, deci nici aserțiunea asta, nici vreo altă abordare pe PATH n-o
+# poate vedea (`hostname 2>/dev/null || true` rămâne verde, declarat, nu scăpat).
+# Ce o prinde e citirea codului, nu testul.
+#
+# De ce `LC_ALL=C` în `_run_verify`: bash traduce mesajul „command not found" cu
+# gettext, iar o aserțiune pe fraza englezească ar fi oarbă sub un bash tradus.
+# Neobservat aici (nicio gazdă de test nu are locale traduse: Git Bash n-are
+# `/usr/share/locale`, WSL are doar C/POSIX); s-a observat doar că fixarea nu
+# schimbă niciun rezultat.
+#
+# Dacă trambulina însăși e stricată (ex. nu e executabilă), testul pică cu
+# `[FATAL] … answered 000`, ca și cum ar fi o pană a sondei pe loopback: shim-ul
+# stricat eșuează în interiorul lui `https_code`, sub `|| true`, iar sonda
+# raportează 000. Roșul e real, dar arată spre sondă, nu spre trambulină — pornește
+# de la `ls -l` pe directorul `shim`, nu de la nginx.
 ABSENT = object()   # `getent=ABSENT`: nu există pe PATH-ul scriptului
 
 _PATH_TOOLS_WITHOUT_GETENT = ("bash",)
@@ -518,7 +541,9 @@ def _run_verify(tmp_path: Path, *, domain: str, getent: str | object | None = No
     elif getent is not ABSENT:
         _write_stub(stubs, "getent", str(getent))
     proof = ""
-    env = {k: v for k, v in codes.items()}
+    # LC_ALL=C: aserțiunea de pe stderr de mai jos caută fraza englezească (vezi
+    # blocul „O unealtă care LIPSEȘTE" despre traducere).
+    env = {"LC_ALL": "C", **codes}
     if getent is ABSENT:
         # Dovada vine din ACELAȘI `have` pe care îl folosește codul testat, rulat
         # de același shell: dacă `getent` e totuși ajungător, testul moare aici
@@ -552,6 +577,15 @@ def _run_verify(tmp_path: Path, *, domain: str, getent: str | object | None = No
     assert not tripwire.exists(), (
         "drumul a chemat `getent`, dar testul nu l-a declarat: dă `getent=<corp>` "
         "sau `getent=ABSENT`, nu ce are mașina")
+    # O unealtă care lipsește din drum NU oprește scriptul: 127 se pierde în
+    # substituția de comandă `note="$(name_resolution_note …)"`, iar singura
+    # urmă e linia de pe stderr. Pe TOATE rulările, nu doar pe `ABSENT`: un
+    # `command not found` din codul livrat nu e niciodată o veste bună, iar
+    # măsurat (46 teste, Git Bash și WSL) nicio rulare existentă nu scoate așa
+    # ceva pe stderr, deci aserțiunea nu cere nicio excepție.
+    assert "command not found" not in proc.stderr, (
+        "codul livrat a chemat o unealtă care nu e pe PATH-ul testului; exit 127 "
+        "se pierde în `$(…)`, deci doar stderr-ul o arată:\n" + proc.stderr)
     return proc
 
 
