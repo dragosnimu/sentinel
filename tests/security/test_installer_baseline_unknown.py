@@ -1256,6 +1256,165 @@ def test_a_record_that_cannot_be_written_is_reported_even_when_the_temp_file_exi
     assert "could not write" in res.out and "baseline captured" not in res.out, res.out
 
 
+# ---------------------------------------------------------------------------
+# Ce se verifică la scriere: unde SE AFLĂ fișierul după mutare, nu ce a răspuns `mv`.
+# `mv -f TMP DIRECTOR` iese cu 0 și mută TMP ÎN director: înainte, o capturare peste un
+# director în locul înregistrării tipărea «[+] baseline captured» și ieșea cu 0, cu un
+# fișier temporar ascuns în interiorul directorului.
+def _tree(root: Path) -> list[str]:
+    return sorted(p.relative_to(root).as_posix() for p in root.rglob("*"))
+
+
+def _success_line(res: Result) -> str:
+    """Ce spune linia «[+] baseline captured: …» (doar ea; avertismentele cu aceleași cuvinte
+    stau pe alte rânduri). Gol dacă linia lipsește."""
+    match = re.search(r"^\[\+\] baseline captured: (.*)$", res.out, re.M)
+    return match.group(1) if match else ""
+
+
+def test_a_directory_where_the_record_goes_is_refused_not_celebrated(host):
+    """Un DIRECTOR la calea înregistrării (`baseline-state.txt`). `rm -f` nu-l poate șterge, iar
+    `mv -f` ar reuși MUTÂND fișierul temporar în el: operatorul vedea «[+] baseline captured: …»
+    și cod 0 deasupra unei înregistrări care nu era unde o citește pasul 39. Acum: nicio
+    măsurătoare, nicio linie de succes, cod 2, un avertisment care NUMEȘTE calea și motivul
+    (mesajul lui `rm`), directorul neatins (gol) și niciun colector chemat."""
+    record = host.state / "baseline-state.txt"
+    record.mkdir(parents=True)
+    res = host.capture()
+    assert res.rc == 2, res.out
+    assert "baseline captured" not in res.out and "[+]" not in res.out, res.out
+    assert "baseline NOT taken" in res.out and f"{record.as_posix()} could not be removed" in res.out, res.out
+    assert "Is a directory" in res.out, res.out
+    assert _tree(host.state) == ["baseline-state.txt"], _tree(host.state)
+    assert host.calls_text() == "", f"un colector a fost chemat: {host.calls_text()!r}"
+    # ce vede pasul 39 după aceea: necunoscut, cu un cuvânt care îl trimite la fișier
+    probe = host.run('baseline_state "$STATE_MARKERS" services\n')
+    assert probe.proc.stdout.strip() == "unreadable", probe.out
+
+
+def test_a_refused_capture_does_not_leave_the_previous_file_paths_standing(host):
+    """O capturare refuzată (înregistrarea veche nu poate fi ștearsă) lasă `BASELINE_SERVICES` și
+    `BASELINE_PORTS` goale, nu îndreptate spre fișierele capturării de dinainte: cine le citește
+    după apel ar crede că baseline-ul a fost luat acum."""
+    state = host.state.as_posix()
+    res = host.run(
+        'capture_baseline > /dev/null\necho "FIRST=$BASELINE_SERVICES"\n'
+        f'rm -f "{state}/baseline-state.txt"\nmkdir "{state}/baseline-state.txt"\n'
+        'rc=0; capture_baseline > /dev/null 2>&1 || rc=$?\n'
+        'echo "SECOND=[$BASELINE_SERVICES][$BASELINE_PORTS]"\necho "RC=$rc"\n')
+    assert res.vars["FIRST"].endswith("baseline-services.txt"), res.out
+    assert res.rc == 2 and res.vars["SECOND"] == "[][]", res.out
+
+
+def test_a_refused_capture_still_says_why_under_set_e_when_called_bare(host):
+    """Un apel gol sub `set -e` (fără `||`) nu are voie să moară în tăcere: exit-ul lui `rm` e
+    citit pe aceeași linie. Altfel scriptul se oprea cu un singur rând `rm: cannot remove …`,
+    fără să spună că nu s-a luat niciun baseline și ce are de făcut operatorul."""
+    (host.state / "baseline-state.txt").mkdir(parents=True)
+    res = host.run("capture_baseline\necho UNREACHED\n")
+    assert "baseline NOT taken" in res.out, res.out
+    assert "UNREACHED" not in res.out and res.proc.returncode == 2, res.out
+
+
+def test_a_directory_that_appears_at_the_record_path_while_measuring_is_not_filled(host):
+    """Directorul apare DUPĂ ștergerea înregistrării vechi (aici: o momeală `ss` îl creează).
+    `mv` l-ar umple cu fișierul temporar și ar răspunde 0. Garda dinaintea mutării refuză: avertisment
+    pe înregistrare cu motivul, cod 2, nicio linie «baseline captured» și NIMIC ascuns în director."""
+    record = host.state / "baseline-state.txt"
+    _stub(host.bin, "ss",
+          f'echo "ss $*" >> "{host.calls.as_posix()}"\n'
+          f'mkdir "{record.as_posix()}"\n'
+          "echo 'LISTEN 0 128 0.0.0.0:22 0.0.0.0:*'\n")
+    res = host.capture()
+    assert res.rc == 2, res.out
+    assert "baseline captured" not in res.out, res.out
+    assert f"could not write {record.as_posix()} ({record.as_posix()} is a directory" in res.out, res.out
+    assert record.is_dir() and _tree(record) == [], _tree(record)
+    assert not [p for p in host.state.iterdir() if p.name.startswith(".")], _tree(host.state)
+
+
+def test_a_mv_that_succeeds_without_putting_the_record_there_is_not_a_record(host):
+    """Un `mv` care iese cu 0 fără ca fișierul să ajungă la cale (aici: o momeală care nu face
+    nimic). Se verifică FAPTUL, nu codul de ieșire: fără înregistrare pe disc, nicio linie
+    «baseline captured», avertisment cu motivul, cod 2 și niciun fișier temporar rămas."""
+    _stub(host.bin, "mv", 'case "$*" in *baseline-state*) exit 0 ;; esac\n'
+          'PATH="${PATH#*:}"\nexec mv "$@"\n')
+    res = host.capture()
+    assert res.rc == 2 and host.record() is None, res.out
+    assert "baseline captured" not in res.out, res.out
+    assert "mv reported success but" in res.out and "is not a file" in res.out, res.out
+    assert not [p for p in host.state.iterdir() if p.name.startswith(".")], _tree(host.state)
+
+
+@pytest.mark.parametrize("dim", DIMS)
+def test_a_directory_where_a_data_file_goes_is_unmeasured_not_a_zero_count(host, dim):
+    """Același defect pe fișierele de date: un DIRECTOR la `baseline-<dim>.txt`. `mv -f` îl umplea
+    cu `.new`, `wc -l < director` dădea o eroare, iar linia de succes spunea «0 listening ports»
+    pe o dimensiune care nu fusese stocată nicăieri, cu înregistrarea pe «measured». Acum:
+    dimensiunea e «unmeasured», avertisment care numește calea și ce să facă omul, nicio
+    cifră pentru ea în linia de succes, nimic ascuns în director și nicio eroare brută."""
+    target = host.state / f"baseline-{dim}.txt"
+    target.mkdir(parents=True)
+    res = host.capture()
+    assert res.rc == 2, res.out
+    assert f"{dim}=unmeasured" in host.record(), res.out
+    assert f"baseline of {dim} was measured but NOT stored" in res.out, res.out
+    assert f"{target.as_posix()} is a directory" in res.out, res.out
+    assert "remove or rename it" in res.out, res.out
+    assert _tree(target) == [], f"ceva a fost mutat în director: {_tree(target)}"
+    assert _success_line(res), f"martorul pozitiv: linia de succes trebuia să existe pentru celelalte: {res.out}"
+    assert PHRASE[dim] not in _success_line(res), res.out
+    assert not re.search(r"^(wc|rm|mv):", res.out, re.M), res.out
+    for other in DIMS:
+        if other != dim:
+            assert f"{other}=measured" in host.record(), res.out
+    probe = host.run(f'baseline_state "$STATE_MARKERS" {dim}\n')
+    assert probe.proc.stdout.strip() == "unmeasured", probe.out
+
+
+def test_a_mv_that_succeeds_without_putting_a_data_file_there_is_unmeasured(host):
+    """Aceeași regulă pe fișierul de date: `mv` iese cu 0 și nu pune nimic la cale. Dimensiunea nu
+    e «măsurată» (nu există fișier), avertismentul spune de ce, iar `.new` nu rămâne orfan."""
+    _stub(host.bin, "mv", 'case "$*" in *baseline-ports.txt.new*) exit 0 ;; esac\n'
+          'PATH="${PATH#*:}"\nexec mv "$@"\n')
+    res = host.capture()
+    assert res.rc == 2 and host.data("ports") is None, res.out
+    assert "ports=unmeasured" in host.record(), res.out
+    assert "baseline of ports was measured but NOT stored" in res.out, res.out
+    assert "mv reported success but" in res.out, res.out
+    assert _success_line(res), f"martorul pozitiv: linia de succes trebuia să existe pentru celelalte: {res.out}"
+    assert "listening ports" not in _success_line(res), res.out
+    assert not (host.state / "baseline-ports.txt.new").exists(), _tree(host.state)
+
+
+def test_a_failed_collector_with_a_directory_in_its_place_leaves_it_alone_quietly(host):
+    """`ss` cade și la calea lui e un director: curățarea `rm -f` nu-l poate șterge. Înainte
+    tipărea o eroare brută `rm: cannot remove …` lângă avertisment (iar sub `set -e` fără `||`
+    oprea funcția la jumătate, înainte de înregistrare). Acum directorul rămâne, dimensiunea e
+    «unmeasured» și avertismentul e cel al colectorului, singur."""
+    target = host.state / "baseline-ports.txt"
+    target.mkdir(parents=True)
+    host.fail("ports")
+    res = host.capture()
+    assert res.rc == 2 and "ports=unmeasured" in host.record(), res.out
+    assert "baseline of ports NOT captured: ss -tlnH failed" in res.out, res.out
+    assert not re.search(r"^rm:", res.out, re.M), res.out
+    assert target.is_dir() and _tree(target) == [], _tree(host.state)
+
+
+def test_no_docker_with_a_directory_at_the_containers_path_is_none_without_noise(host):
+    """Fără `docker`, calea containerelor se curăță ca să nu rămână un fișier vechi. Dacă acolo
+    e un director, curățarea nu are voie să tipărească o eroare brută `rm:` pe ecranul unei
+    instalări care altfel a mers: «none», cod 0, directorul neatins."""
+    target = host.state / "baseline-containers.txt"
+    target.mkdir(parents=True)
+    res = host.capture(no_docker=True)
+    assert res.rc == 0, res.out
+    assert "containers=none" in host.record(), res.out
+    assert not re.search(r"^rm:", res.out, re.M), res.out
+    assert target.is_dir(), _tree(host.state)
+
+
 def test_a_comparison_that_cannot_sort_the_current_state_is_unknown(host):
     """A doua jumătate a comparației: `sort` pe starea de ACUM. Dacă pică doar el, `comm` ar
     primi un fișier lipsă/gol și ar raporta tot baseline-ul ca pierdut (direcția B) sau nimic;
