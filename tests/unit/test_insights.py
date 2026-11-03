@@ -416,19 +416,26 @@ def _ahora() -> datetime:
     return datetime.now(timezone.utc)
 
 
-@pytest.fixture(autouse=True)
-def _ceas_per_test(monkeypatch):
+def _pune_referinta(monkeypatch) -> None:
+    """Pune referința testului curent: ceasul viu, dar niciodată pe secunda :00.
+
+    Toate deltele din fișier sunt minute întregi, deci secunda referinței e
+    secunda fiecărui moment pus în fixtură, iar un moment pe :00 este chiar
+    propriul lui bucket de minut (`_minut`). O interogare care ar trunchia coada
+    la minut (`max(ts)` -> `…:00`) întoarce atunci exact șirul așteptat și
+    defectul trece nevăzut: una din 60 de rulări. Se scade o secundă, nu se
+    adaugă: o referință din viitor ar pune rânduri înaintea ceasului viu al
+    interogării.
+    """
     referinta = _ahora()
-    # Niciodată pe secunda :00. Toate deltele din fișier sunt minute întregi,
-    # deci secunda referinței e secunda fiecărui moment pus în fixtură, iar un
-    # moment pe :00 este chiar propriul lui bucket de minut (`_minut`). O
-    # interogare care ar trunchia coada la minut (`max(ts)` -> `…:00`) întoarce
-    # atunci exact șirul așteptat și defectul trece nevăzut: una din 60 de
-    # rulări. Se scade o secundă, nu se adaugă: o referință din viitor ar pune
-    # rânduri înaintea ceasului viu al interogării.
     if referinta.second == 0:
         referinta -= timedelta(seconds=1)
     monkeypatch.setitem(globals(), "_ACUM_GAP", referinta)
+
+
+@pytest.fixture(autouse=True)
+def _ceas_per_test(monkeypatch):
+    _pune_referinta(monkeypatch)
 
 
 def _t(**delta) -> str:
@@ -659,6 +666,31 @@ def test_the_reference_moment_is_never_read_from_the_clock_again(monkeypatch):
     assert _t(hours=3) == inainte
 
 
+def test_the_reference_never_lands_on_second_zero(monkeypatch):
+    """Referința testului nu cade niciodată pe secunda :00.
+
+    Pana pe care o previne: cu referința pe :00, orice moment pus în fixtură e
+    chiar propriul lui bucket de minut, deci o interogare care ar trunchia coada
+    la minut (`aggregate.py`: `max(ts)` -> `…:00`) întoarce exact ce se așteaptă
+    și `test_a_source_with_several_actions_produces_one_row` rămâne verde pe un
+    defect real. Se întâmplă într-o rulare din 60, deci defectul ar putea trece
+    de o rulare verde. Ceasul e înlocuit cu momente date, nu citit: testul cade
+    la fel de fiecare dată, nu o dată din 60.
+    """
+    for micro in (0, 1, 500_000, 999_999):
+        pe_zero = datetime(2026, 11, 3, 10, 15, 0, micro, tzinfo=timezone.utc)
+        monkeypatch.setitem(globals(), "_ahora", lambda m=pe_zero: m)
+        _pune_referinta(monkeypatch)
+        assert _ACUM_GAP.second != 0, f"referința a rămas pe :00 ({micro} µs)"
+        assert timedelta(0) < pe_zero - _ACUM_GAP <= timedelta(seconds=1), (
+            "referința trebuie să fie în trecut, la cel mult o secundă")
+
+    oarecare = datetime(2026, 11, 3, 10, 15, 37, 250_000, tzinfo=timezone.utc)
+    monkeypatch.setitem(globals(), "_ahora", lambda: oarecare)
+    _pune_referinta(monkeypatch)
+    assert _ACUM_GAP == oarecare, "un moment care nu e pe :00 nu se atinge"
+
+
 #: Ce citește ceasul prin nume. `_ahora`, `_t` și `_minut` sunt ale fișierului;
 #: restul sunt apelurile standard care întorc „acum”.
 _CITITORI_DE_CEAS = frozenset({"now", "utcnow", "today", "time", "monotonic",
@@ -780,14 +812,12 @@ def test_the_import_scan_sees_every_way_a_clock_can_be_frozen():
     for forma, cod in curate.items():
         assert not _apeluri_de_ceas_la_import(cod), f"a prins pe nedrept: {forma}"
 
-    # Aceeași cercetare, pe sursa REALĂ a fișierului cu defectul pus înapoi:
-    # leagă exemplele de mai sus de forma pe care o are `_ACUM_GAP` aici.
+    # Aceeași cercetare, pe sursa REALĂ a fișierului cu defectul adăugat la
+    # coadă: arată că ea trece prin tot ce are fișierul și tot îl vede. Nu
+    # depinde de forma liniei `_ACUM_GAP` de azi.
     sursa = Path(__file__).read_text(encoding="utf-8")
-    inapoi = sursa.replace(
-        "_ACUM_GAP: datetime | None = None",
-        "_ACUM_GAP: datetime | None = datetime.now(timezone.utc)", 1)
-    assert inapoi != sursa, "linia `_ACUM_GAP` nu mai are forma căutată"
-    assert _apeluri_de_ceas_la_import(inapoi), (
+    assert _apeluri_de_ceas_la_import(
+        sursa + "\n_ACUM_GAP = datetime.now(timezone.utc)\n"), (
         "cu referința pusă înapoi la nivel de modul, cercetarea n-a văzut-o")
 
 
