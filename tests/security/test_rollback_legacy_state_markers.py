@@ -30,6 +30,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _symlinks import present
 
 REPO = Path(__file__).resolve().parents[2]
 ROLLBACK_SH = REPO / "deploy" / "rollback.sh"
@@ -139,20 +140,7 @@ def test_rollback_legacy_cleanup_is_a_no_op_when_nothing_legacy_exists(tmp_path)
 # ---------------------------------------------------------------------------
 # `rm -rf` pe un symlink șterge linkul, nu urmează ținta
 # ---------------------------------------------------------------------------
-def _symlink_capable(tmp_path: Path) -> bool:
-    """Sondă reală, nu presupunere: pe Windows fără
-    `SeCreateSymbolicLinkPrivilege`, `Path.symlink_to` ridică `OSError`."""
-    target = tmp_path / "_symprobe_target"
-    link = tmp_path / "_symprobe_link"
-    target.mkdir()
-    try:
-        link.symlink_to(target, target_is_directory=True)
-    except OSError:
-        return False
-    return link.is_symlink()
-
-
-def test_a_symlink_at_the_legacy_path_is_removed_without_following_it(tmp_path):
+def test_a_symlink_at_the_legacy_path_is_removed_without_following_it(tmp_path, make_link):
     """Dacă `.install-state` a rămas un symlink (planted de `sentinel`, care
     deține părintele) către alt director real, `rm -rf` pe calea veche
     trebuie să șteargă LINKUL, nu conținutul țintei — un `rm -rf` care ar
@@ -162,11 +150,19 @@ def test_a_symlink_at_the_legacy_path_is_removed_without_following_it(tmp_path):
     Falsificat schimbând `rm -rf -- "${_LEGACY_STATE_MARKERS}"` într-o formă
     care urmează linkul (ex. adăugând `/` la coadă) — testul trebuie să vadă
     `victim/secret` dispărut.
-    """
-    if not _symlink_capable(tmp_path):
-        pytest.skip("mediul ăsta nu poate crea symlinkuri reale (fără "
-                    "SeCreateSymbolicLinkPrivilege) — netestat, nu curat")
 
+    Pentru operator: un `--purge` care urmează linkul plantat golește un director
+    care nu e al Sentinel (ca root), în loc să șteargă doar linkul și să raporteze
+    „curățat".
+
+    Linkul vine din `make_link` (tests/_symlinks.py): symlink adevărat unde se poate,
+    altfel legătura proprie a runtime-ului MSYS, pe care `rm` din Git Bash o tratează
+    ca pe un symlink (măsurat: `rm -rf L` șterge legătura și lasă ținta, `rm -rf L/`
+    golește ținta — identic cu GNU rm pe WSL). Pe Windows fără privilegiu nu se sare,
+    fiindcă garda ar rămâne fără observator. `legacy.exists()` din pathlib nu vede
+    legătura MSYS, deci „linkul a dispărut" se întreabă bash-ului (`present`) — altfel
+    aserțiunea ar fi adevărată oricum.
+    """
     sentinel_state_dir = tmp_path / "sentinel_state"
     sentinel_state_dir.mkdir(parents=True)
     victim = tmp_path / "victim"
@@ -174,13 +170,13 @@ def test_a_symlink_at_the_legacy_path_is_removed_without_following_it(tmp_path):
     (victim / "secret").write_text("root ALL=(ALL) ALL\n", encoding="utf-8", newline="\n")
 
     legacy = sentinel_state_dir / ".install-state"
-    legacy.symlink_to(victim, target_is_directory=True)
+    make_link(legacy, victim)
 
     install_state_dir = tmp_path / "install_state"
     install_state_dir.mkdir(parents=True)
 
     proc = _run(_harness(tmp_path, sentinel_state_dir, install_state_dir), tmp_path)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert not legacy.exists() and not legacy.is_symlink(), "linkul n-a fost șters"
+    assert not present(legacy), "linkul n-a fost șters"
     assert (victim / "secret").read_text(encoding="utf-8") == "root ALL=(ALL) ALL\n", (
         "conținutul directorului țintit de symlink a fost șters — linkul a fost urmat")

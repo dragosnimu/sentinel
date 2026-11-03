@@ -35,23 +35,6 @@ BASH = shutil.which("bash")
 pytestmark = pytest.mark.skipif(BASH is None, reason="fără bash în PATH")
 
 
-def _can_symlink(tmp: Path) -> bool:
-    """Poate mașina asta să facă un simbolic către un director?
-
-    Pe Windows fără elevare, nu — iar cele două teste care depind de el n-ar mai
-    proba nimic dacă le-am slăbi ca să treacă. Sar VIZIBIL, cu motivul scris,
-    fiindcă un test sărit în tăcere e mai rău decât unul care lipsește: pare
-    acoperire.
-    """
-    tinta = tmp / "_probă_țintă"
-    tinta.mkdir(exist_ok=True)
-    try:
-        (tmp / "_probă_legătură").symlink_to(tinta, target_is_directory=True)
-    except (OSError, NotImplementedError):
-        return False
-    return True
-
-
 def _sh(script: str) -> subprocess.CompletedProcess:
     return subprocess.run([BASH, "-c", script], capture_output=True, text=True)
 
@@ -119,11 +102,17 @@ def test_a_step_that_is_not_always_is_still_skipped_when_done() -> None:
 # ---------------------------------------------------------------------------
 
 def _snapshot_dir(from_step: str, latest_points_to: Path | None,
-                  tmp: Path) -> str:
+                  tmp: Path, make_link=None) -> str:
     """Rulează BUCATA din `resolve_config` care alege calea instantaneului.
 
     Tăiată din fișierul livrat, nu rescrisă: un test care retipărește logica
     verifică copia lui, nu codul care ajunge pe gazdă.
+
+    Simbolicul `predeploy-latest` vine din `make_link` (tests/_symlinks.py): un
+    symlink adevărat unde se poate, altfel legătura proprie a runtime-ului MSYS,
+    pe care `[[ -L ]]` și `readlink -f` din bash o văd ca pe un symlink spre un
+    director. Pe Windows fără elevare testele cu simbolic NU mai sar — sărite, ar fi
+    lăsat condiția `FROM_STEP > 18` fără niciun observator.
     """
     text = INSTALL.read_text(encoding="utf-8")
     match = re.search(
@@ -134,8 +123,7 @@ def _snapshot_dir(from_step: str, latest_points_to: Path | None,
     backup.mkdir(exist_ok=True)
     if latest_points_to is not None:
         latest_points_to.mkdir(parents=True, exist_ok=True)
-        (backup / "predeploy-latest").symlink_to(
-            latest_points_to, target_is_directory=True)
+        make_link(backup / "predeploy-latest", latest_points_to)
 
     body = match.group(0).replace("local ", "")
     out = _sh(
@@ -148,36 +136,38 @@ def _snapshot_dir(from_step: str, latest_points_to: Path | None,
     return out.stdout.strip()
 
 
-def test_a_plain_deploy_keeps_its_own_fresh_snapshot_path(tmp_path) -> None:
+def test_a_plain_deploy_keeps_its_own_fresh_snapshot_path(tmp_path, make_link) -> None:
     """Un deploy obișnuit NU moștenește instantaneul rulării anterioare.
 
     Simbolicul `predeploy-latest` există — e chiar situația de pe gazda reală,
     unde arăta spre un director din 31 iulie. Calea aleasă trebuie să rămână cea
     a rulării curente.
+
+    Falsificat făcând condiția din `resolve_config` mereu adevărată (scoțând
+    `FROM_STEP > 18`): deploy-ul adoptă instantaneul vechi și testul trebuie să-l vadă.
     """
-    if not _can_symlink(tmp_path):
-        pytest.skip("mașina nu poate crea simbolice către directoare "
-                    "(Windows fără elevare); testul ar fi fără dinți")
     vechi = tmp_path / "backups" / "predeploy-20260730-120223"
-    ales = _snapshot_dir(from_step="", latest_points_to=vechi, tmp=tmp_path)
+    ales = _snapshot_dir(from_step="", latest_points_to=vechi, tmp=tmp_path,
+                         make_link=make_link)
     assert ales.endswith("predeploy-PROASPAT"), (
         f"deploy-ul a adoptat instantaneul vechi ({ales}) — comanda de rollback "
         f"pe care o tipărește ar restaura starea de atunci")
 
 
 def test_a_resume_above_the_snapshot_step_does_adopt_the_existing_one(
-        tmp_path) -> None:
+        tmp_path, make_link) -> None:
     """`--from-step 30` sare peste pasul 18, deci trebuie să adopte simbolicul.
 
     Fără ramura asta, pașii 33 și 38 ar scrie și ar citi dintr-un director pe
     care nu l-a creat nimeni — chiar eșecul pentru care logica a fost scrisă
     inițial. Reparația îngustează condiția; nu o șterge.
+
+    Falsificat scoțând adoptarea (`SNAPSHOT_DIR="$resolved"`) din `resolve_config` —
+    reluarea ar rămâne pe calea proaspătă, inexistentă, și testul trebuie să o vadă.
     """
-    if not _can_symlink(tmp_path):
-        pytest.skip("mașina nu poate crea simbolice către directoare "
-                    "(Windows fără elevare); testul ar fi fără dinți")
     vechi = tmp_path / "backups" / "predeploy-20260730-120223"
-    ales = _snapshot_dir(from_step="30", latest_points_to=vechi, tmp=tmp_path)
+    ales = _snapshot_dir(from_step="30", latest_points_to=vechi, tmp=tmp_path,
+                         make_link=make_link)
     assert ales.endswith("predeploy-20260730-120223"), (
         f"o reluare peste pasul 18 nu a găsit instantaneul existent ({ales}); "
         f"pașii de nginx și de rollback ar scrie într-un director inexistent")

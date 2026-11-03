@@ -63,6 +63,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _symlinks import is_link
 
 REPO = Path(__file__).resolve().parents[2]
 COMMON_SH = REPO / "deploy" / "lib" / "common.sh"
@@ -388,23 +389,7 @@ def test_ensure_state_markers_dir_is_never_satisfied_by_a_bare_mkdir(tmp_path):
 # ---------------------------------------------------------------------------
 # ensure_state_markers_dir -- un symlink la calea NOUA nu e urmat
 # ---------------------------------------------------------------------------
-def _symlink_capable(tmp_path: Path) -> bool:
-    """Sonda reala, nu presupunere: pe Windows fara Developer Mode/privilegiu
-    SeCreateSymbolicLinkPrivilege, Path.symlink_to ridica OSError
-    [WinError 1314] -- verificat direct pe masina asta de dezvoltare, care NU
-    are privilegiul. Testul de mai jos se sare (nu trece "din intamplare")
-    acolo unde sonda arata ca nu se poate proba nimic."""
-    target = tmp_path / "_symprobe_target"
-    link = tmp_path / "_symprobe_link"
-    target.mkdir()
-    try:
-        link.symlink_to(target, target_is_directory=True)
-    except OSError:
-        return False
-    return link.is_symlink()
-
-
-def test_ensure_state_markers_dir_refuses_a_symlink_at_the_new_path(tmp_path):
+def test_ensure_state_markers_dir_refuses_a_symlink_at_the_new_path(tmp_path, make_link):
     """install -d/chmod/chown pe o cale EXISTENTA urmeaza un symlink --
     aplica modul/proprietarul tintei, nu linkului. Daca SENTINEL_INSTALL_STATE_DIR
     ar ajunge vreodata un symlink (plantat inainte ca acest director sa existe),
@@ -413,18 +398,26 @@ def test_ensure_state_markers_dir_refuses_a_symlink_at_the_new_path(tmp_path):
     e un builtin bash -- nu poate fi falsificat printr-un stat fals ca restul
     fisierului).
 
+    Pentru operator: fara garda, o instalare peste o gazda unde cineva a plantat
+    un symlink la calea markerelor ar pune 0700 root:root pe directorul spre care
+    arata linkul -- tacut, ca root -- in loc sa se opreasca.
+
+    Linkul vine din `make_link` (tests/_symlinks.py): symlink adevarat unde se
+    poate, altfel legatura proprie a runtime-ului MSYS, pe care bash-ul care ruleaza
+    scriptul o vede exact ca pe un symlink. Pe Windows fara privilegiu NU se
+    sare: ar fi lasat garda fara niciun observator. Intrebarile despre link se pun
+    bash-ului (`is_link`), nu lui pathlib, care nu vede legatura MSYS.
+
     Falsificat scotand verificarea [[ -L "$STATE_MARKERS" ]] de la inceputul
     lui ensure_state_markers_dir -- testul trebuie sa vada iesire 0 si tinta
-    linkului atinsa.
+    linkului atinsa. Mesajul garzii e cerut explicit: fara el, orice alta cauza
+    de iesire nenula (calea nu se rezolva, un typo in harness) ar trece testul
+    fara ca garda sa fi decis ceva.
     """
-    if not _symlink_capable(tmp_path):
-        pytest.skip("mediul asta nu poate crea symlinkuri reale (fara "
-                    "SeCreateSymbolicLinkPrivilege) -- netestat, nu trecut")
-
     target = tmp_path / "elsewhere"
     target.mkdir()
     link_path = tmp_path / "state"
-    link_path.symlink_to(target, target_is_directory=True)
+    make_link(link_path, target)
     before_mode = None
     try:
         import stat as _st
@@ -442,7 +435,9 @@ def test_ensure_state_markers_dir_refuses_a_symlink_at_the_new_path(tmp_path):
     proc = _run(script, tmp_path)
     assert "RC=0" not in proc.stdout, (
         f"ensure_state_markers_dir a continuat peste un symlink: {proc.stdout + proc.stderr}")
-    assert link_path.is_symlink(), "linkul a fost inlocuit, nu doar refuzat"
+    assert "is a symlink" in proc.stderr, (
+        f"iesirea nu vine din garda -L, ci din altceva: {proc.stdout + proc.stderr}")
+    assert is_link(link_path), "linkul a fost inlocuit, nu doar refuzat"
     if before_mode is not None:
         import stat as _st
         assert _st.S_IMODE(target.stat().st_mode) == before_mode, (
@@ -567,25 +562,33 @@ def test_resolve_config_never_stats_the_legacy_path_before_sourcing_preflight_en
         + proc.stdout + proc.stderr)
 
 
-def test_a_symlink_planted_at_the_legacy_path_has_no_effect_on_anything(tmp_path):
+def test_a_symlink_planted_at_the_legacy_path_has_no_effect_on_anything(tmp_path, make_link):
     """R1, direct: un symlink la calea veche (spre o tinta in afara arborelui
     Sentinel) nu mai e nici urmat, nici macar observat -- nimic nu-l citeste.
     Dovedit cu un symlink REAL, nu cu un stat falsificat, fiindca
     ensure_state_markers_dir (singurul lucru neconditionat rulat acum la
     pornire) nu ia nicio decizie despre calea veche, deci nu exista nimic de
     pacalit prin stat.
-    """
-    if not _symlink_capable(tmp_path):
-        pytest.skip("mediul asta nu poate crea symlinkuri reale (fara "
-                    "SeCreateSymbolicLinkPrivilege) -- netestat, nu curat")
 
+    Pentru operator: calea veche e scriibila de `sentinel`; daca instalatorul (root)
+    ar urma vreodata un link plantat acolo, un cont fara privilegii ar putea
+    ghida o scriere sau stergere ca root spre orice director. Testul tine absenta
+    acelei citiri/scrieri. Nu are o linie defensiva de sters -- garda e
+    ABSENTA unei migrari -- deci falsificarea e o mutatie care ADAUGA una:
+    ensure_state_markers_dir care atinge `${SENTINEL_STATE_DIR}/.install-state`
+    (rm -rf pe continutul ei, sau mutarea linkului) trebuie sa faca testul rosu.
+
+    Linkul vine din `make_link` si se intreaba prin `is_link` (bash), nu prin
+    pathlib: pe Windows legatura MSYS nu e vazuta de pathlib, iar
+    `legacy.is_symlink()` ar fi fals chiar daca linkul a ramas.
+    """
     legacy_parent = tmp_path / "sentinel_state"
     legacy_parent.mkdir(parents=True)
     victim = tmp_path / "victim"
     victim.mkdir()
     (victim / "secret").write_text("root ALL=(ALL) ALL\n", encoding="utf-8", newline="\n")
     legacy = legacy_parent / ".install-state"
-    legacy.symlink_to(victim, target_is_directory=True)
+    make_link(legacy, victim)
 
     new_dir = tmp_path / "new_state"
     script = (
@@ -598,7 +601,7 @@ def test_a_symlink_planted_at_the_legacy_path_has_no_effect_on_anything(tmp_path
     )
     proc = _run(script, tmp_path)
     assert "RC=0" in proc.stdout, proc.stdout + proc.stderr
-    assert legacy.is_symlink(), "linkul plantat a fost atins"
+    assert is_link(legacy), "linkul plantat a fost atins"
     assert (victim / "secret").read_text(encoding="utf-8") == "root ALL=(ALL) ALL\n", \
         "continutul tintei linkului a fost modificat -- linkul a fost urmat"
     assert new_dir.exists(), "STATE_MARKERS (calea noua) tot trebuie creat, indiferent de gunoiul de la calea veche"

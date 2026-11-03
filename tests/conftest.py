@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _symlinks import LinkMaker
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -64,3 +65,16 @@ def broken_plan(good_plan: dict[str, Any]):
         return plan
 
     return _break
+
+
+@pytest.fixture
+def make_link():
+    """Fabrica de legături simbolice din `tests/_symlinks.py`, cu curățare la teardown.
+
+    Teardown-ul rulează și când testul pică: o legătură rămasă într-un arbore temporar e
+    ceva pe care un `rmtree` ulterior fie îl urmează, fie cade pe el."""
+    maker = LinkMaker()
+    try:
+        yield maker
+    finally:
+        maker.cleanup()
