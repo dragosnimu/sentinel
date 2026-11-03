@@ -30,7 +30,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from _symlinks import present
+from _symlinks import is_link, present
 
 REPO = Path(__file__).resolve().parents[2]
 ROLLBACK_SH = REPO / "deploy" / "rollback.sh"
@@ -140,7 +140,12 @@ def test_rollback_legacy_cleanup_is_a_no_op_when_nothing_legacy_exists(tmp_path)
 # ---------------------------------------------------------------------------
 # `rm -rf` pe un symlink șterge linkul, nu urmează ținta
 # ---------------------------------------------------------------------------
-def test_a_symlink_at_the_legacy_path_is_removed_without_following_it(tmp_path, make_link):
+@pytest.mark.parametrize("target_exists", [
+    pytest.param(True, id="live"),
+    pytest.param(False, id="dangling"),
+])
+def test_a_symlink_at_the_legacy_path_is_removed_without_following_it(tmp_path, make_link,
+                                                                      target_exists):
     """Dacă `.install-state` a rămas un symlink (planted de `sentinel`, care
     deține părintele) către alt director real, `rm -rf` pe calea veche
     trebuie să șteargă LINKUL, nu conținutul țintei — un `rm -rf` care ar
@@ -162,15 +167,30 @@ def test_a_symlink_at_the_legacy_path_is_removed_without_following_it(tmp_path, 
     fiindcă garda ar rămâne fără observator. `legacy.exists()` din pathlib nu vede
     legătura MSYS, deci „linkul a dispărut" se întreabă bash-ului (`present`) — altfel
     aserțiunea ar fi adevărată oricum.
+
+    Două forme ale aceleiași legături, fiindcă garda din `rollback.sh` are două clauze
+    (`-e` și `-L`) și fiecare are nevoie de propriul observator. Legătura VIE (ținta
+    există) e văzută de `-e`, deci aici clauza `-L` nu e exersată: ștergerea ei lasă
+    testul verde. O legătură ATÂRNÂNDĂ (ținta lipsește: `-e` e fals, doar `-L` o prinde)
+    e singura care o exersează — fără ea, `|| -L` se poate șterge și un `--purge` lasă
+    legătura la calea veche, raportând „curățat". Falsificat scoțând `|| -L` din
+    condiția din `rollback.sh`: forma `dangling` pică, `live` rămâne verde (de aceea
+    sunt două forme, nu una). Parametrul schimbă doar ținta legăturii; aserțiunile
+    formei `live` (ținta neatinsă, legătura dispărută) sunt aceleași ca înainte.
     """
     sentinel_state_dir = tmp_path / "sentinel_state"
     sentinel_state_dir.mkdir(parents=True)
     victim = tmp_path / "victim"
-    victim.mkdir()
-    (victim / "secret").write_text("root ALL=(ALL) ALL\n", encoding="utf-8", newline="\n")
+    secret = victim / "secret"
+    if target_exists:
+        victim.mkdir()
+        secret.write_text("root ALL=(ALL) ALL\n", encoding="utf-8", newline="\n")
 
     legacy = sentinel_state_dir / ".install-state"
     make_link(legacy, victim)
+    assert is_link(legacy) and present(victim) == target_exists, (
+        "precondiția: legătura trebuie să fie vie în forma `live` și atârnândă în `dangling` — "
+        "altfel forma `dangling` ar rula a doua oară cazul viu și clauza `-L` ar rămâne neexersată")
 
     install_state_dir = tmp_path / "install_state"
     install_state_dir.mkdir(parents=True)
@@ -178,5 +198,6 @@ def test_a_symlink_at_the_legacy_path_is_removed_without_following_it(tmp_path, 
     proc = _run(_harness(tmp_path, sentinel_state_dir, install_state_dir), tmp_path)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert not present(legacy), "linkul n-a fost șters"
-    assert (victim / "secret").read_text(encoding="utf-8") == "root ALL=(ALL) ALL\n", (
-        "conținutul directorului țintit de symlink a fost șters — linkul a fost urmat")
+    if target_exists:
+        assert secret.read_text(encoding="utf-8") == "root ALL=(ALL) ALL\n", (
+            "conținutul directorului țintit de symlink a fost șters — linkul a fost urmat")

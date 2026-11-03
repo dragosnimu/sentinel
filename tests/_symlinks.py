@@ -18,15 +18,29 @@ Ce NU are, spus ca să nu fie descoperit târziu:
   * Python nu o vede ca legătură — pe disc e fișierul `NUME.lnk`; `Path.is_symlink()` și
     `Path.exists()` pe `NUME` mint (fals, respectiv fals). De-aia testele întreabă bash-ul prin
     `is_link` / `present`, nu `pathlib`. Pe Linux cele două întrebări dau același răspuns.
-  * Fișierul `.lnk` are atributul read-only, deci `shutil.rmtree` simplu pe un arbore care
-    îl conține cade cu `PermissionError` și lasă resturi. Fixture-ul `make_link` din
-    `conftest.py` le șterge cu `rm -f` din bash la teardown, și teardown-ul rulează și când
-    testul pică.
+  * Fișierul `.lnk` are atributul read-only: `shutil.rmtree` pe un arbore care îl conține
+    cade cu `PermissionError [WinError 5]` și lasă fișierul în urmă, pe când `rm -rf` din
+    bash și `rm_rf` al lui pytest (care face chmod la eroare) îl șterg. De-aia curățarea
+    trece prin bash, iar fixture-ul `make_link` din `conftest.py` o face la teardown, și
+    teardown-ul rulează și când testul pică.
+  * `MSYS=winsymlinks:lnk` e SETAT explicit pentru fiecare `ln -s`, nu moștenit din mediul
+    utilizatorului, și nu trebuie «simplificat» la moștenire. Valoarea implicită copiază
+    (rc 0, fără legătură), iar `winsymlinks:native` fără privilegiu produce o JONCȚIUNE
+    cu date de reparse ilizibile, pe care NIMIC fără drepturi ridicate nu o mai șterge
+    (măsurat de un verificator, runda 1: `del`, `rmdir`, `fsutil`, `os.rmdir`, `rm -rf` cad
+    toate cu eroarea 1920) — ar rămâne definitiv în `pytest-of-*`. Un utilizator cu
+    `MSYS=winsymlinks:native` în mediu ar produce exact asta.
 
 Ordinea încercărilor: `os.symlink` (symlink adevărat: Linux, WSL, Windows cu privilegiu), apoi
 legătura MSYS. După crearea oricăreia, precondiția e VERIFICATĂ cu același bash care rulează
 testul (`-L` adevărat; `-e` și tipul fișier/director cum le-am cerut), nu presupusă. Dacă
 nici una nu merge sau verificarea pică, testul SARE cu motivul scris — niciodată trece.
+
+Consecință pentru cine citește rezultatele: un defect AL AJUTORULUI (nu al codului păzit)
+apare ca SKIPPED, nu ca FAILED, fiindcă același drum de sărit acoperă și cazul legitim «nu
+se poate crea nicio legătură aici». Motivul e scris, deci se vede cu `-rs` (`-rfEs` îl
+arată împreună cu eșecurile); un număr de `skipped` care crește fără să se fi schimbat
+mașina înseamnă ajutor stricat, nu mașină mai săracă.
 """
 
 from __future__ import annotations
@@ -99,6 +113,8 @@ class LinkMaker:
                 pytest.skip(f"nu pot crea un symlink aici ({symlink_err!r}); ramura care "
                             "depinde de legătură nu e verificată pe această mașină")
             refused = symlink_err
+        # `MSYS` se SUPRASCRIE, nu se moștenește: vezi docstring-ul modulului (joncțiune
+        # care nu se mai poate șterge fără drepturi ridicate).
         made = _sh('ln -s -- "$1" "$2"', target, link,
                    env={**os.environ, "MSYS": "winsymlinks:lnk"})
         if made.returncode != 0:

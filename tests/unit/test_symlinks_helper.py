@@ -10,7 +10,9 @@ acoperire pe care n-o au. Aici se fixează ce garantează ajutorul, independent 
 from __future__ import annotations
 
 import shutil
+import subprocess
 
+import _symlinks
 import pytest
 from _symlinks import LinkMaker, _sh, is_link, present
 
@@ -161,3 +163,134 @@ def test_a_refused_copy_is_removed_by_cleanup_without_touching_the_source(tmp_pa
 
     assert not present(tmp_path / "copy"), "copia respinsă a rămas după cleanup"
     assert (source / "secret").read_text(encoding="utf-8") == "S\n", "sursa a fost atinsă"
+
+
+def _rm_that_does_nothing(monkeypatch):
+    """Înlocuiește `_sh` din `_symlinks` cu unul pentru care `rm` iese cu 0 fără să șteargă.
+
+    Doar `rm`: `present` (și orice altă întrebare către bash) rămâne cel real, altfel testul ar
+    afirma despre o sondă stricată. Simulează ce nu pot cere de la sistem — un `rm` care eșuează —
+    deci nu are proprietățile unui `rm` real (fișier blocat de antivirus, bash căzut la jumătate);
+    verifică ce face curățarea CÂND pasul bash nu șterge, nu de ce n-ar șterge."""
+    real_sh = _symlinks._sh
+
+    def _sh(script, *args, **kwargs):
+        if script.startswith("rm "):
+            return subprocess.CompletedProcess(["rm"], 0, "", "")
+        return real_sh(script, *args, **kwargs)
+
+    monkeypatch.setattr(_symlinks, "_sh", _sh)
+
+
+def test_cleanup_raises_when_something_survives_every_removal_step(tmp_path, monkeypatch):
+    """Teardown-ul care a lăsat resturi trebuie să cadă, nu să tacă. Raise-ul e singurul lucru
+    care transformă o curățare eșuată într-o eroare vizibilă: fără el, o legătură rămasă într-un
+    arbore temporar face un `rmtree` ulterior să cadă (sau să urmeze ținta), la un test fără
+    nicio legătură cu ea, iar cauza nu mai poate fi găsită.
+
+    Rămășița e un director NEGOL la calea cerută (copia pe care a respins-o verificarea): `rm`
+    e dezactivat, iar nici `unlink`, nici `rmdir` nu pot șterge un director cu conținut, deci
+    nu mai există nicio cale de a-l scoate. O LEGĂTURĂ n-ar merge aici: fallback-urile din
+    curățare o șterg singure (vezi testul de după), deci n-ar ajunge niciodată la raise.
+
+    Falsificat înlocuind `if left:` cu `if left and False:`: curățarea trece liniștit
+    peste director, iar testul trebuie să vadă că nu a ridicat."""
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "secret").write_text("S\n", encoding="utf-8", newline="\n")
+
+    def _copy_instead_of_link(link, target, is_dir):
+        shutil.copytree(target, link)
+        return "copie"
+
+    monkeypatch.setattr(LinkMaker, "_create", staticmethod(_copy_instead_of_link))
+    maker = LinkMaker()
+    with pytest.raises(pytest.skip.Exception, match="nu e stabilită"):
+        maker(tmp_path / "copy", source)
+    _rm_that_does_nothing(monkeypatch)
+    try:
+        with pytest.raises(AssertionError, match="au rămas"):
+            maker.cleanup()
+        assert (tmp_path / "copy" / "secret").exists(), "precondiția: rămășița chiar există"
+    finally:
+        monkeypatch.undo()
+        shutil.rmtree(tmp_path / "copy", ignore_errors=True)  # un director obișnuit: rmtree merge
+    assert not (tmp_path / "copy").exists(), "testul însuși a lăsat copia în urmă"
+
+
+def test_cleanup_still_clears_a_link_when_the_bash_rm_leaves_it_behind(tmp_path, monkeypatch):
+    """Dacă pasul `rm -rf` din bash nu șterge legătura, curățarea o scoate prin numele pe care
+    îl vede Python: `link.unlink()` pe Linux/WSL (symlink adevărat) sau fișierul `NUME.lnk`
+    (read-only, deci după `chmod`) pe Windows. Fără ele, un `.lnk` rămas ar face un `rmtree`
+    ulterior pe arborele temporar să cadă cu `PermissionError [WinError 5]` și să lase resturi
+    la un test fără legătură cu acesta.
+
+    `rm`-ul care nu șterge e SIMULAT (un `rm` real care eșuează nu l-am putut produce), deci
+    testul dovedește ce face curățarea când pasul bash nu a șters, nu că pasul bash eșuează în
+    practică. Fiecare ramură are observatorul ei pe propria platformă: pe Windows, scoaterea
+    `chmod`-ului dinaintea `unlink` face curățarea să ridice (fișierul `.lnk` e read-only); pe
+    Linux, scoaterea buclei `unlink`/`rmdir`. Pe cealaltă platformă mutația respectivă nu are
+    efect (ramura nu rulează acolo), deci falsificarea se face pe ambele. Ramura `if lnk.exists()`
+    în sine are un observator fără nimic simulat: testul următor.
+
+    Dacă ceva pică, `finally` șterge legătura cu `rm` real (patch-ul e anulat înainte), ca
+    arborele temporar să nu rămână cu un `.lnk` read-only."""
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "keep").write_text("K\n", encoding="utf-8", newline="\n")
+    maker = LinkMaker()
+    maker(tmp_path / "link", target)
+    assert is_link(tmp_path / "link"), "precondiția: există o legătură"
+    _rm_that_does_nothing(monkeypatch)
+    try:
+        maker.cleanup()  # nu are voie să ridice: fallback-ul a scos legătura
+        assert not present(tmp_path / "link"), "legătura a rămas după fallback"
+        assert not _lnk_files(tmp_path), "fișier .lnk rămas după fallback"
+        assert (target / "keep").read_text(encoding="utf-8") == "K\n", "ținta a fost atinsă"
+    finally:
+        monkeypatch.undo()
+        _sh('rm -rf -- "$1"', tmp_path / "link")
+    shutil.rmtree(tmp_path / "target")  # un rmtree ulterior nu trebuie să cadă
+
+
+def test_cleanup_removes_a_half_made_lnk_that_bash_cannot_see(tmp_path, monkeypatch):
+    """Un `NUME.lnk` care nu e o scurtătură MSYS validă (scris pe jumătate, trunchiat) nu e văzut
+    de bash la numele `NUME`: `[ -L NUME ]` și `[ -e NUME ]` sunt false (măsurat pe Git Bash
+    5.2.37), deci pasul `rm -rf NUME` nu are ce șterge. Doar numele pe care îl vede Python
+    (`NUME.lnk`) îl scoate. Fără ramura aceea, fișierul rămâne în arborele temporar, read-only,
+    iar un `rmtree` ulterior cade cu `PermissionError` la un test fără legătură cu acesta.
+
+    Aici ramura Python-name nu depinde de un `rm` simulat: bash chiar nu vede nimic. Fișierul
+    e făcut read-only (cum îl lasă `ln`), deci și `chmod`-ul dinaintea ștergerii e exersat pe
+    Windows; pe Linux un fișier `NUME.lnk` obișnuit se șterge oricum, iar testul rămâne o
+    probă a ramurei, nu a atributului.
+
+    Falsificat scoțând ramura `if lnk.exists():` (curățarea ridică: a rămas ceva) și
+    înlocuind `if present(link) or lnk.exists():` cu `if present(link):` (nu ridică, dar
+    fișierul rămâne: aserțiunea de la sfârșit)."""
+    target = tmp_path / "target"
+    target.mkdir()
+    half_made = tmp_path / "link.lnk"
+
+    def _half_made_lnk(link, target, is_dir):
+        half_made.write_bytes(b"not a shortcut")
+        half_made.chmod(0o444)
+        return "legătură întreruptă"
+
+    monkeypatch.setattr(LinkMaker, "_create", staticmethod(_half_made_lnk))
+    maker = LinkMaker()
+    try:
+        with pytest.raises(pytest.skip.Exception, match="nu e stabilită"):
+            maker(tmp_path / "link", target)
+        assert half_made.exists() and not present(tmp_path / "link"), (
+            "precondiția: fișierul există, dar bash nu vede nimic la numele `link`")
+
+        maker.cleanup()  # nu are voie să ridice: Python-name a scos fișierul
+
+        assert not half_made.exists(), "fișierul .lnk pe jumătate a rămas după cleanup"
+    finally:
+        monkeypatch.undo()
+        if half_made.exists():
+            half_made.chmod(0o600)
+            half_made.unlink()
+    shutil.rmtree(target)  # un rmtree ulterior nu trebuie să cadă

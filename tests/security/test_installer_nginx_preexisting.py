@@ -469,9 +469,11 @@ def _resolve_with_legacy_fact(tmp_path: Path, legacy_bytes: bytes, *,
 def test_a_symlink_at_the_legacy_fact_path_is_refused_not_followed(tmp_path):
     """Verificare STATICA pe sursa livrata: clauza `-L` exista in conditie.
     Perechea ei DINAMICA este `test_a_symlink_at_the_legacy_fact_path_is_not_read_through`
-    (mai jos): aceea prinde comportamentul, asta prinde stergerea clauzei chiar
-    si intr-un mediu unde o mutatie ar fi acoperita de altceva. Nu sunt aceeasi
-    garantie, deci ramin amandoua.
+    (mai jos): aceea prinde comportamentul. Rolul ramas al acesteia: sa fie
+    ROSIE cand cea dinamica SARE (fara bash, sau fara nicio legatura posibila pe
+    masina) -- altfel stergerea clauzei `-L` n-ar mai avea niciun observator.
+    Cat timp cea dinamica ruleaza, o acopera si pe aceasta; nu e o garantie in
+    plus, e plasa de sub ea.
 
     `[[ -f ]]` singur URMEAZĂ o legătură și acceptă orice
     fișier obișnuit numit de ea, oriunde ar fi; `sentinel` deține directorul
