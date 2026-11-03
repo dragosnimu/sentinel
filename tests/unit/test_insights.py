@@ -1135,7 +1135,12 @@ def test_the_import_scan_sees_every_way_a_clock_can_be_frozen():
 #      clasă, nu o formă (de aceea o parte din coada ei, desfacerea tuplului,
 #      stă în `_NEVAZUTE`); un rând care conține marcajul fără să-l exercite
 #      (`X = (f := 1) and datetime.now()`) ar trece, și îl prinde doar cine
-#      citește diferența.
+#      citește diferența. Strângerea mecanică, „rândul e văzut DIN CAUZA
+#      marcajului”, a fost încercată și nu merge: ștergerea marcajului din `=` și
+#      din `partial` dă SyntaxError, `from … import` n-are nimic de șters, iar un
+#      omolog fără marcaj scris de mână e alt rând al autorului, falsificabil la
+#      fel. „Niciun apel direct la un nume din `_CITITORI_DE_CEAS`” respinge forma
+#      de mai sus, dar admite aceeași formă prin `h()`: limita rămâne limită.
 #   d. că testul numit în `_CAPETE_PRIN_CONSTANTA` chiar fixează constanta: se
 #      verifică doar că există și poartă un nume de test.
 #
@@ -1420,8 +1425,11 @@ def test_the_clock_probe_admits_what_it_cannot_count(monkeypatch):
     # Valoarea întoarsă nu se poate folosi, iar eroarea o spune.
     with pytest.raises(RuntimeError) as exc:
         _citiri_de_ceas("import time\nX = time.gmtime().tm_year", monkeypatch)
-    assert "întoarce 0" in str(exc.value) and "tm_year" in str(exc.value), exc.value
+    assert "întoarce 0" in str(exc.value), exc.value
+    # Eroarea ORIGINALĂ, nu mesajul: acela conține și el „tm_year” (exemplul din
+    # sfat), deci o aserțiune pe `exc.value` ar trece și fără `{exc}` în text.
     assert isinstance(exc.value.__cause__, AttributeError), exc.value.__cause__
+    assert "tm_year" in str(exc.value.__cause__), exc.value.__cause__
     # Fereastra se închide și după o eroare.
     assert time.time() > 1_000_000_000
 
@@ -1515,6 +1523,8 @@ def test_every_form_a_class_head_says_the_scan_sees_has_a_witness():
     lăsa suita verde (67 trecute) și docstring-ul spunea operatorului că
     cercetarea vede ceva ce nu vede. Aici fiecare nume din cap cere un rând de
     dovadă, iar un rând de dovadă pe care niciun cap nu-l mai pomenește cade și el.
+    Al treilea fel: același marcaj și în cap (în `_VAZUTE`), și în coadă (în
+    `_NEVAZUTE`) — fiecare tabel singur e cinstit, docstring-ul se contrazice.
     """
     fara_dovada, fara_cap = _capete_fara_dovada(
         _puncte_din_docstring(), _VAZUTE, _CAPETE_PRIN_CONSTANTA)
@@ -1525,6 +1535,14 @@ def test_every_form_a_class_head_says_the_scan_sees_has_a_witness():
         "încă nu-l vede, nu are ce căuta în cap, pune-l în coada punctului, cu rând "
         f"în `_NEVAZUTE`. Rânduri în `_VAZUTE` pe care niciun cap nu le mai "
         f"declară: {fara_cap} — scoate rândul sau pune marcajul înapoi în cap.")
+    # Simetria are două capete: un marcaj nu poate fi și văzut, și nevăzut.
+    nevazute = {marcaj for _, randuri in _NEVAZUTE for marcaj, _ in randuri}
+    ambele = sorted({marcaj for marcaj, _ in _VAZUTE} & nevazute)
+    assert not ambele, (
+        f"marcajul {ambele} e în `_VAZUTE` (capul spune că cercetarea îl vede) ȘI în "
+        "`_NEVAZUTE` (coada spune că nu): docstring-ul se contrazice. Alege: dacă "
+        "cercetarea îl vede, scoate rândul din `_NEVAZUTE` și marcajul din coadă; "
+        "dacă nu, scoate-l din cap și rândul din `_VAZUTE`.")
 
 
 def _doc_de_proba(*puncte: str, lipit: bool = False) -> str:
