@@ -708,9 +708,9 @@ def _apeluri_de_ceas_la_import(sursa: str) -> list[str]:
 
     O funcție din modul care cheamă, direct sau prin alta, un citit de ceas
     devine și ea citit de ceas (punct fix): `X = ajutor()` nu ascunde
-    `datetime.now()` din `ajutor`. Ce NU vede: un ajutor adus din alt modul și
-    un nume ocolit prin `getattr` — pentru ele rămâne garda de vârstă din
-    `_ruleaza_gap`.
+    `datetime.now()` din `ajutor`. Ce NU vede: un ajutor adus din alt modul, un
+    nume ocolit prin `getattr` și o lambdă chemată pe loc — pentru ele rămâne
+    garda de vârstă din `_ruleaza_gap`.
     """
     arbore = ast.parse(sursa)
 
