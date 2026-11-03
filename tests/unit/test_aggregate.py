@@ -43,7 +43,7 @@ def run(coro):
 #:
 #: Cât are voie să dureze: cea mai strâmtă siguranță a fișierului e coada de
 #: `_PLAFON_COADA_ORE` = 6 ore din `test_the_fresh_tail_reaches_back_to_the_rollup_frontier`,
-#: unde rândul stă la 70 de minute — deci 6 h − 70 min = 4 h 50 min (17400 s).
+#: unde rândul stă la 70 de minute — deci 6 h - 70 min = 4 h 50 min (17400 s).
 #: Măsurat la 3 noiembrie 2026, cu `_ACUM` mutat înapoi: 17300 s verde, 17500 s
 #: roșu. O suită întreagă (35-65 de minute) încape cu mult sub ea; o gazdă
 #: suspendată câteva ore, nu. Spre deosebire de test_insights.py, fișierul nu
