@@ -1108,14 +1108,36 @@ def test_the_import_scan_sees_every_way_a_clock_can_be_frozen():
 #   3. docstring-ul și tabelul spun același lucru, în ambele sensuri: aceleași
 #      puncte, în aceeași ordine, și fiecare exemplu din docstring are un rând;
 #   4. partea ÎNCHISĂ a clasei „cititor absent din listă”: fiecare nume din
-#      `_CITITORI_DE_CEAS` e văzut — derivat din constantă, nu enumerat.
-# Ce rămâne nefixat: că enumerarea e completă. Singurul lucru care ține o clasă
-# ca CLASĂ e o probă dinamică (modulul executat sub un ceas care numără
-# citirile). Prototipată în afara depozitului: pe fișierul ăsta dă 0 citiri, iar
-# cu un defect adăugat la coadă (un argument implicit, o lambdă dată unui
-# apelant, `exec`, `time_ns`) dă câte una. E un al patrulea strat, cu riscul lui
-# (un modul importat prima oară în fereastră ar păstra un `datetime` fals),
-# deci o decizie a operatorului, nu a acestui test.
+#      `_CITITORI_DE_CEAS` e văzut — derivat din constantă, nu enumerat;
+#   5. capetele punctelor sunt și ele afirmații, în sens invers: „un nume legat
+#      altfel decât prin `=` sau `from … import`” spune că `=` și `from …
+#      import` SE VĂD. Fiecare nume între apostrofuri inverse dintr-un cap are
+#      un rând în `_VAZUTE` (cod pe care cercetarea îl vede, care conține chiar
+#      marcajul și care rulat chiar citește ceasul), sau e o constantă cu testul
+#      ei derivat (`_CAPETE_PRIN_CONSTANTA`). Fără asta, o formă mutată din
+#      coadă în cap, cu rândul ei șters din `_NEVAZUTE`, lăsa suita verde: fiecare
+#      jumătate singură cădea, perechea nu — un cap care pretinde o acoperire
+#      pe care cercetarea n-are, adică exact greșeala din 5c498ac.
+# Ce rămâne nefixat:
+#   a. că enumerarea e completă. Singurul lucru care ține o clasă ca CLASĂ e o
+#      probă dinamică (modulul executat sub un ceas care numără citirile).
+#      Prototipată în afara depozitului: pe fișierul ăsta dă 0 citiri, iar cu un
+#      defect adăugat la coadă (un argument implicit, o lambdă dată unui
+#      apelant, `exec`, `time_ns`) dă câte una. E un al patrulea strat, cu riscul
+#      lui (un modul importat prima oară în fereastră ar păstra un `datetime`
+#      fals), deci o decizie a operatorului, nu a acestui test.
+#   b. ce spun capetele în proză, fără apostrofuri inverse („nume/atribut”,
+#      „altceva decât”), și secțiunea «Ce numește „ceas”» de la începutul
+#      docstring-ului: o pretenție de acoperire nescrisă între apostrofuri
+#      inverse trece. Capetele sunt verificate acolo doar de un om.
+#   c. că rândul din `_VAZUTE` dovedește TOT mecanismul din cap: dovedește că
+#      cercetarea vede O formă care conține marcajul, nu pe toate. `=` e o
+#      clasă, nu o formă (de aceea o parte din coada ei, desfacerea tuplului,
+#      stă în `_NEVAZUTE`); un rând care conține marcajul fără să-l exercite
+#      (`X = (f := 1) and datetime.now()`) ar trece, și îl prinde doar cine
+#      citește diferența.
+#   d. că testul numit în `_CAPETE_PRIN_CONSTANTA` chiar fixează constanta: se
+#      verifică doar că există și poartă un nume de test.
 #
 # Fiecare rând e (marcaj, cod). Marcajul e exact textul dintre apostrofurile
 # inverse din punctul lui din docstring, după definiția clasei (vezi
@@ -1187,6 +1209,22 @@ _NEVAZUTE = (
     ]),
 )
 
+# Capetele punctelor, în sens invers: ce afirmă docstring-ul că SE VEDE. Marcajul
+# e exact textul dintre apostrofurile inverse din capul punctului (`…` ține locul
+# a orice, ca în „from … import”); codul e o formă pe care cercetarea o vede.
+_VAZUTE = (
+    ("=", "_now = datetime.now\nX = _now()"),
+    ("from … import", "from time import monotonic as m\n"
+                      "from alt_modul import m as n\nn()"),
+    ("partial", "import functools\nP = functools.partial(datetime.now)\nX = P()"),
+)
+
+#: Nume dintr-un cap care sunt constante, nu forme: dovada lor e un test derivat
+#: din constantă (valoarea), nu un cod de probă.
+_CAPETE_PRIN_CONSTANTA = {
+    "_CITITORI_DE_CEAS": "test_the_import_scan_sees_every_reader_in_its_own_list",
+}
+
 #: Capătul unui punct din docstring: de la început până la primul „: ” sau „ — ”.
 #: Acolo stă DEFINIȚIA clasei (ce se vede, `=`, `partial`, `_CITITORI_DE_CEAS`),
 #: nu exemplare; exemplarele vin după. Așa o formă pe care cercetarea tocmai a
@@ -1195,16 +1233,39 @@ _SEPARATOR_DEFINITIE = re.compile(r": | — ")
 
 #: Ceasurile din `time` pe care sonda le numără. `monkeypatch.setattr` cere ca
 #: numele să existe, deci o versiune de Python fără unul dintre ele pică zgomotos.
+#: Lista spune ce poate fi numărat, NU ce e acoperit de un rând. Scoase pe rând
+#: (măsurat la scriere), `monotonic`, `perf_counter` și `perf_counter_ns`, ca și
+#: `utcnow`/`today` ale clasei false din `_citiri_de_ceas`, nu strică niciun test:
+#: stau aici pentru forme încă nedeclarate. Nici `uuid.uuid1` nu e dovedit pe o
+#: gazdă unde trece prin `time.time_ns` (cea de dezvoltare, Windows).
 _CEASURI_TIME = ("time", "time_ns", "monotonic", "monotonic_ns", "perf_counter",
                  "perf_counter_ns", "process_time", "gmtime", "localtime", "ctime")
 
 
 def _citiri_de_ceas(cod: str, monkeypatch) -> int:
-    """Câte ori citește ceasul `cod`, rulat ca un modul (nu citit ca sursă).
+    """Câte apeluri face `cod`, rulat ca un modul, către un nume PATCHUIT de aici.
 
-    `datetime` din cod e o clasă falsă, `time`/`os.times`/`uuid.uuid1` sunt
-    înlocuite pe durata rulării, iar `alt_modul` există. Fiecare citire se numără
-    și întoarce 0: nimic din rulare nu mai depinde de ora reală.
+    Atât măsoară, nu „a citit ceasul”: `datetime.now/utcnow/today` (clasa falsă
+    pe care o primește codul ca `datetime`), numele din `_CEASURI_TIME`,
+    `os.times`, `uuid.uuid1` și `alt_modul.ceas_meu`/`alt_modul.m`. Fiecare apel
+    se numără și întoarce 0, deci un rând nu poate folosi valoarea întoarsă
+    (`time.gmtime().tm_year` nu merge) și nimic din rulare nu depinde de ora
+    reală.
+
+    Greșește în ambele sensuri, cu prețuri diferite:
+    * nu numără citiri REALE care ocolesc numele patchuite: un `datetime` adus
+      de cod însuși (`from datetime import datetime`, `import datetime as dd`)
+      e cel adevărat, iar `time.strftime()` și `time.asctime()` nu sunt
+      patchuite. Un rând așa e respins de
+      `test_every_declared_blind_spot_really_reads_the_clock` ca „nu e un
+      îngheț”: zgomotos, deci fără pagubă;
+    * numără apeluri care nu îngheață nimic: orice trece printr-un nume
+      patchuit, de pildă un `logging` care citește `time.time`. Un rând așa ar
+      trece drept îngheț fără să fie unul, iar singura apărare e cine scrie
+      rândurile.
+    Ambele sunt fixate ca exemple în
+    `test_the_clock_probe_admits_what_it_cannot_count`: dacă sonda se
+    îmbunătățește, testul cade și cere să corectezi acest docstring.
     """
     citiri: list[str] = []
 
@@ -1222,8 +1283,15 @@ def _citiri_de_ceas(cod: str, monkeypatch) -> int:
         m.setattr(uuid, "uuid1", citeste)
         m.setitem(sys.modules, "alt_modul",
                   types.SimpleNamespace(ceas_meu=citeste, m=citeste))
-        exec(compile(cod, "<esantion>", "exec"),
-             {"__name__": "esantion", "datetime": _Datetime})
+        try:
+            exec(compile(cod, "<esantion>", "exec"),
+                 {"__name__": "esantion", "datetime": _Datetime})
+        except Exception as exc:
+            raise RuntimeError(
+                f"rândul n-a putut fi rulat sub ceasul fals ({type(exc).__name__}: "
+                f"{exc}). Ceasul fals întoarce 0 la orice citire, deci un rând nu "
+                "poate folosi valoarea întoarsă (de pildă `time.gmtime().tm_year`); "
+                "dacă nu asta e cauza, verifică scrierea numelor din rând") from exc
     return len(citiri)
 
 
@@ -1247,7 +1315,8 @@ def _raport_formele_vazute(nevazute, cerceteaza) -> str:
             "contrariul. Pentru fiecare formă: (1) scoate marcajul din punctul "
             "respectiv al docstring-ului; (2) mută rândul din `_NEVAZUTE` în "
             "`de_prins` din `test_the_import_scan_sees_every_way_a_clock_can_be_frozen`"
-            ", ca să rămână fixat că se vede. Formele: " + "; ".join(linii))
+            ", ca să rămână fixat că se vede; (3) dacă o numești în capul punctului, "
+            "dă-i și un rând în `_VAZUTE`. Formele: " + "; ".join(linii))
 
 
 def test_the_declared_blind_spots_are_still_blind():
@@ -1282,7 +1351,7 @@ def test_the_blind_spot_report_names_the_class_and_the_line_to_edit():
     assert "«prima clasă…»" in unul and "`beta`" in unul, unul
     assert "`alfa`" not in unul and "a doua clasă" not in unul, unul
     assert "TOATE" not in unul, "clasa mai are o formă nevăzută: punctul rămâne"
-    assert "docstring" in unul and "de_prins" in unul, unul
+    assert "docstring" in unul and "de_prins" in unul and "_VAZUTE" in unul, unul
 
     toate = _raport_formele_vazute(tabel, lambda cod: [cod])
     assert "«a doua clasă…»" in toate and "`gama`" in toate, toate
@@ -1328,16 +1397,74 @@ def test_the_clock_probe_tells_a_read_from_a_definition(monkeypatch):
     assert time.time() > 1_000_000_000
 
 
-def _puncte_din_docstring() -> list[str]:
-    """Punctele secțiunii «Ce NU vede», cu spațiile normalizate."""
-    doc = _apeluri_de_ceas_la_import.__doc__
+def test_the_clock_probe_admits_what_it_cannot_count(monkeypatch):
+    """Sonda numără apeluri la nume patchuite, nu citiri de ceas; asta e fixat.
+
+    Eșecul pe care îl previne: cine citește „sonda dovedește că rândul îngheață”
+    scrie un rând care o păcălește (citire reală necontorizată, sau un nume
+    patchuit care nu îngheață nimic), iar tabelul pretinde o gaură pe care n-o
+    dovedește. Exemplele sunt cele din docstring-ul sondei: dacă una se schimbă,
+    docstring-ul trebuie corectat. Al doilea fel de eșec: un rând care folosește
+    valoarea întoarsă de ceasul fals primește o eroare care spune de ce.
+    """
+    assert _citiri_de_ceas("X = datetime.now()", monkeypatch) == 1  # martor
+    # Citiri reale, necontorizate.
+    for cod in ("from datetime import datetime\nX = datetime.now()",
+                "import datetime as dd\nX = dd.datetime.now()",
+                "import time\nX = time.strftime('%H')",
+                "import time\nX = time.asctime()"):
+        assert _citiri_de_ceas(cod, monkeypatch) == 0, cod
+    # Numărat, deși nu îngheață nimic.
+    assert _citiri_de_ceas(
+        "import logging\nlogging.getLogger('sonda').warning('x')", monkeypatch) > 0
+    # Valoarea întoarsă nu se poate folosi, iar eroarea o spune.
+    with pytest.raises(RuntimeError) as exc:
+        _citiri_de_ceas("import time\nX = time.gmtime().tm_year", monkeypatch)
+    assert "întoarce 0" in str(exc.value) and "tm_year" in str(exc.value), exc.value
+    assert isinstance(exc.value.__cause__, AttributeError), exc.value.__cause__
+    # Fereastra se închide și după o eroare.
+    assert time.time() > 1_000_000_000
+
+
+def _puncte_din_docstring(doc: str | None = None) -> list[str]:
+    """Punctele secțiunii «Ce NU vede», cu spațiile normalizate.
+
+    `doc` e pentru testele care dau un docstring stricat; implicit, cel real.
+    """
+    if doc is None:
+        doc = _apeluri_de_ceas_la_import.__doc__
     assert doc, "`_apeluri_de_ceas_la_import` nu mai are docstring (python -OO?)"
     assert "Ce NU vede." in doc and "Cercetarea e al TREILEA" in doc, (
         "secțiunea «Ce NU vede» a dispărut din docstring sau și-a schimbat capetele")
     sectiune = doc.split("Ce NU vede.", 1)[1].split("Cercetarea e al TREILEA", 1)[0]
     blocuri = [p for p in sectiune.split("\n\n") if re.search(r"(?m)^\s*\* ", p)]
     assert len(blocuri) == 1, "punctele clasei nu mai sunt un singur bloc"
+    # Lista se termină cu un rând gol. Fără el, paragraful următor devine
+    # continuarea ultimului punct, iar tot ce are el între apostrofuri inverse
+    # ar fi citit ca exemple ale acelui punct: eroarea ar spune altceva decât
+    # s-a întâmplat. Se verifică după primul punct (înaintea lui stă
+    # introducerea, la aceeași margine).
+    linii = blocuri[0].splitlines()
+    prima = next(i for i, rand in enumerate(linii) if rand.lstrip().startswith("* "))
+    margine = len(linii[prima]) - len(linii[prima].lstrip())
+    for linie in linii[prima + 1:]:
+        continuare = len(linie) - len(linie.lstrip()) > margine
+        assert continuare or not linie.strip() or linie.lstrip().startswith("* "), (
+            f"după lista de puncte urmează «{linie.strip()[:40]}…» la aceeași "
+            "margine, fără rând gol între ele: ultimul punct l-ar absorbi. Lasă un "
+            "rând gol între ultimul punct și paragraful următor")
     return [" ".join(p.split()) for p in re.split(r"(?m)^\s*\*\s+", blocuri[0])[1:]]
+
+
+def _capete_fara_dovada(puncte, vazute, constante):
+    """(nume declarate ca văzute fără dovadă, dovezi pe care niciun cap nu le declară)."""
+    declarate = set()
+    for punct in puncte:
+        separator = _SEPARATOR_DEFINITIE.search(punct)
+        assert separator, f"punctul «{punct[:60]}…» nu are definiție înaintea exemplelor"
+        declarate |= set(re.findall(r"`([^`]+)`", punct[:separator.start()]))
+    dovedite = {marcaj for marcaj, _ in vazute} | set(constante)
+    return sorted(declarate - dovedite), sorted(dovedite - declarate)
 
 
 def test_the_blind_spot_table_and_the_docstring_say_the_same_thing():
@@ -1377,6 +1504,113 @@ def test_the_blind_spot_table_and_the_docstring_say_the_same_thing():
         assert not fara_urma, (
             f"clasa «{fragment}…»: `_NEVAZUTE` are rânduri {fara_urma} pe care "
             "docstring-ul nu le declară ca exemple; adaugă-le în punctul clasei")
+
+
+def test_every_form_a_class_head_says_the_scan_sees_has_a_witness():
+    """Ce spune un CAP de punct că se vede are un rând în `_VAZUTE`, și invers.
+
+    Eșecul pe care îl previne: coada unui punct („nu vede X”) are un rând în
+    `_NEVAZUTE` care dovedește că X chiar îngheață, dar capul („vede Y”) nu avea
+    nimic. O formă mutată din coadă în cap, cu rândul ei șters din `_NEVAZUTE`,
+    lăsa suita verde (67 trecute) și docstring-ul spunea operatorului că
+    cercetarea vede ceva ce nu vede. Aici fiecare nume din cap cere un rând de
+    dovadă, iar un rând de dovadă pe care niciun cap nu-l mai pomenește cade și el.
+    """
+    fara_dovada, fara_cap = _capete_fara_dovada(
+        _puncte_din_docstring(), _VAZUTE, _CAPETE_PRIN_CONSTANTA)
+    assert not (fara_dovada or fara_cap), (
+        f"capetele punctelor și `_VAZUTE` nu spun același lucru. Declarate ca "
+        f"VĂZUTE în cap, fără rând în `_VAZUTE`: {fara_dovada} — un cap se fixează "
+        "ca o coadă: adaugă (marcaj, cod) cu cod pe care cercetarea îl vede; dacă "
+        "încă nu-l vede, nu are ce căuta în cap, pune-l în coada punctului, cu rând "
+        f"în `_NEVAZUTE`. Rânduri în `_VAZUTE` pe care niciun cap nu le mai "
+        f"declară: {fara_cap} — scoate rândul sau pune marcajul înapoi în cap.")
+
+
+def _doc_de_proba(*puncte: str, lipit: bool = False) -> str:
+    """Un docstring cu forma pe care o citește `_puncte_din_docstring`, dar fără
+    legătură cu cel real: testele de mai jos nu trebuie să cadă când cercetarea se
+    îmbunătățește și docstring-ul real se schimbă."""
+    lista = "\n".join(f"    * {p}" for p in puncte)
+    gol = "\n" if lipit else "\n\n"
+    return (f"Ce NU vede. Lista e pe CLASE:\n{lista}{gol}"
+            "    Enumerarea `_X` e ce s-a măsurat.\n\n    Cercetarea e al TREILEA")
+
+
+def test_a_head_and_the_witness_table_that_disagree_are_caught():
+    """Perechea de editări care a trecut verde o dată: marcajul în cap, rândul șters.
+
+    Eșecul pe care îl previne: `:=` mutat din coada primului punct în capul lui
+    ȘI rândul `(":=", …)` șters din `_NEVAZUTE`, cercetarea neschimbată. Fiecare
+    jumătate singură cădea (sincronizarea docstring-tabel), perechea nu: un cap
+    care spune „vede `:=`” despre o cercetare care nu-l vede. Aici verdictul e
+    verificat pe un docstring și un tabel de probă, nu pe cele reale (care se
+    schimbă când cercetarea se îmbunătățește): marcajul în plus cere un rând, iar
+    un marcaj scos din cap lasă un rând de dovadă pe care nimeni nu-l mai declară.
+    """
+    vazute = (("=", "x = 1"),)
+    punct = "un nume legat altfel decât prin {cap} — `:=`, `a or b`"
+    curat = _capete_fara_dovada(
+        _puncte_din_docstring(_doc_de_proba(punct.format(cap="`=`"))), vazute, {})
+    assert curat == ([], []), f"martor: forma de probă ar trebui să fie curată: {curat}"
+    # Perechea: `:=` trece în cap (iar rândul lui din `_NEVAZUTE` ar dispărea).
+    pe_cap = _doc_de_proba("un nume legat altfel decât prin `=`, `:=` — `a or b`")
+    fara_dovada, _ = _capete_fara_dovada(_puncte_din_docstring(pe_cap), vazute, {})
+    assert fara_dovada == [":="], fara_dovada
+    # Sensul invers: rândul `=` rămâne, dar capul nu-l mai pune între apostrofuri.
+    fara_apostrofuri = _doc_de_proba(punct.format(cap="="))
+    _, fara_cap = _capete_fara_dovada(_puncte_din_docstring(fara_apostrofuri), vazute, {})
+    assert fara_cap == ["="], fara_cap
+    # O constantă numită în cap e dovedită de dicționarul de constante, nu de rânduri.
+    cu_constanta = _doc_de_proba("un cititor care nu e în `_C` — `time_ns`")
+    assert _capete_fara_dovada(
+        _puncte_din_docstring(cu_constanta), vazute, {"_C": "test_x"}) == ([], ["="])
+    assert _capete_fara_dovada(
+        _puncte_din_docstring(cu_constanta), vazute, {}) == (["_C"], ["="])
+
+
+def test_a_list_glued_to_the_next_paragraph_is_reported_as_that():
+    """Fără rândul gol după listă, mesajul spune ce s-a întâmplat, nu altceva.
+
+    Eșecul pe care îl previne: ștergi rândul gol dintre ultimul punct și
+    «Enumerarea…», iar paragraful devine parte din punct; `_NEVAZUTE` din el,
+    între apostrofuri inverse, era citat ca „exemplu declarat fără rând”. Roșul
+    era corect, mesajul trimitea la tabel în loc de rândul gol. Verificat pe un
+    docstring de probă (la fel pentru cel real, prin `_puncte_din_docstring()`
+    din testul de sincronizare).
+    """
+    puncte = ("primul punct: `a`", "al doilea punct,\n      pe două linii: `b`")
+    assert len(_puncte_din_docstring(_doc_de_proba(*puncte))) == 2  # martor
+    with pytest.raises(AssertionError) as exc:
+        _puncte_din_docstring(_doc_de_proba(*puncte, lipit=True))
+    assert "rând gol" in str(exc.value) and "Enumerarea" in str(exc.value), exc.value
+
+
+def test_every_form_a_class_head_says_the_scan_sees_really_is_seen(monkeypatch):
+    """Rândurile din `_VAZUTE` sunt văzute de cercetare, conțin marcajul și îngheață.
+
+    Eșecul pe care îl previne: un cap care spune „vede `partial`” cu un rând de
+    dovadă pe care cercetarea nu-l mai vede (o refacere a scanării a pierdut
+    ramura), sau cu un rând care nu are nicio legătură cu marcajul, sau cu cod
+    inofensiv. Verde ar fi lăsat docstring-ul să promită o acoperire pe care nu o
+    mai are. Pentru constante, dovada e un test care există și o constantă care
+    există.
+    """
+    marcaje = [marcaj for marcaj, _ in _VAZUTE]
+    assert marcaje, "`_VAZUTE` e goală: testul n-ar verifica nimic"
+    assert len(set(marcaje)) == len(marcaje), "marcaje repetate în `_VAZUTE`"
+    for marcaj, cod in _VAZUTE:
+        sablon = re.escape(marcaj).replace("…", ".*")
+        assert re.search(sablon, cod), (
+            f"rândul `{marcaj}` din `_VAZUTE` nu conține marcajul: dovedește altceva")
+        assert _apeluri_de_ceas_la_import(cod), (
+            f"capul declară că cercetarea vede `{marcaj}`, dar nu mai vede `{cod}`")
+        assert _citiri_de_ceas(cod, monkeypatch) > 0, (
+            f"`{marcaj}` (din `_VAZUTE`) rulat nu citește ceasul: nu dovedește nimic")
+    for constanta, nume_test in _CAPETE_PRIN_CONSTANTA.items():
+        assert constanta in globals(), f"constanta `{constanta}` nu mai există"
+        assert nume_test.startswith("test_") and callable(globals().get(nume_test)), (
+            f"dovada constantei `{constanta}` e `{nume_test}`, care nu e un test existent")
 
 
 def test_the_import_scan_sees_every_reader_in_its_own_list():
