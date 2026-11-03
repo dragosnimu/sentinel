@@ -150,7 +150,9 @@ def _run(script: str, tmp_path: Path, extra_path: Path | None = None,
 # unealtă lipsă chemată simplu, cu `>/dev/null`, sub `2>/dev/null || true`,
 # sub `2>&1 || true` (stderr captat în `$(…)`), într-un pipeline, într-un `if`,
 # într-un subshell sau grup, într-o funcție, prin `eval`, printr-o variabilă,
-# prin `command x`, prin `<(…)`, pe fundal — și un director pe PATH. Nu se
+# prin `command x`, prin `<(…)` — și un director pe PATH. Pe fundal o vede doar
+# dacă se AȘTEAPTĂ copilul: fără `wait`, scrierea poate veni după ce shell-ul a
+# ieșit, iar o sondă brută a prins-o aterizând în fișierul cazului URMĂTOR. Nu se
 # declanșează pentru `have` / `command -v` / `type -P`: a SONDA existența nu
 # strică nimic, doar a o CHEMA. Harness-ul se verifică singur: la fiecare rulare,
 # înainte de cod, cheamă o unealtă inexistentă într-un `$(… 2>/dev/null)` (forma
@@ -161,8 +163,10 @@ def _run(script: str, tmp_path: Path, extra_path: Path | None = None,
 # Ce NU vede (măsurat; declarat, nu scăpat — doar citirea codului le prinde):
 #   * `exec x`, inclusiv `$(exec x)`: `exec` își dă singur eroarea
 #     („exec: x: not found"), fără handler;
-#   * înfășurătorile `env x`, `timeout N x`, `xargs x`, `nohup x`: unealta e
-#     căutată de procesul înfășurător, nu de bash;
+#   * unealta DINĂUNTRUL unei înfășurători — `env x`, `timeout N x`, `xargs x`,
+#     `nohup x` — fiindcă o caută procesul înfășurător, nu bash. Înfășurătoarea
+#     ÎNSĂȘI, dacă lipsește, e văzută: pe PATH-ul restrâns `env` lipsește și e
+#     înregistrată, deci forma asta e oarbă doar cât timp înfășurătoarea există;
 #   * o cale absolută (`/usr/sbin/x`): nu se caută pe PATH;
 #   * un shebang stricat („cannot execute: required file not found") și un fișier
 #     fără bit de execuție („Permission denied", măsurat doar pe WSL): ele EXISTĂ
@@ -610,6 +614,15 @@ def _run_verify(tmp_path: Path, *, domain: str, getent: str | object | None = No
         # Dovada vine din ACELAȘI `have` pe care îl folosește codul testat, rulat
         # de același shell: dacă `getent` e totuși ajungător, testul moare aici
         # cu 97, nu mai departe pe o ramură care nu e cea numită.
+        #
+        # NU o scoate ca inertă. Măsurat: un PATH scurs e prins oricum mai jos,
+        # fiindcă un `getent` real nu poate produce propoziția UNKNOWN pe care
+        # testul o cere — deci dovada nu schimbă niciodată trecut/picat. Ce
+        # schimbă e CARE eșec se citește: un defect de harnașament raportat ca
+        # defect de harnașament, în loc de „codul livrat pretinde o măsurătoare
+        # pe care n-a făcut-o". E redundantă pentru detecție și portantă pentru
+        # atribuire. O observă un PATH scurs pe un rulător Linux (pe Git Bash nu
+        # se poate: acolo `getent` nu există).
         proof = (
             "if have getent; then\n"
             '    echo "PRECONDITION: getent is reachable at $(command -v getent)" >&2\n'
