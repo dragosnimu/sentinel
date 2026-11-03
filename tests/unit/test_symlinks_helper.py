@@ -73,28 +73,32 @@ def test_a_copy_is_not_accepted_as_a_link(tmp_path):
         maker.cleanup()
 
 
-@pytest.mark.parametrize("target_exists, live, is_dir, code", [
-    pytest.param(True, False, True, 11, id="expected-dangling-but-target-exists"),
-    pytest.param(True, True, False, 12, id="expected-a-file-but-target-is-a-directory"),
-    pytest.param(False, True, True, 14, id="expected-live-but-link-is-dangling"),
+@pytest.mark.parametrize("target_kind, live, is_dir, code", [
+    pytest.param("dir", False, True, 11, id="expected-dangling-but-target-exists"),
+    pytest.param("dir", True, False, 12, id="expected-a-file-but-target-is-a-directory"),
+    pytest.param("file", True, True, 13, id="expected-a-directory-but-target-is-a-file"),
+    pytest.param("none", True, True, 14, id="expected-live-but-link-is-dangling"),
 ])
-def test_a_link_of_the_wrong_shape_is_refused(tmp_path, target_exists, live, is_dir, code):
-    """O legătură vie cerută atârnândă, spre director cerută spre fișier, sau atârnândă cerută
-    vie: precondiția testului de gardă n-ar fi cea scrisă în el, deci ajutorul sare în loc să o
-    lase. Un test de gardă care are nevoie de o legătură VIE (`[[ -f L && ! -L L ]]`) ar rula
+def test_a_link_of_the_wrong_shape_is_refused(tmp_path, target_kind, live, is_dir, code):
+    """O legătură vie cerută atârnândă, spre director cerută spre fișier (și invers), sau
+    atârnândă cerută vie: precondiția testului de gardă n-ar fi cea scrisă în el, deci
+    ajutorul sare în loc să o lase. Un test de gardă care are nevoie de o legătură VIE (`[[ -f L && ! -L L ]]`) ar rula
     pe una atârnândă și ar raporta o acoperire pe care n-o are.
 
     Fiecare rând fixează CODUL clauzei care a respins (`cod 11:` etc.), nu doar faptul că a
     sărit: altfel o altă clauză (de pildă `-L` fals, cod 10) ar satisface rândul, iar clauza
     pe care rândul pretinde că o exersează ar putea fi ștearsă fără ca nimic să roșească.
     Rândul 14 e cel care exersează ramura `else` din `_verify`: singura în care legătura NU
-    urmează o țintă.
+    urmează o țintă. Rândul 13 (țintă-fișier cerută director) a fost adăugat după ce
+    falsificarea clauzei lui s-a dovedit verde: aceeași clasă de gol ca la 14.
 
     Falsificat înlocuind clauza `[ "$2" = dangling ] || exit 14` cu `true`: rândul 14 pică
-    (nu mai sare), celelalte două rămân verzi."""
+    (nu mai sare), celelalte rămân verzi; la fel clauza 13, cu rândul 13."""
     target = tmp_path / "d"
-    if target_exists:
+    if target_kind == "dir":
         target.mkdir()
+    elif target_kind == "file":
+        target.write_text("1\n", encoding="utf-8", newline="\n")
     maker = LinkMaker()
     try:
         maker(tmp_path / "link", target)
