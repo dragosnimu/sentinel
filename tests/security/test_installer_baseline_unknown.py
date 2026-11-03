@@ -1280,7 +1280,7 @@ def test_a_directory_where_the_record_goes_is_refused_not_celebrated(host):
     (mesajul lui `rm`), directorul neatins (gol) și niciun colector chemat."""
     record = host.state / "baseline-state.txt"
     record.mkdir(parents=True)
-    res = host.capture()
+    res = host.capture(env={"LC_ALL": "C"})   # motivul lui `rm` e text localizat
     assert res.rc == 2, res.out
     assert "baseline captured" not in res.out and "[+]" not in res.out, res.out
     assert "baseline NOT taken" in res.out and f"{record.as_posix()} could not be removed" in res.out, res.out
