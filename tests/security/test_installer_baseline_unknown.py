@@ -1294,19 +1294,24 @@ def test_a_directory_where_the_record_goes_is_refused_not_celebrated(host):
     assert probe.proc.stdout.strip() == "unreadable", probe.out
 
 
-def test_an_old_record_that_rm_cannot_remove_is_refused_even_when_rm_says_nothing(host):
-    """`rm` iese cu 1 fără să tipărească nimic (un sistem de fișiere doar-citire poate face asta
-    printr-un wrapper). Avertismentul nu are voie să iasă cu motivul gol, «could not be removed
-    ()»: spune codul de ieșire. Capturarea e refuzată (2), niciun colector nu e chemat, nicio
-    linie de succes."""
+@pytest.mark.parametrize("status", [1, 3, 74])
+def test_an_old_record_that_rm_cannot_remove_is_refused_even_when_rm_says_nothing(host, status):
+    """`rm` iese cu un cod diferit de 0 fără să tipărească nimic (un sistem de fișiere doar-citire
+    poate face asta printr-un wrapper). Avertismentul nu are voie să iasă cu motivul gol,
+    «could not be removed ()»: spune codul de ieșire, ADEVĂRAT, nu o constantă. Un `exit 1` scris
+    în cod ar fi spus «(exit 1)» oricare ar fi fost răspunsul lui `rm`, iar operatorul ar fi căutat
+    un EPERM acolo unde era altceva: de aceea codurile sunt 1, 3 și 74 (cu un singur cod, 1,
+    constanta și răspunsul real arată la fel). Capturarea e refuzată (2), niciun colector nu e
+    chemat, nicio linie de succes."""
     host.state.mkdir(parents=True)
     (host.state / "baseline-state.txt").write_text(
         "services=measured\nports=measured\ncontainers=measured\n", encoding="utf-8", newline="\n")
-    _stub(host.bin, "rm", 'case "$*" in *baseline-state.txt) exit 1 ;; esac\n'
-          'PATH="${PATH#*:}"\nexec rm "$@"\n')
+    _stub(host.bin, "rm", f'case "$*" in *baseline-state.txt) exit {status} ;; esac\n'
+          + 'PATH="${PATH#*:}"\nexec rm "$@"\n')
     res = host.capture()
     assert res.rc == 2, res.out
-    assert "could not be removed (exit 1)" in res.out, res.out
+    assert f"could not be removed (exit {status})" in res.out, res.out
+    assert "could not be removed ()" not in res.out, res.out
     assert host.calls_text() == "" and "baseline captured" not in res.out, res.out
 
 
@@ -1490,14 +1495,18 @@ def test_a_directory_that_appears_between_the_check_and_the_move_at_a_data_path_
             assert f"{other}=measured" in host.record(), res.out
 
 
-def test_a_mv_that_fails_without_a_word_is_reported_with_its_exit_status(host):
-    """`mv` iese cu 1 fără să tipărească nimic. Avertismentul nu are voie să iasă cu motivul gol,
-    «could not move X into place ()»: spune codul de ieșire, ca la `rm` (același tipar)."""
-    _stub(host.bin, "mv", 'case "$*" in *baseline-ports.txt.new*) exit 1 ;; esac\n'
-          'PATH="${PATH#*:}"\nexec mv "$@"\n')
+@pytest.mark.parametrize("status", [1, 3, 74])
+def test_a_mv_that_fails_without_a_word_is_reported_with_its_exit_status(host, status):
+    """`mv` iese cu un cod diferit de 0 fără să tipărească nimic. Avertismentul nu are voie să
+    iasă cu motivul gol, «could not move X into place ()»: spune codul de ieșire, ADEVĂRAT, ca la
+    `rm` (același tipar). Un `exit 1` scris în cod ar fi spus «(exit 1)» oricare ar fi fost
+    răspunsul lui `mv`; de aceea codurile sunt 1, 3 și 74 (cu un singur cod, 1, constanta și
+    răspunsul real arată la fel)."""
+    _stub(host.bin, "mv", f'case "$*" in *baseline-ports.txt.new*) exit {status} ;; esac\n'
+          + 'PATH="${PATH#*:}"\nexec mv "$@"\n')
     res = host.capture()
     assert res.rc == 2 and "ports=unmeasured" in host.record(), res.out
-    assert "into place (exit 1)" in res.out, res.out
+    assert f"into place (exit {status})" in res.out, res.out
     assert "into place ()" not in res.out, res.out
 
 
