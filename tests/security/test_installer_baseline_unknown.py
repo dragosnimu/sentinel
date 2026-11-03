@@ -1419,17 +1419,19 @@ def test_a_failed_collector_with_a_directory_in_its_place_leaves_it_alone_quietl
 
 
 def test_the_record_warning_does_not_borrow_the_reason_of_an_earlier_dimension(host):
-    """`ss` cade (motivul «boom» ajunge în `BASELINE_WHY`), iar apoi înregistrarea nu poate primi
-    un fișier temporar. Avertismentul despre înregistrare nu are voie să poarte motivul portului:
-    operatorul ar căuta un `ss` stricat, nu discul plin care a oprit scrierea."""
-    host.fail("ports", err="ss: boom (ports)")
+    """`docker` cade ULTIMUL (motivul «boom» rămâne în `BASELINE_WHY`, nimeni nu-l mai șterge), iar
+    apoi înregistrarea nu poate primi un fișier temporar. Avertismentul despre înregistrare nu
+    are voie să poarte motivul containerelor: operatorul ar căuta un `docker` stricat, nu discul
+    plin care a oprit scrierea. (Ultimul, nu primul: `baseline_measure` își șterge singur motivul
+    la fiecare dimensiune, deci un `ss` căzut în mijloc nu lasă nimic în urmă.)"""
+    host.fail("containers", err="docker: boom (containers)")
     host.passthrough("mktemp", "*baseline-state*")
     res = host.capture()
     assert res.rc == 2 and host.record() is None, res.out
+    assert "containers NOT captured" in res.out and "boom (containers)" in res.out, res.out  # martor pozitiv
     record_warning = [ln for ln in res.out.splitlines() if "could not write" in ln]
     assert len(record_warning) == 1, res.out
-    assert "boom" not in record_warning[0] and "(" not in record_warning[0].split("The baseline")[0], \
-        record_warning[0]
+    assert "boom" not in record_warning[0], record_warning[0]
 
 
 def test_a_store_failure_does_not_color_the_next_dimensions_collector_failure(host):
