@@ -37,6 +37,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -311,7 +312,8 @@ def test_a_missing_ports_baseline_is_a_warning_and_the_services_are_still_compar
     out = _regression(fleet)
     assert out.passes == 1 and out.warns == 1 and out.fails == 0, out.text
     assert "no pre-install baseline of listening ports" in out.lines("WARN")[0], out.text
-    assert "(ss could not be asked when it was taken)" in out.lines("WARN")[0], out.text
+    # Cauza e spusă ca presupunere, nu ca fapt: vezi testul cu două fapte, mai jos.
+    assert "(most likely ss could not be asked when it was taken)" in out.lines("WARN")[0], out.text
     # unde s-a căutat și ce poate face operatorul: fără ele avertismentul nu duce nicăieri
     assert f"listening ports at {fleet.state.as_posix()}" in out.lines("WARN")[0], out.text
     assert "cannot verify automatically. Check by hand: ss -tlnp" in out.lines("WARN")[0], out.text
@@ -399,6 +401,75 @@ def test_a_services_baseline_that_could_not_be_read_does_not_license_the_ss_expl
     assert "ss could not be asked" not in out.text, out.text
 
 
+@pytest.mark.parametrize("content", ["", "\n\n"], ids=["zero bytes", "only newlines"])
+def test_an_empty_services_baseline_does_not_license_the_ss_explanation(fleet, content):
+    """Fișierul de servicii EXISTĂ și se citește cu succes, dar e GOL; cel de porturi lipsește.
+    Aceeași execuție spunea, pentru servicii, că «un fișier gol nu se deosebește de o captură
+    căzută», iar pentru porturi «(ss could not be asked when it was taken)»: scriptul își declara
+    singur că nu știe ce s-a întâmplat la captură și, în aceeași ieșire, afirma ce s-a întâmplat.
+    Operatorul ar fi căutat un `ss` căzut când captura poate să nu fi rulat deloc. Cauza se
+    spune numai când ceva a fost CITIT din fișierul de servicii: citirea reușită fără conținut nu
+    e acel fapt (garda e pe conținut, nu doar pe codul de ieșire al cititorului)."""
+    (fleet.state / "baseline-services.txt").write_text(content, encoding="utf-8", newline="\n")
+    (fleet.state / "baseline-ports.txt").unlink()
+    out = _regression(fleet)
+    assert out.passes == 0 and out.warns == 2 and not out.lines("FAIL"), out.text
+    services_warning, ports_warning = out.lines("WARN")
+    assert "is empty" in services_warning, services_warning
+    assert "no pre-install baseline of listening ports" in ports_warning, ports_warning
+    assert "ss could not be asked" not in out.text, out.text
+    assert out.unmeasured == ["services", "ports"], out.text
+
+
+def test_the_ss_explanation_is_worded_as_a_guess_even_when_services_were_recorded(fleet):
+    """Un fișier de servicii cu conținut și unul de porturi lipsă se potrivesc cu un `ss` căzut la
+    captură, dar și cu o captură oprită între dimensiuni sau cu un fișier șters după. Scriptul nu
+    vede care. Textul spune «most likely», nu afirmă: o frază fără ezitare ar fi o cauză
+    OBSERVATĂ, iar ce s-a observat sunt doar cele două fișiere."""
+    (fleet.state / "baseline-ports.txt").unlink()
+    out = _regression(fleet)
+    warning = out.lines("WARN")[0]
+    assert "most likely ss could not be asked" in warning, warning
+    assert warning.count("ss could not be asked") == 1, warning
+    assert " (ss could not be asked" not in warning, warning
+
+
+def _remove_link(link: Path) -> None:
+    """Șterge LEGĂTURA, nu ce arată ea: `unlink` pentru un symlink, `rmdir` pentru o joncțiune
+    (ambele nu urmăresc ținta; o ștergere recursivă ar urma-o)."""
+    try:
+        os.unlink(link)
+    except OSError:
+        os.rmdir(link)
+
+
+@pytest.fixture
+def make_dangling_link():
+    """Dă testului `_dangling_link` și curăță după el, ȘI când testul pică.
+
+    O legătură atârnândă lăsată într-un arbore temporar pytest e o capcană: un `rmtree` de mai
+    târziu (al altui test, al altui agent) intră în ea. O linie la sfârșitul corpului testului nu
+    rulează când o aserțiune de deasupra ei pică; teardown-ul de după `yield` rulează. Și nu tace:
+    dacă după curățare mai rămâne ceva la calea legăturii, teardown-ul pică cu ce a rămas, ca să
+    nu existe o garanție goală de tipul «am curățat» fără dovada că s-a curățat."""
+    made: list[Path] = []
+    def make(link: Path, target: Path) -> str:
+        made.append(link)  # ÎNAINTE de creare: un skip sau o eroare de după tot o șterge
+        return _dangling_link(link, target)
+    yield make
+    left = []
+    for link in made:
+        if os.path.lexists(link):
+            try:
+                _remove_link(link)
+            except OSError as err:
+                left.append(f"{link} ({err!r})")
+                continue
+        if os.path.lexists(link):
+            left.append(f"{link} (încă există după ștergere)")
+    assert not left, f"legături atârnânde rămase după test: {left}"
+
+
 def _dangling_link(link: Path, target: Path) -> str:
     """Face din `link` o legătură spre `target` (care NU există) și întoarce cum a făcut-o.
 
@@ -415,12 +486,12 @@ def _dangling_link(link: Path, target: Path) -> str:
             pytest.skip(f"nu pot crea un symlink aici ({symlink_err!r}); ramura «legătură atârnândă» "
                         "nu e verificată pe această mașină")
         target.mkdir()
-        made = subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(link), str(target)],
-                              capture_output=True, text=True)
+        mklink = subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(link), str(target)],
+                                capture_output=True, text=True)
         target.rmdir()
-        if made.returncode != 0:
+        if mklink.returncode != 0:
             pytest.skip(f"nu pot crea nici symlink ({symlink_err!r}), nici joncțiune "
-                        f"({made.stdout.strip()} {made.stderr.strip()}); ramura «legătură atârnândă» "
+                        f"({mklink.stdout.strip()} {mklink.stderr.strip()}); ramura «legătură atârnândă» "
                         "nu e verificată pe această mașină")
         how = "joncțiune NTFS"
     state = subprocess.run([BASH, "-c", '[ -L "$1" ] && ! [ -e "$1" ]', "sh", link.as_posix()],
@@ -431,7 +502,44 @@ def _dangling_link(link: Path, target: Path) -> str:
     return how
 
 
-def test_a_dangling_link_at_the_baseline_path_is_unreadable_not_missing(fleet):
+def test_the_link_fixture_removes_its_link_even_when_the_test_using_it_fails(tmp_path):
+    """Fixture-ul `make_dangling_link` promite să nu lase o legătură atârnândă în arborele
+    temporar. O linie de curățare la sfârșitul corpului testului nu rulează când o aserțiune de
+    deasupra ei pică, iar o legătură rămasă face ca un `rmtree` de mai târziu (al altui test, al
+    altui agent) să intre în ea. Aici un test LASAT SĂ PICE creează legătura, și se verifică de
+    pe disc, din afară, că ea nu mai există după el, iar teardown-ul nu a raportat nimic."""
+    area = tmp_path / "area"
+    area.mkdir()
+    link = area / "link-made-by-a-failing-test"
+    inner = tmp_path / "inner"
+    inner.mkdir()
+    (inner / "test_inner.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        "from test_smoke_test_baseline import make_dangling_link  # noqa: F401\n"
+        "def test_fails_after_making_the_link(make_dangling_link):\n"
+        f"    link = Path({str(link)!r})\n"
+        f"    how = make_dangling_link(link, Path({str(area / 'target-never-created')!r}))\n"
+        "    assert os.path.lexists(link), 'precondition: the link exists mid-test'\n"
+        "    assert False, f'deliberate failure ({how})'\n",
+        encoding="utf-8", newline="\n")
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parent), "PYTHONDONTWRITEBYTECODE": "1"}
+    try:
+        run = subprocess.run([sys.executable, "-B", "-m", "pytest", "-p", "no:cacheprovider",
+                              "--rootdir", str(inner), "-c", os.devnull, str(inner / "test_inner.py")],
+                             capture_output=True, text=True, encoding="utf-8", errors="replace",
+                             env=env, timeout=120)
+        out = run.stdout + run.stderr
+        # «1 failed» ȘI nimic altceva: un precondition căzut sau un teardown căzut ar arăta altfel
+        assert "1 failed in" in out and "error" not in out.lower().replace("assertionerror", ""), out
+        assert "deliberate failure" in out, out
+        assert not os.path.lexists(link), f"legătura a rămas pe disc: {link}\n{out}"
+    finally:
+        if os.path.lexists(link):  # nu lăsa nici noi gunoiul unui fixture stricat
+            _remove_link(link)
+
+
+def test_a_dangling_link_at_the_baseline_path_is_unreadable_not_missing(fleet, make_dangling_link):
     """La calea baseline-ului e o legătură simbolică a cărei țintă a dispărut. `[ -e ]` urmărește
     legătura, deci o citește fals: cititorul ieșea cu 3 și scriptul spunea «nu există baseline»,
     deși ceva ARE acolo. «Lipsește» și «nu pot citi» sunt răspunsuri diferite, iar acesta e al
@@ -443,7 +551,7 @@ def test_a_dangling_link_at_the_baseline_path_is_unreadable_not_missing(fleet):
     Pe Linux (CI, WSL) rulează cu un symlink adevărat."""
     link = fleet.state / "baseline-ports.txt"
     link.unlink()
-    how = _dangling_link(link, fleet.state / "tinta-disparuta")
+    how = make_dangling_link(link, fleet.state / "tinta-disparuta")
     out = _regression(fleet)
     assert out.passes == 1 and out.warns == 1 and not out.lines("FAIL"), (how, out.text)
     warning = out.lines("WARN")[0]

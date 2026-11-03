@@ -531,9 +531,12 @@ baseline_lines() {
 # (config nginx pe care `nginx -t` nu-l poate citi), iar aici baseline-ul nu are o
 # „stare" — are un motiv, în MEASURE_WHY, spus în cuvinte.
 REGRESSION_UNMEASURED=""
-# «Fișierul de servicii a fost CITIT» e singurul fapt din care se poate spune ceva despre
-# CAUZA unui fișier de porturi lipsă (vezi `cause` în compare_baseline_dim). Se pune pe 1
-# doar la o citire reușită, iar apelul pentru servicii vine înaintea celui pentru porturi.
+# «Fișierul de servicii a fost CITIT și are conținut» e singurul fapt din care se poate spune
+# ceva despre CAUZA unui fișier de porturi lipsă (vezi `cause` în compare_baseline_dim). Se pune
+# pe 1 doar la o citire reușită CU conținut, iar apelul pentru servicii vine înaintea celui pentru
+# porturi. O citire reușită dar goală nu e acel fapt (`$(...)` a tăiat deja liniile goale de la
+# capăt): aceeași execuție spune la servicii că un fișier gol nu se deosebește de o captură
+# căzută, deci nu poate afirma, la porturi, ce a făcut captura.
 BASELINE_SERVICES_READ=""
 compare_baseline_dim() {
     local dim="$1" dir="$2" file now_cmd by_hand what_pass what_fail absent
@@ -552,11 +555,14 @@ Check by hand: systemctl --failed" ;;
             by_hand="ss -tlnp"
             what_pass="every port that was listening before the install still is"
             what_fail="ports closed since the install"
-            # Cauza («ss n-a răspuns la captură») se afirmă numai dacă baseline-ul de servicii
-            # a fost citit: atunci captura a rulat și lipsesc doar porturile. Cu ambele lipsă
-            # (sau fără director) scriptul nu știe dacă s-a captat vreodată ceva.
+            # Cauza se spune numai dacă baseline-ul de servicii a fost citit CU conținut: atunci
+            # captura a rulat și lipsesc doar porturile. Cu ambele lipsă, cu directorul lipsă,
+            # cu serviciile nelizibile sau goale scriptul nu știe dacă s-a captat ceva.
+            # Și atunci e o presupunere («most likely»), nu un fapt observat: o captură oprită
+            # între dimensiuni, sau un fișier de porturi șters după, dau aceleași două fapte
+            # (servicii cu conținut, porturi lipsă) fără ca `ss` să fi căzut.
             if [[ -n "$BASELINE_SERVICES_READ" ]]; then
-                cause=" (ss could not be asked when it was taken)"
+                cause=" (most likely ss could not be asked when it was taken)"
             fi
             absent="no pre-install baseline of listening ports at ${dir}${cause} — cannot \
 verify automatically. Check by hand: ss -tlnp" ;;
@@ -578,7 +584,9 @@ verify automatically. Check by hand: ss -tlnp" ;;
     measure_remote "sudo -n sh -c '${reader}' sh ${file}" || rc=$?
     case $rc in
         0) was_raw="$MEASURE_OUT"
-           if [[ "$dim" == services ]]; then BASELINE_SERVICES_READ=1; fi ;;
+           if [[ "$dim" == services && -n "$was_raw" ]]; then
+               BASELINE_SERVICES_READ=1
+           fi ;;
         3) warn "$absent"; REGRESSION_UNMEASURED+=" ${dim}"; return 0 ;;
         *) warn "could not read the pre-install baseline of ${dim} (${MEASURE_WHY}). That is \
 neither 'nothing was lost' nor 'something was lost'. Run by hand: sudo cat ${file}"
