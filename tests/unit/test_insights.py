@@ -1001,12 +1001,21 @@ def test_the_import_scan_sees_every_way_a_clock_can_be_frozen():
             "def h():\n    @_stamp\n    def g():\n        pass\nX = h()"),
         # Formele de mai jos fixează ramuri ale cercetării pe care nicio formă
         # de mai sus nu le străbate: cu ramura scoasă, un îngheț real trece
-        # nevăzut și suita rămâne verde.
+        # nevăzut și suita rămâne verde. Pentru fiecare, faptul care ar diferi:
+        #
+        # `kw_defaults` — valorile implicite doar-prin-cuvânt-cheie stau în
+        # `args.kw_defaults`, nu în `args.defaults`; fără ramura aceea,
+        # `def f(*, x=datetime.now())` iese curat deși îngheață la definire.
         "valoare implicită doar prin cuvânt-cheie": (
             "def f(*, x=datetime.now()):\n    pass"),
         "valoare implicită de lambdă": "F = lambda x=datetime.now(): x",
         "valoare implicită de lambdă, doar prin cuvânt-cheie": (
             "F = lambda *, x=datetime.now(): x"),
+        # `AsyncFunctionDef` — fără ea, `async def` nu mai e funcție pentru
+        # cercetare: (a) decoratorii și valorile ei implicite, care rulează la
+        # definire, nu se mai citesc; (b) ajutorul `async` care citește ceasul nu
+        # mai propagă, deci `asyncio.run(h())` iese curat; (c) decoratorul unui
+        # `async def` dintr-un ajutor nu mai e socotit chemat de ajutor.
         "valoare implicită într-o funcție async": (
             "async def f(x=datetime.now()):\n    pass"),
         "decorator fără paranteze pe o funcție async": (
@@ -1023,6 +1032,14 @@ def test_the_import_scan_sees_every_way_a_clock_can_be_frozen():
         "atribuire în lanț": "a = b = datetime.now\nb()",
         "lanț de importuri": ("from time import monotonic as m\n"
                               "from alt_modul import m as n\nn()"),
+        # Despărțirea nume/atribut pentru `from time import time`, în ambele
+        # sensuri. Aici: `time` adus sub ALT nume e un ceas ca oricare, deci un
+        # import care îl preia mai departe îl duce cu el. Sensul celălalt (doar
+        # `time` gol e exceptat, fiindcă `NOW.time()` e o oră din zi) e în
+        # `curate`, la „time importat gol, .time() e tot ora din zi”.
+        "time importat sub alt nume, preluat mai departe": (
+            "from time import time as clock\n"
+            "from alt_modul import clock as c2\nc2()"),
     }
     for forma, cod in de_prins.items():
         assert _apeluri_de_ceas_la_import(cod), f"nu a prins forma: {forma}"
@@ -1099,7 +1116,8 @@ def test_the_import_scan_sees_every_way_a_clock_can_be_frozen():
 # `datetime` fals), deci o decizie a operatorului, nu a acestui test.
 #
 # Fiecare rând e (marcaj, cod). Marcajul e exact textul dintre apostrofurile
-# inverse din punctul lui din docstring.
+# inverse din punctul lui din docstring, după definiția clasei (vezi
+# `_SEPARATOR_DEFINITIE`).
 _NEVAZUTE = (
     ("un nume legat altfel decât prin", [
         (":=", "(f := datetime.now)\nf()"),
@@ -1167,9 +1185,11 @@ _NEVAZUTE = (
     ]),
 )
 
-#: Spanurile din docstring care DEFINESC clasele (ce se vede, nu ce nu se vede):
-#: nu sunt exemplare, deci n-au rând în `_NEVAZUTE`.
-_DEFINITORII = frozenset({"=", "from … import", "partial", "_CITITORI_DE_CEAS"})
+#: Capătul unui punct din docstring: de la început până la primul „: ” sau „ — ”.
+#: Acolo stă DEFINIȚIA clasei (ce se vede, `=`, `partial`, `_CITITORI_DE_CEAS`),
+#: nu exemplare; exemplarele vin după. Așa o formă pe care cercetarea tocmai a
+#: învățat-o se mută din coadă în capăt fără nicio altă schimbare.
+_SEPARATOR_DEFINITIE = re.compile(r": | — ")
 
 #: Ceasurile din `time` pe care sonda le numără. `monkeypatch.setattr` cere ca
 #: numele să existe, deci o versiune de Python fără unul dintre ele pică zgomotos.
@@ -1205,6 +1225,29 @@ def _citiri_de_ceas(cod: str, monkeypatch) -> int:
     return len(citiri)
 
 
+def _raport_formele_vazute(nevazute, cerceteaza) -> str:
+    """Mesajul pentru formele „nevăzute” pe care `cerceteaza` le vede acum; gol dacă niciuna."""
+    linii = []
+    for fragment, randuri in nevazute:
+        vazute = [marcaj for marcaj, cod in randuri if cerceteaza(cod)]
+        if not vazute:
+            continue
+        linie = (f"punctul care începe cu «{fragment}…»: cercetarea vede acum "
+                 + ", ".join(f"`{m}`" for m in vazute))
+        if len(vazute) == len(randuri):
+            linie += (" — adică TOATE formele clasei; șterge tot punctul din "
+                      "docstring și clasa din `_NEVAZUTE`")
+        linii.append(linie)
+    if not linii:
+        return ""
+    return ("cercetarea de import a devenit mai bună, iar docstring-ul lui "
+            "`_apeluri_de_ceas_la_import` (secțiunea «Ce NU vede») spune încă "
+            "contrariul. Pentru fiecare formă: (1) scoate marcajul din punctul "
+            "respectiv al docstring-ului; (2) mută rândul din `_NEVAZUTE` în "
+            "`de_prins` din `test_the_import_scan_sees_every_way_a_clock_can_be_frozen`"
+            ", ca să rămână fixat că se vede. Formele: " + "; ".join(linii))
+
+
 def test_the_declared_blind_spots_are_still_blind():
     """Fiecare formă declarată „nevăzută” e încă nevăzută; dacă nu, spune ce să scoți.
 
@@ -1215,24 +1258,34 @@ def test_the_declared_blind_spots_are_still_blind():
     `de_prins` și rândurile lor), și mesajul numește punctul din docstring și
     marcajul de scos, ca să coste o ștergere, nu o căutare.
     """
-    mesaje = []
-    for fragment, randuri in _NEVAZUTE:
-        vazute = [marcaj for marcaj, cod in randuri if _apeluri_de_ceas_la_import(cod)]
-        if not vazute:
-            continue
-        linie = (f"punctul care începe cu «{fragment}…»: cercetarea vede acum "
-                 + ", ".join(f"`{m}`" for m in vazute))
-        if len(vazute) == len(randuri):
-            linie += (" — adică TOATE formele clasei; șterge tot punctul din "
-                      "docstring și clasa din `_NEVAZUTE`")
-        mesaje.append(linie)
-    assert not mesaje, (
-        "cercetarea de import a devenit mai bună, iar docstring-ul lui "
-        "`_apeluri_de_ceas_la_import` (secțiunea «Ce NU vede») spune încă "
-        "contrariul. Pentru fiecare formă: (1) scoate marcajul din punctul "
-        "respectiv al docstring-ului; (2) mută rândul din `_NEVAZUTE` în "
-        "`de_prins` din `test_the_import_scan_sees_every_way_a_clock_can_be_frozen`"
-        ", ca să rămână fixat că se vede. Formele: " + "; ".join(mesaje))
+    raport = _raport_formele_vazute(_NEVAZUTE, _apeluri_de_ceas_la_import)
+    assert not raport, raport
+
+
+def test_the_blind_spot_report_names_the_class_and_the_line_to_edit():
+    """Raportul spune ce punct din docstring și ce marcaj trebuie scoase, nu doar „roșu”.
+
+    Eșecul pe care îl previne: cine îmbunătățește cercetarea primește un test
+    căzut fără indiciu și îl privește ca pe o pedeapsă (îl șterge sau îl
+    relaxează), iar contractul din docstring rămâne mincinos. Aici raportul e
+    verificat cu o cercetare și un tabel date, nu cu cele reale: una care vede
+    un rând din două, una care le vede pe toate, una care nu vede nimic.
+    """
+    tabel = (("prima clasă", [("alfa", "cod-alfa"), ("beta", "cod-beta")]),
+             ("a doua clasă", [("gama", "cod-gama")]))
+    nimic = _raport_formele_vazute(tabel, lambda cod: [])
+    assert nimic == "", "o cercetare care nu vede nimic nu are ce raporta"
+
+    unul = _raport_formele_vazute(tabel, lambda cod: [cod] if cod == "cod-beta" else [])
+    assert "«prima clasă…»" in unul and "`beta`" in unul, unul
+    assert "`alfa`" not in unul and "a doua clasă" not in unul, unul
+    assert "TOATE" not in unul, "clasa mai are o formă nevăzută: punctul rămâne"
+    assert "docstring" in unul and "de_prins" in unul, unul
+
+    toate = _raport_formele_vazute(tabel, lambda cod: [cod])
+    assert "«a doua clasă…»" in toate and "`gama`" in toate, toate
+    assert "TOATE" in toate and "șterge tot punctul" in toate, toate
+    assert "`alfa`" in toate and "`beta`" in toate, toate
 
 
 def test_every_declared_blind_spot_really_reads_the_clock(monkeypatch):
@@ -1246,7 +1299,6 @@ def test_every_declared_blind_spot_really_reads_the_clock(monkeypatch):
     despre cercetare; „îngheață” e una despre lume, și aici se verifică separat.
     """
     for fragment, randuri in _NEVAZUTE:
-        assert randuri, f"clasa «{fragment}…» nu mai are niciun exemplar"
         for marcaj, cod in randuri:
             assert _citiri_de_ceas(cod, monkeypatch) > 0, (
                 f"`{marcaj}` (clasa «{fragment}…») rulat nu citește ceasul: "
@@ -1305,10 +1357,15 @@ def test_the_blind_spot_table_and_the_docstring_say_the_same_thing():
         assert punct.startswith(fragment), (
             f"punctul «{punct[:60]}…» nu începe cu «{fragment}»: clasele din "
             "docstring și din `_NEVAZUTE` nu mai sunt în aceeași ordine")
+        assert randuri, (
+            f"clasa «{fragment}…» nu are niciun exemplar: o clasă declarată fără "
+            "o formă care s-o dovedească nu e fixată de nimic")
         marcaje = [m for m, _ in randuri]
         assert len(set(marcaje)) == len(marcaje), (
             f"marcaje repetate în clasa «{fragment}…»")
-        in_docstring = set(re.findall(r"`([^`]+)`", punct)) - _DEFINITORII
+        separator = _SEPARATOR_DEFINITIE.search(punct)
+        assert separator, f"punctul «{punct[:60]}…» nu are definiție înaintea exemplelor"
+        in_docstring = set(re.findall(r"`([^`]+)`", punct[separator.end():]))
         fara_rand = sorted(in_docstring - set(marcaje))
         fara_urma = sorted(set(marcaje) - in_docstring)
         assert not fara_rand, (
@@ -1317,7 +1374,7 @@ def test_the_blind_spot_table_and_the_docstring_say_the_same_thing():
             "învățat, scoate-le din docstring; altfel adaugă rândul")
         assert not fara_urma, (
             f"clasa «{fragment}…»: `_NEVAZUTE` are rânduri {fara_urma} pe care "
-            "docstring-ul nu le declară; adaugă-le în punctul clasei")
+            "docstring-ul nu le declară ca exemple; adaugă-le în punctul clasei")
 
 
 def test_the_import_scan_sees_every_reader_in_its_own_list():
