@@ -399,6 +399,8 @@ def test_a_baseline_file_that_cannot_be_moved_into_place_is_unmeasured(host):
     assert host.data("services") is None
     assert "services=unmeasured" in host.record()
     assert "could not move" in res.out, res.out
+    # motivul lui `mv` e singurul loc în care operatorul află DE CE (EPERM, EROFS, disc plin)
+    assert "(mv: refuzat de test)" in res.out, res.out
 
 
 def test_a_processing_failure_is_not_recorded_as_a_measured_empty_list(host):
@@ -1335,7 +1337,11 @@ def test_a_refused_capture_still_says_why_under_set_e_when_called_bare(host):
 def test_a_directory_that_appears_at_the_record_path_while_measuring_is_not_filled(host):
     """Directorul apare DUPĂ ștergerea înregistrării vechi (aici: o momeală `ss` îl creează).
     `mv` l-ar umple cu fișierul temporar și ar răspunde 0. Garda dinaintea mutării refuză: avertisment
-    pe înregistrare cu motivul, cod 2, nicio linie «baseline captured» și NIMIC ascuns în director."""
+    pe înregistrare cu motivul, cod 2, nicio linie «baseline captured» și NIMIC ascuns în director.
+
+    ATENȚIE la ce NU acoperă: directorul apare aici ÎNAINTE de testul `-d`, deci e un al doilea test
+    al gărzii de dinainte, nu al verificării de DUPĂ mutare. Fereastra dintre test și mutare are
+    testele ei, cu o momeală `mv` care creează directorul chiar în clipa mutării."""
     record = host.state / "baseline-state.txt"
     _stub(host.bin, "ss",
           f'echo "ss $*" >> "{host.calls.as_posix()}"\n'
@@ -1401,6 +1407,97 @@ def test_a_mv_that_succeeds_without_putting_a_data_file_there_is_unmeasured(host
     assert _success_line(res), f"martorul pozitiv: linia de succes trebuia să existe pentru celelalte: {res.out}"
     assert "listening ports" not in _success_line(res), res.out
     assert not (host.state / "baseline-ports.txt.new").exists(), _tree(host.state)
+
+
+def _race_mv(host: Host, tail: str, *, refuse_inside: bool = False) -> Path:
+    """O momeală `mv` care creează DIRECTORUL la destinație chiar în clipa mutării și apoi cheamă `mv`
+    real: singura formă în care un director poate apărea între testul `-d` și redenumire. Scrie
+    un marcaj când a tras, ca «a avut loc cursa» să fie o observație (un test care nu vede
+    marcajul nu a dovedit nimic). `tail` e sfârșitul destinației (`baseline-state.txt`).
+    Cu `refuse_inside`, un `rm` momeală refuză orice cale DIN interiorul acelui director."""
+    marker = host.tmp / "race-fired"
+    _stub(host.bin, "mv",
+          f'case "$*" in *{tail}) mkdir -- "${{@: -1}}" && echo fired >> "{marker.as_posix()}" ;; esac\n'
+          'PATH="${PATH#*:}"\nexec mv "$@"\n')
+    if refuse_inside:
+        _stub(host.bin, "rm",
+              f'case "$*" in *{tail}/*) echo "rm: refuzat de test" >&2; exit 1 ;; esac\n'
+              'PATH="${PATH#*:}"\nexec rm "$@"\n')
+    return marker
+
+
+def test_a_directory_that_appears_between_the_check_and_the_move_at_the_record_path_is_refused(host):
+    """Directorul apare la calea înregistrării DUPĂ testul `-d` și ÎNAINTE de redenumire (momeala
+    `mv` îl creează în clipa mutării). `mv` răspunde 0 și umple directorul. Cu verificarea
+    de după mutare făcută cu `-e` în loc de `-f`, operatorul vedea «[+] baseline captured»,
+    cod 0, trei dimensiuni «unreadable» la pasul 39 și un fișier ascuns în director. Acum: cod 2,
+    nicio linie de succes, motivul real în avertisment, iar directorul rămâne GOL (fișierul
+    temporar e scos din el), ca «remove or rename it» să fie un `rmdir` care merge."""
+    record = host.state / "baseline-state.txt"
+    marker = _race_mv(host, "baseline-state.txt")
+    res = host.capture()
+    assert marker.exists(), f"martorul pozitiv: cursa n-a avut loc, testul n-a dovedit nimic: {res.out}"
+    assert res.rc == 2, res.out
+    assert "baseline captured" not in res.out and "[+]" not in res.out, res.out
+    assert (f"could not write {record.as_posix()} (mv reported success but {record.as_posix()} "
+            "is not a file)") in res.out, res.out
+    # NU garda de dinaintea mutării: ar fi spus «is a directory, not a file»
+    assert "is a directory, not a file" not in res.out, res.out
+    assert host.record() is None and record.is_dir(), _tree(host.state)
+    assert _tree(record) == [], f"ceva a rămas în director: {_tree(record)}"
+    assert not [p for p in host.state.iterdir() if p.name.startswith(".")], _tree(host.state)
+
+
+def test_a_leftover_in_the_directory_that_cannot_be_removed_is_named(host):
+    """Aceeași cursă, dar `rm` refuză să scoată fișierul temporar din director. Nu are voie să
+    iasă un «curat» pe baza intenției (am chemat `rm`): fișierul din director există, deci
+    avertismentul îl NUMEȘTE și spune de ce nu s-a putut scoate (motivul lui `rm`). Fără asta,
+    operatorul ar primi «remove or rename it», iar `rmdir` ar răspunde «Directory not empty»
+    peste un fișier ascuns pe care nimeni nu i l-a pomenit."""
+    record = host.state / "baseline-state.txt"
+    marker = _race_mv(host, "baseline-state.txt", refuse_inside=True)
+    res = host.capture()
+    assert marker.exists(), f"martorul pozitiv: cursa n-a avut loc: {res.out}"
+    assert res.rc == 2 and "baseline captured" not in res.out, res.out
+    left = _tree(record)
+    assert len(left) == 1 and left[0].startswith(".baseline-state."), left   # martorul: chiar a rămas
+    assert f"{record.as_posix()}/{left[0]} was left inside it and could not be removed " \
+           "(rm: refuzat de test)" in res.out, res.out
+
+
+@pytest.mark.parametrize("dim", DIMS)
+def test_a_directory_that_appears_between_the_check_and_the_move_at_a_data_path_is_unmeasured(host, dim):
+    """Aceeași cursă pe fișierul de date. Cu `-e` în loc de `-f`, `mv` umplea directorul cu `.new`,
+    `wc -l < director` dădea «Is a directory», linia de succes spunea «0 listening ports» și
+    înregistrarea scria `measured` pentru o dimensiune stocată nicăieri. Acum: «unmeasured»,
+    avertisment cu motivul, nicio cifră pentru ea, nicio eroare brută și directorul GOL."""
+    target = host.state / f"baseline-{dim}.txt"
+    marker = _race_mv(host, f"baseline-{dim}.txt")
+    res = host.capture()
+    assert marker.exists(), f"martorul pozitiv: cursa n-a avut loc: {res.out}"
+    assert res.rc == 2, res.out
+    assert f"{dim}=unmeasured" in host.record(), res.out
+    assert f"baseline of {dim} was measured but NOT stored: mv reported success but " \
+           f"{target.as_posix()} is not a file" in res.out, res.out
+    assert "is a directory, not a file" not in res.out, res.out   # nu garda de dinaintea mutării
+    assert _success_line(res), f"martorul pozitiv: linia de succes trebuia să existe pentru celelalte: {res.out}"
+    assert PHRASE[dim] not in _success_line(res), res.out
+    assert not re.search(r"^(wc|rm|mv):", res.out, re.M), res.out
+    assert target.is_dir() and _tree(target) == [], _tree(host.state)
+    for other in DIMS:
+        if other != dim:
+            assert f"{other}=measured" in host.record(), res.out
+
+
+def test_a_mv_that_fails_without_a_word_is_reported_with_its_exit_status(host):
+    """`mv` iese cu 1 fără să tipărească nimic. Avertismentul nu are voie să iasă cu motivul gol,
+    «could not move X into place ()»: spune codul de ieșire, ca la `rm` (același tipar)."""
+    _stub(host.bin, "mv", 'case "$*" in *baseline-ports.txt.new*) exit 1 ;; esac\n'
+          'PATH="${PATH#*:}"\nexec mv "$@"\n')
+    res = host.capture()
+    assert res.rc == 2 and "ports=unmeasured" in host.record(), res.out
+    assert "into place (exit 1)" in res.out, res.out
+    assert "into place ()" not in res.out, res.out
 
 
 def test_a_failed_collector_with_a_directory_in_its_place_leaves_it_alone_quietly(host):

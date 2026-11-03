@@ -1081,26 +1081,45 @@ baseline_complete() {
 
 # baseline_store TMP DEST — put TMP at DEST and check that it is THERE.
 #   0  DEST is a regular file
-#   1  it is not; BASELINE_WHY says why. TMP is the caller's to remove.
+#   1  it is not; BASELINE_WHY says why. TMP is the caller's to remove, EXCEPT
+#      in the one case below where `mv` has already carried it somewhere else.
 # `mv -f TMP DEST` answers 0 when DEST is a DIRECTORY: it moves TMP into it
 # (measured, bash 5.2 / GNU mv: rc=0, TMP now at DEST/<name of TMP>). The exit
 # status is the answer to "did mv run", not to "is the file where the reader
 # looks", so a directory is refused BEFORE the move (nothing is left inside it)
 # and the path is tested AFTER it (a mv that answers 0 and puts nothing there).
 # The reader tests the path with `-f` as well (baseline_state).
+#
+# The test before the move and the move are two steps; a directory can appear
+# between them (measured with a `mv` that mkdir's DEST and then runs the real
+# one: rc=0, TMP inside the directory). Then TMP is no longer where the caller
+# will look to remove it, and the operator is about to be told to "remove or
+# rename" that directory: a dotfile left inside makes `rmdir` fail with
+# "Directory not empty" and `ls` show nothing. So it is taken back out here, and
+# whether that worked is read from the path, not from rm's exit status.
+#
+# mv's own stderr is the only place the reason (EPERM, EROFS, no space) is
+# stated, so it goes into BASELINE_WHY instead of the terminal or /dev/null.
 baseline_store() {
-    local tmp="$1" dest="$2" rc=0
+    local tmp="$1" dest="$2" rc=0 mverr rmerr inside
     if [[ -d "$dest" ]]; then
         BASELINE_WHY="${dest} is a directory, not a file"
         return 1
     fi
-    mv -f "$tmp" "$dest" || rc=$?
+    mverr="$(mv -f "$tmp" "$dest" 2>&1)" || rc=$?
     if (( rc != 0 )); then
-        BASELINE_WHY="could not move ${tmp} into place"
+        BASELINE_WHY="could not move ${tmp} into place (${mverr:-exit ${rc}})"
         return 1
     fi
     if [[ ! -f "$dest" ]]; then
         BASELINE_WHY="mv reported success but ${dest} is not a file"
+        if [[ -d "$dest" ]]; then
+            inside="${dest}/${tmp##*/}"
+            rmerr="$(rm -f -- "$inside" 2>&1)" || true
+            if [[ -e "$inside" || -L "$inside" ]]; then
+                BASELINE_WHY+="; ${inside} was left inside it and could not be removed (${rmerr:-rm said nothing})"
+            fi
+        fi
         return 1
     fi
 }
