@@ -7,8 +7,12 @@ DINAINTE de 8 septembrie, marcajele de pas trăiau la
 `${STATE_MARKERS}` (calea nouă) și lăsa `${SENTINEL_STATE_DIR}` intact —
 inclusiv `.install-state`, care rămânea acolo. Atunci, o funcție de migrare din
 `deploy/lib/common.sh` muta automat orice marcaj găsit acolo înapoi în
-`STATE_MARKERS`; ea a fost scoasă pe 13 septembrie 2026 (nimic din `deploy/` nu
-mai mută calea veche — vezi `test_installer_state_markers.py`). Rămâne însă
+`STATE_MARKERS`; decizia de a o scoate e din 13 septembrie 2026
+(`docs/ARHITECTURA.md`), iar proiectarea fără migrare a aterizat în `87db51a`.
+Funcția nu apare în niciun `deploy/` comis — `git log --all -S` nu găsește
+nimic — deci data e a deciziei, nu una pe care istoria o poate confirma.
+Nimic din `deploy/` nu mai mută calea veche; vezi
+`test_installer_state_markers.py`. Rămâne însă
 o CITIRE: `nginx_preexisting_resolve` din `install.sh` mai ia din calea veche
 faptul scris o singură dată și o linie din `preflight.env`, ca o gazdă
 instalată de arborele vechi să-și păstreze răspunsul. Deci un `.install-state`
