@@ -112,3 +112,43 @@ def test_cleanup_removes_every_link_and_nothing_else(tmp_path):
     assert (directory / "secret").read_text(encoding="utf-8") == "S\n", "ținta a fost atinsă"
     assert regular.read_text(encoding="utf-8") == "1\n", "ținta-fișier a fost atinsă"
     shutil.rmtree(tmp_path / "d")  # un rmtree ulterior nu trebuie să cadă
+
+
+def test_a_taken_path_is_refused_before_anything_is_created(tmp_path):
+    """Ajutorul șterge la curățare tot ce se află la calea cerută. Dacă acolo ar fi deja ceva
+    al testului (un fișier, un director cu date), curățarea l-ar șterge: calea trebuie să fie
+    liberă, altfel e o greșeală de test, spusă înainte de orice creare."""
+    taken = tmp_path / "taken"
+    taken.mkdir()
+    (taken / "data").write_text("d\n", encoding="utf-8", newline="\n")
+    maker = LinkMaker()
+    with pytest.raises(AssertionError, match="există deja"):
+        maker(taken, tmp_path)
+    maker.cleanup()
+    assert (taken / "data").read_text(encoding="utf-8") == "d\n", "ajutorul a șters datele testului"
+
+
+def test_a_refused_copy_is_removed_by_cleanup_without_touching_the_source(tmp_path, monkeypatch):
+    """`ln -s` sub MSYS fără `winsymlinks:lnk` face o COPIE (rc 0). Verificarea o respinge (testul
+    sare), dar copia e un director cu conținut: dacă curățarea n-o șterge, un `rmtree`
+    ulterior pe arborele temporar o parcurge, iar testul care a sărit ar lăsa și o eroare
+    de teardown. Aici copia e simulată (nu pot cere nucleului să greșească): proprietatea
+    verificată e a curățării, nu a lui `ln`."""
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "secret").write_text("S\n", encoding="utf-8", newline="\n")
+
+    def _copy_instead_of_link(link, target, is_dir):
+        shutil.copytree(target, link)
+        return "copie"
+
+    monkeypatch.setattr(LinkMaker, "_create", staticmethod(_copy_instead_of_link))
+    maker = LinkMaker()
+    with pytest.raises(pytest.skip.Exception, match="nu e stabilită"):
+        maker(tmp_path / "copy", source)
+    assert present(tmp_path / "copy") and not is_link(tmp_path / "copy"), "precondiția: există o copie"
+
+    maker.cleanup()
+
+    assert not present(tmp_path / "copy"), "copia respinsă a rămas după cleanup"
+    assert (source / "secret").read_text(encoding="utf-8") == "S\n", "sursa a fost atinsă"

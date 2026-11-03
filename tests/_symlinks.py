@@ -80,6 +80,9 @@ class LinkMaker:
         de același tip. Se înregistrează la curățare ÎNAINTE de creare, ca o creare căzută la
         jumătate să nu lase nimic în urmă."""
         link, target = Path(link), Path(target)
+        assert not present(link), (
+            f"{link} există deja: ajutorul șterge la curățare tot ce se află la cale, deci "
+            "calea trebuie să fie liberă la creare")
         self._made.append(link)
         live, is_dir = target.exists(), target.is_dir()
         how = self._create(link, target, is_dir)
@@ -121,10 +124,15 @@ class LinkMaker:
                         "precondiția testului nu e stabilită pe această mașină")
 
     def cleanup(self) -> None:
-        """Șterge legăturile făcute; ridică dacă una a rămas (nu tace)."""
+        """Șterge ce s-a făcut la căile cerute; ridică dacă ceva a rămas (nu tace).
+
+        `rm -rf`, nu `rm -f`: dacă verificarea a respins ce a produs `ln` (o COPIE în loc de
+        legătură — rc 0, director cu conținut), copia trebuie să dispară și ea. Sigur, fiindcă
+        la creare calea era liberă, deci tot ce e acolo e al ajutorului; iar `rm -rf L` șterge
+        legătura și nu ținta (măsurat pe Git Bash și pe WSL)."""
         left: list[Path] = []
         for link in reversed(self._made):
-            _sh('rm -f -- "$1"', link)
+            _sh('rm -rf -- "$1"', link)
             if present(link):
                 for fallback in (link.unlink, link.rmdir):
                     try:
