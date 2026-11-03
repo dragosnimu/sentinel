@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from pathlib import Path
 
 import _symlinks
 import pytest
@@ -288,6 +289,48 @@ def test_cleanup_removes_a_half_made_lnk_that_bash_cannot_see(tmp_path, monkeypa
         maker.cleanup()  # nu are voie să ridice: Python-name a scos fișierul
 
         assert not half_made.exists(), "fișierul .lnk pe jumătate a rămas după cleanup"
+    finally:
+        monkeypatch.undo()
+        if half_made.exists():
+            half_made.chmod(0o600)
+            half_made.unlink()
+    shutil.rmtree(target)  # un rmtree ulterior nu trebuie să cadă
+
+
+def test_cleanup_reports_a_half_made_lnk_it_could_not_remove(tmp_path, monkeypatch):
+    """Dacă nici numele Python nu poate scoate fișierul (blocat de un alt proces, antivirus),
+    curățarea trebuie să ridice: altfel testul ar trece, iar `.lnk`-ul ar rămâne în arbore și
+    ar strica `rmtree`-ul de la sfârșitul sesiunii.
+
+    Fișierul e unul pe care bash nu-l vede (`present(link)` fals), deci singurul lucru care îl
+    ține în lista de rămășițe e `lnk.exists()` din verificarea finală: dacă verificarea s-ar
+    uita doar la numele bash, curățarea ar tăcea. `Path.unlink` e SIMULAT ca blocat (pe Linux
+    un fișier deschis se șterge oricum, deci nu am cum să-l blochez cu adevărat), deci testul
+    dovedește ce raportează curățarea când ștergerea eșuează, nu că fișierul se blochează.
+
+    Falsificat înlocuind `if present(link) or lnk.exists():` cu `if present(link):`."""
+    target = tmp_path / "target"
+    target.mkdir()
+    half_made = tmp_path / "link.lnk"
+
+    def _half_made_lnk(link, target, is_dir):
+        half_made.write_bytes(b"not a shortcut")
+        return "legătură întreruptă"
+
+    monkeypatch.setattr(LinkMaker, "_create", staticmethod(_half_made_lnk))
+    maker = LinkMaker()
+    try:
+        with pytest.raises(pytest.skip.Exception, match="nu e stabilită"):
+            maker(tmp_path / "link", target)
+        assert half_made.exists() and not present(tmp_path / "link"), (
+            "precondiția: fișierul există, dar bash nu vede nimic la numele `link`")
+
+        def _locked(self, missing_ok=False):
+            raise PermissionError(32, "fișier blocat (simulat)")
+
+        monkeypatch.setattr(Path, "unlink", _locked)
+        with pytest.raises(AssertionError, match="au rămas"):
+            maker.cleanup()
     finally:
         monkeypatch.undo()
         if half_made.exists():
