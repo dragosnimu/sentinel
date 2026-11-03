@@ -1459,6 +1459,7 @@ def test_a_leftover_in_the_directory_that_cannot_be_removed_is_named(host):
     res = host.capture()
     assert marker.exists(), f"martorul pozitiv: cursa n-a avut loc: {res.out}"
     assert res.rc == 2 and "baseline captured" not in res.out, res.out
+    assert "mv reported success but" in res.out, res.out   # motivul de bază nu se pierde sub cel adăugat
     left = _tree(record)
     assert len(left) == 1 and left[0].startswith(".baseline-state."), left   # martorul: chiar a rămas
     assert f"{record.as_posix()}/{left[0]} was left inside it and could not be removed " \
