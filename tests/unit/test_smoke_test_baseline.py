@@ -312,6 +312,9 @@ def test_a_missing_ports_baseline_is_a_warning_and_the_services_are_still_compar
     assert out.passes == 1 and out.warns == 1 and out.fails == 0, out.text
     assert "no pre-install baseline of listening ports" in out.lines("WARN")[0], out.text
     assert "(ss could not be asked when it was taken)" in out.lines("WARN")[0], out.text
+    # unde s-a căutat și ce poate face operatorul: fără ele avertismentul nu duce nicăieri
+    assert f"listening ports at {fleet.state.as_posix()}" in out.lines("WARN")[0], out.text
+    assert "cannot verify automatically. Check by hand: ss -tlnp" in out.lines("WARN")[0], out.text
     assert out.unmeasured == ["ports"], out.text
     assert any("every service" in ln for ln in out.lines("PASS")), out.text
     assert not any("every port" in ln for ln in out.lines("PASS")), out.text
@@ -324,6 +327,9 @@ def test_a_missing_services_baseline_does_not_hide_the_ports_that_were_recorded(
     out = _regression(fleet)
     assert out.passes == 1 and out.warns == 1, out.text
     assert out.unmeasured == ["services"], out.text
+    warning = out.lines("WARN")[0]
+    assert f"no pre-install baseline at {fleet.state.as_posix()}" in warning, warning
+    assert "cannot verify automatically. Check by hand: systemctl --failed" in warning, warning
     assert any("every port" in ln for ln in out.lines("PASS")), out.text
 
 
@@ -376,12 +382,21 @@ def test_the_cause_of_a_missing_ports_baseline_is_not_guessed_when_nothing_was_r
 
 
 def test_a_services_baseline_that_could_not_be_read_does_not_license_the_ss_explanation(fleet):
-    """Citirea baseline-ului de servicii cade (sudo refuză) înainte să se știe dacă a fost
-    captat: nu e «fișierul de servicii a fost citit», deci nici o cauză pentru porturi. Garda e
-    pe CITIT cu succes, nu pe «dimensiunea a fost încercată»."""
-    fleet.env["SUDO_REFUSES"] = "1"
+    """Fișierul de servicii EXISTĂ dar nu poate fi citit (aici: un director la calea lui), iar cel
+    de porturi lipsește. «Fișierul de servicii a fost citit» nu e adevărat, deci scriptul nu știe
+    că captura a rulat și doar `ss` a căzut: nu are voie să o afirme. Garda e pe CITIT cu succes,
+    nu pe «dimensiunea a fost încercată» și nu pe «fișierul există». (Cu sudo care refuză ambele
+    dimensiuni ies pe «n-am putut citi» și textul cauzei nici nu se tipărește, deci acel scenariu
+    n-ar vedea garda; de aceea porturile trebuie să lipsească, iar serviciile să fie nelizibile.)"""
+    (fleet.state / "baseline-services.txt").unlink()
+    (fleet.state / "baseline-services.txt").mkdir()
+    (fleet.state / "baseline-ports.txt").unlink()
     out = _regression(fleet)
-    assert out.warns == 2 and "ss could not be asked" not in out.text, out.text
+    assert out.passes == 0 and out.warns == 2 and not out.lines("FAIL"), out.text
+    services_warning, ports_warning = out.lines("WARN")
+    assert "could not read the pre-install baseline of services" in services_warning, services_warning
+    assert "no pre-install baseline of listening ports" in ports_warning, ports_warning
+    assert "ss could not be asked" not in out.text, out.text
 
 
 def _dangling_link(link: Path, target: Path) -> str:
