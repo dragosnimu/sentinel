@@ -73,19 +73,32 @@ def test_a_copy_is_not_accepted_as_a_link(tmp_path):
         maker.cleanup()
 
 
-@pytest.mark.parametrize("live, is_dir", [
-    pytest.param(False, True, id="expected-dangling-but-target-exists"),
-    pytest.param(True, False, id="expected-a-file-but-target-is-a-directory"),
+@pytest.mark.parametrize("target_exists, live, is_dir, code", [
+    pytest.param(True, False, True, 11, id="expected-dangling-but-target-exists"),
+    pytest.param(True, True, False, 12, id="expected-a-file-but-target-is-a-directory"),
+    pytest.param(False, True, True, 14, id="expected-live-but-link-is-dangling"),
 ])
-def test_a_link_of_the_wrong_shape_is_refused(tmp_path, live, is_dir):
-    """O legătură vie cerută atârnândă, sau spre director cerută spre fișier: precondiția
-    testului de gardă n-ar fi cea scrisă în el, deci ajutorul sare în loc să o lase."""
-    directory = tmp_path / "d"
-    directory.mkdir()
+def test_a_link_of_the_wrong_shape_is_refused(tmp_path, target_exists, live, is_dir, code):
+    """O legătură vie cerută atârnândă, spre director cerută spre fișier, sau atârnândă cerută
+    vie: precondiția testului de gardă n-ar fi cea scrisă în el, deci ajutorul sare în loc să o
+    lase. Un test de gardă care are nevoie de o legătură VIE (`[[ -f L && ! -L L ]]`) ar rula
+    pe una atârnândă și ar raporta o acoperire pe care n-o are.
+
+    Fiecare rând fixează CODUL clauzei care a respins (`cod 11:` etc.), nu doar faptul că a
+    sărit: altfel o altă clauză (de pildă `-L` fals, cod 10) ar satisface rândul, iar clauza
+    pe care rândul pretinde că o exersează ar putea fi ștearsă fără ca nimic să roșească.
+    Rândul 14 e cel care exersează ramura `else` din `_verify`: singura în care legătura NU
+    urmează o țintă.
+
+    Falsificat înlocuind clauza `[ "$2" = dangling ] || exit 14` cu `true`: rândul 14 pică
+    (nu mai sare), celelalte două rămân verzi."""
+    target = tmp_path / "d"
+    if target_exists:
+        target.mkdir()
     maker = LinkMaker()
     try:
-        maker(tmp_path / "link", directory)
-        with pytest.raises(pytest.skip.Exception, match="nu e stabilită"):
+        maker(tmp_path / "link", target)
+        with pytest.raises(pytest.skip.Exception, match=f"cod {code}:"):
             LinkMaker._verify(tmp_path / "link", "legătură", live, is_dir)
     finally:
         maker.cleanup()
@@ -217,6 +230,52 @@ def test_cleanup_raises_when_something_survives_every_removal_step(tmp_path, mon
         monkeypatch.undo()
         shutil.rmtree(tmp_path / "copy", ignore_errors=True)  # un director obișnuit: rmtree merge
     assert not (tmp_path / "copy").exists(), "testul însuși a lăsat copia în urmă"
+
+
+def test_cleanup_clears_an_empty_directory_when_the_bash_rm_leaves_it_behind(tmp_path,
+                                                                           monkeypatch):
+    """Copia respinsă a unei ținte GOALE e un director gol la calea cerută: dacă pasul `rm` din
+    bash nu-l scoate, `link.unlink()` cade (director), iar `link.rmdir()` e singurul pas rămas.
+    Fără el, curățarea ar raporta „au rămas" pentru un director pe care îl putea șterge, iar
+    testul care a sărit ar lăsa și o eroare de teardown.
+
+    Doar acesta e cazul în care `rmdir` face ceva: pe Windows `Path.unlink()` scoate deja o
+    legătură-director (reparse point), iar pe Linux o legătură adevărată, deci `rmdir` e
+    atins numai de un director GOL obișnuit. Perechea testului de mai sus (aceeași stare,
+    dar director NEGOL: nu se poate șterge, curățarea ridică) — împreună fixează că `rmdir`
+    șterge ce poate și că nu ascunde ce nu poate.
+
+    `rm`-ul care nu șterge e SIMULAT: un `rm` real care eșuează pe un director gol nu l-am
+    putut produce (un handle deschis ar împiedica și `rmdir`, deci cele două ar eșua
+    împreună). Testul dovedește ce face curățarea când pasul bash nu a șters, nu că pasul
+    bash eșuează în practică; ramura rămâne ca ultim pas al lanțului pentru cazul acela,
+    iar acesta e singurul ei observator.
+
+    Falsificat reducând `(link.unlink, link.rmdir)` la `(link.unlink,)`: directorul rămâne,
+    curățarea ridică."""
+    source = tmp_path / "source"
+    source.mkdir()
+
+    def _copy_instead_of_link(link, target, is_dir):
+        shutil.copytree(target, link)
+        return "copie"
+
+    monkeypatch.setattr(LinkMaker, "_create", staticmethod(_copy_instead_of_link))
+    maker = LinkMaker()
+    with pytest.raises(pytest.skip.Exception, match="nu e stabilită"):
+        maker(tmp_path / "copy", source)
+    assert present(tmp_path / "copy") and not is_link(tmp_path / "copy"), (
+        "precondiția: există un director obișnuit la calea cerută")
+    assert not any((tmp_path / "copy").iterdir()), "precondiția: directorul e GOL"
+    _rm_that_does_nothing(monkeypatch)
+    try:
+        maker.cleanup()  # nu are voie să ridice: rmdir a scos directorul gol
+        assert not present(tmp_path / "copy"), "directorul gol a rămas după fallback"
+        assert source.is_dir(), "sursa a fost atinsă"
+    finally:
+        monkeypatch.undo()
+        if (tmp_path / "copy").is_dir():
+            (tmp_path / "copy").rmdir()  # un director gol obișnuit: rmdir merge
 
 
 def test_cleanup_still_clears_a_link_when_the_bash_rm_leaves_it_behind(tmp_path, monkeypatch):

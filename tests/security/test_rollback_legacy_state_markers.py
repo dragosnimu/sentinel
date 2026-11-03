@@ -5,12 +5,15 @@ DINAINTE de 8 septembrie, marcajele de pas trăiau la
 `${SENTINEL_STATE_DIR}/.install-state`, nu la calea nouă
 (`SENTINEL_INSTALL_STATE_DIR`). `rollback.sh` ștergea doar
 `${STATE_MARKERS}` (calea nouă) și lăsa `${SENTINEL_STATE_DIR}` intact —
-inclusiv `.install-state`, care rămânea acolo. La următoarea instalare,
-`migrate_legacy_state_markers` din `deploy/lib/common.sh` mută automat orice
-marcaj legitim găsit acolo înapoi în `STATE_MARKERS` — deci o instalare de
-după `--purge`, care a scos un rol prin rollback, ar sări din nou pașii al
-căror marcaj tocmai a fost readus, pe o gazdă despre care rollback-ul tocmai
-a raportat „curățat".
+inclusiv `.install-state`, care rămânea acolo. Atunci, o funcție de migrare din
+`deploy/lib/common.sh` muta automat orice marcaj găsit acolo înapoi în
+`STATE_MARKERS`; ea a fost scoasă pe 13 septembrie 2026 (nimic din `deploy/` nu
+mai mută calea veche — vezi `test_installer_state_markers.py`). Rămâne însă
+o CITIRE: `nginx_preexisting_resolve` din `install.sh` mai ia din calea veche
+faptul scris o singură dată și o linie din `preflight.env`, ca o gazdă
+instalată de arborele vechi să-și păstreze răspunsul. Deci un `.install-state`
+lăsat de un `--purge` ar da următoarei instalări răspunsul de ieri, pe o
+gazdă despre care rollback-ul tocmai a raportat „curățat".
 
 Reparația: rollback.sh șterge acum și calea veche, folosind constanta
 LITERALĂ `_LEGACY_STATE_MARKERS` din `deploy/lib/common.sh` (sourced de
