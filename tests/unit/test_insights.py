@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import os
 import re
 import sqlite3
+import sys
 import time
+import types
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -730,23 +734,34 @@ def _apeluri_de_ceas_la_import(sursa: str) -> list[str]:
     s-a dovedit incompletă: un verificator a găsit 35 de forme nedeclarate care
     chiar îngheață o referință, printre ele un argument implicit dovedit pe
     fișierul ăsta. Fiecare clasă e un defect care ar trece de cercetare:
-    * un nume legat altfel decât prin `=`, `:=` sau `from … import` — argument
+    * un nume legat altfel decât prin `=` sau `from … import` — `:=`, argument
       implicit (`def _g(clock=datetime.now)`), `for … in`, `with … as`, țintă
-      de comprehensiune, parametru de lambda, captură de `match … case`, sau
-      desfacerea unui tuplu (`a, b = datetime.now, 1`);
-    * un alias din altceva decât nume/atribut/`partial`: `a or b`, ternar,
-      `(…,)[0]`, valoarea întoarsă de un ajutor (`h()()`), dispecerat prin
-      dicționar (`D['a']()`), sau modulul redenumit (`t = time`, `t.time()`);
+      de comprehensiune (`[f() for f in …]`), parametru de lambda
+      (`(lambda f: f())(…)`), captură de `match … case`, sau desfacerea unui
+      tuplu (`a, b = datetime.now, 1`);
+    * un alias din altceva decât nume/atribut/`partial`: `a or b`,
+      `a if c else b`, `(…,)[0]`, valoarea întoarsă de un ajutor (`h()()`),
+      dispecerat prin dicționar (`D['a']()`), trecut printr-un apel oarecare
+      (`wrap(datetime.now)`), sau modulul redenumit (`t = time; t.time()`);
     * numele ca TEXT: `exec`/`eval`, `getattr(datetime, 'now')()`,
       `attrgetter`, `methodcaller`, `vars(datetime)['now']`,
       `importlib.import_module`, `from time import *`;
-    * o instanță al cărei `__init__`/`__post_init__` sau property citește
-      ceasul: `k = K()` la import nu arată ca un apel de ceas;
+    * cod pe care interpretorul îl cheamă singur, fără ca la import să arate ca
+      un apel de ceas: `__init__`, `__post_init__`, `property`, `__enter__`,
+      `__init_subclass__` (la import se vede doar construirea instanței);
     * un cititor de ceas care nu e în `_CITITORI_DE_CEAS` — `time_ns`,
       `monotonic_ns`, `gmtime`, `localtime`, `ctime`, `process_time`,
-      `os.times`, `uuid1` — sau un ajutor adus din alt modul sub alt nume.
+      `os.times`, `uuid1` — sau un ajutor adus din alt modul sub alt nume
+      (`from alt_modul import ceas_meu as k`);
+    * un ceas, sau o lambdă care îl citește, dat ca ARGUMENT unui apelant care îl
+      cheamă la import: `map(datetime.now, …)`, `sorted(…, key=lambda x:
+      datetime.now())`, `run(datetime.now)` unde run e un ajutor
+      care cheamă ce primește — corpul lambdei rulează abia la apel, iar apelul e în altă parte.
+
     Enumerarea din fiecare clasă e ce s-a măsurat, nu ce există: clasa e
-    afirmația, exemplele doar o ilustrează.
+    afirmația, exemplele doar o ilustrează. Un test nu poate fixa o clasă, doar
+    exemplarele ei; ce se fixează, și ce nu, e spus în comentariul de la
+    `_NEVAZUTE`.
 
     Cercetarea e al TREILEA strat, nu singurul. Înaintea ei stau fixtura per
     test și `_ACUM_GAP = None` cu `_t()` care aruncă la import; după ea, garda
@@ -984,6 +999,30 @@ def test_the_import_scan_sees_every_way_a_clock_can_be_frozen():
         "decorator fără paranteze într-un ajutor": (
             "def _stamp(f):\n    f.t = datetime.now()\n    return f\n"
             "def h():\n    @_stamp\n    def g():\n        pass\nX = h()"),
+        # Formele de mai jos fixează ramuri ale cercetării pe care nicio formă
+        # de mai sus nu le străbate: cu ramura scoasă, un îngheț real trece
+        # nevăzut și suita rămâne verde.
+        "valoare implicită doar prin cuvânt-cheie": (
+            "def f(*, x=datetime.now()):\n    pass"),
+        "valoare implicită de lambdă": "F = lambda x=datetime.now(): x",
+        "valoare implicită de lambdă, doar prin cuvânt-cheie": (
+            "F = lambda *, x=datetime.now(): x"),
+        "valoare implicită într-o funcție async": (
+            "async def f(x=datetime.now()):\n    pass"),
+        "decorator fără paranteze pe o funcție async": (
+            "def _stamp(f):\n    global X\n    X = datetime.now()\n    return f\n"
+            "@_stamp\nasync def g():\n    pass"),
+        "ajutor async, rulat de asyncio": (
+            "async def h():\n    return datetime.now()\nasyncio.run(h())"),
+        "decorator fără paranteze pe o funcție async, într-un ajutor": (
+            "def _stamp(f):\n    f.t = datetime.now()\n    return f\n"
+            "def h():\n    @_stamp\n    async def g():\n        pass\nX = h()"),
+        "decorator fără paranteze, ca atribut": (
+            "def _stamp(f):\n    f.t = datetime.now()\n    return f\n"
+            "@M._stamp\ndef g():\n    pass"),
+        "atribuire în lanț": "a = b = datetime.now\nb()",
+        "lanț de importuri": ("from time import monotonic as m\n"
+                              "from alt_modul import m as n\nn()"),
     }
     for forma, cod in de_prins.items():
         assert _apeluri_de_ceas_la_import(cod), f"nu a prins forma: {forma}"
@@ -1007,6 +1046,16 @@ def test_the_import_scan_sees_every_way_a_clock_can_be_frozen():
         "ceasul numit, nu chemat": "F = datetime.now",
         "partial pe altceva": "X = functools.partial(int, base=2)('10')",
         "decorator fără paranteze, fără ceas": "@staticmethod\ndef g():\n    pass",
+        # Aceleași ramuri, în sens invers: una prea lacomă strigă „ceas” pe cod
+        # care doar îl pomenește.
+        "corp de funcție async": "async def f():\n    return datetime.now()",
+        "argument doar prin cuvânt-cheie, fără valoare": (
+            "def f(*, x):\n    return x"),
+        "time importat gol, .time() e tot ora din zi": (
+            "from time import time\nNOW = datetime(2026, 8, 3, 12, 0)\n"
+            "NOON = NOW.time()"),
+        "altceva importat din time": "from time import sleep\nsleep(0)",
+        "ora din zi, prin __import__": "NOON = __import__('datetime').time(12, 0)",
     }
     for forma, cod in curate.items():
         assert not _apeluri_de_ceas_la_import(cod), f"a prins pe nedrept: {forma}"
@@ -1018,6 +1067,314 @@ def test_the_import_scan_sees_every_way_a_clock_can_be_frozen():
     assert _apeluri_de_ceas_la_import(
         sursa + "\n_ACUM_GAP = datetime.now(timezone.utc)\n"), (
         "cu referința pusă înapoi la nivel de modul, cercetarea n-a văzut-o")
+
+
+# --- ce NU vede cercetarea de import, ca date -------------------------------
+#
+# Docstring-ul lui `_apeluri_de_ceas_la_import` declară ce nu vede cercetarea,
+# pe șase CLASE. O clasă nu poate fi fixată de un test: „orice nume legat altfel
+# decât prin `=`” e o afirmație despre un set deschis, iar o listă finită de
+# exemplare doar o ilustrează. Nu e teorie: încercarea de a enumera exemplarele
+# pentru tabelul de mai jos a găsit o clasă pe care docstring-ul n-o avea deloc
+# (a șasea, un ceas dat ca argument unui apelant) și a arătat că a patra era mai
+# largă decât „`__init__` și property”. Un test care ar pretinde „clasa e fixată”
+# ar fi aceeași greșeală într-un palton nou: verde cât timp lista rămâne
+# neschimbată, orb la forma care n-a fost enumerată.
+#
+# Ce se fixează, în schimb, e ce se poate verifica:
+#   1. fiecare exemplar declarat rămâne nevăzut — iar dacă cercetarea se
+#      îmbunătățește, testul cade și numește CLASA și MARCAJUL de scos din
+#      docstring. Îmbunătățirea nu e pedepsită: costă o ștergere în docstring și
+#      mutarea rândului în `de_prins`, adică ce trebuia făcut oricum;
+#   2. fiecare exemplar chiar citește ceasul când e RULAT (nu doar „arată a”),
+#      altfel „nevăzut” ar putea fi o greșeală de scriere sau un cod inofensiv;
+#   3. docstring-ul și tabelul spun același lucru, în ambele sensuri: aceleași
+#      puncte, în aceeași ordine, și fiecare exemplu din docstring are un rând;
+#   4. partea ÎNCHISĂ a clasei „cititor absent din listă”: fiecare nume din
+#      `_CITITORI_DE_CEAS` e văzut — derivat din constantă, nu enumerat.
+# Ce rămâne nefixat: că enumerarea e completă. Singurul lucru care ține o clasă
+# ca CLASĂ e o probă dinamică (modulul executat sub un ceas care numără
+# citirile; prototipată, vede toate rândurile de mai jos). E un al patrulea
+# strat, cu riscul lui (un modul importat prima oară în fereastră ar păstra un
+# `datetime` fals), deci o decizie a operatorului, nu a acestui test.
+#
+# Fiecare rând e (marcaj, cod). Marcajul e exact textul dintre apostrofurile
+# inverse din punctul lui din docstring.
+_NEVAZUTE = (
+    ("un nume legat altfel decât prin", [
+        (":=", "(f := datetime.now)\nf()"),
+        ("def _g(clock=datetime.now)",
+         "def g(f=datetime.now):\n    return f()\ng()"),
+        ("for … in", "for f in (datetime.now,):\n    f()"),
+        ("with … as", "import contextlib\n"
+                      "with contextlib.nullcontext(datetime.now) as f:\n    f()"),
+        ("[f() for f in …]", "X = [f() for f in (datetime.now,)]"),
+        ("(lambda f: f())(…)", "X = (lambda f: f())(datetime.now)"),
+        ("match … case", "match datetime.now:\n    case f:\n        f()"),
+        ("a, b = datetime.now, 1", "a, b = datetime.now, 1\na()"),
+    ]),
+    ("un alias din altceva decât", [
+        ("a or b", "f = None or datetime.now\nf()"),
+        ("a if c else b", "f = datetime.now if True else None\nf()"),
+        ("(…,)[0]", "f = (datetime.now,)[0]\nf()"),
+        ("h()()", "def h():\n    return datetime.now\nh()()"),
+        ("D['a']()", "D = {'a': datetime.now}\nD['a']()"),
+        ("wrap(datetime.now)",
+         "def wrap(g):\n    return g\nf = wrap(datetime.now)\nf()"),
+        ("t = time; t.time()", "import time\nt = time\nt.time()"),
+    ]),
+    ("numele ca TEXT", [
+        ("exec", "exec('X = datetime.now()')"),
+        ("eval", "X = eval('datetime.now()')"),
+        ("getattr(datetime, 'now')()", "X = getattr(datetime, 'now')()"),
+        ("attrgetter", "import operator\nX = operator.attrgetter('now')(datetime)()"),
+        ("methodcaller",
+         "import operator\nX = operator.methodcaller('now')(datetime)"),
+        ("vars(datetime)['now']", "X = vars(datetime)['now']()"),
+        ("importlib.import_module",
+         "import importlib\nX = importlib.import_module('time').time()"),
+        ("from time import *", "from time import *\nX = time()"),
+    ]),
+    ("cod pe care interpretorul îl cheamă singur", [
+        ("__init__", "class K:\n    def __init__(self):\n"
+                     "        self.t = datetime.now()\nk = K()"),
+        ("__post_init__", "import dataclasses\n@dataclasses.dataclass\nclass K:\n"
+                          "    def __post_init__(self):\n"
+                          "        self.t = datetime.now()\nk = K()"),
+        ("property", "class K:\n    @property\n    def p(self):\n"
+                     "        return datetime.now()\nX = K().p"),
+        ("__enter__", "class K:\n    def __enter__(self):\n"
+                      "        return datetime.now()\n"
+                      "    def __exit__(self, *a):\n        pass\n"
+                      "with K() as x:\n    pass"),
+        ("__init_subclass__", "class B:\n    def __init_subclass__(cls):\n"
+                              "        cls.t = datetime.now()\nclass C(B):\n    pass"),
+    ]),
+    ("un cititor de ceas care nu e în", [
+        *((nume, f"import time\nX = time.{nume}()")
+          for nume in ("time_ns", "monotonic_ns", "gmtime", "localtime", "ctime",
+                       "process_time")),
+        ("os.times", "import os\nX = os.times()"),
+        ("uuid1", "import uuid\nX = uuid.uuid1()"),
+        ("from alt_modul import ceas_meu as k",
+         "from alt_modul import ceas_meu as k\nX = k()"),
+    ]),
+    ("un ceas, sau o lambdă care îl citește", [
+        ("map(datetime.now, …)", "X = list(map(datetime.now, [None]))"),
+        ("sorted(…, key=lambda x: datetime.now())",
+         "X = sorted([1], key=lambda x: datetime.now())"),
+        ("run(datetime.now)", "def run(f):\n    return f()\nX = run(datetime.now)"),
+    ]),
+)
+
+#: Spanurile din docstring care DEFINESC clasele (ce se vede, nu ce nu se vede):
+#: nu sunt exemplare, deci n-au rând în `_NEVAZUTE`.
+_DEFINITORII = frozenset({"=", "from … import", "partial", "_CITITORI_DE_CEAS"})
+
+#: Ceasurile din `time` pe care sonda le numără. `monkeypatch.setattr` cere ca
+#: numele să existe, deci o versiune de Python fără unul dintre ele pică zgomotos.
+_CEASURI_TIME = ("time", "time_ns", "monotonic", "monotonic_ns", "perf_counter",
+                 "perf_counter_ns", "process_time", "gmtime", "localtime", "ctime")
+
+
+def _citiri_de_ceas(cod: str, monkeypatch) -> int:
+    """Câte ori citește ceasul `cod`, rulat ca un modul (nu citit ca sursă).
+
+    `datetime` din cod e o clasă falsă, `time`/`os.times`/`uuid.uuid1` sunt
+    înlocuite pe durata rulării, iar `alt_modul` există. Fiecare citire se numără
+    și întoarce 0: nimic din rulare nu mai depinde de ora reală.
+    """
+    citiri: list[str] = []
+
+    def citeste(*_a, **_k):
+        citiri.append("citit")
+        return 0
+
+    class _Datetime:
+        now = utcnow = today = staticmethod(citeste)
+
+    with monkeypatch.context() as m:
+        for nume in _CEASURI_TIME:
+            m.setattr(time, nume, citeste)
+        m.setattr(os, "times", citeste)
+        m.setattr(uuid, "uuid1", citeste)
+        m.setitem(sys.modules, "alt_modul",
+                  types.SimpleNamespace(ceas_meu=citeste, m=citeste))
+        exec(compile(cod, "<esantion>", "exec"),
+             {"__name__": "esantion", "datetime": _Datetime})
+    return len(citiri)
+
+
+def test_the_declared_blind_spots_are_still_blind():
+    """Fiecare formă declarată „nevăzută” e încă nevăzută; dacă nu, spune ce să scoți.
+
+    Eșecul pe care îl previne: cercetarea se îmbunătățește (cineva îi învață
+    `for … in`), docstring-ul continuă să spună operatorului că îi scapă, iar
+    cine citește în el „nu vede X” nu mai știe ce e adevărat. Testul cade DOAR
+    când cercetarea vede mai mult, nu când vede mai puțin (asta o prind
+    `de_prins` și rândurile lor), și mesajul numește punctul din docstring și
+    marcajul de scos, ca să coste o ștergere, nu o căutare.
+    """
+    mesaje = []
+    for fragment, randuri in _NEVAZUTE:
+        vazute = [marcaj for marcaj, cod in randuri if _apeluri_de_ceas_la_import(cod)]
+        if not vazute:
+            continue
+        linie = (f"punctul care începe cu «{fragment}…»: cercetarea vede acum "
+                 + ", ".join(f"`{m}`" for m in vazute))
+        if len(vazute) == len(randuri):
+            linie += (" — adică TOATE formele clasei; șterge tot punctul din "
+                      "docstring și clasa din `_NEVAZUTE`")
+        mesaje.append(linie)
+    assert not mesaje, (
+        "cercetarea de import a devenit mai bună, iar docstring-ul lui "
+        "`_apeluri_de_ceas_la_import` (secțiunea «Ce NU vede») spune încă "
+        "contrariul. Pentru fiecare formă: (1) scoate marcajul din punctul "
+        "respectiv al docstring-ului; (2) mută rândul din `_NEVAZUTE` în "
+        "`de_prins` din `test_the_import_scan_sees_every_way_a_clock_can_be_frozen`"
+        ", ca să rămână fixat că se vede. Formele: " + "; ".join(mesaje))
+
+
+def test_every_declared_blind_spot_really_reads_the_clock(monkeypatch):
+    """Fiecare formă declarată „nevăzută” chiar citește ceasul când e rulată.
+
+    Eșecul pe care îl previne: un rând din `_NEVAZUTE` cu o greșeală de scriere
+    (`time.tim_ns()`), sau cod care doar definește un ceas fără să-l cheme, rămâne
+    „nevăzut” pentru totdeauna și trece drept dovadă a unei găuri. Operatorul ar
+    citi în docstring că îi scapă o formă care nu îngheață nimic, iar gaura
+    adevărată din aceeași clasă ar rămâne fără rând. „Nevăzut” e o aserțiune
+    despre cercetare; „îngheață” e una despre lume, și aici se verifică separat.
+    """
+    for fragment, randuri in _NEVAZUTE:
+        assert randuri, f"clasa «{fragment}…» nu mai are niciun exemplar"
+        for marcaj, cod in randuri:
+            assert _citiri_de_ceas(cod, monkeypatch) > 0, (
+                f"`{marcaj}` (clasa «{fragment}…») rulat nu citește ceasul: "
+                "nu e un îngheț, deci nu poate dovedi o gaură")
+
+
+def test_the_clock_probe_tells_a_read_from_a_definition(monkeypatch):
+    """Sonda numără citirile adevărate și doar pe ele.
+
+    Eșecul pe care îl previne: o sondă care întoarce mereu >0 ar face verde
+    `test_every_declared_blind_spot_really_reads_the_clock` pe cod inofensiv, iar
+    una care întoarce mereu 0 l-ar face roșu pe tot; în ambele cazuri verdictul
+    de acolo n-ar mai spune nimic despre rânduri. Aici sonda e pusă să deosebească
+    o citire de o definiție, înainte să fie folosită drept martor.
+    """
+    assert _citiri_de_ceas("X = datetime.now()", monkeypatch) == 1
+    assert _citiri_de_ceas("import time\nX = time.time_ns()", monkeypatch) == 1
+    assert _citiri_de_ceas("X = 1", monkeypatch) == 0
+    # Definit, nu chemat: ce deosebește un îngheț de o funcție.
+    assert _citiri_de_ceas("F = lambda: datetime.now()", monkeypatch) == 0
+    assert _citiri_de_ceas("def f():\n    return datetime.now()", monkeypatch) == 0
+    # Ceasul numit, nu chemat.
+    assert _citiri_de_ceas("F = datetime.now", monkeypatch) == 0
+    # Fereastra se închide: după sondă, ceasul din `time` e cel adevărat.
+    assert time.time() > 1_000_000_000
+
+
+def _puncte_din_docstring() -> list[str]:
+    """Punctele secțiunii «Ce NU vede», cu spațiile normalizate."""
+    doc = _apeluri_de_ceas_la_import.__doc__
+    assert doc, "`_apeluri_de_ceas_la_import` nu mai are docstring (python -OO?)"
+    assert "Ce NU vede." in doc and "Cercetarea e al TREILEA" in doc, (
+        "secțiunea «Ce NU vede» a dispărut din docstring sau și-a schimbat capetele")
+    sectiune = doc.split("Ce NU vede.", 1)[1].split("Cercetarea e al TREILEA", 1)[0]
+    blocuri = [p for p in sectiune.split("\n\n") if re.search(r"(?m)^\s*\* ", p)]
+    assert len(blocuri) == 1, "punctele clasei nu mai sunt un singur bloc"
+    return [" ".join(p.split()) for p in re.split(r"(?m)^\s*\*\s+", blocuri[0])[1:]]
+
+
+def test_the_blind_spot_table_and_the_docstring_say_the_same_thing():
+    """Tabelul `_NEVAZUTE` și docstring-ul declară aceleași clase și aceleași exemple.
+
+    Eșecul pe care îl previne: docstring-ul e ce citește operatorul, tabelul e
+    ce verifică testele, iar când se despart, fiecare spune altceva. Un punct nou
+    în docstring fără clasă în tabel e o declarație pe care nimic n-o fixează; un
+    exemplu în tabel fără urmă în docstring e un rând verde despre ceva ce nu s-a
+    declarat; un exemplu rămas în docstring după ce cercetarea l-a învățat e o
+    afirmație falsă. Verificarea merge în ambele sensuri.
+    """
+    puncte = _puncte_din_docstring()
+    assert len(puncte) == len(_NEVAZUTE), (
+        f"docstring-ul declară {len(puncte)} clase, `_NEVAZUTE` are "
+        f"{len(_NEVAZUTE)}: o clasă nouă cere un rând reprezentativ în tabel, iar "
+        "una fără nicio formă nevăzută cere ștergerea punctului")
+    for punct, (fragment, randuri) in zip(puncte, _NEVAZUTE, strict=True):
+        assert punct.startswith(fragment), (
+            f"punctul «{punct[:60]}…» nu începe cu «{fragment}»: clasele din "
+            "docstring și din `_NEVAZUTE` nu mai sunt în aceeași ordine")
+        marcaje = [m for m, _ in randuri]
+        assert len(set(marcaje)) == len(marcaje), (
+            f"marcaje repetate în clasa «{fragment}…»")
+        in_docstring = set(re.findall(r"`([^`]+)`", punct)) - _DEFINITORII
+        fara_rand = sorted(in_docstring - set(marcaje))
+        fara_urma = sorted(set(marcaje) - in_docstring)
+        assert not fara_rand, (
+            f"clasa «{fragment}…»: docstring-ul declară {fara_rand} dar "
+            "`_NEVAZUTE` n-are rând pentru ele. Dacă cercetarea tocmai le-a "
+            "învățat, scoate-le din docstring; altfel adaugă rândul")
+        assert not fara_urma, (
+            f"clasa «{fragment}…»: `_NEVAZUTE` are rânduri {fara_urma} pe care "
+            "docstring-ul nu le declară; adaugă-le în punctul clasei")
+
+
+def test_the_import_scan_sees_every_reader_in_its_own_list():
+    """Fiecare nume din `_CITITORI_DE_CEAS` e văzut, ca nume și ca atribut.
+
+    Eșecul pe care îl previne: clasa „cititor care nu e în listă” e definită
+    PRIN listă, deci cealaltă jumătate a ei e că tot ce e în listă se vede. O
+    cercetare care ar construi setul de cititori dintr-o copie mai scurtă (sau ar
+    uita unul la o refacere) ar lăsa, de pildă, `perf_counter()` la import fără
+    nicio roșeață, iar lista din cod ar promite mai mult decât face. Formele
+    sunt derivate din constantă: un nume adăugat în ea e verificat fără să mai
+    atingi testul.
+    """
+    assert _CITITORI_DE_CEAS, "lista de cititori e goală: testul n-ar verifica nimic"
+    for nume in sorted(_CITITORI_DE_CEAS):
+        for cod in (f"X = {nume}()", f"X = obiect.{nume}()"):
+            assert _apeluri_de_ceas_la_import(cod), (
+                f"`{nume}` e în `_CITITORI_DE_CEAS` dar `{cod}` nu e văzut")
+
+
+#: Funcțiile ale căror MESAJE de eroare trimit omul la un nume din acest fișier.
+_FUNCTII_CU_MESAJE = ("_t", "test_no_module_level_code_reads_the_clock")
+
+
+def test_every_name_the_clock_messages_point_at_exists():
+    """Numele din mesajele de ceas sunt ale unor lucruri care există.
+
+    Eșecul pe care îl previne: `_t()` chemat la import și garda de la import
+    trimit omul la `_ceas_per_test`. Numele e scris ca text, nu ca
+    `_ceas_per_test.__name__`: (1) cu `__name__`, o redenumire devine un
+    `NameError` în mesaj, adică exact când omul are nevoie de indiciu, iar mesajul
+    din `test_no_module_level_code_reads_the_clock` nu se construiește decât
+    dacă fișierul e chiar stricat; (2)
+    proiectul fixează pytest `>=8.2,<9`, unde obiectul fixturii e o funcție în
+    8.2 până la 8.3 și altceva de la 8.4, iar `__name__` s-a verificat doar pe 9.1.1,
+    peste pin. Ca textul să nu rămână mincinos, aici se citesc mesajele din
+    sursă și fiecare nume între apostrofuri inverse trebuie să existe în modul:
+    redenumirea fixturii sau a testului cade la suită, nu la 3 dimineața.
+    """
+    arbore = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    functii = {n.name: n for n in ast.walk(arbore) if isinstance(n, ast.FunctionDef)}
+    for nume_functie in _FUNCTII_CU_MESAJE:
+        mesaje = []
+        for nod in ast.walk(functii[nume_functie]):
+            parti = ([nod.msg] if isinstance(nod, ast.Assert) and nod.msg
+                     else [nod.exc] if isinstance(nod, ast.Raise) and nod.exc
+                     else [])
+            mesaje += [c.value for p in parti for c in ast.walk(p)
+                       if isinstance(c, ast.Constant) and isinstance(c.value, str)]
+        citate = {t for m in mesaje for t in re.findall(r"`([A-Za-z_]\w*)`", m)}
+        assert citate, (
+            f"mesajele din `{nume_functie}` nu mai numesc nimic între apostrofuri "
+            "inverse: testul n-ar verifica nimic (sau mesajul a pierdut indiciul)")
+        lipsa = sorted(n for n in citate if n not in globals())
+        assert not lipsa, (
+            f"mesajele din `{nume_functie}` trimit la nume care nu mai există în "
+            f"fișier: {lipsa}")
 
 
 # --- multi-vector attackers -------------------------------------------------
