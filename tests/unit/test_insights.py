@@ -737,15 +737,16 @@ def _apeluri_de_ceas_la_import(sursa: str) -> list[str]:
     functii = [n for n in ast.walk(arbore)
                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
     ceas = set(_CITITORI_DE_CEAS)
-    mai_merge = True
-    while mai_merge:
-        mai_merge = False
-        for f in functii:
-            if f.name not in ceas and any(
-                    isinstance(n, ast.Call) and nume_apel(n) in ceas
-                    for n in ast.walk(f)):
-                ceas.add(f.name)
-                mai_merge = True
+    # Fiecare tură adaugă cel puțin o funcție sau iese, deci `len(functii)` ture
+    # ajung; bucla e mărginită ca o greșeală aici să pice testul, nu să-l agațe.
+    for _ in functii:
+        noi = {f.name for f in functii
+               if f.name not in ceas and any(
+                   isinstance(n, ast.Call) and nume_apel(n) in ceas
+                   for n in ast.walk(f))}
+        if not noi:
+            break
+        ceas |= noi
     return [f"linia {n.lineno}: {ast.unparse(n)[:80]}"
             for n in la_import(arbore)
             if isinstance(n, ast.Call) and nume_apel(n) in ceas]
