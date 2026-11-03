@@ -137,19 +137,42 @@ def _run(script: str, tmp_path: Path, extra_path: Path | None = None,
 # `inherit_errexit`). `command not found` ajunge pe stderr, 127 se pierde în
 # substituție, nota iese oricum, iar fiecare aserțiune pe ieșire trece — măsurat:
 # un `hostname >/dev/null` fără pază pus în ramura „getent lipsește" dădea 46
-# verzi pe Git Bash și pe WSL. De aceea `_run_verify` verifică STDERR-ul: fraza
-# `command not found` acolo face testul să pice, cu textul în mesaj.
+# verzi pe Git Bash și pe WSL.
 #
-# LIMITA CARE RĂMÂNE: o unealtă pusă sub `2>/dev/null || true` nu lasă nicio
-# urmă pe stderr, deci nici aserțiunea asta, nici vreo altă abordare pe PATH n-o
-# poate vedea (`hostname 2>/dev/null || true` rămâne verde, declarat, nu scăpat).
-# Ce o prinde e citirea codului, nu testul.
+# De aceea `_run_verify` pune în harness un `command_not_found_handle`: bash îl
+# cheamă el însuși, în procesul copil, ori de câte ori CAUTĂ o comandă pe PATH și
+# nu o găsește, iar handler-ul scrie numele într-un fișier-capcană pe care testul
+# îl cere nescris. Nu potrivește niciun TEXT — o aserțiune pe fraza „command not
+# found" de pe stderr nu vedea ce nu ajunge acolo, iar o frază engleză ar fi oarbă
+# și sub un bash tradus; de-aceea nu mai există nici `LC_ALL`.
 #
-# De ce `LC_ALL=C` în `_run_verify`: bash traduce mesajul „command not found" cu
-# gettext, iar o aserțiune pe fraza englezească ar fi oarbă sub un bash tradus.
-# Neobservat aici (nicio gazdă de test nu are locale traduse: Git Bash n-are
-# `/usr/share/locale`, WSL are doar C/POSIX); s-a observat doar că fixarea nu
-# schimbă niciun rezultat.
+# Ce VEDE (măsurat pe Git Bash 5.2.37 și pe WSL 5.2.21, aceleași rezultate): o
+# unealtă lipsă chemată simplu, cu `>/dev/null`, sub `2>/dev/null || true`,
+# sub `2>&1 || true` (stderr captat în `$(…)`), într-un pipeline, într-un `if`,
+# într-un subshell sau grup, într-o funcție, prin `eval`, printr-o variabilă,
+# prin `command x`, prin `<(…)`, pe fundal — și un director pe PATH. Nu se
+# declanșează pentru `have` / `command -v` / `type -P`: a SONDA existența nu
+# strică nimic, doar a o CHEMA. Harness-ul se verifică singur: la fiecare rulare,
+# înainte de cod, cheamă o unealtă inexistentă exact sub forma `$(… 2>/dev/null ||
+# true)` și iese cu 96 dacă handler-ul n-a scris-o; un handler mort ar lăsa toate
+# testele verzi fără să fi văzut nimic.
+#
+# Ce NU vede (măsurat; declarat, nu scăpat — doar citirea codului le prinde):
+#   * `exec x`, inclusiv `$(exec x)`: `exec` își dă singur eroarea
+#     („exec: x: not found"), fără handler;
+#   * înfășurătorile `env x`, `timeout N x`, `xargs x`, `nohup x`: unealta e
+#     căutată de procesul înfășurător, nu de bash;
+#   * o cale absolută (`/usr/sbin/x`): nu se caută pe PATH;
+#   * un shebang stricat („cannot execute: required file not found") și un fișier
+#     fără bit de execuție („Permission denied", măsurat doar pe WSL): ele EXISTĂ
+#     pe PATH, deci nu lipsesc, iar bash le raportează altfel;
+#   * o unealtă care există, dar eșuează;
+#   * o unealtă chemată într-un `bash -c` / `sh -c`: alt shell, fără funcția;
+#   * un handler înlocuit sau scos (`unset -f`) de codul testat. Nici
+#     `lib/common.sh`, nici `install.sh`, nici altceva din `deploy/` sau `tests/`
+#     nu definesc `command_not_found_handle` (verificat cu grep, cu martor
+#     pozitiv), deci nimic din ce rulează aici nu-l poate umbri.
+# Ce rămâne în afara handler-ului se prinde citind codul, nu rulând testul.
 #
 # Dacă trambulina însăși e stricată (ex. nu e executabilă), testul pică cu
 # `[FATAL] … answered 000`, ca și cum ar fi o pană a sondei pe loopback: shim-ul
@@ -519,6 +542,34 @@ _CURL_STUB = (
 )
 
 
+_HOOK_CONTROL = "vf_hook_control_tool_that_does_not_exist"
+_HOOK_ALIVE = "HOOK_ALIVE"
+
+
+def _not_found_hook(tripwire: Path) -> str:
+    """Harness: o unealtă căutată pe PATH și negăsită lasă un nume în `tripwire`.
+
+    Doar builtin-uri (`printf`, `[[`, `$(<…)`, `:`): handler-ul rulează chiar și
+    când PATH-ul n-are nimic, iar o unealtă externă chemată de el ar fi ea
+    însăși „negăsită". Controlul de la capăt e DOVADA că mecanismul merge:
+    handler-ul e pus la lucru exact sub forma pe care stderr-ul n-o vedea
+    (`$(… 2>/dev/null || true)`), iar harness-ul iese cu 96 dacă n-a lăsat nimic.
+    Apoi fișierul se GOLEȘTE (nu se șterge: `rm` e și el o unealtă), deci ce
+    rămâne în el la sfârșit vine numai din codul testat.
+    """
+    trip = _p(tripwire)
+    return (
+        'command_not_found_handle() { printf "%s\\n" "$*" >> "' + trip + '"; return 127; }\n'
+        + f'_vf_ctl="$({_HOOK_CONTROL} 2>/dev/null || true)"\n'
+        + f'if [[ "$(<"{trip}")" != "{_HOOK_CONTROL}" ]]; then\n'
+        + '    echo "HOOK_DEAD: command_not_found_handle did not record a missing tool" >&2\n'
+        + "    exit 96\n"
+        + "fi\n"
+        + f': > "{trip}"\n'
+        + f'echo "{_HOOK_ALIVE} {trip}"\n'
+    )
+
+
 def _run_verify(tmp_path: Path, *, domain: str, getent: str | object | None = None,
                 **codes: str) -> subprocess.CompletedProcess:
     """Rulează `verify_dashboard_answers` livrat, cu `getent` DECLARAT.
@@ -531,9 +582,13 @@ def _run_verify(tmp_path: Path, *, domain: str, getent: str | object | None = No
                      are mașina": se pune un stub-capcană, și dacă drumul ajunge
                      totuși la el, ASTA e eroarea — un test care depinde de
                      `getent` trebuie să-l declare.
+
+    Orice comandă căutată pe PATH și negăsită de codul livrat strică testul, cu
+    numele ei în mesaj (`_not_found_hook`; ce vede și ce nu, în blocul de sus).
     """
     stubs = tmp_path / "bin"
     tripwire = tmp_path / "getent-was-asked"
+    not_found = tmp_path / "tool-not-found"
     _write_stub(stubs, "curl", _CURL_STUB)
     _write_stub(stubs, "ip", 'printf "1: eth0    inet 203.0.113.9/24 scope global eth0\\n"\n')
     if getent is None:
@@ -541,9 +596,7 @@ def _run_verify(tmp_path: Path, *, domain: str, getent: str | object | None = No
     elif getent is not ABSENT:
         _write_stub(stubs, "getent", str(getent))
     proof = ""
-    # LC_ALL=C: aserțiunea de pe stderr de mai jos caută fraza englezească (vezi
-    # blocul „O unealtă care LIPSEȘTE" despre traducere).
-    env = {"LC_ALL": "C", **codes}
+    env = dict(codes)
     if getent is ABSENT:
         # Dovada vine din ACELAȘI `have` pe care îl folosește codul testat, rulat
         # de același shell: dacă `getent` e totuși ajungător, testul moare aici
@@ -559,6 +612,7 @@ def _run_verify(tmp_path: Path, *, domain: str, getent: str | object | None = No
         env["PATH"] = _p(stubs) + os.pathsep + _p(shim)
     script = (
         _PREAMBLE
+        + _not_found_hook(not_found)
         + f'DOMAIN="{domain}"\n'
         + _line(r"^PENDING_OBSTACLES=\(\)$") + "\n"
         + _line(r"^CLOSING_NOTES=\(\)$") + "\n"
@@ -577,15 +631,29 @@ def _run_verify(tmp_path: Path, *, domain: str, getent: str | object | None = No
     assert not tripwire.exists(), (
         "drumul a chemat `getent`, dar testul nu l-a declarat: dă `getent=<corp>` "
         "sau `getent=ABSENT`, nu ce are mașina")
+    # Handler-ul a fost PUS și a dovedit că scrie, în fișierul pe care îl citește
+    # testul. Fără linia asta, scoaterea apelului `_not_found_hook` din script nu
+    # ar strica nimic: capcana ar rămâne goală, adică verde.
+    assert f"{_HOOK_ALIVE} {_p(not_found)}" in proc.stdout, (
+        "harness-ul n-a dovedit că handler-ul pentru comenzi negăsite funcționează "
+        "(HOOK_DEAD pe stderr = n-a scris); nicio rulare de mai jos nu valorează "
+        "nimic fără el:\n" + proc.stdout + proc.stderr)
     # O unealtă care lipsește din drum NU oprește scriptul: 127 se pierde în
-    # substituția de comandă `note="$(name_resolution_note …)"`, iar singura
-    # urmă e linia de pe stderr. Pe TOATE rulările, nu doar pe `ABSENT`: un
-    # `command not found` din codul livrat nu e niciodată o veste bună, iar
-    # măsurat (46 teste, Git Bash și WSL) nicio rulare existentă nu scoate așa
-    # ceva pe stderr, deci aserțiunea nu cere nicio excepție.
-    assert "command not found" not in proc.stderr, (
-        "codul livrat a chemat o unealtă care nu e pe PATH-ul testului; exit 127 "
-        "se pierde în `$(…)`, deci doar stderr-ul o arată:\n" + proc.stderr)
+    # substituția de comandă `note="$(name_resolution_note …)"`, iar sub
+    # `2>/dev/null || true` n-ar lăsa nicio urmă pe stderr. Handler-ul o vede
+    # oricum. Pe TOATE rulările, nu doar pe `ABSENT`.
+    #
+    # Mesajul nu afirmă o cauză pe care n-o poate ști: fișierul spune CE comandă
+    # n-a fost găsită, nu DE CE. Poate codul livrat a chemat o unealtă care nu e
+    # pe PATH-ul testului, poate un ajutor pe care harness-ul îl ia din
+    # `common.sh` a ieșit de acolo și harness-ul nu l-a urmat.
+    missed = (not_found.read_text(encoding="utf-8", errors="replace")
+              if not_found.exists() else "")
+    assert not missed, (
+        "o comandă a fost căutată pe PATH-ul testului și nu s-a găsit; exit 127 "
+        "se pierde în `$(…)`, deci doar urma din handler o arată. Vinovatul poate "
+        "fi codul livrat SAU harness-ul (un ajutor mutat din `common.sh`); "
+        "comanda e prima pistă, nu verdictul:\n" + missed)
     return proc
 
 
