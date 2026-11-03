@@ -107,6 +107,39 @@ SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -p "$PORT")
 [[ -n "$KEY" ]] && SSH_OPTS+=(-i "${KEY/#\~/$HOME}")
 r() { ssh "${SSH_OPTS[@]}" "${USER}@${HOST}" "$@" 2>/dev/null; }
 
+# Ca `r`, dar răspunsul e MĂSURAT, nu presupus. `r` aruncă și stderr-ul, și
+# diferența dintre „comanda a rulat și n-a tipărit nimic" și „n-am putut întreba":
+# amândouă ajung la apelant ca un șir gol. Pentru o listă de servicii sau de porturi
+# diferența e totul, fiindcă „nimic de raportat" e exact ce arată o comparație
+# făcută pe un răspuns care n-a venit.
+#
+# Întoarce codul de ieșire AL COMENZII, citit pe aceeași linie cu apelul (nu printr-o
+# conductă și nu printr-un `|| true`):
+#   0     comanda a rulat; MEASURE_OUT e ce a tipărit, eventual NIMIC
+#   255   `ssh` însuși a eșuat (conexiune refuzată, tăiată la mijloc, cheie respinsă)
+#   altul codul comenzii de pe gazdă
+# MEASURE_WHY spune în cuvinte care dintre ele și prima linie de stderr. La eșec
+# MEASURE_OUT e golit: ce a apucat să tipărească o comandă căzută nu e o măsurătoare.
+MEASURE_OUT=""
+MEASURE_WHY=""
+measure_remote() {
+    local errf rc=0 first
+    MEASURE_OUT=""; MEASURE_WHY=""
+    errf="$(mktemp)" || { MEASURE_WHY="mktemp failed on this machine"; return 1; }
+    MEASURE_OUT="$(ssh "${SSH_OPTS[@]}" "${USER}@${HOST}" "$@" 2>"$errf")" || rc=$?
+    # `awk`, nu `grep -v | head`: sub pipefail un stderr gol ar face din grep un 1.
+    first="$(awk '!/^Warning: Permanently added/ {print; exit}' "$errf")"
+    rm -f "$errf"
+    if (( rc == 255 )); then
+        MEASURE_OUT=""
+        MEASURE_WHY="ssh could not reach the host or was cut off (exit 255)${first:+: ${first}}"
+    elif (( rc != 0 )); then
+        MEASURE_OUT=""
+        MEASURE_WHY="the command exited ${rc} on the host${first:+: ${first}}"
+    fi
+    return "$rc"
+}
+
 # Numără elementele unui set nftables fără `grep -P`.
 #
 # `grep -P` este o extensie GNU, și acest grep rulează LOCAL — pe Git Bash cu un
@@ -444,6 +477,136 @@ report_loopback_probe() {
         pass "nginx serving on :${port} (HTTP ${code}; ${via})"
     else
         fail "nginx răspunde pe :${port}, dar cu HTTP ${code} la /healthz (${via}) — nu e dashboard-ul Sentinel. Vezi: ${nginx_t}"
+    fi
+}
+
+# O listă de gazdă (sau baseline-ul ei) în forma comparabilă: o intrare pe linie,
+# sortată LC_ALL=C, fără dubluri. WHICH = baseline | now: baseline-ul e DEJA o intrare pe
+# linie (scris de capture_baseline), lista de acum e ieșirea brută a lui systemctl / ss.
+# Aceleași coloane ca `baseline_measure` din deploy/lib/common.sh — dacă una se schimbă,
+# schimbă-o și pe cealaltă. O intrare goală dă listă goală, nu o linie goală.
+baseline_lines() {
+    local dim="$1" raw="$2" which="$3"
+    [[ -n "$raw" ]] || return 0
+    if [[ "$which" == baseline ]]; then
+        printf '%s\n' "$raw" | LC_ALL=C sort -u
+        return
+    fi
+    case "$dim" in
+        services) printf '%s\n' "$raw" | awk '{print $1}' | LC_ALL=C sort -u ;;
+        ports)    printf '%s\n' "$raw" | awk '{print $4}' | sed 's/.*://' | LC_ALL=C sort -u ;;
+    esac
+}
+
+# Compară o dimensiune (services | ports) a gazdei CU baseline-ul luat înainte de
+# instalare, și spune ce a putut afla. Trei răspunsuri, iar al treilea nu e niciunul
+# dintre celelalte două: nimic pierdut (pass), ceva pierdut (fail), NU AM PUTUT
+# MĂSURA (warn, numit și numărat în REGRESSION_UNMEASURED).
+#
+# Cum arăta înainte: `r "comm -23 BASELINE <(listă acum) | grep -v '^sentinel-'" || true`.
+# Patru lucruri se pierdeau acolo:
+#   * un ssh tăiat DUPĂ ce `test -f` reușise dădea șirul gol, deci „fiecare serviciu
+#     care rula înainte rulează încă" — un PASS pentru o comparație care n-a avut loc.
+#     (`grep -v` iese cu 1 când nu mai rămâne nimic, deci codul de ieșire al conductei
+#     nu putea deosebi „nimic pierdut" de „n-a mers" și `|| true` era singura cale.)
+#   * un `ss` (sau `systemctl`) căzut făcea lista de ACUM goală, iar `comm` raporta
+#     tot baseline-ul ca închis: o pană generală, afirmată pe un răspuns care n-a venit.
+#   * `sort -un` pe gazdă (numeric) față de baseline-ul scris cu sort lexical C: `comm`
+#     primea două ordini diferite și raporta ca închise porturi care ascultau.
+#   * `test -f` ca utilizator obișnuit întoarce 1 și când directorul e 0700 root:root
+#     (cum e din 8 sep 2026), și când ssh a căzut: ambele se citeau „nu există baseline".
+#     Acum baseline-ul se citește cu `sudo -n`, iar „lipsește" (cod 3, ales de noi) e
+#     diferit de „n-am putut citi".
+#
+# FAPTUL OBSERVABIL care arată că o comparație a avut loc: ambele liste au fost CITITE cu
+# cod 0, baseline-ul are cel puțin o intrare, `comm` a ieșit cu 0 — iar linia pass spune
+# CÂTE intrări din baseline au fost comparate. O comparație care n-a rulat nu poate
+# tipări numărul; un `comm` fără ieșire nu e acest fapt (fără ieșire e exact cum arată
+# „nimic pierdut").
+#
+# Cuvântul `unreadable` NU apare aici: în acest fișier înseamnă starea lui NGINX_STATE
+# (config nginx pe care `nginx -t` nu-l poate citi), iar aici baseline-ul nu are o
+# „stare" — are un motiv, în MEASURE_WHY, spus în cuvinte.
+REGRESSION_UNMEASURED=""
+compare_baseline_dim() {
+    local dim="$1" dir="$2" file now_cmd by_hand what_pass what_fail absent
+    local reader rc=0 was_raw was now_raw now lost line kept="" n
+    file="${dir}/baseline-${dim}.txt"
+    case "$dim" in
+        services)
+            now_cmd="systemctl list-units --type=service --state=running --no-legend --plain"
+            by_hand="systemctl --failed ; systemctl list-units --type=service --state=running"
+            what_pass="every service that was running before the install is still running"
+            what_fail="services stopped since the install"
+            absent="no pre-install baseline at ${dir} — cannot verify automatically. \
+Check by hand: systemctl --failed" ;;
+        ports)
+            now_cmd="ss -tlnH"
+            by_hand="ss -tlnp"
+            what_pass="every port that was listening before the install still is"
+            what_fail="ports closed since the install"
+            absent="no pre-install baseline of listening ports at ${dir} (ss could not \
+be asked when it was taken) — cannot verify automatically. Check by hand: ss -tlnp" ;;
+        *) fail "compare_baseline_dim: unknown dimension '${dim}'"; return 0 ;;
+    esac
+
+    # Citirea baseline-ului: cod 3 = fișierul lipsește (ales de noi; nici `sudo`, nici
+    # `cat`, nici ssh nu-l folosesc). Orice alt cod diferit de 0 = n-am putut citi.
+    reader='if [ -f "$1" ]; then exec cat -- "$1"; fi; exit 3'
+    measure_remote "sudo -n sh -c '${reader}' sh ${file}" || rc=$?
+    case $rc in
+        0) was_raw="$MEASURE_OUT" ;;
+        3) warn "$absent"; REGRESSION_UNMEASURED+=" ${dim}"; return 0 ;;
+        *) warn "could not read the pre-install baseline of ${dim} (${MEASURE_WHY}). That is \
+neither 'nothing was lost' nor 'something was lost'. Run by hand: sudo cat ${file}"
+           REGRESSION_UNMEASURED+=" ${dim}"; return 0 ;;
+    esac
+
+    # Lista de ACUM: comanda singură, fără conductă, ca să-i vedem codul. Prelucrarea
+    # (awk/sed/sort) se face aici, LC_ALL=C pe ambele părți.
+    rc=0
+    measure_remote "$now_cmd" || rc=$?
+    if (( rc != 0 )); then
+        warn "could not ask the host what is running now for ${dim} (${MEASURE_WHY}). That is \
+neither 'nothing was lost' nor 'something was lost'. Run by hand: ${now_cmd}"
+        REGRESSION_UNMEASURED+=" ${dim}"; return 0
+    fi
+    now_raw="$MEASURE_OUT"
+
+    if ! was="$(baseline_lines "$dim" "$was_raw" baseline)" \
+       || ! now="$(baseline_lines "$dim" "$now_raw" now)"; then
+        warn "could not process the ${dim} lists locally (awk/sed/sort failed), so nothing was \
+compared. Run by hand: ${by_hand}"
+        REGRESSION_UNMEASURED+=" ${dim}"; return 0
+    fi
+    if [[ -z "$was" ]]; then
+        warn "the pre-install baseline of ${dim} at ${file} is empty, so nothing could be compared \
+(an empty file cannot be told from a capture that failed). Check by hand: ${by_hand}"
+        REGRESSION_UNMEASURED+=" ${dim}"; return 0
+    fi
+
+    rc=0
+    lost="$(LC_ALL=C comm -23 <(printf '%s\n' "$was") <(printf '%s\n' "$now"))" || rc=$?
+    if (( rc != 0 )); then
+        warn "comm failed (exit ${rc}) comparing ${dim}, so nothing was compared. Run by hand: ${by_hand}"
+        REGRESSION_UNMEASURED+=" ${dim}"; return 0
+    fi
+
+    # Unitățile sentinel-* se mișcă la o livrare și nu sunt ce verifică secțiunea asta.
+    # Bash simplu, nu `grep -v ... || true`: „nu a rămas nicio linie" (1) și „n-a putut
+    # rula" (2) dispăreau amândouă în `true`.
+    if [[ "$dim" == services ]]; then
+        while IFS= read -r line; do
+            [[ "$line" == sentinel-* ]] || kept+="${line}"$'\n'
+        done <<< "$lost"
+        lost="${kept%$'\n'}"
+    fi
+
+    n="$(wc -l <<< "$was")"; n="${n//[[:space:]]/}"
+    if [[ -z "$lost" ]]; then
+        pass "${what_pass} (${n} compared)"
+    else
+        fail "${what_fail}: $(tr '\n' ' ' <<< "$lost")"
     fi
 }
 
@@ -943,37 +1106,10 @@ sect "Regresie — ce rula înainte de instalare"
 # deploy/lib/common.sh for why the old nesting was a write-access hole.
 baseline_dir=/var/lib/sentinel-install
 
-if r "test -f ${baseline_dir}/baseline-services.txt"; then
-    lost="$(r "comm -23 ${baseline_dir}/baseline-services.txt \
-<(systemctl list-units --type=service --state=running --no-legend --plain | awk '{print \$1}' | sort) \
-| grep -v '^sentinel-'" || true)"
-    if [[ -z "$lost" ]]; then
-        pass "every service that was running before the install is still running"
-    else
-        fail "services stopped since the install: $(tr '\n' ' ' <<< "$lost")"
-    fi
-
-    # Fișierul de porturi poate LIPSI chiar dacă cel de servicii există: de la
-    # lib/common.sh `capture_baseline`, o dimensiune pe care `ss` n-a putut-o
-    # măsura nu mai lasă un fișier gol (care mințea «nimic nu asculta»), nu
-    # lasă niciun fișier. `comm` pe un fișier lipsă iese cu eroare, `|| true` o
-    # înghițea, iar `lost_ports` gol se citea ca «toate porturile sunt la loc».
-    if r "test -f ${baseline_dir}/baseline-ports.txt"; then
-        lost_ports="$(r "comm -23 ${baseline_dir}/baseline-ports.txt \
-<(ss -tlnH | awk '{print \$4}' | sed 's/.*://' | sort -un)" || true)"
-        if [[ -z "$lost_ports" ]]; then
-            pass "every port that was listening before the install still is"
-        else
-            fail "ports closed since the install: $(tr '\n' ' ' <<< "$lost_ports")"
-        fi
-    else
-        warn "no pre-install baseline of listening ports at ${baseline_dir} (ss could not \
-be asked when it was taken) — cannot verify automatically. Check by hand: ss -tlnp"
-    fi
-else
-    warn "no pre-install baseline at ${baseline_dir} — cannot verify automatically. \
-Check by hand: systemctl --failed"
-fi
+# Fiecare dimensiune se compară pe cont propriu: lipsa fișierului de servicii nu mai
+# ascunde porturile care AU fost înregistrate (și invers). Vezi compare_baseline_dim.
+compare_baseline_dim services "$baseline_dir"
+compare_baseline_dim ports "$baseline_dir"
 
 failed_units="$(r "systemctl --failed --no-legend --plain | awk '{print \$1}'" || true)"
 if [[ -z "$failed_units" ]]; then
@@ -996,5 +1132,13 @@ printf '  %s%d trecute%s · %s%d avertismente%s · %s%d eșuate%s\n\n' \
 if (( FAIL > 0 )); then
     printf '%sVerificări eșuate. Nu considera deployment-ul reușit.%s\n' "$_R" "$_0"
     exit 1
+fi
+if [[ -n "$REGRESSION_UNMEASURED" ]]; then
+    # Nu „nimic altceva nu a fost afectat": pentru ce n-a putut fi măsurat nu se știe nici
+    # asta, nici contrariul, iar o propoziție verde care spune altceva ar îngropa
+    # avertismentul de mai sus. Codul de ieșire rămâne 0: necunoscutul nu e eșec.
+    printf '%sNu s-a putut verifica dacă ceva din ce rula înainte s-a oprit (%s):\n' "$_Y" "${REGRESSION_UNMEASURED# }"
+    printf 'nici „nimic afectat", nici „ceva afectat". Verifică de mână; vezi avertismentele de mai sus.%s\n' "$_0"
+    exit 0
 fi
 printf '%sSentinel funcționează, nimic altceva nu a fost afectat.%s\n' "$_G" "$_0"
