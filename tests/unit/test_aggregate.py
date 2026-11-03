@@ -35,10 +35,20 @@ def run(coro):
 #: adevărat.
 #:
 #: Înghețat aici, `_t(minutes=70)` întoarce același șir oriunde e chemat în
-#: aceeași rulare. Interogările folosesc `now()`-ul real al lui SQLite, deci
-#: între import și rulare se pot scurge secundele suitei — inofensiv, fiindcă
-#: ferestrele testelor sunt de ordinul minutelor și al zilelor, iar decalajul
-#: mută toate momentele împreună.
+#: aceeași rulare. Interogările, în schimb, folosesc `now()`-ul VIU al lui
+#: SQLite, care NU stă pe loc: cu cât trece mai mult de la import până la
+#: rulare, cu atât rândurile puse de `_t()` se depărtează de ceasul interogării
+#: și ies, pe rând, din ferestrele ei. Decalajul nu mută „toate momentele
+#: împreună" — mută doar pe ale testului, nu și pe `now()`.
+#:
+#: Cât are voie să dureze: cea mai strâmtă siguranță a fișierului e coada de
+#: `_PLAFON_COADA_ORE` = 6 ore. În
+#: `test_the_fresh_tail_reaches_back_to_the_rollup_frontier` rândul stă la 70 de
+#: minute, deci cade din coadă după 6 h - 70 min = 4 h 50 min (17400 s).
+#: Măsurat la 3 noiembrie 2026, cu `_ACUM` mutat înapoi: 17300 s verde, 17400 s
+#: și 17500 s roșu, în ambele cazuri doar acest test. O suită întreagă (35-65 de
+#: minute) încape cu mult sub prag; o gazdă suspendată câteva ore, nu. Spre
+#: deosebire de test_insights.py, fișierul nu reia referința la fiecare test.
 _ACUM = datetime.now(timezone.utc)
 
 
