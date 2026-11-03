@@ -1111,9 +1111,11 @@ def test_the_import_scan_sees_every_way_a_clock_can_be_frozen():
 #      `_CITITORI_DE_CEAS` e văzut — derivat din constantă, nu enumerat.
 # Ce rămâne nefixat: că enumerarea e completă. Singurul lucru care ține o clasă
 # ca CLASĂ e o probă dinamică (modulul executat sub un ceas care numără
-# citirile; prototipată, vede toate rândurile de mai jos). E un al patrulea
-# strat, cu riscul lui (un modul importat prima oară în fereastră ar păstra un
-# `datetime` fals), deci o decizie a operatorului, nu a acestui test.
+# citirile). Prototipată în afara depozitului: pe fișierul ăsta dă 0 citiri, iar
+# cu un defect adăugat la coadă (un argument implicit, o lambdă dată unui
+# apelant, `exec`, `time_ns`) dă câte una. E un al patrulea strat, cu riscul lui
+# (un modul importat prima oară în fereastră ar păstra un `datetime` fals),
+# deci o decizie a operatorului, nu a acestui test.
 #
 # Fiecare rând e (marcaj, cod). Marcajul e exact textul dintre apostrofurile
 # inverse din punctul lui din docstring, după definiția clasei (vezi
