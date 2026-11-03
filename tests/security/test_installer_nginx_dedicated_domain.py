@@ -153,9 +153,10 @@ def _run(script: str, tmp_path: Path, extra_path: Path | None = None,
 # prin `command x`, prin `<(…)`, pe fundal — și un director pe PATH. Nu se
 # declanșează pentru `have` / `command -v` / `type -P`: a SONDA existența nu
 # strică nimic, doar a o CHEMA. Harness-ul se verifică singur: la fiecare rulare,
-# înainte de cod, cheamă o unealtă inexistentă exact sub forma `$(… 2>/dev/null ||
-# true)` și iese cu 96 dacă handler-ul n-a scris-o; un handler mort ar lăsa toate
-# testele verzi fără să fi văzut nimic.
+# înainte de cod, cheamă o unealtă inexistentă într-un `$(… 2>/dev/null)` (forma
+# pe care stderr-ul n-o vedea) și iese cu 96 dacă handler-ul n-a scris-o SAU n-a
+# întors 127; un handler mort ar lăsa toate testele verzi fără să fi văzut nimic,
+# iar unul care întoarce 0 ar schimba ce face codul testat cu unealta lipsă.
 #
 # Ce NU vede (măsurat; declarat, nu scăpat — doar citirea codului le prinde):
 #   * `exec x`, inclusiv `$(exec x)`: `exec` își dă singur eroarea
@@ -552,17 +553,18 @@ def _not_found_hook(tripwire: Path) -> str:
     Doar builtin-uri (`printf`, `[[`, `$(<…)`, `:`): handler-ul rulează chiar și
     când PATH-ul n-are nimic, iar o unealtă externă chemată de el ar fi ea
     însăși „negăsită". Controlul de la capăt e DOVADA că mecanismul merge:
-    handler-ul e pus la lucru exact sub forma pe care stderr-ul n-o vedea
-    (`$(… 2>/dev/null || true)`), iar harness-ul iese cu 96 dacă n-a lăsat nimic.
+    handler-ul e pus la lucru sub forma pe care stderr-ul n-o vedea
+    (`$(… 2>/dev/null)`), iar harness-ul iese cu 96 dacă n-a lăsat numele sau
+    n-a întors 127 (cu 0, o unealtă lipsă ar părea că a reușit).
     Apoi fișierul se GOLEȘTE (nu se șterge: `rm` e și el o unealtă), deci ce
     rămâne în el la sfârșit vine numai din codul testat.
     """
     trip = _p(tripwire)
     return (
         'command_not_found_handle() { printf "%s\\n" "$*" >> "' + trip + '"; return 127; }\n'
-        + f'_vf_ctl="$({_HOOK_CONTROL} 2>/dev/null || true)"\n'
-        + f'if [[ "$(<"{trip}")" != "{_HOOK_CONTROL}" ]]; then\n'
-        + '    echo "HOOK_DEAD: command_not_found_handle did not record a missing tool" >&2\n'
+        + f'_vf_rc=0; _vf_ctl="$({_HOOK_CONTROL} 2>/dev/null)" || _vf_rc=$?\n'
+        + f'if [[ "$_vf_rc" != 127 || "$(<"{trip}")" != "{_HOOK_CONTROL}" ]]; then\n'
+        + '    echo "HOOK_DEAD: command_not_found_handle did not record a missing tool as 127" >&2\n'
         + "    exit 96\n"
         + "fi\n"
         + f': > "{trip}"\n'
