@@ -1592,9 +1592,11 @@ def test_a_link_to_a_directory_at_a_data_path_is_removed_not_followed_or_filled(
     legătura MSYS (`.lnk`), pe care bash-ul scriptului o vede ca symlink spre un director:
     măsurat pe Git Bash 5.2.37, `-L` și `-d` adevărate, `rm -f` fără `-r` o șterge în tăcere
     (nimic pe stderr, nici `.lnk` rămas pe disc) și lasă ținta neatinsă. Deci pe Windows
-    ambele ramuri livrate se exersează cu adevărat: `-d` în `baseline_store` (refuză mutarea)
-    și `! -L` în `baseline_unstore` (scoate linkul). Fără acest test, ultima gardă n-ar avea
-    niciun observator pe mașina de dezvoltare.
+    ramura livrată se exersează cu adevărat: `[[ -d ]]` e adevărat pe link, iar `! -L` din
+    `baseline_unstore` decide să-l scoată. Fără acest test, `! -L` n-ar avea niciun observator
+    pe mașina de dezvoltare. Observator pentru `-d` din `baseline_store` NU e acesta (scos
+    `-d`, testul rămâne verde: `inside` e luat înapoi din țintă după mutare, deci ținta tot
+    iese goală); acela e păzit de testele cu director adevărat, mai sus.
 
     «Linkul a dispărut» se întreabă bash-ului (`present`), NU `os.path.lexists`: pe Windows
     legătura MSYS e fișierul `baseline-ports.txt.lnk`, iar `lexists` pe `baseline-ports.txt` e
