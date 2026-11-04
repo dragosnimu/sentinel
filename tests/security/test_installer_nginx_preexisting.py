@@ -502,6 +502,9 @@ def test_a_symlink_at_the_legacy_fact_path_is_refused_not_followed(tmp_path):
     fișierul direct, deci refuzul trebuie să fie explicit în sursă, nu doar
     "de fapt inofensiv fiindcă valoarea tot trece prin regex".
 
+    Clauza acopera DOAR ultima componenta; directoarele de deasupra raman deschise
+    (vezi `test_a_symlink_on_a_directory_above_the_legacy_fact_is_followed`).
+
     Falsificat scoțând `&& ! -L "$legacy_fact"` din condiția care păzește
     citirea — testul trebuie să nu mai găsească acea clauză.
     """
