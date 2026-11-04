@@ -67,23 +67,32 @@ say so in your report; do not silently repair it in the same change.
 ## Work fast — falsify against the target, not the world
 
 Falsification is the slowest thing you do, and almost all of that cost is
-avoidable. Measured on this repository, 2026-08-10:
+avoidable. Measured on this repository, 2026-11-04:
 
 | command | time |
 |---|---|
-| `pytest` (whole suite, 1565 tests) | 36.2 s |
-| `pytest tests/unit/test_selfcheck.py` | 0.73 s |
-| two target files | 0.60 s |
+| `pytest` (whole suite, ~8,500 tests) | **46–51 min** |
+| `pytest tests/unit/test_selfcheck.py` (195 tests) | 2.3 s |
+| `pytest tests/security/test_installer_baseline_unknown.py` (113 tests) | 195 s |
 
-A round with 34 mutations costs **20 minutes** at full-suite pace and **24
-seconds** at targeted pace. Same evidence, fifty times cheaper.
+A round with 34 mutations costs **over a day** at full-suite pace. Targeted, it
+is minutes — but read the second and third rows together before you assume
+"targeted" means "instant": the suite has grown 5.5× since the figures this
+table used to carry (1565 tests / 36 s, measured 2026-08-10), and some single
+files are now minutes on their own, because they drive `bash` in a subprocess
+per test.
 
 So: **while falsifying, run only the test files that cover the mutated code.**
 Name them explicitly — `pytest tests/unit/test_x.py tests/security/test_y.py`.
-Run the whole suite exactly twice: once before you start, to know your baseline,
-and once at the end, to prove you broke nothing elsewhere. If a mutation's
-targeted run is green when you expected red, *then* widen to the whole suite —
-a mutation nothing catches is the interesting case, and it is worth 36 seconds.
+Measure your target file once up front, so you know what each mutation will
+cost before you plan the campaign.
+
+**Do not run the whole suite without saying why first.** It is three quarters of
+an hour, this machine runs one `pytest` at a time, and a second one started
+alongside slows both. If a mutation's targeted run is green when you expected
+red, widen to the *files that could plausibly cover it*, not to the world — a
+mutation nothing catches is the interesting case, and the way to find its
+observer is to name candidates, not to buy 46 minutes.
 
 Two more habits that cost you rounds:
 
@@ -95,9 +104,10 @@ command's output, they belong in the same invocation.
 **Read once, precisely.** Prefer `grep -n` with context or a bounded `Read` over
 pulling a 1500-line file into your context so you can look at forty lines of it.
 
-None of this trades away rigour. You still falsify every repair, you still see
-each test fail, you still run the full suite before you report. You just stop
-paying thirty-six seconds to learn something a targeted run tells you in one.
+None of this trades away rigour. You still falsify every repair, and you still
+see each test fail. What changes is that a full-suite run is a request rather
+than a reflex: name the files your change could reach, and if you believe you
+need the whole suite, say why and let the coordinator decide.
 
 ## Proving a negative
 
