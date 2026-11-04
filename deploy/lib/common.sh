@@ -1079,20 +1079,93 @@ baseline_complete() {
     return 0
 }
 
+# baseline_store TMP DEST — put TMP at DEST and check that it is THERE.
+#   0  DEST is a regular file
+#   1  it is not; BASELINE_WHY says why. TMP is the caller's to remove, EXCEPT
+#      in the one case below where `mv` has already carried it somewhere else.
+# `mv -f TMP DEST` answers 0 when DEST is a DIRECTORY: it moves TMP into it
+# (measured, bash 5.2 / GNU mv: rc=0, TMP now at DEST/<name of TMP>). The exit
+# status is the answer to "did mv run", not to "is the file where the reader
+# looks", so a directory is refused BEFORE the move (nothing is left inside it)
+# and the path is tested AFTER it (a mv that answers 0 and puts nothing there).
+# The reader tests the path with `-f` as well (baseline_state).
+#
+# The test before the move and the move are two steps; a directory can appear
+# between them (measured with a `mv` that mkdir's DEST and then runs the real
+# one: rc=0, TMP inside the directory). Then TMP is no longer where the caller
+# will look to remove it, and the operator is about to be told to "remove or
+# rename" that directory: a dotfile left inside makes `rmdir` fail with
+# "Directory not empty" and `ls` show nothing. So it is taken back out here, and
+# whether that worked is read from the path, not from rm's exit status.
+#
+# mv's own stderr is the only place the reason (EPERM, EROFS, no space) is
+# stated, so it goes into BASELINE_WHY instead of the terminal or /dev/null.
+baseline_store() {
+    local tmp="$1" dest="$2" rc=0 mverr rmerr inside
+    if [[ -d "$dest" ]]; then
+        BASELINE_WHY="${dest} is a directory, not a file"
+        return 1
+    fi
+    mverr="$(mv -f "$tmp" "$dest" 2>&1)" || rc=$?
+    if (( rc != 0 )); then
+        BASELINE_WHY="could not move ${tmp} into place (${mverr:-exit ${rc}})"
+        return 1
+    fi
+    if [[ ! -f "$dest" ]]; then
+        BASELINE_WHY="mv reported success but ${dest} is not a file"
+        # Where mv would have put TMP if DEST is a directory. If it is not one,
+        # this names nothing and `rm -f` has nothing to do.
+        inside="${dest}/${tmp##*/}"
+        rmerr="$(rm -f -- "$inside" 2>&1)" || true
+        if [[ -e "$inside" || -L "$inside" ]]; then
+            BASELINE_WHY+="; ${inside} was left inside it and could not be removed (${rmerr:-rm said nothing})"
+        fi
+        return 1
+    fi
+}
+
+# Take away what a dimension must not leave standing. A directory at the path is
+# left alone: `rm -f` cannot remove one (it prints an error and, under `set -e`,
+# ends the caller), and it is not a baseline anyway — baseline_state tests `-f`.
+baseline_unstore() {
+    local f
+    for f in "$@"; do
+        [[ -d "$f" && ! -L "$f" ]] || rm -f "$f"
+    done
+}
+
 # Take the baseline. 0 when every dimension was measured (or is `none`), 2 when
 # at least one was not — each of those has a warning of its own, and NO success
 # line: the "baseline captured" line names only what was actually measured.
+#
+# What is checked is where the files ARE afterwards, not what the commands that
+# put them there answered (baseline_store). The same call that had `mv -f`
+# succeed into a directory used to print the success line over a record that
+# was not at the path the reader reads.
 capture_baseline() {
     local dir="${1:-$STATE_MARKERS}" dim file rc n state="" notes="" unmeasured="" tmp
+    local record="${dir}/baseline-state.txt" rmerr where
     mkdir -p "$dir"
-    rm -f "${dir}/baseline-state.txt"
     BASELINE_SERVICES=""; BASELINE_PORTS=""
+    # The old record goes FIRST (see above). If it cannot go, nothing is measured
+    # and nothing is changed: a new baseline cannot be recorded where the old one
+    # stands, and the exit status of rm is the effect here (it removes the entry
+    # or it fails; the directory case is rm's own refusal).
+    rc=0; rmerr="$(rm -f "$record" 2>&1)" || rc=$?
+    if (( rc != 0 )); then
+        warn "baseline NOT taken: the previous record ${record} could not be removed \
+(${rmerr:-exit ${rc}}). Nothing was measured and nothing was changed, so whatever is at that \
+path is what step 39 will read. It must be a plain file or absent: remove or rename it, then \
+run the installer again."
+        return 2
+    fi
 
     for dim in $BASELINE_DIMENSIONS; do
         file="${dir}/baseline-${dim}.txt"
+        where=measure
         rc=0; baseline_measure "$dim" "${file}.new" || rc=$?
-        if (( rc == 0 )) && ! mv -f "${file}.new" "$file"; then
-            rc=1; BASELINE_WHY="could not move ${file}.new into place"
+        if (( rc == 0 )) && ! baseline_store "${file}.new" "$file"; then
+            rc=1; where=store
         fi
         case $rc in
             0)
@@ -1104,26 +1177,33 @@ capture_baseline() {
                     containers) notes+=", ${n} running containers" ;;
                 esac ;;
             2)
-                rm -f "$file" "${file}.new"
+                baseline_unstore "$file" "${file}.new"
                 state+="${dim}=none"$'\n'
                 notes+=", no docker on PATH (no containers to compare)" ;;
             *)
-                rm -f "$file" "${file}.new"
+                baseline_unstore "$file" "${file}.new"
                 state+="${dim}=unmeasured"$'\n'
                 unmeasured+=" ${dim}"
-                warn "baseline of ${dim} NOT captured: $(baseline_cmd_text "$dim") failed (${BASELINE_WHY}). \
+                if [[ "$where" == store ]]; then
+                    # The command answered; what failed is the place it was to be kept.
+                    warn "baseline of ${dim} was measured but NOT stored: ${BASELINE_WHY}. \
 Step 39 cannot check ${dim} against anything and will stop with 'could not verify'. \
-Run it by hand to see why." ;;
+${file} must be a plain file or absent: remove or rename it, then run the installer again."
+                else
+                    warn "baseline of ${dim} NOT captured: $(baseline_cmd_text "$dim") failed (${BASELINE_WHY}). \
+Step 39 cannot check ${dim} against anything and will stop with 'could not verify'. \
+Run it by hand to see why."
+                fi ;;
         esac
     done
 
-    tmp=""
+    tmp=""; BASELINE_WHY=""
     if ! tmp="$(mktemp "${dir}/.baseline-state.XXXXXX")" \
        || ! printf '%s' "$state" > "$tmp" \
-       || ! mv -f "$tmp" "${dir}/baseline-state.txt"; then
+       || ! baseline_store "$tmp" "$record"; then
         rm -f "$tmp"
-        warn "could not write ${dir}/baseline-state.txt. The baseline files stay, but an EMPTY one \
-will be read as unknown, not as 'nothing was running'."
+        warn "could not write ${record}${BASELINE_WHY:+ (${BASELINE_WHY})}. The baseline files stay, \
+but an EMPTY one will be read as unknown, not as 'nothing was running'."
         return 2
     fi
 
