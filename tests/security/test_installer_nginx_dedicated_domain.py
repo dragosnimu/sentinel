@@ -1457,6 +1457,13 @@ def test_a_host_without_nginx_is_also_could_not_look(tmp_path):
     livrat), nu doar verificata: o garda pe `shutil.which` nu vede pe Windows un
     script `nginx` fara extensie, deci pe masina aia testul ar fi rulat peste un
     nginx pe care garda nu-l zarea.
+
+    Garda `have nginx || return 2` are si ea un observator: fara ea, `nginx -T`
+    negasit da tot 2 (127 in `|| return 2`), deci rc-ul nu o vede disparand;
+    handler-ul de comenzi negasite din `_run_foreign` vede cautarea. Falsificat
+    scotand garda: pica acest test (1 din 46); iar daca se scoate si apelul
+    `_assert_no_tool_missed`, toate cele 46 raman verzi - asertiunea aceea e
+    singurul lucru care o vede.
     """
     rc, _, out = _run_foreign(tmp_path, dump=None)
     assert rc == 2, out
