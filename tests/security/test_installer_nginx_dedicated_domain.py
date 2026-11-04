@@ -199,10 +199,11 @@ def _run(script: str, tmp_path: Path, extra_path: Path | None = None,
 # `have nginx || return 2`. Listele sunt goale. Pentru `ufw` e MĂSURAT: rulat sub
 # handler pe un PATH fără nicio trambulină, drumul nu caută nimic (Git Bash și
 # WSL, 46 verzi, capcana goală), iar o căutare adăugată înaintea lui `have`
-# (`hostname >/dev/null 2>&1 || true`) îl face roșu. Pentru `nginx` e citit din
-# cod, nu măsurat: `_run_foreign` n-are handler, fiindcă o unealtă căutată acolo
-# n-ar schimba răspunsul (`nginx -T` negăsit iese 127, iar `|| return 2` dă
-# același 2 ca ramura `have`; scoasă ramura, testul rămâne verde).
+# (`hostname >/dev/null 2>&1 || true`) îl face roșu. Pentru `nginx` răspunsul nu
+# deosebește garda de lipsa ei (`nginx -T` negăsit iese 127, iar `|| return 2` dă
+# același 2 ca ramura `have`: rc, stdout și stderr identice), așa că doar
+# handler-ul din `_run_foreign` o vede dispărând: scoasă `have nginx || return 2`,
+# el înregistrează căutarea lui `nginx`.
 #
 # Capcana pe care o ascunde o listă prea mică, DOAR pe drumul în care `ufw` e
 # prezent: `ufw_blocks_public_port` ține fiecare `grep` într-o condiție
@@ -1341,9 +1342,15 @@ def _run_foreign(tmp_path: Path, *, dump: str | None, nginx_rc: int = 0,
         proof = _unreachable_proof("nginx")
         shim = _path_tools_only(tmp_path / "shim", _PATH_TOOLS_WITHOUT_NGINX, absent="nginx")
         env["PATH"] = _p(stubs) + os.pathsep + _p(shim)
+    # Handler-ul de comenzi negasite, pe TOATE rularile (`_not_found_hook`). Fara
+    # el, `have nginx || return 2` ar fi o linie pe care nimic n-o vede disparand:
+    # fara garda, `nginx -T 2>/dev/null` negasit iese 127 in `|| return 2` si da
+    # acelasi rc, stdout si stderr. Handler-ul vede cautarea, nu rezultatul ei.
+    not_found = tmp_path / "tool-not-found"
     proc = _run(
         "set -euo pipefail\n"
         "source ./lib/common.sh\n"
+        + _not_found_hook(not_found)
         + _funcs("nginx_foreign_default_on_port")
         + proof
         + "rc=0\n"
@@ -1354,7 +1361,9 @@ def _run_foreign(tmp_path: Path, *, dump: str | None, nginx_rc: int = 0,
         + 'printf "%s" "$out"\n',
         tmp_path, extra_path=stubs, env=env)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    lines = proc.stdout.splitlines()
+    _assert_no_tool_missed(proc, not_found)
+    # Linia de mărturie a handler-ului nu e `RC=`.
+    lines = [ln for ln in proc.stdout.splitlines() if not ln.startswith(_HOOK_ALIVE + " ")]
     if dump is None:
         # Marturia ca `nginx` chiar lipsea, data de scriptul insusi; scoasa din
         # lista ca sa nu fie citita drept `RC=`.
