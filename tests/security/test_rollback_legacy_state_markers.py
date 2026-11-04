@@ -5,12 +5,19 @@ DINAINTE de 8 septembrie, marcajele de pas trăiau la
 `${SENTINEL_STATE_DIR}/.install-state`, nu la calea nouă
 (`SENTINEL_INSTALL_STATE_DIR`). `rollback.sh` ștergea doar
 `${STATE_MARKERS}` (calea nouă) și lăsa `${SENTINEL_STATE_DIR}` intact —
-inclusiv `.install-state`, care rămânea acolo. La următoarea instalare,
-`migrate_legacy_state_markers` din `deploy/lib/common.sh` mută automat orice
-marcaj legitim găsit acolo înapoi în `STATE_MARKERS` — deci o instalare de
-după `--purge`, care a scos un rol prin rollback, ar sări din nou pașii al
-căror marcaj tocmai a fost readus, pe o gazdă despre care rollback-ul tocmai
-a raportat „curățat".
+inclusiv `.install-state`, care rămânea acolo. Atunci, o funcție de migrare din
+`deploy/lib/common.sh` muta automat orice marcaj găsit acolo înapoi în
+`STATE_MARKERS`; decizia de a o scoate e din 13 septembrie 2026
+(`docs/ARHITECTURA.md`), iar proiectarea fără migrare a aterizat în `87db51a`.
+Funcția nu apare în niciun `deploy/` comis — `git log --all -S` nu găsește
+nimic — deci data e a deciziei, nu una pe care istoria o poate confirma.
+Nimic din `deploy/` nu mai mută calea veche; vezi
+`test_installer_state_markers.py`. Rămâne însă
+o CITIRE: `nginx_preexisting_resolve` din `install.sh` mai ia din calea veche
+faptul scris o singură dată și o linie din `preflight.env`, ca o gazdă
+instalată de arborele vechi să-și păstreze răspunsul. Deci un `.install-state`
+lăsat de un `--purge` ar da următoarei instalări răspunsul de ieri, pe o
+gazdă despre care rollback-ul tocmai a raportat „curățat".
 
 Reparația: rollback.sh șterge acum și calea veche, folosind constanta
 LITERALĂ `_LEGACY_STATE_MARKERS` din `deploy/lib/common.sh` (sourced de
@@ -30,6 +37,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _symlinks import is_link, present
 
 REPO = Path(__file__).resolve().parents[2]
 ROLLBACK_SH = REPO / "deploy" / "rollback.sh"
@@ -139,20 +147,12 @@ def test_rollback_legacy_cleanup_is_a_no_op_when_nothing_legacy_exists(tmp_path)
 # ---------------------------------------------------------------------------
 # `rm -rf` pe un symlink șterge linkul, nu urmează ținta
 # ---------------------------------------------------------------------------
-def _symlink_capable(tmp_path: Path) -> bool:
-    """Sondă reală, nu presupunere: pe Windows fără
-    `SeCreateSymbolicLinkPrivilege`, `Path.symlink_to` ridică `OSError`."""
-    target = tmp_path / "_symprobe_target"
-    link = tmp_path / "_symprobe_link"
-    target.mkdir()
-    try:
-        link.symlink_to(target, target_is_directory=True)
-    except OSError:
-        return False
-    return link.is_symlink()
-
-
-def test_a_symlink_at_the_legacy_path_is_removed_without_following_it(tmp_path):
+@pytest.mark.parametrize("target_exists", [
+    pytest.param(True, id="live"),
+    pytest.param(False, id="dangling"),
+])
+def test_a_symlink_at_the_legacy_path_is_removed_without_following_it(tmp_path, make_link,
+                                                                      target_exists):
     """Dacă `.install-state` a rămas un symlink (planted de `sentinel`, care
     deține părintele) către alt director real, `rm -rf` pe calea veche
     trebuie să șteargă LINKUL, nu conținutul țintei — un `rm -rf` care ar
@@ -162,25 +162,49 @@ def test_a_symlink_at_the_legacy_path_is_removed_without_following_it(tmp_path):
     Falsificat schimbând `rm -rf -- "${_LEGACY_STATE_MARKERS}"` într-o formă
     care urmează linkul (ex. adăugând `/` la coadă) — testul trebuie să vadă
     `victim/secret` dispărut.
-    """
-    if not _symlink_capable(tmp_path):
-        pytest.skip("mediul ăsta nu poate crea symlinkuri reale (fără "
-                    "SeCreateSymbolicLinkPrivilege) — netestat, nu curat")
 
+    Pentru operator: un `--purge` care urmează linkul plantat golește un director
+    care nu e al Sentinel (ca root), în loc să șteargă doar linkul și să raporteze
+    „curățat".
+
+    Linkul vine din `make_link` (tests/_symlinks.py): symlink adevărat unde se poate,
+    altfel legătura proprie a runtime-ului MSYS, pe care `rm` din Git Bash o tratează
+    ca pe un symlink (măsurat: `rm -rf L` șterge legătura și lasă ținta, `rm -rf L/`
+    golește ținta — identic cu GNU rm pe WSL). Pe Windows fără privilegiu nu se sare,
+    fiindcă garda ar rămâne fără observator. `legacy.exists()` din pathlib nu vede
+    legătura MSYS, deci „linkul a dispărut" se întreabă bash-ului (`present`) — altfel
+    aserțiunea ar fi adevărată oricum.
+
+    Două forme ale aceleiași legături, fiindcă garda din `rollback.sh` are două clauze
+    (`-e` și `-L`) și fiecare are nevoie de propriul observator. Legătura VIE (ținta
+    există) e văzută de `-e`, deci aici clauza `-L` nu e exersată: ștergerea ei lasă
+    testul verde. O legătură ATÂRNÂNDĂ (ținta lipsește: `-e` e fals, doar `-L` o prinde)
+    e singura care o exersează — fără ea, `|| -L` se poate șterge și un `--purge` lasă
+    legătura la calea veche, raportând „curățat". Falsificat scoțând `|| -L` din
+    condiția din `rollback.sh`: forma `dangling` pică, `live` rămâne verde (de aceea
+    sunt două forme, nu una). Parametrul schimbă doar ținta legăturii; aserțiunile
+    formei `live` (ținta neatinsă, legătura dispărută) sunt aceleași ca înainte.
+    """
     sentinel_state_dir = tmp_path / "sentinel_state"
     sentinel_state_dir.mkdir(parents=True)
     victim = tmp_path / "victim"
-    victim.mkdir()
-    (victim / "secret").write_text("root ALL=(ALL) ALL\n", encoding="utf-8", newline="\n")
+    secret = victim / "secret"
+    if target_exists:
+        victim.mkdir()
+        secret.write_text("root ALL=(ALL) ALL\n", encoding="utf-8", newline="\n")
 
     legacy = sentinel_state_dir / ".install-state"
-    legacy.symlink_to(victim, target_is_directory=True)
+    make_link(legacy, victim)
+    assert is_link(legacy) and present(victim) == target_exists, (
+        "precondiția: legătura trebuie să fie vie în forma `live` și atârnândă în `dangling` — "
+        "altfel forma `dangling` ar rula a doua oară cazul viu și clauza `-L` ar rămâne neexersată")
 
     install_state_dir = tmp_path / "install_state"
     install_state_dir.mkdir(parents=True)
 
     proc = _run(_harness(tmp_path, sentinel_state_dir, install_state_dir), tmp_path)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert not legacy.exists() and not legacy.is_symlink(), "linkul n-a fost șters"
-    assert (victim / "secret").read_text(encoding="utf-8") == "root ALL=(ALL) ALL\n", (
-        "conținutul directorului țintit de symlink a fost șters — linkul a fost urmat")
+    assert not present(legacy), "linkul n-a fost șters"
+    if target_exists:
+        assert secret.read_text(encoding="utf-8") == "root ALL=(ALL) ALL\n", (
+            "conținutul directorului țintit de symlink a fost șters — linkul a fost urmat")

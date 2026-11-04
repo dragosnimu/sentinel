@@ -1021,7 +1021,9 @@ prin funcție, indiferent de rezultat — inclusiv pe o instalare nouă, fără
 nimic de migrat, sau pe un refuz — ca să nu mai fie interogată calea veche la
 nesfârșit; un refuz nu se mai reîncearcă automat, operatorul repară de mână și
 șterge marcajul dacă vrea o privire în plus. Detalii în comentariul din
-`migrate_legacy_state_markers` (`deploy/lib/common.sh`).
+`migrate_legacy_state_markers` — funcție care **nu mai există** în
+`deploy/lib/common.sh`; paragraful de deasupra descrie proiectarea de atunci,
+iar nota de dedesubt spune ce a rămas.
 
 **Notă, 13 septembrie 2026 — migrarea a fost scoasă, nu re-reparată.** A treia
 rundă de mai sus a fost și ea ocolită (un symlink plantat la calea NOUĂ, după
