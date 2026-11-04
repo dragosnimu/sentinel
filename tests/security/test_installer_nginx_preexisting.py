@@ -497,9 +497,10 @@ def test_a_symlink_at_the_legacy_fact_path_is_refused_not_followed(tmp_path):
     plus, e plasa de sub ea.
 
     `[[ -f ]]` singur URMEAZĂ o legătură și acceptă orice
-    fișier obișnuit numit de ea, oriunde ar fi; `sentinel` deține directorul
-    și poate planta o astfel de legătură la fel de ușor cum ar planta
-    fișierul direct, deci refuzul trebuie să fie explicit în sursă, nu doar
+    fișier obișnuit numit de ea, oriunde ar fi; `sentinel` deține părintele
+    (`/var/lib/sentinel`), deci poate muta `.install-state` deoparte și o poate
+    recrea cu o astfel de legătură la fel de ușor cum ar planta fișierul
+    direct, deci refuzul trebuie să fie explicit în sursă, nu doar
     "de fapt inofensiv fiindcă valoarea tot trece prin regex".
 
     Clauza acopera DOAR ultima componenta; directoarele de deasupra raman deschise
@@ -520,8 +521,9 @@ def test_a_symlink_at_the_legacy_fact_path_is_not_read_through(tmp_path, make_li
     """Comportamentul, nu textul: o LEGATURA la calea faptului vechi, spre un fisier
     care spune "1", nu are voie sa fie crezuta.
 
-    Pentru operator: `sentinel` detine directorul vechi si poate planta acolo o
-    legatura spre orice fisier pe care il poate numi. Daca instalatorul (root) o
+    Pentru operator: `sentinel` detine parintele (/var/lib/sentinel), deci poate
+    muta `.install-state` deoparte si o poate recrea cu o legatura spre orice
+    fisier pe care il poate numi. Daca instalatorul (root) o
     urmeaza, "1" din fisierul tinta devine faptul write-once PERMANENT «nginx era
     al operatorului» -- iar pasul 33 nu mai are voie sa-si repare propriul
     nginx.conf, in tacere, pentru totdeauna. Faptul scris o data nu se mai
@@ -572,7 +574,8 @@ def test_a_symlink_at_the_legacy_fact_path_is_not_read_through(tmp_path, make_li
     pytest.param(b"01\n", id="two-characters-no-separator"),
 ])
 def test_a_forged_legacy_fact_value_is_never_promoted(tmp_path, legacy_bytes):
-    """`sentinel` deține directorul unde stă acest fișier octet cu octet — nimic
+    """`sentinel` deține părintele (`/var/lib/sentinel`), deci poate recrea
+    `.install-state` și scrie acest fișier octet cu octet — nimic
     din el nu are voie să treacă direct în faptul write-once, permanent, decât
     exact "0" sau "1". Fiecare valoare de-aici trebuie să cadă înapoi pe tier
     (4) (nicio linie de fapt VECHE găsită) și, cu pasul 20 marcat gata, faptul
