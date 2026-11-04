@@ -193,20 +193,25 @@ def _run(script: str, tmp_path: Path, extra_path: Path | None = None,
 # de la `ls -l` pe directorul `shim`, nu de la nginx.
 #
 # Aceeași unealtă servește acum și `ufw` (`_run_closing`) și `nginx`
-# (`_run_foreign`), dar CÂTE O listă pozitivă pentru fiecare, măsurată pe drumul ei:
-# lista lui `getent` NU se reciclează. Drumul „ufw lipsește” se oprește la
+# (`_run_foreign`), dar CÂTE O listă pozitivă pentru fiecare, derivată pe drumul
+# ei: lista lui `getent` NU se reciclează. Drumul „ufw lipsește” se oprește la
 # `have ufw || return 3`, înainte de orice `grep`; drumul „nginx lipsește” la
-# `have nginx || return 2`. Amândouă ajung deci la zero unelte externe (măsurat:
-# handler-ul nu înregistrează nimic pe un PATH fără nicio trambulină, pe Git Bash
-# și pe WSL), iar listele rămân goale în loc de a fi umplute „pentru orice
-# eventualitate”.
+# `have nginx || return 2`. Listele sunt goale. Pentru `ufw` e MĂSURAT: rulat sub
+# handler pe un PATH fără nicio trambulină, drumul nu caută nimic (Git Bash și
+# WSL, 46 verzi, capcana goală), iar o căutare adăugată înaintea lui `have`
+# (`hostname >/dev/null 2>&1 || true`) îl face roșu. Pentru `nginx` e citit din
+# cod, nu măsurat: `_run_foreign` n-are handler, fiindcă o unealtă căutată acolo
+# n-ar schimba răspunsul (`nginx -T` negăsit iese 127, iar `|| return 2` dă
+# același 2 ca ramura `have`; scoasă ramura, testul rămâne verde).
 #
 # Capcana pe care o ascunde o listă prea mică, DOAR pe drumul în care `ufw` e
 # prezent: `ufw_blocks_public_port` ține fiecare `grep` într-o condiție
 # (`grep -q … || return 1`, `grep -q … && return 1`). Un `grep` lipsă iese cu 127,
 # adică nenul, deci prima linie întoarce 1 — „nimic nu blochează” — fără nicio
-# eroare. Un PATH restrâns care uită `grep` n-ar strica niciun test, ar lăsa verzi
-# toate aserțiunile de tip „nu apare niciun obstacol”. De aceea `_run_closing`
+# eroare. Măsurat, cu `grep` redenumit în codul livrat într-unul inexistent: cu
+# handler și aserțiunea lui, 5 teste pică; fără aserțiunea lui (doar cu
+# rezultatele de pe ecran), 3, iar celelalte două — cele care cer „nu apare niciun
+# obstacol” — rămân verzi peste un `grep` care nu există. De aceea `_run_closing`
 # pune handler-ul pe TOATE rulările (cele cu `ufw` stub rulează pe PATH-ul
 # mașinii, care are `grep`; dacă nu l-ar avea, handler-ul îl înregistrează).
 ABSENT = object()   # `getent=ABSENT` / `ufw=ABSENT`: nu există pe PATH-ul scriptului
@@ -228,8 +233,9 @@ def _path_tools_only(directory: Path, tools: tuple[str, ...], *, absent: str) ->
 
     `absent` e unealta care TREBUIE să lipsească; fără ea în semnătură, o listă
     scrisă pentru altă unealtă ar putea-o readuce. Directorul se creează chiar
-    și pentru o listă goală: un PATH către un director inexistent e un alt caz
-    (handler-ul îl vede, dar nu e cel pe care îl vrem aici).
+    și pentru o listă goală, ca PATH-ul să nu poarte un intrar către un director
+    inexistent; asta e igienă, nu garanție (măsurat: fără el, testele cu `ufw`
+    rămân verzi, iar cel cu `getent` pică fiindcă nu mai are unde scrie).
     """
     assert absent not in tools, f"lista de unelte ar readuce chiar unealta care trebuie să lipsească ({absent})"
     directory.mkdir(parents=True, exist_ok=True)
@@ -1101,6 +1107,13 @@ def test_no_ufw_on_the_host_raises_nothing(tmp_path):
     pe platforma unde rulează instalatorul. Defect de TEST, nu de producție:
     instalatorul rulează ca root (`need_root`), deci acolo starea 2 nu vine din
     lipsa privilegiilor.
+
+    Falsificat în două feluri: scoțând `have ufw || return 3` din
+    `ufw_blocks_public_port`, `ufw` negăsit iese 127 sub `|| true`, starea devine
+    2 și obstacolul apare (cele trei teste cu `ufw=ABSENT` pică; testul de mod
+    `shared` nu, fiindcă are `ufw` prezent și altă ramură a lui 3); și lăsând
+    PATH-ul mașinii să intre în rulare, pe un rulător care are un `ufw`, scriptul
+    iese cu 97 și mesajul spune că e un defect de harnașament, nu al codului.
     """
     proc = _run_closing(tmp_path, domain="panou.example.test", ufw=ABSENT)
     assert proc.returncode == 0, proc.stdout + proc.stderr
