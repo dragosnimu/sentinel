@@ -1310,31 +1310,43 @@ _PLAIN_BLOCK = (
 def _run_foreign(tmp_path: Path, *, dump: str | None, nginx_rc: int = 0,
                  port: str = "8443") -> tuple[int, list[str], str]:
     stubs = tmp_path / "bin"
+    env: dict[str, str] = {}
+    proof = ""
     if dump is not None:
         payload = tmp_path / "dump.txt"
         payload.write_text(dump, encoding="utf-8", newline="\n")
         _write_stub(stubs, "nginx",
                     'cat "' + _p(payload) + '"\nexit ' + str(nginx_rc) + "\n")
     else:
+        # Absenta se FACE, nu se presupune: pe o masina cu nginx instalat testul
+        # "gazda fara nginx" ar masura cu totul altceva. Vechea garda
+        # (`shutil.which("nginx") is None`) era buna doar pe jumatate: pica
+        # zgomotos pe o masina cu nginx, dar pe Windows `which` respecta PATHEXT
+        # si nu vede un script fara extensie pe care `have nginx` din bash il
+        # gaseste (masurat, Python 3.10.8) - deci garda tacea exact acolo.
         stubs.mkdir(parents=True, exist_ok=True)
-        # Altfel testul "gazda fara nginx" ar depinde tacut de masina care il
-        # ruleaza: pe una cu nginx instalat ar masura cu totul altceva si ar
-        # trece sau pica din motive care n-au legatura cu codul livrat.
-        assert shutil.which("nginx") is None, \
-            "exista un nginx real pe PATH, deci cazul 'nginx absent' NU a fost testat"
+        proof = _unreachable_proof("nginx")
+        shim = _path_tools_only(tmp_path / "shim", _PATH_TOOLS_WITHOUT_NGINX, absent="nginx")
+        env["PATH"] = _p(stubs) + os.pathsep + _p(shim)
     proc = _run(
         "set -euo pipefail\n"
         "source ./lib/common.sh\n"
         + _funcs("nginx_foreign_default_on_port")
+        + proof
         + "rc=0\n"
         + 'out="$(nginx_foreign_default_on_port "' + port + '" '
           "/etc/nginx/conf.d/sentinel.conf "
           '/etc/nginx/conf.d/sentinel-default-deny.conf)" || rc=$?\n'
         + 'echo "RC=$rc"\n'
         + 'printf "%s" "$out"\n',
-        tmp_path, extra_path=stubs)
+        tmp_path, extra_path=stubs, env=env)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     lines = proc.stdout.splitlines()
+    if dump is None:
+        # Marturia ca `nginx` chiar lipsea, data de scriptul insusi; scoasa din
+        # lista ca sa nu fie citita drept `RC=`.
+        assert "NGINX_UNREACHABLE" in lines, proc.stdout + proc.stderr
+        lines.remove("NGINX_UNREACHABLE")
     rc = int(lines[0].split("=", 1)[1])
     return rc, [ln for ln in lines[1:] if ln.strip()], proc.stdout + proc.stderr
 
@@ -1415,7 +1427,15 @@ def test_nginx_refusing_to_dump_is_could_not_look_not_nothing_there(tmp_path):
 
 def test_a_host_without_nginx_is_also_could_not_look(tmp_path):
     """Aceeasi stare, alta cauza. `have nginx` fals nu inseamna "portul e
-    liber"."""
+    liber" - iar un instalator care ar citi "nu pot vedea ce asculta nginx"
+    ca "nimeni altcineva nu tine portul" ar scrie un al doilea `default_server`
+    peste o configuratie pe care nu a putut-o citi.
+
+    Absenta e FACUTA de test (PATH fara nginx, dovedit in script cu `have`-ul
+    livrat), nu doar verificata: o garda pe `shutil.which` nu vede pe Windows un
+    script `nginx` fara extensie, deci pe masina aia testul ar fi rulat peste un
+    nginx pe care garda nu-l zarea.
+    """
     rc, _, out = _run_foreign(tmp_path, dump=None)
     assert rc == 2, out
 
