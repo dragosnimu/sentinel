@@ -39,7 +39,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from _symlinks import is_link, present
+from _symlinks import is_link
 
 REPO = Path(__file__).resolve().parents[2]
 INSTALL_SH = REPO / "deploy" / "install.sh"
@@ -597,31 +597,41 @@ def test_a_forged_legacy_fact_value_is_never_promoted(tmp_path, legacy_bytes):
         f"valoarea forjată {legacy_bytes!r} a fost promovată")
 
 
+def _is_regular_file(path: Path) -> bool:
+    """`[ -f ]` din bash -- exact testul din conditia pazita. NU `present` din
+    `_symlinks` (`-L || -e`): acela accepta si un director la calea respectiva."""
+    return subprocess.run([BASH, "-c", '[ -f "$1" ]', "sh", _p(path)],
+                          capture_output=True).returncode == 0
+
+
 def test_a_symlink_on_a_directory_above_the_legacy_fact_is_followed(tmp_path, make_link):
     """Limita garzii `-L`, inregistrata de un test care trece, nu doar de proza.
     `-L` din nginx_preexisting_resolve priveste ULTIMA componenta. `sentinel` detine
-    si `.install-state`, si `facts`: daca muta `facts` deoparte si pune in loc o
-    legatura spre un director din afara arborelui, `[[ -f ]]` ramane adevarat,
-    `[[ -L ]]` pe fisier devine fals, iar instalatorul (root) citeste valoarea de
-    acolo. Perechea ei pentru legatura chiar pe fisier e
+    parintele (/var/lib/sentinel), deci poate muta `.install-state` deoparte si
+    recrea acolo un `facts` care e o legatura spre un director din afara arborelui:
+    `[[ -f ]]` ramane adevarat, `[[ -L ]]` pe fisier devine fals, iar instalatorul
+    (root) citeste valoarea de acolo. Perechea ei pentru legatura chiar pe fisier e
     `test_a_symlink_at_the_legacy_fact_path_is_not_read_through` (mai sus).
 
-    Pentru operator: asta NU e o gaura noua. `sentinel` poate scrie direct
-    `facts/nginx_preexisting`, cu orice continut, deci legatura nu-i da nicio putere
+    Pentru operator: asta NU e o gaura noua. `sentinel` poate planta direct un
+    `facts/nginx_preexisting` cu orice continut, deci legatura nu-i da nicio putere
     in plus; ii da doar un loc unde bytes plantati se vad mai greu ca interventie.
     Testul exista ca garda sa nu mai poata fi citita drept «calea e la adapost de
     legaturi»: un comentariu care promite mai mult decat face codul e felul in care
     urmatorul care intareste calea se increde in el.
 
-    NU e o aprobare a comportamentului. Cand calea va fi intarita cu adevarat (alt
-    mecanism -- o citire care refuza legaturi in nucleu; decizia operatorului, nu a
-    unui agent), testul acesta trebuie sa PICE si sa fie intors, iar comentariul din
-    install.sh rescris: tocmai asta e rostul lui. O verificare a componentelor in
-    bash nu inchide calea (`sentinel` redenumeste intre verificare si citire).
+    NU e o aprobare a comportamentului, si e SINGURUL test care trebuie sa pice cand
+    calea e intarita (alt mecanism -- o citire care refuza legaturi in nucleu;
+    decizia operatorului, nu a unui agent): atunci se intoarce (asteapta FLAG=0 prin
+    directorul-legatura) si se rescrie comentariul din install.sh. O verificare a
+    componentelor in bash nu inchide calea (`sentinel` redenumeste intre verificare
+    si citire). Restul fisierului nu depinde de traversare: valoarea forjata e oprita
+    de `^[01]$` pe orice cale, iar asta o dovedeste deja
+    `test_a_forged_legacy_fact_value_is_never_promoted`.
 
-    Falsificat adaugand `&& ! -L "${_LEGACY_STATE_MARKERS}/facts"` la conditia care
-    pazeste citirea: directorul-legatura e refuzat, FLAG cade pe 0 si testul trebuie
-    sa pice.
+    Falsificat adaugand `&& ! -L "${_LEGACY_STATE_MARKERS}/facts"` (sau o plimbare
+    completa a componentelor) la conditia care pazeste citirea: directorul-legatura e
+    refuzat, FLAG cade pe 0 si exact acest test trebuie sa pice.
     """
     outside = tmp_path / "outside_facts"
     proc, state = _resolve_with_legacy_fact(
@@ -630,63 +640,19 @@ def test_a_symlink_on_a_directory_above_the_legacy_fact_is_followed(tmp_path, ma
     legacy_fact = legacy_facts / "nginx_preexisting"
     # precondiția: exact forma ocolirii, intrebata din bash (cel care ruleaza garda)
     assert is_link(legacy_facts), "precondiția: `facts` trebuie sa fie o legatura"
-    assert present(legacy_fact) and not is_link(legacy_fact), (
-        "precondiția: fisierul trebuie sa fie vizibil prin legatura si sa nu fie el "
-        "insusi legatura -- altfel nu aceasta e forma ocolirii")
+    assert _is_regular_file(legacy_fact) and not is_link(legacy_fact), (
+        "precondiția: la cale trebuie sa fie un FISIER obisnuit (`[ -f ]`), vizibil "
+        "prin legatura si care nu e el insusi legatura -- altfel nu aceasta e forma "
+        "ocolirii")
     assert (outside / "nginx_preexisting").read_bytes() == b"1\n", (
         "octetii nu stau in afara arborelui, deci testul nu arata ce spune")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "FLAG=1" in proc.stdout, (
-        "valoarea din afara arborelui NU a fost citita prin directorul-legatura: garda "
-        "s-a lărgit peste ultima componenta -- rescrie comentariul din install.sh si "
-        f"intoarce acest test, nu il sterge: {proc.stdout!r}")
+        "valoarea din afara arborelui NU a mai fost citita prin directorul-legatura: "
+        "calea pare INTARITA. Nu sterge testul: intoarce-l (asteapta FLAG=0) si rescrie "
+        "comentariul «NOT LINK-PROOF» din nginx_preexisting_resolve (deploy/install.sh). "
+        f"Daca nu ai intarit nimic, harnesul e stricat: {proc.stdout!r}")
     assert (state / "facts" / "nginx_preexisting").read_text(encoding="utf-8").strip() == "1"
-
-
-@pytest.mark.parametrize("legacy_bytes", [
-    pytest.param(b"2\n", id="out-of-range-digit"),
-    pytest.param(b"0 1\n", id="two-values-one-line"),
-    pytest.param(b"1;rm\n", id="shell-metacharacter-tail"),
-    pytest.param(b"01\n", id="two-characters-no-separator"),
-])
-def test_a_forged_value_behind_a_linked_facts_directory_is_never_promoted(
-        tmp_path, make_link, legacy_bytes):
-    """Granita reala a citirii, exersata PE drumul cu legatura: garda `-L` nu
-    acopera directoarele de deasupra, deci ce opreste un text strain sa devina fapt
-    permanent este `^[01]$` -- nu legatura. Pentru operator: un director `facts`
-    inlocuit cu o legatura spre un fisier cu continut oarecare nu are voie sa scrie
-    in directorul root-only nimic in afara de «0» sau «1»; un fapt scris o data nu se
-    mai corecteaza.
-
-    Control in aceeasi proba: acelasi drum cu «1» curat TREBUIE sa dea FLAG=1 -- altfel
-    «FLAG=0» de mai jos ar putea veni din faptul ca harnesul nu citeste nimic prin
-    legatura, nu din regex.
-
-    Falsificat largind `^[01]$` la `^.*$` in nginx_preexisting_resolve: valoarea
-    forjata trece, iar testul trebuie sa pice.
-    """
-    control_dir = tmp_path / "control"
-    control_dir.mkdir()
-    control, _ = _resolve_with_legacy_fact(
-        control_dir, b"1\n", step20_done=True,
-        facts_link_to=control_dir / "outside_facts", make_link=make_link)
-    assert control.returncode == 0, control.stdout + control.stderr
-    assert "FLAG=1" in control.stdout, (
-        "controlul («1» curat prin directorul-legatura) n-a dat FLAG=1 -- harnesul nu "
-        f"citeste prin legatura, deci testul n-ar dovedi nimic: {control.stdout!r}")
-
-    forged_dir = tmp_path / "forged"
-    forged_dir.mkdir()
-    proc, state = _resolve_with_legacy_fact(
-        forged_dir, legacy_bytes, step20_done=True,
-        facts_link_to=forged_dir / "outside_facts", make_link=make_link)
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "FLAG=0" in proc.stdout, (
-        f"valoarea forjata {legacy_bytes!r} a trecut prin directorul-legatura: {proc.stdout!r}")
-    fact_file = state / "facts" / "nginx_preexisting"
-    assert fact_file.exists(), "faptul n-a fost scris deloc dupa pasul 20"
-    assert fact_file.read_text(encoding="utf-8").strip() == "0", (
-        f"faptul scris nu e '0' ci {fact_file.read_text(encoding='utf-8')!r}")
 
 
 def test_a_planted_zero_beats_the_legacy_one_and_is_frozen(tmp_path):
@@ -695,9 +661,10 @@ def test_a_planted_zero_beats_the_legacy_one_and_is_frozen(tmp_path):
     Un «0» plantat in `facts/nginx_preexisting` bate deci linia veche din
     `preflight.env` care spunea «1» (nginx era al operatorului), iar
     `fact_record_once` il ingheata in directorul root-only PENTRU TOTDEAUNA. De
-    atunci pasul 33 are voie sa editeze `nginx.conf`-ul operatorului la fiecare
-    deploy. Falsul trebuie sa reuseasca o singura data. Un fisier obisnuit, scris de
-    `sentinel` in directorul pe care il detine, ajunge -- nicio legatura nu e
+    atunci `step_nginx` (doar in modul dedicat, si doar cat :80 e tinut) are voie sa
+    editeze `nginx.conf`-ul operatorului la fiecare deploy. Falsul trebuie sa reuseasca
+    o singura data. Un fisier obisnuit, plantat de `sentinel` (care detine parintele
+    /var/lib/sentinel si poate recrea `.install-state`), ajunge -- nicio legatura nu e
     implicata, deci nici o garda pe legaturi nu ar fi oprit asta.
 
     Testul fixeaza comportamentul pe care comentariul din install.sh il afirma, ca

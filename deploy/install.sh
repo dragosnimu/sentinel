@@ -453,8 +453,8 @@ nginx_preexisting_resolve() {
     # So what protects this read is not the link test but the bounds under it:
     # `head -c 64` (bounded time and size) and `^[01]$` (nothing else is ever
     # believed). And `-L` buys no capability against `sentinel` either way —
-    # it owns this tree and can write `facts/nginx_preexisting` itself with
-    # any content. What a link adds for an attacker is only that the planted
+    # it can rename `.install-state` aside and recreate it with its own
+    # `facts/nginx_preexisting` holding any content. What a link adds for an attacker is only that the planted
     # bytes live elsewhere (harder to spot as tampering). `-L` is kept because
     # it costs nothing and refuses the plain case (a link to a file), not
     # because it is the boundary.
@@ -463,9 +463,10 @@ nginx_preexisting_resolve() {
     # before (3), which is skipped once `legacy` is set. A planted "0" therefore
     # overrides a preflight.env line saying "1" (nginx was the operator's), and
     # fact_record_once then freezes that "0" in the root-only directory for good
-    # — step 33 may then edit the operator's nginx.conf on every deploy. The
-    # forgery has to succeed once. That follows from the ordering and from
-    # `sentinel` owning the tree, not from symlinks
+    # — step_nginx (dedicated mode only, and only while :80 is held) may then
+    # edit the operator's nginx.conf on every deploy. The forgery has to
+    # succeed once. That follows from the ordering and from `sentinel` owning
+    # the parent directory, not from symlinks
     # (test_a_planted_zero_beats_the_legacy_one_and_is_frozen).
     local legacy_fact="${_LEGACY_STATE_MARKERS}/facts/${NGINX_PREEXISTING_FACT}"
     if [[ -f "$legacy_fact" && ! -L "$legacy_fact" ]]; then
