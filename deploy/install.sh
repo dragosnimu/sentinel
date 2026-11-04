@@ -431,11 +431,39 @@ nginx_preexisting_resolve() {
     # "1" answer is anywhere near that size, so nothing legitimate is cut
     # short by it.
     #
-    # `-L` refuses a symlink at this exact path: `-f` alone follows the link
-    # and would accept one pointed at any regular file `sentinel` can name —
-    # narrow (the value is still constrained to "0"/"1" below), but there is
-    # no reason to read through a link `sentinel` planted when reading the
-    # file it names directly costs nothing extra.
+    # `-L` refuses a symlink at the FINAL component only — the file itself.
+    # It says nothing about the two directories above it (`.install-state`,
+    # `facts`): `sentinel` owns both, so it can rename either aside and put a
+    # link to a directory elsewhere in its place. Then `-f` is true, `-L` on
+    # the file is false, and the bytes come from outside the tree. Measured,
+    # not argued: test_a_symlink_on_a_directory_above_the_legacy_fact_is_followed
+    # makes that happen and passes. THIS PATH IS NOT LINK-PROOF.
+    #
+    # It is not made so by walking the components either: any check here is
+    # followed by a use here, and the account being defended against can
+    # rename between the two (see the comment on SENTINEL_INSTALL_STATE_DIR in
+    # deploy/lib/common.sh — three rounds of making the old-location migration
+    # safe from stat() results were each beaten by that). Closing it for real needs a read that refuses links in
+    # the kernel (openat2 RESOLVE_NO_SYMLINKS), which bash does not have: a new
+    # mechanism, for the operator to decide, not something to grow here.
+    #
+    # So what protects this read is not the link test but the two lines under
+    # it: `head -c 64` (bounded time and size) and `^[01]$` (nothing else is
+    # ever believed). And `-L` buys no capability against `sentinel` either way
+    # — it owns this tree and can write `facts/nginx_preexisting` itself with
+    # any content. What the link adds for an attacker is only that the planted
+    # bytes live elsewhere (harder to spot as tampering). `-L` is kept because
+    # it costs nothing and refuses the plain case (a link to a file), not
+    # because it is the boundary.
+    #
+    # What a forged value DOES achieve, and why it matters: this tier runs
+    # before (3), which is skipped once `legacy` is set. A planted "0" therefore
+    # overrides a preflight.env line saying "1" (nginx was the operator's), and
+    # fact_record_once then freezes that "0" in the root-only directory for good
+    # — step 33 may then edit the operator's nginx.conf on every deploy. The
+    # forgery has to succeed once. That follows from the ordering and from
+    # `sentinel` owning the tree, not from symlinks
+    # (test_a_planted_zero_beats_the_legacy_one_and_is_frozen).
     local legacy_fact="${_LEGACY_STATE_MARKERS}/facts/${NGINX_PREEXISTING_FACT}"
     if [[ -f "$legacy_fact" && ! -L "$legacy_fact" ]]; then
         local legacy_fact_value
