@@ -1362,7 +1362,7 @@ def _run_foreign(tmp_path: Path, *, dump: str | None, nginx_rc: int = 0,
         tmp_path, extra_path=stubs, env=env)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     _assert_no_tool_missed(proc, not_found)
-    # Linia de mărturie a handler-ului nu e `RC=`.
+    # Linia de marturie a handler-ului nu e `RC=`.
     lines = [ln for ln in proc.stdout.splitlines() if not ln.startswith(_HOOK_ALIVE + " ")]
     if dump is None:
         # Marturia ca `nginx` chiar lipsea, data de scriptul insusi; scoasa din
