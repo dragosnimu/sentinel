@@ -432,26 +432,29 @@ nginx_preexisting_resolve() {
     # short by it.
     #
     # `-L` refuses a symlink at the FINAL component only — the file itself.
-    # It says nothing about the two directories above it (`.install-state`,
-    # `facts`): `sentinel` owns both, so it can rename either aside and put a
-    # link to a directory elsewhere in its place. Then `-f` is true, `-L` on
-    # the file is false, and the bytes come from outside the tree. Measured,
-    # not argued: test_a_symlink_on_a_directory_above_the_legacy_fact_is_followed
-    # makes that happen and passes. THIS PATH IS NOT LINK-PROOF.
+    # It says nothing about the directories above it (`.install-state`,
+    # `facts`): `sentinel` owns the parent (/var/lib/sentinel), so it can
+    # rename `.install-state` aside and build any tree it likes at that name,
+    # `facts` included, or make `facts` a link to a directory elsewhere. Then
+    # `-f` is true, `-L` on the file is false, and the bytes come from outside
+    # the tree. Measured, not argued:
+    # test_a_symlink_on_a_directory_above_the_legacy_fact_is_followed makes
+    # that happen and passes. THIS PATH IS NOT LINK-PROOF.
     #
-    # It is not made so by walking the components either: any check here is
-    # followed by a use here, and the account being defended against can
-    # rename between the two (see the comment on SENTINEL_INSTALL_STATE_DIR in
-    # deploy/lib/common.sh — three rounds of making the old-location migration
-    # safe from stat() results were each beaten by that). Closing it for real needs a read that refuses links in
-    # the kernel (openat2 RESOLVE_NO_SYMLINKS), which bash does not have: a new
+    # Walking the components would not make it so: any check here is followed
+    # by a use here, and the account being defended against can rename between
+    # the two (see the comment on SENTINEL_INSTALL_STATE_DIR in
+    # deploy/lib/common.sh: three rounds of making the old-location migration
+    # safe from stat() results each closed one bypass and fell to the next).
+    # Closing it for real needs a read that refuses links in the kernel (e.g.
+    # openat2 with RESOLVE_NO_SYMLINKS), which bash does not have: a new
     # mechanism, for the operator to decide, not something to grow here.
     #
-    # So what protects this read is not the link test but the two lines under
-    # it: `head -c 64` (bounded time and size) and `^[01]$` (nothing else is
-    # ever believed). And `-L` buys no capability against `sentinel` either way
-    # — it owns this tree and can write `facts/nginx_preexisting` itself with
-    # any content. What the link adds for an attacker is only that the planted
+    # So what protects this read is not the link test but the bounds under it:
+    # `head -c 64` (bounded time and size) and `^[01]$` (nothing else is ever
+    # believed). And `-L` buys no capability against `sentinel` either way —
+    # it owns this tree and can write `facts/nginx_preexisting` itself with
+    # any content. What a link adds for an attacker is only that the planted
     # bytes live elsewhere (harder to spot as tampering). `-L` is kept because
     # it costs nothing and refuses the plain case (a link to a file), not
     # because it is the boundary.
