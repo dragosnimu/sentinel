@@ -112,6 +112,199 @@ def _run(script: str, tmp_path: Path, extra_path: Path | None = None,
     )
 
 
+# ---------------------------------------------------------------------------
+# O unealtă care LIPSEȘTE de-adevăratelea, nu una pe care mașina o are sau nu
+# ---------------------------------------------------------------------------
+# `_run` PREPUNE directorul de stub-uri la PATH-ul mașinii, nu îl înlocuiește.
+# Un test care „nu are `getent`" doar fiindcă n-a scris un stub moștenește deci
+# ce are mașina: trece pe Git Bash (n-are getent) și pică pe Linux (glibc îl
+# are, rulează cel real, iar scriptul spune cu totul altceva). Un verde pe
+# Windows care nu poate fi verde pe singura platformă unde rulează instalatorul
+# e mai rău decât niciun test — se citește ca acoperire.
+#
+# Așa că absența se FACE: scriptul primește un PATH format din stub-uri plus
+# câteva „trambuline" către uneltele de care chiar are nevoie, rezolvate acum,
+# în procesul de test, pe PATH-ul real. Directoarele reale NU intră pe PATH —
+# pe Linux `getent` stă în /usr/bin, lângă `bash`, deci filtrarea pe directoare
+# nu poate separa una de cealaltă; singura listă care se poate ține e cea
+# pozitivă, a uneltelor numite.
+#
+# Lista e MINIMUL măsurat al drumului „getent lipsește" prin
+# `verify_dashboard_answers`, nu o presupunere. Ce se întâmplă când drumul
+# ajunge la o unealtă nouă, nelistată, NU e un cod 127 care oprește testul:
+# `name_resolution_note` e chemată doar ca `note="$(name_resolution_note …)"`,
+# iar substituția de comandă pierde `errexit` (installer-ul nu pune niciodată
+# `inherit_errexit`). `command not found` ajunge pe stderr, 127 se pierde în
+# substituție, nota iese oricum, iar fiecare aserțiune pe ieșire trece — măsurat:
+# un `hostname >/dev/null` fără pază pus în ramura „getent lipsește" dădea 46
+# verzi pe Git Bash și pe WSL.
+#
+# De aceea `_run_verify` pune în harness un `command_not_found_handle`: bash îl
+# cheamă el însuși, în procesul copil, ori de câte ori CAUTĂ o comandă pe PATH și
+# nu o găsește, iar handler-ul scrie numele într-un fișier-capcană pe care testul
+# îl cere nescris. Nu potrivește niciun TEXT — o aserțiune pe fraza „command not
+# found" de pe stderr nu vedea ce nu ajunge acolo, iar o frază engleză ar fi oarbă
+# și sub un bash tradus; de-aceea nu mai există nici `LC_ALL`.
+#
+# Ce VEDE (măsurat pe Git Bash 5.2.37 și pe WSL 5.2.21, aceleași rezultate): o
+# unealtă lipsă chemată simplu, cu `>/dev/null`, sub `2>/dev/null || true`,
+# sub `2>&1 || true` (stderr captat în `$(…)`), într-un pipeline, într-un `if`,
+# într-un subshell sau grup, într-o funcție, prin `eval`, printr-o variabilă,
+# prin `command x`, prin `<(…)` — și un director pe PATH. Pe fundal o vede doar
+# dacă se AȘTEAPTĂ copilul: fără `wait`, scrierea poate veni după ce shell-ul a
+# ieșit, iar o sondă brută a prins-o aterizând în fișierul cazului URMĂTOR. Nu se
+# declanșează pentru `have` / `command -v` / `type -P`: a SONDA existența nu
+# strică nimic, doar a o CHEMA. Harness-ul se verifică singur: la fiecare rulare,
+# înainte de cod, cheamă o unealtă inexistentă într-un `$(… 2>/dev/null)` (forma
+# pe care stderr-ul n-o vedea) și iese cu 96 dacă handler-ul n-a scris-o SAU n-a
+# întors 127; un handler mort ar lăsa toate testele verzi fără să fi văzut nimic,
+# iar unul care întoarce 0 ar schimba ce face codul testat cu unealta lipsă.
+#
+# Ce NU vede (măsurat; declarat, nu scăpat — doar citirea codului le prinde):
+#   * `exec x`, inclusiv `$(exec x)`: `exec` își dă singur eroarea
+#     („exec: x: not found"), fără handler;
+#   * unealta DINĂUNTRUL unei înfășurători — `env x`, `timeout N x`, `xargs x`,
+#     `nohup x` — fiindcă o caută procesul înfășurător, nu bash. Înfășurătoarea
+#     ÎNSĂȘI, dacă lipsește, e văzută: pe PATH-ul restrâns `env` lipsește și e
+#     înregistrată, deci forma asta e oarbă doar cât timp înfășurătoarea există;
+#   * o cale absolută (`/usr/sbin/x`): nu se caută pe PATH;
+#   * un shebang stricat („cannot execute: required file not found") și un fișier
+#     fără bit de execuție („Permission denied", măsurat doar pe WSL): ele EXISTĂ
+#     pe PATH, deci nu lipsesc, iar bash le raportează altfel;
+#   * o unealtă care există, dar eșuează;
+#   * o unealtă chemată într-un `bash -c` / `sh -c`: alt shell, fără funcția;
+#   * un PATH gol sau nesetat: bash caută în directorul curent și raportează
+#     „No such file or directory", fără handler (un PATH către un director
+#     inexistent, în schimb, îl cheamă). Codul testat nu atinge PATH-ul;
+#   * un handler înlocuit sau scos (`unset -f`) de codul testat. Nici
+#     `lib/common.sh`, nici `install.sh`, nici altceva din repository, în afara
+#     acestui fișier, nu definesc `command_not_found_handle` și nu fac `unset -f`
+#     (verificat cu grep, cu martor pozitiv; scos din cele trei funcții extrase
+#     la fel), deci nimic din ce rulează aici nu-l poate umbri. Harness-ul îl
+#     definește DUPĂ `source ./lib/common.sh`, deci unul din `common.sh` ar fi
+#     fost suprascris, nu ar fi ascuns capcana. Subshell-urile, `set +o …`,
+#     `set -o posix` și `hash -r` nu-l opresc (măsurat).
+# Ce rămâne în afara handler-ului se prinde citind codul, nu rulând testul.
+#
+# Dacă trambulina însăși e stricată (ex. nu e executabilă), testul pică cu
+# `[FATAL] … answered 000`, ca și cum ar fi o pană a sondei pe loopback: shim-ul
+# stricat eșuează în interiorul lui `https_code`, sub `|| true`, iar sonda
+# raportează 000. Roșul e real, dar arată spre sondă, nu spre trambulină — pornește
+# de la `ls -l` pe directorul `shim`, nu de la nginx.
+#
+# Aceeași unealtă servește acum și `ufw` (`_run_closing`) și `nginx`
+# (`_run_foreign`), dar CÂTE O listă pozitivă pentru fiecare, derivată pe drumul
+# ei: lista lui `getent` NU se reciclează. Drumul „ufw lipsește” se oprește la
+# `have ufw || return 3`, înainte de orice `grep`; drumul „nginx lipsește” la
+# `have nginx || return 2`. Listele sunt goale. Pentru `ufw` e MĂSURAT: rulat sub
+# handler pe un PATH fără nicio trambulină, drumul nu caută nimic (Git Bash și
+# WSL, 46 verzi, capcana goală), iar o căutare adăugată înaintea lui `have`
+# (`hostname >/dev/null 2>&1 || true`) îl face roșu. Pentru `nginx` răspunsul nu
+# deosebește garda de lipsa ei (`nginx -T` negăsit iese 127, iar `|| return 2` dă
+# același 2 ca ramura `have`: rc, stdout și stderr identice), așa că doar
+# handler-ul din `_run_foreign` o vede dispărând: scoasă `have nginx || return 2`,
+# el înregistrează căutarea lui `nginx`.
+#
+# Capcana pe care o ascunde o listă prea mică, DOAR pe drumul în care `ufw` e
+# prezent: `ufw_blocks_public_port` ține fiecare `grep` într-o condiție
+# (`grep -q … || return 1`, `grep -q … && return 1`). Un `grep` lipsă iese cu 127,
+# adică nenul, deci prima linie întoarce 1 — „nimic nu blochează” — fără nicio
+# eroare. Măsurat, cu `grep` redenumit în codul livrat într-unul inexistent: cu
+# handler și aserțiunea lui, 5 teste pică; fără aserțiunea lui (doar cu
+# rezultatele de pe ecran), 3, iar celelalte două — cele care cer „nu apare niciun
+# obstacol” — rămân verzi peste un `grep` care nu există. De aceea `_run_closing`
+# pune handler-ul pe TOATE rulările (cele cu `ufw` stub rulează pe PATH-ul
+# mașinii, care are `grep`; dacă nu l-ar avea, handler-ul îl înregistrează).
+ABSENT = object()   # `getent=ABSENT` / `ufw=ABSENT`: nu există pe PATH-ul scriptului
+
+_PATH_TOOLS_WITHOUT_GETENT = ("bash",)
+_PATH_TOOLS_WITHOUT_UFW = ()
+_PATH_TOOLS_WITHOUT_NGINX = ()
+
+
+def _path_tools_only(directory: Path, tools: tuple[str, ...], *, absent: str) -> Path:
+    """Un director cu câte o trambulină pentru fiecare unealtă din `tools`.
+
+    Trambulina e un script `#!/bin/sh` care face `exec` pe calea ABSOLUTĂ a
+    uneltei reale, găsită pe PATH-ul procesului de test. Nu e o copie și nu e o
+    legătură simbolică: pe Windows o copie a lui `bash.exe` fără DLL-ul de lângă
+    ea nu pornește, iar legăturile simbolice cer privilegii. `/bin/sh` în
+    shebang, nu `env`: `env bash` ar căuta chiar unealta pe care trambulina o
+    furnizează.
+
+    `absent` e unealta care TREBUIE să lipsească; fără ea în semnătură, o listă
+    scrisă pentru altă unealtă ar putea-o readuce. Directorul se creează chiar
+    și pentru o listă goală, ca PATH-ul să nu poarte un intrar către un director
+    inexistent; asta e igienă, nu garanție (măsurat: fără el, testele cu `ufw`
+    rămân verzi, iar cel cu `getent` pică fiindcă nu mai are unde scrie).
+    """
+    assert absent not in tools, f"lista de unelte ar readuce chiar unealta care trebuie să lipsească ({absent})"
+    directory.mkdir(parents=True, exist_ok=True)
+    for name in tools:
+        real = shutil.which(name)
+        assert real, f"`{name}` nu e pe PATH-ul mașinii de test — drumul „{absent} lipsește” nu poate rula"
+        path = directory / name
+        path.write_text(f'#!/bin/sh\nexec "{_p(Path(real))}" "$@"\n', encoding="utf-8", newline="\n")
+        path.chmod(path.stat().st_mode | stat_module.S_IEXEC | stat_module.S_IXGRP | stat_module.S_IXOTH)
+    return directory
+
+
+def _unreachable_proof(tool: str) -> str:
+    """Fragment de harness: iese cu 97 dacă `tool` e totuși ajungător.
+
+    Dovada vine din ACELAȘI `have` pe care îl folosește codul testat, rulat de
+    același shell: dacă unealta e totuși ajungătoare, testul moare aici cu 97,
+    nu mai departe pe o ramură care nu e cea numită.
+
+    NU o scoate ca inertă. Măsurat (pentru `getent`): un PATH scurs e prins
+    oricum mai jos, fiindcă o unealtă reală nu poate produce propoziția pe care
+    testul o cere — deci dovada nu schimbă niciodată trecut/picat. Ce schimbă e
+    CARE eșec se citește: un defect de harnașament raportat ca defect de
+    harnașament, în loc de „codul livrat pretinde o măsurătoare pe care n-a
+    făcut-o”. E redundantă pentru detecție și portantă pentru atribuire. O
+    observă un PATH scurs pe un rulător unde unealta există (pentru `getent`, un
+    Linux; pentru `ufw`, orice Ubuntu).
+    """
+    return (
+        f"if have {tool}; then\n"
+        f'    echo "PRECONDITION: {tool} is reachable at $(command -v {tool})" >&2\n'
+        "    exit 97\n"
+        "fi\n"
+        f'echo "{tool.upper()}_UNREACHABLE"\n'
+    )
+
+
+def _assert_no_tool_missed(proc: subprocess.CompletedProcess, not_found: Path) -> None:
+    """Handler-ul a fost PUS și viu, și codul testat n-a căutat nimic negăsit.
+
+    Prima aserțiune: handler-ul a dovedit că scrie, în fișierul pe care îl
+    citește testul. Fără ea, scoaterea apelului `_not_found_hook` din script nu
+    ar strica nimic: capcana ar rămâne goală, adică verde.
+
+    A doua: o unealtă care lipsește din drum NU oprește scriptul — 127 se pierde
+    în substituția de comandă (`note="$(name_resolution_note …)"`), iar sub
+    `2>/dev/null || true` n-ar lăsa nicio urmă pe stderr; în `ufw_blocks_public_port`
+    e mai rău, fiindcă 127 de la un `grep` dintr-o condiție se citește ca „nu
+    blochează”. Handler-ul le vede oricum. Pe TOATE rulările, nu doar pe `ABSENT`.
+
+    Mesajul nu afirmă o cauză pe care n-o poate ști: fișierul spune CE comandă
+    n-a fost găsită, nu DE CE. Poate codul livrat a chemat o unealtă care nu e
+    pe PATH-ul testului, poate un ajutor pe care harness-ul îl ia din
+    `common.sh` a ieșit de acolo și harness-ul nu l-a urmat.
+    """
+    assert f"{_HOOK_ALIVE} {_p(not_found)}" in proc.stdout, (
+        "harness-ul n-a dovedit că handler-ul pentru comenzi negăsite funcționează "
+        "(HOOK_DEAD pe stderr = n-a scris); nicio rulare de mai jos nu valorează "
+        "nimic fără el:\n" + proc.stdout + proc.stderr)
+    missed = (not_found.read_text(encoding="utf-8", errors="replace")
+              if not_found.exists() else "")
+    assert not missed, (
+        "o comandă a fost căutată pe PATH-ul testului și nu s-a găsit; exit 127 "
+        "se pierde în `$(…)`, deci doar urma din handler o arată. Vinovatul poate "
+        "fi codul livrat SAU harness-ul (un ajutor mutat din `common.sh`); "
+        "comanda e prima pistă, nu verdictul:\n" + missed)
+
+
 _PREAMBLE = (
     "set -euo pipefail\n"
     "source ./lib/common.sh\n"
@@ -449,15 +642,71 @@ _CURL_STUB = (
 )
 
 
-def _run_verify(tmp_path: Path, *, domain: str, getent: str | None = None,
+_HOOK_CONTROL = "vf_hook_control_tool_that_does_not_exist"
+_HOOK_ALIVE = "HOOK_ALIVE"
+
+
+def _not_found_hook(tripwire: Path) -> str:
+    """Harness: o unealtă căutată pe PATH și negăsită lasă un nume în `tripwire`.
+
+    Doar builtin-uri (`printf`, `[[`, `$(<…)`, `:`): pe PATH-ul lui `ABSENT`
+    n-au ce căuta `rm` sau `grep`, iar o unealtă externă chemată de handler ar
+    fi ea însăși „negăsită" și ar polua capcana. Controlul de la capăt e DOVADA că mecanismul merge:
+    handler-ul e pus la lucru sub forma pe care stderr-ul n-o vedea
+    (`$(… 2>/dev/null)`), iar harness-ul iese cu 96 dacă n-a lăsat numele sau
+    n-a întors 127 (cu 0, o unealtă lipsă ar părea că a reușit).
+    Apoi fișierul se GOLEȘTE (nu se șterge: `rm` e și el o unealtă), deci ce
+    rămâne în el la sfârșit vine numai din codul testat.
+    """
+    trip = _p(tripwire)
+    return (
+        'command_not_found_handle() { printf "%s\\n" "$*" >> "' + trip + '"; return 127; }\n'
+        + f'_vf_rc=0; _vf_ctl="$({_HOOK_CONTROL} 2>/dev/null)" || _vf_rc=$?\n'
+        + f'if [[ "$_vf_rc" != 127 || "$(<"{trip}")" != "{_HOOK_CONTROL}" ]]; then\n'
+        + '    echo "HOOK_DEAD: command_not_found_handle did not record a missing tool as 127" >&2\n'
+        + "    exit 96\n"
+        + "fi\n"
+        + f': > "{trip}"\n'
+        + f'echo "{_HOOK_ALIVE} {trip}"\n'
+    )
+
+
+def _run_verify(tmp_path: Path, *, domain: str, getent: str | object | None = None,
                 **codes: str) -> subprocess.CompletedProcess:
+    """Rulează `verify_dashboard_answers` livrat, cu `getent` DECLARAT.
+
+    `getent=<corp>`  un stub cu corpul ăsta, înaintea oricărui `getent` real;
+    `getent=ABSENT`  nicio unealtă `getent` pe PATH-ul scriptului (vezi mai sus),
+                     iar scriptul DOVEDEȘTE asta cu `have` — cel livrat — înainte
+                     să pornească verificarea;
+    `getent=None`    testul nu spune nimic despre `getent`. Nu mai înseamnă „ce
+                     are mașina": se pune un stub-capcană, și dacă drumul ajunge
+                     totuși la el, ASTA e eroarea — un test care depinde de
+                     `getent` trebuie să-l declare.
+
+    Orice comandă căutată pe PATH și negăsită de codul livrat strică testul, cu
+    numele ei în mesaj (`_not_found_hook`; ce vede și ce nu, în blocul de sus).
+    """
     stubs = tmp_path / "bin"
+    tripwire = tmp_path / "getent-was-asked"
+    not_found = tmp_path / "tool-not-found"
     _write_stub(stubs, "curl", _CURL_STUB)
     _write_stub(stubs, "ip", 'printf "1: eth0    inet 203.0.113.9/24 scope global eth0\\n"\n')
-    if getent is not None:
-        _write_stub(stubs, "getent", getent)
+    if getent is None:
+        _write_stub(stubs, "getent", f': > "{_p(tripwire)}"\nexit 99\n')
+    elif getent is not ABSENT:
+        _write_stub(stubs, "getent", str(getent))
+    proof = ""
+    env = dict(codes)
+    if getent is ABSENT:
+        # Dovada vine din ACELAȘI `have` pe care îl folosește codul testat (de ce
+        # nu se scoate ca inertă: `_unreachable_proof`).
+        proof = _unreachable_proof("getent")
+        shim = _path_tools_only(tmp_path / "shim", _PATH_TOOLS_WITHOUT_GETENT, absent="getent")
+        env["PATH"] = _p(stubs) + os.pathsep + _p(shim)
     script = (
         _PREAMBLE
+        + _not_found_hook(not_found)
         + f'DOMAIN="{domain}"\n'
         + _line(r"^PENDING_OBSTACLES=\(\)$") + "\n"
         + _line(r"^CLOSING_NOTES=\(\)$") + "\n"
@@ -465,13 +714,21 @@ def _run_verify(tmp_path: Path, *, domain: str, getent: str | None = None,
         + _line(r"^closing_note\(\).*$") + "\n"
         + _line(r"^SENTINEL_ANSWERED=.*$") + "\n"
         + _funcs("https_code", "name_resolution_note", "verify_dashboard_answers")
+        + proof
         + "verify_dashboard_answers\n"
         + 'echo "PASSED_CHECK"\n'
         + 'if (( ${#PENDING_OBSTACLES[@]} )); then\n'
         + '    printf "OBSTACLE: %s\\n" "${PENDING_OBSTACLES[@]}"\n'
         + "fi\n"
     )
-    return _run(script, tmp_path, extra_path=stubs, env={k: v for k, v in codes.items()})
+    proc = _run(script, tmp_path, extra_path=stubs, env=env)
+    assert not tripwire.exists(), (
+        "drumul a chemat `getent`, dar testul nu l-a declarat: dă `getent=<corp>` "
+        "sau `getent=ABSENT`, nu ce are mașina")
+    # Handler-ul viu și nimic căutat-și-negăsit, pe TOATE rulările, nu doar pe
+    # `ABSENT` (`_assert_no_tool_missed`).
+    _assert_no_tool_missed(proc, not_found)
+    return proc
 
 
 def _fatal_text(proc: subprocess.CompletedProcess) -> str:
@@ -631,16 +888,42 @@ def test_with_domain_a_name_that_does_not_arrive_weakens_the_check_out_loud(tmp_
 
 
 def test_a_missing_getent_is_reported_as_unknown_not_as_a_clean_name(tmp_path):
-    """CLAUDE.md: „nu pot verifica" ≠ „e curat". Fără `getent` pe PATH, motivul
-    pentru care numele nu răspunde e NECUNOSCUT, și se spune ca atare în loc să
-    se tacă."""
-    proc = _run_verify(tmp_path, domain="panou.example.test",
+    """CLAUDE.md: „nu pot verifica" ≠ „e curat". Pe o gazdă fără `getent`,
+    instalatorul NU a putut întreba dacă numele rezolvă; dacă i-ar atribui
+    totuși răspunsul „nu rezolvă deloc", operatorul ar căuta o pană de DNS pe
+    care nimeni n-a măsurat-o, în loc să afle că gazda n-are cu ce o măsura.
+    Cele două răspunsuri trebuie să se deosebească pe ecran: „NECUNOSCUT, nu am
+    avut cu ce întreba" vs „am întrebat și nu rezolvă" (testul de mai sus).
+
+    Condiția e FĂCUTĂ de test (`getent=ABSENT`: niciun `getent` pe PATH-ul
+    scriptului, dovedit în script cu `have`), nu moștenită. Versiunea
+    anterioară nu scria niciun stub și trecea pe Git Bash doar fiindcă
+    mașina n-are `getent`; pe Linux rula `getent`-ul real și pica.
+
+    Falsificat scoțând ramura `if ! have getent` din `name_resolution_note`:
+    `getent` lipsă ajunge pe `|| true`, iese un răspuns gol, iar mesajul devine
+    „nu rezolvă deloc" — afirmația pe care nimeni n-a măsurat-o.
+    """
+    proc = _run_verify(tmp_path, domain="panou.example.test", getent=ABSENT,
                        NAME_CODE="000", LOOP_CODE="200", UNKNOWN_CODE="444")
     assert proc.returncode == 0, proc.stdout + proc.stderr
+    # Condiția a fost cea numită: scriptul a verificat el însuși, cu `have`.
+    assert "GETENT_UNREACHABLE" in proc.stdout, proc.stdout + proc.stderr
+    assert "PASSED_CHECK" in proc.stdout, proc.stdout + proc.stderr
     out = proc.stdout + proc.stderr
     # Fraza întreagă, nu cuvântul: „UNKNOWN" singur ar fi putut veni din orice
     # alt mesaj al pasului.
     assert "resolves at all is UNKNOWN" in out, out
+    # Și cauza, ca operatorul să știe ce îi lipsește gazdei.
+    assert "getent is missing from this host" in out, out
+    # Nu doar „spune UNKNOWN": nu spune ȘI contrariul. „Nu rezolvă deloc" e
+    # rezultatul unei măsurători, iar aici nu s-a făcut niciuna.
+    assert "does not resolve on this host at all" not in out, out
+    # Ajunge și în rezumatul final (obstacolul), nu doar în avertismentul care
+    # trece pe ecran în mijlocul instalării.
+    obstacles = [ln for ln in proc.stdout.splitlines() if ln.startswith("OBSTACLE:")]
+    assert len(obstacles) == 1, proc.stdout
+    assert "resolves at all is UNKNOWN" in obstacles[0], obstacles[0]
 
 
 def test_with_domain_the_deny_block_is_proven_to_refuse_not_assumed(tmp_path):
@@ -687,19 +970,50 @@ def test_the_step_calls_the_verification_after_the_reload(tmp_path):
 # ---------------------------------------------------------------------------
 # Rezumatul final: ce mai stă între operator și panou
 # ---------------------------------------------------------------------------
-def _run_closing(tmp_path: Path, *, domain: str, ufw: str | None,
+def _run_closing(tmp_path: Path, *, domain: str, ufw: str | object,
                  nginx_mode: str = "dedicated",
                  allow_ufw: str = "0") -> subprocess.CompletedProcess:
+    """Rulează `ufw_blocks_public_port` + `report_closing_facts` livrate, cu `ufw` DECLARAT.
+
+    `ufw=<corp>`   un stub cu corpul ăsta, înaintea oricărui `ufw` real;
+                   `proc.ufw_was_asked` spune dacă a fost chemat;
+    `ufw=ABSENT`   nicio unealtă `ufw` pe PATH-ul scriptului (vezi blocul de la
+                   `ABSENT`), iar scriptul DOVEDEȘTE asta cu `have` — cel livrat
+                   — înainte să ruleze rezumatul.
+
+    Nu există „nu spun nimic despre ufw”, iar `None` e refuzat: în mod dedicat
+    `report_closing_facts` îl întreabă ÎNTOTDEAUNA, deci o rulare nedeclarată ar
+    moșteni ce are mașina. Pe orice Ubuntu asta e un `ufw` real pe care un
+    utilizator fără root nu-l poate citi: starea 2 („instalat, dar nu se poate
+    citi”), nu starea 3 („absent”). Un test care voia a doua o verifica pe
+    prima, și era verde pe mașina fără ufw și roșu pe cea cu.
+
+    Un stub-capcană (ca la `getent`) ar dubla degeaba `ufw_was_asked`: în mod
+    `shared`, unde ufw n-are voie să fie întrebat, un test cu un corp oarecare
+    și `assert not proc.ufw_was_asked` e aceeași garanție.
+
+    Handler-ul de comenzi negăsite e pus pe TOATE rulările (motivul, la blocul
+    de la `ABSENT`: un `grep` lipsă ar fi citit „nu blochează”).
+    """
+    assert ufw is ABSENT or isinstance(ufw, str), (
+        "`ufw` trebuie declarat: un corp de stub sau `ABSENT`, nu ce are mașina")
     stubs = tmp_path / "bin"
     marker = tmp_path / "ufw-was-asked"
-    if ufw is not None:
-        _write_stub(stubs, "ufw", f': > "{_p(marker)}"\n' + ufw)
-    else:
+    not_found = tmp_path / "tool-not-found"
+    env: dict[str, str] = {}
+    proof = ""
+    if ufw is ABSENT:
         stubs.mkdir(parents=True, exist_ok=True)
+        proof = _unreachable_proof("ufw")
+        shim = _path_tools_only(tmp_path / "shim", _PATH_TOOLS_WITHOUT_UFW, absent="ufw")
+        env["PATH"] = _p(stubs) + os.pathsep + _p(shim)
+    else:
+        _write_stub(stubs, "ufw", f': > "{_p(marker)}"\n' + ufw)
     script = (
         "set -euo pipefail\n"
         "source ./lib/common.sh\n"
-        f'DOMAIN="{domain}"\n'
+        + _not_found_hook(not_found)
+        + f'DOMAIN="{domain}"\n'
         f'NGINX_MODE="{nginx_mode}"\n'
         f'ALLOW_UFW="{allow_ufw}"\n'
         'PUBLIC_PORT="8443"\n'
@@ -708,10 +1022,18 @@ def _run_closing(tmp_path: Path, *, domain: str, ufw: str | None,
         + _line(r"^obstacle\(\).*$") + "\n"
         + _line(r"^closing_note\(\).*$") + "\n"
         + _funcs("ufw_blocks_public_port", "report_closing_facts")
+        + proof
         + "report_closing_facts\n"
         + 'echo "END_OF_RUN"\n'
     )
-    proc = _run(script, tmp_path, extra_path=stubs)
+    proc = _run(script, tmp_path, extra_path=stubs, env=env)
+    if ufw is ABSENT:
+        # Un 97 sau lipsa mărturiei = PATH-ul a scăpat un `ufw`; roșul care
+        # urmează n-ar mai fi despre codul livrat.
+        assert proc.returncode != 97 and "UFW_UNREACHABLE" in proc.stdout, (
+            "precondiția „ufw lipsește” nu s-a realizat — defect de harnașament, "
+            "nu al codului livrat:\n" + proc.stdout + proc.stderr)
+    _assert_no_tool_missed(proc, not_found)
     proc.ufw_was_asked = marker.exists()   # type: ignore[attr-defined]
     return proc
 
@@ -775,8 +1097,26 @@ def test_an_unreadable_ufw_is_unknown_not_fine(tmp_path):
 def test_no_ufw_on_the_host_raises_nothing(tmp_path):
     """Producția e AlmaLinux, unde ufw nici nu există. Un obstacol inventat
     acolo ar învăța operatorul să sară peste secțiunea asta — și atunci n-ar mai
-    citi-o nici pe gazda unde chiar contează."""
-    proc = _run_closing(tmp_path, domain="panou.example.test", ufw=None)
+    citi-o nici pe gazda unde chiar contează.
+
+    Condiția e FĂCUTĂ de test (`ufw=ABSENT`: niciun `ufw` pe PATH-ul scriptului,
+    dovedit în script cu `have`), nu moștenită. Versiunea anterioară nu scria
+    niciun stub și moștenea PATH-ul mașinii: trecea pe o mașină fără ufw, dar pe
+    orice Ubuntu rula `ufw`-ul REAL, pe care un utilizator fără root nu-l poate
+    citi (`ERROR: You need to be root to run this script`, ieșire goală). Asta e
+    starea 2, „NECUNOSCUT”, nu starea 3 — adică exact obstacolul de mai jos,
+    pe platforma unde rulează instalatorul. Defect de TEST, nu de producție:
+    instalatorul rulează ca root (`need_root`), deci acolo starea 2 nu vine din
+    lipsa privilegiilor.
+
+    Falsificat în două feluri: scoțând `have ufw || return 3` din
+    `ufw_blocks_public_port`, `ufw` negăsit iese 127 sub `|| true`, starea devine
+    2 și obstacolul apare (cele trei teste cu `ufw=ABSENT` pică; testul de mod
+    `shared` nu, fiindcă are `ufw` prezent și altă ramură a lui 3); și lăsând
+    PATH-ul mașinii să intre în rulare, pe un rulător care are un `ufw`, scriptul
+    iese cu 97 și mesajul spune că e un defect de harnașament, nu al codului.
+    """
+    proc = _run_closing(tmp_path, domain="panou.example.test", ufw=ABSENT)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "CE MAI STĂ ÎNTRE TINE ȘI PANOU" not in proc.stdout, proc.stdout
 
@@ -795,8 +1135,13 @@ def test_shared_mode_is_not_told_to_open_a_port_it_does_not_bind(tmp_path):
 def test_the_any_host_posture_is_repeated_in_the_closing_summary(tmp_path):
     """Spus o dată la pasul 33, pierdut în mijlocul unei instalări lungi. Postura
     cu care rămâne gazda trebuie să fie și ultimul lucru pe care îl vede
-    operatorul, împreună cu steagul care o îngustează."""
-    proc = _run_closing(tmp_path, domain="", ufw=None)
+    operatorul, împreună cu steagul care o îngustează.
+
+    `ufw=ABSENT`, ca pe producție: nota nu depinde de ufw, dar un test fără
+    declarație moștenea ce are mașina (pe Ubuntu, starea 2) și trecea pentru alt
+    motiv decât cel numit.
+    """
+    proc = _run_closing(tmp_path, domain="", ufw=ABSENT)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     out = proc.stdout
     assert "DE ȘTIUT" in out, out
@@ -806,8 +1151,11 @@ def test_the_any_host_posture_is_repeated_in_the_closing_summary(tmp_path):
 
 def test_with_a_domain_the_any_host_note_is_absent(tmp_path):
     """Cazul negativ: dacă nota ar apărea mereu, n-ar spune nimic despre
-    configurația chiar instalată."""
-    proc = _run_closing(tmp_path, domain="panou.example.test", ufw=None)
+    configurația chiar instalată.
+
+    `ufw=ABSENT`, ca pe producție (vezi testul de mai sus).
+    """
+    proc = _run_closing(tmp_path, domain="panou.example.test", ufw=ABSENT)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "ORICE Host" not in proc.stdout, proc.stdout
 
@@ -976,31 +1324,51 @@ _PLAIN_BLOCK = (
 def _run_foreign(tmp_path: Path, *, dump: str | None, nginx_rc: int = 0,
                  port: str = "8443") -> tuple[int, list[str], str]:
     stubs = tmp_path / "bin"
+    env: dict[str, str] = {}
+    proof = ""
     if dump is not None:
         payload = tmp_path / "dump.txt"
         payload.write_text(dump, encoding="utf-8", newline="\n")
         _write_stub(stubs, "nginx",
                     'cat "' + _p(payload) + '"\nexit ' + str(nginx_rc) + "\n")
     else:
+        # Absenta se FACE, nu se presupune: pe o masina cu nginx instalat testul
+        # "gazda fara nginx" ar masura cu totul altceva. Vechea garda
+        # (`shutil.which("nginx") is None`) era buna doar pe jumatate: pica
+        # zgomotos pe o masina cu nginx, dar pe Windows `which` respecta PATHEXT
+        # si nu vede un script fara extensie pe care `have nginx` din bash il
+        # gaseste (masurat, Python 3.10.8) - deci garda tacea exact acolo.
         stubs.mkdir(parents=True, exist_ok=True)
-        # Altfel testul "gazda fara nginx" ar depinde tacut de masina care il
-        # ruleaza: pe una cu nginx instalat ar masura cu totul altceva si ar
-        # trece sau pica din motive care n-au legatura cu codul livrat.
-        assert shutil.which("nginx") is None, \
-            "exista un nginx real pe PATH, deci cazul 'nginx absent' NU a fost testat"
+        proof = _unreachable_proof("nginx")
+        shim = _path_tools_only(tmp_path / "shim", _PATH_TOOLS_WITHOUT_NGINX, absent="nginx")
+        env["PATH"] = _p(stubs) + os.pathsep + _p(shim)
+    # Handler-ul de comenzi negasite, pe TOATE rularile (`_not_found_hook`). Fara
+    # el, `have nginx || return 2` ar fi o linie pe care nimic n-o vede disparand:
+    # fara garda, `nginx -T 2>/dev/null` negasit iese 127 in `|| return 2` si da
+    # acelasi rc, stdout si stderr. Handler-ul vede cautarea, nu rezultatul ei.
+    not_found = tmp_path / "tool-not-found"
     proc = _run(
         "set -euo pipefail\n"
         "source ./lib/common.sh\n"
+        + _not_found_hook(not_found)
         + _funcs("nginx_foreign_default_on_port")
+        + proof
         + "rc=0\n"
         + 'out="$(nginx_foreign_default_on_port "' + port + '" '
           "/etc/nginx/conf.d/sentinel.conf "
           '/etc/nginx/conf.d/sentinel-default-deny.conf)" || rc=$?\n'
         + 'echo "RC=$rc"\n'
         + 'printf "%s" "$out"\n',
-        tmp_path, extra_path=stubs)
+        tmp_path, extra_path=stubs, env=env)
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    lines = proc.stdout.splitlines()
+    _assert_no_tool_missed(proc, not_found)
+    # Linia de marturie a handler-ului nu e `RC=`.
+    lines = [ln for ln in proc.stdout.splitlines() if not ln.startswith(_HOOK_ALIVE + " ")]
+    if dump is None:
+        # Marturia ca `nginx` chiar lipsea, data de scriptul insusi; scoasa din
+        # lista ca sa nu fie citita drept `RC=`.
+        assert "NGINX_UNREACHABLE" in lines, proc.stdout + proc.stderr
+        lines.remove("NGINX_UNREACHABLE")
     rc = int(lines[0].split("=", 1)[1])
     return rc, [ln for ln in lines[1:] if ln.strip()], proc.stdout + proc.stderr
 
@@ -1081,7 +1449,22 @@ def test_nginx_refusing_to_dump_is_could_not_look_not_nothing_there(tmp_path):
 
 def test_a_host_without_nginx_is_also_could_not_look(tmp_path):
     """Aceeasi stare, alta cauza. `have nginx` fals nu inseamna "portul e
-    liber"."""
+    liber" - iar un instalator care ar citi "nu pot vedea ce asculta nginx"
+    ca "nimeni altcineva nu tine portul" ar scrie un al doilea `default_server`
+    peste o configuratie pe care nu a putut-o citi.
+
+    Absenta e FACUTA de test (PATH fara nginx, dovedit in script cu `have`-ul
+    livrat), nu doar verificata: o garda pe `shutil.which` nu vede pe Windows un
+    script `nginx` fara extensie, deci pe masina aia testul ar fi rulat peste un
+    nginx pe care garda nu-l zarea.
+
+    Garda `have nginx || return 2` are si ea un observator: fara ea, `nginx -T`
+    negasit da tot 2 (127 in `|| return 2`), deci rc-ul nu o vede disparand;
+    handler-ul de comenzi negasite din `_run_foreign` vede cautarea. Falsificat
+    scotand garda: pica acest test (1 din 46); iar daca se scoate si apelul
+    `_assert_no_tool_missed`, toate cele 46 raman verzi - asertiunea aceea e
+    singurul lucru care o vede.
+    """
     rc, _, out = _run_foreign(tmp_path, dump=None)
     assert rc == 2, out
 
