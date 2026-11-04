@@ -1634,23 +1634,39 @@ def test_a_comparison_that_cannot_sort_the_current_state_is_unknown(host):
 SMOKE = (REPO / "scripts" / "smoke-test.sh").read_text(encoding="utf-8")
 
 
+def _smoke_functions() -> str:
+    """Funcțiile LIVRATE prin care `smoke-test.sh` își măsoară gazda: `measure_remote` (ssh cu
+    cod de ieșire), `baseline_lines` și `compare_baseline_dim`. Secțiunea «Regresie» doar le
+    cheamă, deci fără ele blocul de mai jos nu ar compara nimic."""
+    parts = []
+    for name in ("measure_remote", "baseline_lines", "compare_baseline_dim"):
+        match = re.search(rf"^{name}\(\) \{{.*?^\}}", SMOKE, re.S | re.M)
+        assert match, f"{name}() nu mai există în smoke-test.sh"
+        parts.append(match.group(0))
+    return 'REGRESSION_UNMEASURED=""\n' + "\n".join(parts) + "\n"
+
+
 def _smoke_block(baseline_dir: Path) -> str:
     start = SMOKE.index("baseline_dir=/var/lib/sentinel-install")
     end = SMOKE.index("failed_units=", start)
     block = SMOKE[start:end]
-    assert "baseline-ports.txt" in block and "pass " in block, block[:200]
+    assert "compare_baseline_dim ports" in block, block[:200]
     return block.replace("baseline_dir=/var/lib/sentinel-install",
                          f'baseline_dir="{baseline_dir.as_posix()}"', 1)
 
 
 def _smoke_run(host: Host) -> str:
-    """Blocul «Regresie» din smoke-test.sh, LIVRAT, cu `r` înlocuit de o rulare locală (în
-    producție `r` e `ssh … "$@"`) și `pass`/`fail`/`warn` care tipăresc un cuvânt-cheie."""
+    """Blocul «Regresie» din smoke-test.sh, LIVRAT, cu un `ssh` momeală pe PATH care rulează
+    comanda primită printr-un `bash -c` local (în producție e ssh către gazdă, iar shell-ul de
+    acolo reinterpretează șirul la fel) și `pass`/`fail`/`warn` care tipăresc un cuvânt-cheie."""
+    _stub(host.bin, "ssh", 'exec bash -c "${@: -1}"\n')
+    _stub(host.bin, "sudo", '[[ "$1" == -n ]] && shift\nexec "$@"\n')
     script = host.tmp / "smoke.sh"
     script.write_text(
         "set -euo pipefail\n"
         'pass() { echo "PASS $*"; }\nfail() { echo "FAIL $*"; }\nwarn() { echo "WARN $*"; }\n'
-        'r() { bash -c "$1"; }\n' + _smoke_block(host.state) + "\n", encoding="utf-8", newline="\n")
+        "HOST=h; USER=u; SSH_OPTS=(-p 22)\n"
+        + _smoke_functions() + _smoke_block(host.state) + "\n", encoding="utf-8", newline="\n")
     environ = {**os.environ}
     environ["PATH"] = host.bin.as_posix() + os.pathsep + environ.get("PATH", "")
     proc = subprocess.run([BASH, script.as_posix()], capture_output=True, text=True,
