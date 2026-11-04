@@ -47,6 +47,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _symlinks import present
 
 REPO = Path(__file__).resolve().parents[2]
 DEPLOY = REPO / "deploy"
@@ -1162,22 +1163,23 @@ def test_a_record_that_says_measured_while_its_file_is_gone_is_unusable(host):
     assert "unusable (inconsistent)" in res.out, res.out
 
 
-def test_a_record_that_is_a_dangling_symlink_is_unusable_not_absent(host):
+def test_a_record_that_is_a_dangling_symlink_is_unusable_not_absent(host, make_link):
     """Un `baseline-state.txt` care e un link spre nicăieri nu există pentru `-e`, dar nici nu e
     «lipsă»: dacă gărzii îi lipsește `-L`, cade pe regula veche («are conținut, deci e bun») și
     deploy-ul de după compară cu un baseline despre care nimeni nu știe ce spune. Aici e
     `unreadable`, adică necunoscut.
 
-    ACEST TEST SE SARE fără dreptul de a crea linkuri simbolice (Windows: `WinError 1314`, iar
-    `ln -s` din git-bash eșuează la fel), deci pe mașina de dezvoltare Windows `-L` NU are
-    observator. În depozit nu există niciun CI care să-l ruleze. A fost rulat doar sub WSL
-    (bash 5.2, pytest într-un director propriu): verde cu `-L`, ROȘU fără el. Pe Windows
-    rămâne neacoperit, și spus."""
+    Linkul vine din `make_link` (tests/_symlinks.py): symlink adevărat unde se poate (Linux,
+    WSL, Windows cu privilegiu), altfel legătura proprie a runtime-ului MSYS (`.lnk`, fără
+    privilegiu), pe care bash-ul care rulează scriptul o vede ca pe un symlink — măsurat aici
+    pe Git Bash 5.2.37: `-L` adevărat, `-e` și `-s` false, `cat` pică, exact ca pe un link
+    atârnând real. `make_link` VERIFICĂ prin bash că linkul e atârnând înainte să-l dea
+    testului, deci dacă nu poate, testul SARE cu motivul scris, nu trece. Pe Windows testul
+    rulează, deci `-L` are observator și pe mașina de dezvoltare (în depozit nu există CI).
+
+    Falsificat scoțând `|| -L "$record"` din `baseline_state`: testul trebuie să dea roșu."""
     host.legacy(services="sshd.service\n", ports="22\n", containers="web\n")
-    try:
-        os.symlink(host.tmp / "nowhere", host.state / "baseline-state.txt")
-    except (OSError, NotImplementedError) as err:
-        pytest.skip(f"nu pot crea un link simbolic pe această mașină: {err}")
+    make_link(host.state / "baseline-state.txt", host.tmp / "nowhere")
     res = host.run('baseline_state "$STATE_MARKERS" services\n')
     assert res.proc.returncode == 0 and res.proc.stdout.strip() == "unreadable", res.out
     assert not re.search(r"^(sed|cat):", res.out, re.M), res.out
@@ -1579,28 +1581,39 @@ def test_storing_does_not_clobber_the_variables_of_the_caller(host):
 
 
 @pytest.mark.parametrize("collector_works", [True, False], ids=["collector-ok", "collector-fails"])
-def test_a_link_to_a_directory_at_a_data_path_is_removed_not_followed_or_filled(host, collector_works):
+def test_a_link_to_a_directory_at_a_data_path_is_removed_not_followed_or_filled(
+        host, collector_works, make_link):
     """Un LINK către un director la `baseline-ports.txt`. `[[ -d ]]` îl vede ca director, deci `mv` nu
     mută nimic în directorul-țintă, iar curățarea scoate linkul (`rm -f` pe un link nu atinge
     ținta), în loc să-l lase în picioare ca un «fișier» vechi pe care un cititor vechi l-ar
     citi. Ținta rămâne goală.
 
-    ACEST TEST SE SARE fără dreptul de a crea linkuri simbolice (Windows: `WinError 1314`). Pe
-    mașina de dezvoltare Windows `! -L` din `baseline_unstore` NU are observator; testul a fost
-    rulat sub WSL (bash 5.2, Linux), verde cu `! -L` și ROȘU fără el."""
+    Linkul vine din `make_link` (tests/_symlinks.py): symlink adevărat unde se poate, altfel
+    legătura MSYS (`.lnk`), pe care bash-ul scriptului o vede ca symlink spre un director:
+    măsurat pe Git Bash 5.2.37, `-L` și `-d` adevărate, `rm -f` fără `-r` o șterge în tăcere
+    (nimic pe stderr, nici `.lnk` rămas pe disc) și lasă ținta neatinsă. Deci pe Windows
+    ambele ramuri livrate se exersează cu adevărat: `-d` în `baseline_store` (refuză mutarea)
+    și `! -L` în `baseline_unstore` (scoate linkul). Fără acest test, ultima gardă n-ar avea
+    niciun observator pe mașina de dezvoltare.
+
+    «Linkul a dispărut» se întreabă bash-ului (`present`), NU `os.path.lexists`: pe Windows
+    legătura MSYS e fișierul `baseline-ports.txt.lnk`, iar `lexists` pe `baseline-ports.txt` e
+    FALS cât timp linkul stă încă în picioare, deci aserțiunea ar trece cu defectul prezent.
+    `os.listdir(elsewhere)` rămâne: `elsewhere` e un director obișnuit, nu o legătură.
+
+    Falsificat scoțând `&& ! -L "$f"` din `baseline_unstore`: ambele variante trebuie să dea
+    roșu (linkul rămâne în picioare)."""
     elsewhere = host.tmp / "elsewhere"
     elsewhere.mkdir()
     host.state.mkdir(parents=True)
-    try:
-        os.symlink(elsewhere, host.state / "baseline-ports.txt")
-    except (OSError, NotImplementedError) as err:
-        pytest.skip(f"nu pot crea un link simbolic pe această mașină: {err}")
+    link = host.state / "baseline-ports.txt"
+    make_link(link, elsewhere)
     if not collector_works:
         host.fail("ports")
     res = host.capture()
     assert res.rc == 2 and "ports=unmeasured" in host.record(), res.out
     assert os.listdir(elsewhere) == [], f"ceva a fost mutat prin link: {os.listdir(elsewhere)}"
-    assert not os.path.lexists(host.state / "baseline-ports.txt"), "linkul a rămas în picioare"
+    assert not present(link), "linkul a rămas în picioare"
     assert not re.search(r"^rm:", res.out, re.M), res.out
 
 
