@@ -95,7 +95,7 @@ and it is the only source that reports either.
 `SEVERITIES` below says the whole of why. The short version: on 29 August 2026
 the six running images carried 2838 findings at MEDIUM and above against the
 `MAX_FINDINGS` cap of that day — 2500, and a refusal of the whole run, not the
-6000 per-image budget it is since 23 October — so this scanner refused every
+6000 per-image budget it was from 23 October (9000 since 18 November) — so this scanner refused every
 night and reported nothing whatsoever about the containers; at HIGH they carry
 450. `trivy_fs` keeps MEDIUM — its 92 findings are nowhere near its own cap, and
 nobody asked for it to change.
@@ -150,7 +150,7 @@ had been 2484, sixteen under. The total does not drift, it moves in steps, and
 each step is an event — a third-party `:latest` image appearing or being
 refreshed (720 -> 1517 on 17 Oct when `waha` appeared, +698 on 22 Oct when it was
 refreshed) — so a total that sits near the cap crosses it the night an image
-changes, with nobody having touched this scanner. That is why the cap is 6000
+changes, with nobody having touched this scanner. That is why the cap is 9000
 today and not 2500: the series, the reasoning and the measured costs are written
 next to `MAX_FINDINGS`.
 
@@ -170,7 +170,18 @@ So the budget decides PER IMAGE, and an image that is not ingested is NAMED:
     the images that blow a budget are the large third-party ones, not them.
     The price is real and stated: when the sum binds, the LARGEST image is the
     one skipped, and the largest is not the least exposed. It is named every
-    night it happens, and the number is the operator's to move;
+    night it happens, and the number is the operator's to move. Since 18
+    November 2026 that price is bounded in time by the rotation below: the
+    largest image is skipped, but not on every night;
+  * ROTATION (18 November 2026): smallest-first alone starves the largest image
+    for good — the same image is the largest every night, so it is skipped every
+    night, its rows go stale and no repair of it can ever be recorded. That is
+    what happened to `devlikeapro/waha:latest` (2828 findings): skipped from the
+    night the sum crossed the old budget, with nothing in the rule that would
+    ever let it back in. So one image per run is given PRIORITY: the one that has
+    gone longest without being seen, if it was PASSED OVER (below), is admitted
+    first and the rest fill what is left smallest-first. See `plan_rotation` and `Admission` for the
+    rule, its bound and what it costs;
   * the findings of a skipped image are not in `seen_keys`, so
     `mark_resolved_absent(skip_locations=...)` leaves its rows exactly as they
     were — open, with the date of the last run that did look. This is the same
@@ -182,21 +193,111 @@ One number, not two. A per-image cap only means something if it is LOWER than
 the per-run one (an image over the whole run budget is over any larger per-image
 cap too), and nothing in the data justifies a particular lower number: the
 largest image on 23 Oct (`waha`, 1602) was 64% of that day's 2500 budget and is
-27% of today's 6000, and a lower per-image cap would skip it permanently. So the
-single `MAX_FINDINGS` is the run's budget and "an image alone over it" is its
+18% of today's 9000 (27% of the 6000 before), and a lower per-image cap would
+skip it permanently. So the single `MAX_FINDINGS` is the run's budget and "an image alone over it" is its
 degenerate case, reported under a different reason because the remedy differs —
 an image alone over the budget stays skipped whatever the others do; one that
 merely did not fit comes back when the sum drops.
 
 The per-run sum is kept, and not as protection for the panel or for memory: it
 bounds how much one night can write and how much of it is held at once
-(`MAX_IMAGES` x a per-image bound of `MAX_FINDINGS` would be 40 x 6000 = 240 000
+(`MAX_IMAGES` x a per-image bound of `MAX_FINDINGS` would be 40 x 9000 = 360 000
 rows), and it is a tripwire — if a trivy release stops honouring `--severity`,
 every image goes up together and the run says so instead of flooding `findings`.
 What the number is, what it costs (with the figures, dated, and which of them
 were NOT measured on the host) and why it is not 2500 are written next to
 `MAX_FINDINGS`, as the severity floor's are next to `SEVERITIES`: one copy, so
 the figures cannot drift apart.
+
+### Rotation: who has been passed over, and how that is known
+
+The fact "when was this image last ingested" comes from `findings.last_seen`:
+the upsert is the only writer of that column for this scanner, it is written
+with `now()` by the database (no clock of this process is involved), and it moves
+for every row the run reports. So `max(last_seen)` over an image's `location` is
+the last night that image was ingested AND had a finding in it. No new table:
+`scans` records counts and text, not images, and `scans.error` is prose.
+
+What that fact cannot say, stated so nobody reads more into it:
+
+  * an image whose last ingest reported ZERO findings, or whose findings are all
+    resolved (`mysql:8.0` on the host: 113 rows, none open, last seen 20 Oct),
+    looks stale although it was ingested last night. It also costs nothing —
+    zero findings fit in any budget — so the rule below never lets it take the
+    priority slot (the slot goes to an image that has findings to admit);
+  * an image that has never had a finding has no row at all, i.e. "never
+    ingested" and "ingested, clean" look the same. Same answer: it costs nothing;
+  * the date is therefore worded in the operator text as "last finding seen",
+    which is what it is, not "last ingested".
+
+"Stale" alone is not the trigger. After a normal night every image carries the
+same date, within seconds of each other (25 s across 25 images on 18 Nov), so
+"the stalest" would be an arbitrary image, and promoting an arbitrary big one
+would skip small ones for nothing. After a failed run or an outage ALL images are
+equally old and nobody was neglected. The trigger is being PASSED OVER: an image
+is overdue when its last sight is older than the newest sight in the fleet by more
+than `ROTATION_MARGIN` — somebody else was ingested since, and it was not. That
+needs no wall clock either, only the database's own timestamps. The margin is
+12 hours: far above the spread inside one run, far below the nightly cadence; a
+cadence faster than the margin would delay detection to the margin, not break it.
+
+The rule, in `Admission` (round 2; round 1 is described at the end of this
+section because its defect is the reason for this shape):
+
+  * `plan_rotation` lists the overdue images of the running fleet, longest
+    unseen first (never-seen before all). `scan_order` scans them first, in that
+    order;
+  * the overdue images that have findings (0 < findings <= `MAX_FINDINGS`) are
+    admitted in that order, each if it still fits in what is left of the budget
+    (one that does not fit is skipped and the next is tried). They are admitted
+    BEFORE the plain rule, but they cost only their own findings: a small newcomer
+    takes a few rows, not somebody else's place;
+  * everything else is admitted by the plain smallest-first rule, in the budget
+    that remains. With no overdue image the result is exactly the smallest-first
+    of the previous section, so no small image is skipped to make room for a big
+    one unless somebody has actually been passed over;
+  * an image that was skipped although the plain rule, without rotation, would
+    have admitted it is marked `displaced`, and the images admitted only thanks to
+    rotation are named in the text.
+
+Starvation bound, for an image X that fits alone and whose report is readable: if
+the sum binds every night and nothing else changes, X is skipped at most ONE run
+after it was last ingested — the next run finds it passed over, and if it is the
+stalest overdue image with findings it is admitted first. Otherwise it is
+admitted unless the overdue images STALER than itself, which are admitted before
+it, leave no room: it waits at most as many runs as it takes to clear those, each
+becoming fresh once admitted. With a fixed fleet that is at most n-1 extra runs,
+n <= `MAX_IMAGES`. New images do not make that worse unless they are themselves
+too big to fit beside X: a small newcomer (never seen, hence staler than X) is
+admitted before X but leaves room for it; a big one takes the room once and is
+then fresh. So the bound is 1 + the number of staler images that cannot fit
+together with X, newcomers included: a stream of new images each too big to fit
+beside X can keep delaying it, and that is not repaired here.
+
+Round 1 gave ONE priority slot to the first overdue image with findings, never-seen
+first. The verifier simulated the 18 November fleet at 1/10 scale with one small
+new image per night: it took the slot every night, `waha` — who needed it — was
+skipped 38 nights of 40 (digest-pinned images such as `traefik`, `whoami` and
+`rustdesk` become "never seen" at every version bump; the image count rose on 6 of
+the last 19 nights). The first repair of that — the slot only for an image the plain
+rule would not admit — still starved an image that the plain rule admitted but the
+lead displaced every night (a random fleet in the simulation test, 59 nights).
+Admitting every overdue image first closes both.
+
+KNOWN LIMIT, NOT FIXED: rotation is per REFERENCE (`location`), not per image ID.
+Two image IDs under one reference (a re-pulled tag with only some containers
+restarted) share the date and the rank. If one is admitted and the other does not
+fit, the admitted one refreshes the shared date and the other looks "seen": it can
+be skipped EVERY night without ever becoming overdue, and nothing in the operator
+text says so. The old rule skipped it the same; the host has no such pair today (`findings.location` holds one row set per
+reference, and the key does not include the digest on purpose). Also: a rejected
+overdue image is not retained for a retry (memory), so the exactness of the
+first-fit depends on `scan_order`; out of order, an image rejected earlier does not
+come back.
+
+What it costs: on a night with a big overdue image, smaller ones that the plain rule
+would have admitted can be the ones skipped (marked `displaced` in the text). The
+skip is named, with the date its last finding was seen.
 
 What the operator sees: `scans.target` is rewritten when the row is closed, with
 `N din M imagini ingerate` next to the severity floor — a count is only honest
@@ -260,13 +361,16 @@ never starts, stops or pulls anything.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
 import shutil
 import tempfile
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
 
 from sentinel.db.repo import findings as fx
@@ -333,7 +437,7 @@ MAX_IMAGES = 40
 #: s-a masurat pe gazda in ziua aia, cu trivy 0.73.0, pe cele sase imagini care
 #: rulau: 2838 de constatari de la MEDIUM in sus si 450 de la HIGH in sus, cu
 #: `MAX_FINDINGS` la 2500 (plafonul de ATUNCI, un refuz al intregii rulari; azi e
-#: 6000 pe imagine, vezi acolo). Adica scanarea refuza sa ingereze in fiecare
+#: 9000 pe imagine, vezi acolo). Adica scanarea refuza sa ingereze in fiecare
 #: noapte — pe drept, vezi mai jos — deci despre containere nu se raporta nimic.
 #: O singura imagine (`snipe-it`) aducea 75% din volumul de la MEDIUM. Cu plafonul
 #: de azi cele 2838 ar incapea; pragul ramane la HIGH fiindca el e maneta pentru
@@ -379,6 +483,31 @@ SEVERITIES = ("UNKNOWN", "HIGH", "CRITICAL")
 #: de `mark_resolved_absent`, care ar marca restul drept rezolvate, iar garda pe
 #: `location` (`skip_locations`) exista tocmai ca imaginea sarita sa ramana cum era.
 #:
+#: 9000, pe 18 noiembrie 2026, la decizia operatorului; era 6000 (23 octombrie).
+#: Impreuna cu ROTATIA (vezi „Rotation" in docstring-ul modulului), nu in locul ei.
+#:
+#: Ce s-a vazut. Totalurile rularilor `completed` din `scans`, citite pe 18
+#: noiembrie 2026: 3418 (5 nov), 3146, 3214, 3218 (8 nov), 3218, 3426 (10 nov),
+#: 3681, 3864 (12 nov), 4216, 4231 (14 nov), 4459 (15 nov), 4735 (16 nov), 5391
+#: (17 nov), apoi 3185 pe 18 nov: 24 de imagini ingerate, iar `devlikeapro/waha:latest`
+#: (2828 de constatari) SARITA cu `REASON_BUDGET`, fiindca 3185 + 2828 = 6013, adica
+#: 13 peste plafon. Flota creste ~280 de constatari pe noapte, pe tot frontul (615
+#: constatari noi in cele 24 de imagini ingerate in ultima noapte), nu printr-o
+#: treapta de la o singura imagine — deci nu e un eveniment ca cele din octombrie,
+#: ci o panta, si orice plafon fix o atinge. Pe gazda, `waha` are 2821 de constatari
+#: deschise cu `last_seen` 17 noiembrie: sarita, a ramas deschisa, a imbatranit, si
+#: o reparatie a ei nu s-ar mai putea inregistra.
+#:
+#: Ce schimba rotatia in rolul acestui numar. Pana acum plafonul hotara cine e
+#: ASCUNS: cel mai mare, in fiecare noapte, la nesfarsit — nu exista nimic care sa
+#: l-aduca inapoi. Acum hotaraste doar cine ASTEAPTA o noapte: imaginea trecuta cu
+#: vederea intra prima la rularea urmatoare, deci cea mai mare e reimprospatata cel
+#: putin o noapte din doua, oricat ar creste flota (cat timp incape singura). Plafonul
+#: ramane o margine de volum si o alarma, nu maneta pentru ce se vede. Nu inlocuieste
+#: rotatia: 9000 la panta de azi (6013 + 280/noapte) se atinge in ~11 nopti — o
+#: EXTRAPOLARE liniara, seria are si trepte — si fara rotatie ar reaparea acelasi
+#: defect, cu alta imagine in locul lui `waha`.
+#:
 #: Pana pe 23 octombrie 2026 era un REFUZ al intregii rulari (acelasi rationament
 #: ca la `trivy_fs.MAX_FINDINGS`, care ramane refuz: 92 de constatari fata de 500,
 #: un singur set de cai). Aici a dus la orbire totala: 2532 de constatari fata de
@@ -414,74 +543,103 @@ SEVERITIES = ("UNKNOWN", "HIGH", "CRITICAL")
 #:     doua zi (nu e un rand din `scans`), la cateva zeci de 2532 — dar de cealalta
 #:     parte a lui 2500, deci un plafon acolo ar fi depins si de zgomotul asta.
 #:     6000 acopera o treapta de 2,107 peste noaptea de azi: 2532 x 2,107 = 5335.
+#:     (9000 acopera si 2540 x 2,107 = 5352 cu loc de ramas; dar panta din noiembrie
+#:     nu e o treapta, vezi mai sus.)
 #:     Orice plafon fix va fi depasit data viitoare cand apare o imagine mare;
 #:     plasa pe imagine (`REASON_IMAGE`/`REASON_BUDGET`) exista pentru asta, si
 #:     pentru un trivy care nu mai respecta `--severity`.
 #:
-#: Ce costa 6000. Citit de pe gazda pe 23 octombrie 2026 (jurnalul serviciilor si
-#: `psql`, doar citire), cu rularea din 22 octombrie ca reper (2484 de constatari,
-#: 777 noi), in afara de ce spune ca e extrapolat sau nemasurat:
+#: Ce costa 9000. Fiecare cifra spune de unde vine: MASURAT (pe gazda, citit pe 18
+#: noiembrie 2026, doar `psql` SELECT) sau EXTRAPOLAT (liniar din ce e masurat, nu
+#: rulat la 9000). Cifrele din 23 octombrie, cu rularea din 22 octombrie ca reper
+#: (2484 de constatari, 777 noi), sunt pastrate unde nu le-am remasurat:
 #:
-#:   * ingestia (de la «trivy image scan parsed» la «scan complete») a durat
-#:     13,6 s, ~5,5 ms per constatare; cu totul, randul `scans` 205 a durat 58 s.
-#:     Extrapolat liniar, ~33 s la 6000 — extrapolare, nu masuratoare;
-#:   * toata trecerea de scanare a durat 5,5 minute (00:24:13 -> 00:29:46 UTC)
-#:     din cele 14400 s ale unitatii, din care 3 min 48 s in `enrich`. Plafoanele
+#:   * ingestia. MASURAT pe 18 nov: cele 3185 de constatari ingerate au `last_seen`
+#:     intre 01:39:47 si 01:40:12, adica ~25 s, ~7,9 ms per constatare (pe 22 oct:
+#:     13,6 s, ~5,5 ms; diferenta nu e explicata, n-am masurat de ce).
+#:     EXTRAPOLAT la 9000: 50-71 s. Intreaga rulare (randul `scans`) a durat 257 s
+#:     pe 18 nov (3185) si 218 s pe 17 nov (5391) — masurat; durata o dau rularile
+#:     trivy pe cele 25 de imagini, nu numarul de constatari. Toata trecerea de
+#:     scanare: 5,5 minute pe 22-23 oct, din cele 14400 s ale unitatii. Plafoanele
 #:     documentate (300 + 1800 + `TIMEOUT_S`) sunt 5700 s si le pazeste un test;
 #:     `TIMEOUT_S` acopera doar rularile trivy, ingestia si evaluarea vin DUPA el;
 #:   * expedierea: un lot de `findings` e plafonat la 2000 de randuri
 #:     (`ship.max_rows_per_batch`, `MAX_ROWS_PER_BATCH` la agregator), deci
-#:     bugetul schimba NUMARUL loturilor, nu marimea lor. In noaptea de 22 oct au
-#:     plecat `findings`x2000 si, la 3 s distanta (`DRAIN_PAUSE_S` + cererea),
-#:     `findings`x502, fara niciun avertisment in jurnalul expeditorului; 6000 de
-#:     randuri sunt trei-patru loturi (si randurile atinse de rezolvare), ~9-12 s,
-#:     fata de `ship.timeout_s` 30 per cerere.
-#:     Plafonul de octeti e `MAX_BODY_BYTES` = 2000 x 4096 = 8 192 000: lotul de
-#:     22 oct a purtat 5 057 646 (62%), iar cele mai late 2000 de randuri
-#:     `trivy_image` din baza insumeaza ~6,2 MB (~75%, masurat ca text JSON al
-#:     randului, deci un reprezentant, nu octetii de pe sarma). Niciuna nu depinde
-#:     de buget. Pe gazda, `sentinel.yaml` nu seteaza decat `ship.enabled`, deci
-#:     `timeout_s` si `max_rows_per_batch` sunt implicitele din cod;
+#:     bugetul schimba NUMARUL loturilor, nu marimea lor: 9000 de randuri sunt cinci
+#:     loturi (erau trei la 6000; 5391 pe 17 nov au fost tot trei). Ingestia atinge
+#:     `last_seen` pe FIECARE rand raportat, deci tot ce e ingerat se reexpediaza
+#:     in noaptea aia. Pe 22 oct au plecat `findings`x2000 si, la 3 s distanta
+#:     (`DRAIN_PAUSE_S` + cererea), `findings`x502; cinci loturi ar fi ~15 s —
+#:     EXTRAPOLAT — fata de `ship.timeout_s` 30 PER CERERE. Plafonul de octeti e
+#:     `MAX_BODY_BYTES` = 2000 x 4096 = 8 192 000. MASURAT pe 18 nov: cele mai late
+#:     2000 de randuri `trivy_image` din baza insumeaza 6 838 437 de caractere
+#:     (83% din plafon; pe 23 oct erau ~6,2 MB, 75%) ca text JSON al randului, deci
+#:     un reprezentant, nu octetii de pe sarma. Nu depinde de buget (un lot are cel
+#:     mult 2000 de randuri), dar marja se subtiaza de la sine pe masura ce
+#:     descrierile cresc, iar urmarirea ei nu e treaba acestui numar. Pe
+#:     gazda, sectiunea `ship:` din `sentinel.yaml` seteaza `enabled`, `url` si
+#:     `max_backfill_days: 3650` (citit de verificator pe 18 nov; eu nu am putut
+#:     citi fisierul), dar nu `timeout_s` si nici `max_rows_per_batch`, deci acestea
+#:     sunt implicitele din cod (30 s per cerere, 2000 de randuri). Prima varianta a
+#:     acestui rand spunea ca nu se seteaza decat `enabled`: cifra citita pe 23 oct
+#:     era incompleta, iar concluzia a ramas aceeasi;
 #:   * limita de 64 KB per coloana a agregatorului: singurul text scris de aici si
 #:     tinut acolo e `scans.error`/`scans.target`, ambele marginite de
 #:     `MAX_ROW_TEXT` (2000 de caractere) oricare ar fi bugetul — el intra in text
-#:     doar ca un numar. Cel mai lung de pe gazda: 254 si 75 de caractere;
+#:     doar ca un numar. MASURAT pe 18 nov: cel mai lung `error` din ultimele 14
+#:     zile are 606 de caractere (textul rotatiei, adaugat dupa aceasta data, il
+#:     mareste cu ~300; il pazeste un test);
 #:   * jurnalul: `scan pass done` scrie TOATE constatarile noi (`new_items`) pe o
 #:     singura linie. Pe 22 oct, 777 de noi au fost 1,54 MB, taiati de jurnal in
-#:     bucati de 48 KiB, ~2 KB per constatare noua; o noapte cu 6000 de noi ar
-#:     fi ~12 MB. Cresterea bugetului nu schimba media, dar ridica cel mai rau
-#:     caz. Lasat neschimbat aici;
+#:     bucati de 48 KiB, ~2 KB per constatare noua; 615 noi pe 18 nov ar fi ~1,2
+#:     MB. Cazul rau e prima ingestie a unei flote intregi: 9000 de noi ar fi ~18 MB
+#:     (6000 -> ~12 MB). EXTRAPOLAT din cei ~2 KB, nemasurat la volumul asta.
+#:     Cresterea bugetului nu schimba media, dar ridica cel mai rau caz. Lasat
+#:     neschimbat aici;
 #:   * memoria — NEMASURATA PE GAZDA. `MemoryPeak` e nesetat (`systemctl show`
 #:     tipareste 2^64-1): cgroup-ul unitatii dispare cand serviciul `oneshot`
 #:     iese, deci dupa rulare nu mai ramane nimic de citit. Singurele cifre sunt
 #:     locale, cu tracemalloc pe un raport SINTETIC (Python 3.10 si 3.13; gazda
-#:     ruleaza 3.12). Doua ordini de masurare dau doua cifre, si amandoua sunt
-#:     adevarate despre altceva: cu raportul deja in memorie si doar `parse()`
-#:     urmarit, ~1,2-1,6 KB (masurat de mine si de verificator) per constatare INDIFERENT de lungimea descrierii —
-#:     asta e lista fara sirurile pe care le imparte cu raportul (o felie
-#:     completa intoarce acelasi obiect in CPython). Dar constatarile TIN acele
-#:     siruri vii dupa ce raportul e eliberat, iar asta e ce ramane tinut pe
-#:     noapte: urmarind si `json.loads`, ~2,4-2,9 KB cu descrieri de lungimea
-#:     medie din baza (560 de caractere) si ~3,9-4,3 KB cu descrieri la maxim
-#:     (2000), adica ~15-26 MB la 6000 fata de `MemoryMax=1G`. Cifra scrisa aici
-#:     pana pe 23 octombrie (~1,6 KB, ~4 MB la 2500) era a primei ordini si e
-#:     retrasa ca figura de memorie tinuta. Ce domina de fapt varful nu e numarul
-#:     asta: raportul unei imagini se citeste intreg INAINTE sa decida bugetul,
-#:     iar `json.loads` ia de 1,8-2,7 ori marimea fisierului (masurat local),
-#:     deci un raport la plafonul `trivy_fs.MAX_OUTPUT_BYTES` (64 MiB) ar fi
-#:     ~120-180 MB indiferent de buget.
+#:     ruleaza 3.12), de pe 23 oct, NEremasurate pe 18 nov. Doua ordini de masurare
+#:     dau doua cifre, si amandoua sunt adevarate despre altceva: cu raportul deja
+#:     in memorie si doar `parse()` urmarit, ~1,2-1,6 KB per constatare INDIFERENT
+#:     de lungimea descrierii — asta e lista fara sirurile pe care le imparte cu
+#:     raportul (o felie completa intoarce acelasi obiect in CPython). Dar
+#:     constatarile TIN acele siruri vii dupa ce raportul e eliberat, iar asta e ce
+#:     ramane tinut pe noapte: urmarind si `json.loads`, ~2,4-2,9 KB cu descrieri de
+#:     lungimea medie din baza (560 de caractere) si ~3,9-4,3 KB cu descrieri la
+#:     maxim (2000). EXTRAPOLAT la 9000: ~22-26 MB, ~35-39 MB la maxim (la 6000:
+#:     ~15-26 MB), fata de `MemoryMax=1G`. Ce domina de fapt varful nu e numarul
+#:     asta: raportul unei imagini se citeste intreg INAINTE sa decida bugetul, iar
+#:     `json.loads` ia de 1,8-2,7 ori marimea fisierului (masurat local), deci un
+#:     raport la plafonul `trivy_fs.MAX_OUTPUT_BYTES` (64 MiB) ar fi ~120-180 MB
+#:     indiferent de buget. Admiterea tine in memorie cel mult bugetul plus imaginea
+#:     curenta; rotatia nu schimba asta: imaginile restante se admit pe
+#:     loc, in ordinea vechimii, si o respinsa nu se retine, deci suma tinuta ramane
+#:     cel mult bugetul (restantele + restul), la fel ca inainte.
 #:
 #: Ce se schimba la plasa `--severity`. Un trivy care ar adauga brusc nivelul
 #: MEDIUM ar umfla totalul cu un FACTOR, nu cu un numar: pe 29 august cele sase
 #: imagini aveau 2838 de la MEDIUM in sus si 450 de la HIGH in sus, adica ~6,3x.
 #: Aplicat flotei de azi (2532) ar da ~15 900, iar `waha` singura (1602) ~10 000 —
-#: amandoua mult peste 6000, deci plasa ar suna oricum, ca `REASON_IMAGE`. Asta e o
-#: IPOTEZA: raportul e masurat pe alte imagini (`snipe-it` aducea 75% din volumul
-#: de la MEDIUM), iar trivy n-a fost rulat pe gazda cu MEDIUM de atunci.
+#: amandoua peste 9000 (15 900 si ~10 000 cu cifrele din 23 oct; cu cele de azi, 6013
+#: si 2828, ar fi ~38 000 si ~17 800), deci plasa ar suna oricum, ca `REASON_IMAGE`.
+#: Asta e o IPOTEZA: raportul e masurat pe alte imagini (`snipe-it` aducea 75% din
+#: volumul de la MEDIUM), iar trivy n-a fost rulat pe gazda cu MEDIUM de atunci.
 #:
 #: Cat timp bugetul se atinge, imaginea cea mai MARE e cea care se sare cand suma
-#: depaseste — spus in text, in fiecare noapte in care se intampla.
-MAX_FINDINGS = 6000
+#: depaseste, in afara de imaginea-lider a rotatiei (vezi `Admission`) — spus in
+#: text, in fiecare noapte in care se intampla.
+MAX_FINDINGS = 9000
+
+#: Cat de in urma fata de CEA MAI RECENTA constatare vazuta in flota trebuie sa fie
+#: o imagine ca sa fie „trecuta cu vederea" (si deci candidata la prioritate). Nu o
+#: varsta fata de ceasul acestui proces: se compara doua marci de timp puse de
+#: baza (`last_seen = now()`), deci nicio abatere de ceas nu intra. 12 ore: mult
+#: peste cat dureaza ingestia unei rulari (25 s pe 18 nov 2026 — imaginile aceleiasi
+#: rulari poarta aceeasi data) si mult sub cadenta de o noapte. Vezi „Rotation" in
+#: docstring-ul modulului.
+ROTATION_MARGIN = timedelta(hours=12)
 
 #: De ce nu a fost ingerata o imagine. Trei motive, pentru ca remediul difera:
 #: `image` — singura depaseste tot bugetul (ramane sarita orice ar face celelalte,
@@ -506,11 +664,31 @@ MAX_NAMED_SKIPPED_CHARS = 600
 MAX_NAMED_INGESTED = 12
 MAX_NAMED_INGESTED_CHARS = 300
 
+#: Cate imagini cu prioritate de rotatie se numesc in text (restul se numara), si
+#: cate caractere au voie sa ocupe numele lor impreuna cu data: doua margini, ca la
+#: celelalte liste. Doar numarul lasa trei referinte de 120 de caractere sa
+#: umple ~500 de caractere si sa impinga textul peste `MAX_ROW_TEXT`.
+MAX_NAMED_PROMOTED = 3
+MAX_NAMED_PROMOTED_CHARS = 200
+
 #: O referinta mai lunga de-atat se taie in text (intreaga ramane in constatari).
 MAX_REFERENCE_CHARS = 120
 
-#: Plafon dur pe textul de pe rand, ultima plasa sub marginile de mai sus. Cu ele
-#: textul cel mai lung posibil are ~1600 de caractere; peste asta ceva s-a rupt.
+#: Plafon dur pe textul de pe rand, ultima plasa sub marginile de mai sus. Cat de
+#: lung poate ajunge cu ele, MASURAT pe 19 noiembrie 2026 (lungime netaiata, cu
+#: plafonul ridicat): comentariul de dinainte spunea ~1600; verificatorul a
+#: construit 1864, iar o cautare adversariala a dat 2034 (4 imagini cu prioritate
+#: cu referinte de 120 de caractere, 5 sarite, 30 ingerate de cate 30) — peste
+#: plafon, adica `…` la sfarsit si lista imaginilor ingerate taiata. De aceea
+#: numele imaginilor cu prioritate au si margine pe caractere
+#: (`MAX_NAMED_PROMOTED_CHARS`). Cu ea: maximul gasit e 1857 (doua cautari, 150 000
+#: de configuratii aleatoare + 150 000 de pasi de urcare, semintele 7 si 11); suma
+#: maximelor fiecarei componente luate separat e ~2000, deci NU e o margine
+#: demonstrata, doar una cautata. Peste plafon NU se respinge nimic: `_cut` taie
+#: sfarsitul (lista „Ingerate", ultima propozitie) si pune `…`; coloana din
+#: agregator accepta 64 KB, deci plafonul e al nostru. Il acopera
+#: `test_the_hard_cap_on_the_row_text_holds_even_if_the_other_bounds_fail` (taierea)
+#: si `test_the_row_text_never_exceeds_its_cap_for_the_worst_inputs_found` (suma).
 MAX_ROW_TEXT = 2000
 
 #: Starile lui docker. Doar `unreachable` e o eroare; vezi docstring-ul de sus.
@@ -630,15 +808,93 @@ class SkippedImage:
     high: int = 0
     unrated: int = 0
     report_bytes: int | None = None
+    #: Ultima zi (UTC) in care s-a vazut o constatare a imaginii, din
+    #: `findings.last_seen`; `None` = nu s-a vazut niciodata. Conteaza doar daca
+    #: `seen_known`: fara datele rotatiei „nu stim" nu are voie sa devina
+    #: „niciodata".
+    last_seen: str | None = None
+    seen_known: bool = False
+    #: Inlaturata DE imaginea cu prioritate de rotatie (ar fi incaput dupa regula
+    #: „cele mai mici intai"), nu de imaginile mai mici. Textul de pe rand spune
+    #: cele doua situatii diferit.
+    displaced: bool = False
 
     def as_dict(self) -> dict[str, Any]:
-        return {"reference": self.reference, "image_id": self.image_id,
-                "reason": self.reason, "findings": self.findings,
-                "critical": self.critical, "high": self.high,
-                "unrated": self.unrated, "report_bytes": self.report_bytes}
+        out: dict[str, Any] = {
+            "reference": self.reference, "image_id": self.image_id,
+            "reason": self.reason, "findings": self.findings,
+            "critical": self.critical, "high": self.high,
+            "unrated": self.unrated, "report_bytes": self.report_bytes,
+            "displaced": self.displaced}
+        if self.seen_known:
+            out["last_seen"] = self.last_seen
+        return out
 
 
-def _skip(image: RunningImage, items: list[dict[str, Any]], reason: str) -> SkippedImage:
+@dataclass(frozen=True)
+class Rotation:
+    """Ce imagini ale flotei au fost trecute cu vederea, cele mai vechi intai.
+
+    `overdue` e lista de REFERINTE (= `location`), cea nevazuta de cel mai mult
+    timp prima; cele fara nicio constatare in baza, inaintea tuturor. `last_seen`
+    e doar pentru referintele flotei care au vreun rand, ca textul sa poata spune
+    de cand.
+    """
+
+    overdue: tuple[str, ...]
+    last_seen: Mapping[str, datetime]
+
+
+def plan_rotation(references: Sequence[str],
+                  last_seen: Mapping[str, datetime]) -> Rotation:
+    """Imaginile trecute cu vederea, din `max(findings.last_seen)` per `location`.
+
+    „Trecuta cu vederea" = ultima ei constatare vazuta e mai veche decat cea mai
+    recenta din tot scanerul cu mai mult de `ROTATION_MARGIN`: altcineva a fost
+    ingerat de atunci, ea nu. NU „cea mai veche": dupa o noapte obisnuita toate
+    poarta aceeasi data si „cea mai veche" ar fi una la intamplare, iar dupa o
+    rulare cazuta sau o pana toate sunt la fel de vechi si nimeni n-a fost lasat
+    pe dinafara. Fara nicio constatare in baza (prima rulare) nu e nimeni trecut cu
+    vederea.
+
+    Pura, ca sa poata fi probata fara baza. Citirea din baza e
+    `fx.last_seen_by_location`; aici nu se atinge ceasul.
+    """
+    latest = max(last_seen.values(), default=None)
+    if latest is None:
+        return Rotation((), {})
+    cutoff = latest - ROTATION_MARGIN
+    stale = [ref for ref in set(references)
+             if ref not in last_seen or last_seen[ref] < cutoff]
+    # (a vazut-o vreodata?, de cand, nume): False < True pune „niciodata" primele;
+    # numele departajeaza total, ca ordinea sa nu depinda de `set`.
+    stale.sort(key=lambda ref: (ref in last_seen, last_seen.get(ref, latest), ref))
+    return Rotation(tuple(stale),
+                    {ref: last_seen[ref] for ref in set(references) if ref in last_seen})
+
+
+def scan_order(images: Sequence[RunningImage],
+               rotation: Rotation | None) -> list[RunningImage]:
+    """Ordinea in care se scaneaza: cele trecute cu vederea PRIMELE, cea mai veche
+    inaintea celorlalte, apoi restul in ordinea (referinta, id).
+
+    Nu e cosmetica: `Admission` primeste imaginile restante in ordinea asta si
+    decide pe loc, fara sa tina ce a respins (memoria ramane marginita de buget).
+    Fara nimeni trecut cu vederea ordinea e cea de pana acum.
+    """
+    rank = ({ref: n for n, ref in enumerate(rotation.overdue)}
+            if rotation is not None else {})
+    return sorted(images, key=lambda i: (
+        rank.get(i.reference, len(rank)), i.reference, i.image_id))
+
+
+def _day(moment: datetime) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(moment.timestamp()))
+
+
+def _skip(image: RunningImage, items: list[dict[str, Any]], reason: str,
+          seen: dict[str, Any] | None = None, *,
+          displaced: bool = False) -> SkippedImage:
     """Inregistrarea unei imagini sarite, numarand ce are in raport."""
     return SkippedImage(
         reference=image.reference, image_id=image.image_id, reason=reason,
@@ -646,57 +902,187 @@ def _skip(image: RunningImage, items: list[dict[str, Any]], reason: str) -> Skip
         critical=sum(1 for f in items if f.get("severity") == "critical"),
         high=sum(1 for f in items if f.get("severity") == "high"),
         unrated=sum(1 for f in items
-                    if (f.get("raw") or {}).get("severity_known") is False))
+                    if (f.get("raw") or {}).get("severity_known") is False),
+        displaced=displaced, **(seen or {}))
 
 
 class Admission:
     """Ce imagini incap in bugetul de constatari al unei rulari.
 
-    Functie de DIMENSIUNI, nu de ordinea in care vin: rezultatul final e cel mai
-    lung prefix, in ordinea crescatoare a (numar de constatari, referinta, id), a
-    carui suma incape in `budget`. Se obtine fara a tine toate imaginile in
-    memorie: dupa fiecare imagine adaugata, cat timp suma depaseste bugetul se
-    scoate cea mai mare. Memoria ramane marginita de buget plus imaginea curenta,
-    iar o imagine scoasa o data nu mai poate reveni (suma doar creste), deci
-    rezultatul incremental e acelasi cu cel calculat la sfarsit pe toate.
+    Regula de baza e functia de DIMENSIUNI, nu de ordinea in care vin: cel mai lung
+    prefix, in ordinea crescatoare a (numar de constatari, referinta, id), a carui
+    suma incape in `budget`. Dupa fiecare imagine adaugata, cat timp suma depaseste
+    bugetul se scoate cea mai mare; memoria ramane marginita de buget plus imaginea
+    curenta, iar o imagine scoasa nu mai poate reveni. Departajarea e totala, ca o
+    repornire de container sa nu mute vinovatul de la o noapte la alta.
 
-    Departajarea e totala (referinta, apoi id), deliberat: doua imagini cu acelasi
-    numar de constatari ar fi altfel scoase in ordinea in care a listat docker
-    containerele, iar o repornire ar muta vinovatul de la o noapte la alta.
+    ROTATIA pune inaintea regulii de baza imaginile TRECUTE CU VEDEREA (`Rotation`):
+    cele cu 0 < constatari <= buget se admit in ordinea vechimii (cea nevazuta de cel
+    mai mult timp prima), fiecare daca incape in ce a ramas din buget (cea care nu
+    incape e sarita, urmatoarea se incearca). Restul se admit dupa regula de baza,
+    in ce ramane. Asta inlocuieste „un singur loc pentru prima restanta" din runda 1,
+    care avea doua defecte, ambele prinse de verificator:
+
+      * locul se cheltuia pe imagini care ar fi incaput oricum (una noua si mica, o
+        imagine fixata pe digest al carei digest s-a schimbat — „nevazuta" din nou),
+        iar `waha` ramanea sarita cat timp apareau imagini noi;
+      * un lider unic inlatura cea mai mare imagine ramasa, care putea fi chiar una
+        mai veche decat el, in fiecare noapte.
+
+    Acum o imagine mica trecuta cu vederea costa doar cele cateva constatari ale ei,
+    nu locul altcuiva, iar cea mai veche dintre cele cu constatari e mereu prima.
+    Imaginile fara constatari nu intra in lista restantelor (costa zero; una curata
+    ar aparea „nevazuta" in fiecare noapte).
+
+    Garantia depinde de ordinea sosirii: `scan` le aduce pe cele restante INAINTEA
+    celorlalte si in ordinea vechimii (`scan_order`), iar o restanta respinsa nu e
+    retinuta ca sa fie reincercata (memorie). Daca una mai veche ajunge dupa una mai
+    noua, ia locul celei mai noi (care poate fi inlaturata), dar o imagine respinsa
+    mai devreme nu mai revine; garantia pentru cea mai veche ramane. Nu e o cale
+    parcursa de `scan`.
+
+    Ce NU promite si marginea de infometare: in modulul scanerului.
+
+    LIMITA CUNOSCUTA (nereparata): rotatia e pe REFERINTA (= `location`), nu pe id.
+    Doua id-uri de imagine sub aceeasi referinta (un `:latest` re-tras cu doar o
+    parte din containere repornite) impart data si rangul. Daca unul e admis si
+    celalalt nu incape, data comuna se reimprospateaza prin cel admis si al doilea
+    pare „vazut": poate fi SARIT in fiecare noapte, fara sa devina vreodata
+    restant, si nimic din text nu o spune. Regula veche il sarea la fel; pe gazda
+    nu exista o pereche asa la ultima verificare (a verificatorului, 18 noiembrie 2026).
     """
 
-    def __init__(self, budget: int) -> None:
+    def __init__(self, budget: int, rotation: Rotation | None = None) -> None:
         self.budget = budget
+        self.rotation = rotation
+        self._rank = ({ref: i for i, ref in enumerate(rotation.overdue)}
+                      if rotation is not None else {})
+        # Restantele admise (cu rangul lor) si restul, tinute separat: cele doua
+        # clase au reguli diferite de scoatere.
+        self._owed: dict[str, tuple[int, RunningImage, list[dict[str, Any]]]] = {}
         self._held: dict[str, tuple[RunningImage, list[dict[str, Any]]]] = {}
-        self.skipped: list[SkippedImage] = []
+        self._skipped: list[SkippedImage] = []
+        # (constatari, referinta, id) al fiecarei imagini care incape singura, ca la
+        # sfarsit sa se poata spune ce ar fi admis regula de baza FARA rotatie.
+        self._sizes: list[tuple[int, str, str]] = []
+        self._settled = False
 
-    def total(self) -> int:
+    def _owed_sum(self) -> int:
+        return sum(len(items) for _rank, _image, items in self._owed.values())
+
+    def _pool_sum(self) -> int:
         return sum(len(items) for _image, items in self._held.values())
+
+    def _seen(self, image: RunningImage) -> dict[str, Any] | None:
+        """Cand s-a vazut ultima constatare a imaginii; `None` fara rotatie."""
+        if self.rotation is None:
+            return None
+        when = self.rotation.last_seen.get(image.reference)
+        return {"seen_known": True,
+                "last_seen": _day(when) if when is not None else None}
 
     def offer(self, image: RunningImage, items: list[dict[str, Any]]) -> None:
         """O imagine cu constatarile ei, deja parsate."""
+        if self._settled:
+            raise RuntimeError("Admission: imagine oferita dupa ce rezultatul a "
+                               "fost citit")
         if len(items) > self.budget:
             # Peste tot bugetul, singura: nu intra nici pe un camp gol. Constatarile
             # se arunca aici — de la ele ramane doar numaratoarea din `_skip`.
-            self.skipped.append(_skip(image, items, REASON_IMAGE))
+            self._skipped.append(_skip(image, items, REASON_IMAGE, self._seen(image)))
             return
-        self._held[image.image_id] = (image, items)
-        while self.total() > self.budget:
+        self._sizes.append((len(items), image.reference, image.image_id))
+        rank = self._rank.get(image.reference)
+        if items and rank is not None:
+            self._owed[image.image_id] = (rank, image, items)
+            self._refit_owed()
+        else:
+            self._held[image.image_id] = (image, items)
+        self._trim_pool()
+
+    def _refit_owed(self) -> None:
+        """First-fit in ordinea vechimii: cea care nu incape in restul bugetului e
+        sarita, urmatoarea se incearca."""
+        used = 0
+        for ident, (rank, image, items) in sorted(
+                self._owed.items(), key=lambda kv: (kv[1][0], kv[1][1].image_id)):
+            if used + len(items) <= self.budget:
+                used += len(items)
+            else:
+                del self._owed[ident]
+                self._skipped.append(_skip(image, items, REASON_BUDGET,
+                                           self._seen(image)))
+
+    def _trim_pool(self) -> None:
+        room = self.budget - self._owed_sum()
+        while self._pool_sum() > room:
             victim, victim_items = max(
                 self._held.values(),
                 key=lambda held: (len(held[1]), held[0].reference, held[0].image_id))
             del self._held[victim.image_id]
-            self.skipped.append(_skip(victim, victim_items, REASON_BUDGET))
+            self._skipped.append(_skip(victim, victim_items, REASON_BUDGET,
+                                       self._seen(victim)))
+
+    def _plain_prefix(self) -> set[str]:
+        """Id-urile pe care regula de baza, FARA rotatie, le-ar fi admis."""
+        out: set[str] = set()
+        total = 0
+        for n, _ref, ident in sorted(self._sizes):
+            if total + n > self.budget:
+                break
+            out.add(ident)
+            total += n
+        return out
+
+    def _settle(self) -> None:
+        """Marcheaza, o singura data, ce a fost inlaturat de rotatie."""
+        if self._settled:
+            return
+        self._settled = True
+        plain = self._plain_prefix()
+        self._skipped = [
+            dataclasses.replace(sk, displaced=True)
+            if sk.reason == REASON_BUDGET and sk.image_id in plain else sk
+            for sk in self._skipped]
+
+    @property
+    def skipped(self) -> list[SkippedImage]:
+        self._settle()
+        return self._skipped
+
+    def total(self) -> int:
+        return self._owed_sum() + self._pool_sum()
 
     def refuse_report(self, image: RunningImage, size: int) -> None:
         """Raport prea mare ca sa fie citit: nici nu stim cate constatari are."""
-        self.skipped.append(SkippedImage(
+        self._skipped.append(SkippedImage(
             reference=image.reference, image_id=image.image_id,
-            reason=REASON_REPORT, findings=None, report_bytes=size))
+            reason=REASON_REPORT, findings=None, report_bytes=size,
+            **(self._seen(image) or {})))
 
     def admitted(self) -> list[tuple[RunningImage, list[dict[str, Any]]]]:
-        return sorted(self._held.values(),
-                      key=lambda held: (held[0].reference, held[0].image_id))
+        both = [(image, items) for _rank, image, items in self._owed.values()]
+        both += list(self._held.values())
+        return sorted(both, key=lambda held: (held[0].reference, held[0].image_id))
+
+    def promoted(self) -> list[RunningImage]:
+        """Imaginile admise DOAR datorita rotatiei, cea mai veche intai: regula de
+        baza, fara ea, nu le-ar fi admis."""
+        plain = self._plain_prefix()
+        return [image for _rank, image, _items in sorted(
+                    self._owed.values(), key=lambda o: (o[0], o[1].image_id))
+                if image.image_id not in plain]
+
+    def rotation_facts(self) -> dict[str, Any] | None:
+        """Ce a facut rotatia in rularea asta; `None` = nu s-a aplicat deloc."""
+        if self.rotation is None:
+            return None
+        promoted = []
+        for image in self.promoted():
+            seen = self._seen(image)
+            promoted.append({"reference": image.reference,
+                             "last_seen": seen["last_seen"] if seen else None})
+        return {"overdue": list(self.rotation.overdue), "promoted": promoted}
 
     def coverage(self, total_images: int) -> dict[str, Any]:
         """Ce a acoperit rularea, in forma care ajunge in `facts` si pe rand."""
@@ -707,6 +1093,7 @@ class Admission:
                 "ingested": [image.reference for image, _items in admitted],
                 "admitted_findings": self.total(),
                 "budget": self.budget,
+                "rotation": self.rotation_facts(),
                 "skipped": [sk.as_dict() for sk in skipped]}
 
 
@@ -750,10 +1137,27 @@ def _fit(items: list[str], max_count: int, max_chars: int) -> int:
     return count
 
 
+def _seen_clause(sk: dict[str, Any]) -> str:
+    """De cand datează ce stie baza despre imaginea sarita. Gol daca nu s-a citit.
+
+    „Ultima constatare văzută", nu „ultima ingerare": data vine din
+    `findings.last_seen`, care nu se misca la o ingerare fara nicio constatare.
+    Lipsa cheii inseamna ca rotatia nu a avut datele, si atunci nu se spune nimic
+    — „nu stim" nu se scrie ca „niciodata".
+    """
+    if "last_seen" not in sk:
+        return ""
+    if sk["last_seen"] is None:
+        return "nicio constatare văzută până acum"
+    return f"ultima constatare văzută: {sk['last_seen']}"
+
+
 def _describe_skipped(sk: dict[str, Any]) -> str:
     ref = _cut(sk["reference"], MAX_REFERENCE_CHARS)
+    seen = _seen_clause(sk)
     if sk["findings"] is None:
-        return f"{ref} (numărul de constatări nu se știe: raportul nu s-a citit)"
+        detail = "numărul de constatări nu se știe: raportul nu s-a citit"
+        return f"{ref} ({detail}{'; ' + seen if seen else ''})"
     parts = []
     if sk["critical"]:
         parts.append(f"{sk['critical']} CRITICAL")
@@ -761,8 +1165,52 @@ def _describe_skipped(sk: dict[str, Any]) -> str:
         parts.append(f"{sk['high']} HIGH")
     if sk["unrated"]:
         parts.append(f"{sk['unrated']} fără notă")
+    if seen:
+        parts.append(seen)
+    if sk.get("displaced"):
+        parts.append("înlăturată de imaginea cu prioritate de rotație")
     detail = f": {', '.join(parts)}" if parts else ""
     return f"{ref} ({sk['findings']} constatări{detail})"
+
+
+def _rotation_text(coverage: dict[str, Any], skipped: list[dict[str, Any]], *,
+                   ingested_names: bool) -> str:
+    """Propozitiile despre rotatie: ce s-a intamplat acum si ce regula se aplica.
+
+    Doar fapte pe care rularea le poate sustine. „A fost ingerata cu prioritate" se
+    scrie doar daca lista celor ingerate o contine (si nu pe calea in care ingestia
+    a cazut la mijloc, unde nu stim ce a ajuns). Regula pentru rularile urmatoare e
+    spusa ca regula, nu ca rezultat.
+    """
+    if "rotation" not in coverage:
+        return ""   # acoperire fara date de rotatie (nu o produce `Admission`)
+    rotation = coverage["rotation"]
+    if rotation is None:
+        return (" Rotația NU a fost aplicată în rularea asta (nu s-a citit când a "
+                "fost văzută ultima oară fiecare imagine): imaginile sărite nu "
+                "primesc prioritate data viitoare.")
+    text = ""
+    ingested = coverage.get("ingested") or []
+    promoted = [p for p in (rotation.get("promoted") or [])
+                if ingested_names and p["reference"] in ingested]
+    if promoted:
+        def _one(p: dict[str, Any]) -> str:
+            since = (f"ultima constatare văzută: {p['last_seen']}" if p["last_seen"]
+                     else "nicio constatare văzută până acum")
+            return f"{_cut(p['reference'], MAX_REFERENCE_CHARS)} ({since})"
+        described = [_one(p) for p in promoted]
+        k = _fit(described, MAX_NAMED_PROMOTED, MAX_NAMED_PROMOTED_CHARS)
+        more = len(promoted) - k
+        names = ", ".join(described[:k]) + (f" și încă {more}" if more else "")
+        verb = "a fost ingerată" if len(promoted) == 1 else "au fost ingerate"
+        text += (f" Rotație: {names} {verb} cu prioritate de rotație, "
+                 f"deși după regula «cele mai mici întâi» nu "
+                 f"ar fi încăput.")
+    if any(sk["reason"] == REASON_BUDGET for sk in skipped):
+        text += (" Regula de rotație: la rulările următoare imaginile sărite pentru "
+                 "buget sunt trecute cu vederea, iar cele nevăzute de cel mai mult "
+                 "timp se ingerează primele, cât încap.")
+    return text
 
 
 def coverage_caveat(coverage: dict[str, Any], held_open: int | None = None, *,
@@ -803,9 +1251,11 @@ def coverage_caveat(coverage: dict[str, Any], held_open: int | None = None, *,
         why = {
             REASON_IMAGE: (f"depășește singură tot plafonul de {budget}" if one
                            else f"depășesc singure tot plafonul de {budget}"),
-            REASON_BUDGET: (f"încape singură, dar nu și laolaltă cu cele mai mici "
+            # „Celelalte", nu „cele mai mici": intr-o noapte cu imagine-lider unele
+            # au fost inlaturate de lider (marcate pe nume), nu de imagini mai mici.
+            REASON_BUDGET: ("încape singură, dar nu și laolaltă cu celelalte "
                             if one else
-                            f"încap singure, dar nu și laolaltă cu cele mai mici ")
+                            "încap singure, dar nu și laolaltă cu celelalte ")
                            + f"(plafonul pe rulare e {budget}, {admitted} admise)",
             REASON_REPORT: ("raportul trivy e prea mare ca să fie citit în proces"
                             if one else
@@ -823,6 +1273,7 @@ def coverage_caveat(coverage: dict[str, Any], held_open: int | None = None, *,
         text += (f" Constatările lor deja deschise ({held_open}) rămân deschise, "
                  f"nereîmprospătate și nerezolvate — datează de la ultima rulare "
                  f"care le-a văzut.")
+    text += _rotation_text(coverage, skipped, ingested_names=ingested_names)
     if ingested_names:
         names = [_cut(n, MAX_REFERENCE_CHARS) for n in (coverage.get("ingested") or [])]
         k = _fit(names, MAX_NAMED_INGESTED, MAX_NAMED_INGESTED_CHARS)
@@ -1235,7 +1686,8 @@ def parse(payload: dict[str, Any], *, reference: str, image_id: str,
     return list(items.values())
 
 
-async def scan(probe: DockerProbe | None = None
+async def scan(probe: DockerProbe | None = None,
+               last_seen: Mapping[str, datetime] | None = None
                ) -> tuple[list[dict[str, Any]], str | None, dict[str, Any]]:
     """Scaneaza imaginile containerelor in rulare. (constatari, eroare, fapte).
 
@@ -1248,6 +1700,12 @@ async def scan(probe: DockerProbe | None = None
     si care au fost sarite (peste buget, sau cu raportul prea mare). Constatarile
     intoarse sunt ale celor ingerate; ale celor sarite nu sunt, iar apelantul le
     protejeaza de `mark_resolved_absent`. Pe orice drum de eroare e `None`.
+
+    `last_seen` = `max(findings.last_seen)` per `location`, citit de apelant din
+    baza INAINTE de scanare (`fx.last_seen_by_location`); de el atarna rotatia.
+    `None` = nu s-a putut citi: nu se aplica rotatie si coverage o spune
+    (`rotation: None`), in loc sa para ca nimeni nu a fost trecut cu vederea. Un
+    dictionar gol e altceva: baza a raspuns ca nu stie nimic despre scaner.
     """
     # `severities` e scris din prima linie, nu la sfarsit: apelantul il duce in
     # sumar si in jurnal, iar o rulare care a esuat inainte sa vada vreo imagine
@@ -1297,8 +1755,13 @@ async def scan(probe: DockerProbe | None = None
                     f"({trivy_fs.BINARY} lipsește) — nu s-a scanat niciuna, deci "
                     f"lista goală nu spune nimic despre ele"), facts
 
+    rotation = (plan_rotation([i.reference for i in images], last_seen)
+                if last_seen is not None else None)
+
+    images = scan_order(images, rotation)
+
     workdir = tempfile.mkdtemp(prefix="sentinel-trivy-image-")
-    admission = Admission(MAX_FINDINGS)
+    admission = Admission(MAX_FINDINGS, rotation)
     deadline = time.monotonic() + TIMEOUT_S
     try:
         for index, image in enumerate(images):
@@ -1396,6 +1859,7 @@ async def scan(probe: DockerProbe | None = None
              extra={"findings": len(unique), "images": len(images),
                     "ingested": len(coverage["ingested"]),
                     "skipped": [sk["reference"] for sk in coverage["skipped"]],
+                    "rotation": coverage["rotation"],
                     "containers": facts["containers"], "db_version": described,
                     "severities": facts["severities"]})
     return list(unique.values()), None, facts

@@ -434,7 +434,10 @@ async def _run_trivy_image(db: Database, triggered_by: str) -> dict:
         fi doar o alta forma de tacere.
 
     Si doua care vin din bugetul de volum (`trivy_image.MAX_FINDINGS`, pe IMAGINE
-    de la 23 octombrie 2026; vezi „Ingest per image" in modulul scanerului):
+    de la 23 octombrie 2026; vezi „Ingest per image" in modulul scanerului). Din 18
+    noiembrie 2026 bugetul are si ROTATIE: `findings.last_seen` per imagine se
+    citeste inainte de scanare, iar imaginea trecuta cu vederea cel mai de mult
+    intra prima, ca una mare sa nu ramana sarita in fiecare noapte:
 
       * o imagine care nu incape nu e ingerata, iar `location`-ul ei intra in
         `skip_locations` al lui `mark_resolved_absent`. Ea lipseste din
@@ -462,7 +465,14 @@ async def _run_trivy_image(db: Database, triggered_by: str) -> dict:
     # ca o ingestie cazuta la mijloc sa-si spuna imaginile sarite pe randul `failed`.
     coverage: dict | None = None
     try:
-        raw, error, facts = await trivy_image.scan(probe)
+        # Cand a fost vazuta ultima oara fiecare imagine, din baza, INAINTE de
+        # scanare: de el atarna ce imagine are prioritate cand bugetul nu le
+        # incape pe toate (rotatia, vezi modulul scanerului). O citire cazuta
+        # ridica exceptia si randul se inchide `failed`: nu se inlocuieste cu un
+        # dictionar gol, care ar insemna „baza nu stie nimic" si ar opri rotatia
+        # tacut.
+        last_seen = await fx.last_seen_by_location(db, trivy_image.SCANNER)
+        raw, error, facts = await trivy_image.scan(probe, last_seen)
         db_version = facts.get("db_version")
         coverage = facts.get("coverage")
         if error:
@@ -524,6 +534,7 @@ async def _run_trivy_image(db: Database, triggered_by: str) -> dict:
             log.warning("imagini sărite de la ingestie",
                         extra={"scanner": trivy_image.SCANNER,
                                "skipped": coverage["skipped"],
+                               "rotation": (coverage or {}).get("rotation"),
                                "open_untouched": ramase_deschise})
         if sub_prag:
             # WARNING, nu INFO: sunt constatari care raman in panou fara ca ceva

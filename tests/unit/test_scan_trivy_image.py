@@ -1207,7 +1207,7 @@ def test_a_completed_scan_ingests_and_closes_what_disappeared(monkeypatch) -> No
     _probe(monkeypatch, trivy_image.DOCKER_READY)
     _no_kev(monkeypatch)
 
-    async def merge(_probe):
+    async def merge(_probe, _last_seen=None):
         return (list(trivy_image.parse(SAMPLE, reference="nginx:1.27",
                                        image_id=IMG_NGINX)),
                 None,
@@ -1231,7 +1231,7 @@ def test_a_completed_scan_ingests_and_closes_what_disappeared(monkeypatch) -> No
 
 def _merge_stub(monkeypatch, findings=None, facts=None):
     """`trivy_image.scan` înlocuit cu un rezultat gata făcut."""
-    async def merge(_probe):
+    async def merge(_probe, _last_seen=None):
         return (list(findings if findings is not None
                      else trivy_image.parse(SAMPLE, reference="nginx:1.27",
                                             image_id=IMG_NGINX)),
@@ -2426,3 +2426,749 @@ def test_the_hard_cap_on_the_row_text_holds_even_if_the_other_bounds_fail(
     text = trivy_image.coverage_caveat(
         _coverage(skipped=[("r/" + "x" * 3000, 5, 0, 5, 0)]), held_open=5)
     assert len(text) == 300 and text.endswith("…")
+
+
+# --------------------------------------------------------------------------
+# Rotatia: imaginea cea mai mare nu mai e sarita in fiecare noapte, la nesfarsit
+# --------------------------------------------------------------------------
+#
+# Pe 18 noiembrie 2026 bugetul de 6000 a sarit `devlikeapro/waha:latest` (2828 de
+# constatari; 3185 + 2828 = 6013). Cea mai mare imagine e cea sarita, iar cea mai
+# mare ramane cea mai mare in fiecare noapte: fara rotatie constatarile ei
+# imbatranesc si nu se mai pot rezolva niciodata. Testele de mai jos tin regula
+# (cine e trecut cu vederea, cine are prioritate) si marginea de infometare.
+def _day_at(night: int, second: int = 0) -> datetime:
+    return datetime(2026, 11, 1, 1, 0, tzinfo=timezone.utc) + timedelta(
+        days=night, seconds=second)
+
+
+def _rimg(ref: str, n: int):
+    """Imagine cu id stabil dedus din nume (aceeasi la fiecare rulare de test)."""
+    ident = _image_id(int.from_bytes(ref.encode(), "big") % 10**15)
+    image = trivy_image.RunningImage(image_id=ident, reference=ref, containers=())
+    return image, [{"severity": "high"} for _ in range(n)]
+
+
+def test_an_image_passed_over_is_overdue_and_one_ingested_with_the_rest_is_not() -> None:
+    """Rotația nu promovează o imagine la întâmplare după o noapte obișnuită.
+
+    Eșecul pe care îl previne: după o rulare obișnuită toate imaginile poartă
+    aceeași dată (la câteva secunde una de alta — 25 s pe 25 de imagini pe 18
+    noiembrie); dacă „cea mai veche" ar fi criteriul, una oarecare ar primi
+    prioritate în fiecare noapte și ar lăsa pe dinafară imagini mici fără ca
+    cineva să fi fost neglijat. Aici: `waha` nu a fost ingerată în noaptea de
+    ieri (ultima dată, cu o zi înainte), celelalte da, cu secunde de diferență.
+    """
+    seen = {"waha": _day_at(0, 3), "a": _day_at(1, 0), "b": _day_at(1, 9),
+            "c": _day_at(1, 25)}
+    rot = trivy_image.plan_rotation(["a", "b", "c", "waha"], seen)
+    assert rot.overdue == ("waha",), rot.overdue
+
+
+def test_after_an_outage_or_on_the_first_run_nobody_is_overdue() -> None:
+    """O pană sau prima rulare nu sunt „cineva a fost lăsat pe dinafară".
+
+    Eșecul pe care îl previne: după trei nopți fără rulare toate imaginile sunt la
+    fel de vechi (față de ceasul de pe perete), iar un criteriu de vârstă absolută
+    le-ar marca pe toate drept restante și ar da prioritate uneia la întâmplare.
+    Criteriul e „altcineva a fost ingerat de atunci", deci aici nu e nimeni. La
+    fel pentru baza goală (prima rulare): fără istoric nu se poate spune nimic.
+    """
+    pana = {ref: _day_at(0, i) for i, ref in enumerate("abc")}
+    assert trivy_image.plan_rotation(["a", "b", "c"], pana).overdue == ()
+    assert trivy_image.plan_rotation(["a", "b", "c"], {}).overdue == ()
+
+
+def test_never_seen_images_come_before_the_oldest_seen_ones() -> None:
+    """„Nu a fost ingerată niciodată" e cea mai veche stare, nu una necunoscută.
+
+    Eșecul pe care îl previne: o imagine nouă și mare (nicio constatare în baza de
+    date) sortată după cele deja văzute, deci sărită de bugetul care o lasă să
+    aștepte la coadă. Ordinea cerută: nevăzutele (după nume), apoi cele văzute,
+    cea mai veche întâi. Ordinea contează doar între imaginile care chiar au nevoie
+    de loc (vezi testul cu imaginea nouă și mică): `Admission` nu dă locul unei
+    imagini care ar fi încăput oricum.
+    """
+    seen = {"veche": _day_at(0), "mai-veche": _day_at(-2), "noua-vazuta": _day_at(5)}
+    rot = trivy_image.plan_rotation(
+        ["veche", "mai-veche", "noua-vazuta", "zz-noua", "aa-noua"], seen)
+    assert rot.overdue == ("aa-noua", "zz-noua", "mai-veche", "veche")
+
+
+def test_the_priority_image_is_never_the_victim_of_the_budget() -> None:
+    """Imaginea trecută cu vederea intră chiar dacă e cea mai mare.
+
+    Eșecul pe care îl previne: starea din 18 noiembrie 2026 — `waha` (cea mai
+    mare) sărită în fiecare noapte pentru că suma depășește bugetul, deci
+    constatările ei nu se mai reîmprospătează și nu se mai pot rezolva. Același
+    set de imagini, aceeași sumă: fără rotație cade cea mai mare, cu rotația cade
+    cea mai mare dintre celelalte.
+    """
+    sizes = {"big": 6, "mid": 3, "small": 2, "other": 4}      # suma 15, buget 10
+
+    fara = trivy_image.Admission(10)
+    cu = trivy_image.Admission(10, trivy_image.Rotation(("big",), {}))
+    for adm in (fara, cu):
+        for ref in sizes:
+            adm.offer(*_rimg(ref, sizes[ref]))
+
+    assert fara.coverage(4)["ingested"] == ["mid", "other", "small"]
+    assert cu.coverage(4)["ingested"] == ["big", "small"], (
+        "imaginea trecută cu vederea nu a intrat prima")
+    assert {sk.reference for sk in cu.skipped} == {"mid", "other"}
+    assert cu.total() <= 10
+
+
+def test_with_nobody_overdue_the_result_is_the_plain_smallest_first_one() -> None:
+    """Fără nimeni trecut cu vederea rotația nu schimbă nimic.
+
+    Eșecul pe care îl previne: o imagine mare care ia locul mai multor mici „din
+    principiu", în nopți în care nimeni nu e infometat — acoperirea (numărul de
+    imagini ingerate) ar scădea pentru nimic. Aceeași flotă ca în testul de
+    ordine, în toate ordinile de sosire, cu și fără obiectul de rotație gol.
+    """
+    import itertools
+
+    sizes = {"b": 2, "a": 2, "c": 5, "d": 1, "e": 5}
+    rezultate = set()
+    for perm in itertools.permutations(sizes):
+        for rotation in (None, trivy_image.Rotation((), {})):
+            adm = trivy_image.Admission(10, rotation)
+            for ref in perm:
+                adm.offer(*_rimg(ref, sizes[ref]))
+            cov = adm.coverage(5)
+            rezultate.add((tuple(cov["ingested"]),
+                           tuple(sk["reference"] for sk in cov["skipped"])))
+    assert rezultate == {(("a", "b", "c", "d"), ("e",))}, rezultate
+
+
+def test_a_clean_image_is_never_reported_as_promoted() -> None:
+    """O imagine fără constatări nu e „ingerată cu prioritate".
+
+    Eșecul pe care îl previne: o imagine curată n-are niciun rând în `findings`,
+    deci arată „nevăzută" în fiecare noapte. Costă zero și regula de bază o
+    admite oricum; dacă ar fi numită în text ca ingerată cu prioritate, textul ar
+    afirma în fiecare noapte o rotație care n-a schimbat nimic, iar `big` ar fi
+    ascunsă între ele.
+    """
+    rot = trivy_image.Rotation(("curata", "big"), {})
+    adm = trivy_image.Admission(10, rot)
+    for ref, n in {"curata": 0, "big": 6, "mid": 3, "other": 4}.items():
+        adm.offer(*_rimg(ref, n))
+    cov = adm.coverage(4)
+    assert "big" in cov["ingested"] and "curata" in cov["ingested"]
+    assert [p["reference"] for p in cov["rotation"]["promoted"]] == ["big"]
+
+
+def test_an_overdue_image_that_does_not_fit_is_skipped_and_the_next_one_is_tried() -> None:
+    """O restantă care nu încape nu oprește restul restantelor.
+
+    Eșecul pe care îl previne: restantele admise ca prefix (oprire la prima care nu
+    încape), deci una mare, a doua în ordinea vechimii, ar lăsa pe dinafară și o
+    restantă mică de după ea, care încăpea. Aici: `veche` (8) intră, `mijlocie` (5)
+    nu mai încape, `mica` (1) încape și trebuie să intre.
+    """
+    rot = trivy_image.Rotation(("veche", "mijlocie", "mica"), {})
+    adm = trivy_image.Admission(10, rot)
+    for ref, n in {"veche": 8, "mijlocie": 5, "mica": 1}.items():
+        adm.offer(*_rimg(ref, n))
+    cov = adm.coverage(3)
+    assert cov["ingested"] == ["mica", "veche"]
+    assert [sk["reference"] for sk in cov["skipped"]] == ["mijlocie"]
+
+    # Și când ajung în altă ordine, într-o singură reîncadrare a celor deja ținute:
+    # `mijlocie` nu mai încape după `veche`, dar `mica` da.
+    alta = trivy_image.Admission(10, rot)
+    for ref in ("mica", "mijlocie", "veche"):
+        alta.offer(*_rimg(ref, {"veche": 8, "mijlocie": 5, "mica": 1}[ref]))
+    assert alta.coverage(3)["ingested"] == ["mica", "veche"]
+
+
+def test_an_overdue_image_that_cannot_fit_alone_does_not_take_the_slot() -> None:
+    """Imaginea peste tot bugetul nu poate fi lider, următoarea restantă da.
+
+    Eșecul pe care îl previne: liderul ales după vechime, nu după faptul că poate
+    fi ingerat. O imagine de 12 la un buget de 10 e `REASON_IMAGE` oricum; dacă ar
+    „ocupa" locul, cea de după ea (care încape) ar fi sărită ca de obicei.
+    """
+    rot = trivy_image.Rotation(("uriasa", "big"), {})
+    adm = trivy_image.Admission(10, rot)
+    for ref, n in {"uriasa": 12, "big": 6, "mid": 3, "other": 4}.items():
+        adm.offer(*_rimg(ref, n))
+    assert [p["reference"] for p in adm.rotation_facts()["promoted"]] == ["big"]
+    assert "big" in adm.coverage(4)["ingested"]
+    assert {(sk.reference, sk.reason) for sk in adm.skipped} >= {
+        ("uriasa", trivy_image.REASON_IMAGE)}
+
+
+def test_the_stalest_eligible_image_is_ingested_in_every_arrival_order() -> None:
+    """Garanția nu depinde de ordinea sosirii, nici dacă `scan` ar greși ordinea.
+
+    Eșecul pe care îl previne: liderul ales „primul sosit dintre restante". Dacă o
+    restantă mai veche ajunge după una mai nouă, trebuie să-i ia locul — altfel
+    imaginea nevăzută de cel mai mult timp ar aștepta după una mai nouă.
+    """
+    import itertools
+
+    sizes = {"veche": 6, "noua": 6, "mica": 2, "alta": 3}   # 17 > 10
+    rot = trivy_image.Rotation(("veche", "noua"), {})
+    for perm in itertools.permutations(sizes):
+        adm = trivy_image.Admission(10, rot)
+        for ref in perm:
+            adm.offer(*_rimg(ref, sizes[ref]))
+        assert "veche" in adm.coverage(4)["ingested"], (
+            f"ordinea {perm}: cea mai veche nu a intrat")
+        assert adm.total() <= 10
+
+
+def _simulate(sizes: dict[str, int], nights: int, budget: int, *,
+              rotate: bool = True, newcomer=None) -> dict[str, list[bool]]:
+    """`nights` rulari consecutive pe aceeasi flota, cu starea ca in baza.
+
+    Foloseste aceleasi functii ca `scan`: `plan_rotation`, `scan_order`, `Admission`.
+    `last_seen` se actualizeaza ca `upsert_finding`: doar pentru imaginile
+    ingerate si doar daca au constatari, cu secunde intre ele. `newcomer(noapte)`
+    poate intoarce `(referinta, constatari)` pentru o imagine care exista DOAR in
+    noaptea aceea (o imagine fixata pe digest, al carei digest se schimba, e din
+    nou „nevazuta"); apare in `history` doar pentru noptile in care exista.
+    """
+    last_seen: dict[str, datetime] = {}
+    history: dict[str, list[bool]] = {ref: [] for ref in sizes}
+    for night in range(nights):
+        fleet = dict(sizes)
+        nou = newcomer(night) if newcomer is not None else None
+        if nou is not None:
+            fleet[nou[0]] = nou[1]
+            history.setdefault(nou[0], [])
+        rotation = (trivy_image.plan_rotation(list(fleet), last_seen)
+                    if rotate else None)
+        adm = trivy_image.Admission(budget, rotation)
+        for image in trivy_image.scan_order(
+                [_rimg(ref, n)[0] for ref, n in fleet.items()], rotation):
+            adm.offer(image, _rimg(image.reference, fleet[image.reference])[1])
+        done = {image.reference for image, _items in adm.admitted()}
+        for k, ref in enumerate(sorted(done)):
+            history[ref].append(True)
+            if fleet[ref]:
+                last_seen[ref] = _day_at(night, k)
+        for ref in set(fleet) - done:
+            history[ref].append(False)
+    return history
+
+
+def _longest_gap(flags: list[bool]) -> int:
+    best = run_ = 0
+    for ingested in flags:
+        run_ = 0 if ingested else run_ + 1
+        best = max(best, run_)
+    return best
+
+
+def test_the_biggest_image_is_never_skipped_two_runs_in_a_row() -> None:
+    """Marginea de infometare, pe forma din 18 noiembrie: o imagine mare, suma peste buget.
+
+    Eșecul pe care îl previne: `waha` sărită în fiecare noapte, la nesfârșit. Aici
+    flota are o imagine mare și patru mici, suma e peste buget în fiecare noapte
+    și FIECARE imagine încape singură. Fără rotație cea mai mare e sărită toate
+    cele 30 de nopți; cu rotația, nicio imagine nu e sărită două rulări la rând
+    (prima rulare n-are istoric, deci acolo cea mare cade o dată).
+    """
+    sizes = {"waha": 28, "a": 20, "b": 20, "c": 20, "d": 5}     # 93 > 90
+    fara = _simulate(sizes, 30, 90, rotate=False)
+    assert fara["waha"] == [False] * 30, "martorul: fără rotație ar fi sărită mereu"
+
+    cu = _simulate(sizes, 30, 90)
+    for ref, flags in cu.items():
+        assert _longest_gap(flags) <= 1, f"{ref} a așteptat {_longest_gap(flags)} rulări"
+        assert any(flags), ref
+    assert sum(cu["waha"]) >= 14, "cea mare nu a fost reîmprospătată cel puțin o noapte din două"
+
+
+def test_no_image_that_fits_alone_waits_longer_than_the_number_of_images() -> None:
+    """Marginea cu mai multe imagini restante: cel mult n rulări, n = numărul de imagini.
+
+    Eșecul pe care îl previne: o regulă care promovează „cea mai veche" dar lasă o
+    imagine în urma altora la nesfârșit (de pildă un lider ales după mărime, nu
+    după vechime). 200 de flote aleatoare, cu sămânță fixă, de 3-9 imagini care
+    încap singure dar nu toate laolaltă; seria completă pe 60 de nopți. Martorul
+    negativ: aceleași flote, fără rotație — cel puțin una așteaptă mai mult decât
+    marginea, deci testul vede ce apără.
+    """
+    import random
+
+    rng = random.Random(20261118)
+    depasiri_fara = 0
+    for _ in range(200):
+        n = rng.randint(3, 9)
+        budget = rng.randint(30, 60)
+        sizes = {f"i{k}": rng.randint(1, budget) for k in range(n)}
+        if sum(sizes.values()) <= budget:
+            continue
+        cu = _simulate(sizes, 60, budget)
+        for ref, flags in cu.items():
+            assert _longest_gap(flags) <= n, (ref, _longest_gap(flags), sizes, budget)
+        fara = _simulate(sizes, 60, budget, rotate=False)
+        depasiri_fara += any(_longest_gap(f) > n for f in fara.values())
+    assert depasiri_fara > 0, "martorul nu vede nicio flotă infometată fără rotație"
+
+
+def test_a_small_newcomer_does_not_take_the_slot_the_big_image_needs() -> None:
+    """Locul rotației nu se cheltuie pe o imagine care ar fi încăput oricum.
+
+    Eșecul pe care îl previne: runda 1 dădea locul primei restante cu constatări,
+    iar imaginile „nevăzute" veneau primele. O imagine nouă și mică (sau una
+    fixată pe digest al cărei digest s-a schimbat) lua locul, ar fi încăput și
+    fără el, iar `waha`, care aștepta, rămânea sărită — noapte de noapte atâta
+    timp cât apăreau imagini noi (38 de nopți din 40 în simularea verificatorului).
+    Aici nou-venita (1) e „nevăzută" și mică, `waha` (6) e restantă și nu încape.
+    """
+    rot = trivy_image.Rotation(("nou", "waha"), {})
+    adm = trivy_image.Admission(10, rot)
+    for ref, n in {"nou": 1, "waha": 6, "a": 3, "b": 4}.items():       # suma 14
+        adm.offer(*_rimg(ref, n))
+    cov = adm.coverage(4)
+    assert [p["reference"] for p in cov["rotation"]["promoted"]] == ["waha"], (
+        cov["rotation"])
+    assert "waha" in cov["ingested"] and "nou" in cov["ingested"]
+    assert cov["admitted_findings"] <= 10
+
+
+def test_the_images_rotation_displaced_are_marked_and_the_plain_ones_are_not() -> None:
+    """Textul poate spune cine a înlăturat pe cine.
+
+    Eșecul pe care îl previne: toate cele sărite descrise ca „nu au încăput cu cele
+    mai mici", deși într-o noapte cu imagine restantă unele au fost înlăturate de
+    ea. Aici `uriasa` (8) e restantă și intră prima; `mijlocie` (3) și `alta` (2)
+    ar fi încăput după regula de bază și sunt marcate `displaced`. Fără rotație,
+    `uriasa` e cea sărită de regula de bază și nu e marcată.
+    """
+    rot = trivy_image.Rotation(("uriasa",), {})
+    adm = trivy_image.Admission(10, rot)
+    for ref, n in {"uriasa": 8, "mijlocie": 3, "mica": 1, "alta": 2}.items():
+        adm.offer(*_rimg(ref, n))
+    cov = adm.coverage(4)
+    assert [p["reference"] for p in cov["rotation"]["promoted"]] == ["uriasa"]
+    marcaj = {sk["reference"]: sk["displaced"] for sk in cov["skipped"]}
+    assert marcaj == {"mijlocie": True, "alta": True}, marcaj
+    assert cov["ingested"] == ["mica", "uriasa"] and cov["admitted_findings"] == 9
+
+    plain = trivy_image.Admission(10, trivy_image.Rotation((), {}))
+    for ref, n in {"uriasa": 8, "mijlocie": 3, "mica": 1}.items():
+        plain.offer(*_rimg(ref, n))
+    assert [(sk.reference, sk.displaced) for sk in plain.skipped] == [("uriasa", False)]
+    assert plain.coverage(3)["rotation"]["promoted"] == []
+
+
+def test_new_images_that_keep_appearing_do_not_starve_the_big_one() -> None:
+    """Marginea de infometare ține și când flota se schimbă în fiecare noapte.
+
+    Eșecul pe care îl previne: regula din runda 1 (locul primei restante, cele
+    nevăzute primele). Flota din 18 noiembrie la scară, suma peste buget, plus o
+    imagine nouă și mică în fiecare noapte (digest nou, „nevăzută") sau în fiecare
+    a treia, plus una curată fixată pe digest care n-are nicio constatare
+    (`rustdesk`). Cu regula veche `waha` e sărită toate cele 40 de nopți (în
+    simularea verificatorului, 38); acum cel mult o noapte la rând.
+    """
+    sizes = {"waha": 28, "a": 20, "b": 20, "c": 20, "d": 5, "rustdesk": 0}
+    for fiecare in (1, 3):
+        def nou(noapte, fiecare=fiecare):
+            return (f"nou-{noapte}", 1) if noapte % fiecare == 0 else None
+        h = _simulate(sizes, 40, 90, newcomer=nou)
+        assert _longest_gap(h["waha"]) <= 1, (
+            fiecare, "".join("X" if x else "." for x in h["waha"]))
+        assert sum(h["waha"]) >= 18
+
+
+# --- scan(): rotatia, cap la cap ------------------------------------------
+def test_scan_hands_the_rotation_to_the_admission_and_the_big_image_gets_in(
+        gazda, monkeypatch) -> None:
+    """Rotația ajunge în `scan`: imaginea trecută cu vederea intră, cea mică e sărită.
+
+    Eșecul pe care îl previne: `scan` primește datele rotației dar le ignoră. Aici
+    `zz-big` (5) e singura trecută cu vederea, suma 12 > 10; „cele mai mici
+    întâi" ar sări-o, rotația o ingerează și o înlătură pe `mm-mid`, marcată ca
+    înlăturată de imaginea cu prioritate.
+    """
+    monkeypatch.setattr(trivy_image, "MAX_FINDINGS", 10)
+    ids = _fleet(gazda, {"aa-small": 3, "mm-mid": 4, "zz-big": 5})
+    scanate: list[str] = []
+    ref_of = {v: k for k, v in ids.items()}
+    gazda.on_image = lambda image: scanate.append(ref_of[image])
+    seen = {"zz-big": _day_at(0), "aa-small": _day_at(1), "mm-mid": _day_at(1, 4)}
+
+    items, eroare, fapte = run(trivy_image.scan(None, seen))
+
+    assert eroare is None, eroare
+    assert scanate[0] == "zz-big", f"ordinea de scanare: {scanate}"
+    cov = fapte["coverage"]
+    assert cov["ingested"] == ["aa-small", "zz-big"]
+    (sarita,) = cov["skipped"]
+    assert (sarita["reference"], sarita["reason"]) == ("mm-mid",
+                                                       trivy_image.REASON_BUDGET)
+    assert sarita["last_seen"] == "2026-11-02", "data ultimei constatări nu e pe sărită"
+    assert sarita["displaced"] is True
+    assert cov["rotation"]["promoted"] == [
+        {"reference": "zz-big", "last_seen": "2026-11-01"}]
+    assert len(items) == 8
+
+
+def test_without_the_rotation_data_the_scan_says_so_and_does_not_claim_never(
+        gazda, monkeypatch) -> None:
+    """„Nu știu când a fost văzută" nu se scrie „n-a fost văzută niciodată".
+
+    Eșecul pe care îl previne: baza nu a putut fi citită (sau apelantul n-a dat
+    datele) și imaginea sărită ar apărea ca „nicio constatare văzută până acum" —
+    o afirmație despre baza de date pe care nu am verificat-o. Fără date, sărita
+    nu poartă `last_seen` deloc, iar acoperirea spune că rotația nu s-a aplicat.
+    """
+    monkeypatch.setattr(trivy_image, "MAX_FINDINGS", 10)
+    _fleet(gazda, {"aa-small": 3, "mm-mid": 4, "zz-big": 5})
+    _items, eroare, fapte = run(trivy_image.scan())
+    assert eroare is None, eroare
+    cov = fapte["coverage"]
+    assert cov["rotation"] is None
+    assert [sk["reference"] for sk in cov["skipped"]] == ["zz-big"]
+    assert "last_seen" not in cov["skipped"][0]
+    text = trivy_image.coverage_caveat(cov, held_open=1)
+    assert "Rotația NU a fost aplicată" in text
+    assert "nicio constatare văzută" not in text and "ultima constatare" not in text
+
+
+def _rot_coverage(skipped, *, lead="devlikeapro/waha:latest", lead_seen="2026-11-16",
+                  ingested=("nginx:1.27", "devlikeapro/waha:latest"), rotation="set"):
+    """`lead` = referinta imaginii admise cu prioritate (sau `None`)."""
+    cov = _coverage(skipped=skipped, ingested=ingested)
+    for sk in cov["skipped"]:
+        sk["last_seen"] = "2026-11-17"
+    promoted = ([{"reference": lead, "last_seen": lead_seen}] if lead else [])
+    cov["rotation"] = ({"overdue": [], "promoted": promoted}
+                       if rotation == "set" else None)
+    return cov
+
+
+def test_the_skipped_image_is_named_with_when_its_last_finding_was_seen() -> None:
+    """Operatorul vede de când datează ce i se arată despre imaginea sărită.
+
+    Eșecul pe care îl previne: „rămân deschise, datează de la ultima rulare care
+    le-a văzut" fără nicio dată — operatorul n-are cum să judece dacă e o noapte
+    sau două săptămâni. Textul spune „ultima constatare văzută", nu „ultima
+    ingerare": data vine din `findings.last_seen`, care nu se mișcă la o ingerare
+    fără constatări.
+    """
+    cov = _rot_coverage([("devlikeapro/waha:latest", 2828, 34, 918, 650)],
+                        ingested=("nginx:1.27",), lead=None)
+    text = trivy_image.coverage_caveat(cov, held_open=2821)
+    assert "devlikeapro/waha:latest (2828 constatări: 34 CRITICAL, 918 HIGH, " \
+           "650 fără notă, ultima constatare văzută: 2026-11-17)" in text
+
+    cov["skipped"][0]["last_seen"] = None
+    assert "nicio constatare văzută până acum" in trivy_image.coverage_caveat(
+        cov, held_open=0)
+
+    # Fără cheie (rotația nu a avut datele) nu se spune nimic despre dată.
+    del cov["skipped"][0]["last_seen"]
+    cov["rotation"] = None
+    fara = trivy_image.coverage_caveat(cov, held_open=0)
+    assert "ultima constatare" not in fara and "nicio constatare văzută" not in fara
+
+
+def test_the_rotation_sentences_say_only_what_happened() -> None:
+    """Textul despre rotație afirmă doar ce a verificat rularea.
+
+    Eșecul pe care îl previne: „X a fost ingerată cu prioritate" scris și pe calea
+    în care ingestia a căzut la mijloc (nu știm ce a ajuns în bază), sau fără
+    lider (nicio imagine restantă), sau regula „rulările următoare" scrisă când
+    nicio imagine nu a fost sărită pentru buget (ar promite ceva despre o
+    imagine care nu așteaptă).
+    """
+    waha = ("devlikeapro/waha:latest", 2828, 34, 918, 650)
+    cu_lider = trivy_image.coverage_caveat(
+        _rot_coverage([("mm-mid", 4, 0, 4, 0)]), held_open=4)
+    assert ("Rotație: devlikeapro/waha:latest (ultima constatare văzută: "
+            "2026-11-16) a fost ingerată cu prioritate de rotație, deși după "
+            "regula «cele mai mici întâi» nu ar fi încăput.") in cu_lider
+    assert "înaintea imaginilor mici" not in cu_lider, (
+        "într-o noapte cu lider, cele sărite nu au fost înlăturate de imagini mici")
+    assert "cu cele mai mici" not in cu_lider
+    assert "Regula de rotație: la rulările următoare" in cu_lider
+    assert cu_lider.index("Rotație:") < cu_lider.index("Ingerate (")
+
+    # Ingestia a căzut la mijloc: nu afirmăm ce s-a ingerat.
+    cazut = trivy_image.coverage_caveat(
+        _rot_coverage([waha], lead="mm-mid"), held_open=4, ingested_names=False)
+    assert "a fost ingerată cu prioritate" not in cazut
+    assert "Regula de rotație" in cazut
+
+    # Liderul trebuie să figureze între cele ingerate ca să fie afirmat.
+    absent = trivy_image.coverage_caveat(
+        _rot_coverage([waha], lead="nu-e-in-lista"), held_open=4)
+    assert "a fost ingerată cu prioritate" not in absent
+
+    # Nicio imagine sărită pentru buget: nicio regulă promisă.
+    cov = _rot_coverage([("uriasa", 9999, 0, 0, 0)])
+    cov["skipped"][0]["reason"] = trivy_image.REASON_IMAGE
+    peste = trivy_image.coverage_caveat(cov, held_open=0)
+    assert "Regula de rotație" not in peste and "Rotație:" in peste
+
+
+def test_the_text_says_who_displaced_whom_on_a_lead_night() -> None:
+    """Imaginea înlăturată de lider e numită ca atare, nu ca „prea mare pentru cele mici".
+
+    Eșecul pe care îl previne: textul din runda 1 descria toate imaginile sărite
+    ca „nu au încăput laolaltă cu cele mai mici" și lider ca „înaintea imaginilor
+    mici" — fals într-o noapte în care sărita a fost înlăturată de un lider mai
+    mare. Operatorul ar fi citit că mai mici au ocupat locul.
+    """
+    cov = _rot_coverage([("mm-mid", 4, 0, 4, 0), ("zz-plain", 9, 0, 9, 0)])
+    cov["skipped"][0]["displaced"] = True
+    text = trivy_image.coverage_caveat(cov, held_open=13)
+    assert "mm-mid (4 constatări: 4 HIGH, ultima constatare văzută: 2026-11-17, "            "înlăturată de imaginea cu prioritate de rotație)" in text
+    assert "zz-plain (9 constatări: 9 HIGH, ultima constatare văzută: 2026-11-17)" in text
+    assert "nu și laolaltă cu celelalte" in text and "laolaltă cu cele mai mici" not in text
+
+
+def test_the_row_text_with_the_rotation_sentences_stays_inside_the_bound() -> None:
+    """Propozițiile noi nu împing textul peste plafon și nu taie lista ingerate.
+
+    Eșecul pe care îl previne: cele două propoziții de rotație (~350 de caractere)
+    plus data de pe fiecare imagine numită adaugă la un text care avea ~1600 de
+    caractere în cel mai rău caz; peste `MAX_ROW_TEXT` tăierea de la sfârșit ar
+    scoate chiar lista imaginilor ingerate. Cel mai rău caz construit aici: zece
+    imagini sărite cu nume de 120+ de caractere, lider cu nume uriaș, douăsprezece
+    imagini ingerate cu nume lungi.
+    """
+    lung = "registry.example/echipa/imagine-cu-nume-lung-{:02d}:" + "x" * 200
+    sarite = [(lung.format(i), 100 + i, 9, 9, 9) for i in range(30)]
+    ingerate = tuple(lung.format(50 + i) for i in range(20))
+    lider = lung.format(77)
+    cov = _rot_coverage(sarite, lead=lider, ingested=(*ingerate, lider))
+    cov["skipped"].sort(key=lambda sk: -sk["findings"])
+    text = trivy_image.coverage_caveat(cov, held_open=123456)
+
+    assert len(text) <= trivy_image.MAX_ROW_TEXT
+    assert "Rotație:" in text and "Regula de rotație" in text
+    assert "Ingerate (21)" in text and not text.endswith("…"), text[-200:]
+    assert "(123456)" in text
+
+
+# --- orchestratorul: citeste faptul din baza, inainte de scanare -----------
+class _SeenDB(_DB):
+    """`_DB` care raspunde si la citirea `max(last_seen)` per `location`."""
+
+    def __init__(self, rows=(), fail_read: bool = False, **kw) -> None:
+        super().__init__(**kw)
+        self.rows = list(rows)
+        self.fail_read = fail_read
+        self.read_sql: list[str] = []
+
+    async def fetch(self, sql, *args):
+        if "max(last_seen)" in sql:
+            self.events.append("read_last_seen")
+            self.read_sql.append(sql)
+            if self.fail_read:
+                raise RuntimeError("baza nu raspunde la citirea last_seen")
+            return self.rows
+        return await super().fetch(sql, *args)
+
+
+def test_the_orchestrator_reads_last_seen_before_the_scan_and_hands_it_over(
+        monkeypatch) -> None:
+    """Datele rotației vin din baza de date, citite ÎNAINTE de scanare.
+
+    Eșecul pe care îl previne: rotația scrisă dar neconectată — `scan` apelat fără
+    datele din `findings.last_seen`, deci mereu fără nimeni trecut cu vederea, cu
+    toate testele pe `Admission` verzi și `waha` sărită în fiecare noapte. Aici
+    scanerul înlocuit înregistrează ce primește și când.
+    """
+    _probe(monkeypatch, trivy_image.DOCKER_READY)
+    _no_kev(monkeypatch)
+    primit: list = []
+    db = _SeenDB(rows=[{"location": "nginx:1.27", "last_seen": _day_at(3)},
+                       {"location": "waha", "last_seen": _day_at(1)}])
+
+    async def scan(_probe, last_seen=None):
+        db.events.append("scan")
+        primit.append(last_seen)
+        return ([], None, {"db_version": "v", "images": 1, "containers": 1,
+                           "references": [], "severities": list(trivy_image.SEVERITIES),
+                           "coverage": None})
+
+    monkeypatch.setattr(orchestrator.trivy_image, "scan", scan)
+    out = run(orchestrator._run_trivy_image(db, "test"))
+
+    assert out["status"] == "completed", out
+    assert primit == [{"nginx:1.27": _day_at(3), "waha": _day_at(1)}]
+    assert db.events.index("read_last_seen") < db.events.index("scan")
+    assert "scanner = $1" in db.read_sql[0]
+
+
+def test_a_failed_last_seen_read_fails_the_row_instead_of_switching_rotation_off(
+        monkeypatch) -> None:
+    """O citire căzută nu devine „baza nu știe nimic" (dicționar gol).
+
+    Eșecul pe care îl previne: `except: last_seen = {}` — rotația s-ar opri tăcut
+    exact în nopțile în care baza are probleme, iar `waha` ar fi sărită fără ca
+    textul să spună că rotația nu s-a aplicat. Rularea se închide `failed`, nu se
+    scanează, nu se ingerează și nu se rezolvă nimic (cine nu s-a putut uita nu
+    închide constatări).
+    """
+    _probe(monkeypatch, trivy_image.DOCKER_READY)
+    _no_kev(monkeypatch)
+    db = _SeenDB(fail_read=True)
+
+    async def scan(*_a):
+        raise AssertionError("nu trebuia să se scaneze")
+
+    monkeypatch.setattr(orchestrator.trivy_image, "scan", scan)
+    out = run(orchestrator._run_trivy_image(db, "test"))
+
+    assert out["status"] == "failed" and "last_seen" in out["error"]
+    assert db.upserted == [] and db.resolve_calls == []
+    (rand,) = db.finished
+    assert rand["status"] == "failed"
+
+
+def test_last_seen_by_location_reads_every_status_and_returns_a_plain_map() -> None:
+    """Citirea nu filtrează pe `status`, și o imagine fără rânduri lipsește din hartă.
+
+    Eșecul pe care îl previne: un `AND status = 'open'` adăugat „ca să fie doar ce
+    e deschis". O imagine ale cărei constatări s-au rezolvat toate ar arăta atunci
+    „neingerată niciodată" și ar fi tratată ca restantă; mai grav, rezolvarea nu
+    atinge `last_seen`, deci rândurile rezolvate sunt tocmai cele care spun ultima
+    dată când imaginea a fost văzută. SQL-ul a fost rulat (doar SELECT) pe gazdă pe
+    18 noiembrie 2026; acest test păzește forma, nu execuția.
+    """
+    from sentinel.db.repo import findings as fx
+
+    class Db:
+        async def fetch(self, sql, *args):
+            self.sql, self.args = sql, args
+            return [{"location": "a", "last_seen": _day_at(1)},
+                    {"location": "b", "last_seen": None}]
+
+    db = Db()
+    harta = run(fx.last_seen_by_location(db, "trivy_image"))
+    assert harta == {"a": _day_at(1)}, "un last_seen NULL a intrat în hartă"
+    assert db.args == ("trivy_image",)
+    assert "max(last_seen)" in db.sql and "GROUP BY location" in db.sql
+    assert "status" not in db.sql.lower(), "citirea filtrează pe status"
+
+
+def test_the_budget_holds_the_fleet_of_18_november() -> None:
+    """Bugetul acoperă flota care a stat la 13 peste plafonul de 6000.
+
+    Eșecul pe care îl previne: bugetul coborât înapoi la 6000 (sau sub 6013). Pe
+    18 noiembrie 2026 flota era 3185 (24 de imagini ingerate) + 2828 (`waha`) =
+    6013: cu 13 peste, cea mai mare imagine a fost sărită și constatările ei
+    (2821 deschise, `last_seen` 17 noiembrie) au început să îmbătrânească.
+    Cifrele sunt măsurători datate, citite din `scans` pe gazdă.
+    """
+    assert trivy_image.MAX_FINDINGS >= 3185 + 2828
+
+
+# --- marginile textului de rotatie si garda de dupa citire ------------------
+def test_more_promoted_images_than_the_cap_are_counted_not_all_named() -> None:
+    """Lista imaginilor cu prioritate nu crește cu flota în textul de pe rând.
+
+    Eșecul pe care îl previne: nouă imagini promovate scrise toate, cu nume și
+    dată, în `scans.error` (care pleacă spre agregator) și în mesajul de Telegram
+    din `/selfcheck`; cu nume de registry lungi lista ar împinge textul peste
+    `MAX_ROW_TEXT` și tăierea de la sfârșit ar scoate lista imaginilor ingerate.
+    Două margini, ca la celelalte liste: numărul (`MAX_NAMED_PROMOTED`) și
+    caracterele (`MAX_NAMED_PROMOTED_CHARS`); cele rămase se numără, nu dispar.
+    """
+    def cov(refs):
+        c = _coverage(skipped=[("mm-mid", 4, 0, 4, 0)], ingested=tuple(refs))
+        c["skipped"][0]["last_seen"] = "2026-11-17"
+        c["rotation"] = {"overdue": [], "promoted": [
+            {"reference": r, "last_seen": "2026-11-16"} for r in refs]}
+        return c
+
+    scurte = [f"img-{i}" for i in range(trivy_image.MAX_NAMED_PROMOTED + 4)]
+    text = trivy_image.coverage_caveat(cov(scurte), held_open=1)
+    numite = [r for r in scurte if f"{r} (ultima constatare văzută" in text]
+    assert numite == scurte[:trivy_image.MAX_NAMED_PROMOTED], numite
+    assert "și încă 4 au fost ingerate cu prioritate de rotație" in text
+
+    # Marginea pe caractere: trei referinte de ~90 de caractere nu incap toate.
+    lungi = [f"reg.example/echipa/{i}-" + "x" * 70 for i in range(3)]
+    text = trivy_image.coverage_caveat(cov(lungi), held_open=1)
+    numite = [r for r in lungi if f"{r} (ultima" in text]
+    assert 0 < len(numite) < 3, "marginea pe caractere nu a limitat numele"
+    assert f"și încă {3 - len(numite)} au fost ingerate" in text, text
+
+
+def test_the_row_text_never_exceeds_its_cap_for_the_worst_inputs_found() -> None:
+    """Cel mai lung text posibil încape în `MAX_ROW_TEXT` fără să taie ultima propoziție.
+
+    Eșecul pe care îl previne: marginile pe nume (număr, caractere, referință)
+    sunt scrise lângă fiecare listă, dar nimic nu verifica SUMA lor. Comentariul
+    spunea „~1600 de caractere" în cel mai rău caz; verificatorul a construit 1864,
+    iar o căutare cu 4 promovate de 120 de caractere, 5 sărite scurte și 30 de
+    ingerate de 30 a dat 2034 — peste plafon, deci `…` la sfârșit și lista
+    imaginilor ingerate tăiată. Aici: configurația aceea, plus 3000 de configurații
+    aleatoare cu sămânță fixă; lungimea se măsoară NETĂIATĂ (plafonul ridicat), ca
+    plasa din urmă să nu ascundă depășirea.
+    """
+    import random
+
+    def cov(sk_lens, pr_lens, in_lens):
+        reasons = [trivy_image.REASON_IMAGE, trivy_image.REASON_BUDGET,
+                   trivy_image.REASON_REPORT]
+        skipped = []
+        for i, ln in enumerate(sk_lens):
+            r = reasons[i % 3]
+            skipped.append({
+                "reference": f"s{i}" if ln == 1 else f"s{i:02d}" + "x" * ln,
+                "image_id": "0" * 64, "reason": r,
+                "findings": None if r == trivy_image.REASON_REPORT else 8999 - i,
+                "critical": 9999, "high": 9999, "unrated": 9999,
+                "report_bytes": None, "displaced": r == trivy_image.REASON_BUDGET,
+                "last_seen": "2026-11-17"})
+        skipped.sort(key=lambda sk: -(sk["findings"] or 0))
+        promoted = [{"reference": f"p{i:02d}" + "y" * ln, "last_seen": None}
+                    for i, ln in enumerate(pr_lens)]
+        ingested = [f"i{i:02d}" + "z" * ln for i, ln in enumerate(in_lens)]
+        ingested += [p["reference"] for p in promoted]
+        return {"images": 40, "ingested": ingested, "admitted_findings": 8999,
+                "budget": 9000, "skipped": skipped,
+                "rotation": {"overdue": [], "promoted": promoted}}
+
+    def uncut(c) -> int:
+        # Plafonul ridicat doar pe durata măsurării, ca plasa să nu mascheze nimic.
+        cap = trivy_image.MAX_ROW_TEXT
+        try:
+            trivy_image.MAX_ROW_TEXT = 10**6
+            return len(trivy_image.coverage_caveat(c, held_open=10**9))
+        finally:
+            trivy_image.MAX_ROW_TEXT = cap
+
+    cunoscuta = cov([1] * 5, [120] * 4, [30] * 30)
+    assert uncut(cunoscuta) <= trivy_image.MAX_ROW_TEXT, uncut(cunoscuta)
+    text = trivy_image.coverage_caveat(cunoscuta, held_open=10**9)
+    assert "Ingerate (" in text and not text.endswith("…")
+
+    rng = random.Random(20261119)
+    cel_mai_lung = 0
+    for _ in range(3000):
+        c = cov([rng.choice((1, 5, 30, 120, 400)) for _ in range(rng.choice((1, 4, 10, 39)))],
+                [rng.choice((1, 40, 120, 400)) for _ in range(rng.choice((0, 1, 3, 9)))],
+                [rng.choice((1, 30, 120)) for _ in range(rng.choice((0, 5, 12, 30)))])
+        cel_mai_lung = max(cel_mai_lung, uncut(c))
+    assert 0 < cel_mai_lung <= trivy_image.MAX_ROW_TEXT, cel_mai_lung
+
+
+def test_offering_an_image_after_the_result_was_read_raises() -> None:
+    """Rezultatul citit nu mai poate fi schimbat pe tăcute.
+
+    Eșecul pe care îl previne: o imagine oferită după `coverage()` (sau `skipped`)
+    ar intra în `_held`/`_owed`, dar `displaced` e deja calculat fără ea și
+    `coverage` deja întors apelantului — textul de pe rând ar descrie o rulare
+    diferită de cea ingerată, fără nicio eroare. `scan` nu oferă niciodată după
+    citire; garda există ca o schimbare viitoare a ordinii să pice zgomotos.
+    """
+    adm = trivy_image.Admission(10)
+    adm.offer(*_rimg("a", 3))
+    adm.coverage(1)
+    with pytest.raises(RuntimeError, match="dupa ce rezultatul"):
+        adm.offer(*_rimg("b", 2))

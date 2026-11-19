@@ -329,6 +329,36 @@ async def count_open_outside_severities(db: Database, scanner: str,
         scanner, asset_id, list(visible_severities), bool(visible_unscored)) or 0)
 
 
+async def last_seen_by_location(db: Database, scanner: str) -> dict[str, datetime]:
+    """`max(last_seen)` per `location` for one scanner, over EVERY status.
+
+    The durable answer to "when did this scanner last see something at this
+    location" — for `trivy_image`, which image was last ingested (rotation, see its
+    module docstring). `last_seen` is written by `upsert_finding` and nothing else,
+    with the database's own `now()`, and moves for each row a run reports; resolving
+    does not touch it. Every status is read: a resolved row's `last_seen` is the
+    last night it WAS seen, and an image whose findings are all resolved would
+    otherwise look as if it had never been ingested.
+
+    What it cannot tell: an ingest that reported nothing leaves no mark. A location
+    with no row is absent from the result — "never seen" and "ingested clean" are
+    the same here, and the caller has to treat them so.
+
+    A failed read raises. It is not turned into an empty dict: empty means "the
+    database says nothing was ever seen", which would switch rotation off by
+    looking like a fresh install.
+    """
+    rows = await db.fetch(
+        """
+        SELECT location, max(last_seen) AS last_seen
+        FROM findings
+        WHERE scanner = $1 AND location IS NOT NULL
+        GROUP BY location
+        """,
+        scanner)
+    return {r["location"]: r["last_seen"] for r in rows if r["last_seen"] is not None}
+
+
 async def count_open_at_locations(db: Database, scanner: str, asset_id: int | None,
                                   locations: list[str]) -> int:
     """How many still-open findings sit at the given locations.

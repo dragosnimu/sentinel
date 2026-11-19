@@ -385,6 +385,36 @@ Acum fiecare imagine e scanată și parsată, iar bugetul decide care se ingerea
   nu a lui `docker ps`, deci rezultatul unei nopți se poate explica și nu se mută
   la o repornire de container. Prețul e spus: când suma se atinge, cade imaginea
   cea **mai mare**, care nu e cea mai puțin expusă;
+- **rotație** (din 18 noiembrie 2026): „cea mai mare cade" singură ar sări aceeași
+  imagine în fiecare noapte, la nesfârșit — chiar asta a pățit
+  `devlikeapro/waha:latest` (2828 de constatări, 3185 + 2828 = 6013, 13 peste
+  plafonul de atunci): rândurile ei au rămas deschise dar au îmbătrânit și nicio
+  reparație nu s-ar mai fi înregistrat. Imaginile **trecute cu vederea** — a căror
+  ultimă constatare văzută (`max(findings.last_seen)` pe `location`) e mai veche
+  cu peste 12 ore decât cea mai recentă din tot scanerul: altcineva a fost ingerat
+  de atunci, ele nu — se admit PRIMELE, cea nevăzută de cel mai mult timp întâi,
+  fiecare dacă încape în ce a rămas din buget; restul, ca mai sus, în ce rămâne.
+  Nu „cea mai veche" simplu: după o noapte obișnuită toate poartă aceeași dată,
+  iar după o pană toate sunt la fel de vechi. Fără nicio imagine trecută cu
+  vederea, rezultatul e cel de mai sus, neschimbat. Runda 1 dădea un singur loc
+  primei restante, cele nevăzute primele; o imagine nouă și mică (sau una fixată
+  pe digest al cărei digest s-a schimbat) lua locul în fiecare noapte și `waha`
+  rămânea sărită (38 de nopți din 40 în simularea verificatorului). Acum o
+  imagine mică costă doar propriile constatări, nu locul altcuiva. Marginea: o
+  imagine care încape singură e sărită cel mult **o** rulare după ce a fost
+  ingerată, apoi e admisă înaintea celor mai noi decât ea; așteaptă mai mult doar
+  cât timp imaginile *mai vechi decât ea* nu încap împreună cu ea (cu o flotă
+  fixă, cel mult n−1 rulări în plus, n ≤ `MAX_IMAGES`); imagini noi care nu încap
+  lângă ea o pot întârzia, câte o rulare fiecare. Faptul „când a fost văzută" vine
+  din `findings.last_seen`, scris cu `now()` de bază doar de `upsert_finding`
+  (fără ceasul procesului); nu poate spune nimic despre o imagine fără constatări,
+  dar una ca asta costă zero. Limită cunoscută, nereparată: rotația e pe referință, deci
+  două id-uri sub aceeași referință împart data; dacă unul e admis și celălalt
+  nu încape, al doilea poate fi sărit în fiecare noapte fără să devină vreodată
+  restant. Textul de pe rând și din
+  `/selfcheck` numește fiecare imagine sărită cu „ultima constatare văzută:
+  AAAA-LL-ZZ", spune care au fost înlăturate de rotație și care au intrat cu
+  prioritate, și spune regula;
 - constatările unei imagini sărite **nu se rezolvă**: `mark_resolved_absent` primește
   `skip_locations`, aceeași îngrădire ca `visible_severities` dar pe cealaltă axă —
   *unde* s-a uitat rularea, nu *cât de tare*. Rămân deschise, cu data ultimei rulări
@@ -392,12 +422,15 @@ Acum fiecare imagine e scanată și parsată, iar bugetul decide care se ingerea
 - un singur număr, nu două. Un plafon pe imagine are sens doar dacă e mai mic decât
   cel pe rulare, iar nimic din date nu justifică o anumită valoare mai mică (pe 23
   octombrie cea mai mare imagine, `waha` cu 1602, avea 64% din bugetul de atunci,
-  2500, și are 27% din cel de azi);
+  2500, și are 18% din cel de azi, 9000, față de 27% din cel de 6000);
 - suma pe rulare rămâne ca margine a cât scrie o noapte și ca alarmă dacă trivy
   încetează să respecte `--severity`, **nu** ca protecție a panoului (rândurile
   unei imagini sărite rămân deschise, deci sunt în panou oricum) și nu ca
-  protecție de memorie. Valoarea e **6000** din 23 octombrie 2026 (era 2500), la
-  decizia operatorului. Un plafon lipit de flotă cade la prima treaptă: cea mai mare
+  protecție de memorie. Valoarea e **9000** din 18 noiembrie 2026 (6000 din 23
+  octombrie, 2500 înainte), la decizia operatorului: pe 18 noiembrie flota a
+  trecut de 6000 cu 13 (3185 ingerate + `waha` 2828), cu o pantă de ~280 de
+  constatări pe noapte pe toate imaginile, nu o treaptă. 9000 nu rezolvă panta
+  (se atinge în ~11 nopți, extrapolare liniară) — o suportă rotația de mai sus. Un plafon lipit de flotă cade la prima treaptă: cea mai mare
   din seria `scans` (55 de rulări) e de 2,107×, pe 16 → 17 octombrie, iar 2532 ×
   2,107 = 5335 — un buget de 5000, propus întâi, nu o acoperea. Atunci
   `scan:last:trivy_image` trece `degraded`, runner-ul alertează, iar imaginea scoasă
