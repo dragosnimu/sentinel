@@ -70,6 +70,119 @@ su_check_update_state() {
 }
 
 # ---------------------------------------------------------------------------
+# Gestionarul de pachete (dnf pe familia RHEL, apt pe Debian/Ubuntu)
+# ---------------------------------------------------------------------------
+# Formele de ieșire de mai jos (apt-get -s, grub.cfg, history.log, dpkg-query) sunt MĂSURATE pe n8n.srv1051579.hstgr.cloud
+# (Ubuntu 24.04, apt 2.8.4) pe 24 noiembrie 2026, doar citire. Fiecare funcție e o decizie pură: măsurătoarea vine ca argument sau pe stdin.
+
+# su_pkgmgr_family ID ID_LIKE — familia după /etc/os-release: apt | dnf | unknown.
+# O gazdă care se declară în ambele familii, ori în niciuna cunoscută (SUSE, Alpine, Arch), e `unknown`: nu se ghicește.
+su_pkgmgr_family() {
+    local id="${1:-}" like="${2:-}" w apt=0 dnf=0
+    id="${id,,}"; like="${like,,}"
+    for w in $id $like; do
+        case "$w" in
+            debian|ubuntu|raspbian|linuxmint|pop) apt=1 ;;
+            rhel|centos|fedora|almalinux|rocky|ol|amzn) dnf=1 ;;
+        esac
+    done
+    if (( apt && ! dnf )); then echo apt
+    elif (( dnf && ! apt )); then echo dnf
+    else echo unknown
+    fi
+}
+
+# su_pkgmgr_decide FAMILIE ARE_DNF ARE_APT — apt | dnf | unknown | no-binary.
+# Familia din os-release SPUNE ce gestionar are gazda; binarul trebuie să existe și el. O familie apt pe care lipsește apt-get (sau una dnf fără dnf)
+# e `no-binary`, nu «folosesc celălalt»: două surse care nu se potrivesc nu se rezolvă prin alegerea uneia.
+su_pkgmgr_decide() {
+    case "${1:-}" in
+        apt) [[ "${3:-0}" == 1 ]] && echo apt || echo no-binary ;;
+        dnf) [[ "${2:-0}" == 1 ]] && echo dnf || echo no-binary ;;
+        *)   echo unknown ;;
+    esac
+}
+
+# su_apt_sim_names KIND < ieșirea lui `apt-get -s` — numele pachetelor de pe liniile `Inst` / `Remv`.
+su_apt_sim_names() {
+    awk -v k="${1:-Inst}" '$1 == k { print $2 }' | LC_ALL=C sort -u
+}
+
+# su_apt_kept_back < ieșirea lui `apt-get -s` — pachetele din secțiunea «kept back» (pe hold, în fază sau blocate de dependențe).
+su_apt_kept_back() {
+    awk '/^The following packages? (have been|was) kept back:/ { on = 1; next }
+         on && /^[[:space:]]/ { for (i = 1; i <= NF; i++) print $i; next }
+         { on = 0 }' | LC_ALL=C sort -u
+}
+
+# su_apt_kernel_pending < ieșirea lui `apt-get -s` — 0 dacă simularea INSTALEAZĂ un pachet linux-image-<versiune>.
+su_apt_kernel_pending() {
+    awk '$1 == "Inst" && $2 ~ /^linux-image-[0-9]/ { f = 1 } END { exit !f }'
+}
+
+# su_apt_pkglist < `dpkg-query -W -f='${db:Status-Abbrev}|${binary:Package}=${Version}\n'` — doar pachetele INSTALATE (ii, hi), sortate.
+# Un pachet scos dar cu fișiere de configurare rămase (`rc`) nu e instalat și nu intră în comparația dinainte/după.
+su_apt_pkglist() {
+    awk -F'|' '$1 ~ /^[hi]i/ && $2 != "" { print $2 }' | LC_ALL=C sort
+}
+
+# su_apt_unclean < `dpkg-query -W -f='${db:Status-Abbrev}|${binary:Package}\n'` — pachetele a căror stare NU e una stabilă:
+# ii (instalat), hi (instalat, pe hold), un/pn (necunoscut/purjat), rc (scos, configurația a rămas). Orice altceva (iU despachetat, iF configurat pe
+# jumătate, iH instalat pe jumătate, iW/it în așteptarea declanșatoarelor, ri…) înseamnă că dpkg a lăsat ceva neterminat.
+su_apt_unclean() {
+    awk -F'|' '$1 !~ /^(ii|hi|un|pn|rc) ?$/ && $1 != "" { print $1 "|" $2 }'
+}
+
+# su_apt_kernel_versions FLAVOR < `dpkg-query -W -f='${db:Status-Abbrev}|${Package}|${Version}\n' 'linux-image-[0-9]*'`
+# — versiunile INSTALATE (nu `deinstall … config-files`: gazda de test are 25 de linii de felul ăsta) ale variantei de nucleu care rulează (`-generic`).
+su_apt_kernel_versions() {
+    awk -F'|' -v fl="${1:-}" '$1 ~ /^[hi]i/ && $2 ~ /^linux-image-[0-9]/ { v = $2; sub(/^linux-image-/, "", v); if (fl == "" || v ~ ("-" fl "$")) print v }'
+}
+
+# su_grub_default_is_first VALOARE — GRUB_DEFAULT arată prima intrare (gol sau 0)? 0 da, 1 nu (saved, un id, un număr).
+# Doar atunci prima intrare din grub.cfg e nucleul care pornește; altfel NU știm care e, și spunem asta.
+su_grub_default_is_first() {
+    local v="${1:-}"
+    v="${v#\"}"; v="${v%\"}"; v="${v#\'}"; v="${v%\'}"
+    [[ -z "$v" || "$v" == 0 ]]
+}
+
+# su_apt_grub_default_kernel < grub.cfg — /boot/vmlinuz-<versiune> din PRIMA intrare de nivel superior (nu din submeniul «Advanced options»).
+# 1 dacă nu se găsește o linie `linux` cu un fișier vmlinuz-* înainte de a doua intrare ori de submeniu.
+su_apt_grub_default_kernel() {
+    awk '/^menuentry[[:space:]]/ { if (seen) exit; seen = 1; next }
+         /^submenu[[:space:]]/ { exit }
+         seen && ($1 == "linux" || $1 == "linuxefi") { n = $2; sub(/.*\//, "", n); if (n ~ /^vmlinuz-/) { print "/boot/" n; found = 1 } exit }
+         END { exit !found }'
+}
+
+# su_apt_reboot_state FIȘIER_EXISTĂ CÂRLIG_EXISTĂ — yes | no | unknown.
+# /var/run/reboot-required îl scrie cârligul pachetului update-notifier-common la fiecare instalare care cere reboot. Fișierul PREZENT = reboot
+# necesar. Fișierul ABSENT dovedește «nu» doar dacă cârligul care l-ar fi scris există: fără el, absența nu înseamnă nimic (Debian de bază nu-l are).
+su_apt_reboot_state() {
+    if [[ "${1:-0}" == 1 ]]; then echo yes
+    elif [[ "${2:-0}" == 1 ]]; then echo no
+    else echo unknown
+    fi
+}
+
+# su_apt_history_verdict ÎNAINTE DUPĂ ULTIMUL — ce spune /var/log/apt/history.log despre rularea de acum.
+#   ÎNAINTE/DUPĂ = numărul de blocuri `Start-Date:`; ULTIMUL = ok | unfinished | error | ? (starea ultimului bloc).
+#   none | new-ok | new-unfinished | new-error | unknown
+su_apt_history_verdict() {
+    local b="${1:-}" a="${2:-}" last="${3:-?}"
+    [[ "$b" =~ ^[0-9]+$ && "$a" =~ ^[0-9]+$ ]] || { echo unknown; return 0; }
+    (( a >= b )) || { echo unknown; return 0; }    # jurnalul s-a rotit între cele două citiri
+    (( a > b )) || { echo none; return 0; }
+    case "$last" in
+        ok)         echo new-ok ;;
+        unfinished) echo new-unfinished ;;
+        error)      echo new-error ;;
+        *)          echo unknown ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # Containere
 # ---------------------------------------------------------------------------
 

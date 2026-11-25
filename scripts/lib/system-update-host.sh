@@ -75,6 +75,19 @@
 # inactive/failed de DOUĂ ori la rând și nu există rezultat; o stare necitibilă (daemon-reexec în tranzacția dnf) se așteaptă,
 # cel mult SU_FOLLOW_UNREADABLE_S secunde (120), apoi e «necunoscut» (3).
 #
+# Gestionarul de pachete: dnf (AlmaLinux/RHEL/Rocky/Fedora) sau apt (Debian/Ubuntu), stabilit O DATĂ în init_state (pkg_detect, system-update-measure.sh)
+# din /etc/os-release ȘI din binarele care trebuie să existe; preflight îl scrie în baseline (pkgmgr.kv), iar os/reboot/verify refuză un baseline luat cu
+# altul. Pe orice altă gazdă fazele pe pachete ies cu 1 înainte de orice atingere. Echivalențele (fiecare cu dovada ei, nu cu codul de ieșire):
+#   dnf makecache --refresh        apt-get update (ieșirea citită: `Err:`/`E:` cu cod 0 = depozit căzut)
+#   dnf check-update               apt-get -s dist-upgrade (liniile Inst/Remv; «kept back»)
+#   dnf upgrade --refresh -y       apt-get dist-upgrade --no-remove, DEBIAN_FRONTEND=noninteractive, --force-confdef --force-confold, DPkg::Lock::Timeout
+#   dnf history (Return-Code)      /var/log/apt/history.log (bloc nou, End-Date, fără Error:)
+#   rpm -qa / dnf check            dpkg-query (ii/hi) / dpkg --audit + starea fiecărui pachet + apt-get check
+#   grubby --default-kernel        prima intrare din grub.cfg, doar dacă GRUB_DEFAULT=0 (altfel «nu știu»)
+#   needs-restarting -r            /var/run/reboot-required (absența dovedește «nu» doar cu cârligul update-notifier-common)
+#   initramfs-<v>.img              initrd.img-<v>
+# Pachetele pe hold (apt-mark showhold) nu se ating și se dovedește că au rămas la fel.
+#
 # Regula de la care pleacă tot ce e mai jos (CLAUDE.md): fiecare pas care raportează
 # succes îl raportează pe baza unui FAPT observabil, nu a intenției. Un cod de ieșire
 # nu e dovadă de efect (dnf ieșit cu 0 nu dovedește un nucleu nou, `docker compose up`
@@ -136,6 +149,15 @@ BASE=""
 ORIG_ARGS=()
 OPT_IGNORE_OS_STATE=0; OPT_NEW_BASELINE=0; OPT_STALE_OK=0; OPT_DRY_RUN=0; OPT_YES=0; OPT_FORCE=0; OPT_KEEP_GOING=0
 OPT_REBUILD=""; OPT_ACCEPT_DRIFT=""; OPT_ONLY=""; OPT_RETRY_FAILED=""; OPT_ACKNOWLEDGE=""
+
+# Gestionarul de pachete (dnf | apt | unknown): detectat o dată, în init_state, din /etc/os-release + binare (pkg_detect, system-update-measure.sh).
+PKG_MGR=""; PKG_WHY=""; PKG_OS_ID=""; PKG_OS_LIKE=""; PKG_DB=rpm; PKG_LIST_FILE=rpm-qa.txt; PKG_LIST_CMD="rpm -qa"
+KLIST_CMD="rpm -q kernel-core"; KDEF_NAME=grubby; KDEF_CMD="grubby --default-kernel"; REBOOT_PROBE_NAME="needs-restarting -r"
+APT_LOCK_TIMEOUT_S="${SU_APT_LOCK_TIMEOUT_S:-900}"     # cât așteaptă apt-get blocarea dpkg și cât se reîncearcă `update` (unattended-upgrades pornește zilnic, la ore aleatorii)
+# Ce arată că o tranzacție apt rulează ACUM: blocările pe care le iau apt/dpkg (NU numele proceselor: `unattended-upgrade-shutdown` stă pornit luni întregi,
+# iar packagekitd rămâne ~5 min după fiecare `apt-get update`, fără nicio blocare) și unitățile care pornesc `apt-get update`/`unattended-upgrade`.
+APT_LOCK_FILES="/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock"
+APT_TXN_UNITS="apt-daily.service apt-daily-upgrade.service"
 
 WARN_N=0; FAIL_N=0; UNK_N=0
 ACK_N=0    # servicii recunoscute de operator (--acknowledge) și încă nerezolvate în fapt: rezultatul spune asta, nu «TOTUL DOVEDIT»
@@ -228,7 +250,31 @@ init_state() {
     RESULT_FILE="${SU_STATE}/runs/${PHASE}-${RUN_ID}.result"
     LOG_FILE="${SU_STATE}/runs/${PHASE}-${RUN_ID}.log"
     [[ -L "${SU_STATE}/current" ]] && BASE="$(readlink -f "${SU_STATE}/current")" || BASE=""
+    pkg_detect
 }
+
+# Fazele care ating pachetele (preflight, os, reboot, verify) cer un gestionar DETECTAT din fapte. Pe o gazdă care nu e nici dnf, nici apt, refuză cu
+# ieșire 1 înainte de orice atingere: a alege unul «cel mai apropiat» ar rula comenzile greșite peste o gazdă de producție.
+pkg_require() {
+    case "$PKG_MGR" in
+        dnf|apt) return 0 ;;
+    esac
+    die "nu pot stabili gestionarul de pachete al gazdei: ${PKG_WHY:-necunoscut}. Sunt acceptate doar dnf (AlmaLinux/RHEL/Rocky/Fedora) și apt (Debian/Ubuntu); refuz, nu ghicesc"
+}
+
+# Baseline-ul își notează gestionarul (pkgmgr.kv, scris la preflight): un baseline luat sub apt nu se judecă cu dnf sau invers. Un baseline FĂRĂ
+# pkgmgr.kv e unul din vremea în care exista doar dnf — se acceptă doar pe o gazdă dnf.
+pkg_check_baseline() {
+    local rec=""
+    [[ -f "${BASE}/pkgmgr.kv" ]] && rec="$(kv_get "${BASE}/pkgmgr.kv" manager)"
+    if [[ -z "$rec" ]]; then
+        [[ "$PKG_MGR" == dnf ]] || die "baseline-ul ${BASE##*/} n-are pkgmgr.kv (luat înainte de suportul apt), iar gazda e ${PKG_MGR} — rulează întâi: preflight --new-baseline"
+        return 0
+    fi
+    [[ "$rec" == "$PKG_MGR" ]] || die "baseline-ul ${BASE##*/} a fost luat cu ${rec}, dar gazda e acum ${PKG_MGR} — nu le judec unul cu celălalt; rulează: preflight --new-baseline"
+}
+
+require_pkg_baseline() { require_baseline; pkg_require; pkg_check_baseline; }
 
 # Faza cere un baseline COMPLET: fără el, «nu mai rău decât înainte» n-are față de ce.
 require_baseline() {
@@ -254,6 +300,58 @@ pf_check_dnf_idle() {
     if [[ -e /var/run/dnf.pid ]]; then
         say_bad "/var/run/dnf.pid există — o tranzacție dnf e în curs sau a rămas agățată"
     fi
+}
+
+# apt_busy_now — rulează ACUM o tranzacție apt? Iese cu 0 (ocupat; motivele pe stdout), 1 (liber) sau 2 (nu pot afla).
+# Întrebarea e «ține cineva blocarea dpkg/apt?», nu «există un proces cu numele apt?»: măsurat pe n8n.srv1051579.hstgr.cloud (24 nov 2026), procesul
+# `unattended-upgrade-shutdown --wait-for-signal` (pid 829) rulează de 37 de zile fără nicio blocare, iar packagekitd rămâne ~5 min după fiecare `apt-get
+# update` tot fără blocări; o potrivire pe nume ar fi făcut preflight/os/reboot să aștepte 300 s și să iasă 1 de fiecare dată. `lslocks` (util-linux)
+# citește blocările din nucleu (și POSIX, cum ia dpkg, și flock) fără să le ia; e în util-linux, deci pe orice Debian/Ubuntu. Fără el: «nu pot afla» (2).
+apt_busy_now() {
+    local out why="" u st
+    if have lslocks; then
+        out="$(lslocks -n -o COMMAND,PID,PATH)" || return 2
+        why="$(awk -v files=" ${APT_LOCK_FILES} " 'NF >= 3 { p = $NF; if (index(files, " " p " ")) print $1 " (pid " $(NF - 1) ") ține " p }' <<< "$out")"
+    else
+        printf 'lslocks (util-linux) lipsește de pe gazdă'; return 2     # fără el nu citim blocările: «nu pot afla», nu «liber»
+    fi
+    for u in $APT_TXN_UNITS; do
+        st="$(systemctl show -p ActiveState --value "$u")" || return 2
+        case "$st" in active|activating|deactivating|reloading) why+="unitatea ${u} e ${st}"$'\n' ;; esac
+    done
+    printf '%s' "$why"
+    [[ -z "$why" ]] || return 0
+    return 1
+}
+
+# apt: așteptare MĂRGINITĂ, nu refuz pe loc. `unattended-upgrades` pornește zilnic (apt-daily-upgrade.timer, ore aleatorii: 06:11 azi, 06:46 mâine) și ține blocarea
+# dpkg; o actualizare pornită în fereastra lui trebuie să aștepte, nu să cadă și nici să se bată cu el. După SU_APT_IDLE_WAIT_S secunde fără liniște, e roșu.
+# `apt-get dist-upgrade` primește și `-o DPkg::Lock::Timeout` pentru cursa dintre verificare și pornire.
+pf_check_apt_idle() {
+    local rc found waited=0 limit="${SU_APT_IDLE_WAIT_S:-300}" step="${SU_APT_IDLE_STEP_S:-5}"
+    while :; do
+        rc=0; found="$(apt_busy_now)" || rc=$?
+        case "$rc" in
+            1) if (( waited > 0 )); then say_ok "apt/dpkg s-au liniștit după ${waited}s (nicio blocare apt/dpkg)"; else say_ok "nicio tranzacție apt/dpkg nu rulează (nicio blocare ținută)"; fi
+               return 0 ;;
+            0) ;;
+            *) say_bad "nu pot afla dacă o tranzacție apt/dpkg rulează (${found:-lslocks/systemctl au eșuat}) — refuz, nu ghicesc"; return 0 ;;
+        esac
+        if (( waited >= limit )); then
+            say_bad "o tranzacție apt/dpkg rulează încă după ${waited}s (${found//$'\n'/; }) — nu pornesc o a doua tranzacție; reia după ce se termină (unattended-upgrades?)"
+            return 0
+        fi
+        (( waited > 0 )) || say_info "o tranzacție apt/dpkg rulează (${found//$'\n'/; }) — aștept până la ${limit}s să se termine"
+        sleep "$step"; waited=$((waited + step))
+        (( step > 0 )) || waited=$((waited + 1))
+    done
+}
+
+pf_check_pkg_idle() {
+    case "$PKG_MGR" in
+        apt) pf_check_apt_idle ;;
+        *)   pf_check_dnf_idle ;;
+    esac
 }
 
 # Un baseline NOU luat cu --new-baseline după ce faza `os` a reușit (calea documentată când `containers` refuză un serviciu cu baseline
@@ -299,20 +397,20 @@ carry_forward_os_explanation() {
 
 pf_check_pending_reboot() {
     local out rc=0 state def running first_line
-    out="$(needs-restarting -r 2>&1)" || rc=$?
+    out="$(reboot_probe 2>&1)" || rc=$?
     first_line="$(awk 'NR == 1' <<< "$out")"   # prima linie, fără conductă care se poate închide
     state="$(su_reboot_needed_from_rc "$rc")"
     case "$state" in
-        no)  say_ok "niciun reboot în așteptare (needs-restarting -r)" ;;
+        no)  say_ok "niciun reboot în așteptare (${REBOOT_PROBE_NAME})" ;;
         yes) if pf_reboot_explained_by_os; then
                  say_warn "un reboot e necesar (${first_line}), dar baseline-ul înlocuit are faza os încheiată cu succes dovedit (os.ok) și niciun reboot cerut: îl explică actualizarea de sistem de acum, nu o problemă separată. Reboot-ul rămâne de făcut (--phase reboot) după ce containerele sunt la zi"
              else
                  say_bad "un reboot e DEJA necesar, înainte de orice schimbare de-a noastră: ${first_line}. Nu ghicesc dacă are legătură cu actualizarea — decide separat (repornește sau investighează), apoi rulează din nou preflight"
              fi ;;
-        *)   say_bad "nu pot afla dacă un reboot e în așteptare (needs-restarting -r a ieșit cu ${rc}: ${first_line}) — refuz, nu ghicesc" ;;
+        *)   say_bad "nu pot afla dacă un reboot e în așteptare (${REBOOT_PROBE_NAME} a ieșit cu ${rc}: ${first_line}) — refuz, nu ghicesc" ;;
     esac
     running="$(uname -r)"
-    def="$(grubby --default-kernel)" || def=""
+    def="$(default_kernel)" || def=""
     su_kernel_matches_default "$running" "$def" && rc=0 || rc=$?
     case "$rc" in
         0) say_ok "nucleul care rulează (${running}) e cel implicit la pornire" ;;
@@ -321,7 +419,7 @@ pf_check_pending_reboot() {
            else
                say_bad "nucleul care rulează (${running}) NU e cel implicit la pornire (${def}) — o repornire nefinalizată; lămurește-o înainte"
            fi ;;
-        *) say_bad "nu pot citi nucleul implicit (grubby --default-kernel) — refuz, nu ghicesc" ;;
+        *) say_bad "nu pot citi nucleul implicit (${KDEF_CMD}) — refuz, nu ghicesc" ;;
     esac
 }
 
@@ -350,6 +448,45 @@ pf_check_disk() {
 # `dnf upgrade --refresh` să cadă întreg. Aflat aici, nu la jumătatea ferestrei.
 # NU se adaugă `--setopt=skip_if_unavailable=True`: ar actualiza pe metadate parțiale.
 pf_check_repos() {
+    case "$PKG_MGR" in
+        apt) pf_check_repos_apt ;;
+        *)   pf_check_repos_dnf ;;
+    esac
+}
+
+# apt-get update: scrie doar în /var/lib/apt/lists. Codul 0 NU dovedește că toate listele s-au adus (un depozit căzut dă adesea doar «W: Failed to fetch»
+# și 0), deci ieșirea se citește: orice `Err:`, `E:` sau «Failed to fetch» e roșu — nu rulăm upgrade-ul pe liste parțiale (aceeași regulă ca la dnf).
+# `apt-get update` NU primește `-o DPkg::Lock::Timeout`: opțiunea e a blocării dpkg, iar apt 2.8.4 ia blocarea listelor (/var/lib/apt/lists/lock) fără timeout și iese
+# imediat cu «Could not get lock». De aceea așteptarea e aici: o reîncercare mărginită (APT_LOCK_TIMEOUT_S) DOAR pe eroarea de blocare a listelor; orice altă
+# eroare (depozit căzut, rețea) nu se reîncearcă.
+apt_refresh() {
+    local rc waited=0 step="${SU_APT_IDLE_STEP_S:-5}"
+    while :; do
+        rc=0
+        APT_REFRESH_OUT="$(timeout 1200 apt-get update -o APT::Update::Error-Mode=any 2>&1)" || rc=$?
+        APT_REFRESH_RC="$rc"
+        if (( rc != 0 && waited < APT_LOCK_TIMEOUT_S )) && grep -qE 'Could not get lock /var/lib/apt/lists/lock|Unable to lock directory /var/lib/apt/lists' <<< "$APT_REFRESH_OUT"; then
+            sleep "$step"; waited=$((waited + step))
+            (( step > 0 )) || waited=$((waited + 1))
+            continue
+        fi
+        break
+    done
+    (( rc == 0 )) || return 1
+    if grep -qE '^(Err:|E: |W: (Failed to fetch|Some index files failed))' <<< "$APT_REFRESH_OUT"; then return 1; fi
+    return 0
+}
+
+pf_check_repos_apt() {
+    say_info "reîmprospătez listele apt (scrie doar în /var/lib/apt/lists)"
+    if apt_refresh; then
+        say_ok "toate depozitele au răspuns (apt-get update, fără Err:/E:)"
+    else
+        say_bad "apt-get update a eșuat sau a raportat depozite căzute (cod ${APT_REFRESH_RC}): $(grep -E '^(Err:|E: |W: )' <<< "$APT_REFRESH_OUT" | tail -n 3 | tr '\n' ' ') — nu rulez actualizarea pe liste parțiale"
+    fi
+}
+
+pf_check_repos_dnf() {
     local out rc=0
     say_info "reîmprospătez metadatele dnf (scrie doar în /var/cache/dnf)"
     out="$(timeout 1200 dnf -q makecache --refresh 2>&1)" || rc=$?
@@ -416,9 +553,9 @@ baseline_overwrite_markers() {
 }
 
 phase_preflight() {
-    need_root
+    need_root; pkg_require
     say_sect "Preflight"
-    pf_check_dnf_idle
+    pf_check_pkg_idle
     pf_check_pending_reboot
     pf_check_disk
     pf_check_docker
@@ -598,19 +735,28 @@ write_episode_records() {
     return 0
 }
 
+# Gestionarul cu care s-a luat baseline-ul, scris înainte de orice măsurătoare (take_snapshot își alege fișierele după el).
+record_pkgmgr() {
+    printf 'manager=%s\nos_id=%s\nos_id_like=%s\n' "$PKG_MGR" "$PKG_OS_ID" "$PKG_OS_LIKE" > "${1}/pkgmgr.kv"
+}
+
 snapshot_and_publish() {
     local prev_base="${1:-}" stamp dir unknown live recorded name
     stamp="$(date -u +%Y%m%dT%H%M%SZ)"
     dir="${SU_STATE}/snapshots/${stamp}"
     mkdir -p "${dir}.tmp"
     say_sect "Baseline (${stamp})"
+    record_pkgmgr "${dir}.tmp"
     unknown="$(take_snapshot "${dir}.tmp")"
     for name in "${dir}.tmp"/*.unknown; do
         [[ -e "$name" ]] || continue
         say_unk "baseline: nu am putut măsura $(basename "${name%.unknown}"): $(head -n 1 "$name")"
     done
     printf 'stamp=%s\nrun=%s\nunknown_measures=%s\n' "$stamp" "$RUN_ID" "$unknown" > "${dir}.tmp/meta.kv"
-    rpm -q --qf '%{NAME}-%{VERSION}\n' docker-ce 2> /dev/null > "${dir}.tmp/docker-version.txt" || true
+    case "$PKG_MGR" in
+        apt) dpkg-query -W -f='${Package}-${Version}\n' docker-ce 2> /dev/null > "${dir}.tmp/docker-version.txt" || true ;;
+        *)   rpm -q --qf '%{NAME}-%{VERSION}\n' docker-ce 2> /dev/null > "${dir}.tmp/docker-version.txt" || true ;;
+    esac
     docker compose ls -a > "${dir}.tmp/compose-ls.txt" || say_warn "docker compose ls a eșuat — lista proiectelor nu e în înregistrare"
     : > "${dir}.tmp/COMPLETE"
     mv "${dir}.tmp" "$dir"
@@ -840,16 +986,28 @@ dnf_last_txn_id() {
 }
 
 phase_os() {
-    need_root; require_baseline
+    need_root; require_pkg_baseline
     say_sect "Actualizare sistem (os)"
     require_backup_gate
     local lock_cu lock_bk
     take_lock lock_cu "${SU_RUN_DIR}/container-update.lock" "actualizarea săptămânală a containerelor"
     take_lock lock_bk "${SU_RUN_DIR}/srv-backup.lock" "backup-ul zilnic"
-    pf_check_dnf_idle
+    pf_check_pkg_idle
     pf_check_disk
     (( FAIL_N == 0 )) || finish
 
+    case "$PKG_MGR" in
+        apt) os_run_apt ;;
+        *)   os_run_dnf ;;
+    esac
+    # os.ok = succes DOVEDIT (ieșire 0). O fază încheiată «necunoscut» (3) nu l-a dovedit: fără acest fișier, poarta
+    # de reboot nu mai spune «succes dovedit» peste ceva ce n-a putut fi măsurat.
+    # os.ok poartă boot_id-ul de acum: explicația «reboot-ul îl cere os» (pf_reboot_explained_by_os) e valabilă doar cât gazda n-a repornit.
+    if (( FAIL_N == 0 && UNK_N == 0 )); then mark_phase os.ok; printf 'boot_id=%s\n' "$(current_boot_id)" >> "${BASE}/phases/os.ok"; fi
+    finish
+}
+
+os_run_dnf() {
     local pending_n=0 kernel_expected=no hist_before rc=0 excl live_out live_rc=0
     # Ce e în așteptare ACUM, nu ce era la baseline: la o a doua rulare, după ce prima a reușit,
     # lista din baseline e veche, iar «dnf n-a schimbat nimic» ar părea o minciună a lui dnf.
@@ -881,11 +1039,163 @@ phase_os() {
     os_check_residual "$rc"
     os_check_kernel "$kernel_expected"
     os_check_services
-    # os.ok = succes DOVEDIT (ieșire 0). O fază încheiată «necunoscut» (3) nu l-a dovedit: fără acest fișier, poarta
-    # de reboot nu mai spune «succes dovedit» peste ceva ce n-a putut fi măsurat.
-    # os.ok poartă boot_id-ul de acum: explicația «reboot-ul îl cere os» (pf_reboot_explained_by_os) e valabilă doar cât gazda n-a repornit.
-    if (( FAIL_N == 0 && UNK_N == 0 )); then mark_phase os.ok; printf 'boot_id=%s\n' "$(current_boot_id)" >> "${BASE}/phases/os.ok"; fi
-    finish
+}
+
+# ---------------------------------------------------------------------------
+# os pe apt (Debian/Ubuntu)
+# ---------------------------------------------------------------------------
+# De ce `dist-upgrade` și nu `upgrade`: un nucleu nou e un pachet NOU (linux-image-<versiune>), iar `apt-get upgrade` nu instalează niciodată pachete noi — ar
+# lăsa meta-pachetul linux-image-virtual «kept back» și ar raporta «actualizat» cu nucleul vechi (măsurat: simularea de pe gazdă instalează 6 pachete noi,
+# printre ele linux-image-6.8.0-151-generic). Prețul lui `dist-upgrade` e că poate ȘTERGE pachete ca să rezolve conflicte: de aceea (1) simularea se citește
+# înainte și orice linie `Remv` oprește faza, iar (2) upgrade-ul real primește `--no-remove`, deci apt-get însuși refuză, nu doar scriptul.
+# Nimic nu se «deține» (`apt-mark unhold`, `--allow-change-held-packages`, `--allow-downgrades`): un pachet pe hold rămâne pe hold, iar faza dovedește asta.
+# Fișierele de configurare ale operatorului rămân (`--force-confdef --force-confold`); fără ele dpkg așteaptă la un prompt pe care nimeni nu-l vede (unitate detașată).
+# needrestart (instalat implicit pe Ubuntu) ar reporni în mod automat serviciile cu biblioteci vechi: NEEDRESTART_MODE=l îl lasă doar să LISTEZE — ca la dnf,
+# serviciile cu cod vechi se curăță la reboot, nu printr-o repornire pe care n-a cerut-o nimeni.
+apt_upgrade_cmd() {
+    nolock env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l APT_LISTCHANGES_FRONTEND=none \
+        apt-get -y --no-remove -o "DPkg::Lock::Timeout=${APT_LOCK_TIMEOUT_S}" \
+        -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade
+}
+
+APT_HISTORY="${SU_APT_HISTORY:-/var/log/apt/history.log}"
+# Numărul de blocuri `Start-Date:` din history.log (gol = necitibil). Un `grep -c` fără potriviri iese cu 1 și tipărește 0: nu e eroare.
+apt_history_count() {
+    local n
+    [[ -r "$APT_HISTORY" ]] || return 0
+    n="$(grep -c '^Start-Date:' "$APT_HISTORY" || true)"
+    printf '%s' "$n"
+}
+# Starea ULTIMULUI bloc: ok (are End-Date, fără Error:) | unfinished (apt a murit înainte de End-Date) | error (blocul are o linie Error:) | ?
+apt_history_last_state() {
+    [[ -r "$APT_HISTORY" ]] || { echo '?'; return 0; }
+    awk '/^Start-Date:/ { have = 1; ended = 0; err = 0 } /^End-Date:/ { ended = 1 } /^Error:/ { err = 1 }
+         END { if (!have) print "?"; else if (err) print "error"; else if (ended) print "ok"; else print "unfinished" }' "$APT_HISTORY"
+}
+
+# Pachetele pe hold, cu versiunea lor: `nume=versiune`, sortat. Iese cu 1 dacă hold-urile nu se pot citi (necunoscut, nu «niciunul»).
+apt_held_state() {
+    local holds p v acc=""
+    holds="$(apt-mark showhold)" || return 1
+    while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        v="$(dpkg-query -W -f='${Package}=${Version}\n' "$p")" || return 1     # fără conductă: un `return` dintr-o conductă n-ar ieși din funcție
+        acc+="${v}"$'\n'
+    done <<< "$holds"
+    printf '%s' "$acc" | LC_ALL=C sort
+}
+
+os_run_apt() {
+    local pending_n=0 kernel_expected=no hist_before rc=0 sim sim_rc=0 removals held_before held_known=1
+    say_info "apt-get update — listele se reîmprospătează ÎNAINTE de simulare (scrie doar în /var/lib/apt/lists)"
+    if ! apt_refresh; then
+        say_bad "apt-get update a eșuat sau a raportat depozite căzute (cod ${APT_REFRESH_RC}): $(grep -E '^(Err:|E: |W: )' <<< "$APT_REFRESH_OUT" | tail -n 3 | tr '\n' ' ') — nu rulez upgrade-ul pe liste parțiale"
+        finish
+    fi
+    sim="$(apt_simulate)" || sim_rc=$?
+    if (( sim_rc != 0 )); then
+        say_bad "apt-get -s dist-upgrade a ieșit cu ${sim_rc} — nu știu ce ar face upgrade-ul (poate șterge pachete?); refuz să-l rulez"
+        finish
+    fi
+    removals="$(su_apt_sim_names Remv <<< "$sim")"
+    if [[ -n "$removals" ]]; then
+        say_bad "dist-upgrade ar ȘTERGE pachete: $(tr '\n' ' ' <<< "$removals")— nu o fac singură; citește simularea (apt-get -s dist-upgrade) și decide tu"
+        finish
+    fi
+    pending_n="$(su_apt_sim_names Inst <<< "$sim" | wc -l)"
+    if su_apt_kernel_pending <<< "$sim"; then kernel_expected=yes; fi
+    held_before="$(apt_held_state)" || { held_known=0; say_unk "nu pot citi pachetele pe hold (apt-mark showhold) — nu pot dovedi că rămân neatinse"; }
+    if (( held_known )); then
+        if [[ -n "$held_before" ]]; then say_info "pachete pe hold (rămân neatinse, nu le deblochez): $(tr '\n' ' ' <<< "$held_before")"; else say_info "niciun pachet pe hold"; fi
+    fi
+    hist_before="$(apt_history_count)"
+    mark_phase os.started
+
+    say_info "apt-get dist-upgrade — ${pending_n} pachete în simulare; blocarea dpkg se așteaptă până la ${APT_LOCK_TIMEOUT_S}s; poate dura zeci de minute"
+    apt_upgrade_cmd || rc=$?
+    say_info "apt-get a ieșit cu ${rc} — codul nu e dovadă; efectul se verifică mai jos"
+    (( rc == 0 )) || say_bad "apt-get dist-upgrade a ieșit cu ${rc}"
+
+    os_check_transaction_apt "$hist_before" "$pending_n" "$rc"
+    os_check_packages "$pending_n"
+    os_check_residual_apt
+    os_check_kernel "$kernel_expected"
+    if (( held_known )); then os_check_held "$held_before"; fi
+    os_check_services
+}
+
+# Fapt 1 (apt): history.log a primit un bloc NOU, încheiat (End-Date) și fără linie `Error:`.
+os_check_transaction_apt() {
+    local before="$1" pending="$2" rc="$3" after last
+    after="$(apt_history_count)"; last="$(apt_history_last_state)"
+    case "$(su_apt_history_verdict "$before" "$after" "$last")" in
+        unknown)         say_unk "nu pot citi ${APT_HISTORY} (înainte: '${before}', după: '${after}', ultimul bloc: ${last}) — nu pot dovedi că a existat o tranzacție" ;;
+        none)
+            if (( pending == 0 && rc == 0 )); then
+                say_ok "nimic de actualizat și niciun bloc nou în history.log (${after} blocuri) — rulare repetată, no-op dovedit"
+            elif (( pending > 0 && rc == 0 )); then
+                say_bad "apt-get a ieșit cu 0 dar history.log n-are niciun bloc nou (${after} blocuri) — ${pending} pachete erau în simulare"
+            else
+                say_info "niciun bloc nou în history.log (${after} blocuri)"
+            fi ;;
+        new-ok)          say_ok "history.log: tranzacție nouă, încheiată (End-Date) și fără Error:" ;;
+        new-unfinished)  say_bad "history.log: ultimul bloc n-are End-Date — apt a murit la jumătate; rulează: dpkg --audit; dpkg --configure -a" ;;
+        new-error)       say_bad "history.log: ultimul bloc conține o linie Error: — baza dpkg poate fi la jumătate; rulează: dpkg --audit; tail ${APT_HISTORY}" ;;
+    esac
+}
+
+# Fapt 3 (apt): ce a rămas, și dacă dpkg a lăsat ceva neterminat. Trei observatori care nu depind unul de altul: simularea (ce e încă de instalat), `dpkg --audit`
+# (pachete despachetate dar neconfigurate) și starea fiecărui pachet din baza dpkg (db:Status-Abbrev). Codul de ieșire 0 al lui apt-get nu intră în niciunul.
+os_check_residual_apt() {
+    local sim sim_rc=0 n kept held unheld out arc=0 states bad
+    sim="$(apt_simulate)" || sim_rc=$?
+    if (( sim_rc != 0 )); then
+        say_unk "apt-get -s dist-upgrade a ieșit cu ${sim_rc} — nu pot spune ce a rămas"
+    else
+        n="$(su_apt_sim_names Inst <<< "$sim" | wc -l)"
+        if (( n == 0 )); then
+            say_ok "apt-get -s dist-upgrade: nu a rămas nimic de instalat"
+        else
+            say_warn "au rămas ${n} pachete de actualizat (primele 15):"
+            su_apt_sim_names Inst <<< "$sim" | awk '{ print "    " $1; if (++c >= 15) exit }'
+            CHANGED_LIST+=("au rămas ${n} pachete neactualizate (vezi mai sus)")
+        fi
+        kept="$(su_apt_kept_back <<< "$sim")"
+        if [[ -n "$kept" ]]; then
+            held="$(apt-mark showhold || true)"
+            unheld="$(LC_ALL=C comm -23 <(printf '%s\n' "$kept") <(printf '%s\n' "$held" | LC_ALL=C sort -u) | awk 'NF')"
+            say_info "ținute înapoi de apt (kept back): $(tr '\n' ' ' <<< "$kept")"
+            [[ -z "$unheld" ]] || say_warn "kept back FĂRĂ să fie pe hold (actualizare în fază, dependențe blocate): $(tr '\n' ' ' <<< "$unheld")— nu le forțez"
+        fi
+    fi
+    out="$(dpkg --audit)" || arc=$?
+    if [[ -n "$out" ]]; then
+        say_bad "dpkg --audit raportează pachete neterminate: $(head -c 400 <<< "$out" | tr '\n' ' ') — rulează: dpkg --configure -a"
+    elif (( arc != 0 )); then
+        say_unk "dpkg --audit a ieșit cu ${arc} fără ieșire — nu pot spune că baza dpkg e curată"
+    else
+        say_ok "dpkg --audit: niciun pachet despachetat sau configurat pe jumătate"
+    fi
+    if states="$(dpkg-query -W -f='${db:Status-Abbrev}|${binary:Package}\n')"; then
+        bad="$(su_apt_unclean <<< "$states")"
+        if [[ -n "$bad" ]]; then say_bad "pachete într-o stare nestabilă în baza dpkg (stare|pachet): $(head -n 8 <<< "$bad" | tr '\n' ' ')"
+        else say_ok "baza dpkg: toate pachetele sunt într-o stare stabilă (ii/hi/rc/un/pn)"; fi
+    else
+        say_unk "nu pot citi starea pachetelor din dpkg-query — nu pot dovedi că nimic n-a rămas neconfigurat"
+    fi
+    if out="$(apt-get check 2>&1)"; then say_ok "apt-get check: nicio dependență ruptă"; else say_bad "apt-get check raportează dependențe rupte: $(tail -n 2 <<< "$out" | tr '\n' ' ')"; fi
+}
+
+# Pachetele pe hold n-au fost atinse: aceeași listă, aceleași versiuni (cloud-init e ținut pe gazda de test din motive ale operatorului).
+os_check_held() {
+    local before="$1" after
+    after="$(apt_held_state)" || { say_unk "nu pot citi pachetele pe hold după upgrade — nu pot dovedi că au rămas neatinse"; return 0; }
+    if [[ "$before" == "$after" ]]; then
+        if [[ -n "$after" ]]; then say_ok "pachetele pe hold au rămas neatinse (aceeași listă, aceleași versiuni): $(tr '\n' ' ' <<< "$after")"
+        else say_ok "niciun pachet pe hold, înainte și după"; fi
+    else
+        say_bad "pachetele pe hold s-au schimbat. Înainte: $(tr '\n' ' ' <<< "$before")| după: $(tr '\n' ' ' <<< "$after")"
+    fi
 }
 
 # Fapt 1: istoricul dnf a primit o tranzacție NOUĂ, încheiată cu Success.
@@ -917,17 +1227,17 @@ os_check_transaction() {
 os_check_packages() {
     local pending="$1" now changed
     now="$(mktemp)"
-    if ! m_rpm_qa > "$now"; then rm -f "$now"; say_unk "nu pot citi rpm -qa după actualizare"; return 0; fi
-    if [[ "$(base_state "${BASE}/rpm-qa.txt")" != measured ]]; then
-        rm -f "$now"; say_unk "rpm -qa din baseline lipsește — nu pot număra schimbările"; return 0
+    if ! m_pkg_list > "$now"; then rm -f "$now"; say_unk "nu pot citi ${PKG_LIST_CMD} după actualizare"; return 0; fi
+    if [[ "$(base_state "${BASE}/${PKG_LIST_FILE}")" != measured ]]; then
+        rm -f "$now"; say_unk "${PKG_LIST_CMD} din baseline lipsește — nu pot număra schimbările"; return 0
     fi
-    changed="$(su_new_lines "${BASE}/rpm-qa.txt" "$now" | wc -l)"
+    changed="$(su_new_lines "${BASE}/${PKG_LIST_FILE}" "$now" | wc -l)"
     rm -f "$now"
-    CHANGED_LIST+=("${changed} pachete instalate sau actualizate (rpm -qa față de baseline)")
+    CHANGED_LIST+=("${changed} pachete instalate sau actualizate (${PKG_LIST_CMD} față de baseline)")
     if (( pending > 0 && changed == 0 )); then
-        say_bad "baza rpm n-are niciun pachet schimbat față de baseline, deși ${pending} erau în așteptare"
+        say_bad "baza ${PKG_DB} n-are niciun pachet schimbat față de baseline, deși ${pending} erau în așteptare"
     else
-        say_ok "${changed} pachete diferă față de baseline în baza rpm"
+        say_ok "${changed} pachete diferă față de baseline în baza ${PKG_DB}"
     fi
 }
 
@@ -958,8 +1268,8 @@ os_check_residual() {
 os_check_kernel() {
     local expected="$1" newest def running why_files
     running="$(uname -r)"
-    newest="$(newest_installed_kernel)" || { say_unk "nu pot citi nucleele instalate (rpm -q kernel-core)"; return 0; }
-    def="$(grubby --default-kernel)" || { say_unk "nu pot citi nucleul implicit (grubby --default-kernel)"; return 0; }
+    newest="$(newest_installed_kernel)" || { say_unk "nu pot citi nucleele instalate (${KLIST_CMD})"; return 0; }
+    def="$(default_kernel)" || { say_unk "nu pot citi nucleul implicit (${KDEF_CMD})"; return 0; }
     if [[ "$newest" == "$running" ]]; then
         if [[ "$expected" == yes ]]; then
             say_bad "baseline-ul avea un nucleu în așteptare dar cel mai nou instalat e tot cel care rulează (${running}) — nucleul nou NU s-a instalat"
@@ -971,12 +1281,12 @@ os_check_kernel() {
     say_ok "nucleu nou instalat: ${running} -> ${newest}"
     CHANGED_LIST+=("nucleu: ${running} -> ${newest} (devine activ după reboot)")
     if su_kernel_matches_default "$newest" "$def"; then
-        say_ok "nucleul nou e cel implicit la pornire (grubby)"
+        say_ok "nucleul nou e cel implicit la pornire (${KDEF_NAME})"
     else
-        say_bad "nucleul nou (${newest}) NU e cel implicit la pornire (grubby spune ${def}) — o repornire ar porni alt nucleu"
+        say_bad "nucleul nou (${newest}) NU e cel implicit la pornire (${KDEF_NAME} spune ${def}) — o repornire ar porni alt nucleu"
     fi
     if why_files="$(boot_files_ok "$newest")"; then
-        say_ok "fișierele de pornire ale nucleului nou există (vmlinuz și initramfs-${newest}.img, de mărime credibilă)"
+        say_ok "fișierele de pornire ale nucleului nou există (vmlinuz și $(boot_initrd_file "$newest"), de mărime credibilă)"
     else
         say_bad "nucleul nou (${newest}) NU poate porni: ${why_files%; } — o repornire n-ar porni nucleul nou"
     fi
@@ -998,8 +1308,12 @@ os_check_services() {
             fi
         fi
     fi
-    state="$(su_reboot_needed_from_rc "$(needs-restarting -r > /dev/null; echo $?)")"
-    say_info "reboot necesar după actualizare (needs-restarting -r): ${state}"
+    state="$(su_reboot_needed_from_rc "$(reboot_probe > /dev/null; echo $?)")"
+    say_info "reboot necesar după actualizare (${REBOOT_PROBE_NAME}): ${state}"
+    if [[ "$PKG_MGR" == apt ]]; then
+        [[ "$state" != yes ]] || say_info "$(reboot_probe || true)"
+        return 0
+    fi
     restart_list="$(needs-restarting -s | awk 'NF' | head -n 12 | tr '\n' ' ' || true)"
     [[ -z "$restart_list" ]] || say_info "servicii cu cod vechi în memorie (se curăță la reboot): ${restart_list}"
 }

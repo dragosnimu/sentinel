@@ -38,12 +38,12 @@ verify_boot() {
     fi
 
     running="$(uname -r)"
-    def="$(grubby --default-kernel)" || def=""
+    def="$(default_kernel)" || def=""
     rc=0; su_kernel_matches_default "$running" "$def" || rc=$?
     case "$rc" in
         0) say_ok "nucleul care rulează (${running}) e cel implicit la pornire" ;;
         1) say_bad "rulează ${running}, dar implicit la pornire e ${def##*/vmlinuz-} — actualizarea nu e activă (reboot neefectuat) sau a pornit alt nucleu" ;;
-        *) say_unk "nu pot citi nucleul implicit (grubby --default-kernel)" ;;
+        *) say_unk "nu pot citi nucleul implicit (${KDEF_CMD})" ;;
     esac
     newest="$(newest_installed_kernel)" || newest=""
     if [[ -n "$newest" && -n "$def" ]] && ! su_kernel_matches_default "$newest" "$def"; then
@@ -54,13 +54,13 @@ verify_boot() {
         CHANGED_LIST+=("nucleu: ${base_running} -> ${running}")
     fi
     local nr_out=""
-    rc=0; nr_out="$(needs-restarting -r 2>&1)" || rc=$?
+    rc=0; nr_out="$(reboot_probe 2>&1)" || rc=$?
     state="$(su_reboot_needed_from_rc "$rc")"
     # După actualizare și repornire nu mai trebuie să existe un reboot în așteptare: «încă necesar» e o
     # problemă (actualizarea nu e activă), iar «n-am putut afla» (127: comandă lipsă) e necunoscut, nu verde.
     case "$state" in
-        yes)     say_bad "needs-restarting -r cere încă un reboot (pachete actualizate după ultima pornire) — actualizarea nu e încă activă" ;;
-        unknown) say_unk "needs-restarting -r a ieșit cu ${rc} ($(awk 'NR == 1' <<< "$nr_out")) — nu pot spune dacă mai e nevoie de un reboot" ;;
+        yes)     say_bad "${REBOOT_PROBE_NAME} cere încă un reboot (pachete actualizate după ultima pornire) — actualizarea nu e încă activă" ;;
+        unknown) say_unk "${REBOOT_PROBE_NAME} a ieșit cu ${rc} ($(awk 'NR == 1' <<< "$nr_out")) — nu pot spune dacă mai e nevoie de un reboot" ;;
     esac
     return 0
 }
@@ -219,10 +219,10 @@ verify_probes() {
 verify_summary() {
     local item now n
     say_sect "Rezumat"
-    if [[ "$(base_state "${BASE}/rpm-qa.txt")" == measured ]]; then
+    if [[ "$(base_state "${BASE}/${PKG_LIST_FILE}")" == measured ]]; then
         now="$(mktemp)"
-        if m_rpm_qa > "$now"; then
-            n="$(su_new_lines "${BASE}/rpm-qa.txt" "$now" | wc -l)"
+        if m_pkg_list > "$now"; then
+            n="$(su_new_lines "${BASE}/${PKG_LIST_FILE}" "$now" | wc -l)"
             CHANGED_LIST+=("${n} pachete instalate sau actualizate față de baseline")
         fi
         rm -f "$now"
@@ -311,7 +311,7 @@ verify_disabled_running() {
 }
 
 phase_verify() {
-    need_root; require_baseline
+    need_root; require_pkg_baseline
     say_sect "Verificare față de baseline ${BASE##*/}"
     verify_phases_done
     verify_boot
@@ -332,7 +332,7 @@ phase_verify() {
 # Tipărește motivul când nu e bine.
 boot_files_ok() {
     local ver="$1" dir="${SU_BOOT_DIR:-/boot}" min="${SU_MIN_BOOT_FILE_BYTES:-1000000}" f sz bad=0
-    for f in "vmlinuz-${ver}" "initramfs-${ver}.img"; do
+    for f in "vmlinuz-${ver}" "$(boot_initrd_file "$ver")"; do
         if [[ ! -f "${dir}/${f}" ]]; then printf '%s lipsește; ' "$f"; bad=1; continue; fi
         sz="$(stat -c %s "${dir}/${f}")" || sz=0
         if (( sz < min )); then printf '%s are doar %s octeți (minim %s); ' "$f" "$sz" "$min"; bad=1; fi
@@ -352,7 +352,7 @@ reboot_os_state_gate() {
         say_ok "faza os încheiată cu succes dovedit în baseline-ul anterior (preluat în os-carried.kv), pe acest boot"; return 0
     fi
     if [[ -f "${BASE}/phases/os.started" ]]; then
-        why="faza os a PORNIT dar n-a ajuns la os.ok (a eșuat sau unitatea a murit) — o repornire peste o tranzacție dnf neterminată e riscul cel mai mare"
+        why="faza os a PORNIT dar n-a ajuns la os.ok (a eșuat sau unitatea a murit) — o repornire peste o tranzacție ${PKG_MGR} neterminată e riscul cel mai mare"
     elif [[ "$(base_state "${BASE}/pending.txt")" == measured && ! -s "${BASE}/pending.txt" ]]; then
         say_ok "faza os n-a rulat, dar baseline-ul n-avea nicio actualizare în așteptare"; return 0
     else
@@ -365,30 +365,30 @@ reboot_os_state_gate() {
 }
 
 phase_reboot() {
-    need_root; require_baseline
+    need_root; require_pkg_baseline
     say_sect "Reboot"
     (( OPT_YES )) || die "reboot-ul cere --yes (confirmarea o ia system-update.sh de la operator, nu scriptul de pe gazdă)"
     local rc=0 out state running def def_ver newest boot_id why_files scheduled="${SU_SHUTDOWN_SCHEDULED:-/run/systemd/shutdown/scheduled}" need=no why=""
-    pf_check_dnf_idle
+    pf_check_pkg_idle
     (( FAIL_N == 0 )) || finish
     reboot_os_state_gate
     (( FAIL_N == 0 )) || finish
 
-    out="$(needs-restarting -r 2>&1)" || rc=$?
+    out="$(reboot_probe 2>&1)" || rc=$?
     state="$(su_reboot_needed_from_rc "$rc")"
     running="$(uname -r)"
-    def="$(grubby --default-kernel)" || def=""
+    def="$(default_kernel)" || def=""
     rc=0; su_kernel_matches_default "$running" "$def" || rc=$?
-    case "$state" in yes) need=yes; why="needs-restarting -r cere reboot" ;; esac
+    case "$state" in yes) need=yes; why="${REBOOT_PROBE_NAME} cere reboot" ;; esac
     [[ "$rc" == 1 ]] && { need=yes; why="${why:+${why}; }rulează ${running}, implicit e ${def##*/vmlinuz-}"; }
     if [[ "$state" == unknown || "$rc" == 2 ]]; then
         if (( OPT_FORCE )); then say_warn "nu pot afla dacă e nevoie de reboot; continui doar fiindcă ai dat --force"; need=yes; why="--force"
-        else die "nu pot afla dacă e nevoie de reboot (needs-restarting -r: ${state}, grubby: cod ${rc}) — refuz să ghicesc; --force ca să-l faci oricum"
+        else die "nu pot afla dacă e nevoie de reboot (${REBOOT_PROBE_NAME}: ${state}, ${KDEF_NAME}: cod ${rc}) — refuz să ghicesc; --force ca să-l faci oricum"
         fi
     fi
     if [[ "$need" == no ]]; then
         if (( OPT_FORCE )); then need=yes; why="--force"
-        else say_ok "nu e nevoie de reboot (needs-restarting -r: nu; nucleul care rulează e cel implicit)"; finish
+        else say_ok "nu e nevoie de reboot (${REBOOT_PROBE_NAME}: nu; nucleul care rulează e cel implicit)"; finish
         fi
     fi
     say_info "reboot necesar: ${why}"
@@ -399,7 +399,7 @@ phase_reboot() {
     def_ver="${def##*/vmlinuz-}"
     newest="$(newest_installed_kernel)" || newest=""
     if [[ -z "$def_ver" ]]; then
-        say_bad "nu pot citi nucleul implicit (grubby --default-kernel) — nu știu ce ar porni"
+        say_bad "nu pot citi nucleul implicit (${KDEF_CMD}) — nu știu ce ar porni"
     elif why_files="$(boot_files_ok "$def_ver")"; then
         say_ok "fișierele nucleului implicit (${def_ver}) există: vmlinuz și initramfs"
     else

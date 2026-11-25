@@ -56,6 +56,105 @@ base_state() {
 
 m_rpm_qa() { rpm -qa --qf '%{NEVRA}\n' | LC_ALL=C sort; }
 
+# ---------------------------------------------------------------------------
+# Gestionarul de pachete: detectat O DATĂ (pkg_detect, din init_state), apoi fiecare măsurătoare care depinde de el trece printr-un dispatcher.
+# Un PKG_MGR necunoscut NU cade pe «dnf»: măsurătoarea iese cu 1 și devine `.unknown` — «nu știu» nu e «la fel ca pe gazda de producție».
+# ---------------------------------------------------------------------------
+
+# pkg_detect — din FAPTE: ID/ID_LIKE din os-release (familia) ȘI binarele care trebuie să existe (dnf; apt-get + dpkg + dpkg-query).
+# Seteaza PKG_MGR (dnf|apt|unknown) și etichetele din mesaje; nu iese și nu refuză (refuzul e pkg_require). SU_OS_RELEASE: doar pentru teste.
+pkg_detect() {
+    local osr="${SU_OS_RELEASE:-/etc/os-release}" fam have_dnf=0 have_apt=0 verdict
+    PKG_MGR=unknown; PKG_WHY=""; PKG_OS_ID=""; PKG_OS_LIKE=""
+    if [[ ! -r "$osr" ]]; then PKG_WHY="nu pot citi ${osr}"; return 0; fi
+    PKG_OS_ID="$(awk -F= '$1 == "ID" { v = $2; gsub(/^["\047]|["\047]$/, "", v); print v; exit }' "$osr")"
+    PKG_OS_LIKE="$(awk -F= '$1 == "ID_LIKE" { v = $2; gsub(/^["\047]|["\047]$/, "", v); print v; exit }' "$osr")"
+    fam="$(su_pkgmgr_family "$PKG_OS_ID" "$PKG_OS_LIKE")"
+    have dnf && have_dnf=1
+    if have apt-get && have dpkg && have dpkg-query; then have_apt=1; fi
+    verdict="$(su_pkgmgr_decide "$fam" "$have_dnf" "$have_apt")"
+    case "$verdict" in
+        dnf|apt) PKG_MGR="$verdict" ;;
+        no-binary) PKG_WHY="${osr} spune ID=${PKG_OS_ID} ID_LIKE=${PKG_OS_LIKE} (familia ${fam}), dar binarul gestionarului lipsește de pe gazdă" ;;
+        *) PKG_WHY="ID=${PKG_OS_ID:-?} ID_LIKE=${PKG_OS_LIKE:-?} din ${osr} nu e nici familia RHEL (dnf), nici Debian (apt)" ;;
+    esac
+    case "$PKG_MGR" in
+        dnf) PKG_DB=rpm;   PKG_LIST_FILE=rpm-qa.txt;     PKG_LIST_CMD="rpm -qa";
+             KLIST_CMD="rpm -q kernel-core"; KDEF_NAME=grubby; KDEF_CMD="grubby --default-kernel"; REBOOT_PROBE_NAME="needs-restarting -r" ;;
+        apt) PKG_DB=dpkg;  PKG_LIST_FILE=dpkg-list.txt;  PKG_LIST_CMD="dpkg-query -W";
+             KLIST_CMD="dpkg-query linux-image-*"; KDEF_NAME=grub; KDEF_CMD="grub.cfg, GRUB_DEFAULT=0"; REBOOT_PROBE_NAME="/var/run/reboot-required" ;;
+    esac
+    return 0
+}
+
+m_dpkg_list() { dpkg-query -W -f='${db:Status-Abbrev}|${binary:Package}=${Version}\n' | su_apt_pkglist; }
+
+m_pkg_list() {
+    case "${PKG_MGR:-}" in
+        dnf) m_rpm_qa ;;
+        apt) m_dpkg_list ;;
+        *)   echo "gestionarul de pachete nu e detectat (${PKG_WHY:-init_state n-a rulat})" >&2; return 1 ;;
+    esac
+}
+
+# apt-get -s dist-upgrade: ce ar face upgrade-ul ACUM, din listele de pe disc (nu atinge rețeaua și nu ia blocări). Aceeași comandă ca upgrade-ul real,
+# doar cu -s: o decizie luată din `upgrade` (care nu instalează pachete NOI) ar rata nucleul nou, linux-image-<versiune> fiind un pachet nou.
+apt_simulate() { apt-get -s dist-upgrade; }
+
+# apt_default_kernel — /boot/vmlinuz-<versiune> pe care îl va porni GRUB. Doar când GRUB_DEFAULT arată prima intrare; altfel iese cu 1 («nu știu»).
+apt_grub_default_setting() {
+    local f v="" files="${SU_GRUB_DEFAULT_FILES:-/etc/default/grub /etc/default/grub.d/*.cfg}"
+    for f in $files; do
+        [[ -f "$f" ]] || continue
+        v="$(awk -F= -v cur="$v" '/^[[:space:]]*GRUB_DEFAULT=/ { cur = $2 } END { print cur }' "$f")" || return 1
+    done
+    printf '%s' "$v"
+}
+apt_default_kernel() {
+    local cfg="${SU_GRUB_CFG:-/boot/grub/grub.cfg}" setting
+    setting="$(apt_grub_default_setting)" || { echo "nu pot citi GRUB_DEFAULT" >&2; return 1; }
+    su_grub_default_is_first "$setting" || { echo "GRUB_DEFAULT=${setting}: nu arată prima intrare, deci nu știu ce nucleu pornește" >&2; return 1; }
+    [[ -r "$cfg" ]] || { echo "nu pot citi ${cfg}" >&2; return 1; }
+    su_apt_grub_default_kernel < "$cfg" || { echo "nu găsesc un nucleu vmlinuz-* în prima intrare din ${cfg}" >&2; return 1; }
+}
+
+default_kernel() {
+    case "${PKG_MGR:-}" in
+        dnf) grubby --default-kernel ;;
+        apt) apt_default_kernel ;;
+        *)   echo "gestionarul de pachete nu e detectat" >&2; return 1 ;;
+    esac
+}
+
+# Numele fișierului initrd al unei versiuni: dracut (RHEL) vs initramfs-tools (Debian).
+boot_initrd_file() {
+    case "${PKG_MGR:-}" in
+        apt) printf 'initrd.img-%s' "$1" ;;
+        *)   printf 'initramfs-%s.img' "$1" ;;
+    esac
+}
+
+# reboot_probe — aceleași coduri ca `needs-restarting -r` (0 = nu, 1 = da, altceva = necunoscut), ca su_reboot_needed_from_rc să rămână singura decizie.
+apt_reboot_probe() {
+    local f="${SU_REBOOT_REQUIRED:-/var/run/reboot-required}" hooks="${SU_REBOOT_HOOKS:-/usr/share/update-notifier/notify-reboot-required /etc/kernel/postinst.d/unattended-upgrades}" ex=0 hk=0 pk="" hook
+    [[ -e "$f" ]] && ex=1
+    # Doi scriitori ai fișierului: update-notifier-common (Ubuntu) și pachetul unattended-upgrades (Debian de bază); oricare dovedește că absența înseamnă «nu».
+    for hook in $hooks; do [[ -x "$hook" ]] && hk=1; done
+    case "$(su_apt_reboot_state "$ex" "$hk")" in
+        yes) [[ -r "${f}.pkgs" ]] && pk="$(tr '\n' ' ' < "${f}.pkgs")"
+             printf '%s există (pachete: %s)\n' "$f" "${pk:-necitite}"; return 1 ;;
+        no)  printf '%s nu există\n' "$f"; return 0 ;;
+        *)   printf '%s lipsește, dar niciunul dintre cârligele care l-ar scrie (%s: update-notifier-common sau unattended-upgrades) nu e instalat: absența fișierului nu dovedește că nu e nevoie de reboot\n' "$f" "$hooks"; return 2 ;;
+    esac
+}
+reboot_probe() {
+    case "${PKG_MGR:-}" in
+        dnf) needs-restarting -r ;;
+        apt) apt_reboot_probe ;;
+        *)   echo "gestionarul de pachete nu e detectat" >&2; return 127 ;;
+    esac
+}
+
 # Unitățile eșuate. Controlul pozitiv e în funcție: dacă `systemctl list-units --all`
 # nu listează NIMIC, systemctl nu răspunde, iar `--failed` gol ar fi o minciună.
 m_failed_units() {
@@ -165,6 +264,11 @@ m_probes() {
 # doar dacă dnf a răspuns; un cache lipsit iese cu 1 și devine `.unknown`.
 m_pending() {
     local out rc=0
+    if [[ "${PKG_MGR:-}" == apt ]]; then
+        out="$(apt_simulate)" || return 1
+        printf '%s\n' "$out" | su_apt_sim_names Inst
+        return 0
+    fi
     out="$(dnf -C -q check-update)" || rc=$?
     case "$(su_check_update_state "$rc")" in
         none)    ;;
@@ -177,11 +281,19 @@ m_pending() {
 # boot_id e dovada că o repornire chiar s-a întâmplat între baseline și verificare:
 # „uptime mic" nu e dovadă, un `reboot` cerut dar neexecutat nu schimbă boot_id.
 newest_installed_kernel() {
-    rpm -q kernel-core --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' | LC_ALL=C sort -V | tail -n 1
+    local out running
+    case "${PKG_MGR:-}" in
+        apt)
+            running="$(uname -r)"
+            out="$(dpkg-query -W -f='${db:Status-Abbrev}|${Package}|${Version}\n' 'linux-image-[0-9]*')" || return 1
+            printf '%s\n' "$out" | su_apt_kernel_versions "${running##*-}" | LC_ALL=C sort -V | tail -n 1 ;;
+        dnf) rpm -q kernel-core --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' | LC_ALL=C sort -V | tail -n 1 ;;
+        *)   return 1 ;;
+    esac
 }
 m_kernel() {
     local def newest
-    def="$(grubby --default-kernel)" || return 1
+    def="$(default_kernel)" || return 1
     newest="$(newest_installed_kernel)" || return 1
     [[ -n "$def" && -n "$newest" ]] || return 1
     printf 'running=%s\n' "$(uname -r)"
@@ -198,7 +310,7 @@ kv_get() { awk -F= -v k="$2" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$1";
 # de măsurători care n-au reușit; fiecare are un `.unknown` cu motivul.
 take_snapshot() {
     local dir="$1" unknown=0
-    snap_measure "$dir" rpm-qa.txt 50          m_rpm_qa        || unknown=$((unknown + 1))
+    snap_measure "$dir" "${PKG_LIST_FILE:-rpm-qa.txt}" 50 m_pkg_list || unknown=$((unknown + 1))
     snap_measure "$dir" failed-units.txt 0     m_failed_units  || unknown=$((unknown + 1))
     snap_measure "$dir" services.txt 1         m_services      || unknown=$((unknown + 1))
     snap_measure "$dir" timers.txt 1           m_timers        || unknown=$((unknown + 1))

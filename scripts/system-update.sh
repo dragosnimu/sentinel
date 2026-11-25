@@ -18,6 +18,14 @@
 #
 #   --host H   gazda            --user U   implicit sentinel-deploy (ca deploy.sh)
 #   --key K    cheia privată    --port P   portul ssh (22)
+#   Cu un alt cont (și o gazdă Debian/Ubuntu), cheia și contul se dau împreună; contul are nevoie doar de `sudo -n`:
+#   ./scripts/system-update.sh --host n8n.srv1051579.hstgr.cloud --user dragos --key ~/.ssh/id_ed25519 --phase preflight
+#
+#   Gestionarul de pachete (dnf pe AlmaLinux/RHEL/Rocky/Fedora, apt pe Debian/Ubuntu) se stabilește PE GAZDĂ, o singură dată, din
+#   /etc/os-release (ID/ID_LIKE) ȘI din binarele care trebuie să existe; preflight îl scrie în baseline (pkgmgr.kv), iar os/reboot/verify
+#   refuză un baseline luat cu altul. O gazdă care nu e nici una, nici alta: ieșire 1, nimic atins. Pe apt: `apt-get dist-upgrade --no-remove`
+#   (nucleul nou e un pachet NOU, pe care `upgrade` nu-l instalează; nimic nu se șterge, nimic de pe hold nu se atinge), așteptând blocarea dpkg
+#   (unattended-upgrades pornește zilnic, la ore aleatorii; așteptarea se face pe blocări, nu pe nume de procese); `--phase backup` cere `--allow-stale-srv-backup` pe o gazdă fără backup-ul zilnic /var/lib/srv-backup.
 #   --phase F  una dintre: preflight backup os containers reboot verify status
 #   --yes      răspunde «da» la confirmarea fazelor care schimbă gazda (os, containers,
 #              reboot). NU face nimic altceva: ce schimbă faza o spun ele.
@@ -185,15 +193,19 @@ if (( needs_confirm && ! ASSUME_YES )); then
         os) cat <<'EOF'
 
   ┌────────────────────────────────────────────────────────────────────┐
-  │  dnf upgrade --refresh -y  — actualizare completă a sistemului     │
+  │  Actualizare completă a sistemului, cu gestionarul gazdei:         │
+  │  `dnf upgrade --refresh -y` (AlmaLinux/RHEL) sau                   │
+  │  `apt-get dist-upgrade` (Debian/Ubuntu) — îl alege gazda, din      │
+  │  /etc/os-release; pe orice altceva faza REFUZĂ.                    │
   │                                                                    │
   │  1. Ai rulat preflight ȘI backup, iar backup-ul a ieșit cu 0?      │
   │  2. Ai o A DOUA sesiune ssh deschisă și acces TESTAT la consola    │
   │     VPS-ului de la provider (nucleul se schimbă)?                  │
   │  3. Faza rulează într-o unitate systemd: dacă sesiunea cade, ea    │
   │     continuă. Starea o vezi cu --phase status.                     │
-  │  4. nginx, mariadb, php-fpm, systemd, openssl, sudo se actualizează│
-  │     și unele se repornesc singure — site-urile pot clipi.          │
+  │  4. nginx, mariadb, php-fpm, systemd, openssl, sudo, docker (pe    │
+  │     apt și containerd) se actualizează; unele se repornesc singure │
+  │     — site-urile și containerele pot clipi.                        │
   └────────────────────────────────────────────────────────────────────┘
 
 EOF

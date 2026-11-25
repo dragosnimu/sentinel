@@ -69,6 +69,7 @@ class FakeHost:
             self.w(f"http/{name}", "200")
         self.w("http/sentinel-web", "200")
         self.w("boot_files", "present")
+        self.w("os-release", 'NAME="AlmaLinux"\nID="almalinux"\nID_LIKE="rhel centos fedora"\nVERSION_ID="9.7"\n')
         self.set_boot_files(OLD_K)
 
     # -- stare ---------------------------------------------------------------
@@ -184,6 +185,7 @@ exit 0
         }
         bindir = make_bin(self.tmp, shims, docker=True)
         env = {"FH": fh, "SU_BOOT_DIR": posix(self.fh / "boot"), "SU_BOOT_ID_FILE": posix(self.fh / "boot_id"),
-               "SU_SHUTDOWN_SCHEDULED": posix(self.fh / "scheduled"), "FAKE_SYSTEMCTL_STATE": posix(self.fh / "systemctl.json")}
+               "SU_SHUTDOWN_SCHEDULED": posix(self.fh / "scheduled"), "FAKE_SYSTEMCTL_STATE": posix(self.fh / "systemctl.json"),
+               "SU_OS_RELEASE": posix(self.fh / "os-release")}
         env.update(extra_env or {})
         return bindir, env
