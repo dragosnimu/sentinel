@@ -95,6 +95,41 @@ class Fleet:
         self.systemctl_rc = 0
         self.ss_rc = 0
         self.extra: dict[str, str] = {}
+        # `systemctl show UNIT -p ...`: proprietățile fiecărei unități, ca pe gazdă. O unitate
+        # neînregistrată răspunde ca una necunoscută de systemd (cod 0, câmpuri goale, inactive).
+        self.show: dict[str, dict[str, str]] = {}
+        self.show_rc = 0
+        # fișierele de activare D-Bus ale gazdei: BusName -> unitatea din `SystemdService=`
+        self.dbus_files: dict[str, str] = {}
+
+    def _show_handler(self) -> str:
+        """`systemctl show` fals: scoate DOAR proprietățile cerute cu `-p`, ca cel real — un
+        script care nu cere `Result` nu-l primește, deci nu poate decide pe el din întâmplare."""
+        showdir = self.tmp / "show"
+        showdir.mkdir(exist_ok=True)
+        for unit, props in self.show.items():
+            (showdir / unit).write_text("".join(f"{k}={v}\n" for k, v in props.items()),
+                                        encoding="utf-8", newline="\n")
+        dbusdir = self.tmp / "dbus-services"
+        dbusdir.mkdir(exist_ok=True)
+        for bus, unit in self.dbus_files.items():
+            (dbusdir / f"{bus}.service").write_text(
+                f"[D-BUS Service]\nName={bus}\nSystemdService={unit}\n", encoding="utf-8", newline="\n")
+        calls = self.calls.as_posix()
+        return (
+            'if [[ "${1:-}" == show ]]; then\n'
+            f'  echo "systemctl $*" >> "{calls}"\n'
+            + (f"  echo 'Failed to connect to bus' >&2; exit {self.show_rc}\n" if self.show_rc else "")
+            + '  unit="$2"; shift 2; want=","\n'
+            '  while [[ $# -gt 0 ]]; do if [[ "$1" == -p ]]; then want+="$2,"; shift; fi; shift; done\n'
+            f'  src="{showdir.as_posix()}/$unit"\n'
+            '  all="Type=\nBusName=\nTriggeredBy=\nResult=success\nActiveState=inactive\nRestart=no\nUnitFileState="\n'
+            '  if [[ -f "$src" ]]; then all="$(cat "$src")"; fi\n'
+            '  while IFS="=" read -r k v; do\n'
+            '    if [[ "$want" == *",$k,"* ]]; then echo "$k=$v"; fi\n'
+            '  done <<< "$all"\n'
+            '  exit 0\n'
+            'fi\n')
 
     def stub(self, name: str, body: str) -> None:
         """O momeală în plus pe PATH (instalată ultima, deci umbrește una mai veche)."""
@@ -123,8 +158,9 @@ class Fleet:
                 ("systemctl", "list-units --type=service --state=running --no-legend --plain",
                  self.services_out, self.systemctl_rc, "Failed to connect to bus"),
                 ("ss", "-tlnH", self.ports_out, self.ss_rc, "ss: netlink error")):
-            body = (f"echo {name} \"$*\" >> \"{calls}\"\n"
-                    f'[[ "$*" == "{want}" ]] || {{ echo "{name}: argumente neașteptate: $*" >&2; exit 2; }}\n')
+            body = self._show_handler() if name == "systemctl" else ""
+            body += (f"echo {name} \"$*\" >> \"{calls}\"\n"
+                     f'[[ "$*" == "{want}" ]] || {{ echo "{name}: argumente neașteptate: $*" >&2; exit 2; }}\n')
             if rc:
                 body += f"echo '{err}' >&2\nexit {rc}\n"
             else:
@@ -181,7 +217,7 @@ def _section(fleet: Fleet) -> str:
                                      f'baseline_dir="{fleet.state.as_posix()}"', 1)
     assert "compare_baseline_dim services" in block and "compare_baseline_dim ports" in block, block
     return (PRELUDE + _function("measure_remote") + "\n" + _function("baseline_lines") + "\n"
-            + _function("compare_baseline_dim") + "\n" + block
+            + f'DBUS_SERVICES_DIR="{(fleet.tmp / "dbus-services").as_posix()}"\n' + _function("service_on_demand") + "\n" + _function("compare_baseline_dim") + "\n" + block
             + '\nprintf "CONTOARE %s %s %s\\n" "$PASS" "$WARN" "$FAIL"\n'
               'printf "NEMASURAT [%s]\\n" "$REGRESSION_UNMEASURED"\n')
 
@@ -807,3 +843,204 @@ def test_the_baseline_comparison_does_not_borrow_the_word_unreadable():
         code = [ln for ln in _function(name).splitlines() if not ln.lstrip().startswith("#")]
         assert not any("unreadable" in ln for ln in code), (name, code)
     assert "NGINX_STATE=\"unreadable\"" in SMOKE, "înțelesul vechi trebuie să rămână neatins"
+
+
+# --- servicii care nu sunt făcute să rămână pornite: ieșirea curată nu e regresie --------------
+#
+# Proprietățile sunt MĂSURATE pe gazda n8n (Ubuntu 24.04, 24 nov 2026), nu inventate:
+#   fwupd.service        Type=dbus BusName=org.freedesktop.fwupd Restart=no UnitFileState=static
+#   packagekit.service   Type=dbus BusName=org.freedesktop.PackageKit Restart=no static
+#   apt-daily.service    Type=oneshot TriggeredBy=apt-daily.timer Restart=no static
+#   docker.service       Type=notify TriggeredBy=docker.socket Restart=always enabled
+#   ssh.service          Type=notify TriggeredBy=ssh.socket Restart=on-failure disabled
+#   rsyslog.service      Type=notify TriggeredBy=syslog.socket Restart=on-failure enabled
+#   ModemManager         Type=dbus BusName=org.freedesktop.ModemManager1 Restart=on-abort enabled
+# Prima versiune scutea după Type=dbus / TriggeredBy singure și scutea ultimele patru:
+# un `docker stop` trecea ca «nu e regresie» cu toate containerele jos.
+FWUPD = {"Type": "dbus", "BusName": "org.freedesktop.fwupd", "TriggeredBy": "",
+         "Result": "success", "ActiveState": "inactive", "Restart": "no", "UnitFileState": "static"}
+APT_DAILY = {"Type": "oneshot", "BusName": "", "TriggeredBy": "apt-daily.timer",
+             "Result": "success", "ActiveState": "inactive", "Restart": "no", "UnitFileState": "static"}
+ALWAYS_ON = {
+    "docker.service": {"Type": "notify", "BusName": "", "TriggeredBy": "docker.socket", "Result": "success",
+                       "ActiveState": "inactive", "Restart": "always", "UnitFileState": "enabled"},
+    "ssh.service": {"Type": "notify", "BusName": "", "TriggeredBy": "ssh.socket", "Result": "success",
+                    "ActiveState": "inactive", "Restart": "on-failure", "UnitFileState": "disabled"},
+    "rsyslog.service": {"Type": "notify", "BusName": "", "TriggeredBy": "syslog.socket", "Result": "success",
+                        "ActiveState": "inactive", "Restart": "on-failure", "UnitFileState": "enabled"},
+    "ModemManager.service": {"Type": "dbus", "BusName": "org.freedesktop.ModemManager1", "TriggeredBy": "",
+                             "Result": "success", "ActiveState": "inactive", "Restart": "on-abort",
+                             "UnitFileState": "enabled"},
+}
+
+
+def _lose(fleet: Fleet, unit: str, props: dict[str, str], *, dbus_file: bool | None = None,
+          active_triggers: tuple[str, ...] = ()) -> None:
+    """Pune `unit` în baseline și îl scoate din lista de ACUM, cu proprietățile date.
+
+    Implicit, ca pe gazdă: un serviciu Type=dbus are fișierul lui de activare, iar unitățile din
+    `TriggeredBy` sunt ACTIVE. Fiecare test care vrea contrariul îl cere pe față."""
+    (fleet.state / "baseline-services.txt").write_text(
+        SERVICES_WAS + f"{unit}\n", encoding="utf-8", newline="\n")
+    fleet.show[unit] = props
+    if dbus_file is None:
+        dbus_file = props["Type"] == "dbus" and bool(props["BusName"])
+    if dbus_file and props["BusName"]:
+        fleet.dbus_files[props["BusName"]] = unit
+    triggers = props["TriggeredBy"].split()
+    for trigger in triggers:
+        fleet.show[trigger] = {"ActiveState": "active" if trigger in active_triggers or not active_triggers else "inactive"}
+
+
+def _only_fail_names(out: Out, unit: str) -> None:
+    assert out.fails == 1 and unit in out.lines("FAIL")[0], out.text
+
+
+def test_a_dbus_service_with_an_activation_file_that_exited_cleanly_is_not_a_regression(fleet):
+    """fwupd iese singur când nu-l mai cere nimeni (`Deactivated successfully`). Smoke-testul
+    îl raporta «services stopped since the install: fwupd.service» și termina cu «Nu considera
+    deployment-ul reușit» pe o gazdă la care instalarea nu atinsese nimic. Acum: PASS, iar
+    scutirea e SPUSĂ (unitatea și motivul), nu tăcută."""
+    _lose(fleet, "fwupd.service", FWUPD)
+    out = _regression(fleet)
+    assert out.fails == 0 and not out.lines("FAIL"), out.text
+    assert any("every service" in ln for ln in out.lines("PASS")), out.text
+    assert "fwupd.service (Type=dbus" in out.text and "inactiv acum, dar pornit la cerere" in out.text, out.text
+
+
+@pytest.mark.parametrize("trigger", ["apt-daily.timer", "x.socket", "x.path"])
+def test_a_static_service_whose_active_trigger_starts_it_is_not_a_regression(fleet, trigger):
+    """apt-daily: static, Restart=no, pornit de un timer ACTIV. Fără excepția asta, fiecare
+    unitate pornită de timer și prinsă `running` la captură ar fi alarmă falsă."""
+    _lose(fleet, "apt-daily.service", {**APT_DAILY, "TriggeredBy": trigger})
+    out = _regression(fleet)
+    assert out.fails == 0 and not out.lines("FAIL"), out.text
+    assert f"pornit de {trigger} (activ)" in out.text, out.text
+
+
+def test_a_trigger_that_is_listed_but_not_active_does_not_excuse_a_service(fleet):
+    """`TriggeredBy` listează și unitățile de declanșare INACTIVE (măsurat: tpm-udev.path,
+    apport-autoreport.timer). Un timer oprit nu mai pornește nimic, deci serviciul pierdut e
+    o regresie reală."""
+    _lose(fleet, "apt-daily.service", APT_DAILY, active_triggers=("something-else.timer",))
+    fleet.show["apt-daily.timer"] = {"ActiveState": "inactive"}
+    out = _regression(fleet)
+    _only_fail_names(out, "apt-daily.service")
+
+
+@pytest.mark.parametrize("unit", sorted(ALWAYS_ON))
+def test_an_always_on_daemon_that_stopped_is_a_regression_even_with_an_active_trigger_and_result_success(fleet, unit):
+    """Cazul care a trecut verde în runda 1: docker.service (enabled, Restart=always, cu
+    docker.socket ACTIV), ssh, rsyslog, ModemManager (Type=dbus). Un install care oprește Docker
+    lasă toate containerele jos; smoke-testul spunea «nu e regresie». Proprietățile sunt cele
+    reale, iar fișierul de activare D-Bus și triggerul activ sunt puse în favoarea scutirii."""
+    props = ALWAYS_ON[unit]
+    _lose(fleet, unit, props, dbus_file=True)
+    out = _regression(fleet)
+    _only_fail_names(out, unit)
+    assert "pornit la cerere" not in out.text, out.text
+
+
+@pytest.mark.parametrize("restart", ["always", "on-failure", "on-abort", "on-success", "on-watchdog"])
+def test_restart_other_than_no_is_a_regression_even_when_everything_else_excuses_it(fleet, restart):
+    """Doar Restart-ul diferă de fwupd: o unitate cu Restart=* e făcută să rămână pornită."""
+    _lose(fleet, "fwupd.service", {**FWUPD, "Restart": restart})
+    _only_fail_names(_regression(fleet), "fwupd.service")
+
+
+@pytest.mark.parametrize("state", ["enabled", "enabled-runtime", "disabled", "masked", "generated", ""])
+def test_an_enabled_or_otherwise_non_static_unit_file_is_a_regression(fleet, state):
+    """Doar UnitFileState-ul diferă de fwupd: o unitate `enable`-ată e ceva ce operatorul vrea
+    pornit; scutirea e numai pentru static/indirect."""
+    _lose(fleet, "fwupd.service", {**FWUPD, "UnitFileState": state})
+    _only_fail_names(_regression(fleet), "fwupd.service")
+
+
+def test_an_indirect_unit_file_is_still_excusable(fleet):
+    """Contra-proba pentru testul de mai sus: `indirect` e singura altă valoare scutită."""
+    _lose(fleet, "fwupd.service", {**FWUPD, "UnitFileState": "indirect"})
+    assert _regression(fleet).fails == 0
+
+
+def test_type_dbus_without_an_activation_file_is_not_on_demand(fleet):
+    """«Type=dbus» nu înseamnă activare la cerere (pe AlmaLinux firewalld, tuned, NetworkManager
+    sunt Type=dbus și mereu pornite). Fără fișierul `<BusName>.service` cu SystemdService=unitatea,
+    nimic nu o pornește."""
+    _lose(fleet, "fwupd.service", FWUPD, dbus_file=False)
+    _only_fail_names(_regression(fleet), "fwupd.service")
+
+
+def test_an_activation_file_that_names_another_unit_does_not_excuse_this_one(fleet):
+    _lose(fleet, "fwupd.service", FWUPD, dbus_file=False)
+    fleet.dbus_files["org.freedesktop.fwupd"] = "other.service"
+    _only_fail_names(_regression(fleet), "fwupd.service")
+
+
+def test_type_dbus_without_a_bus_name_is_not_on_demand(fleet):
+    _lose(fleet, "odd.service", {**FWUPD, "BusName": ""})
+    _only_fail_names(_regression(fleet), "odd.service")
+
+
+@pytest.mark.parametrize("trigger", ["other.service", "x.target", "x.mount"])
+def test_a_trigger_that_is_not_a_socket_timer_or_path_does_not_excuse_a_service(fleet, trigger):
+    _lose(fleet, "demo.service", {**APT_DAILY, "TriggeredBy": trigger})
+    _only_fail_names(_regression(fleet), "demo.service")
+
+
+@pytest.mark.parametrize("result", ["exit-code", "signal", "core-dump", "timeout", "oom-kill",
+                                    "watchdog", "start-limit-hit", "resources"])
+@pytest.mark.parametrize("state", ["failed", "inactive"])
+def test_a_service_that_did_not_exit_cleanly_is_still_a_regression(fleet, result, state):
+    """Un fwupd care a murit (segfault, timeout) arată din afară la fel ca unul care a ieșit
+    curat. Doar `Result=success` îl deosebește."""
+    _lose(fleet, "fwupd.service", {**FWUPD, "Result": result, "ActiveState": state})
+    _only_fail_names(_regression(fleet), "fwupd.service")
+
+
+@pytest.mark.parametrize("state", ["failed", "active", "activating", "deactivating", "reloading"])
+def test_active_state_alone_decides_when_the_result_looks_clean(fleet, state):
+    """Result=success, dar ActiveState nu e `inactive`: `failed` (ex. oprit de watchdog după un
+    exit curat), `active`/`activating` (nu e oprit, nu e ce măsurăm). Dacă scutirea citește doar
+    Result, un serviciu căzut trece verde."""
+    _lose(fleet, "fwupd.service", {**FWUPD, "ActiveState": state})
+    _only_fail_names(_regression(fleet), "fwupd.service")
+
+
+def test_a_systemctl_that_cannot_answer_does_not_excuse_the_service(fleet):
+    """«N-am putut întreba» nu dovedește nimic: serviciul pierdut rămâne eșec."""
+    _lose(fleet, "fwupd.service", FWUPD)
+    fleet.show_rc = 1
+    _only_fail_names(_regression(fleet), "fwupd.service")
+
+
+def test_only_the_excusable_service_is_excused_from_a_mixed_loss(fleet):
+    """fwupd (excusabil) și mysql (oprit de-adevăratelea) pierdute odată: eșecul numește DOAR
+    mysql."""
+    (fleet.state / "baseline-services.txt").write_text(
+        SERVICES_WAS + "fwupd.service\nmysql.service\n", encoding="utf-8", newline="\n")
+    fleet.show["fwupd.service"] = FWUPD
+    fleet.dbus_files["org.freedesktop.fwupd"] = "fwupd.service"
+    out = _regression(fleet)
+    assert out.fails == 1, out.text
+    assert "mysql.service" in out.lines("FAIL")[0] and "fwupd" not in out.lines("FAIL")[0], out.text
+
+
+def test_the_host_is_asked_for_every_property_the_decision_rests_on(fleet):
+    """Fake-ul scoate doar ce i se cere cu `-p`; comanda se fixează aici, într-un singur loc."""
+    _lose(fleet, "fwupd.service", FWUPD)
+    _regression(fleet)
+    asked = [ln for ln in fleet.calls_text().splitlines() if ln.startswith("systemctl show")]
+    assert asked == ["systemctl show fwupd.service -p Type,BusName,TriggeredBy,Result,ActiveState,Restart,UnitFileState"], asked
+
+
+@pytest.mark.parametrize("name", ["x;touch${IFS}/tmp/pwn.service", "--now.service", "-x.service"])
+def test_a_hostile_or_option_like_unit_name_is_never_sent_to_the_host(fleet, name):
+    """Numele intră într-o comandă ssh reinterpretată de shell-ul gazdei. `x;touch ...` nu are
+    voie să ajungă acolo, iar un nume cu `-` în față ar fi luat de systemctl drept opțiune
+    (`--now`, `-H host`). Rămâne eșec și nu se face nicio întrebare despre el."""
+    (fleet.state / "baseline-services.txt").write_text(
+        SERVICES_WAS + f"{name}\n", encoding="utf-8", newline="\n")
+    out = _regression(fleet)
+    assert out.fails == 1, out.text
+    assert not [ln for ln in fleet.calls_text().splitlines() if ln.startswith("systemctl show")], fleet.calls_text()
+    assert not [ln for ln in fleet.calls_text().splitlines() if ln.startswith("ssh") and "touch" in ln], fleet.calls_text()

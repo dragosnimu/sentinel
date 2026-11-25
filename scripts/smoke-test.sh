@@ -501,6 +501,87 @@ baseline_lines() {
     } | LC_ALL=C sort -u
 }
 
+# Un serviciu care rula la captură și acum e inactiv: regresie sau serviciu care nu e
+# făcut să rămână pornit?
+#
+# `list-units --state=running` din baseline prinde și serviciile care există doar cât
+# au de lucru: fwupd iese singur când nu-l mai cere nimeni, iar `Deactivated
+# successfully` din jurnal e comportamentul lui normal. Comparația „rula, acum nu
+# rulează" le raporta ca regresie pe o gazdă la care instalarea nu atinsese nimic.
+#
+# Prima versiune scutea după `Type=dbus` sau după `TriggeredBy=` — și a scutit
+# docker.service, ssh.service, rsyslog și ModemManager. Măsurat pe gazdă: `TriggeredBy`
+# listează și unitățile de declanșare INACTIVE (tpm-udev.path, apport-autoreport.timer),
+# iar `Type=dbus` nu înseamnă activare la cerere (pe AlmaLinux firewalld, tuned și
+# NetworkManager sunt Type=dbus și mereu pornite). Un `docker stop` ar fi trecut ca
+# „nu e regresie" cu toate containerele jos.
+#
+# Ce desparte, pe aceeași gazdă, fwupd și packagekit de docker, ssh, rsyslog și
+# ModemManager sunt proprietăți ale unității, nu numele ei. Toate trebuie să fie
+# adevărate:
+#   * ActiveState=inactive și Result=success — a ieșit curat (un proces căzut are alt
+#     Result și rămâne regresie);
+#   * Restart=no — o unitate cu Restart=on-failure/always/on-abort e făcută să rămână
+#     pornită (docker: always, ssh și rsyslog: on-failure, ModemManager: on-abort);
+#   * UnitFileState=static sau indirect — nimeni n-a activat-o (`enable`); una `enabled`
+#     e ceva ce operatorul vrea pornit (docker, rsyslog, ModemManager: enabled);
+#   * și dovada că ceva o PORNEȘTE la cerere, verificată, nu dedusă din nume:
+#       - D-Bus: Type=dbus, BusName, și un fișier de activare
+#         `<dbus-services>/<BusName>.service` care conține `SystemdService=<unitate>`
+#         (fwupd, packagekit au unul; fără el, Type=dbus nu pornește nimic);
+#       - sau o unitate din `TriggeredBy=` (.socket/.timer/.path) care ESTE ACTIVĂ acum.
+# Dacă systemd sau gazda nu răspund, nu se scutește nimic: „n-am putut întreba" nu
+# dovedește nimic, iar serviciul rămâne în lista pierdută.
+#
+# Limita acceptată: `systemctl stop` manual lasă tot Result=success, deci un serviciu
+# static fără Restart oprit de mână nu se deosebește de unul ieșit singur.
+#
+# Numele intră în comanda trimisă gazdei: doar caractere de nume de unitate, fără `-`
+# la început (ar fi luat drept opțiune).
+# Scrie ONDEMAND_WHY. Întoarce 0 = scutit, 1 = rămâne regresie.
+ONDEMAND_WHY=""
+service_on_demand() {
+    local unit="$1" key val type="" bus="" trig="" result="" state="" restart="" ufs="" t rc=0
+    local name_re='^[A-Za-z0-9:_.@][A-Za-z0-9:_.@-]*\.[a-z]+$'
+    ONDEMAND_WHY=""
+    [[ "$unit" =~ $name_re && "$unit" == *.service ]] || return 1
+    measure_remote "systemctl show ${unit} -p Type,BusName,TriggeredBy,Result,ActiveState,Restart,UnitFileState" || rc=$?
+    (( rc == 0 )) || return 1
+    while IFS='=' read -r key val; do
+        case "$key" in
+            Type)          type="$val" ;;
+            BusName)       bus="$val" ;;
+            TriggeredBy)   trig="$val" ;;
+            Result)        result="$val" ;;
+            ActiveState)   state="$val" ;;
+            Restart)       restart="$val" ;;
+            UnitFileState) ufs="$val" ;;
+        esac
+    done <<< "$MEASURE_OUT"
+    [[ "$state" == inactive && "$result" == success ]] || return 1
+    [[ "$restart" == no ]] || return 1
+    case "$ufs" in static|indirect) ;; *) return 1 ;; esac
+
+    if [[ "$type" == dbus && "$bus" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        rc=0
+        measure_remote "grep -qx 'SystemdService=${unit}' '${DBUS_SERVICES_DIR:-/usr/share/dbus-1/system-services}/${bus}.service'" || rc=$?
+        if (( rc == 0 )); then
+            ONDEMAND_WHY="Type=dbus, ${bus} are fișier de activare pentru ${unit}; ${ufs}, Restart=no"
+            return 0
+        fi
+    fi
+    for t in $trig; do
+        [[ "$t" =~ $name_re && "$t" =~ \.(socket|timer|path)$ ]] || continue
+        rc=0
+        measure_remote "systemctl show ${t} -p ActiveState" || rc=$?
+        if (( rc == 0 )) && [[ "$MEASURE_OUT" == "ActiveState=active" ]]; then
+            ONDEMAND_WHY="pornit de ${t} (activ); ${ufs}, Restart=no"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Compară o dimensiune (services | ports) a gazdei CU baseline-ul luat înainte de
 # instalare, și spune ce a putut afla. Trei răspunsuri, iar al treilea nu e niciunul
 # dintre celelalte două: nimic pierdut (pass), ceva pierdut (fail), NU AM PUTUT
@@ -540,7 +621,7 @@ REGRESSION_UNMEASURED=""
 BASELINE_SERVICES_READ=""
 compare_baseline_dim() {
     local dim="$1" dir="$2" file now_cmd by_hand what_pass what_fail absent
-    local reader rc=0 was_raw was now_raw now lost line kept="" n cause=""
+    local reader rc=0 was_raw was now_raw now lost line kept="" n cause="" excused=""
     file="${dir}/baseline-${dim}.txt"
     case "$dim" in
         services)
@@ -626,9 +707,19 @@ compared. Run by hand: ${by_hand}"
     # rula" (2) dispăreau amândouă în `true`.
     if [[ "$dim" == services ]]; then
         while IFS= read -r line; do
-            [[ "$line" == sentinel-* ]] || kept+="${line}"$'\n'
+            [[ -n "$line" ]] || continue
+            if [[ "$line" == sentinel-* ]]; then continue; fi
+            # Serviciile la cerere care au ieșit curat nu sunt regresie (vezi service_on_demand).
+            if service_on_demand "$line"; then
+                excused+="${line} (${ONDEMAND_WHY})"$'\n'
+                continue
+            fi
+            kept+="${line}"$'\n'
         done <<< "$lost"
         lost="${kept%$'\n'}"
+        while IFS= read -r line; do
+            [[ -z "$line" ]] || printf '    %s: inactiv acum, dar pornit la cerere și ieșit curat (Result=success) — nu e regresie\n' "$line"
+        done <<< "$excused"
     fi
 
     n="$(wc -l <<< "$was")"; n="${n//[[:space:]]/}"
@@ -637,6 +728,178 @@ compared. Run by hand: ${by_hand}"
     else
         fail "${what_fail}: $(tr '\n' ' ' <<< "$lost")"
     fi
+}
+
+# Adresa ADDR e acoperită de CIDR? yes | no | ?
+#
+# Calculată PE GAZDĂ (python3, `ipaddress`): aritmetica de rețele pe IPv6 în bash
+# e locul unde o greșeală răspunde „nu e acolo" cu aplomb. Fără python3, fără ssh sau
+# cu o intrare ciudată răspunsul e „?", nu „no" — iar „?" ține eșecul roșu.
+# Ambele valori intră într-o comandă trimisă gazdei: doar caractere de adresă.
+addr_in_cidr() {
+    local addr="$1" cidr="$2" out
+    if [[ ! "$addr" =~ ^[0-9A-Fa-f:.]+$ || ! "$cidr" =~ ^[0-9A-Fa-f:.]+(/[0-9]{1,3})?$ ]]; then
+        printf '?'; return 0
+    fi
+    out="$(r "python3 -c 'import ipaddress,sys; a=ipaddress.ip_address(sys.argv[1]); n=ipaddress.ip_network(sys.argv[2], strict=False); print(\"yes\" if a.version==n.version and a in n else \"no\")' ${addr} ${cidr}" || true)"
+    case "$out" in
+        yes|no) printf '%s' "$out" ;;
+        *)      printf '?' ;;
+    esac
+}
+
+# Firewall-ul PROPRIU al gazdei restrânge portul PORT la surse care nu te includ?
+#
+# Verificarea externă pică (`000`) și pe o gazdă sănătoasă al cărei ufw lasă portul
+# deschis doar din rețelele Docker (Traefik e în față, portul nu e public). Mesajul
+# vechi trimitea operatorul la firewall-ul furnizorului sau la DNS — fals aici, iar un
+# eșec fals mereu prezent îl învață să nu mai citească raportul.
+#
+# Dovada vine din REGULILE gazdei (`sudo ufw status verbose`), nu din faptul că ufw
+# există. Întoarce în FW_VERDICT:
+#   restricted  ufw e activ, politica implicită pe intrare e deny/reject, există cel puțin
+#               o regulă ALLOW/LIMIT pentru port, NICIUNA (în nicio familie IP) nu admite
+#               orice sursă sau adresa ta, iar portul nu e al lui docker-proxy
+#               (FW_SOURCES, FW_RULES spun sursele rămase)
+#   open        o regulă acoperă portul și admite internetul sau adresa ta — nu
+#               firewall-ul îl închide
+#   unknown     orice altceva: ufw inactiv sau nelizibil, politică implicită allow,
+#               nicio regulă pentru port, o regulă pe care n-o pot parsa, adresa ta
+#               sau portul necunoscute, portul publicat de Docker. FW_WHY spune care.
+#               Se comportă ca `open`: rămâne eșec.
+# Doar regulile ALLOW/LIMIT contează (LIMIT admite traficul, cu limită de rată, deci
+# poate deschide portul): sub deny implicit un DENY nu poate decât să restrângă mai mult. Regulile OUT și FWD (rutate) nu privesc intrarea spre gazdă.
+#
+# Limite spuse, nu ascunse: `ufw status` nu arată `before.rules` editate de mână,
+# nici regulile iptables/nft ale altora; nu verifică dacă adresa de pe care rulează
+# curl-ul e aceeași cu cea a conexiunii ssh (`peer`) — de aceea se citesc regulile ambelor
+# familii; un port publicat de Docker fără docker-proxy (userland-proxy dezactivat) nu se
+# vede în `ss`. Doar ufw e citit: pentru firewalld sau nft gol rămâne eșecul.
+#
+#   $1 portul   $2 adresa ta (peer-ul ssh)
+FW_VERDICT="unknown"; FW_WHY=""; FW_SOURCES=""; FW_RULES=""
+firewall_port_verdict() {
+    local port="$1" addr="$2" raw rc=0 line fam rule_fam
+    local to_field action from_field to_tok rest spec proto lo hi covers part
+    local from_clean cidr_says nl
+    local rule_re='^(.*[^[:space:]])[[:space:]]+(ALLOW|DENY|REJECT|LIMIT)([[:space:]]+(IN|OUT|FWD))?[[:space:]]+(.*[^[:space:]])[[:space:]]*$'
+    local spec_re='^[0-9]{1,5}(:[0-9]{1,5})?(,[0-9]{1,5}(:[0-9]{1,5})?)*(/(tcp|udp))?$'
+    FW_VERDICT="unknown"; FW_WHY=""; FW_SOURCES=""; FW_RULES=""
+
+    # PORTUL e validat ÎNAINTE de orice folosire: vine din `--web-port` sau din
+    # sentinel.yaml-ul gazdei, iar într-un `(( ... ))` o valoare ca `a[$(cmd)]` se
+    # EXECUTĂ pe mașina operatorului (măsurat: `port='PASS[$(touch PWNED)]'` a creat
+    # fișierul). Doar cifre, 1-65535; orice altceva e „nu știu", nu o expresie.
+    if [[ ! "$port" =~ ^[0-9]{1,5}$ ]] || (( 10#$port < 1 || 10#$port > 65535 )); then
+        FW_WHY="portul «${port}» nu e un număr de port valid"; return 0
+    fi
+    port=$((10#$port))
+
+    # `::ffff:a.b.c.d` e o adresă IPv4 văzută de un socket dual-stack, iar regulile ei
+    # sunt cele v4: altfel ar fi judecată după familia greșită.
+    if [[ "$addr" =~ ^::[Ff]{4}:([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+        addr="${BASH_REMATCH[1]}"
+    fi
+    if [[ -z "$addr" || ! "$addr" =~ ^[0-9A-Fa-f:.]+$ ]]; then
+        FW_WHY="nu știu adresa ta"; return 0
+    fi
+    if [[ "$addr" == *:* ]]; then fam=6; else fam=4; fi
+
+    measure_remote "sudo -n ufw status verbose" || rc=$?
+    if (( rc != 0 )); then
+        FW_WHY="nu pot citi firewall-ul gazdei (ufw): ${MEASURE_WHY}"; return 0
+    fi
+    raw="${MEASURE_OUT//$'\r'/}"
+    nl=$'\n'
+    if [[ "${nl}${raw}${nl}" != *"${nl}Status: active${nl}"* ]]; then
+        FW_WHY="ufw nu raportează «Status: active» (inactiv, absent sau ieșire neînțeleasă)"; return 0
+    fi
+    if [[ "${nl}${raw}" != *"${nl}Default: deny (incoming)"* && "${nl}${raw}" != *"${nl}Default: reject (incoming)"* ]]; then
+        FW_WHY="politica implicită ufw pe intrare nu e deny/reject, deci un port fără regulă nu e închis"; return 0
+    fi
+
+    while IFS= read -r line; do
+        line="${line%%#*}"
+        [[ "$line" =~ $rule_re ]] || continue
+        to_field="${BASH_REMATCH[1]}"; action="${BASH_REMATCH[2]}"
+        from_field="${BASH_REMATCH[5]}"
+        case "$action" in DENY|REJECT) continue ;; esac
+        case "${BASH_REMATCH[4]}" in OUT|FWD) continue ;; esac
+
+        to_tok="${to_field%% *}"
+        rest="${to_field#"$to_tok"}"; rest="${rest#"${rest%%[![:space:]]*}"}"
+        if [[ -n "$rest" && ! "$rest" =~ ^\(.*\)$ ]]; then
+            FW_WHY="regula ufw «${to_field} ${action} ${from_field}» nu are o formă pe care o știu citi"; return 0
+        fi
+
+        covers=0
+        if [[ "$to_tok" == Anywhere ]]; then
+            covers=1
+        elif [[ "$to_tok" =~ $spec_re ]]; then
+            spec="${to_tok%%/*}"; proto=""
+            [[ "$to_tok" == */* ]] && proto="${to_tok##*/}"
+            if [[ "$proto" != udp ]]; then
+                for part in ${spec//,/ }; do
+                    lo="${part%%:*}"; hi="${part##*:}"
+                    if (( 10#$lo <= port && port <= 10#$hi )); then covers=1; fi
+                done
+            fi
+        else
+            FW_WHY="regula ufw «${to_field} ${action} ${from_field}» nu are o formă pe care o știu citi"; return 0
+        fi
+        (( covers )) || continue
+
+        from_clean="${from_field% (v6)}"
+        if [[ "$from_field" == *"(v6)"* || "$to_field" == *"(v6)"* || "$from_clean" == *:* ]]; then
+            rule_fam=6
+        else
+            rule_fam=4
+        fi
+
+        # AMBELE familii se citesc. `curl` poate ajunge pe IPv6 chiar dacă ssh-ul a venit
+        # pe IPv4: o regulă `(v6) ALLOW Anywhere` deschide portul oricui, oricâtă restricție
+        # ar avea familia peer-ului. Orice regulă care admite internetul, în ORICE familie,
+        # sau care te admite pe tine, înseamnă că firewall-ul nu e motivul.
+        if [[ "$from_clean" == Anywhere || "$from_clean" =~ ^(0\.0\.0\.0|::)/0$ ]]; then
+            FW_VERDICT="open"; FW_WHY="regula ufw «${to_field} ${action} ${from_field}» admite orice sursă"; return 0
+        fi
+        if [[ ! "$from_clean" =~ ^[0-9A-Fa-f:.]+(/[0-9]{1,3})?$ ]]; then
+            FW_WHY="regula ufw «${to_field} ${action} ${from_field}» are o sursă pe care n-o știu citi"; return 0
+        fi
+        if (( rule_fam == fam )); then
+            cidr_says="$(addr_in_cidr "$addr" "$from_clean")"
+        else
+            cidr_says="no"   # o rețea dintr-o familie nu poate conține adresa din cealaltă
+        fi
+        case "$cidr_says" in
+            yes) FW_VERDICT="open"; FW_WHY="regula ufw «${to_field} ${action} ${from_field}» te admite (${addr})"; return 0 ;;
+            no)  FW_SOURCES+=" ${from_clean}"; FW_RULES+="${FW_RULES:+; }${to_field} ${action} ${from_clean}" ;;
+            *)   FW_WHY="n-am putut calcula dacă ${addr} e în ${from_clean} (python3 lipsă pe gazdă?)"; return 0 ;;
+        esac
+    done <<< "$raw"
+
+    if [[ -z "$FW_SOURCES" ]]; then
+        FW_WHY="nicio regulă ufw ALLOW pentru portul ${port}/tcp: nu pot spune că restricția e intenționată"
+        return 0
+    fi
+
+    # Porturile publicate de Docker (docker-proxy sau DNAT) ocolesc ufw: regulile de mai sus
+    # nu spun nimic despre ele. Dacă portul e al lui docker-proxy, sau dacă nu pot afla cine
+    # îl ține, restricția nu e dovedită.
+    rc=0
+    measure_remote "sudo -n ss -tlnpH" || rc=$?
+    if (( rc != 0 )); then
+        FW_WHY="nu pot afla cine ascultă pe :${port} (ss: ${MEASURE_WHY}); un port publicat de Docker ocolește ufw"
+        return 0
+    fi
+    while IFS= read -r line; do
+        read -r _ _ _ spec _ <<< "$line"
+        if [[ "$spec" == *":${port}" && "$line" == *docker-proxy* ]]; then
+            FW_WHY="portul ${port} e publicat de Docker (docker-proxy), iar acesta ocolește ufw: regulile lui nu dovedesc nimic"
+            return 0
+        fi
+    done <<< "$MEASURE_OUT"
+    FW_VERDICT="restricted"
 }
 
 printf '%sSentinel smoke test — %s%s\n' "$_B" "$HOST" "$_0"
@@ -982,6 +1245,11 @@ fi
 # ---------------------------------------------------------------------------
 sect "Dashboard"
 
+# Câte eșecuri existau la intrarea în secțiune: dacă numărul n-a crescut după sondele de
+# loopback, atât aplicația (8787) cât și nginx au răspuns, iar un `000` extern poate fi
+# pus pe seama firewall-ului — vezi `firewall_port_verdict`.
+DASH_FAIL_BASE=$FAIL
+
 # Fără `|| echo 000`: curl tipărește el însuși `000` când eșuează, iar `|| echo`
 # l-ar lipi de al lui („000000"). Gol = ssh n-a răspuns; se citește tot ca 000.
 code="$(r "curl -sk -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:8787/healthz" || true)"
@@ -1009,9 +1277,24 @@ if [[ -n "$DOMAIN" ]]; then
     if [[ "$code" =~ ^(200|401|302)$ ]]; then
         pass "reachable from outside at https://${DOMAIN}${URL_SUFFIX} (HTTP ${code})"
     elif [[ "$code" == "000" ]]; then
-        fail "https://${DOMAIN}${URL_SUFFIX}/healthz did not connect. If the loopback \
+        # Avertisment doar când TOATE sunt dovedite: sondele de loopback au trecut, iar
+        # regulile ufw ale gazdei restrâng portul la surse care nu te includ. Orice altceva
+        # rămâne eșec, cu motivul pentru care restricția nu s-a putut dovedi.
+        FW_VERDICT="unknown"; FW_WHY="sondele de pe loopback de mai sus nu au trecut"
+        if (( FAIL == ${DASH_FAIL_BASE:--1} )); then
+            firewall_port_verdict "$WEB_PORT" "${peer:-}"
+        fi
+        if [[ "$FW_VERDICT" == restricted ]]; then
+            warn "https://${DOMAIN}${URL_SUFFIX}/healthz nu s-a conectat de la tine, dar \
+portul ${WEB_PORT} e închis dinadins de firewall-ul gazdei (ufw): îl admite doar din\
+${FW_SOURCES}, iar adresa ta (${peer}) nu e acolo [regula: ${FW_RULES}]. Sentinel e \
+sănătos pe loopback; presupun că ${DOMAIN} duce la gazda asta (DNS-ul nu-l verific)."
+        else
+            fail "https://${DOMAIN}${URL_SUFFIX}/healthz did not connect. If the loopback \
 check above passed, port ${WEB_PORT} is blocked by the provider firewall or DNS is \
-not pointing here yet — Sentinel itself is fine."
+not pointing here yet — Sentinel itself is fine. (Nu pot dovedi că firewall-ul gazdei \
+îl închide dinadins: ${FW_WHY:-motiv necunoscut}.)"
+        fi
     else
         fail "https://${DOMAIN}${URL_SUFFIX}/healthz returned ${code}"
     fi
