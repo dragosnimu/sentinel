@@ -244,6 +244,10 @@ EXTERNAL_COMMANDS = {
     # interpreters and the operator-side tooling (scripts/ runs on Windows or
     # on the operator's shell, not on the monitored host)
     "bash", "git", "hostname", "jq", "python3", "scp", "ssh",
+    # scripts/lib/system-update-*.sh (the host-side system update): util-linux and coreutils
+    # on every supported host, plus the per-family tools it asks for itself
+    "flock", "gzip", "shutdown", "sync", "systemd-run", "uname",
+    "apt-mark", "grubby", "lslocks", "mysqladmin", "needs-restarting",
 } | SELINUX_TOOLS
 
 #: The subset of EXTERNAL_COMMANDS that may be absent from a supported host,
@@ -271,6 +275,35 @@ UNDERSCORED_BINARIES = {
 # could not see what that pulls in" and "that pulls in nothing" are different
 # answers and only one of them is safe to act on.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Libraries that are only ever run INSIDE another script's shell.
+#
+# scripts/lib/system-update-{measure,containers,verify}.sh are sourced by
+# scripts/lib/system-update-host.sh and call functions that file defines
+# (`say_bad`, `finish`, `have`, ...) and each other's (`su_epoch`). Read alone,
+# every such call is "defined nowhere", and the only ways to make that green
+# would be to widen EXTERNAL_COMMANDS with function names or to skip the files
+# — both of which turn this test into the thing it replaces. The honest model
+# is the runtime one: the call resolves against what the SOURCING script has
+# loaded.
+#
+# So the exception is a reviewed table, not a rule: a library listed here is
+# resolved against its own closure PLUS the closure of the one script that
+# sources it. `test_declared_library_contexts_really_source_the_library`
+# checks the claim (the context sources the library, directly) and that the
+# context is not itself a library, so the table cannot be used to bless a
+# file nothing loads. Every script NOT listed is still resolved in isolation.
+# system-update-lib.sh is deliberately NOT listed: it resolves alone, and listing it
+# would hide a host-only call in a library that is also sourced standalone.
+# ---------------------------------------------------------------------------
+
+SYSTEM_UPDATE_HOST = "scripts/lib/system-update-host.sh"
+LIBRARY_CONTEXT: dict[str, str] = {
+    "scripts/lib/system-update-measure.sh": SYSTEM_UPDATE_HOST,
+    "scripts/lib/system-update-containers.sh": SYSTEM_UPDATE_HOST,
+    "scripts/lib/system-update-verify.sh": SYSTEM_UPDATE_HOST,
+}
 
 OPAQUE_SOURCES: dict[tuple[str, str], str] = {
     ("deploy/lib/distro.sh", "/etc/os-release"):
@@ -301,6 +334,14 @@ PATH_VARIABLES: dict[str, tuple[str, str]] = {
     "REPO_ROOT": (
         ".",
         r'REPO_ROOT="\$\(cd "\$\(dirname "\$\{BASH_SOURCE\[0\]\}"\)/\.\." && pwd\)"'),
+    # scripts/lib/system-update-host.sh sources its four libraries through SU_HERE. The idiom
+    # is TWO lines on purpose: SU_HERE is the script's own directory only because the line
+    # right before it sets SU_SELF to BASH_SOURCE[0] (SU_SELF is reassigned further down, after
+    # SU_HERE is read), so both have to still be there, adjacent, in that order.
+    "SU_HERE": (
+        "%(dir)s",
+        r'SU_SELF="\$\{BASH_SOURCE\[0\]\}"' "\n"
+        r'SU_HERE="\$\(cd "\$\(dirname "\$SU_SELF"\)" && pwd\)"'),
 }
 
 #: `$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)` written out inline.
@@ -1252,6 +1293,8 @@ def analyse(texts: dict[str, str]) -> tuple[list[MissingCall], list[OpaqueSource
     opaque_all: list[OpaqueSource] = []
     for path in sorted(texts):
         reachable, opaque = closure(path)
+        if path in LIBRARY_CONTEXT and LIBRARY_CONTEXT[path] in scans:
+            reachable = reachable | closure(LIBRARY_CONTEXT[path])[0]
         opaque_all += opaque
         available = {name for p in reachable for name in scans[p].defs}
         guarded = _guarded_names(scans[path])
@@ -1369,9 +1412,15 @@ CORE_SCRIPTS = {
     "scripts/inventory-push.sh",
     "scripts/lib/build-package.sh",
     "scripts/lib/check-line-endings.sh",
+    "scripts/lib/system-update-containers.sh",
+    "scripts/lib/system-update-host.sh",
+    "scripts/lib/system-update-lib.sh",
+    "scripts/lib/system-update-measure.sh",
+    "scripts/lib/system-update-verify.sh",
     "scripts/lib/vps-watchdog-conf-init-remote.sh",
     "scripts/secrets-init.sh",
     "scripts/smoke-test.sh",
+    "scripts/system-update.sh",
     "scripts/tail-logs.sh",
     "scripts/vendor-assets.sh",
     "scripts/vps-watchdog-conf-init.sh",
@@ -1492,6 +1541,32 @@ def test_declared_exceptions_are_still_real():
     assert not stale, (
         "OPAQUE_SOURCES allows `source` directives that no longer exist; remove "
         f"them: {stale}")
+
+
+@needs_git
+def test_declared_library_contexts_really_source_the_library():
+    """LIBRARY_CONTEXT lets a library borrow its sourcer's functions; the claim has to be true.
+
+    A library listed with a context that does NOT source it would resolve calls against a
+    script that never loads it at runtime: "defined by the sourcer" would be a fiction and the
+    call would still die with `command not found` on the host. Each entry must name a committed
+    library and a committed context that sources it directly, the context must not itself be a
+    library, and the table must not be empty (an empty table passes over nothing, silently).
+    """
+    texts = _texts_at("HEAD")
+    assert LIBRARY_CONTEXT, "LIBRARY_CONTEXT is empty: the check below would pass over nothing"
+    problems: list[str] = []
+    for library, context in sorted(LIBRARY_CONTEXT.items()):
+        if library not in texts or context not in texts:
+            problems.append(f"{library} -> {context}: not both committed shell scripts")
+            continue
+        if context in LIBRARY_CONTEXT:
+            problems.append(f"{library} -> {context}: the context is itself a library")
+        targets = {_resolve_source_target(context, raw, texts[context], set(texts))
+                   for raw, _ in _scan(texts[context]).sources}
+        if library not in targets:
+            problems.append(f"{context} does not source {library}")
+    assert not problems, "\n".join(problems)
 
 
 @needs_git
