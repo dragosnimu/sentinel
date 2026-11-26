@@ -226,7 +226,7 @@ EXTERNAL_COMMANDS = {
     "awk", "base64", "basename", "cat", "chmod", "chown", "cmp", "comm", "cp",
     "cut", "date", "df", "dirname", "du", "env", "find", "getent", "grep", "head",
     "id", "install", "ln", "mkdir", "mktemp", "mv", "nproc", "od", "readlink", "rm", "sed",
-    "seq", "sha256sum", "sleep", "sort", "stat", "tail", "tar", "timeout",
+    "seq", "sha256sum", "sleep", "sort", "stat", "tail", "tar", "tee", "timeout",
     "touch", "tr", "uniq", "unzip", "wc",
     # accounts, privilege, ACLs
     "groupadd", "runuser", "setfacl", "sudo", "useradd", "usermod", "visudo",
@@ -246,7 +246,7 @@ EXTERNAL_COMMANDS = {
     "bash", "git", "hostname", "jq", "python3", "scp", "ssh",
     # scripts/lib/system-update-*.sh (the host-side system update): util-linux and coreutils
     # on every supported host, plus the per-family tools it asks for itself
-    "flock", "gzip", "shutdown", "sync", "systemd-run", "uname",
+    "flock", "gzip", "shutdown", "sync", "systemd-run", "uname", "ionice", "nice",
     "apt-mark", "grubby", "lslocks", "mysqladmin", "needs-restarting",
 } | SELINUX_TOOLS
 
@@ -1412,12 +1412,14 @@ CORE_SCRIPTS = {
     "scripts/inventory-push.sh",
     "scripts/lib/build-package.sh",
     "scripts/lib/check-line-endings.sh",
+    "scripts/lib/n8n-staging-host.sh",
     "scripts/lib/system-update-containers.sh",
     "scripts/lib/system-update-host.sh",
     "scripts/lib/system-update-lib.sh",
     "scripts/lib/system-update-measure.sh",
     "scripts/lib/system-update-verify.sh",
     "scripts/lib/vps-watchdog-conf-init-remote.sh",
+    "scripts/n8n-staging.sh",
     "scripts/secrets-init.sh",
     "scripts/smoke-test.sh",
     "scripts/system-update.sh",
