@@ -177,7 +177,8 @@ PY
 # singuri sau octeți non-UTF-8 nu ridică excepție (se potrivește ca literal).
 # NEACOPERITE: base64, entități HTML (`&#64;`), dublă codificare (`%2540`, `\\u0103`), o valoare spartă pe două linii de jurnal,
 # o formă derivată (hash, trunchiere), rescrierile parserului URL WHATWG (tab/newline scoase din URL, `\` → `/` în cale) și valorile
-# excluse mai sus (scurte, true/false, chei nesecrete).
+# excluse mai sus (scurte, true/false, chei nesecrete), și o apariție care începe în interiorul celei precedente (un secret care
+# se suprapune cu el însuși, ex. `abab-abab` în `abab-abab-abab`, lasă `-abab`; căutarea reia după prima potrivire completă).
 # O valoare secretă tot nu trebuie pusă în mediu sub o cheie pe care n-o vrei mascată.
 # Dacă scriptul totuși pică, apelanții ascund jurnalul (`scrub_stream` iese nenul → «jurnal ascuns» / ieșire 3), nu îl tipăresc brut.
 read -r -d '' SCRUB_PY <<'PY' || true
