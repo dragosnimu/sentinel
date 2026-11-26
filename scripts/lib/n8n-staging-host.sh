@@ -167,11 +167,17 @@ PY
 #   (2) octeții lui UTF-8 ca `%XX`, cifre hex mici sau mari, în orice combinație (`ă` = `%C4%83`); spațiul și ca `+`;
 #   (3) escaparea JSON: `\"`, `\\`, `\/`, `\n \t \r \b \f`, `\uXXXX` cu hex mic sau mare, iar un caracter din afara BMP ca pereche
 #       surogat (`\uD83D\uDE00`).
-# Fiecare secret dă un tipar; toate potrivirile tuturor tiparelor se unesc în intervale (cele care se suprapun devin unul singur) și abia
-# apoi se înlocuiesc cu `***`. Ordinea secretelor nu contează: un secret prefix al altuia sau două care se acoperă parțial (`ab/cd/ef` și
-# `cd/ef/gh`) nu lasă rest. O valoare cu surogați singuri sau octeți non-UTF-8 nu ridică excepție (se potrivește ca literal).
+#   (4) formele Node: `\'` (util.inspect), `\xNN` pentru coduri sub 0x100 (util.inspect: `\x01`, `\x7F`), iar `escape()` vechi: `%uXXXX` pentru
+#       coduri peste 0xFF (`ă` = `%u0103`) și `%XX` cu octetul Latin-1 pentru 0x80-0xFF (`ñ` = `%F1`); hex mic sau mare în toate.
+# Fiecare secret dă o listă de forme per caracter; potrivirea o face o simulare de NFA (`longest_match`), NU un regex peste tot secretul:
+# `\` și `\\` sunt amândouă forme ale unui backslash, iar motorul `re` încearcă pe rând toate felurile de a parcurge un șir de backslash-uri
+# (exponențial: ~25 în jurnal = minute). Un regex scurt pe primele caractere doar alege pozițiile de început. Toate potrivirile tuturor
+# secretelor se unesc în intervale (cele care se suprapun devin unul singur) și abia apoi se înlocuiesc cu `***`. Ordinea secretelor nu
+# contează: un secret prefix al altuia sau două care se acoperă parțial (`ab/cd/ef` și `cd/ef/gh`) nu lasă rest. O valoare cu surogați
+# singuri sau octeți non-UTF-8 nu ridică excepție (se potrivește ca literal).
 # NEACOPERITE: base64, entități HTML (`&#64;`), dublă codificare (`%2540`, `\\u0103`), o valoare spartă pe două linii de jurnal,
-# o formă derivată (hash, trunchiere) și valorile excluse mai sus (scurte, true/false, chei nesecrete).
+# o formă derivată (hash, trunchiere), rescrierile parserului URL WHATWG (tab/newline scoase din URL, `\` → `/` în cale) și valorile
+# excluse mai sus (scurte, true/false, chei nesecrete).
 # O valoare secretă tot nu trebuie pusă în mediu sub o cheie pe care n-o vrei mascată.
 # Dacă scriptul totuși pică, apelanții ascund jurnalul (`scrub_stream` iese nenul → «jurnal ascuns» / ieșire 3), nu îl tipăresc brut.
 read -r -d '' SCRUB_PY <<'PY' || true
@@ -197,31 +203,102 @@ for e in entries:
 JSON_SHORT = {'"': '\\"', "\\": "\\\\", "/": "\\/", "\n": "\\n", "\t": "\\t", "\r": "\\r", "\b": "\\b", "\f": "\\f"}
 
 
-def hex_any_case(n, width):
-    return "".join(d if d.isdigit() else "[%s%s]" % (d.lower(), d.upper()) for d in "%0*x" % (width, n))
+def hex_atoms(n, width):
+    """Cifrele hex ale lui n ca atomi: o cifră-literă acceptă ambele litere (`c` și `C`), independent per cifră."""
+    return tuple(d if d.isdigit() else d.lower() + d.upper() for d in "%0*x" % (width, n))
 
 
-def char_pattern(ch):
-    alts = [re.escape(ch)]
+def char_forms(ch):
+    """Toate formele în care jurnalul poate scrie caracterul `ch`; fiecare formă e un tuplu de ATOMI, iar un atom e șirul de caractere
+    pe care îl acceptă într-o poziție (un singur caracter, sau `cC` pentru o cifră hex)."""
+    forms = [(ch,)]
     if ch == " ":
-        alts.append(re.escape("+"))
+        forms.append(("+",))
     try:
         raw = ch.encode("utf-8", "surrogateescape")
     except UnicodeEncodeError:
-        raw = b""                         # surogat singur: nu are octeți, rămâne doar litera și forma JSON
+        raw = b""                         # surogat singur: nu are octeți, rămâne doar litera și formele cu cod
     if raw:
-        alts.append("".join("%" + hex_any_case(b, 2) for b in raw))
+        forms.append(tuple(a for b in raw for a in ("%",) + hex_atoms(b, 2)))
     if ch in JSON_SHORT:
-        alts.append(re.escape(JSON_SHORT[ch]))
+        forms.append(tuple(JSON_SHORT[ch]))
+    if ch == "'":
+        forms.append(("\\", "'"))            # util.inspect scrie 'a\'b'
     cp = ord(ch)
+    if cp < 0x100:
+        forms.append(("\\", "x") + hex_atoms(cp, 2))                  # util.inspect: caractere de control (x01, x7F, precedate de backslash)
+    if 0x80 <= cp < 0x100:
+        forms.append(("%",) + hex_atoms(cp, 2))                        # escape() legacy: octetul Latin-1 (ñ = %F1)
     units = [cp] if cp < 0x10000 else [0xD800 + ((cp - 0x10000) >> 10), 0xDC00 + ((cp - 0x10000) & 0x3FF)]
-    alts.append("".join(re.escape("\\u") + hex_any_case(u, 4) for u in units))
-    return "(?:" + "|".join(alts) + ")"
+    forms.append(tuple(a for u in units for a in ("\\", "u") + hex_atoms(u, 4)))
+    if cp > 0xFF:
+        forms.append(tuple(a for u in units for a in ("%", "u") + hex_atoms(u, 4)))   # escape() legacy: ă = %u0103
+    return list(dict.fromkeys(forms))
 
 
-patterns = [re.compile("".join(char_pattern(c) for c in v)) for v in found]
+def atom_rx(atom):
+    return re.escape(atom) if len(atom) == 1 else "[" + "".join(re.escape(c) for c in atom) + "]"
+
+
+PREFIX_CHARS = 3
+
+
+def prefix_regex(forms):
+    """Doar primele PREFIX_CHARS caractere, ca filtru ieftin pentru pozițiile de început (apelantul reia căutarea de la start+1, ca să
+    vadă și pozițiile care se suprapun). NU se potrivește tot secretul într-un regex: un backslash și două backslash-uri sunt amândouă
+    forme ale aceluiași caracter, deci un șir de backslash-uri se poate parcurge în foarte multe feluri, iar motorul `re` le încearcă
+    pe toate (exponențial: ~25 de backslash-uri în jurnal = minute). Verificarea întreagă o face `longest_match`, care ține MULȚIMEA
+    stărilor, nu o cale."""
+    return re.compile("".join("(?:" + "|".join("".join(atom_rx(a) for a in f) for f in forms[i]) + ")"
+                              for i in range(min(PREFIX_CHARS, len(forms)))))
+
+
+def longest_match(forms, text, start):
+    """(primul, cel mai lung) sfârșit al unei potriviri a secretului (lista `forms`) care începe la `start`, sau (-1, -1). Simulare de NFA:
+    starea e (index caracter, index formă, atomi consumați), iar mulțimea stărilor vii se avansează o dată per caracter de text, deci
+    un șir ambiguu NU mai cere un număr exponențial de încercări. Costul e polinomial, nu liniar: la fiecare început candidat se
+    parcurge cât timp mai trăiește vreo stare, deci ~(începuturi candidate × întinderea unei potriviri parțiale × stări); un secret de
+    40 de backslash-uri + `Q`, absent într-un șir de 4000 de backslash-uri, durează secunde."""
+    n, end = len(forms), len(text)
+    live = {(0, f, 0) for f in range(len(forms[0]))}
+    best, first, pos = -1, -1, start
+    while live and pos < end:
+        ch = text[pos]
+        pos += 1
+        nxt = set()
+        for i, f, j in live:
+            form = forms[i][f]
+            if ch not in form[j]:
+                continue
+            if j + 1 < len(form):
+                nxt.add((i, f, j + 1))
+            elif i + 1 == n:
+                best = pos
+                if first < 0:
+                    first = pos
+            else:
+                nxt.update((i + 1, g, 0) for g in range(len(forms[i + 1])))
+        live = nxt
+    return first, best
+
+
 text = sys.stdin.buffer.read().decode("utf-8", "surrogateescape")
-spans = sorted(m.span() for rx in patterns for m in rx.finditer(text))
+spans = []
+for v in found:
+    forms = [char_forms(c) for c in v]
+    prefix, at = prefix_regex(forms), 0
+    while True:
+        m = prefix.search(text, at)
+        if m is None:
+            break
+        first, e = longest_match(forms, text, m.start())
+        if e >= 0:
+            spans.append((m.start(), e))  # se maschează până la cea mai lungă potrivire...
+            at = first                    # ...dar căutarea reia de la PRIMA: un secret care se termină în backslash are ca formă lungă
+                                          # `\\`, al cărui al doilea backslash ar fi început o a doua apariție a secretului (rămânea în clar)
+        else:
+            at = m.start() + 1
+spans.sort()
 merged = []
 for s, e in spans:
     if merged and s < merged[-1][1]:
@@ -426,6 +503,8 @@ check_prod_unchanged() {
 # (din fișierul de mediu, dacă există, și din Config.Env al containerului, dacă există) devine ***, cu excepțiile din SCRUB_PY
 # (cifre, true/false, valori scurte, suprascrierile noastre). Dacă nu are de unde să afle valorile, NU tipărește textul:
 # «n-am putut filtra» nu înseamnă «nu e nimic de filtrat».
+SCRUB_FAILED_MSG='(jurnal ascuns: filtrarea a eșuat)'
+SCRUB_UNREADABLE_MSG='(text ascuns: nu pot citi valorile de mediu ca să-l filtrez)'
 scrub_stream() {
     local json="" k skip=""
     for k in "${ENV_OVERRIDES[@]}"; do skip+="${k%%=*},"; done
@@ -436,7 +515,7 @@ scrub_stream() {
         N8N_SCRUB_SKIP_KEYS="$skip" N8N_SCRUB_JSON="$json" python3 -c "$SCRUB_PY"
     else
         cat >/dev/null
-        printf '(text ascuns: nu pot citi valorile de mediu ca să-l filtrez)\n'
+        printf '%s\n' "$SCRUB_UNREADABLE_MSG"
     fi
 }
 
@@ -802,23 +881,41 @@ sample_state() {
     docker container inspect "$STAGING_CONTAINER" --format '{{.State.Status}} {{.RestartCount}} {{.State.StartedAt}}'
 }
 
+# 0 dacă textul întors de scrub_stream e un înlocuitor (filtrul a căzut sau n-a avut valorile), nu un jurnal filtrat.
+log_is_hidden() { [[ "$1" == "$SCRUB_FAILED_MSG" || "$1" == "$SCRUB_UNREADABLE_MSG" ]]; }
+
+# Un jurnal ascuns NU e un jurnal fără migrări sau erori: sub fiecare titlu se spune că nu se știe, nu se lasă titlul gol (un titlu gol
+# la capătul unui `up` reușit se citește ca «nicio eroare»).
 show_log_excerpt() {
-    local logs
+    local logs hidden=0
     logs="$(docker logs --tail 3000 "$STAGING_CONTAINER" 2>&1)" || true
-    logs="$(scrub_stream <<<"$logs")" || logs="(jurnal ascuns: filtrarea a eșuat)"
+    logs="$(scrub_stream <<<"$logs")" || logs="$SCRUB_FAILED_MSG"
+    if log_is_hidden "$logs"; then hidden=1; fi
     say "migrările bazei, din jurnal (cel mult 30):"
-    { grep -i -E 'migrat' <<<"$logs" || true; } | awk 'NR <= 30 { print "    " $0 }'
+    if [[ $hidden -eq 1 ]]; then
+        printf '    %s\n    NU știu dacă există migrări: jurnalul nu poate fi arătat, iar liniile lui nu se tipăresc nefiltrate.\n' "$logs"
+    else
+        { grep -i -E 'migrat' <<<"$logs" || true; } | awk 'NR <= 30 { print "    " $0 }'
+    fi
     say "linii de eroare, din jurnal (cel mult 30):"
-    { grep -i -E 'error|fatal|exception|cannot|failed' <<<"$logs" || true; } | awk 'NR <= 30 { print "    " $0 }'
+    if [[ $hidden -eq 1 ]]; then
+        printf '    %s\n    NU știu dacă există erori: jurnalul nu poate fi arătat, iar liniile lui nu se tipăresc nefiltrate.\n' "$logs"
+    else
+        { grep -i -E 'error|fatal|exception|cannot|failed' <<<"$logs" || true; } | awk 'NR <= 30 { print "    " $0 }'
+    fi
 }
 
 # Progres cât așteaptă: ultimele linii din jurnal, filtrate. O migrare de ore pe o bază mare arată altfel ca un proces blocat.
 show_progress() {
     local waited="$1" tail_logs
     tail_logs="$(docker logs --tail 2 "$STAGING_CONTAINER" 2>&1)" || tail_logs=""
-    tail_logs="$(scrub_stream <<<"$tail_logs")" || tail_logs="(jurnal ascuns: filtrarea a eșuat)"
+    tail_logs="$(scrub_stream <<<"$tail_logs")" || tail_logs="$SCRUB_FAILED_MSG"
     say "încă aștept (~${waited}s); ultimele linii din jurnal:"
-    awk 'NF { print "    | " $0 }' <<<"$tail_logs"
+    if log_is_hidden "$tail_logs"; then
+        printf '    | %s\n    | (liniile nu se tipăresc nefiltrate; nu știu ce spun)\n' "$tail_logs"
+    else
+        awk 'NF { print "    | " $0 }' <<<"$tail_logs"
+    fi
 }
 
 wait_healthy() {
@@ -887,7 +984,7 @@ report_release_type() {
 }
 
 cmd_up() {
-    local version="$1" image ip stage_dir
+    local version="$1" image ip stage_dir create_err
     image="${IMAGE_REPO}:${version}"
     up_preflight
 
@@ -929,7 +1026,11 @@ cmd_up() {
     fi
     args+=("$image")
     if ! docker "${args[@]}" >/dev/null 2>"$ERR_FILE"; then
-        scrub_stream <"$ERR_FILE" | sed 's/^/    docker: /' >&2
+        create_err="$(scrub_stream <"$ERR_FILE")" || create_err="$SCRUB_FAILED_MSG"
+        if [[ -n "$create_err" ]]; then printf '%s\n' "$create_err" | sed 's/^/    docker: /' >&2; fi
+        if log_is_hidden "$create_err"; then
+            refuse "docker create a eșuat; mesajul lui docker NU se arată (filtrarea a eșuat sau nu pot citi valorile de mediu), deci nu știu ce a spus"
+        fi
         refuse "docker create a eșuat (mesajul de mai sus are valorile de mediu înlocuite cu ***)"
     fi
     STAGING_CREATED=1

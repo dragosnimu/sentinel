@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -678,6 +679,7 @@ def test_a_docker_create_error_that_quotes_the_environment_is_scrubbed_and_the_e
     res = w.up()
     assert res.rc == 1, res.out
     assert "TWILIO_AUTH_TOKEN=***" in res.out
+    assert "mesajul de mai sus are valorile de mediu înlocuite" in res.out, res.out      # aici ESTE un mesaj mai sus
     assert_no_secret(w, res)
     assert_env_file_gone(w)
     assert STAGE not in w.load()["containers"]
@@ -981,6 +983,115 @@ def test_a_value_with_a_lone_surrogate_does_not_hide_the_log_nor_other_secrets(w
     assert res.rc == 0 and _lines(res) == ["mail=*** ok"], res.out
 
 
+def test_a_secret_that_starts_inside_a_false_start_is_still_found_and_the_longest_form_wins(w):
+    """Filtrul alege pozițiile de început cu un regex scurt, apoi verifică tot secretul. (1) `abab-key` în `ababab-key`: primul început (0)
+    pică, iar al doilea (2) e în interiorul potrivirii de prefix a primului: dacă după un prefix se sare peste el, `ab` + secretul rămân
+    în clar. (2) un secret care se termină în backslash, în jurnal ca JSON `\\\\`: dacă se ia prima formă (un backslash), rămâne un backslash
+    pe lângă `***`; se ia cea mai lungă."""
+    res = _encoded_logs(w, ["PASS=abab-key"], "t ababab-key t\n")
+    assert _lines(res) == ["t ab*** t"], res.out
+    res = _encoded_logs(w, ["PASS=abc-" + BS], "t abc-" + BS + BS + " t\nu abc-" + BS + " u\n")
+    assert _lines(res) == ["t *** t", "u *** u"], res.out
+
+
+def test_two_occurrences_of_a_secret_ending_in_a_backslash_back_to_back_leave_no_residue(tmp_path):
+    """Pentru un secret care se termină în backslash, forma lungă (JSON `\\\\`) înghite primul backslash al unei a doua apariții lipite de
+    prima; dacă după o potrivire căutarea reia de la sfârșitul celei mai lungi, a doua apariție nu mai are început și cade în clar
+    (`***key9\\` în loc de nimic). Se maschează până la cea mai lungă potrivire, dar căutarea reia de la prima."""
+    t, out = _run_scrub(BS + "key9" + BS, "x " + BS + "key9" + BS + BS + "key9" + BS + " y\n")
+    assert out == "x *** y\n", out
+    t, out = _run_scrub("ab-key" + BS, "x ab-key" + BS + BS + "u0061b-key" + BS + " y\n")
+    assert out == "x *** y\n", out
+
+
+def test_node_inspect_escaped_single_quote_is_masked(w):
+    """`util.inspect` pune un șir cu ghilimele simple și duble în apostrofuri și scrie apostroful din valoare ca backslash + apostrof:
+    `'O\\'Brien-key9'`. Fără forma asta, un secret cu apostrof ajungea în clar în `logs` când n8n loga un obiect cu `console.log`."""
+    log = "obj { who: 'O" + BS + "'Brien-key9' } and O'Brien-key9 and O%27Brien-key9\n"
+    res = _encoded_logs(w, ["OWNER=O'Brien-key9"], log)
+    assert res.rc == 0, res.out
+    assert _lines(res) == ["obj { who: '***' } and *** and ***"], res.out
+
+
+def test_node_inspect_hex_escapes_of_control_and_latin1_characters_are_masked(w):
+    """`util.inspect` scrie caracterele de control și cele sub 0x100 ca `\\xNN` (`\\x01`, `\\x7F`, `\\xF1`), cu hex mic sau mare. Un secret
+    cu un caracter de control (cheie lipită dintr-un terminal) sau cu `ñ` rămânea în clar în `logs` când n8n loga obiectul."""
+    secret = "ab" + chr(1) + "cd" + chr(0x7F) + "ef-Mu" + chr(0xF1) + "oz"
+    log = (f"v1 ab{BS}x01cd{BS}x7Fef-Mu{BS}xF1oz end\n"
+           f"v2 ab{BS}x01cd{BS}x7fef-Mu{BS}xf1oz end\n"
+           f"v3 ab{BS}x01cd{BS}x7Fef-Mu{BS}xf1oz end\n")
+    res = _encoded_logs(w, [f"RAW={secret}"], log)
+    assert res.rc == 0, res.out
+    assert _lines(res) == ["v1 *** end", "v2 *** end", "v3 *** end"], res.out
+
+
+def test_legacy_escape_percent_u_form_is_masked_for_characters_above_ff(w):
+    """`escape()` din Node (vechi, încă în codul unor noduri n8n) scrie `ă` ca `%u0103` și `ț` ca `%u021B`, nu ca `%C4%83`: un nume sau o
+    parolă cu diacritice logate așa rămâneau în clar în `logs`. Hex mic sau mare, iar un caracter din afara BMP e pereche `%uD83D%uDE00`."""
+    res = _encoded_logs(w, ["OWNER=Ionel-Băs-ț"], "a Ionel-B%u0103s-%u021B z\nb Ionel-B%u0103s-%u021b z\n")
+    assert res.rc == 0, res.out
+    assert _lines(res) == ["a *** z", "b *** z"], res.out
+    res = _encoded_logs(w, ["EMOJI_PASS=key😀value"], "a key%uD83D%uDE00value z\nb key%ud83d%ude00value z\n")
+    assert _lines(res) == ["a *** z", "b *** z"], res.out
+
+
+def test_legacy_escape_percent_xx_of_the_latin1_byte_is_masked_for_0x80_to_0xff(w):
+    """`escape("ñ")` e `%F1` (octetul Latin-1), nu `%C3%B1` (UTF-8): un secret cu `ñ` sau `é` logat așa rămânea în clar în `logs`."""
+    res = _encoded_logs(w, ["OWNER=Muñoz-Café"], "a Mu%F1oz-Caf%E9 z\nb Mu%f1oz-Caf%e9 z\nc Mu%C3%B1oz-Caf%C3%A9 z\n")
+    assert res.rc == 0, res.out
+    assert _lines(res) == ["a *** z", "b *** z", "c *** z"], res.out
+
+
+def _scrub_program() -> str:
+    """Textul lui SCRUB_PY, exact cum e livrat în bibliotecă."""
+    src = HOST_LIB.read_text(encoding="utf-8")
+    m = re.search(r"read -r -d '' SCRUB_PY <<'PY' \|\| true\n(.*?)\nPY\n", src, re.S)
+    assert m, "nu găsesc SCRUB_PY în bibliotecă"
+    return m.group(1)
+
+
+def _run_scrub(secret: str, log: str, timeout: float = 30.0):
+    """Rulează filtrul real pe `log` cu un singur secret. Un tipar care revine la timp exponențial cade pe `timeout`, nu agață testul.
+    `-W error`: un avertisment de sintaxă din program (o secvență de escapare nevalidă într-un docstring) ar face filtrul să cadă."""
+    env = dict(os.environ, N8N_SCRUB_JSON=json.dumps(["K=" + secret]), PYTHONIOENCODING="utf-8")
+    t0 = time.monotonic()
+    try:
+        proc = subprocess.run([sys.executable, "-W", "error", "-c", _scrub_program()], input=log.encode(), capture_output=True,
+                              env=env, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        pytest.fail(f"filtrul n-a terminat în {timeout:.0f} s (timp exponențial pe un șir de backslash-uri?)")
+    assert proc.returncode == 0, proc.stderr.decode(errors="replace")
+    return time.monotonic() - t0, proc.stdout.decode("utf-8")
+
+
+def test_a_long_run_of_backslashes_in_the_log_does_not_make_the_filter_take_minutes(tmp_path):
+    """Un backslash dintr-un secret se potrivește ca `\\` sau `\\\\` (JSON): un regex peste tot secretul parcurge un șir de backslash-uri în
+    exponențial de multe feluri (~25 de backslash-uri în jurnal, secretul absent = 43 s; 28 = peste un minut). Un jurnal cu un șir lung de
+    backslash-uri (un JSON escapat de mai multe ori, un traseu Windows) ar fi blocat `logs` și fiecare `up` la capăt, fără nicio eroare.
+    Aici: secret de 40 de backslash-uri, absent într-un șir de 39 (nimic de mascat), prezent într-unul de 48 și de 3000, sub 2,5 s fiecare."""
+    secret = BS * 40
+    t, out = _run_scrub(secret, "x " + BS * 39 + " y\n")
+    assert out == "x " + BS * 39 + " y\n", out
+    assert t < 2.5, f"absent: {t:.1f} s"
+    t, out = _run_scrub(secret, "x " + BS * 48 + " y\n")
+    assert out == "x *** y\n", out
+    assert t < 2.5, f"prezent (48): {t:.1f} s"
+    t, out = _run_scrub(secret, "x " + BS * 3000 + " y\n")
+    assert out.startswith("x ***") and out.endswith(" y\n") and BS * 40 not in out, out[:80]
+    assert t < 2.5, f"prezent (3000): {t:.1f} s"
+
+
+def test_repeated_backslash_quote_pairs_do_not_make_the_filter_take_minutes(tmp_path):
+    """Același eșec pe altă cale: `\\"` apare în secret ca backslash + ghilimea, iar în jurnal `\\\\"` se parcurge în două feluri; 26 de perechi
+    la rând, cu sfârșitul secretului lipsă din jurnal, dădeau 38 s (2^26 de încercări), iar 30 de perechi ore."""
+    secret = (BS + '"') * 30 + "Q"
+    log_absent = "x " + (BS + BS + '"') * 30 + "z y\n"
+    t, out = _run_scrub(secret, log_absent)
+    assert out == log_absent and t < 2.5, f"{t:.1f} s"
+    t, out = _run_scrub(secret, "x " + (BS + BS + '"') * 30 + "Q y\n")
+    assert out == "x *** y\n" and t < 2.5, f"{t:.1f} s: {out[:60]}"
+
+
 def _python_that_crashes_on_the_scrub_program(w: World) -> None:
     """Înlocuiește `python3` din momeli cu unul care pică DOAR pe programul de filtrare (îl recunoaște după variabila N8N_SCRUB_JSON din
     codul lui) și în rest e python-ul real. Simulare: pică înainte de orice citire, ca o excepție la început; nu reproduce o excepție
@@ -1006,7 +1117,8 @@ def test_logs_hides_the_log_when_the_scrub_crashes(w):
 @pytest.mark.parametrize("fn", ["show_log_excerpt", "show_progress 30"])
 def test_the_wait_helpers_hide_the_log_when_the_scrub_crashes(w, fn):
     """`show_log_excerpt` (cauza unui timeout) și `show_progress` (progresul la așteptare) tipăresc linii de jurnal în mijlocul unui `up`:
-    dacă filtrul pică, ele trebuie să înlocuiască jurnalul cu «jurnal ascuns», nu să-l tipărească brut."""
+    dacă filtrul pică, ele trebuie să înlocuiască jurnalul cu «jurnal ascuns», nu să-l tipărească brut. ȘI trebuie să SPUNĂ asta: sub titlurile
+    «migrările bazei» și «linii de eroare» un jurnal ascuns lăsat gol se citește, la capătul unui `up` reușit, ca «nicio eroare»."""
     add_container(w, STAGE, {LABEL: "1"}, network=STAGE_NET)
     w.load()
     w.state["containers"][STAGE]["env"] = [f"{k}={v}" for k, v in SECRETS.items()]
@@ -1014,10 +1126,43 @@ def test_the_wait_helpers_hide_the_log_when_the_scrub_crashes(w, fn):
     w.save()
     ok = w.run_sourced(fn)       # control pozitiv: cu filtrul întreg comanda ARATĂ linia (mascată); altfel «nu apare» n-ar dovedi nimic
     assert "retrying with ***" in ok.out, ok.out
+    assert "jurnal ascuns" not in ok.out and "NU știu" not in ok.out, ok.out
     _python_that_crashes_on_the_scrub_program(w)
     res = w.run_sourced(fn)
     assert "retrying" not in res.out, res.out
     assert_no_secret(w, res)
+    assert "jurnal ascuns: filtrarea a eșuat" in res.out, res.out        # operatorul e anunțat, nu doar scutit de linii
+    if fn != "show_log_excerpt":
+        # și a doua linie: fără ea, un `if false` în loc de `log_is_hidden` ar lăsa doar placeholderul (trecut prin awk) și testul ar tăcea
+        assert "liniile nu se tipăresc nefiltrate; nu știu ce spun" in res.out, res.out
+    if fn == "show_log_excerpt":
+        # câte un mesaj sub FIECARE titlu, nu un titlu gol urmat de altul
+        assert res.out.count("jurnal ascuns: filtrarea a eșuat") == 2, res.out
+        mig, err = res.out.index("migrările bazei"), res.out.index("linii de eroare")
+        assert mig < res.out.index("NU știu dacă există migrări") < err < res.out.index("NU știu dacă există erori"), res.out
+
+
+def test_the_log_excerpt_says_so_when_the_scrub_cannot_read_the_environment_values(w):
+    """A treia cale spre un jurnal ascuns: nu e nicio valoare de mediu de citit (containerul a dispărut, nu e fișier de mediu), iar
+    `scrub_stream` iese 0 cu «text ascuns». Excerptul trece acel text prin `grep migrat`/`grep error` și rămânea cu două titluri goale."""
+    res = w.run_sourced("show_log_excerpt")
+    assert res.out.count("text ascuns: nu pot citi valorile de mediu") == 2, res.out
+    assert "NU știu dacă există migrări" in res.out and "NU știu dacă există erori" in res.out, res.out
+
+
+def test_a_docker_create_error_that_cannot_be_scrubbed_is_not_described_as_scrubbed(w):
+    """Dacă filtrul pică în timp ce se arată eroarea lui `docker create`, nu există niciun mesaj «mai sus»: textul `mesajul de mai sus are
+    valorile înlocuite cu ***` ar trimite operatorul să caute ceva ce nu s-a tipărit. Se spune pe față că mesajul docker nu se arată, iar
+    valoarea din el nu apare nicăieri."""
+    patch_state(w, create_rc=125, create_stderr=f"Error response from daemon: invalid env entry TWILIO_AUTH_TOKEN={SECRETS['TWILIO_AUTH_TOKEN']}")
+    _python_that_crashes_on_the_scrub_program(w)
+    res = w.up()
+    assert res.rc == 1, res.out
+    assert "mesajul lui docker NU se arată" in res.out and "jurnal ascuns: filtrarea a eșuat" in res.out, res.out
+    assert "mesajul de mai sus" not in res.out, res.out
+    assert_no_secret(w, res)
+    assert_env_file_gone(w)
+    assert STAGE not in w.load()["containers"]
 
 
 def test_logs_without_a_container_is_a_refusal(w):
