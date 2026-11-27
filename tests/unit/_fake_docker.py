@@ -218,7 +218,14 @@ def cmd_compose(state: dict, args: list[str]) -> int:
                 if c["labels"].get("com.docker.compose.service") == s and c["labels"].get("com.docker.compose.project") == project:
                     # `up_image`: un redeploy făcut de altcineva chiar în fereastra dintre `tag` și `up` — containerul rezultat rulează ALTĂ imagine decât
                     # cea pe care o numește eticheta (efect scriptat, ca `swap_on_pull`, dar în `up`).
-                    c["image_id"] = state.get("up_image", {}).get(s) or state["images"][c["config_image"]]["id"]
+                    # Ca un `up` real, recreează pe imaginea pe care o numește FIȘIERUL compose acum (nu pe numele cu care a fost creat containerul: un fișier
+                    # editat să numească altă etichetă nu era reprodus) și aliniază eticheta de hash la hash-ul serviciului. Fără `image:` în config, rămâne
+                    # numele de la creare.
+                    file_ref = comp["config"]["services"].get(s, {}).get("image")
+                    img_ref = file_ref if file_ref in state["images"] else c["config_image"]
+                    c["image_id"] = state.get("up_image", {}).get(s) or state["images"][img_ref]["id"]
+                    if s in comp.get("hashes", {}):
+                        c["labels"]["com.docker.compose.config-hash"] = comp["hashes"][s]
                     if effect != "recreate_old_created":      # `recreate_old_created`: ID nou, dar containerul NU e recreat acum
                         c["created"] = now_iso()
                     c["started"] = now_iso()
