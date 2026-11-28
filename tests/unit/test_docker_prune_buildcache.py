@@ -416,3 +416,39 @@ def test_shared_entries_that_vanish_are_not_added_to_the_freed_total(w):
     rc, out = w.run("--yes")
     assert rc == 0, out
     assert f"eliberat: 5 intrări, 95.92 GB ({TOTAL} B)" in out and "2 intrări care erau în uz sau partajate" in out, out
+
+
+# ---------------------------------------------------------------- round 3: două gărzi fără test
+
+def test_a_failed_remeasurement_after_da_neither_prunes_nor_reports_ok(w):
+    """După «da», măsurătoarea «înainte» se reia. Dacă ssh cade chiar atunci, un fișier gol arată ca «cache deja gol»: scriptul ar ieși cu 0
+    și ar spune operatorului că nu e nimic de făcut, pe o gazdă pe care nu a mai văzut-o. Trebuie 255, fără prune și fără niciun verdict."""
+    rc, out = w.run(stdin=b"da\n", FAKE_SSH_FAIL_SNAPSHOT_N="2")
+    assert rc == 255, out
+    assert w.prune_calls() == [], w.tool_log()
+    assert "deja gol" not in out and "gata" not in out and "nimic de eliberat" not in out, out
+
+
+def test_a_truncated_remeasurement_after_da_is_unknown_and_does_not_prune(w):
+    """Aceeași clipă, dar ssh nu cade, ci întoarce o jumătate de răspuns. Trunchiat, fără SNAPSHOT_END, el nu e o măsurătoare: cod 3, nu
+    «cache deja gol» (0) și nu un prune pornit pe o stare necunoscută."""
+    rc, out = w.run(stdin=b"da\n", FAKE_SSH_TRUNCATE_SNAPSHOT_N="2")
+    assert rc == 3 and "trunchiat" in out, out
+    assert w.prune_calls() == [], w.tool_log()
+    assert "deja gol" not in out and "gata" not in out, out
+
+
+def test_a_cache_entry_without_the_shared_key_is_unknown_and_not_reclaimable(w):
+    """O formă a API-ului în care intrarea nu are cheia Shared nu spune dacă straturile ei țin imagini. Tratată ca «nepartajată», intrarea ar
+    intra la eliberabil și operatorul ar vedea un total umflat (sau ar încerca să șteargă ceva ce docker nu șterge). Gazda iese cu 13, lansatorul
+    cu 3, fără prune; intrarea nu se numără nicăieri."""
+    import subprocess
+    from _su_shell import BASH, posix
+    mutate(w, curl_mode="no_shared_key")
+    direct = subprocess.run([BASH, posix(HOST_LIB), "snapshot"], input=b"", capture_output=True, env=w.env(), timeout=120)
+    assert direct.returncode == 13, direct.stderr
+    assert b"BCENTRY" not in direct.stdout, direct.stdout
+    assert b"Shared" in direct.stderr, direct.stderr          # eroarea numește cheia care lipsește
+    rc, out = w.run("--yes")
+    assert rc == 3 and "n-am putut citi cache-ul de build" in out, out
+    assert w.prune_calls() == []

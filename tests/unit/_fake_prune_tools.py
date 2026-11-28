@@ -134,7 +134,10 @@ def curl(args: list[str]) -> int:
     if mode == "not_json":
         print("<html>502</html>")
         return 0
-    print(json.dumps({"LayersSize": 1, "Images": [], "BuildCache": st["cache"] or None}))
+    rows = st["cache"] or None
+    if mode == "no_shared_key" and rows:
+        rows = [{k: v for k, v in rows[0].items() if k != "Shared"}] + rows[1:]   # API fără cheia Shared pe prima intrare
+    print(json.dumps({"LayersSize": 1, "Images": [], "BuildCache": rows}))
     return 0
 
 
