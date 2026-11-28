@@ -23,8 +23,10 @@
     "anything that CHANGES the server still goes through deploy/ or scripts/,",
     "where it can be reviewed and repeated.",
     "",
-    "`scp` and `git push` stay denied. Neither was asked for, and neither is",
-    "needed to diagnose anything."
+    "`scp` ramane refuzat. `git push` a fost refuzat pana pe 24 septembrie 2026,",
+    "cand operatorul l-a cerut ca sa poata fi publicat cod trecut deja prin",
+    "scriitor si verificator. Ramane refuzata doar rescrierea de istorie: un",
+    "--force peste main e singurul push care chiar poate distruge ceva."
   ],
 
   "permissions": {
@@ -55,7 +57,9 @@
       "Write(./secrets/**)",
 
       "Bash(scp:*)",
-      "Bash(git push:*)"
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git push:*--force*)"
     ]
   }
 }
