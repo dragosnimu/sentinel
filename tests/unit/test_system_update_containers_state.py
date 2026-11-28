@@ -253,7 +253,7 @@ def test_retry_failed_must_name_a_known_project(tmp_path):
 
 def test_rerun_never_retags_the_rollback_tag_with_the_failed_image(tmp_path):
     """Eticheta de rollback se suprascria cu imaginea picată la o rerulare cu retry: imaginea originală
-    rămânea fără etichetă, iar `docker image prune --filter until=720h` din timerul săptămânal o șterge —
+    rămânea fără etichetă, iar primul `docker image prune` (de mână — pe gazdă nu rulează niciun timer) o șterge —
     rollback-ul dispărea exact când era nevoie. Prima scriere câștigă: eticheta arată mereu imaginea de
     dinainte de mentenanță (verificat după ID)."""
     base = failed_recreate(tmp_path)

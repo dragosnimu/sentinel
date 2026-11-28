@@ -880,8 +880,10 @@ recheck_services() {
 #   * containerul rulează acum ID-ul clasificat — altfel a fost schimbat de altcineva între timp și nu etichetăm nimic;
 #   * ID-ul e al baseline-ului sau unul pe care l-am văzut noi rulând (altfel baseline vechi: nicio etichetă);
 #   * `prev` (primul fapt scris înainte de tag/up) e ținta etichetei. Prima scriere câștigă: la o rulare repetată `old_id` poate fi
-#     deja imaginea picată; retagarea ar lăsa originalul fără etichetă, iar `docker image prune --filter until=720h` din timerul
-#     săptămânal l-ar șterge. Fără `prev` încă, prima atingere cere ca imaginea să fie chiar cea din baseline.
+#     deja imaginea picată; retagarea ar lăsa originalul fără etichetă, iar orice `docker image prune` l-ar șterge. Pe gazda
+#     Sentinel nu rulează niciun timer de prune (verificat 2026-11-28); scripts/docker-prune-buildcache.sh atinge doar cache-ul
+#     de build, nu imaginile — riscul vine dintr-un prune de imagini rulat de mână. Fără `prev` încă, prima atingere cere ca
+#     imaginea să fie chiar cea din baseline.
 ensure_rollback_tag() {
     local project="$1" svc="$2" tag id live prev first landed_hit landed_n l
     local owned="${BASE}/containers.owned"
